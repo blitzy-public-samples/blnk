@@ -36,6 +36,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/posthog/posthog-go v1.3.3
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/common v0.67.5
 	github.com/redis/go-redis/v9 v9.7.3
 	github.com/rubenv/sql-migrate v1.7.1
 	github.com/segmentio/kafka-go v0.4.51
@@ -107,7 +108,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect

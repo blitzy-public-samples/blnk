@@ -31,6 +31,7 @@ Start here:
 - [Create your first ledger, balance, and transaction](https://docs.blnkfinance.com/tutorials/quick-start/create-your-first-ledger-balance-and-transaction?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
 - [Explore Blnk tutorials](https://docs.blnkfinance.com/tutorials?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
 - [Read the API reference](https://docs.blnkfinance.com/api-reference?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
+- [Set up Kafka event streaming](docs/kafka-operations.md), which is optional: the Docker Compose stack ships a single-broker Kafka with SASL/SCRAM behind an opt-in `kafka` profile and provisions the topics at startup, and with `KAFKA_BROKERS` unset the ledger runs exactly as before
 
 <br/>
 
@@ -77,6 +78,16 @@ Blnk helps teams match external records, such as bank statements or payment proc
 ### Identity management
 
 Blnk lets teams create and manage identities, tokenize PII, and link identities to balances and transactions.
+
+### Event streaming
+
+Blnk publishes every ledger event to Kafka, so subscribers consume a stream directly instead of receiving HTTP pushes. Each event is captured in a PostgreSQL transactional outbox inside the same database transaction as the ledger mutation that produced it, so the mutation and its event commit together and an event is never lost because the broker was unavailable. A relay then publishes the event, retries with bounded backoff, and dead-letters it if every attempt fails.
+
+Events are grouped into four category topics, `blnk.transactions`, `blnk.balances`, `blnk.identities`, and `blnk.system`, each with a dead-letter sibling named by appending `.dlt`. Messages are keyed by ledger id, so every event that belongs to a ledger lands on one partition and arrives in the order the mutations happened. Each subscriber is a Kafka principal with its own SASL/SCRAM credentials and ACLs scoped to the topics and consumer group it was granted.
+
+The outbox gives exactly-once capture on the write side, while Kafka delivery itself is at-least-once, so `event_id` is the subscriber's idempotency key and deduplicating on it is the subscriber's responsibility. Blnk owns every `<topic>.dlt` name and does not implement or manage subscriber-side dead-lettering, so name your own dead-letter topics outside that namespace.
+
+Read [the event streaming reference](docs/event-streaming.md) for the full topic catalogue, the event schema, and the idempotency guidance. If you run a webhook receiver today, [the migration guide](docs/webhook-to-kafka-migration.md) covers the move: HTTP webhook delivery and Kafka publishing run concurrently, from the same outbox events, for a 30-day window, after which the deprecated webhook management API answers `410 Gone` on every request. Provisioning, the ACL model, and the dead-letter triage and replay runbook are in [the Kafka operations runbook](docs/kafka-operations.md).
 
 <br/>
 

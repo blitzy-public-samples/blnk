@@ -54,16 +54,41 @@ if [[ "${CASE_NAME}" == "events" ]]; then
   EVENTS_SUMMARY_OUT="${SUMMARY_OUT:-${EVENTS_OUT_DIR}/summary-events.json}"
   EVENTS_NDJSON_OUT="${NDJSON_OUT:-${EVENTS_OUT_DIR}/run-events.ndjson}"
 
+  # THIS ARRAY CARRIES CREDENTIAL VALUES — the metrics bearer token, the master key and the API
+  # key are all appended into it below. It is handed to k6 and to nothing else: do not echo it,
+  # do not `set -x` around the invocation, and do not write it into an artefact or a filename.
   events_args=()
 
   # The verdicts are computed from Blnk's own /metrics, scraped before and after the run, so
   # the bearer token is not optional when metrics are protected. The master key is what reads
   # GET /events/stats. Both are taken from the same BLNK_* names ./.env already exports, so a
   # sourced environment needs no extra flags.
-  # Derived from URL when it was not given, so a run against a non-default host needs one
-  # variable rather than two. events.js derives it too; doing it here as well means the value the
-  # runner ECHOES below is the value k6 receives.
-  METRICS_URL="${METRICS_URL:-$(dirname "${URL}")/metrics}"
+  #
+  # METRICS_URL is derived from URL when it was not given, so a run against a non-default host
+  # needs one variable rather than two, and the value the runner ECHOES below is the value k6
+  # receives. THIS DERIVATION IS NOT REDUNDANT WITH events.js: that file defaults METRICS_URL to
+  # the literal http://localhost:5001/metrics and derives only EVENTS_STATS_URL, LEDGERS_URL and
+  # BALANCES_URL. Remove it and a run against a non-default URL measures localhost instead —
+  # a clean set of verdicts for a deployment nobody asked about.
+  #
+  # The substitution replaces the /transactions path with /metrics, which is precisely what
+  # events.js's own siblingURL(URL, "/transactions", ...) does for /ledgers and /balances, so the
+  # runner and the scenario agree on how a sibling endpoint is spelled. It is deliberately NOT
+  # `dirname`: dirname is not URL-aware and answers `http:` for a URL with no path, so
+  # URL=http://localhost:5001 yielded METRICS_URL=http:/metrics, every scrape failed, and the run
+  # reported withheld verdicts rather than naming the malformed endpoint. A URL that cannot be
+  # transformed is refused here instead of guessed at, because the guess is not visibly wrong.
+  if [[ -z "${METRICS_URL:-}" ]]; then
+    if [[ "${URL}" == */transactions* ]]; then
+      METRICS_URL="${URL%/transactions*}/metrics"
+    else
+      echo "error: METRICS_URL cannot be derived from URL=${URL}"
+      echo "       URL is expected to contain the /transactions path. Either correct it, or name"
+      echo "       the metrics endpoint directly, for example:"
+      echo "       METRICS_URL=http://localhost:5001/metrics bash tests/loadtest/run_case.sh events"
+      exit 1
+    fi
+  fi
   events_args+=(-e "METRICS_URL=${METRICS_URL}")
 
   # The metrics endpoint is guarded by MetricsAuthHandler whenever server.secure is true, and an
@@ -81,6 +106,18 @@ if [[ "${CASE_NAME}" == "events" ]]; then
   [[ -n "${API_KEY:-${BLNK_API_KEY:-}}" ]] &&
     events_args+=(-e "API_KEY=${API_KEY:-${BLNK_API_KEY}}")
   events_args+=(-e "URL=${URL}")
+
+  # The scenario identifier is PINNED, not inherited — the same rule the transaction arms below
+  # follow, where the case name decides the scenario and any ambient value is overwritten.
+  #
+  # It matters here because k6 runs with --include-system-env-vars enabled by default, so every
+  # variable exported in the caller's shell arrives in __ENV whether the runner forwarded it or
+  # not, and events.js recognises exactly one scenario name: `event_publish`, throwing
+  # `Unknown SCENARIO=` on anything else. An operator who had exported SCENARIO=hot_source while
+  # working on a transaction case would otherwise watch the acceptance run abort during init over
+  # a scenario they never asked for. The literal below is the same name events.js falls back to,
+  # so pinning it changes no behaviour beyond closing that leak.
+  events_args+=(-e "SCENARIO=event_publish")
 
   # Load shape: forwarded only when explicitly set, per the note above.
   for setting in RATE DURATION VUS MAX_VUS LEDGER_SPREAD TARGET_EVENTS_PER_SEC \

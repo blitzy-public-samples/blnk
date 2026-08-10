@@ -922,8 +922,8 @@ type OutboxReconciliationResult struct {
 	// zero.
 	Overhead int64 `json:"overhead"`
 
-	// LossDetected is true when the broker holds FEWER records than the outbox
-	// has terminal rows — rows claiming a publication no record corresponds to.
+	// LossDetected is true when specific records this outbox recorded are provably
+	// not on the log — a row naming an offset at or beyond its partition's end.
 	//
 	// False does NOT mean "proven no loss". It means no loss is provable from the
 	// coordinates that were checkable, which is only a meaningful statement when

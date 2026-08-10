@@ -1370,12 +1370,27 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            # Matches kafka-data-persistentvolumeclaim.yaml. Size this for the
-            # retention window: the four category topics — blnk.transactions,
-            # blnk.balances, blnk.identities and blnk.system — and their four
-            # dead-letter siblings, at six partitions each, times the segment
-            # retention the cluster is configured for.
-            storage: 10Gi
+            # THE SIZE IS DERIVED, NOT ESTIMATED. It pairs with
+            # log.retention.bytes in the broker configuration this file
+            # generates, and the two are halves of one decision that the broker
+            # only enforces one of:
+            #
+            #   8 topics (4 category + 4 .dlt) x 6 partitions   = 48 partitions
+            #   RF 3 across exactly 3 brokers                   => each broker holds all 48
+            #   48 x log.retention.bytes (2 GiB, PER PARTITION) = 96 GiB of log data
+            #   96 GiB is 60% of 160Gi; the remaining 64 GiB is working headroom
+            #
+            # The headroom is required rather than generous: Kafka writes a new
+            # segment before deleting an old one, keeps an offset and a time
+            # index beside every segment, and takes a log directory OFFLINE —
+            # dropping its partitions — when it runs out of space rather than
+            # shedding data to continue. It replaced 10Gi, which is under three
+            # hours of a typical 2 KiB event at 500/second.
+            #
+            # Change this number and log.retention.bytes together, or the volume
+            # decides when the broker stops. Adding a category topic adds six
+            # partitions, which is 12 GiB more log data per broker.
+            storage: 160Gi
 ---
 # THE QUORUM BUDGET (F-22).
 #

@@ -17,695 +17,292 @@ limitations under the License.
 package api
 
 import (
-	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
 
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/api/middleware"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
+	"github.com/blnkfinance/blnk/database/mocks"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"testing"
-	"time"
 )
 
-// This file is the HTTP half of acceptance criterion V-10: after the retirement instant
-// the webhook REST API answers 410 Gone on EVERY request.
+// This file is the HTTP half of acceptance criterion V-10: once the configured
+// retirement instant has passed, the webhook subscription REST API answers 410 Gone on
+// EVERY request, and nothing else in the API is retired with it.
 //
-// "Every" is the load-bearing word, and it is the reason these tests exist as a set
-// rather than as one happy-path check. A guard attached per route and behind
-// authentication satisfies the obvious reading of V-10 — the four registered methods,
-// called with a valid master key, all return 410 — while leaving two populations of
-// request answering something else entirely:
+// # "Every request" is the load-bearing phrase
 //
-//   - Callers that do not authenticate. They are answered by the authentication
-//     middleware first and told the surface is unauthorized, which is a claim about
-//     their credentials rather than about the surface. A client with no credentials
-//     cannot discover the retirement at all.
-//   - Methods nobody registered. PATCH, HEAD and OPTIONS match no route, so Gin's
-//     fallback answers as though the path had never existed.
+// A guard attached only per route, only behind authentication, satisfies the obvious
+// reading of V-10 — the four registered methods, called with a valid master key, all
+// answer 410 — while leaving three whole populations of request answering something
+// else:
 //
-// Both populations are asserted below, and both are the kind of gap that no amount of
-// testing the four registered methods with a valid key would ever reveal.
-
-// sunsetTestSecretKey is the master key the retirement tests authenticate with when
-// they want to isolate the retirement from authentication rather than test their
-// interaction.
-const sunsetTestSecretKey = "sunset-test-master-key"
-
-// setupSunsetRouter builds a fully wired router with a chosen retirement instant and
-// secure-mode setting.
+//   - Callers that do not authenticate. Authentication would answer them first and tell
+//     them their credentials are the problem, which is a claim about the caller rather
+//     than about the surface. A client with no valid key could never discover the
+//     retirement at all.
+//   - Methods nobody registered. PATCH, HEAD, OPTIONS and friends match no route, so
+//     there is no route-attached handler for them to reach.
+//   - Callers the rate limiter has already refused. A 429 tells a client to slow down
+//     and try again, about a surface that is never coming back.
 //
-// Two details matter for correctness rather than convenience:
+// All three are asserted below, and none of them would be revealed by any amount of
+// testing the four registered verbs with a valid key.
 //
-//   - Router() calls router.Use, so it must be invoked exactly once per engine. A
-//     second call would install the whole global chain — the retirement guard and
-//     authentication included — a second time, and every request would then be judged
-//     twice. Each test therefore gets its own instance.
-//   - MockConfig must be applied BEFORE NewBlnk, because the Blnk instance captures
-//     the configuration it is constructed with and only falls back to the live store.
+// # Why two barriers are exercised rather than one
 //
-// Parameters:
-//   - t: the test.
-//   - sunsetDate: the RFC3339 retirement instant, or "" for a deployment that has
-//     configured none.
-//   - secure: whether secure mode is enabled, which is what makes the authentication
-//     middleware actually enforce.
+// api/api.go installs the retirement twice, deliberately, and both installations are
+// covered here:
 //
-// Returns:
-//   - *gin.Engine: the assembled router.
-func setupSunsetRouter(t *testing.T, sunsetDate string, secure bool) *gin.Engine {
-	t.Helper()
-
-	config.MockConfig(&config.Configuration{
-		Queue: config.QueueConfig{
-			TransactionQueue: "transaction_queue_test_sunset",
-			NumberOfQueues:   1,
-		},
-		Redis:      config.RedisConfig{Dns: "localhost:6379"},
-		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
-		Server: config.ServerConfig{
-			Secure:    secure,
-			SecretKey: sunsetTestSecretKey,
-		},
-		WebhookDeprecationSunsetDate: sunsetDate,
-	})
-
-	cnf, err := config.Fetch()
-	require.NoError(t, err, "fetching the mocked configuration")
-	require.Equal(t, sunsetDate, cnf.WebhookDeprecationSunsetDate,
-		"the retirement instant did not reach the configuration store; MockConfig "+
-			"silently keeps the previous configuration when validation fails, which "+
-			"would make every assertion below test the wrong deployment")
-
-	db, err := database.NewDataSource(cnf)
-	require.NoError(t, err, "creating the datasource")
-
-	instance, err := blnk.NewBlnk(db)
-	require.NoError(t, err, "creating the Blnk instance")
-
-	api := NewAPI(instance)
-	require.NotNil(t, api, "NewAPI returned nil, which means configuration fetch failed")
-
-	return api.Router()
-}
-
-// retiredWebhookPath is a concrete request path on the retired surface.
-const retiredWebhookPath = "/subscribers/sub_sunset_test/webhook-subscription"
-
-// pastSunset is an instant comfortably behind any clock the suite could run under.
-func pastSunset() string {
-	return time.Now().UTC().AddDate(0, 0, -1).Format(time.RFC3339)
-}
-
-// futureSunset is an instant far enough ahead that the dual-delivery window is open.
-func futureSunset() string {
-	return time.Now().UTC().AddDate(0, 0, 10).Format(time.RFC3339)
-}
-
-// doSunsetRequest issues a request through the router and returns the recorder.
-func doSunsetRequest(t *testing.T, router *gin.Engine, method, path string, authenticate bool) *httptest.ResponseRecorder {
-	t.Helper()
-
-	req := httptest.NewRequest(method, path, nil)
-	if authenticate {
-		req.Header.Set("X-Blnk-Key", sunsetTestSecretKey)
-	}
-
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	return rec
-}
-
-// Past the retirement instant, every method addressed to the retired path is Gone —
-// including the ones no route was ever registered for.
+//   - middleware.WebhookSunsetPreAuthGuard(), installed globally in NewAPI ahead of the
+//     request-size limit, the rate limiter and Authenticate(). It is what reaches the
+//     three populations above.
+//   - middleware.WebhookSunsetGuard(), attached to each of the four registered routes.
+//     It is the retirement's local statement at the point of registration and would
+//     still refuse if the global middleware were ever dropped from the chain.
 //
-// The unregistered methods are the substantive half. PATCH, HEAD and OPTIONS reach no
-// route, so they are answered by the handler chain Gin rebuilds for unmatched requests.
-// That chain contains the global middleware and therefore the retirement guard, which
-// is exactly why the guard has to be installed globally: attached per route it cannot
-// run for a method that has no route.
-func TestWebhookSunset_EveryMethodOnTheRetiredPathIsGone(t *testing.T) {
-	router := setupSunsetRouter(t, pastSunset(), true)
-
-	registered := []string{
-		http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete,
-	}
-	unregistered := []string{
-		http.MethodPatch, http.MethodHead, http.MethodOptions,
-	}
-
-	for _, method := range append(registered, unregistered...) {
-		t.Run(method, func(t *testing.T) {
-			rec := doSunsetRequest(t, router, method, retiredWebhookPath, true)
-
-			require.Equal(t, http.StatusGone, rec.Code,
-				"%s %s must be Gone after the retirement instant; got %d with body %q",
-				method, retiredWebhookPath, rec.Code, rec.Body.String())
-
-			// Note on HEAD: the body is asserted here as it is for every other method,
-			// and that is correct even though a HEAD response carries no body on the
-			// wire. httptest.ResponseRecorder records exactly what the handler wrote,
-			// whereas net/http is what discards the body for HEAD when serving a real
-			// connection. So the recorded body proves the handler produced the right
-			// refusal, and the suppression is the server's job rather than the guard's.
-			assert.Equal(t, string(apierror.ErrGenGone), errorCodeOf(t, rec.Body.Bytes()),
-				"the refusal must carry the typed Gone code so clients branch on the "+
-					"code rather than parsing prose")
-		})
-	}
-}
-
-// A caller that does not authenticate is told the surface is Gone, not that it is
-// unauthorized.
+// The two cannot disagree about WHEN, because both resolve the verdict through
+// blnk.WebhookSunsetSnapshotAt. They could disagree about WHICH paths are retired, and
+// TestWebhookSunset_TheTwoBarriersCoverTheSameRoutes walks the assembled router to
+// prove they do not.
 //
-// This is the single most important assertion in the file, because it is the one that
-// fails the moment the guard is registered after authentication instead of before it.
-// Secure mode is deliberately ON: with it off the authentication middleware passes
-// everything through and the test would pass regardless of ordering, proving nothing.
-// With it on, an unauthenticated request would be answered 401 by authentication if it
-// ran first — so 410 here is positive evidence that the retirement precedes it.
-func TestWebhookSunset_AnUnauthenticatedCallerIsToldGoneNotUnauthorized(t *testing.T) {
-	router := setupSunsetRouter(t, pastSunset(), true)
-
-	t.Run("secure mode really would reject an unauthenticated caller", func(t *testing.T) {
-		// The control. A live, supported route under the same prefix must still
-		// challenge an unauthenticated caller, which establishes that authentication is
-		// genuinely enforcing in this configuration and that the 410 below is not simply
-		// authentication being inert.
-		rec := doSunsetRequest(t, router, http.MethodGet, "/subscribers", false)
-
-		require.Equal(t, http.StatusUnauthorized, rec.Code,
-			"a live route must challenge an unauthenticated caller when secure mode is "+
-				"on; if it does not, this test cannot distinguish guard ordering from "+
-				"authentication being disabled")
-	})
-
-	for _, method := range []string{
-		http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPatch,
-	} {
-		t.Run(method+" unauthenticated is Gone", func(t *testing.T) {
-			rec := doSunsetRequest(t, router, method, retiredWebhookPath, false)
-
-			require.Equal(t, http.StatusGone, rec.Code,
-				"%s %s must be Gone for an unauthenticated caller; %d suggests the "+
-					"retirement guard is registered AFTER authentication, which hides "+
-					"the retirement from exactly the clients that need to learn about it",
-				method, retiredWebhookPath, rec.Code)
-
-			assert.Equal(t, string(apierror.ErrGenGone), errorCodeOf(t, rec.Body.Bytes()),
-				"an unauthenticated caller must receive the Gone code, not an auth code")
-		})
-	}
-}
-
-// The retirement is scoped to the retired surface and nothing else.
+// # What this file deliberately does NOT do
 //
-// A globally installed guard is offered every request in the service, so the blast
-// radius of a sloppy path match is the whole API. These routes are the neighbours most
-// at risk: two share the /subscribers prefix with the retired surface, /hooks shares
-// its vocabulary, and the health route is what an orchestrator uses to decide whether
-// the process is alive at all.
-func TestWebhookSunset_RetiresNothingBeyondTheRetiredSurface(t *testing.T) {
-	router := setupSunsetRouter(t, pastSunset(), true)
-
-	for _, tc := range []struct {
-		name   string
-		method string
-		path   string
-		why    string
-	}{
-		{
-			name:   "the live subscriber registry",
-			method: http.MethodGet,
-			path:   "/subscribers",
-			why:    "the registry is the replacement for the retired surface",
-		},
-		{
-			name:   "the credential-issuance endpoint",
-			method: http.MethodPost,
-			path:   "/subscribers/sub_sunset_test/kafka-credentials",
-			why:    "retiring this would remove the migration path off webhooks entirely",
-		},
-		{
-			name:   "the hooks surface of a different feature",
-			method: http.MethodGet,
-			path:   "/hooks",
-			why:    "PRE_TRANSACTION and POST_TRANSACTION callouts are fully supported",
-		},
-		{
-			name:   "the dead-letter inventory",
-			method: http.MethodGet,
-			path:   "/events/stats",
-			why:    "the event surface is the feature the retirement exists to move traffic to",
-		},
-		{
-			name:   "the health route",
-			method: http.MethodGet,
-			path:   "/",
-			why:    "retiring this would take the deployment down, not a transport",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := doSunsetRequest(t, router, tc.method, tc.path, true)
-
-			assert.NotEqual(t, http.StatusGone, rec.Code,
-				"%s %s must not be retired: %s", tc.method, tc.path, tc.why)
-		})
-	}
-}
-
-// Inside the dual-delivery window the guard is transparent, and it advertises the
-// instant at which it will stop being so.
+// It never parses the retirement instant and never compares dates. The verdict has
+// exactly one home — blnk.WebhookSunsetPassed, reached through
+// blnk.WebhookSunsetSnapshotAt — and its boundary (inclusive, to the nanosecond) is
+// owned by event_sunset_test.go. A second comparison here could let this file agree
+// with itself while disagreeing with the code that decides, which is the one failure
+// mode a test of a date-driven behaviour must not have. So the retirement is moved by
+// CONFIGURATION and the HTTP result is what gets asserted. Nothing sleeps.
 //
-// The headers are asserted on a SUCCEEDING request deliberately. RFC 8594's Sunset
-// field exists to warn a client that is still working, and a deprecation notice
-// delivered only with the refusal arrives precisely too late to act on.
-func TestWebhookSunset_BeforeTheInstantTheGuardIsTransparentAndWarns(t *testing.T) {
-	router := setupSunsetRouter(t, futureSunset(), true)
+// Likewise, the resolution of the configured window is owned by config/config_test.go
+// and the happy-path lifecycle of the four handlers by
+// api/subscribers_api_test.go. What is asserted here is the retirement's observable
+// behaviour over HTTP and its blast radius, which is what V-10 is about.
 
-	rec := doSunsetRequest(t, router, http.MethodGet, retiredWebhookPath, true)
-
-	require.NotEqual(t, http.StatusGone, rec.Code,
-		"inside the dual-delivery window the deprecated routes must still answer; "+
-			"body %q", rec.Body.String())
-
-	assert.NotEmpty(t, rec.Header().Get("Sunset"),
-		"a request succeeding inside the window must still carry the Sunset header, "+
-			"which is the only warning a working client receives")
-	deprecated, _, configured := blnk.WebhookDeprecationWindow()
-	require.True(t, configured, "a configured sunset must yield a window to advertise")
-	assert.Equal(t, middleware.DeprecationHeaderValue(deprecated), rec.Header().Get("Deprecation"),
-		"the Deprecation field is RFC 9745 — a structured-field date for the instant the "+
-			"deprecation BEGAN — and it must accompany Sunset on a request that still succeeds")
-}
-
-// A deployment that has configured no retirement instant keeps working indefinitely.
+// sunsetMasterKey is the master secret the secure-mode cases authenticate with.
 //
-// This is a legitimate steady state rather than a misconfiguration, and it is the state
-// every deployment that has not yet scheduled its migration is in. A guard that treated
-// an absent instant as a passed one would retire the surface on upgrade, for everybody,
-// without anyone having chosen a date.
-func TestWebhookSunset_NoConfiguredInstantRetiresNothing(t *testing.T) {
-	router := setupSunsetRouter(t, "", true)
+// It is an obviously fake, clearly-labelled test value: it must never resemble a real
+// credential, because the whole point of the secure-mode cases is that a request
+// carrying it is fully authorised and STILL told the surface is gone.
+const sunsetMasterKey = "not-a-real-secret-sunset-test-master-key"
 
-	rec := doSunsetRequest(t, router, http.MethodGet, retiredWebhookPath, true)
-
-	require.NotEqual(t, http.StatusGone, rec.Code,
-		"with no retirement instant configured the deprecated routes must keep "+
-			"answering; body %q", rec.Body.String())
-
-	assert.Empty(t, rec.Header().Get("Sunset"),
-		"there is no instant to advertise, so no Sunset header may be invented")
-}
-
-// errorCodeOf reads the machine-readable code out of an error response body.
+// The two retirement instants every test is driven from.
 //
-// The status alone cannot distinguish a deliberate 410 from an unmapped code that defaulted
-// to one, so every sunset assertion checks the code as well.
+// They are FIXED literals rather than time.Now offsets on purpose. An offset computed
+// at fixture time can be crossed by a slow or heavily loaded test machine part-way
+// through a table, and the resulting failure reads exactly like a logic error in the
+// guard. A year in the past and a millennium in the future cannot be crossed.
 //
-// Parameters:
-//   - t *testing.T: for the fatal on an unparseable body.
-//   - body []byte: the raw response body.
-//
-// Returns:
-//   - string: the "code" field, or the empty string when the body carries none.
-func errorCodeOf(t *testing.T, body []byte) string {
-	t.Helper()
-
-	// THE CODE IS NESTED, and reading it from the top level is what made this helper report
-	// an empty string for every refusal. respondCode writes the API's standard envelope —
-	// {"error": <message>, "error_detail": {"code": ..., "message": ...}} — so a top-level
-	// `code` key does not exist on any error response this package produces, and a helper
-	// looking for one turns "the guard answered with the wrong code" and "the guard answered
-	// correctly" into the same empty answer.
-	var envelope struct {
-		ErrorDetail struct {
-			Code string `json:"code"`
-		} `json:"error_detail"`
-	}
-	require.NoError(t, json.Unmarshal(body, &envelope), "body: %s", string(body))
-
-	return envelope.ErrorDetail.Code
-}
-
-// A sunset instant safely in the past and one safely in the future. Both are fixed rather
-// than computed from time.Now with a small offset, so a slow test machine cannot drift
-// across the boundary mid-run and make a failure look like a logic error.
+// Both are already normalised — UTC, RFC3339, second precision — which is the form
+// config.resolveWebhookDeprecationWindow stores, so a fixture can assert that the value
+// it published is the value that landed.
 const (
 	sunsetPassedInstant = "2020-01-01T00:00:00Z"
 	sunsetFutureInstant = "2999-01-01T00:00:00Z"
 )
 
-// A concrete path on the deprecated surface, and the supported credential route that must
-// keep working. The deprecated path is built from a literal subscriber id rather than from
-// the route pattern, because a request carries a concrete path and the point of the
-// interceptor is that it reads that.
-const (
-	deprecatedWebhookPath = "/subscribers/sub_sunset_probe/webhook-subscription"
-	supportedHooksPath    = "/hooks"
-)
-
-// sunsetRouter builds a real router with the retirement instant set, and — when secure is
-// true — with authentication genuinely enabled so the 401 and 403 paths are the real ones
-// rather than a simulation.
+// retiredProbeSubscriberID is the subscriber identifier the retired-surface probes
+// address.
 //
-// setupAuthedRouter is deliberately NOT used: it injects an authenticated context with a
-// middleware of its own, which is exactly the ordering under test. Here the request must
-// arrive with nothing, or with a real key, and meet the real chain.
-func sunsetRouter(t *testing.T, sunset string, secure bool) *gin.Engine {
-	t.Helper()
+// It deliberately names no subscriber that exists. Past the retirement instant that is
+// the point: the request must be answered 410 rather than 404, and a 404 would prove
+// the registry had been consulted for a surface that no longer exists.
+const retiredProbeSubscriberID = "sub_sunset_probe"
 
-	router, _, _ := setupRouterWithConfig(t, func(cfg *config.Configuration) {
-		cfg.WebhookDeprecationSunsetDate = sunset
-		if secure {
-			cfg.Server.Secure = true
-			cfg.Server.SecretKey = sunsetMasterKey
-		}
-	})
-
-	return router
-}
-
-// sunsetMasterKey is the master secret the secure-mode cases authenticate with.
-const sunsetMasterKey = "sunset-master-key-for-the-real-router-tests"
-
-// TestWebhookSunset_AnsweredForEveryVerbOnEveryDeprecatedRoute is the V-10 criterion stated
-// as the request matrix it actually is.
+// retiredWebhookPath is a concrete request path on the retired surface.
 //
-// Each of the four supported verbs is sent to the deprecated path through the real router,
-// and each must be answered 410 with the GEN_GONE code — not merely a 410 status, because
-// an unmapped code would resolve to 500 and a hand-written status would drift from the
-// catalog.
-func TestWebhookSunset_AnsweredForEveryVerbOnEveryDeprecatedRoute(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete} {
-		t.Run(method, func(t *testing.T) {
-			router := sunsetRouter(t, sunsetPassedInstant, false)
+// It is derived from the exported route template through the shared helper rather than
+// written as a literal, so this file cannot drift from api/api.go's registration: the
+// template is one fact, stated in the middleware that owns the retirement and read by
+// the router, the guards and these tests alike.
+var retiredWebhookPath = webhookSubscriptionPath(retiredProbeSubscriberID)
 
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, httptest.NewRequest(method, deprecatedWebhookPath, strings.NewReader("{}")))
-
-			assertErrorCode(t, w, http.StatusGone, apierror.ErrGenGone)
-		})
-	}
-}
-
-// TestWebhookSunset_AnswersGoneBeforeAuthentication is the ordering assertion, and it is the
-// finding itself.
+// sunsetRoute is one request on the retired surface, together with the status that
+// request answers while the dual-delivery window is still open.
 //
-// Every credential state must reach 410. A missing key must not be answered 401 and an
-// insufficiently scoped key must not be answered 403: both were, and both sent a client to
-// investigate its credentials for a surface that has been removed from every scope there is.
-// Authentication is genuinely enabled here, so these are the real refusals being displaced.
-func TestWebhookSunset_AnswersGoneBeforeAuthentication(t *testing.T) {
-	for name, apiKey := range map[string]string{
-		"no credentials at all": "",
-		"an unknown key":        "a-key-that-was-never-issued",
-		"the master key":        sunsetMasterKey,
-	} {
-		t.Run(name, func(t *testing.T) {
-			router := sunsetRouter(t, sunsetPassedInstant, true)
-
-			request := httptest.NewRequest(http.MethodGet, deprecatedWebhookPath, nil)
-			if apiKey != "" {
-				request.Header.Set("X-Blnk-Key", apiKey)
-			}
-
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, request)
-
-			require.NotEqual(t, http.StatusUnauthorized, w.Code,
-				"401 BEFORE 410 IS THE DEFECT: the surface is gone, so a credential is not what "+
-					"is missing, and telling a client otherwise sends it to debug its keys")
-			require.NotEqual(t, http.StatusForbidden, w.Code,
-				"and 403 is the same mistake: no scope grants access to a route that no longer exists")
-
-			assertErrorCode(t, w, http.StatusGone, apierror.ErrGenGone)
-		})
-	}
-}
-
-// TestWebhookSunset_AnswersGoneForUnsupportedMethods covers the class of request that could
-// not previously reach any guard at all.
-//
-// A verb the router never registered matches no route, so no route-attached handler exists
-// to run: Gin answered it itself. "Every request" includes these, and a global interceptor
-// running before authentication is the only thing that can see them — Gin runs global
-// middleware for its NoRoute and NoMethod paths.
-func TestWebhookSunset_AnswersGoneForUnsupportedMethods(t *testing.T) {
-	for _, method := range []string{
-		http.MethodPatch,
-		http.MethodHead,
-		http.MethodOptions,
-		http.MethodTrace,
-		"PROPFIND", // an entirely unregistered verb, not merely an unrouted standard one
-	} {
-		t.Run(method, func(t *testing.T) {
-			router := sunsetRouter(t, sunsetPassedInstant, true)
-
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, httptest.NewRequest(method, deprecatedWebhookPath, nil))
-
-			require.Equal(t, http.StatusGone, w.Code,
-				"an unsupported verb on a retired path reached no route, so nothing route-attached "+
-					"could answer it; the interceptor is what makes 'every request' true")
-
-			// HEAD carries no body by definition, so only the status is assertable there.
-			if method != http.MethodHead {
-				assertErrorCode(t, w, http.StatusGone, apierror.ErrGenGone)
-			}
-		})
-	}
-}
-
-// TestWebhookSunset_LeavesTheSurfaceAloneBeforeTheInstant is the other half of the boundary,
-// and without it the tests above are satisfied by a router that answers 410 always.
-//
-// Inside the dual-delivery window the deprecated routes must behave exactly as they did:
-// authentication runs, the handler runs, and an unsupported verb still gets Gin's own
-// refusal rather than a premature retirement.
-func TestWebhookSunset_LeavesTheSurfaceAloneBeforeTheInstant(t *testing.T) {
-	t.Run("a supported verb is not retired early", func(t *testing.T) {
-		router := sunsetRouter(t, sunsetFutureInstant, false)
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, deprecatedWebhookPath, nil))
-
-		assert.NotEqual(t, http.StatusGone, w.Code,
-			"the window is still open, so the route must answer as itself — 404 for an unknown "+
-				"subscriber is a correct answer here, 410 is not")
-	})
-
-	t.Run("authentication still applies inside the window", func(t *testing.T) {
-		// The interceptor passes the request on before the instant, so the chain behind it
-		// must be intact. A missing credential is answered by authentication, as always.
-		router := sunsetRouter(t, sunsetFutureInstant, true)
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, deprecatedWebhookPath, nil))
-
-		assert.Equal(t, http.StatusUnauthorized, w.Code,
-			"inside the window the deprecated routes are ordinary authenticated routes; an "+
-				"interceptor that swallowed the request would have disabled authentication on them")
-	})
-
-	t.Run("an unsupported verb is not retired early either", func(t *testing.T) {
-		router := sunsetRouter(t, sunsetFutureInstant, false)
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodPatch, deprecatedWebhookPath, nil))
-
-		assert.NotEqual(t, http.StatusGone, w.Code,
-			"PATCH is unsupported, which is not the same as retired; answering 410 before the "+
-				"instant would retire the surface early for one class of caller")
-	})
-}
-
-// TestWebhookSunset_AdvertisesTheInstantOnBothSidesOfTheBoundary pins the advisory headers.
-//
-// RFC 8594 Sunset is what lets a client schedule its own migration, so it is most useful
-// BEFORE the instant — on the very responses the client is still succeeding with. It is
-// asserted on both sides because a header that appeared only after the surface was gone
-// would be a notice nobody could act on.
-func TestWebhookSunset_AdvertisesTheInstantOnBothSidesOfTheBoundary(t *testing.T) {
-	expected, err := time.Parse(time.RFC3339, sunsetPassedInstant)
-	require.NoError(t, err)
-
-	t.Run("after the instant", func(t *testing.T) {
-		router := sunsetRouter(t, sunsetPassedInstant, false)
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, deprecatedWebhookPath, nil))
-
-		require.Equal(t, http.StatusGone, w.Code)
-		assert.Equal(t, expected.UTC().Format(http.TimeFormat), w.Header().Get("Sunset"),
-			"the Sunset header must carry the configured instant, rendered in GMT as the layout claims")
-		// RFC 9745 requires an Item Structured Field Date per RFC 9651 §3.3.7 — "@" followed
-		// by an integer — for the window's OPENING instant, which is the sunset less the
-		// dual-delivery window. The literal "true" this once asserted satisfies neither the
-		// syntax nor the meaning, and a client parsing the field per the RFC would reject it.
-		deprecated, _, configured := blnk.WebhookDeprecationWindow()
-		require.True(t, configured, "a configured sunset must yield a window to advertise")
-		assert.Equal(t, middleware.DeprecationHeaderValue(deprecated), w.Header().Get("Deprecation"),
-			"the Deprecation header must be the RFC 9745 structured-field date of the window's "+
-				"opening instant, and it must be rendered from the SAME resolution as the Sunset "+
-				"header beside it")
-	})
-
-	t.Run("before the instant", func(t *testing.T) {
-		router := sunsetRouter(t, sunsetFutureInstant, false)
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, deprecatedWebhookPath, nil))
-
-		future, parseErr := time.Parse(time.RFC3339, sunsetFutureInstant)
-		require.NoError(t, parseErr)
-		assert.Equal(t, future.UTC().Format(http.TimeFormat), w.Header().Get("Sunset"),
-			"the notice is most useful while the surface still works, so it must be present here")
-	})
-
-	t.Run("with no instant configured", func(t *testing.T) {
-		router := sunsetRouter(t, "", false)
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, deprecatedWebhookPath, nil))
-
-		assert.Empty(t, w.Header().Get("Sunset"),
-			"a deployment with no retirement instant has nothing to advertise, and an empty or "+
-				"invented header would be worse than none")
-		assert.NotEqual(t, http.StatusGone, w.Code,
-			"and no instant means no retirement: this is a legitimate steady state")
-	})
-}
-
-// TestWebhookSunset_DoesNotTouchAnyOtherRoute is the blast-radius assertion, and /hooks is
-// the route it exists for.
-//
-// /hooks is the PRE_TRANSACTION and POST_TRANSACTION request-time callout feature. It shares
-// a word with the transport being retired, shares the asynq queue with it, and must keep
-// working. The supported subscriber routes matter for the same reason: the credential
-// endpoint is the REPLACEMENT for the retired surface, so retiring it by accident would
-// leave a caller with neither.
-func TestWebhookSunset_DoesNotTouchAnyOtherRoute(t *testing.T) {
-	for name, target := range map[string]struct {
-		method string
-		path   string
-	}{
-		"hooks list":                   {http.MethodGet, supportedHooksPath},
-		"hooks create":                 {http.MethodPost, supportedHooksPath},
-		"subscriber read":              {http.MethodGet, "/subscribers/sub_sunset_probe"},
-		"subscriber list":              {http.MethodGet, "/subscribers"},
-		"kafka credential issuance":    {http.MethodPost, "/subscribers/sub_sunset_probe/kafka-credentials"},
-		"a ledger route":               {http.MethodGet, "/ledgers"},
-		"a path that shares a word":    {http.MethodGet, "/subscribers/webhook-subscription"},
-		"a deeper deprecated-ish path": {http.MethodGet, "/subscribers/sub_x/webhook-subscription/extra"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			// The instant is PAST, so anything the interceptor wrongly matches answers 410
-			// and this assertion catches it.
-			router := sunsetRouter(t, sunsetPassedInstant, false)
-
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, httptest.NewRequest(target.method, target.path, strings.NewReader("{}")))
-
-			assert.NotEqual(t, http.StatusGone, w.Code,
-				"%s %s was retired by the webhook sunset. Only the deprecated "+
-					"webhook-subscription surface may be; retiring anything else silently removes "+
-					"a supported feature", target.method, target.path)
-		})
-	}
-}
-
-// TestWebhookSunset_TheTwoLayersCoverTheSameRoutes is the drift guard between the global
-// interceptor and the per-route guard, and it walks the ROUTER rather than the source.
-//
-// The two layers share the sunset predicate, so they cannot disagree about when the window
-// closes. What they could disagree about is WHICH paths are retired: the interceptor matches
-// a concrete path, the guard is attached during registration. This asserts the sets agree in
-// both directions — every registered route carrying the deprecated suffix is one the matcher
-// recognises, and the matcher recognises nothing that is not registered as deprecated.
-func TestWebhookSunset_TheTwoLayersCoverTheSameRoutes(t *testing.T) {
-	router := sunsetRouter(t, sunsetPassedInstant, false)
-
-	deprecatedRoutes := 0
-
-	for _, route := range router.Routes() {
-		concrete := strings.ReplaceAll(route.Path, ":subscriber_id", "sub_sunset_probe")
-		matched := middleware.IsDeprecatedWebhookSubscriptionPath(concrete)
-
-		if strings.HasSuffix(route.Path, "/webhook-subscription") {
-			deprecatedRoutes++
-
-			assert.True(t, matched,
-				"route %s %s is registered as deprecated but the interceptor's matcher does not "+
-					"recognise it, so requests to it would be answered by authentication first",
-				route.Method, route.Path)
-
-			continue
-		}
-
-		assert.False(t, matched,
-			"route %s %s is a SUPPORTED route that the interceptor's matcher claims, so it would "+
-				"be retired along with the webhook surface", route.Method, route.Path)
-	}
-
-	assert.Equal(t, 4, deprecatedRoutes,
-		"the deprecated surface is four verbs on one path; a different count means a route was "+
-			"added or removed without this matrix being updated")
-}
-
-// webhookSunsetRoute is one deprecated route, addressed the way a client addresses it.
-type webhookSunsetRoute struct {
+// Pinning the normal status IN THE TABLE is what stops the "before the instant" half of
+// the criterion from degenerating into "not 410". "Not 410" is satisfied by a 500, by a
+// 403, and by a router that lost the route altogether, so the pre-retirement half
+// asserts the exact status api/subscribers.go documents for each verb.
+type sunsetRoute struct {
+	// method is the HTTP method, which is the only thing that varies across the
+	// retired surface: it is four verbs on ONE path.
 	method string
-	path   string
-	body   string
-}
-
-// webhookSunsetRoutes is every deprecated webhook-subscription route and method.
-//
-// The list is exhaustive on purpose: the acceptance criterion is "410 on every request",
-// so a route that kept answering would be a hole in the retirement, and a method that did
-// would be the same hole reached differently. Bodies are supplied where the handler binds
-// one, so a refusal cannot be mistaken for a bind failure that happens to share a status.
-var webhookSunsetRoutes = []webhookSunsetRoute{
-	{
-		method: http.MethodPost,
-		path:   "/subscribers/sub_sunset_probe/webhook-subscription",
-		body:   `{"url":"https://example.test/hooks"}`,
-	},
-	{method: http.MethodGet, path: "/subscribers/sub_sunset_probe/webhook-subscription"},
-	{
-		method: http.MethodPut,
-		path:   "/subscribers/sub_sunset_probe/webhook-subscription",
-		body:   `{"url":"https://example.test/hooks"}`,
-	},
-	{method: http.MethodDelete, path: "/subscribers/sub_sunset_probe/webhook-subscription"},
+	// body is the request payload, supplied wherever the handler binds one so that a
+	// refusal can never be confused with a bind failure that happens to share a status.
+	body string
+	// normalStatus is what the route answers inside the window, taken from
+	// api/subscribers.go rather than guessed: POST 201 Created, GET 200 OK, PUT 200 OK,
+	// DELETE 204 No Content.
+	normalStatus int
 }
 
 // name renders a route for a subtest name.
-func (r webhookSunsetRoute) name() string {
-	return r.method + " " + r.path
+//
+// Returns:
+//   - string: the HTTP method, which uniquely identifies a route on this surface.
+func (r sunsetRoute) name() string {
+	return r.method
 }
 
-// webhookSunsetConfig builds the configuration the router under test reads.
+// sunsetRoutes is every registered method on the retired surface.
 //
-// The base is this package's usual test configuration; mutate adjusts the retirement
-// instant and, where the case needs it, the broker list — those two together are the whole
-// input to the sunset decision.
+// The list is exhaustive by requirement rather than by convenience: V-10 says 410 on
+// every request, so a verb missing from here would be a hole in the retirement reached
+// by a client and by nothing in this file.
+//
+// The POST and PUT URLs share no prefix and both satisfy the destination policy in
+// api/model.CreateWebhookSubscription.Validate, so the pre-retirement half exercises
+// the real handler rather than its validation branch.
+var sunsetRoutes = []sunsetRoute{
+	{
+		method:       http.MethodPost,
+		body:         `{"webhook_url":"https://sunset-first.example.com/blnk-events"}`,
+		normalStatus: http.StatusCreated,
+	},
+	{
+		method:       http.MethodGet,
+		normalStatus: http.StatusOK,
+	},
+	{
+		method:       http.MethodPut,
+		body:         `{"webhook_url":"https://sunset-second.example.net/kafka-cutover"}`,
+		normalStatus: http.StatusOK,
+	},
+	{
+		method:       http.MethodDelete,
+		normalStatus: http.StatusNoContent,
+	},
+}
+
+// sunsetUnregisteredMethods are methods the router registers for no route at all.
+//
+// They are the population a per-route guard structurally cannot see: with no matching
+// route there is no route-attached handler to run, so gin answers them from the chain it
+// rebuilds for unmatched requests — which contains the global middleware, and therefore
+// the pre-auth retirement barrier. PROPFIND is included because it is not merely an
+// unrouted standard verb but an entirely unregistered one.
+var sunsetUnregisteredMethods = []string{
+	http.MethodPatch,
+	http.MethodHead,
+	http.MethodOptions,
+	http.MethodTrace,
+	"PROPFIND",
+}
+
+// sunsetFixture is the assembled state of one router under test.
+//
+// It is mutated only by sunsetRouterOption values before the router is built. Nothing
+// reads it afterwards: the router reads the CONFIGURATION STORE live on every request,
+// which is precisely the property TestWebhookSunset_DecidesPerRequestRatherThanAtRouterBuildTime
+// exists to pin.
+type sunsetFixture struct {
+	// secure turns real authentication on. With it off, Authenticate() short-circuits
+	// and never runs, so the 401 and 403 paths cannot be observed at all.
+	secure bool
+	// masterKeyPrincipal injects an authenticated master-key context ahead of the whole
+	// chain, so that a refusal can only have come from the retirement.
+	masterKeyPrincipal bool
+	// rateLimitRPS and rateLimitBurst arm the limiter tightly enough that a second
+	// request from one client is refused.
+	rateLimitRPS   *float64
+	rateLimitBurst *int
+	// brokers and insecureBrokerTransport describe a publishing deployment, which is
+	// what makes the configuration layer insist on a usable window.
+	brokers                 []string
+	insecureBrokerTransport bool
+}
+
+// sunsetRouterOption adjusts a fixture before its router is assembled.
+type sunsetRouterOption func(*sunsetFixture)
+
+// withSunsetSecureMode enables real authentication with sunsetMasterKey as the master
+// secret.
+//
+// It is required by any case that asserts something about the ORDER of the retirement
+// and authentication. With secure mode off, Authenticate() returns immediately and an
+// unauthenticated request would be answered 410 whichever order the two were installed
+// in — so the assertion would hold while proving nothing.
+//
+// Returns:
+//   - sunsetRouterOption: the option.
+func withSunsetSecureMode() sunsetRouterOption {
+	return func(f *sunsetFixture) { f.secure = true }
+}
+
+// withSunsetMasterKeyPrincipal injects an authenticated master-key context ahead of the
+// chain, the way this package's other router fixtures do.
+//
+// It is for cases where authentication is NOT the subject: the neighbouring routes must
+// answer as themselves rather than as authorization refusals, and a retired route must
+// be shown to refuse the most privileged caller there is.
+//
+// Returns:
+//   - sunsetRouterOption: the option.
+func withSunsetMasterKeyPrincipal() sunsetRouterOption {
+	return func(f *sunsetFixture) { f.masterKeyPrincipal = true }
+}
+
+// withSunsetRateLimit arms the rate limiter.
+//
+// The production defaults are 2000 requests per second with a burst of 4000, so
+// exhausting them would take four thousand requests to prove the same thing far more
+// slowly. A limit of one makes the SECOND request from a client a refusal.
 //
 // Parameters:
-//   - mutate func(*config.Configuration): applied before the configuration is published.
+//   - requestsPerSecond float64: the sustained rate.
+//   - burst int: the burst allowance.
+//
+// Returns:
+//   - sunsetRouterOption: the option.
+func withSunsetRateLimit(requestsPerSecond float64, burst int) sunsetRouterOption {
+	return func(f *sunsetFixture) {
+		rps := requestsPerSecond
+		allowance := burst
+		f.rateLimitRPS = &rps
+		f.rateLimitBurst = &allowance
+	}
+}
+
+// withSunsetKafkaBrokers describes a deployment that publishes to Kafka.
+//
+// The transport is declared insecure alongside it because that is what a single-broker
+// local stack is, and because leaving it undeclared makes the configuration layer refuse
+// the fixture for a reason that has nothing to do with the retirement.
+//
+// Parameters:
+//   - brokers ...string: the broker list.
+//
+// Returns:
+//   - sunsetRouterOption: the option.
+func withSunsetKafkaBrokers(brokers ...string) sunsetRouterOption {
+	return func(f *sunsetFixture) {
+		f.brokers = brokers
+		f.insecureBrokerTransport = true
+	}
+}
+
+// sunsetConfiguration builds the configuration a fixture publishes.
+//
+// Parameters:
+//   - sunset string: the RFC3339 retirement instant, or "" for a deployment that has
+//     configured none.
+//   - fixture sunsetFixture: the assembled fixture state.
 //
 // Returns:
 //   - *config.Configuration: the configuration to publish.
-func webhookSunsetConfig(mutate func(*config.Configuration)) *config.Configuration {
+func sunsetConfiguration(sunset string, fixture sunsetFixture) *config.Configuration {
 	cfg := &config.Configuration{
 		Queue: config.QueueConfig{
 			TransactionQueue: "transaction_queue_test_api_sunset",
@@ -713,80 +310,229 @@ func webhookSunsetConfig(mutate func(*config.Configuration)) *config.Configurati
 		},
 		Redis:      config.RedisConfig{Dns: "localhost:6379"},
 		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
+		Server: config.ServerConfig{
+			Secure:    fixture.secure,
+			SecretKey: sunsetMasterKey,
+		},
+		WebhookDeprecationSunsetDate: sunset,
 	}
-	if mutate != nil {
-		mutate(cfg)
+
+	if fixture.rateLimitRPS != nil {
+		cfg.RateLimit = config.RateLimitConfig{
+			RequestsPerSecond: fixture.rateLimitRPS,
+			Burst:             fixture.rateLimitBurst,
+		}
+	}
+
+	if len(fixture.brokers) > 0 {
+		cfg.Kafka.Brokers = fixture.brokers
+		cfg.Kafka.InsecureLocalDev = fixture.insecureBrokerTransport
 	}
 
 	return cfg
 }
 
-// webhookSunsetRouter publishes the given configuration and returns the REAL router, with
-// the master-key principal in context.
+// publishSunsetConfiguration publishes a configuration and proves it actually landed.
 //
-// The master key is granted so that a refusal can only come from the retirement guard. A
-// non-master caller is covered separately, because the ORDER of the two gates is itself a
-// property worth pinning.
-//
-// The configuration is restored to one with no retirement instant on cleanup, so a past
-// instant published here cannot leak into another test in this package and retire routes
-// it expects to work.
+// THE PROOF IS NOT OPTIONAL. config.MockConfig validates before it stores and, on
+// failure, logs and RETURNS — leaving the previous configuration in place. A fixture that
+// trusted it would silently test the previous test's deployment, and the resulting
+// failure would point at the guard rather than at the configuration that never arrived.
 //
 // Parameters:
-//   - t *testing.T: the test, for fatal reporting and cleanup registration.
-//   - mutate func(*config.Configuration): adjusts the published configuration.
+//   - t *testing.T: the test.
+//   - sunset string: the retirement instant the fixture asked for.
+//   - fixture sunsetFixture: the assembled fixture state.
 //
 // Returns:
-//   - *gin.Engine: the router NewAPI builds, with every route registered as production
-//     registers it.
-func webhookSunsetRouter(t *testing.T, mutate func(*config.Configuration)) *gin.Engine {
+//   - *config.Configuration: the published configuration.
+func publishSunsetConfiguration(t *testing.T, sunset string, fixture sunsetFixture) *config.Configuration {
 	t.Helper()
 
-	config.MockConfig(webhookSunsetConfig(mutate))
-	t.Cleanup(func() { config.MockConfig(webhookSunsetConfig(nil)) })
+	config.MockConfig(sunsetConfiguration(sunset, fixture))
 
 	cnf, err := config.Fetch()
-	require.NoError(t, err)
+	require.NoError(t, err, "fetching the published configuration")
+	require.Equal(t, sunset, cnf.WebhookDeprecationSunsetDate,
+		"the retirement instant did not reach the configuration store. config.MockConfig "+
+			"keeps the PREVIOUS configuration when validation fails, so every assertion "+
+			"below would have been made against the wrong deployment")
 
-	db, err := database.NewDataSource(cnf)
-	require.NoError(t, err)
+	return cnf
+}
 
-	instance, err := blnk.NewBlnk(db)
-	require.NoError(t, err)
+// buildSunsetRouter is the ONE construction path behind both public fixtures.
+//
+// Two details are correctness rather than convenience:
+//
+//   - Router() calls router.Use, so it must be invoked exactly once per engine. Calling
+//     it twice would install the whole global chain — the pre-auth retirement barrier and
+//     authentication included — a second time, and every request would then be judged
+//     twice. Each test therefore gets its own engine.
+//   - The configuration is published BEFORE NewBlnk and NewAPI, because both capture what
+//     they were constructed with: NewAPI resolves the rate limiter and the middleware
+//     chain at construction time.
+//
+// The configuration is restored to a no-retirement deployment on cleanup. Without that,
+// a past instant published here would remain in the package-level store and retire the
+// deprecated routes for any later test in package api that builds its own router but not
+// its own retirement instant — api/subscribers_api_test.go's lifecycle tests among them.
+//
+// The registry arrives as a FACTORY rather than as a value, and the ordering that forces
+// is the reason: the configuration has to be published before the datasource is built, so
+// that the datasource and the router are reading one and the same deployment. Taking a
+// ready-made datasource would have let a caller resolve it from whatever the store happened
+// to hold beforehand — which, for the first test in a run, is nothing at all.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - sunset string: the RFC3339 retirement instant, or "" for none.
+//   - fixture sunsetFixture: the assembled fixture state.
+//   - registryFor func(*config.Configuration) database.IDataSource: builds the datasource
+//     from the configuration that was actually published.
+//
+// Returns:
+//   - *gin.Engine: the router, with every route registered as production registers it.
+func buildSunsetRouter(
+	t *testing.T,
+	sunset string,
+	fixture sunsetFixture,
+	registryFor func(cnf *config.Configuration) database.IDataSource,
+) *gin.Engine {
+	t.Helper()
+
+	cnf := publishSunsetConfiguration(t, sunset, fixture)
+	t.Cleanup(func() { config.MockConfig(sunsetConfiguration("", sunsetFixture{})) })
+
+	instance, err := blnk.NewBlnk(registryFor(cnf))
+	require.NoError(t, err, "creating the Blnk instance")
 
 	apiInstance := NewAPI(instance)
-	apiInstance.router.Use(func(c *gin.Context) {
-		c.Set("isMasterKey", true)
-		c.Next()
-	})
+	require.NotNil(t, apiInstance,
+		"NewAPI returned nil, which means the configuration it fetched was unusable")
+
+	if fixture.masterKeyPrincipal {
+		// Installed before Router(), so it precedes the chain Router() adds — including
+		// Authenticate(), which is what lets a non-secure fixture present a master-key
+		// principal without a header.
+		apiInstance.router.Use(func(c *gin.Context) {
+			c.Set("isMasterKey", true)
+			c.Next()
+		})
+	}
 
 	return apiInstance.Router()
 }
 
-// webhookSunsetRequest issues one request against the router and returns the recorder.
+// setupSunsetRouter builds a router backed by the real registry, at a chosen retirement
+// instant.
+//
+// This is the fixture almost every case here uses. The real datasource matters for the
+// blast-radius and pre-retirement cases: a neighbouring route has to be able to answer as
+// ITSELF — 200, 404, whatever it genuinely answers — for "this route was not retired" to
+// mean anything.
 //
 // Parameters:
-//   - t *testing.T: the test, for fatal reporting.
-//   - router *gin.Engine: the router under test.
-//   - route webhookSunsetRoute: the request to issue.
+//   - t *testing.T: the test.
+//   - sunset string: the RFC3339 retirement instant, or "" for a deployment that has
+//     configured none.
+//   - opts ...sunsetRouterOption: fixture adjustments.
 //
 // Returns:
-//   - *httptest.ResponseRecorder: the response.
-func webhookSunsetRequest(t *testing.T, router *gin.Engine, route webhookSunsetRoute) *httptest.ResponseRecorder {
+//   - *gin.Engine: the assembled router.
+func setupSunsetRouter(t *testing.T, sunset string, opts ...sunsetRouterOption) *gin.Engine {
 	t.Helper()
 
-	var body *strings.Reader
-	if route.body == "" {
-		body = strings.NewReader("")
-	} else {
-		body = strings.NewReader(route.body)
+	var fixture sunsetFixture
+	for _, opt := range opts {
+		opt(&fixture)
 	}
 
-	request, err := http.NewRequestWithContext(context.Background(), route.method, route.path, body)
-	require.NoError(t, err)
-	if route.body != "" {
+	return buildSunsetRouter(t, sunset, fixture,
+		func(cnf *config.Configuration) database.IDataSource {
+			registry, err := database.NewDataSource(cnf)
+			require.NoError(t, err, "creating the datasource")
+
+			return registry
+		})
+}
+
+// setupSunsetRouterWithRegistrySpy builds the same router over a SPY datasource and hands
+// the spy back, so a test can assert what the registry was — and was not — asked to do.
+//
+// It exists for one assertion the real datasource cannot make. A 410 written AFTER the
+// handler had already read or written the registry would pass every status and code check
+// in this file, and would still be wrong: the retirement must refuse the request, not
+// perform it and then deny it. Only observing that the datasource was never touched
+// proves the short circuit, and the mirror — that it IS touched inside the window —
+// proves the guard is transparent rather than merely absent.
+//
+// The spy is returned with NO expectations set. That is deliberate: an unstubbed call on
+// a testify mock fails loudly, so a guard that leaked a request into a handler is
+// reported here rather than silently absorbed.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - sunset string: the RFC3339 retirement instant, or "" for none.
+//   - opts ...sunsetRouterOption: fixture adjustments.
+//
+// Returns:
+//   - *gin.Engine: the assembled router.
+//   - *mocks.MockDataSource: the registry spy backing it.
+func setupSunsetRouterWithRegistrySpy(
+	t *testing.T,
+	sunset string,
+	opts ...sunsetRouterOption,
+) (*gin.Engine, *mocks.MockDataSource) {
+	t.Helper()
+
+	var fixture sunsetFixture
+	for _, opt := range opts {
+		opt(&fixture)
+	}
+
+	spy := new(mocks.MockDataSource)
+
+	router := buildSunsetRouter(t, sunset, fixture,
+		func(*config.Configuration) database.IDataSource { return spy })
+
+	return router, spy
+}
+
+// sunsetRequestAs issues one request through the assembled router, optionally carrying an
+// API key.
+//
+// The peer is forced to loopback. httptest.NewRequest records 192.0.2.1 — a documentation
+// address, deliberately not loopback — and the credential-issuance endpoint refuses to put
+// a one-time secret on a channel it cannot establish as confidential. Without this, the
+// blast-radius case covering POST /subscribers/{id}/kafka-credentials would be asserting
+// against a transport refusal rather than against the route.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - router *gin.Engine: the router under test.
+//   - method string: the HTTP method.
+//   - path string: the request path.
+//   - body string: the request payload, or "" for none.
+//   - apiKey string: the X-Blnk-Key value, or "" to send no credential at all.
+//
+// Returns:
+//   - *httptest.ResponseRecorder: the recorded response.
+func sunsetRequestAs(
+	t *testing.T,
+	router *gin.Engine,
+	method, path, body, apiKey string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
 		request.Header.Set("Content-Type", "application/json")
 	}
+	if apiKey != "" {
+		request.Header.Set("X-Blnk-Key", apiKey)
+	}
+	request.RemoteAddr = "127.0.0.1:54321"
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
@@ -794,438 +540,878 @@ func webhookSunsetRequest(t *testing.T, router *gin.Engine, route webhookSunsetR
 	return recorder
 }
 
-// webhookSunsetErrorCode reads the catalog code out of an error response, or "" when the
-// response is not an error payload.
+// sunsetRequest issues one unauthenticated-by-header request through the router.
+//
+// "Unauthenticated by header" is not the same as unauthorised: a fixture built with
+// withSunsetMasterKeyPrincipal presents a master-key principal from context, and a
+// fixture built without secure mode is not challenged at all.
 //
 // Parameters:
-//   - t *testing.T: the test, for fatal reporting.
+//   - t *testing.T: the test.
+//   - router *gin.Engine: the router under test.
+//   - method string: the HTTP method.
+//   - path string: the request path.
+//   - body string: the request payload, or "" for none.
+//
+// Returns:
+//   - *httptest.ResponseRecorder: the recorded response.
+func sunsetRequest(
+	t *testing.T,
+	router *gin.Engine,
+	method, path, body string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return sunsetRequestAs(t, router, method, path, body, "")
+}
+
+// sunsetErrorCode reads the machine-readable code out of a response, or "" when the
+// response carries none.
+//
+// THE CODE IS NESTED. Both the middleware's abortWithCode and the handler layer's
+// respondCode write the API's standard dual envelope —
+// {"error": <message>, "error_detail": {"code": ..., "message": ...}} — so no error
+// response in this package carries a top-level "code" key. A reader that looked for one
+// would report the empty string for every refusal, turning "the guard answered with the
+// wrong code" and "the guard answered correctly" into the same answer.
+//
+// A body that is not an error envelope at all — a 200 carrying a subscription, a 204
+// carrying nothing — yields "" rather than a failure, because the negative assertions in
+// this file ask exactly that question of successful responses.
+//
+// Parameters:
+//   - t *testing.T: the test.
 //   - recorder *httptest.ResponseRecorder: the response to read.
 //
 // Returns:
 //   - apierror.ErrorCode: the code carried in error_detail, or "".
-func webhookSunsetErrorCode(t *testing.T, recorder *httptest.ResponseRecorder) apierror.ErrorCode {
+func sunsetErrorCode(t *testing.T, recorder *httptest.ResponseRecorder) apierror.ErrorCode {
 	t.Helper()
 
-	var body struct {
+	var envelope struct {
 		ErrorDetail apierror.APIError `json:"error_detail"`
 	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
 		return ""
 	}
 
-	return body.ErrorDetail.Code
+	return envelope.ErrorDetail.Code
 }
 
-// TestWebhookSubscriptionRoutes_AnswerGoneOnEveryRouteAndMethodAfterTheSunset is acceptance
-// criterion V-10.
+// expectedSunsetHeaders returns the advisory header values the currently published window
+// must produce.
 //
-// The status is asserted together with the CODE, and both matter. The status alone would
-// pass if a handler wrote 410 directly, which is the implementation the error catalog exists
-// to prevent: an unmapped code resolves to 500, so a typed code with an explicit status
-// mapping is the only thing that makes 410 reachable at all, and asserting the code is what
-// proves the response came through the catalog.
-func TestWebhookSubscriptionRoutes_AnswerGoneOnEveryRouteAndMethodAfterTheSunset(t *testing.T) {
-	// The precondition, asserted first so a catalog regression fails here with a clear
-	// message rather than as four confusing 500s below.
+// Both come from the production resolution — blnk.WebhookDeprecationWindow for the
+// instants and middleware.DeprecationHeaderValue for the RFC 9745 structured-field
+// rendering — rather than being formatted here. Re-deriving them locally would be a second
+// implementation of the window, and a test that agreed with itself while disagreeing with
+// the guard is exactly the outcome to avoid. It is also why this file needs no date
+// arithmetic of its own.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//
+// Returns:
+//   - string: the expected RFC 8594 Sunset header value, in GMT as the field requires.
+//   - string: the expected RFC 9745 Deprecation header value for the window's opening
+//     instant.
+func expectedSunsetHeaders(t *testing.T) (string, string) {
+	t.Helper()
+
+	windowStart, sunsetInstant, configured := blnk.WebhookDeprecationWindow()
+	require.True(t, configured,
+		"a configured retirement instant must resolve to a window; with none there is "+
+			"nothing to advertise and this helper must not be called")
+
+	return sunsetInstant.UTC().Format(http.TimeFormat), middleware.DeprecationHeaderValue(windowStart)
+}
+
+// assertSunsetHeadersAdvertised asserts that a response carries both advisory headers for
+// the published window.
+//
+// It is applied to SUCCESSFUL responses as well as refusals, and that is the substantive
+// half. RFC 8594's Sunset field exists so a client can schedule its own migration, which
+// makes it most useful on the responses the client is still succeeding with; a notice
+// delivered only alongside the refusal arrives precisely too late to act on.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - recorder *httptest.ResponseRecorder: the response to inspect.
+func assertSunsetHeadersAdvertised(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+
+	sunsetHeader, deprecationHeader := expectedSunsetHeaders(t)
+
+	assert.Equal(t, sunsetHeader, recorder.Header().Get("Sunset"),
+		"the Sunset header must carry the configured instant, rendered in GMT as the "+
+			"field's layout claims")
+	assert.Equal(t, deprecationHeader, recorder.Header().Get("Deprecation"),
+		"the Deprecation header must be the RFC 9745 structured-field date of the "+
+			"window's OPENING instant, rendered from the SAME resolution as the Sunset "+
+			"header beside it, so the two cannot describe windows that disagree")
+}
+
+// assertNotRetired asserts that a response is not the retirement.
+//
+// Both halves are needed. A status check alone would miss a 200 carrying the retirement
+// code, and a code check alone would miss a bare 410 written without one.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - recorder *httptest.ResponseRecorder: the response to inspect.
+//   - method string: the method, for the failure message.
+//   - path string: the path, for the failure message.
+//   - why string: why this request must not be retired.
+func assertNotRetired(
+	t *testing.T,
+	recorder *httptest.ResponseRecorder,
+	method, path, why string,
+) {
+	t.Helper()
+
+	assert.NotEqual(t, http.StatusGone, recorder.Code,
+		"%s %s was retired by the webhook sunset: %s. body: %s",
+		method, path, why, recorder.Body.String())
+	assert.NotEqual(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder),
+		"%s %s carries the retirement code: %s", method, path, why)
+}
+
+// TestWebhookSunset_GoneStatusComesFromCodeCatalogue is the precondition every other test
+// in this file rests on, asserted on its own so that a catalogue regression fails HERE
+// with an unambiguous message instead of surfacing as a handful of confusing 500s.
+//
+// apierror.StatusForCode defaults UNKNOWN codes to 500. So a retirement code that had no
+// statusByCode entry would not fail to compile, would not fail to respond, and would not
+// even log: the guard would abort with GEN_GONE and the client would receive
+// 500 Internal Server Error. V-10 would fail while every line of the guard looked
+// correct. The 410 is reachable only because the catalogue maps this code to it, and that
+// mapping is what this test pins.
+//
+// It is a pure unit assertion — no router, no configuration, no HTTP — because the
+// property belongs to the catalogue rather than to any request.
+func TestWebhookSunset_GoneStatusComesFromCodeCatalogue(t *testing.T) {
 	require.Equal(t, http.StatusGone, apierror.StatusForCode(apierror.ErrGenGone),
-		"the retirement answers 410 only because the catalog maps this code to it; an unmapped "+
-			"code resolves to 500 and the acceptance criterion would fail silently")
+		"internal/apierror must map the retirement code to 410. Without the statusByCode "+
+			"entry StatusForCode falls back to 500, and the sunset guard would answer "+
+			"Internal Server Error to every request on the retired surface")
 
-	sunset := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	router := webhookSunsetRouter(t, func(cfg *config.Configuration) {
-		cfg.WebhookDeprecationSunsetDate = sunset.Format(time.RFC3339)
-	})
+	assert.Equal(t, apierror.ErrorCode("GEN_GONE"), apierror.ErrGenGone,
+		"GEN_GONE is the CLIENT-VISIBLE contract: it is the string a subscriber branches "+
+			"on to tell a retirement from any other refusal. Renaming the constant is a "+
+			"breaking change, so the literal is pinned here rather than only referenced")
 
-	for _, route := range webhookSunsetRoutes {
-		t.Run(route.name(), func(t *testing.T) {
-			recorder := webhookSunsetRequest(t, router, route)
+	assert.Equal(t, apierror.ErrGenGone, apierror.Normalize(apierror.ErrGenGone),
+		"the retirement code must be canonical, i.e. absent from legacyToCanonical. Were "+
+			"it mapped there, responses would surface some other code and a client "+
+			"branching on GEN_GONE would never see it")
+}
 
+// TestWebhookSunset_ReturnsGoneAfterSunsetDate is acceptance criterion V-10 stated as the
+// request matrix it actually is: every method on the retired path, registered or not,
+// answered 410 Gone with the GEN_GONE code.
+//
+// The status is asserted TOGETHER WITH the code on every case, and both matter. A status
+// alone would be satisfied by a handler writing 410 directly — the very implementation the
+// error catalogue exists to prevent — and a code alone would be satisfied by a 500 that
+// merely mentioned it.
+func TestWebhookSunset_ReturnsGoneAfterSunsetDate(t *testing.T) {
+	// Fully authorised, so nobody can claim the 410 was really an authorization failure.
+	router := setupSunsetRouter(t, sunsetPassedInstant, withSunsetMasterKeyPrincipal())
+
+	for _, route := range sunsetRoutes {
+		t.Run("registered "+route.name(), func(t *testing.T) {
+			recorder := sunsetRequest(t, router, route.method, retiredWebhookPath, route.body)
+
+			// assertErrorCode is the package's shared reader: it asserts the status, the
+			// nested error_detail.code, a non-empty message AND the legacy flat "error"
+			// field. That last one is the dual response contract the middleware's
+			// abortWithCode produces, and it is what keeps a pre-catalogue client working.
 			assertErrorCode(t, recorder, http.StatusGone, apierror.ErrGenGone)
-			assert.Contains(t, recorder.Body.String(), "retired and is no longer available",
-				"the body must say what happened, and say the same thing on every route. It says "+
-					"RETIRED rather than removed because the handlers are still registered and still "+
-					"compiled: the instant withdraws the behaviour, deleting the surface is a later "+
-					"release, and moving the date back restores it")
-			assert.Contains(t, recorder.Body.String(), "Kafka event stream",
-				"and must name the replacement, or a client has nowhere to go")
 
-			// RFC 8594 advisory headers, on the refusal as well as on a success.
-			assert.Equal(t, sunset.Format(http.TimeFormat), recorder.Header().Get("Sunset"),
-				"the Sunset header must carry the configured instant, rendered in GMT as the field requires")
-			deprecated, _, configured := blnk.WebhookDeprecationWindow()
-			require.True(t, configured)
-			assert.Equal(t, middleware.DeprecationHeaderValue(deprecated),
-				recorder.Header().Get("Deprecation"),
-				"the same structured-field date accompanies the refusal, so a client sees one "+
-					"consistent field on both sides of the boundary")
+			// The literal, so the client-visible code is pinned on the wire and cannot be
+			// renamed by a change that keeps the Go constant compiling.
+			assert.Contains(t, recorder.Body.String(), `"GEN_GONE"`,
+				"the response body must carry the literal code a client branches on")
+
+			assert.Contains(t, recorder.Body.String(), "retired and is no longer available",
+				"the body must say what happened, and say the same thing on every route. "+
+					"It says RETIRED rather than removed because the handlers are still "+
+					"registered and still compiled: the instant withdraws the behaviour, "+
+					"deleting the surface is a later release, and moving the date back "+
+					"restores it")
+			assert.Contains(t, recorder.Body.String(), "Kafka event stream",
+				"and it must name the replacement, or a client has nowhere to go")
+
+			assertSunsetHeadersAdvertised(t, recorder)
+		})
+	}
+
+	// The unregistered verbs are the substantive half of "every request". They match no
+	// route, so nothing route-attached can answer them: the global pre-auth barrier is
+	// what makes the criterion true for them, and without it gin would answer as though
+	// the path had never existed.
+	for _, method := range sunsetUnregisteredMethods {
+		t.Run("unregistered "+method, func(t *testing.T) {
+			recorder := sunsetRequest(t, router, method, retiredWebhookPath, "")
+
+			require.Equal(t, http.StatusGone, recorder.Code,
+				"%s reached no route, so no route-attached guard could answer it; the "+
+					"global barrier is what makes 'every request' true. Got %d: %s",
+				method, recorder.Code, recorder.Body.String())
+
+			// A HEAD response carries no body on the wire, but httptest.ResponseRecorder
+			// records what the handler WROTE — net/http is what discards it when serving a
+			// real connection. So the recorded body still proves the refusal was formed
+			// correctly, and the suppression is the server's job rather than the guard's.
+			assert.Equal(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder),
+				"an unregistered verb must be refused with the retirement code too, so a "+
+					"client can tell a retirement from a routing mistake")
 		})
 	}
 
 	t.Run("a body is not required to be refused", func(t *testing.T) {
-		// A retired route must not read the request before refusing it: binding first would
-		// answer a malformed-body error to a caller whose real problem is that the surface is
-		// gone, and would make the refusal depend on what was sent.
-		recorder := webhookSunsetRequest(t, router, webhookSunsetRoute{
-			method: http.MethodPost,
-			path:   "/subscribers/sub_sunset_probe/webhook-subscription",
-			body:   "}{ not json at all",
-		})
+		// A retired route must not read the request before refusing it. Binding first
+		// would answer a malformed-body error to a caller whose real problem is that the
+		// surface is gone, and would make the refusal depend on what was sent.
+		recorder := sunsetRequest(t, router, http.MethodPost, retiredWebhookPath,
+			"}{ not json at all")
 
 		assertErrorCode(t, recorder, http.StatusGone, apierror.ErrGenGone)
 	})
 
-	t.Run("the surface is gone for a non-master caller too", func(t *testing.T) {
-		// The guard is attached ahead of the handler, so it answers before the master-key
-		// gate does. That ordering is the correct one: the resource no longer exists, and
-		// which principal is asking cannot change that.
-		nonMaster := webhookSunsetRouter(t, func(cfg *config.Configuration) {
-			cfg.WebhookDeprecationSunsetDate = sunset.Format(time.RFC3339)
-		})
+	t.Run("a non-master caller is told Gone, not Forbidden", func(t *testing.T) {
+		// No master-key principal at all. The retirement precedes the master-key gate,
+		// and that ordering is the correct one: the resource no longer exists, and which
+		// principal is asking cannot change that. A 403 here would send an operator to
+		// audit scopes for a surface that has been removed from every scope there is.
+		nonMaster := setupSunsetRouter(t, sunsetPassedInstant)
 
-		for _, route := range webhookSunsetRoutes {
-			recorder := webhookSunsetRequest(t, nonMaster, route)
+		for _, route := range sunsetRoutes {
+			recorder := sunsetRequest(t, nonMaster, route.method, retiredWebhookPath, route.body)
+
 			assert.Equal(t, http.StatusGone, recorder.Code, "%s", route.name())
-			assert.Equal(t, apierror.ErrGenGone, webhookSunsetErrorCode(t, recorder), "%s", route.name())
+			assert.Equal(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder), "%s", route.name())
+			assert.NotEqual(t, apierror.ErrAuthMasterKeyRequired, sunsetErrorCode(t, recorder),
+				"%s: the master-key gate must not answer ahead of the retirement", route.name())
 		}
 	})
 }
 
-// TestWebhookSubscriptionRoutes_KeepAnsweringBeforeTheSunset is the other half of the
-// criterion, and the half that keeps the dual-delivery window usable.
+// TestWebhookSunset_ReturnsGoneBeforeAuthentication is the ordering assertion, and it is
+// the one that fails the moment the retirement is installed behind authentication instead
+// of ahead of it.
 //
-// A guard that refused early would end the window before its 30 days were up, silently
-// cutting off subscribers who have not migrated yet — a failure that raises no error
-// anywhere and looks exactly like a successful retirement.
-func TestWebhookSubscriptionRoutes_KeepAnsweringBeforeTheSunset(t *testing.T) {
-	sunset := time.Now().UTC().Add(15 * 24 * time.Hour).Truncate(time.Second)
-	router := webhookSunsetRouter(t, func(cfg *config.Configuration) {
-		cfg.WebhookDeprecationSunsetDate = sunset.Format(time.RFC3339)
+// Every credential state must reach 410. A missing key must not be answered 401 and an
+// unknown key must not be answered 401 either: both send a client to investigate its
+// credentials for a surface that no longer exists, and a client with no valid key could
+// never learn about the retirement at all.
+//
+// Secure mode is deliberately ON. With it off, Authenticate() short-circuits and passes
+// everything through, so these assertions would hold whichever order the two were
+// installed in — proving nothing. The first subtest establishes that authentication really
+// is enforcing in this configuration, which is what makes the rest positive evidence.
+func TestWebhookSunset_ReturnsGoneBeforeAuthentication(t *testing.T) {
+	router := setupSunsetRouter(t, sunsetPassedInstant, withSunsetSecureMode())
+
+	t.Run("control: a live route really does challenge an unauthenticated caller", func(t *testing.T) {
+		// A LIVE route under the very same prefix. If this did not challenge, the 410s
+		// below could not be distinguished from authentication being inert.
+		recorder := sunsetRequest(t, router, http.MethodGet, "/subscribers", "")
+
+		require.Equal(t, http.StatusUnauthorized, recorder.Code,
+			"a live route must challenge an unauthenticated caller when secure mode is "+
+				"on; without that this test cannot tell guard ordering from disabled "+
+				"authentication. body: %s", recorder.Body.String())
 	})
 
-	for _, route := range webhookSunsetRoutes {
-		t.Run(route.name(), func(t *testing.T) {
-			recorder := webhookSunsetRequest(t, router, route)
+	for name, apiKey := range map[string]string{
+		"no credentials at all":            "",
+		"a key that was never issued":      "a-key-that-was-never-issued",
+		"the master key, fully authorised": sunsetMasterKey,
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Every registered verb, plus one unregistered verb, because the two reach
+			// the barrier by different routes through gin.
+			for _, method := range append(
+				[]string{http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete},
+				http.MethodPatch,
+			) {
+				recorder := sunsetRequestAs(t, router, method, retiredWebhookPath, "", apiKey)
 
-			assert.NotEqual(t, http.StatusGone, recorder.Code,
-				"inside the window the route must answer as it always did; body was: %s", recorder.Body.String())
-			assert.NotEqual(t, apierror.ErrGenGone, webhookSunsetErrorCode(t, recorder),
-				"and must never carry the retirement code")
-
-			// Warned by the very responses it is succeeding with, which is the point of
-			// advertising the headers on both sides of the boundary.
-			assert.Equal(t, sunset.Format(http.TimeFormat), recorder.Header().Get("Sunset"))
-			deprecated, _, configured := blnk.WebhookDeprecationWindow()
-			require.True(t, configured)
-			assert.Equal(t, middleware.DeprecationHeaderValue(deprecated),
-				recorder.Header().Get("Deprecation"))
+				require.NotEqual(t, http.StatusUnauthorized, recorder.Code,
+					"%s: 401 BEFORE 410 IS THE DEFECT. The surface is gone, so a "+
+						"credential is not what is missing", method)
+				require.NotEqual(t, http.StatusForbidden, recorder.Code,
+					"%s: and 403 is the same mistake — no scope grants access to a "+
+						"route that no longer exists", method)
+				require.Equal(t, http.StatusGone, recorder.Code,
+					"%s must be Gone regardless of credentials. Got %d: %s",
+					method, recorder.Code, recorder.Body.String())
+				assert.Equal(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder),
+					"%s must carry the retirement code, not an auth code", method)
+			}
 		})
 	}
+}
 
-	t.Run("the boundary is inclusive: AT the instant the surface is gone", func(t *testing.T) {
-		// Asked of the predicate rather than over HTTP, because "now == the configured
-		// instant" cannot be arranged in a request. The guard consults this predicate and
-		// nothing else, so pinning it here pins the boundary the routes observe.
-		assert.True(t, blnk.WebhookSunsetPassed(sunset),
-			"the retirement takes effect ON the configured instant, not the moment after it")
-		assert.False(t, blnk.WebhookSunsetPassed(sunset.Add(-time.Nanosecond)),
-			"and not one instant before")
+// TestWebhookSunset_ReturnsGoneWithoutReachingTheRegistry proves the retirement REFUSES
+// the request rather than performing it and then denying it.
+//
+// A 410 written after the handler had already read or written blnk.event_subscribers would
+// satisfy every status and code assertion in this file and would still be a defect: past
+// the retirement instant a POST must not record a URL, a PUT must not replace one and a
+// DELETE must not stamp a migration. Only observing that the registry was never touched
+// distinguishes the two, which is why this is the one case backed by a spy datasource
+// rather than the real one.
+//
+// The mirror matters as much as the assertion. Inside the window the very same request
+// MUST reach the registry, because a guard that refused everything would pass the negative
+// half while having ended the dual-delivery window early — a failure that raises no error
+// anywhere and looks exactly like a successful retirement.
+func TestWebhookSunset_ReturnsGoneWithoutReachingTheRegistry(t *testing.T) {
+	// The three repository methods the four retired handlers reach, and the only ways the
+	// registry can be touched from this surface:
+	//   GET    -> GetEventSubscriberByID          (blnk.GetEventSubscriber)
+	//   POST   -> RecordSubscriberWebhookURL      (blnk.RecordSubscriberWebhookSubscription)
+	//   PUT    -> RecordSubscriberWebhookURL      (same write)
+	//   DELETE -> CompleteSubscriberWebhookMigration
+	//             (blnk.CompleteEventSubscriberWebhookMigration)
+	registryMethods := []string{
+		"GetEventSubscriberByID",
+		"RecordSubscriberWebhookURL",
+		"CompleteSubscriberWebhookMigration",
+	}
+
+	t.Run("after the instant the registry is never consulted", func(t *testing.T) {
+		router, spy := setupSunsetRouterWithRegistrySpy(
+			t, sunsetPassedInstant, withSunsetMasterKeyPrincipal(),
+		)
+
+		for _, route := range sunsetRoutes {
+			recorder := sunsetRequest(t, router, route.method, retiredWebhookPath, route.body)
+			require.Equal(t, http.StatusGone, recorder.Code,
+				"%s must be refused before the handler runs. Got %d: %s",
+				route.name(), recorder.Code, recorder.Body.String())
+			require.Equal(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder), "%s", route.name())
+		}
+
+		for _, method := range registryMethods {
+			spy.AssertNotCalled(t, method, mock.Anything, mock.Anything)
+		}
+
+		// No expectation was ever set on the spy, so this asserts the stronger property:
+		// the datasource was not touched AT ALL, by any method, including any the four
+		// handlers might reach in a future refactor.
+		spy.AssertExpectations(t)
+		assert.Empty(t, spy.Calls,
+			"the retired surface must not touch the datasource at all past the instant; "+
+				"calls recorded: %v", spy.Calls)
 	})
 
-	t.Run("no retirement instant is a legitimate steady state", func(t *testing.T) {
-		unconfigured := webhookSunsetRouter(t, nil)
+	t.Run("inside the window the very same request does reach the registry", func(t *testing.T) {
+		router, spy := setupSunsetRouterWithRegistrySpy(
+			t, sunsetFutureInstant, withSunsetMasterKeyPrincipal(),
+		)
 
-		for _, route := range webhookSunsetRoutes {
-			recorder := webhookSunsetRequest(t, unconfigured, route)
+		// A canonical identifier, because a non-canonical one is refused by the service
+		// before the store is reached and the mirror would then prove nothing.
+		subscriberID := uniqueSubscriberID()
 
-			assert.NotEqual(t, http.StatusGone, recorder.Code,
-				"%s: a deployment that has scheduled no retirement keeps working indefinitely", route.name())
+		// Answered as an unknown subscriber. The VALUE of the read is irrelevant here;
+		// that the read happened at all is the whole assertion.
+		spy.On("GetEventSubscriberByID", mock.Anything, subscriberID).
+			Return(nil, apierror.NewAPIError(
+				apierror.ErrGenNotFound, "subscriber not found", nil,
+			))
+
+		recorder := sunsetRequest(
+			t, router, http.MethodGet, webhookSubscriptionPath(subscriberID), "",
+		)
+
+		require.Equal(t, http.StatusNotFound, recorder.Code,
+			"inside the window the handler runs, so an unknown subscriber is 404 — not "+
+				"410, and not a 200 conjured by a guard that swallowed the request. "+
+				"body: %s", recorder.Body.String())
+		assert.Equal(t, apierror.ErrSubscriberNotFound, sunsetErrorCode(t, recorder),
+			"and the answer comes from the registry layer, which is what makes this the "+
+				"mirror of the assertion above")
+
+		spy.AssertCalled(t, "GetEventSubscriberByID", mock.Anything, subscriberID)
+		spy.AssertExpectations(t)
+	})
+}
+
+// TestWebhookSunset_RoutesAnswerNormallyBeforeSunsetDate is the other half of the
+// criterion, and without it every assertion above is satisfied by a router that answers
+// 410 always.
+//
+// It is also the half that keeps the dual-delivery window usable: a guard that refused
+// early would end the 30 days before they were up, silently cutting off subscribers who
+// have not migrated yet.
+//
+// The exact statuses are PINNED rather than merely asserted to be "not 410". Not-410 is
+// satisfied by a 500, by a 403 and by a router that lost the route altogether, so each
+// verb is checked against what api/subscribers.go documents it answers.
+func TestWebhookSunset_RoutesAnswerNormallyBeforeSunsetDate(t *testing.T) {
+	t.Run("a future instant: the routes answer exactly as they always did", func(t *testing.T) {
+		router := setupSunsetRouter(t, sunsetFutureInstant, withSunsetMasterKeyPrincipal())
+
+		// A REAL registered subscriber, so each handler can complete its own work and the
+		// documented success status is reachable. Registration and cleanup are the shared
+		// helpers from api/subscribers_api_test.go, so this file does not maintain a second
+		// notion of what a valid subscriber is.
+		subscriberID := registerSubscriberForWebhookTests(t, router)
+		path := webhookSubscriptionPath(subscriberID)
+
+		// Ordered deliberately: record, read, replace, then complete the migration. The
+		// DELETE is last because it forgets the URL and stamps the migration, which is the
+		// terminal state of this surface.
+		for _, route := range sunsetRoutes {
+			t.Run(route.name(), func(t *testing.T) {
+				recorder := sunsetRequest(t, router, route.method, path, route.body)
+
+				require.Equal(t, route.normalStatus, recorder.Code,
+					"inside the window %s must answer %d, the status api/subscribers.go "+
+						"documents. Got %d: %s",
+					route.method, route.normalStatus, recorder.Code, recorder.Body.String())
+				assert.NotEqual(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder),
+					"a succeeding response must never carry the retirement code")
+
+				// Warned by the very responses it is succeeding with, which is the point
+				// of advertising the window on both sides of the boundary.
+				assertSunsetHeadersAdvertised(t, recorder)
+			})
+		}
+	})
+
+	t.Run("an unregistered verb is not retired early either", func(t *testing.T) {
+		router := setupSunsetRouter(t, sunsetFutureInstant, withSunsetMasterKeyPrincipal())
+
+		recorder := sunsetRequest(t, router, http.MethodPatch, retiredWebhookPath, "")
+
+		assertNotRetired(t, recorder, http.MethodPatch, retiredWebhookPath,
+			"PATCH is unsupported, which is not the same as retired; answering 410 before "+
+				"the instant would retire the surface early for one class of caller")
+	})
+
+	t.Run("authentication still applies inside the window", func(t *testing.T) {
+		// The barrier passes the request on before the instant, so the chain behind it
+		// must be intact. A missing credential is answered by authentication, as always.
+		// A barrier that swallowed the request would have disabled authentication on
+		// these four routes.
+		router := setupSunsetRouter(t, sunsetFutureInstant, withSunsetSecureMode())
+
+		recorder := sunsetRequest(t, router, http.MethodGet, retiredWebhookPath, "")
+
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code,
+			"inside the window the deprecated routes are ordinary authenticated routes. "+
+				"body: %s", recorder.Body.String())
+	})
+
+	t.Run("no configured instant retires nothing, and advertises nothing", func(t *testing.T) {
+		// A legitimate steady state, not a misconfiguration: it is the state every
+		// deployment that has not yet scheduled its migration is in, and the state every
+		// deployment predating this feature is in. A guard that read an absent instant as
+		// a passed one would retire the surface on upgrade, for everybody, without anyone
+		// having chosen a date.
+		router := setupSunsetRouter(t, "", withSunsetMasterKeyPrincipal())
+
+		for _, route := range sunsetRoutes {
+			recorder := sunsetRequest(t, router, route.method, retiredWebhookPath, route.body)
+
+			assertNotRetired(t, recorder, route.method, retiredWebhookPath,
+				"a deployment that has scheduled no retirement keeps working indefinitely")
 			assert.Empty(t, recorder.Header().Get("Sunset"),
-				"%s: there is no instant to advertise, so the header must be absent rather than empty-valued",
-				route.name())
-			assert.Empty(t, recorder.Header().Get("Deprecation"), "%s", route.name())
+				"%s: there is no instant to advertise, so the header must be ABSENT "+
+					"rather than empty-valued or invented", route.name())
+			assert.Empty(t, recorder.Header().Get("Deprecation"),
+				"%s: and no deprecation may be announced either", route.name())
 		}
 	})
 }
 
-// TestWebhookSunsetWindow_IsSettledAtLoadRatherThanPerRequest is the configuration half of
-// the retirement, asserted where the 410 lives.
+// TestWebhookSunset_HooksRoutesUnaffectedAfterSunset guards the most expensive mistake
+// available in this package.
 //
-// The routes never have to cope with a window nobody can read, because a configuration
-// carrying one is REFUSED before it is published: an unparseable instant is fatal, and an
-// absent instant is fatal too once brokers are configured. Both refusals matter to an
-// operator, and they are the reason the environment template must describe the retirement
-// instant as required-and-fatal rather than as advisory — a template promising a warning
-// leads an operator to deploy a configuration the service will not start under.
+// /hooks is NOT the webhook subscription API. api/hooks.go and internal/hooks implement
+// the PRE_TRANSACTION and POST_TRANSACTION request-time callouts — synchronous
+// interception whose RESPONSES influence transaction processing — which is a different,
+// fully supported feature that merely shares a word and an asynq queue with the transport
+// being retired. Attaching the retirement with router.Use, or to a /subscribers group, or
+// matching "hook" anywhere in a path, would take it down alongside the transport, and it
+// would look like a correct retirement while doing it.
 //
-// The observation is on the published configuration rather than on a returned error because
-// that is what a request reads. A refused configuration leaves the previous one in place, so
-// nothing serves traffic under the rejected value.
-func TestWebhookSunsetWindow_IsSettledAtLoadRatherThanPerRequest(t *testing.T) {
-	// A valid baseline: no transport, no window. This is the shape every existing
-	// deployment runs, and it must stay loadable.
-	config.MockConfig(webhookSunsetConfig(nil))
-	t.Cleanup(func() { config.MockConfig(webhookSunsetConfig(nil)) })
+// Every registered /hooks route is exercised, at a retirement instant that has passed, so
+// any leak shows up here.
+func TestWebhookSunset_HooksRoutesUnaffectedAfterSunset(t *testing.T) {
+	router := setupSunsetRouter(t, sunsetPassedInstant, withSunsetMasterKeyPrincipal())
 
-	baseline, err := config.Fetch()
-	require.NoError(t, err)
-	require.Empty(t, baseline.WebhookDeprecationSunsetDate)
-	require.Empty(t, baseline.Kafka.Brokers)
+	// The five routes registered in api/api.go, in registration order.
+	for _, target := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/hooks", `{"name":"sunset probe"}`},
+		{http.MethodPut, "/hooks/hook_sunset_probe", `{"name":"sunset probe"}`},
+		{http.MethodGet, "/hooks/hook_sunset_probe", ""},
+		{http.MethodGet, "/hooks", ""},
+		{http.MethodDelete, "/hooks/hook_sunset_probe", ""},
+	} {
+		t.Run(target.method+" "+target.path, func(t *testing.T) {
+			recorder := sunsetRequest(t, router, target.method, target.path, target.body)
 
-	refused := []struct {
-		name   string
-		mutate func(*config.Configuration)
+			assertNotRetired(t, recorder, target.method, target.path,
+				"/hooks is the PRE_TRANSACTION and POST_TRANSACTION callout feature, which "+
+					"is fully supported and must never be reached by the webhook retirement")
+			assert.Empty(t, recorder.Header().Get("Sunset"),
+				"an unguarded route must not advertise a retirement it is not subject to")
+			assert.Empty(t, recorder.Header().Get("Deprecation"),
+				"nor a deprecation it is not subject to")
+		})
+	}
+}
+
+// TestWebhookSunset_RetiresNothingBeyondTheRetiredSurface is the blast-radius assertion for
+// everything that is not /hooks.
+//
+// A globally installed barrier is offered every request in the service, so the blast radius
+// of a sloppy path match is the whole API. The routes below are the neighbours most at risk
+// and the ones whose loss would hurt most:
+//
+//   - The live subscriber registry and the credential endpoint are the REPLACEMENT for the
+//     retired surface. Retiring them by association would leave a caller with neither the
+//     old transport nor a way onto the new one.
+//   - The /events routes are the feature the retirement exists to move traffic to.
+//   - The near-miss paths are the ones a prefix or substring match would wrongly claim.
+//   - The health route is what an orchestrator uses to decide whether the process is alive:
+//     retiring it would take the deployment down rather than a transport.
+func TestWebhookSunset_RetiresNothingBeyondTheRetiredSurface(t *testing.T) {
+	router := setupSunsetRouter(t, sunsetPassedInstant, withSunsetMasterKeyPrincipal())
+
+	for name, target := range map[string]struct {
+		method string
+		path   string
+		body   string
 		why    string
 	}{
-		{
-			name: "an unparseable instant",
-			mutate: func(cfg *config.Configuration) {
-				cfg.Kafka.Brokers = []string{"kafka:9092"}
-				cfg.Kafka.InsecureLocalDev = true
-				cfg.WebhookDeprecationSunsetDate = "30 days from now"
-			},
-			why: "a mis-typed instant would otherwise resolve to \"keep the legacy behaviour\", " +
-				"keeping the deprecated transport alive indefinitely with nothing failing",
+		"the live subscriber registry": {
+			method: http.MethodGet,
+			path:   "/subscribers",
+			why:    "the registry is the replacement for the retired surface",
 		},
-		{
-			name: "no instant at all while publishing",
-			mutate: func(cfg *config.Configuration) {
-				cfg.Kafka.Brokers = []string{"kafka:9092"}
-				cfg.Kafka.InsecureLocalDev = true
-			},
-			why: "a publishing deployment with no window has no retirement to honour, and the " +
-				"runtime predicate fails closed — so accepting it here would let configuration " +
-				"and behaviour disagree about the one decision the retirement is made of",
+		"a single subscriber": {
+			method: http.MethodGet,
+			path:   "/subscribers/" + retiredProbeSubscriberID,
+			why:    "reading a subscriber is not reading its webhook subscription",
 		},
-	}
+		"subscriber update": {
+			method: http.MethodPut,
+			path:   "/subscribers/" + retiredProbeSubscriberID,
+			body:   `{"name":"renamed"}`,
+			why:    "the generic update is a supported route on the same prefix",
+		},
+		"subscriber deletion": {
+			method: http.MethodDelete,
+			path:   "/subscribers/" + retiredProbeSubscriberID,
+			why:    "deregistering a subscriber must stay possible after the cutover",
+		},
+		"kafka credential issuance": {
+			method: http.MethodPost,
+			path:   "/subscribers/" + retiredProbeSubscriberID + "/kafka-credentials",
+			why:    "retiring this would remove the migration path off webhooks entirely",
+		},
+		"the dead-letter inventory": {
+			method: http.MethodGet,
+			path:   "/events/dead-letter",
+			why:    "the event surface is the feature the retirement moves traffic to",
+		},
+		"a dead-letter replay": {
+			method: http.MethodPost,
+			path:   "/events/dead-letter/evt_sunset_probe/replay",
+			why:    "replay is how a dead-lettered event is recovered",
+		},
+		"the outbox statistics": {
+			method: http.MethodGet,
+			path:   "/events/stats",
+			why:    "the daily zero-loss reconciliation reads this route",
+		},
+		"an unrelated ledger route": {
+			method: http.MethodGet,
+			path:   "/ledgers",
+			why:    "the retirement is scoped to one transport, not to the API",
+		},
+		"the health route": {
+			method: http.MethodGet,
+			path:   "/",
+			why:    "retiring this would take the deployment down, not a transport",
+		},
+		"a path one segment short of the retired shape": {
+			method: http.MethodGet,
+			path:   "/subscribers/webhook-subscription",
+			why:    "it merely shares the words; a substring match would claim it",
+		},
+		"a path one segment past the retired shape": {
+			method: http.MethodGet,
+			path:   "/subscribers/" + retiredProbeSubscriberID + "/webhook-subscription/extra",
+			why:    "a prefix match would retire it by association",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := sunsetRequest(t, router, target.method, target.path, target.body)
 
-	for _, testCase := range refused {
-		t.Run("refused: "+testCase.name, func(t *testing.T) {
-			config.MockConfig(webhookSunsetConfig(testCase.mutate))
-
-			published, fetchErr := config.Fetch()
-			require.NoError(t, fetchErr,
-				"a refused configuration must leave the previous one in place rather than emptying the store")
-			assert.Empty(t, published.WebhookDeprecationSunsetDate, testCase.why)
-			assert.Empty(t, published.Kafka.Brokers,
-				"the whole configuration is refused, not the offending field: %s", testCase.why)
+			assertNotRetired(t, recorder, target.method, target.path, target.why)
 		})
 	}
-
-	t.Run("accepted: a publishing deployment with a stated instant", func(t *testing.T) {
-		sunset := time.Now().UTC().Add(30 * 24 * time.Hour).Truncate(time.Second)
-		config.MockConfig(webhookSunsetConfig(func(cfg *config.Configuration) {
-			cfg.Kafka.Brokers = []string{"kafka:9092"}
-			cfg.Kafka.InsecureLocalDev = true
-			cfg.WebhookDeprecationSunsetDate = sunset.Format(time.RFC3339)
-		}))
-
-		published, fetchErr := config.Fetch()
-		require.NoError(t, fetchErr)
-		require.NotEmpty(t, published.Kafka.Brokers,
-			"the valid combination must actually be published, or the refusals above prove nothing")
-
-		parsed, parseErr := time.Parse(time.RFC3339, published.WebhookDeprecationSunsetDate)
-		require.NoError(t, parseErr)
-		assert.True(t, sunset.Equal(parsed))
-		assert.False(t, blnk.WebhookSunsetPassed(time.Now()),
-			"a 30-day window opens now, so the routes must still answer")
-	})
-
-	t.Run("accepted: no transport and no window", func(t *testing.T) {
-		config.MockConfig(webhookSunsetConfig(nil))
-
-		published, fetchErr := config.Fetch()
-		require.NoError(t, fetchErr)
-		assert.Empty(t, published.WebhookDeprecationSunsetDate)
-		assert.False(t, blnk.WebhookSunsetPassed(time.Now()),
-			"with nothing to migrate to there is no retirement, so the routes answer indefinitely")
-	})
 }
 
-// TestWebhookSunsetGuard_DecidesPerRequestRatherThanAtRouterBuildTime is what makes the
+// TestWebhookSunset_TheTwoBarriersCoverTheSameRoutes is the drift guard between the global
+// pre-auth barrier and the per-route guard, and it walks the ASSEMBLED ROUTER rather than
+// the source.
+//
+// The two barriers cannot disagree about WHEN the window closes, because both resolve the
+// verdict through blnk.WebhookSunsetSnapshotAt. What they could disagree about is WHICH
+// paths are retired: the pre-auth barrier matches a request, while the per-route guard is
+// attached during registration. This asserts the two sets agree in BOTH directions — every
+// registered route carrying the deprecated suffix is one the matcher recognises, and the
+// matcher claims nothing that is registered as supported.
+//
+// Walking router.Routes() rather than a hand-maintained list is what makes this survive a
+// route being added: a new supported route the matcher wrongly claims fails here without
+// anyone having to remember to list it.
+func TestWebhookSunset_TheTwoBarriersCoverTheSameRoutes(t *testing.T) {
+	router := setupSunsetRouter(t, sunsetPassedInstant, withSunsetMasterKeyPrincipal())
+
+	retiredRoutes := 0
+
+	for _, route := range router.Routes() {
+		// The matcher reads a CONCRETE request path, so the route template's parameter is
+		// filled in the way a client would fill it.
+		concrete := strings.ReplaceAll(route.Path, ":subscriber_id", retiredProbeSubscriberID)
+		claimed := middleware.IsDeprecatedWebhookSubscriptionPath(concrete)
+
+		// The suffix is an INDEPENDENT reading of "is this route deprecated", written here
+		// rather than derived from middleware.DeprecatedWebhookSubscriptionRoute on purpose.
+		// Deriving the expectation from the same constant the matcher consults would make
+		// this comparison circular: the two would agree by construction and the test would
+		// be incapable of failing. Everywhere else in this file the retired path IS derived
+		// from that constant, because everywhere else the goal is to avoid drift rather than
+		// to detect it.
+		if strings.HasSuffix(route.Path, "/webhook-subscription") {
+			retiredRoutes++
+
+			assert.True(t, claimed,
+				"route %s %s is registered as deprecated but the barrier's matcher does "+
+					"not recognise it, so requests to it would be answered by "+
+					"authentication or by its handler instead of by the retirement",
+				route.Method, route.Path)
+
+			continue
+		}
+
+		assert.False(t, claimed,
+			"route %s %s is a SUPPORTED route that the barrier's matcher claims, so it "+
+				"would be retired along with the webhook surface",
+			route.Method, route.Path)
+	}
+
+	assert.Equal(t, len(sunsetRoutes), retiredRoutes,
+		"the retired surface is %d verbs on one path, and this file's route table must "+
+			"describe exactly the routes the router registers. A different count means a "+
+			"route was added or removed without sunsetRoutes being updated, and the "+
+			"criterion would then be asserted against an incomplete matrix",
+		len(sunsetRoutes))
+}
+
+// TestWebhookSunset_DecidesPerRequestRatherThanAtRouterBuildTime is what makes the
 // retirement happen on its own, without a deployment.
 //
 // Configuration is read live from a store that is replaced wholesale, so a verdict captured
 // when the router was assembled would answer the question as it stood at start-up. A
 // long-running process would then serve the deprecated routes for ever, and the retirement
-// would appear to work only because every test restarts the process.
-func TestWebhookSunsetGuard_DecidesPerRequestRatherThanAtRouterBuildTime(t *testing.T) {
-	future := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
-	router := webhookSunsetRouter(t, func(cfg *config.Configuration) {
-		cfg.WebhookDeprecationSunsetDate = future.Format(time.RFC3339)
-	})
+// would appear to work only because every test builds a fresh router.
+//
+// The window is closed UNDERNEATH the very same engine, which is the only way to tell a
+// per-request decision from a per-build one.
+func TestWebhookSunset_DecidesPerRequestRatherThanAtRouterBuildTime(t *testing.T) {
+	router := setupSunsetRouter(t, sunsetFutureInstant, withSunsetMasterKeyPrincipal())
 
-	probe := webhookSunsetRoutes[1] // GET, which binds no body.
-
-	before := webhookSunsetRequest(t, router, probe)
+	// GET, because it binds no body and so cannot be confused with a bind failure.
+	before := sunsetRequest(t, router, http.MethodGet, retiredWebhookPath, "")
 	require.NotEqual(t, http.StatusGone, before.Code,
-		"the fixture must start inside the window, or this proves nothing")
+		"the fixture must start INSIDE the window, or this test proves nothing. body: %s",
+		before.Body.String())
 
-	// The window closes underneath the very same router.
-	past := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
-	config.MockConfig(webhookSunsetConfig(func(cfg *config.Configuration) {
-		cfg.WebhookDeprecationSunsetDate = past.Format(time.RFC3339)
-	}))
+	// Only the configuration changes. The engine, its middleware chain and its route table
+	// are all the ones built above.
+	publishSunsetConfiguration(t, sunsetPassedInstant, sunsetFixture{masterKeyPrincipal: true})
 
-	after := webhookSunsetRequest(t, router, probe)
+	after := sunsetRequest(t, router, http.MethodGet, retiredWebhookPath, "")
 	assertErrorCode(t, after, http.StatusGone, apierror.ErrGenGone)
-	assert.Equal(t, past.Format(http.TimeFormat), after.Header().Get("Sunset"),
-		"and the advertised instant must follow the configuration too, not the one the router was built with")
+	assertSunsetHeadersAdvertised(t, after)
 }
 
-// TestHooksRoutes_SurviveTheWebhookSunset guards the most expensive mistake available here.
+// TestWebhookSunset_IsNotPreemptedByRateLimiting asserts the retirement through a response
+// that the limiter would otherwise have owned.
 //
-// /hooks is a different feature that merely shares a word: the PRE_TRANSACTION and
-// POST_TRANSACTION request-time callouts, whose responses influence transaction processing.
-// Attaching the retirement guard with router.Use, or to a group, would take them down with
-// the transport — and it would look like a correct retirement while doing it.
-func TestHooksRoutes_SurviveTheWebhookSunset(t *testing.T) {
-	router := webhookSunsetRouter(t, func(cfg *config.Configuration) {
-		cfg.WebhookDeprecationSunsetDate = time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
-	})
-
-	for _, route := range []webhookSunsetRoute{
-		{method: http.MethodGet, path: "/hooks"},
-		{method: http.MethodGet, path: "/hooks/hook_probe"},
-		{method: http.MethodPost, path: "/hooks", body: `{"name":"probe"}`},
-		{method: http.MethodPut, path: "/hooks/hook_probe", body: `{"name":"probe"}`},
-		{method: http.MethodDelete, path: "/hooks/hook_probe"},
-		// The live subscriber surface the retirement migrates callers TO must also survive.
-		{method: http.MethodGet, path: "/subscribers"},
-		{method: http.MethodGet, path: "/subscribers/sub_sunset_probe"},
-	} {
-		t.Run(route.name(), func(t *testing.T) {
-			recorder := webhookSunsetRequest(t, router, route)
-
-			assert.NotEqual(t, http.StatusGone, recorder.Code,
-				"only the deprecated webhook-subscription routes are retired; body was: %s",
-				recorder.Body.String())
-			assert.NotEqual(t, apierror.ErrGenGone, webhookSunsetErrorCode(t, recorder))
-			assert.Empty(t, recorder.Header().Get("Sunset"),
-				"an unguarded route must not advertise a retirement it is not subject to")
-		})
-	}
-}
-
-// setupThrottledSunsetRouter builds the same router setupSunsetRouter does, but with a rate limit
-// small enough that the SECOND request from one client is refused.
+// # The defect this pins
 //
-// The tiny limit is the whole apparatus. The production defaults are 2000 rps with a burst of
-// 4000, so exhausting them would take four thousand requests and would prove the same thing far
-// more slowly.
-//
-// Parameters:
-//   - t *testing.T: the test, for require.
-//   - sunsetDate string: the RFC3339 retirement instant.
-//
-// Returns:
-//   - *gin.Engine: the assembled router, whose limiter admits one request per client.
-func setupThrottledSunsetRouter(t *testing.T, sunsetDate string) *gin.Engine {
-	t.Helper()
-
-	rps := 1.0
-	burst := 1
-
-	config.MockConfig(&config.Configuration{
-		Queue: config.QueueConfig{
-			TransactionQueue: "transaction_queue_test_sunset_throttled",
-			NumberOfQueues:   1,
-		},
-		Redis:      config.RedisConfig{Dns: "localhost:6379"},
-		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
-		Server: config.ServerConfig{
-			Secure:    false,
-			SecretKey: sunsetTestSecretKey,
-		},
-		RateLimit:                    config.RateLimitConfig{RequestsPerSecond: &rps, Burst: &burst},
-		WebhookDeprecationSunsetDate: sunsetDate,
-	})
-
-	cnf, err := config.Fetch()
-	require.NoError(t, err, "fetching the mocked configuration")
-	require.NotNil(t, cnf.RateLimit.RequestsPerSecond,
-		"the rate limit did not reach the configuration store, so nothing below would be throttled")
-	require.Equal(t, sunsetDate, cnf.WebhookDeprecationSunsetDate,
-		"the retirement instant did not reach the configuration store")
-
-	db, err := database.NewDataSource(cnf)
-	require.NoError(t, err, "creating the datasource")
-
-	instance, err := blnk.NewBlnk(db)
-	require.NoError(t, err, "creating the Blnk instance")
-
-	api := NewAPI(instance)
-	require.NotNil(t, api, "NewAPI returned nil, which means configuration fetch failed")
-
-	return api.Router()
-}
-
-// TestWebhookSunset_IsNotPreemptedByRateLimiting is the M-5 guard, asserted through a response
-// rather than through the source.
-//
-// # The defect
-//
-// The retirement barrier was installed in api.Router, and every router.Use there runs AFTER every
-// r.Use in NewAPI — where RateLimitMiddleware is installed. So a throttled request to a retired
-// webhook-subscription route was answered 429 by the limiter and never reached either sunset
-// guard. The caller was told to slow down and try again, about a surface that is gone, and would
-// have retried it indefinitely. Requirement R-12 says the webhook REST API answers 410 Gone on
-// every request; "every request except the throttled ones" does not satisfy it.
+// The barrier once lived in Api.Router, and every router.Use there runs AFTER every r.Use
+// in NewAPI — where the request-size limit and the rate limiter are installed. A throttled
+// request to a retired route was therefore answered 429 by the limiter and reached neither
+// barrier. The caller was told to slow down and try again, about a surface that is gone, and
+// would have retried it indefinitely. R-12 says the webhook REST API answers 410 Gone on
+// every request; "every request except the throttled ones" does not satisfy that.
 //
 // # Why the limiter is exhausted rather than mocked
 //
-// The bug is one of ORDER, and order is a property of the assembled chain. A test that installed
-// its own middleware would assemble a different chain and could pass while the real one stayed
-// broken, which is precisely what every existing test in this file did — they authenticate, use a
-// registered verb, and send one request each, so none of them is ever throttled.
+// The bug is one of ORDER, and order is a property of the ASSEMBLED chain. A test that
+// installed its own middleware would assemble a different chain and could pass while the
+// real one stayed broken — which is precisely what a test that authenticates, uses a
+// registered verb and sends one request per case can never notice.
 func TestWebhookSunset_IsNotPreemptedByRateLimiting(t *testing.T) {
-	router := setupThrottledSunsetRouter(t, pastSunset())
+	// One request per second, burst one: the SECOND request from this client is refused.
+	router := setupSunsetRouter(t, sunsetPassedInstant,
+		withSunsetMasterKeyPrincipal(), withSunsetRateLimit(1, 1))
 
-	// FIRST, prove the limiter is actually armed: a live route must start refusing. Without this
-	// the test below would pass on a router that throttles nothing, which is the failure mode a
-	// too-generous limit would produce and the reason the limit is asserted rather than assumed.
+	// FIRST, prove the limiter is actually armed. Without this the assertions below would
+	// pass on a router that throttles nothing — the failure mode an over-generous limit
+	// produces — and would prove nothing at all.
 	var throttled bool
 	for range 8 {
-		rec := doSunsetRequest(t, router, http.MethodGet, "/ledgers", true)
-		if rec.Code == http.StatusTooManyRequests {
+		recorder := sunsetRequest(t, router, http.MethodGet, "/ledgers", "")
+		if recorder.Code == http.StatusTooManyRequests {
 			throttled = true
 
 			break
 		}
 	}
 	require.True(t, throttled,
-		"the rate limiter never refused a live route, so nothing below would have been preempted "+
-			"and this test would prove nothing")
+		"the rate limiter never refused a live route, so nothing below could have been "+
+			"preempted and this test would be vacuous")
 
-	// NOW the retired path, with the limiter already exhausted for this client. Every one of these
-	// would have been 429 before the barrier moved.
-	for _, method := range []string{
-		http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete,
-		// The unregistered verbs too: they reach no route, so they are answered by the chain gin
-		// rebuilds for unmatched requests — which contains the limiter as well.
-		http.MethodPatch, http.MethodHead, http.MethodOptions,
-	} {
+	// NOW the retired path, with this client's allowance already spent. Every one of these
+	// was a 429 before the barrier moved ahead of the limiter.
+	for _, method := range append(
+		[]string{http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete},
+		sunsetUnregisteredMethods...,
+	) {
 		t.Run(method, func(t *testing.T) {
-			rec := doSunsetRequest(t, router, method, retiredWebhookPath, true)
+			recorder := sunsetRequest(t, router, method, retiredWebhookPath, "")
 
-			require.Equal(t, http.StatusGone, rec.Code,
-				"a throttled request to a retired route must still be told the route is GONE, not "+
-					"that it should retry. Got %d: %s", rec.Code, rec.Body.String())
-
-			// HEAD carries no body by definition, so the code assertion applies to the others.
-			if method != http.MethodHead {
-				assert.Equal(t, string(apierror.ErrGenGone), errorCodeOf(t, rec.Body.Bytes()),
-					"the refusal must carry GEN_GONE, so a client can tell a retirement from a "+
-						"throttle without parsing prose")
-			}
+			require.Equal(t, http.StatusGone, recorder.Code,
+				"a throttled request to a retired route must still be told the route is "+
+					"GONE, not that it should retry. Got %d: %s",
+				recorder.Code, recorder.Body.String())
+			assert.Equal(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder),
+				"and it must carry GEN_GONE, so a client can tell a retirement from a "+
+					"throttle without parsing prose")
 		})
 	}
 
-	// AND THE NEIGHBOURS ARE STILL THROTTLED. Moving the barrier ahead of the limiter must not
-	// have moved the limiter, and a barrier that somehow admitted everything would pass every
-	// assertion above while disabling rate limiting for the whole API.
-	rec := doSunsetRequest(t, router, http.MethodGet, "/ledgers", true)
-	assert.Equal(t, http.StatusTooManyRequests, rec.Code,
-		"a live route must still be throttled; the barrier is scoped to the retired surface and "+
-			"must not have displaced the limiter for anything else. Got %d", rec.Code)
+	// AND THE NEIGHBOURS ARE STILL THROTTLED. Moving the barrier ahead of the limiter must
+	// not have moved the limiter: a barrier that somehow admitted everything would satisfy
+	// every assertion above while disabling rate limiting for the whole API.
+	recorder := sunsetRequest(t, router, http.MethodGet, "/ledgers", "")
+	assert.Equal(t, http.StatusTooManyRequests, recorder.Code,
+		"a live route must still be throttled; the barrier is scoped to the retired "+
+			"surface and must not have displaced the limiter for anything else. Got %d",
+		recorder.Code)
+}
+
+// TestWebhookSunset_AnUnusableWindowNeverReachesTheRoutes is the cross-layer half of the
+// retirement, asserted where the 410 is observable.
+//
+// The runtime predicate FAILS CLOSED: a deployment that publishes to Kafka with no usable
+// dual-delivery window is treated as ALREADY past the retirement instant. That is the right
+// default for the relay — it must not keep pushing HTTP webhooks on a guess — but it means
+// an operator typo could retire the management surface with nothing having failed to warn
+// them. The protection is that such a configuration is REFUSED before it is ever published,
+// so no request is served under it.
+//
+// The observation here is deliberately on the ROUTES and on the PUBLISHED configuration,
+// not on a returned error. config.MockConfig discards a configuration it cannot validate
+// and leaves the previous one serving traffic, so what a request can actually see is the
+// only thing that settles whether the routes were affected. The refusal rules themselves are
+// owned by config/config_test.go and are not re-derived here.
+func TestWebhookSunset_AnUnusableWindowNeverReachesTheRoutes(t *testing.T) {
+	// A valid baseline: no transport, no window. This is the shape every deployment that
+	// predates the feature runs, and it must stay loadable and unretired.
+	router := setupSunsetRouter(t, "", withSunsetMasterKeyPrincipal())
+
+	baseline := sunsetRequest(t, router, http.MethodGet, retiredWebhookPath, "")
+	require.NotEqual(t, http.StatusGone, baseline.Code,
+		"the baseline deployment must not be retired, or nothing below is measurable. "+
+			"body: %s", baseline.Body.String())
+
+	for _, refused := range []struct {
+		name    string
+		sunset  string
+		brokers []string
+		why     string
+	}{
+		{
+			name:    "an unparseable instant while publishing",
+			sunset:  "30 days from now",
+			brokers: []string{"kafka:9092"},
+			why: "a mis-typed instant must not resolve to a retirement; it would withdraw " +
+				"the management surface with nothing having failed",
+		},
+		{
+			name:    "no instant at all while publishing",
+			brokers: []string{"kafka:9092"},
+			why: "a publishing deployment with no window has no retirement to honour, and " +
+				"the runtime predicate fails closed — so accepting this would let " +
+				"configuration and behaviour disagree about the one decision the " +
+				"retirement is made of",
+		},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			config.MockConfig(sunsetConfiguration(refused.sunset, sunsetFixture{
+				masterKeyPrincipal:      true,
+				brokers:                 refused.brokers,
+				insecureBrokerTransport: true,
+			}))
+
+			published, err := config.Fetch()
+			require.NoError(t, err,
+				"a refused configuration must leave the previous one in place rather than "+
+					"emptying the store")
+			assert.Empty(t, published.WebhookDeprecationSunsetDate, refused.why)
+			assert.Empty(t, published.Kafka.Brokers,
+				"the WHOLE configuration is refused, not the offending field: %s", refused.why)
+
+			// And the routes, which is the point: they answer exactly as they did under the
+			// baseline, because the rejected configuration never reached them.
+			recorder := sunsetRequest(t, router, http.MethodGet, retiredWebhookPath, "")
+
+			assertNotRetired(t, recorder, http.MethodGet, retiredWebhookPath, refused.why)
+			assert.Empty(t, recorder.Header().Get("Sunset"),
+				"and no window may be advertised from a configuration that was never "+
+					"published")
+		})
+	}
+
+	t.Run("accepted: publishing to Kafka with a stated instant still serves the routes", func(t *testing.T) {
+		// The positive control, without which the refusals above would also be satisfied by
+		// a configuration layer that rejected EVERY Kafka deployment. Configuring the new
+		// transport must not by itself retire the old one — that is what the stated window
+		// is for, and serving these routes throughout it is the whole point of dual
+		// delivery.
+		publishing := setupSunsetRouter(t, sunsetFutureInstant,
+			withSunsetMasterKeyPrincipal(), withSunsetKafkaBrokers("kafka:9092"))
+
+		published, err := config.Fetch()
+		require.NoError(t, err)
+		require.NotEmpty(t, published.Kafka.Brokers,
+			"the valid combination must actually be published, or the refusals above prove "+
+				"nothing about validation and everything about Kafka being unconfigurable")
+
+		recorder := sunsetRequest(t, publishing, http.MethodGet, retiredWebhookPath, "")
+
+		assertNotRetired(t, recorder, http.MethodGet, retiredWebhookPath,
+			"the window is open, so the legacy surface is still the one a subscriber that "+
+				"has not migrated depends on")
+		assertSunsetHeadersAdvertised(t, recorder)
+	})
 }

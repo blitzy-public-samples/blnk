@@ -565,7 +565,11 @@ The subscriber concept is genuinely new. It has to exist anyway, because a Kafka
 | `webhook_url` | The legacy HTTP endpoint a migrating subscriber receives pushes on today. Never required — a subscriber onboarded after the cutover never had one. |
 | `migrated_at` | When that subscriber's cutover completed. This is what makes migration progress **queryable** rather than a matter of asking around. |
 
-A small, **explicitly deprecated** management surface exposes them: `POST`, `GET`, `PUT` and `DELETE` on `/subscribers/{subscriber_id}/webhook-subscription`. `DELETE` is the cutover *record* — it forgets the recorded URL and then stamps the migration instant, in that order, so a partial failure reports the subscriber as still awaiting migration rather than over-claiming progress.
+A small, **explicitly deprecated** management surface exposes them: `POST`, `GET`, `PUT` and `DELETE` on `/subscribers/{subscriber_id}/webhook-subscription`. `DELETE` is the cutover *record*, and it writes **both facts in one statement**: the recorded URL is forgotten and the migration instant is stamped together, so a subscriber is always on exactly one side of the migration report.
+
+That single write matters for the report rather than for tidiness. Done as a clear followed by a stamp, a failure in between left the row with **neither** column set — no URL, so nothing still to migrate from, and no instant, so not counted as migrated. Such a row is invisible to both halves of the progress query, and nothing surfaces it: the endpoint no longer holds the URL that would identify it as owing a migration. One write removes that state rather than choosing which side of it to fail on.
+
+**Clearing a URL is a different operation.** `migrated_at` is an audit fact, so stamping it for a subscriber that has not moved records a false one. To correct a mis-recorded endpoint, `PUT` the replacement; the cutover is for a subscriber that has actually finished moving.
 
 #### The webhook-subscription routes track migration only
 

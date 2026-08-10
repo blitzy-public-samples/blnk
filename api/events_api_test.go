@@ -36,11 +36,37 @@ limitations under the License.
 // The listing reads the outbox table and never a Kafka topic, so every test below
 // runs with no broker configured — which is also the deployment posture that must
 // keep working.
+//
+// # TWO HARNESSES, AND WHY BOTH ARE NEEDED
+//
+// The tests split by what they have to observe, not by taste.
+//
+//   - The LIVE-DATASOURCE harness — eventsRouter and eventsRequest, over the real
+//     PostgreSQL the api package already runs against — is used wherever the subject
+//     is the query string or the response envelope. It exercises the production
+//     repository, so an accepted parameter is proved to be a parameter the SQL layer
+//     genuinely honours.
+//   - The MOCK-DATASOURCE harness — setupEventsRouter, over mocks.MockDataSource —
+//     is used wherever the subject is a value crossing the handler/service boundary
+//     or a FAILURE the database will not produce on demand. The arguments the
+//     repository received are otherwise unobservable, so limit normalisation and
+//     filter pass-through could only be inferred from a 200; and a repository error,
+//     an unreplayable event, an exhausted publish and a missing broker have no
+//     reachable live equivalent, so the typed-code matrix could not be asserted at
+//     all. This file is the first in api/ to use the mock datasource; it does so in
+//     the root tests' style — new(mocks.MockDataSource) plus .On(...) — because
+//     blnk.NewBlnk takes database.IDataSource and the mock satisfies it.
+//
+// Neither harness sets configuration by any route other than config.MockConfig, and
+// no test in this file imports a Kafka client: the pipeline's transport is exercised
+// in the root package, and what is under test here is HTTP.
 package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -54,11 +80,13 @@ import (
 	"github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
+	"github.com/blnkfinance/blnk/database/mocks"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	coremodel "github.com/blnkfinance/blnk/model"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1305,4 +1333,2288 @@ func eventsReadRepositoryFile(t *testing.T, elements ...string) string {
 	require.NoError(t, err, "%s must be readable to assert its contents", path)
 
 	return string(contents)
+}
+
+// ---------------------------------------------------------------------------
+// The mock-datasource harness
+//
+// Everything below this line observes something the live-datasource harness above
+// cannot reach: the ARGUMENTS the repository was handed, and the FAILURES a healthy
+// database will not produce on request. Both are load-bearing rather than
+// convenient — the first is the only way to prove a normalisation happened at all
+// (over an empty inventory a bounded page and an unbounded one produce byte-identical
+// responses), and the second is the only way to reach the typed-code matrix the
+// endpoints document.
+// ---------------------------------------------------------------------------
+
+// eventsMockMasterKey is the master secret the mock-datasource harness configures.
+//
+// It is distinct from every other master key in this package so that a router built
+// here can never be authorised by a secret another test left in the configuration
+// store, and vice versa.
+const eventsMockMasterKey = "events-api-mock-datasource-master-key"
+
+// eventsMockAPIKeySecret is the raw credential the non-master probe presents.
+//
+// It is a plausible opaque token rather than a recognisable literal because it travels
+// in an X-Blnk-Key header through the real authentication middleware, and the
+// middleware compares it against the master key with a constant-time comparison: a
+// value that shares a prefix with the master key would prove nothing extra but would
+// make a failure harder to read.
+const eventsMockAPIKeySecret = "events-api-non-master-probe-credential"
+
+// eventsBackgroundTouchBuffer and eventsBackgroundTouchTimeout size the barrier below.
+//
+// The buffer only has to absorb the background touches of the requests one router serves,
+// which is a handful, and it is generously oversized so a send can never block. The
+// timeout is a safety valve that is never reached in a correct run: it exists so that a
+// future change which stops the touch from happening fails as a slow test rather than as a
+// hung one.
+const (
+	eventsBackgroundTouchBuffer  = 64
+	eventsBackgroundTouchTimeout = 5 * time.Second
+)
+
+// eventsSynchronizedDatasource is the mock datasource with ONE method wrapped, so a
+// request can be joined with the background work the authentication middleware starts for
+// it.
+//
+// # The race this removes, and why it is removed HERE
+//
+// api/middleware/auth.go authenticates a non-master credential and then updates the key's
+// last-used timestamp in a fire-and-forget goroutine that reads c.Request.Context() from
+// inside the goroutine. Meanwhile otelgin's middleware restores c.Request in a DEFERRED
+// function, which runs as the handler chain unwinds. The two touch c.Request concurrently,
+// and `go test -race` reports it.
+//
+// That is a property of the production middleware and not of these tests, and this file is
+// not the place it can be corrected — it is a test file, and the authorization middleware
+// is out of its scope. What IS this file's business is not turning a green race build red:
+// a mock-backed request completes in microseconds, so the goroutine is still starting when
+// the chain unwinds and the interleaving becomes reliable rather than rare.
+//
+// So the request is JOINED with its own background work before the chain unwinds. The touch
+// signals this channel after it has run, the barrier middleware below receives that signal
+// after the handler returns and before otelgin's deferred restore, and the resulting
+// happens-before edge orders the goroutine's read ahead of the write. It is a
+// synchronisation edge and not a delay: nothing sleeps, and the ordering is guaranteed
+// rather than made probable.
+//
+// It also makes the mock's own call log safe to read. The recorder is appended to from that
+// same goroutine, so a test that inspected it while the goroutine was live would be racing
+// on testify's internals; joining first means no goroutine is in flight by the time any
+// assertion runs.
+type eventsSynchronizedDatasource struct {
+	*mocks.MockDataSource
+
+	// touched receives once per completed background last-used update.
+	touched chan struct{}
+}
+
+// UpdateLastUsed records the call on the embedded mock and then announces that the
+// background goroutine has finished with the request.
+//
+// The signal is sent AFTER the delegation, which is what makes it mean "the goroutine has
+// read everything it is going to read and its call is recorded" rather than merely "the
+// goroutine started".
+//
+// Parameters:
+//   - ctx context.Context: the context the middleware's goroutine captured.
+//   - id string: the API key id being touched.
+//
+// Returns:
+//   - error: whatever the embedded mock was programmed to return.
+func (d *eventsSynchronizedDatasource) UpdateLastUsed(ctx context.Context, id string) error {
+	err := d.MockDataSource.UpdateLastUsed(ctx, id)
+
+	// Non-blocking: a full buffer would mean far more requests than any test here makes,
+	// and blocking a production goroutine on a test channel is never worth the certainty.
+	select {
+	case d.touched <- struct{}{}:
+	default:
+	}
+
+	return err
+}
+
+// eventsAuthGoroutineBarrier joins each authenticated request with the background work the
+// authentication middleware started for it.
+//
+// It is installed between otelgin and the authentication middleware, so its post-Next code
+// runs after the handler has answered and BEFORE otelgin's deferred restore of c.Request —
+// which is exactly the window the background goroutine's read has to be ordered into.
+//
+// Whether to wait is decided from the context rather than guessed: the middleware sets
+// "apiKey" on precisely the path that spawns the goroutine, and on no other. A master-key
+// request therefore waits for nothing, which is what keeps this from blocking the many
+// tests in this file that authenticate with the master key.
+//
+// Parameters:
+//   - touched <-chan struct{}: the channel the wrapped datasource signals.
+//
+// Returns:
+//   - gin.HandlerFunc: the barrier.
+func eventsAuthGoroutineBarrier(touched <-chan struct{}) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+
+		// No API-key principal means the master key, an anonymous refusal or a skipped
+		// authentication — none of which starts a goroutine, so there is nothing to join.
+		if _, authenticated := c.Get("apiKey"); !authenticated {
+			return
+		}
+
+		select {
+		case <-touched:
+		case <-time.After(eventsBackgroundTouchTimeout):
+		}
+	}
+}
+
+// setupEventsRouter builds a REAL router over a MOCK datasource.
+//
+// Secure mode is ON and a master key is configured, because two of the properties
+// under test are properties of the authentication middleware: that it resolves
+// "/events" to an authorization resource at all, and that it admits a correctly
+// scoped non-master key rather than aborting it. Both are invisible with secure mode
+// off — the middleware returns before consulting the resource map — so a harness that
+// disabled it could not fail for the reason it exists to catch.
+//
+// The datasource is a mock rather than the live repository for the reason given at the
+// top of this section, and it is returned to the caller so a test can both program the
+// seam and assert on what reached it. blnk.NewBlnk takes database.IDataSource, so the
+// mock is passed exactly where the production datasource goes; the Blnk struct's
+// datasource field is unexported, so this is the only way to reach that seam from
+// package api.
+//
+// Kafka is deliberately left UNCONFIGURED. config.MockConfig does not consult the
+// environment, so KAFKA_BROKERS is empty whatever the host has set, the publisher
+// resolves to its no-op implementation, and the listing and statistics endpoints must
+// still answer — which is the graceful-degradation posture every existing deployment
+// runs in.
+//
+// Parameters:
+//   - t *testing.T: the test, failed on any construction error.
+//   - mutate func(*config.Configuration): an optional hook to adjust the
+//     configuration before it is published. Nil leaves the defaults above.
+//
+// Returns:
+//   - *gin.Engine: the router, with the full production middleware chain.
+//   - *mocks.MockDataSource: the datasource behind it, ready to be programmed.
+func setupEventsRouter(t *testing.T, mutate func(*config.Configuration)) (*gin.Engine, *mocks.MockDataSource) {
+	t.Helper()
+
+	apiInstance, ds := newEventsAPIOverMockDatasource(t, mutate)
+
+	return apiInstance.Router(), ds
+}
+
+// newEventsAPIOverMockDatasource is setupEventsRouter without the route registration.
+//
+// It exists because two of the handler contracts are only reachable by CALLING THE
+// HANDLER: a route parameter that is absent altogether cannot be expressed as a URL the
+// registered route matches, since gin will not match a path with a missing segment. Both
+// constructions share this one function so the configuration, the service container and
+// the middleware chain cannot drift between them.
+//
+// Router() must be called at most once per instance — it registers routes on the engine
+// the Api already holds, so a second call panics on duplicate registration. Callers that
+// want a router must therefore go through setupEventsRouter.
+//
+// Parameters:
+//   - t *testing.T: the test, failed on any construction error.
+//   - mutate func(*config.Configuration): an optional configuration hook.
+//
+// Returns:
+//   - *Api: the constructed API, with no routes registered.
+//   - *mocks.MockDataSource: the datasource behind it.
+func newEventsAPIOverMockDatasource(
+	t *testing.T,
+	mutate func(*config.Configuration),
+) (*Api, *mocks.MockDataSource) {
+	t.Helper()
+
+	cfg := &config.Configuration{
+		Queue: config.QueueConfig{
+			TransactionQueue: "transaction_queue_test_api_events",
+			NumberOfQueues:   1,
+		},
+		Redis:      config.RedisConfig{Dns: "localhost:6379"},
+		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
+		Server: config.ServerConfig{
+			Secure:    true,
+			SecretKey: eventsMockMasterKey,
+		},
+	}
+	if mutate != nil {
+		mutate(cfg)
+	}
+	config.MockConfig(cfg)
+
+	cnf, err := config.Fetch()
+	require.NoError(t, err, "the mocked configuration must load")
+	require.True(t, cnf.Server.Secure,
+		"secure mode must survive validateAndAddDefaults, or the authentication middleware "+
+			"returns before it consults the resource map and the authorization tests below "+
+			"pass vacuously")
+	require.Empty(t, cnf.Kafka.Brokers,
+		"this harness must run with NO broker configured: that is the posture the endpoints "+
+			"are required to degrade gracefully in, and it is what makes a replay answer "+
+			"EVENT_KAFKA_UNAVAILABLE deterministically")
+
+	ds := new(mocks.MockDataSource)
+
+	// The datasource handed to the service container is the mock with its last-used update
+	// wrapped, so each request can be joined with the background goroutine the
+	// authentication middleware starts for it. See eventsSynchronizedDatasource: this is
+	// what keeps a pre-existing production race in the authorization middleware from being
+	// made reliably observable by a test that answers in microseconds.
+	synchronized := &eventsSynchronizedDatasource{
+		MockDataSource: ds,
+		touched:        make(chan struct{}, eventsBackgroundTouchBuffer),
+	}
+
+	instance, err := blnk.NewBlnk(synchronized)
+	require.NoError(t, err, "the service container must build over the mock datasource")
+
+	apiInstance := NewAPI(instance)
+	require.NotNil(t, apiInstance, "NewAPI returned nil, which means the configuration was unusable")
+
+	// Installed BEFORE Router() adds the authentication middleware, so the barrier sits
+	// between otelgin and authentication in the chain — which is the only position from
+	// which it can order the background read ahead of otelgin's deferred write.
+	apiInstance.router.Use(eventsAuthGoroutineBarrier(synchronized.touched))
+
+	return apiInstance, ds
+}
+
+// eventsTestAPIKey is a valid, NON-MASTER principal for the authorization tests.
+//
+// Validity is the whole point and it is not incidental: model.APIKey.IsValid is
+// `!IsRevoked && time.Now().Before(ExpiresAt)`, and the middleware aborts an invalid
+// key with AUTH_EXPIRED_API_KEY long before it reaches the resource map. A fixture
+// with a zero ExpiresAt would therefore make every test below fail for a reason that
+// has nothing to do with what they assert.
+//
+// The scopes are the caller's to choose, because the two authorization questions need
+// opposite answers from them: a key scoped to these routes proves the middleware
+// ADMITS the request and hands it to the endpoint's own gate, while a key scoped
+// elsewhere proves the path resolved to the RIGHT resource by being refused in its
+// name.
+//
+// Parameters:
+//   - scopes ...string: the granted scopes, in "resource:action" form.
+//
+// Returns:
+//   - *coremodel.APIKey: the principal, carrying eventsMockAPIKeySecret as its key.
+func eventsTestAPIKey(scopes ...string) *coremodel.APIKey {
+	return &coremodel.APIKey{
+		APIKeyID:  "api_key_events_probe",
+		Key:       eventsMockAPIKeySecret,
+		Name:      "events surface probe",
+		OwnerID:   "owner_events_probe",
+		Scopes:    scopes,
+		ExpiresAt: time.Now().Add(time.Hour),
+		CreatedAt: time.Now().Add(-time.Hour),
+		IsRevoked: false,
+	}
+}
+
+// expectEventsAPIKeyLookup programs the two datasource calls the authentication
+// middleware makes for a non-master credential.
+//
+// GetAPIKey is the datasource method behind blnk.GetAPIKeyByKey, so that is the
+// expectation name — not the service method's.
+//
+// UpdateLastUsed is expected with .Maybe() because the middleware fires it in a
+// GOROUTINE after the response has been written. A strict expectation would be a
+// race by construction: the request can complete, the recorder can be asserted and
+// the test can finish before that goroutine runs, and an unmet-or-unexpected call
+// would then be reported nondeterministically — which is exactly the flake `-race`
+// makes frequent.
+//
+// Parameters:
+//   - ds *mocks.MockDataSource: the datasource to program.
+//   - key *coremodel.APIKey: the principal the lookup resolves to.
+func expectEventsAPIKeyLookup(ds *mocks.MockDataSource, key *coremodel.APIKey) {
+	ds.On("GetAPIKey", mock.Anything, eventsMockAPIKeySecret).Return(key, nil)
+	ds.On("UpdateLastUsed", mock.Anything, key.APIKeyID).Return(nil).Maybe()
+}
+
+// eventsAPIRoute is one registered route on the event management surface, named so a
+// failure message says which endpoint broke rather than which table row did.
+type eventsAPIRoute struct {
+	name   string
+	method string
+	path   string
+	// scope is the "resource:action" the authorization middleware must resolve this
+	// route to. It is asserted verbatim in the refusal message, which is what pins the
+	// mapping rather than merely its existence.
+	scope string
+	// repositoryMethod is the first datasource method this route's handler would reach
+	// if the master-key gate let it through. It is the subject of the AssertNotCalled
+	// checks: a gate that fires AFTER the work has started is not a gate.
+	repositoryMethod string
+}
+
+// eventsAPIRoutes is every route in api/events.go, with the authorization scope and
+// the repository seam each one owns.
+//
+// Declared once and shared by every table-driven test below, so a route added to the
+// surface without being added here is visible as an omission in one place.
+var eventsAPIRoutes = []eventsAPIRoute{
+	{
+		name:             "dead-letter inventory",
+		method:           http.MethodGet,
+		path:             "/events/dead-letter",
+		scope:            "events:read",
+		repositoryMethod: "ListDeadLetterInventory",
+	},
+	{
+		name:             "outbox statistics",
+		method:           http.MethodGet,
+		path:             "/events/stats",
+		scope:            "events:read",
+		repositoryMethod: "CountEventOutboxByStatus",
+	},
+	{
+		name:             "dead-letter replay",
+		method:           http.MethodPost,
+		path:             "/events/dead-letter/3f2504e0-4f89-11d3-9a0c-0305e82c3301/replay",
+		scope:            "events:write",
+		repositoryMethod: "ClaimEventForReplay",
+	},
+}
+
+// eventsKeyedRequest issues a request carrying an X-Blnk-Key credential through the
+// real middleware chain.
+//
+// The header form is used rather than an injected context flag wherever the
+// authentication middleware itself is part of the subject: injecting isMasterKey
+// bypasses the very code that resolves the path to a resource and evaluates a scope.
+//
+// Parameters:
+//   - t *testing.T: the test, for fatal reporting.
+//   - router *gin.Engine: the router under test.
+//   - method, path string: the request line.
+//   - key string: the credential for the X-Blnk-Key header. Empty sends no header.
+//
+// Returns:
+//   - *httptest.ResponseRecorder: the recorded response.
+func eventsKeyedRequest(
+	t *testing.T,
+	router *gin.Engine,
+	method, path, key string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	request := httptest.NewRequest(method, path, strings.NewReader(""))
+	if key != "" {
+		request.Header.Set("X-Blnk-Key", key)
+	}
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	return recorder
+}
+
+// eventsErrorDetail decodes the structured error object every refusal on this surface
+// carries.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when the body is not the dual error payload.
+//   - recorder *httptest.ResponseRecorder: the recorded response.
+//
+// Returns:
+//   - apierror.APIError: the decoded error_detail object.
+func eventsErrorDetail(t *testing.T, recorder *httptest.ResponseRecorder) apierror.APIError {
+	t.Helper()
+
+	var body struct {
+		ErrorDetail apierror.APIError `json:"error_detail"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body),
+		"every refusal on this surface carries error_detail: %s", recorder.Body.String())
+
+	return body.ErrorDetail
+}
+
+// eventsRepositoryCallsExcludingAuth names every datasource method a request reached,
+// with the two the authentication middleware makes removed.
+//
+// It is how "no service call is made" is asserted as an absolute rather than as a list
+// of specific methods that were not called. AssertNotCalled proves a named method was
+// spared; this proves NOTHING was touched, which is the property a gate that must fire
+// before any work actually has.
+//
+// Parameters:
+//   - ds *mocks.MockDataSource: the datasource the request ran against.
+//
+// Returns:
+//   - []string: the method names, in call order, excluding GetAPIKey and UpdateLastUsed.
+func eventsRepositoryCallsExcludingAuth(ds *mocks.MockDataSource) []string {
+	reached := make([]string, 0, len(ds.Calls))
+	for _, call := range ds.Calls {
+		switch call.Method {
+		case "GetAPIKey", "UpdateLastUsed":
+			continue
+		default:
+			reached = append(reached, call.Method)
+		}
+	}
+
+	return reached
+}
+
+// TestEventsAPI_AuthorizationResourceIsRegistered is THE decisive authorization test,
+// and it is the only one in this file that can fail for the reason it exists to catch.
+//
+// # Why every simpler version of this test is vacuous
+//
+// api/middleware/auth.go returns early twice before the resource map is read. It
+// returns when Server.Secure is false, so any assertion made against an insecure
+// router holds whether "/events" is mapped or not. And it returns for the MASTER KEY,
+// which has all permissions and needs no resource — so a master-key request to an
+// unmapped prefix SUCCEEDS. A "the route is reachable with the master key" test
+// therefore passes even if pathToResource was never edited, which is precisely the
+// mistake it would be written to catch.
+//
+// The resource map is reached by exactly one kind of request: secure mode, a valid
+// credential, and NOT the master key. That is the combination assembled here.
+//
+// # What an unmapped prefix does, and what this asserts instead
+//
+// getResourceFromPath returns "" and the middleware aborts with AUTH_UNKNOWN_RESOURCE
+// for every caller of that route, forever — which is why "events" had to be added to
+// BOTH api/middleware/scope.go and api/middleware/auth.go and why registering the
+// scope constant alone is not enough.
+//
+// The key here is scoped TO these routes, so all three assertions below are available
+// at once and each excludes a different failure:
+//
+//   - NOT AUTH_UNKNOWN_RESOURCE: the path prefix resolved to a resource.
+//   - NOT AUTH_INSUFFICIENT_PERMISSIONS: it resolved to the RIGHT resource and the
+//     method mapped to the right action, so a key granted exactly this scope was
+//     admitted rather than refused. A prefix pointed at some other feature's resource
+//     would fail here.
+//   - IS AUTH_MASTER_KEY_REQUIRED: the request traversed the whole middleware chain and
+//     was refused by the ENDPOINT's own gate, which is the last thing that can refuse
+//     it. Nothing short of a fully authorised request produces this code.
+//
+// The assertion is on error_detail.code and never on the status, because
+// AUTH_UNKNOWN_RESOURCE, AUTH_INSUFFICIENT_PERMISSIONS and AUTH_MASTER_KEY_REQUIRED all
+// resolve to 403: a status-only assertion cannot tell the three apart and would pass in
+// every one of the failure modes above.
+//
+// FALSIFIABILITY: removing the "events" entry from pathToResource in
+// api/middleware/auth.go makes this test fail with AUTH_UNKNOWN_RESOURCE on all three
+// routes. That check was performed against this test.
+func TestEventsAPI_AuthorizationResourceIsRegistered(t *testing.T) {
+	for _, route := range eventsAPIRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			expectEventsAPIKeyLookup(ds, eventsTestAPIKey(route.scope))
+
+			recorder := eventsKeyedRequest(t, router, route.method, route.path, eventsMockAPIKeySecret)
+
+			detail := eventsErrorDetail(t, recorder)
+
+			require.NotEqual(t, apierror.ErrAuthUnknownResource, detail.Code,
+				"%s %s RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware aborts every "+
+					"request to it — the master key included. The path prefix is missing from "+
+					"pathToResource in api/middleware/auth.go; adding the scope constant to "+
+					"api/middleware/scope.go alone is not enough. THIS IS THE ASSERTION THIS "+
+					"TEST EXISTS FOR: it is the only failure mode of the two-file registration "+
+					"that has no other symptom", route.method, route.path)
+
+			require.NotEqual(t, apierror.ErrAuthInsufficientPermissions, detail.Code,
+				"a key granted exactly %q was refused on permissions, which means %s %s resolves "+
+					"to a DIFFERENT resource or the method mapped to a different action; the "+
+					"routes would then be authorised under some other feature's scope",
+				route.scope, route.method, route.path)
+
+			assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+
+			// And the endpoint's gate refused BEFORE any work: a fully authorised
+			// non-master caller must learn only that the master key is required, never
+			// whether an event id exists — which would turn the replay route into an
+			// existence oracle for anyone holding an events-scoped key.
+			assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+				"the gate must refuse before touching the repository; it reached %v",
+				eventsRepositoryCallsExcludingAuth(ds))
+
+			ds.AssertExpectations(t)
+		})
+	}
+}
+
+// TestEventsAPI_AuthorizationRefusesAnUnrelatedScopeInItsOwnName is the companion that
+// pins the mapping to the RIGHT resource from the other direction.
+//
+// The test above proves an events-scoped key is admitted. This one proves a key scoped
+// to something else is refused, and refused in the name of the resource and action THIS
+// route maps to. Together they bracket the mapping: one would pass if "/events" were
+// mapped to any resource at all, the other only if it is mapped to `events` with the
+// method resolving to the expected action.
+func TestEventsAPI_AuthorizationRefusesAnUnrelatedScopeInItsOwnName(t *testing.T) {
+	for _, route := range eventsAPIRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			// Deliberately unrelated to this surface, and deliberately a real resource:
+			// an unparseable scope would be refused by scope parsing rather than by the
+			// permission check, which is a different code path.
+			expectEventsAPIKeyLookup(ds, eventsTestAPIKey("ledgers:read"))
+
+			recorder := eventsKeyedRequest(t, router, route.method, route.path, eventsMockAPIKeySecret)
+
+			detail := eventsErrorDetail(t, recorder)
+
+			require.NotEqual(t, apierror.ErrAuthUnknownResource, detail.Code,
+				"%s %s must resolve to an authorization resource", route.method, route.path)
+			assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthInsufficientPermissions)
+			assert.Contains(t, detail.Message, route.scope,
+				"the refusal must name %q: that is the resource this path maps to and the action "+
+					"this method maps to, and both have to be right", route.scope)
+
+			assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+				"a request refused by the middleware must never reach the repository")
+
+			ds.AssertExpectations(t)
+		})
+	}
+}
+
+// TestEnsureEventManagementAuthorized_AdmitsTheMasterKeyAndRefusesEveryoneElse tests the
+// gate in isolation, exactly as TestEnsureHookManagementAuthorized does for the hook
+// surface it is modelled on.
+//
+// Testing it directly is worth doing on top of the routed tests because the gate's
+// CONTRACT has two halves that a routed test only observes one of: it returns a boolean
+// the handler branches on, AND it writes the refusal itself. A gate that returned false
+// without writing would leave the handler returning an empty 200 body; a gate that
+// wrote and returned true would write twice. Neither is visible from a status code.
+func TestEnsureEventManagementAuthorized_AdmitsTheMasterKeyAndRefusesEveryoneElse(t *testing.T) {
+	t.Run("the master key is admitted and nothing is written", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("isMasterKey", true)
+
+		assert.True(t, ensureEventManagementAuthorized(c),
+			"the master key is the authorised principal for the event management surface")
+		assert.Equal(t, http.StatusOK, recorder.Code,
+			"an admitted request must have nothing written for it, or the handler's own "+
+				"response is a second body")
+		assert.Empty(t, recorder.Body.String(), "and no body either")
+	})
+
+	t.Run("an absent flag is refused and the refusal is written", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+
+		assert.False(t, ensureEventManagementAuthorized(c))
+		assert.Equal(t, http.StatusForbidden, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), errEventsRequireMasterKey.Error(),
+			"the caller must be told what is required, and told it in the surface's own words")
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+	})
+
+	// The flag is read from a context value, so the three ways it can be present and
+	// still not mean "master" are worth pinning: a false boolean, and a value of some
+	// other type that a naive type-assertion would panic on or coerce to true.
+	for name, value := range map[string]interface{}{
+		"an explicit false":        false,
+		"a string that says true":  "true",
+		"a number":                 1,
+		"a nil interface value":    nil,
+		"a pointer to a true bool": new(bool),
+	} {
+		t.Run(name+" is not the master key", func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set("isMasterKey", value)
+
+			assert.False(t, ensureEventManagementAuthorized(c),
+				"only a boolean true means the master key; anything else must refuse rather "+
+					"than be coerced")
+			assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+		})
+	}
+}
+
+// eventsDeadLetterEntry builds one inventory entry with every field populated.
+//
+// Every field is set on purpose. A fixture with zero values cannot distinguish a
+// projection that carries a field from one that drops it, so a test asserting the
+// response would pass against a handler that returned nothing but the event id.
+//
+// Parameters:
+//   - eventID string: the entry's event id.
+//   - eventType string: the event name.
+//   - occurredAt time.Time: the occurrence instant, which is the listing's ordering key.
+//
+// Returns:
+//   - coremodel.DeadLetterInventoryEntry: the populated entry.
+func eventsDeadLetterEntry(
+	eventID, eventType string,
+	occurredAt time.Time,
+) coremodel.DeadLetterInventoryEntry {
+	first := occurredAt.Add(time.Second)
+	last := occurredAt.Add(31 * time.Second)
+
+	return coremodel.DeadLetterInventoryEntry{
+		ID:               4242,
+		EventID:          eventID,
+		EventType:        eventType,
+		AggregateID:      "txn_" + eventID,
+		PartitionKey:     "partition_key_from_the_column",
+		LedgerID:         "ldg_events_api_probe",
+		Topic:            deadLetterFixtureTopic,
+		SchemaVersion:    coremodel.SchemaVersionV1,
+		OccurredAt:       occurredAt,
+		Status:           coremodel.EventOutboxStatusDeadLettered,
+		Attempts:         5,
+		LastError:        "dial tcp 10.0.0.7:9092: connect: connection refused",
+		FirstAttemptedAt: &first,
+		LastAttemptedAt:  &last,
+		DLTTopic:         deadLetterFixtureTopic + ".dlt",
+		PayloadBytes:     512,
+	}
+}
+
+// eventsReplayableRow builds a dead-lettered outbox row a replay claim can return.
+//
+// Parameters:
+//   - eventID string: the row's event id.
+//
+// Returns:
+//   - *coremodel.EventOutbox: the row, held in the claimed state the service expects.
+func eventsReplayableRow(eventID string) *coremodel.EventOutbox {
+	return &coremodel.EventOutbox{
+		ID:            777,
+		EventID:       eventID,
+		EventType:     "transaction.applied",
+		AggregateID:   "txn_" + eventID,
+		PartitionKey:  "ldg_events_api_probe",
+		LedgerID:      "ldg_events_api_probe",
+		Topic:         deadLetterFixtureTopic,
+		SchemaVersion: coremodel.SchemaVersionV1,
+		Payload:       json.RawMessage(`{"event":"transaction.applied","data":{"status":"APPLIED"}}`),
+		EventRaw:      []byte(`{"event_id":"` + eventID + `","event_type":"transaction.applied"}`),
+		OccurredAt:    time.Now().Add(-time.Hour).UTC(),
+		Status:        coremodel.EventOutboxStatusReplaying,
+		Attempts:      5,
+		MaxAttempts:   5,
+		LastError:     "dial tcp 10.0.0.7:9092: connect: connection refused",
+		ClaimToken:    "claim-token-events-api-probe",
+		DLTTopic:      deadLetterFixtureTopic + ".dlt",
+	}
+}
+
+// TestListDeadLetterEvents_RefusesANonMasterCallerBeforeAnyRepositoryWork proves the
+// gate fires BEFORE the work rather than merely instead of the response.
+//
+// The construction matters and it is not the obvious one: the repository is programmed
+// to SUCCEED. If the gate leaked, the handler would answer 200 with an inventory page,
+// so this test fails on the leak itself rather than on a repository that happened to be
+// unprogrammed — which would surface as a panic or a 500 and could be mistaken for an
+// unrelated fault.
+//
+// The inventory names every stuck event in the deployment together with its failure
+// reason and broker coordinate. Leaking it to any authenticated caller is a disclosure,
+// not merely an authorization slip, which is why refusing before the read is the
+// property and not refusing after it.
+func TestListDeadLetterEvents_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *testing.T) {
+	router, ds := setupEventsRouter(t, nil)
+	expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:read"))
+
+	// Programmed to succeed, so a leaking gate produces a 200 and this test fails
+	// for the right reason.
+	ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+		Return(coremodel.DeadLetterInventoryPage{
+			Entries: []coremodel.DeadLetterInventoryEntry{
+				eventsDeadLetterEntry(uuid.NewString(), "transaction.applied", time.Now().UTC()),
+			},
+		}, nil).Maybe()
+
+	recorder := eventsKeyedRequest(t, router,
+		http.MethodGet, "/events/dead-letter", eventsMockAPIKeySecret)
+
+	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+	ds.AssertNotCalled(t, "ListDeadLetterInventory", mock.Anything, mock.Anything)
+	ds.AssertNotCalled(t, "ListAndCountDeadLetterInventory", mock.Anything, mock.Anything)
+	assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+		"a gate that fires after the work has started is not a gate")
+	assert.NotContains(t, recorder.Body.String(), deadLetterFixtureTopic,
+		"no fragment of the inventory may appear in a refusal")
+}
+
+// TestReplayDeadLetterEvent_RefusesANonMasterCallerBeforeAnyRepositoryWork is the same
+// property on the one WRITE this surface exposes, where the consequence is larger.
+//
+// Replay re-publishes a ledger event. The claim is also a state transition, so a gate
+// that fired after it would leave the row held in `replaying` for a caller who was
+// never allowed to replay it — and the refusal would additionally reveal whether the
+// event id exists, turning the route into an existence oracle.
+func TestReplayDeadLetterEvent_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *testing.T) {
+	eventID := uuid.NewString()
+
+	router, ds := setupEventsRouter(t, nil)
+	expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:write"))
+
+	ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+		Return(eventsReplayableRow(eventID), nil).Maybe()
+	ds.On("ReleaseEventReplay", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Maybe()
+
+	recorder := eventsKeyedRequest(t, router,
+		http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockAPIKeySecret)
+
+	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+	ds.AssertNotCalled(t, "ClaimEventForReplay", mock.Anything, mock.Anything, mock.Anything)
+	ds.AssertNotCalled(t, "GetEventByID", mock.Anything, mock.Anything)
+	assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+		"the row must not be claimed, and its existence must not be revealed, for a caller "+
+			"that is not permitted to replay it")
+}
+
+// TestGetEventOutboxStats_RefusesANonMasterCallerBeforeAnyRepositoryWork completes the
+// set.
+//
+// The statistics expose the whole outbox and, when a broker is configured, its offsets:
+// the size and health of every event stream in the deployment. It is an operator
+// reading, so the gate precedes the counts.
+func TestGetEventOutboxStats_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *testing.T) {
+	router, ds := setupEventsRouter(t, nil)
+	expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:read"))
+
+	ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+		Return(map[string]int64{coremodel.EventOutboxStatusDispatched: 9_999_999}, nil).Maybe()
+	ds.On("CountBalanceMonitorHandoffByStatus", mock.Anything).
+		Return(map[string]int64{}, nil).Maybe()
+	ds.On("CountUnfinalizedBulkTransactionBatches", mock.Anything, mock.Anything).
+		Return(0, nil, nil).Maybe()
+
+	recorder := eventsKeyedRequest(t, router,
+		http.MethodGet, "/events/stats", eventsMockAPIKeySecret)
+
+	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+	ds.AssertNotCalled(t, "CountEventOutboxByStatus", mock.Anything, mock.Anything)
+	assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+		"the outbox must not be counted for a caller that may not read it")
+	assert.NotContains(t, recorder.Body.String(), "9999999",
+		"no count may leak into a refusal")
+}
+
+// TestEventsAPI_TypedCodesResolveToIntendedStatuses pins the error catalogue this
+// surface's whole contract rests on.
+//
+// internal/apierror's statusByCode is the single source of truth for the default status
+// of every code, and StatusForCode DEFAULTS AN UNKNOWN CODE TO 500. So a code declared
+// but never mapped does not fail loudly: every endpoint that returns it silently answers
+// 500, and a test asserting only on the code would still pass while the documented
+// status — 404, 409, 503 — never appeared on the wire.
+//
+// This asserts the mapping directly, which is the one place the defaulting cannot hide.
+func TestEventsAPI_TypedCodesResolveToIntendedStatuses(t *testing.T) {
+	for name, expectation := range map[string]struct {
+		code   apierror.ErrorCode
+		status int
+	}{
+		"an unknown event is a not found":            {apierror.ErrEventNotFound, http.StatusNotFound},
+		"an unreplayable event is a conflict":        {apierror.ErrEventNotDeadLettered, http.StatusConflict},
+		"a failed replay is a server fault":          {apierror.ErrEventReplayFailed, http.StatusInternalServerError},
+		"an unreachable broker is unavailable":       {apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable},
+		"a missing master key is forbidden":          {apierror.ErrAuthMasterKeyRequired, http.StatusForbidden},
+		"an unmapped route prefix is also forbidden": {apierror.ErrAuthUnknownResource, http.StatusForbidden},
+		"a missing route parameter is a bad request": {apierror.ErrGenMissingParameter, http.StatusBadRequest},
+		"an unusable parameter is a bad request":     {apierror.ErrGenValidation, http.StatusBadRequest},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, expectation.status, apierror.StatusForCode(expectation.code),
+				"%s must be mapped in statusByCode; an unmapped code silently answers 500 and "+
+					"the documented status never reaches a client", expectation.code)
+		})
+	}
+
+	// AND THE TWO 403s MUST BE DISTINGUISHABLE ONLY BY CODE. This is the reason every
+	// assertion in this file is written against error_detail.code: the status cannot tell
+	// "the endpoint refused me" from "the route prefix is unmapped", and those are a
+	// permissions answer and a deployment bug respectively.
+	assert.Equal(t,
+		apierror.StatusForCode(apierror.ErrAuthMasterKeyRequired),
+		apierror.StatusForCode(apierror.ErrAuthUnknownResource),
+		"these two share a status, which is why a status-only authorization assertion is "+
+			"unfalsifiable on this surface")
+	assert.NotEqual(t, apierror.ErrAuthMasterKeyRequired, apierror.ErrAuthUnknownResource,
+		"and they must remain distinct codes, or the distinction is unobservable anywhere")
+}
+
+// eventsCapturedInventoryQuery returns the single inventory query the repository was
+// handed, failing the test when it was handed none or more than one.
+//
+// "Exactly one" is part of the contract rather than a convenience: the listing is
+// documented as one read when no total was asked for and one COMBINED read when one was,
+// and a handler that issued two would be reporting a page and a total drawn from two
+// populations.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when the expectation is not met.
+//   - ds *mocks.MockDataSource: the datasource the request ran against.
+//   - method string: "ListDeadLetterInventory" or "ListAndCountDeadLetterInventory".
+//
+// Returns:
+//   - coremodel.DeadLetterInventoryQuery: the query as the repository received it.
+func eventsCapturedInventoryQuery(
+	t *testing.T,
+	ds *mocks.MockDataSource,
+	method string,
+) coremodel.DeadLetterInventoryQuery {
+	t.Helper()
+
+	var captured []coremodel.DeadLetterInventoryQuery
+	for _, call := range ds.Calls {
+		if call.Method != method {
+			continue
+		}
+
+		query, ok := call.Arguments.Get(1).(coremodel.DeadLetterInventoryQuery)
+		require.True(t, ok, "%s must be called with a model.DeadLetterInventoryQuery", method)
+		captured = append(captured, query)
+	}
+
+	require.Len(t, captured, 1,
+		"%s must be reached exactly once per request; it was reached %d times", method, len(captured))
+
+	return captured[0]
+}
+
+// eventsEmptyInventoryPage is the repository answer for a healthy, empty inventory.
+var eventsEmptyInventoryPage = coremodel.DeadLetterInventoryPage{
+	Entries: []coremodel.DeadLetterInventoryEntry{},
+}
+
+// TestListDeadLetterEvents_HandsTheNormalisedPageAndEveryFilterToTheRepository is the
+// assertion the live-datasource tests structurally cannot make.
+//
+// # Why a 200 proves nothing here
+//
+// Over an inventory that matches nothing — which is the healthy state, and the state a
+// shared test database is in for any synthetic filter — a bounded page and an unbounded
+// one produce byte-identical responses. So "the request was accepted" says nothing about
+// whether the limit was capped, whether the occurrence window was parsed into the right
+// instant, or whether `dlt_topic` was resolved to its category sibling before it reached
+// SQL. The only observation that settles it is the ARGUMENT the repository received, and
+// that requires the datasource seam.
+//
+// The two properties this pins are the ones with a real failure mode. An UNCAPPED limit
+// turns one request into a full-table read of a table that gains 43.2 million rows a day.
+// A DROPPED filter answers a different question than the operator asked, silently: an
+// operator scoped to the twenty minutes the broker was down would read the whole
+// inventory as if it were that window.
+func TestListDeadLetterEvents_HandsTheNormalisedPageAndEveryFilterToTheRepository(t *testing.T) {
+	windowFrom := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	windowTo := time.Date(2026, time.January, 2, 4, 4, 5, 0, time.UTC)
+
+	for name, tt := range map[string]struct {
+		query    string
+		expected coremodel.DeadLetterInventoryQuery
+	}{
+		"no query at all takes the default page": {
+			query:    "",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+		"a limit within the ceiling is honoured verbatim": {
+			query:    "limit=50",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: 50},
+		},
+		"a limit exactly at the ceiling is honoured": {
+			query:    fmt.Sprintf("limit=%d", deadLetterPageMaxLimit),
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageMaxLimit},
+		},
+		"one past the ceiling falls back to the default rather than to the ceiling": {
+			query:    fmt.Sprintf("limit=%d", deadLetterPageMaxLimit+1),
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+		"an absurd limit cannot become a full-table read": {
+			query:    "limit=1000000",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+		"a zero limit is normalised, not passed through as no limit": {
+			query:    "limit=0",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+		"a negative limit is normalised": {
+			query:    "limit=-5",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+		"an event type reaches SQL unchanged": {
+			query: "event_type=transaction.applied",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:     deadLetterPageDefaultLimit,
+				EventType: "transaction.applied",
+			},
+		},
+		"surrounding whitespace on a filter is trimmed rather than matched": {
+			query: "event_type=%20transaction.applied%20",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:     deadLetterPageDefaultLimit,
+				EventType: "transaction.applied",
+			},
+		},
+		"a category topic reaches SQL unchanged": {
+			query: "topic=" + deadLetterFixtureTopic,
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit: deadLetterPageDefaultLimit,
+				Topic: deadLetterFixtureTopic,
+			},
+		},
+		"the dlt spelling is resolved to its category sibling before it reaches SQL": {
+			// The repository filters on the ORIGINAL topic, so the ".dlt" suffix has to be
+			// removed here or the filter matches nothing — an operator filtering by the
+			// dlt_topic printed on every inventory item would receive an empty page and
+			// read it as "nothing is stuck".
+			query: "dlt_topic=" + deadLetterFixtureTopic + ".dlt",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit: deadLetterPageDefaultLimit,
+				Topic: deadLetterFixtureTopic,
+			},
+		},
+		"both spellings agreeing resolve to one filter": {
+			query: "topic=" + deadLetterFixtureTopic + "&dlt_topic=" + deadLetterFixtureTopic + ".dlt",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit: deadLetterPageDefaultLimit,
+				Topic: deadLetterFixtureTopic,
+			},
+		},
+		"a status filter reaches SQL unchanged": {
+			query: "status=" + coremodel.EventOutboxStatusDeadLettered,
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:  deadLetterPageDefaultLimit,
+				Status: coremodel.EventOutboxStatusDeadLettered,
+			},
+		},
+		"the more urgent failed status is filterable too": {
+			query: "status=" + coremodel.EventOutboxStatusFailed,
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:  deadLetterPageDefaultLimit,
+				Status: coremodel.EventOutboxStatusFailed,
+			},
+		},
+		"an occurrence window reaches SQL as instants": {
+			query: "occurred_from=2026-01-02T03:04:05Z&occurred_to=2026-01-02T04:04:05Z",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:        deadLetterPageDefaultLimit,
+				OccurredFrom: windowFrom,
+				OccurredTo:   windowTo,
+			},
+		},
+		"a zone offset names the same instant as its Z spelling": {
+			query: "occurred_from=2026-01-02T04:04:05%2B01:00",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:        deadLetterPageDefaultLimit,
+				OccurredFrom: windowFrom,
+			},
+		},
+		"a one-sided window leaves the other end unbounded": {
+			query: "occurred_to=2026-01-02T04:04:05Z",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:      deadLetterPageDefaultLimit,
+				OccurredTo: windowTo,
+			},
+		},
+		"every narrowing at once arrives intact": {
+			query: "limit=7&event_type=transaction.applied&dlt_topic=" + deadLetterFixtureTopic +
+				".dlt&status=" + coremodel.EventOutboxStatusDeadLettered +
+				"&occurred_from=2026-01-02T03:04:05Z&occurred_to=2026-01-02T04:04:05Z",
+			expected: coremodel.DeadLetterInventoryQuery{
+				Limit:        7,
+				EventType:    "transaction.applied",
+				Topic:        deadLetterFixtureTopic,
+				Status:       coremodel.EventOutboxStatusDeadLettered,
+				OccurredFrom: windowFrom,
+				OccurredTo:   windowTo,
+			},
+		},
+		"the inert sort options do not alter the query": {
+			// sort_by and sort_order are accepted for client compatibility and the
+			// ordering is fixed by the repository. Accepted-and-inert is the contract;
+			// what must not happen is a sort option silently becoming a filter.
+			query:    "sort_by=occurred_at&sort_order=asc",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+		"an unrecognised sort order is still inert rather than refused": {
+			query:    "sort_order=sideways",
+			expected: coremodel.DeadLetterInventoryQuery{Limit: deadLetterPageDefaultLimit},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+				Return(eventsEmptyInventoryPage, nil).Once()
+
+			target := "/events/dead-letter"
+			if tt.query != "" {
+				target += "?" + tt.query
+			}
+
+			recorder := eventsKeyedRequest(t, router, http.MethodGet, target, eventsMockMasterKey)
+			require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+			query := eventsCapturedInventoryQuery(t, ds, "ListDeadLetterInventory")
+
+			assert.Equal(t, tt.expected.Limit, query.Limit,
+				"NO PAGE MAY EXCEED THE CEILING and none may be unbounded: an uncapped limit "+
+					"lets one request read the whole dead-letter inventory")
+			assert.LessOrEqual(t, query.Limit, deadLetterPageMaxLimit)
+			assert.Positive(t, query.Limit, "a page of zero rows answers nothing")
+
+			assert.Equal(t, tt.expected.EventType, query.EventType)
+			assert.Equal(t, tt.expected.Topic, query.Topic)
+			assert.Equal(t, tt.expected.Status, query.Status)
+			assert.True(t, tt.expected.OccurredFrom.Equal(query.OccurredFrom),
+				"occurred_from must reach SQL as %s, not %s",
+				tt.expected.OccurredFrom, query.OccurredFrom)
+			assert.True(t, tt.expected.OccurredTo.Equal(query.OccurredTo),
+				"occurred_to must reach SQL as %s, not %s",
+				tt.expected.OccurredTo, query.OccurredTo)
+			assert.Nil(t, query.Cursor, "no cursor was supplied, so the page starts at the newest entry")
+
+			ds.AssertExpectations(t)
+		})
+	}
+}
+
+// TestListDeadLetterEvents_ResumesFromTheCursorItIssued closes the paging loop.
+//
+// A cursor is only useful if the token the response hands back is the token the next
+// request is understood by. Both halves are asserted against one another here rather
+// than separately: the encoded token from a page is fed straight back as ?cursor= and
+// the decoded coordinate the repository receives must be the one that was encoded.
+//
+// A paging client terminates on a MISSING cursor rather than on an empty page, so the
+// last page's response must omit next_cursor entirely — an empty-string token would send
+// a client that branches on presence around again forever.
+func TestListDeadLetterEvents_ResumesFromTheCursorItIssued(t *testing.T) {
+	position := coremodel.DeadLetterCursor{
+		OccurredAt: time.Date(2026, time.March, 4, 5, 6, 7, 891011, time.UTC),
+		ID:         4242,
+	}
+
+	var issued string
+
+	t.Run("a page with more behind it hands back a cursor", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(coremodel.DeadLetterInventoryPage{
+				Entries: []coremodel.DeadLetterInventoryEntry{
+					eventsDeadLetterEntry(uuid.NewString(), "transaction.applied", position.OccurredAt),
+				},
+				NextCursor: &position,
+				HasMore:    true,
+			}, nil).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+		require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+		var envelope DeadLetterPageResponse
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
+
+		require.NotEmpty(t, envelope.NextCursor,
+			"a page with more behind it must say where to resume, or paging cannot continue")
+		assert.True(t, envelope.HasMore,
+			"has_more must mirror the cursor so a client can branch on a boolean")
+		assert.Equal(t, position.Encode(), envelope.NextCursor,
+			"the token must be the repository's position, encoded")
+
+		issued = envelope.NextCursor
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("handing that cursor back resumes at the same coordinate", func(t *testing.T) {
+		require.NotEmpty(t, issued, "the previous sub-test must have produced a cursor")
+
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(eventsEmptyInventoryPage, nil).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/dead-letter?cursor="+issued, eventsMockMasterKey)
+		require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+		query := eventsCapturedInventoryQuery(t, ds, "ListDeadLetterInventory")
+		require.NotNil(t, query.Cursor,
+			"the cursor must reach the repository, or every page restarts at the newest entry "+
+				"and a paging client never terminates")
+		assert.True(t, position.OccurredAt.Equal(query.Cursor.OccurredAt),
+			"the decoded instant must be the encoded one: %s", query.Cursor.OccurredAt)
+		assert.Equal(t, position.ID, query.Cursor.ID,
+			"and the tie-break id with it, or rows sharing an instant repeat or vanish")
+
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("the last page omits the cursor entirely", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(eventsEmptyInventoryPage, nil).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+		require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+		var raw map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &raw))
+		assert.NotContains(t, raw, "next_cursor",
+			"the termination condition is an ABSENT cursor; an empty-string token sends a "+
+				"client that branches on presence around again forever")
+		ds.AssertExpectations(t)
+	})
+}
+
+// TestListDeadLetterEvents_TakesThePageAndTheTotalFromOneReadOnlyWhenATotalIsAskedFor
+// pins the two-path read contract.
+//
+// The page and the total used to be two independent calls, and the response then asserted
+// a relationship between them that nothing established: an entry dead-lettered between
+// the two reads is counted by one and absent from the other, so the total described a set
+// the page was not a slice of. A client comparing the page against the total does not
+// terminate on that.
+//
+// The combined read fixed it, and a caller who did NOT ask for a total must still take
+// the cheaper single-statement path — there is then no second answer to be coherent with.
+// Both halves are asserted here, because each has a distinct failure: taking the combined
+// read always is a needless REPEATABLE READ transaction on every listing, and taking the
+// separate reads when a total was asked for reintroduces the incoherence.
+func TestListDeadLetterEvents_TakesThePageAndTheTotalFromOneReadOnlyWhenATotalIsAskedFor(t *testing.T) {
+	t.Run("without a total there is one plain read and no total_count field", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(eventsEmptyInventoryPage, nil).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+		require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+		ds.AssertNotCalled(t, "ListAndCountDeadLetterInventory", mock.Anything, mock.Anything)
+
+		var raw map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &raw))
+		assert.Contains(t, raw, "data", "the envelope is the shape with or without a total")
+		assert.Contains(t, raw, "has_more")
+		assert.NotContains(t, raw, "total_count",
+			"a total that was not asked for must be ABSENT rather than zero: a client cannot "+
+				"tell a measured zero from an unmeasured one otherwise")
+
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("with a total there is one combined read carrying the page's own narrowing", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListAndCountDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(coremodel.DeadLetterInventoryPage{
+				Entries: []coremodel.DeadLetterInventoryEntry{
+					eventsDeadLetterEntry(uuid.NewString(), "transaction.applied", time.Now().UTC()),
+				},
+			}, int64(17), nil).Once()
+
+		recorder := eventsKeyedRequest(t, router, http.MethodGet,
+			"/events/dead-letter?include_count=true&event_type=transaction.applied&topic="+
+				deadLetterFixtureTopic, eventsMockMasterKey)
+		require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+		ds.AssertNotCalled(t, "ListDeadLetterInventory", mock.Anything, mock.Anything)
+
+		// The COUNT must be taken with the page's own filters. A total derived from a
+		// whole-table aggregate would describe a different set from the page beside it,
+		// which is the defect the combined read replaced.
+		query := eventsCapturedInventoryQuery(t, ds, "ListAndCountDeadLetterInventory")
+		assert.Equal(t, "transaction.applied", query.EventType,
+			"the count and the page must share one narrowing")
+		assert.Equal(t, deadLetterFixtureTopic, query.Topic)
+
+		var envelope DeadLetterPageResponse
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
+		require.NotNil(t, envelope.TotalCount, "include_count must produce a total")
+		assert.Equal(t, int64(17), *envelope.TotalCount,
+			"the total reported must be the total measured, not the size of the page")
+		assert.Len(t, envelope.Data, 1)
+
+		ds.AssertExpectations(t)
+	})
+
+	// include_count is parsed with strconv.ParseBool rather than by comparing against
+	// "true", because a misspelling that silently changes the response SHAPE is worse than
+	// one that is refused: a caller that asked for a total and received a bare envelope
+	// cannot tell its spelling was ignored from a deployment that cannot count.
+	for _, spelling := range []string{"true", "TRUE", "True", "1", "t"} {
+		t.Run("include_count="+spelling+" is honoured", func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			ds.On("ListAndCountDeadLetterInventory", mock.Anything, mock.Anything).
+				Return(eventsEmptyInventoryPage, int64(0), nil).Once()
+
+			recorder := eventsKeyedRequest(t, router, http.MethodGet,
+				"/events/dead-letter?include_count="+spelling, eventsMockMasterKey)
+			require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+			var envelope DeadLetterPageResponse
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
+			require.NotNil(t, envelope.TotalCount,
+				"%q is one of strconv.ParseBool's true spellings and must not be dropped", spelling)
+			assert.Equal(t, int64(0), *envelope.TotalCount,
+				"a measured zero must render, which is why the field is a pointer")
+
+			ds.AssertExpectations(t)
+		})
+	}
+
+	for _, spelling := range []string{"yes", "on", "maybe", "2"} {
+		t.Run("include_count="+spelling+" is refused rather than read as false", func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+
+			recorder := eventsKeyedRequest(t, router, http.MethodGet,
+				"/events/dead-letter?include_count="+spelling, eventsMockMasterKey)
+
+			assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenValidation)
+			assert.Contains(t, recorder.Body.String(), spelling,
+				"the refusal must name the value, or the caller is guessing again")
+			assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+				"an unusable parameter must be refused before the read")
+		})
+	}
+}
+
+// TestListDeadLetterEvents_ProjectsTheWholeFailureRecordOntoTheResponse pins the triage
+// payload.
+//
+// Every field on the item is what an operator triages from, so a projection that silently
+// drops one leaves them without the coordinate they need and with no indication anything
+// is missing. The fixture populates every field for exactly that reason: against a
+// zero-valued fixture this test would pass on a handler that returned nothing but the
+// event id.
+//
+// The raw driver text is asserted ABSENT, and that is not incidental tidiness. A Kafka
+// write error renders as "dial tcp 10.0.0.7:9092: connect: connection refused", naming
+// Blnk's internal addressing and broker topology; the response carries the CLASSIFIED
+// reason instead, which answers the triage question — broker, event, or grant? — without
+// describing the inside of the deployment.
+func TestListDeadLetterEvents_ProjectsTheWholeFailureRecordOntoTheResponse(t *testing.T) {
+	occurredAt := time.Date(2026, time.February, 3, 4, 5, 6, 0, time.UTC)
+	eventID := uuid.NewString()
+	entry := eventsDeadLetterEntry(eventID, "transaction.applied", occurredAt)
+
+	router, ds := setupEventsRouter(t, nil)
+	ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+		Return(coremodel.DeadLetterInventoryPage{
+			Entries: []coremodel.DeadLetterInventoryEntry{entry},
+		}, nil).Once()
+
+	recorder := eventsKeyedRequest(t, router,
+		http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+	require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+	var envelope DeadLetterPageResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
+	require.Len(t, envelope.Data, 1)
+
+	item := envelope.Data[0]
+	assert.Equal(t, eventID, item.EventID, "the id a replay is addressed by")
+	assert.Equal(t, "transaction.applied", item.EventType)
+	assert.Equal(t, entry.AggregateID, item.AggregateID)
+	assert.Equal(t, entry.LedgerID, item.LedgerID)
+	assert.Equal(t, coremodel.SchemaVersionV1, item.SchemaVersion)
+	assert.Equal(t, deadLetterFixtureTopic, item.Topic,
+		"the ORIGINAL category topic, which is where a replay sends the event back to")
+	assert.Equal(t, deadLetterFixtureTopic+".dlt", item.DLTTopic,
+		"and the dlt sibling it was actually preserved on")
+	assert.Equal(t, coremodel.EventOutboxStatusDeadLettered, item.Status)
+	assert.Equal(t, 5, item.Attempts)
+	assert.Equal(t, entry.PayloadBytes, item.PayloadBytes,
+		"the SIZE of the stored body, so an inventory of large events costs a page of "+
+			"metadata rather than a page of event bodies")
+	assert.True(t, occurredAt.Equal(item.OccurredAt))
+
+	// THE EFFECTIVE MESSAGE KEY, not the stored column. The publish path prefers the
+	// ledger id whenever there is one, so on a row whose partition_key was derived before
+	// the ledger was known the two differ — and that is precisely the row an operator
+	// investigating an ordering question is looking at.
+	assert.Equal(t, entry.LedgerID, item.PartitionKey,
+		"an entry carrying a ledger was keyed on the ledger; reporting the stored column "+
+			"would name a key the event was not routed by")
+
+	require.NotNil(t, item.FirstAttemptedAt)
+	require.NotNil(t, item.LastAttemptedAt)
+	assert.True(t, entry.FirstAttemptedAt.Equal(*item.FirstAttemptedAt))
+	assert.True(t, entry.LastAttemptedAt.Equal(*item.LastAttemptedAt))
+	assert.True(t, item.LastAttemptedAt.After(*item.FirstAttemptedAt),
+		"the pair bounds the window the failure persisted over, which is what separates a "+
+			"momentary broker blip from a sustained outage")
+
+	assert.Equal(t, model.FailureReasonBrokerUnavailable, item.FailureReason,
+		"a connection refusal is a broker problem and must be classified as one")
+
+	body := recorder.Body.String()
+	assert.NotContains(t, body, "10.0.0.7",
+		"the broker address must never reach a response body")
+	assert.NotContains(t, body, entry.LastError,
+		"the raw driver text stays in the outbox row and the runbook reads it through the "+
+			"database; the wire carries the classified reason")
+
+	ds.AssertExpectations(t)
+}
+
+// TestListDeadLetterEvents_BackfillsTheItemFromTheStoredFailureMetadata covers the
+// second source of the same five facts.
+//
+// FailureMetadata is the record written to the dead-letter topic beside the event, and it
+// carries EXACTLY FIVE fields: the original topic, the error reason, the attempt count and
+// the first and last attempt instants. On a row whose own columns were not populated —
+// which is what a row dead-lettered by an older relay looks like — the projection reads
+// them from that record instead, so an operator sees the same triage coordinates either
+// way.
+//
+// Without this the fields would render as zero and nil on exactly the rows that have been
+// stuck longest.
+func TestListDeadLetterEvents_BackfillsTheItemFromTheStoredFailureMetadata(t *testing.T) {
+	occurredAt := time.Date(2026, time.April, 5, 6, 7, 8, 0, time.UTC)
+	metadata := coremodel.FailureMetadata{
+		OriginalTopic:    deadLetterFixtureTopic,
+		ErrorReason:      "SASL authentication failed for the producer principal",
+		AttemptCount:     4,
+		FirstAttemptedAt: occurredAt.Add(2 * time.Second),
+		LastAttemptedAt:  occurredAt.Add(45 * time.Second),
+	}
+	encoded, err := json.Marshal(metadata)
+	require.NoError(t, err)
+
+	eventID := uuid.NewString()
+	// Deliberately BARE: no LastError, no attempt count, no attempt instants. Everything
+	// asserted below therefore has to have come from the metadata record.
+	entry := coremodel.DeadLetterInventoryEntry{
+		ID:              99,
+		EventID:         eventID,
+		EventType:       "identity.created",
+		AggregateID:     "idt_" + eventID,
+		PartitionKey:    "idt_" + eventID,
+		Topic:           deadLetterFixtureTopic,
+		SchemaVersion:   coremodel.SchemaVersionV1,
+		OccurredAt:      occurredAt,
+		Status:          coremodel.EventOutboxStatusDeadLettered,
+		DLTTopic:        deadLetterFixtureTopic + ".dlt",
+		FailureMetadata: encoded,
+	}
+
+	router, ds := setupEventsRouter(t, nil)
+	ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+		Return(coremodel.DeadLetterInventoryPage{
+			Entries: []coremodel.DeadLetterInventoryEntry{entry},
+		}, nil).Once()
+
+	recorder := eventsKeyedRequest(t, router,
+		http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+	require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+	var envelope DeadLetterPageResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &envelope))
+	require.Len(t, envelope.Data, 1)
+
+	item := envelope.Data[0]
+	assert.Equal(t, metadata.AttemptCount, item.Attempts,
+		"attempt_count must be read from the failure record when the column is unset")
+	assert.Equal(t, model.FailureReasonAuthorizationDenied, item.FailureReason,
+		"error_reason must be classified from the failure record, and a SASL refusal is a "+
+			"grant problem rather than a broker outage")
+	require.NotNil(t, item.FirstAttemptedAt)
+	require.NotNil(t, item.LastAttemptedAt)
+	assert.True(t, metadata.FirstAttemptedAt.Equal(*item.FirstAttemptedAt))
+	assert.True(t, metadata.LastAttemptedAt.Equal(*item.LastAttemptedAt))
+
+	// An entry with NO ledger falls back to the stored partition key, which is the other
+	// half of the effective-key rule.
+	assert.Equal(t, entry.PartitionKey, item.PartitionKey)
+	assert.Empty(t, item.LedgerID,
+		"a ledger-less event omits ledger_id rather than reporting an empty string")
+
+	assert.NotContains(t, recorder.Body.String(), metadata.ErrorReason,
+		"the raw reason is classified before it reaches the wire, here as elsewhere")
+
+	ds.AssertExpectations(t)
+}
+
+// TestListDeadLetterEvents_AnswersAnEmptyPageRatherThanANotFound pins the healthy case.
+//
+// "No events are stuck" is a successful answer, and it is the answer a reconciliation
+// script sees every day it runs against a working deployment. A 404 would make the daily
+// check fail on success, and a null `data` would break a script that ranges over the page
+// unconditionally — both failures landing precisely when nothing is wrong.
+func TestListDeadLetterEvents_AnswersAnEmptyPageRatherThanANotFound(t *testing.T) {
+	for name, page := range map[string]coremodel.DeadLetterInventoryPage{
+		"an empty slice from the repository": eventsEmptyInventoryPage,
+		// A nil slice is the other way a repository can say "nothing": the service
+		// normalises it defensively and the handler allocates with make, so both must
+		// render as [].
+		"a nil slice from the repository": {Entries: nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).Return(page, nil).Once()
+
+			recorder := eventsKeyedRequest(t, router,
+				http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+
+			require.Equal(t, http.StatusOK, recorder.Code,
+				"an empty inventory is a 200, never a 404: it is the daily healthy answer. "+
+					"body: %s", recorder.Body.String())
+			assert.JSONEq(t, `{"data":[],"has_more":false}`, recorder.Body.String(),
+				"data must be [] and never null, or a script that ranges over it breaks in "+
+					"exactly the case where nothing is wrong")
+
+			ds.AssertExpectations(t)
+		})
+	}
+}
+
+// TestListDeadLetterEvents_AnswersATypedCodeWithoutLeakingTheRepositoryError covers the
+// failure the live-datasource harness cannot stage.
+//
+// Two behaviours are asserted, and they are the two halves of the error convention.
+//
+//   - An UNCLASSIFIED repository failure answers GEN_INTERNAL with the SANITIZED message,
+//     never the driver's own text. A PostgreSQL error renders with the schema, table,
+//     constraint, source file and routine that produced it, and that text is a description
+//     of the inside of the deployment.
+//   - A TYPED error is answered with ITS OWN code rather than with the handler's default,
+//     which is what makes the service's vocabulary reach the client at all. A handler that
+//     always used its default would answer 500 for a validation refusal.
+func TestListDeadLetterEvents_AnswersATypedCodeWithoutLeakingTheRepositoryError(t *testing.T) {
+	t.Run("an unclassified repository failure is sanitized", func(t *testing.T) {
+		driverText := `pq: relation "blnk.event_outbox" does not exist (SQLSTATE 42P01) in ` +
+			`parse_relation.c:1381 routine=parserOpenTable`
+
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(coremodel.DeadLetterInventoryPage{}, errors.New(driverText)).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusInternalServerError, apierror.ErrGenInternal)
+
+		detail := eventsErrorDetail(t, recorder)
+		assert.Equal(t, sanitizedInternalMessage, detail.Message,
+			"an unclassified 5xx carries the fixed sanitized message")
+
+		body := recorder.Body.String()
+		for _, leak := range []string{"pq:", "SQLSTATE", "parse_relation.c", "parserOpenTable", "blnk.event_outbox"} {
+			assert.NotContains(t, body, leak,
+				"the driver's own text must never reach a client: %q leaked", leak)
+		}
+
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("a typed repository failure keeps its own code", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ListDeadLetterInventory", mock.Anything, mock.Anything).
+			Return(coremodel.DeadLetterInventoryPage{}, apierror.NewAPIError(
+				apierror.ErrGenResourceLocked,
+				"The dead-letter inventory is being maintained",
+				errors.New("blnk: maintenance lock held"),
+			)).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/dead-letter", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder,
+			apierror.StatusForCode(apierror.ErrGenResourceLocked), apierror.ErrGenResourceLocked)
+		assert.NotEqual(t, http.StatusInternalServerError, recorder.Code,
+			"a typed error must not be flattened into the handler's default")
+
+		ds.AssertExpectations(t)
+	})
+}
+
+// TestReplayDeadLetterEvent_AnswersTheTypedCodeForEveryFailureMode is the replay error
+// matrix, and every row of it is unreachable without the datasource seam.
+//
+// Replay is the one write on this surface and its documented responses are five distinct
+// codes across four statuses. An operator acts differently on each: 404 means the event
+// was purged or the id is wrong, 409 means it is not replayable and says WHY, 500 means
+// the re-publish failed and is worth retrying, 503 means the transport is down and
+// retrying now is pointless. Collapsing any pair of them sends somebody to do the wrong
+// thing during an incident.
+//
+// Each row also asserts that a CLAIMED row is RELEASED when the replay does not complete.
+// The claim is a state transition, so a failure that left the row in `replaying` would
+// make the event unreplayable until its lease expired — the failure mode this matters most
+// for is the one most likely to happen, a broker that is down.
+func TestReplayDeadLetterEvent_AnswersTheTypedCodeForEveryFailureMode(t *testing.T) {
+	t.Run("a repository miss is a not found", func(t *testing.T) {
+		eventID := uuid.NewString()
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+			Return(nil, sql.ErrNoRows).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusNotFound, apierror.ErrEventNotFound)
+		ds.AssertNotCalled(t, "ReleaseEventReplay",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("a typed not-found from the repository keeps the event code", func(t *testing.T) {
+		eventID := uuid.NewString()
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+			Return(nil, apierror.NewAPIError(
+				apierror.ErrEventNotFound,
+				"No event with that id exists",
+				errors.New("blnk: no such row"),
+			)).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusNotFound, apierror.ErrEventNotFound)
+		ds.AssertExpectations(t)
+	})
+
+	// THE THREE CONFLICTS. All three answer 409 EVENT_NOT_DEAD_LETTERED, and the code
+	// alone would be satisfied by one message for all of them — but "you already replayed
+	// this", "somebody else is replaying it right now" and "this event was never
+	// replayable" call for three different actions, so the MESSAGE is asserted too.
+	for name, tt := range map[string]struct {
+		row     *coremodel.EventOutbox
+		expects string
+	}{
+		"an event that has already been replayed": {
+			row: &coremodel.EventOutbox{
+				ID:       31,
+				EventID:  "placeholder",
+				Status:   coremodel.EventOutboxStatusDispatched,
+				DLTTopic: deadLetterFixtureTopic + ".dlt",
+			},
+			expects: "already been replayed",
+		},
+		"an event a concurrent replay is holding": {
+			row: &coremodel.EventOutbox{
+				ID:      32,
+				EventID: "placeholder",
+				Status:  coremodel.EventOutboxStatusReplaying,
+			},
+			expects: "already being replayed",
+		},
+		"an event still working through ordinary delivery": {
+			row: &coremodel.EventOutbox{
+				ID:      33,
+				EventID: "placeholder",
+				Status:  coremodel.EventOutboxStatusPending,
+			},
+			expects: coremodel.EventOutboxStatusPending,
+		},
+	} {
+		t.Run(name+" is a conflict that says why", func(t *testing.T) {
+			eventID := uuid.NewString()
+			row := *tt.row
+			row.EventID = eventID
+
+			router, ds := setupEventsRouter(t, nil)
+			ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+				Return(nil, apierror.NewAPIError(
+					apierror.ErrGenConflict,
+					"The event is not in a replayable state",
+					errors.New("blnk: claim precondition failed"),
+				)).Once()
+			// The explanatory read runs on the failure path only, and it is what turns
+			// "the precondition failed" into the operator's actual situation.
+			ds.On("GetEventByID", mock.Anything, eventID).Return(&row, nil).Once()
+
+			recorder := eventsKeyedRequest(t, router,
+				http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+			assertErrorCode(t, recorder, http.StatusConflict, apierror.ErrEventNotDeadLettered)
+			assert.Contains(t, eventsErrorDetail(t, recorder).Message, tt.expects,
+				"the refusal must name the situation; %q and the other two conflicts call for "+
+					"different actions", tt.expects)
+			ds.AssertExpectations(t)
+		})
+	}
+
+	t.Run("an unclassified failure is a failed replay rather than a generic fault", func(t *testing.T) {
+		eventID := uuid.NewString()
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+			Return(nil, errors.New("blnk: the replay claim could not be recorded")).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+		// EVENT_REPLAY_FAILED, not GEN_INTERNAL: the handler's default is the endpoint's
+		// own code, so an operator reading the response knows which operation failed.
+		assertErrorCode(t, recorder, http.StatusInternalServerError, apierror.ErrEventReplayFailed)
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("no configured broker is unavailable, and the claim is released", func(t *testing.T) {
+		// This is the row the whole harness is arranged for. The claim SUCCEEDS, so the
+		// service holds the row in `replaying`, and the publisher is the no-op
+		// implementation because no brokers are configured — which is a legitimate steady
+		// state rather than a misconfiguration. The replay must refuse with 503 and hand
+		// the row back, or an event becomes unreplayable until its lease expires.
+		eventID := uuid.NewString()
+		row := eventsReplayableRow(eventID)
+
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).Return(row, nil).Once()
+		ds.On("ReleaseEventReplay", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
+			Return(nil).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusServiceUnavailable, apierror.ErrKafkaUnavailable)
+		assert.Equal(t, string(apierror.ErrKafkaUnavailable), "EVENT_KAFKA_UNAVAILABLE",
+			"the code carries the EVENT_ prefix deliberately, so the whole event surface reads "+
+				"as one family in a client's error handling")
+
+		// RELEASED WITH ITS FENCING TOKEN. The token is what makes the release safe against
+		// a concurrent claim, so releasing without it — or with the wrong one — is not a
+		// release at all.
+		ds.AssertCalled(t, "ReleaseEventReplay", mock.Anything, row.ID, row.ClaimToken, mock.Anything)
+		ds.AssertExpectations(t)
+	})
+}
+
+// TestReplayDeadLetterEvent_DoesNotFallThroughToTheGenericNotFound is the guard against
+// api/errors.go's broad catch-all, and it is the test that forces the handler to declare
+// its upgrades.
+//
+// classifyMessage's pattern table ends with a bare {"not found"} → GEN_NOT_FOUND entry
+// that matches any error message containing those words. So an UNTYPED repository error
+// whose text happens to say "not found" — which is what an error from a layer that has not
+// adopted typed errors looks like — would be answered GEN_NOT_FOUND by a bare
+// respondError. The status would be right and the code would be wrong, which is the worst
+// combination: a client switching on the code sees a generic miss on a surface whose whole
+// vocabulary is EVENT_*, and nothing in the response reveals the endpoint had a specific
+// code for it.
+//
+// withUpgrade(ErrGenNotFound, ErrEventNotFound) is what closes that gap, and this test is
+// what keeps it closed: deleting the upgrade makes it fail with GEN_NOT_FOUND while every
+// status assertion in the file still passes.
+func TestReplayDeadLetterEvent_DoesNotFallThroughToTheGenericNotFound(t *testing.T) {
+	for name, cause := range map[string]error{
+		"a bare not-found message":       errors.New("event outbox row not found"),
+		"a message naming the id":        errors.New(`blnk: event "evt_probe" not found in the outbox`),
+		"a wrapped driver miss":          fmt.Errorf("querying the outbox: %w", sql.ErrNoRows),
+		"a repository phrasing with sql": errors.New("no rows in result set: outbox row not found"),
+	} {
+		t.Run(name+" answers EVENT_NOT_FOUND", func(t *testing.T) {
+			eventID := uuid.NewString()
+			router, ds := setupEventsRouter(t, nil)
+			ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+				Return(nil, cause).Once()
+
+			recorder := eventsKeyedRequest(t, router,
+				http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+			detail := eventsErrorDetail(t, recorder)
+			require.NotEqual(t, apierror.ErrGenNotFound, detail.Code,
+				"GEN_NOT_FOUND is the catch-all at the END of classifyMessage's table; this "+
+					"endpoint must answer in its own vocabulary. The handler needs "+
+					"withUpgrade(ErrGenNotFound, ErrEventNotFound) — a bare respondError is not "+
+					"enough. body: %s", recorder.Body.String())
+			assertErrorCode(t, recorder, http.StatusNotFound, apierror.ErrEventNotFound)
+
+			ds.AssertExpectations(t)
+		})
+	}
+
+	t.Run("and a conflict phrased in prose is upgraded the same way", func(t *testing.T) {
+		// The companion upgrade. Nothing in classifyMessage's table maps this text, so
+		// without withUpgrade(ErrGenConflict, ErrEventNotDeadLettered) the typed conflict
+		// the service raises would be the only source of a 409 — and a repository that
+		// reported the precondition failure with the legacy generic code would answer 500.
+		eventID := uuid.NewString()
+		row := coremodel.EventOutbox{
+			ID:      44,
+			EventID: eventID,
+			Status:  coremodel.EventOutboxStatusReplaying,
+		}
+
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
+			Return(nil, apierror.NewAPIError(
+				apierror.ErrGenConflict, "precondition failed", errors.New("blnk: not claimable"),
+			)).Once()
+		ds.On("GetEventByID", mock.Anything, eventID).Return(&row, nil).Once()
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+
+		detail := eventsErrorDetail(t, recorder)
+		assert.NotEqual(t, apierror.ErrGenConflict, detail.Code,
+			"the generic conflict must be upgraded to the endpoint's own code")
+		assertErrorCode(t, recorder, http.StatusConflict, apierror.ErrEventNotDeadLettered)
+
+		ds.AssertExpectations(t)
+	})
+}
+
+// TestReplayDeadLetterEvent_AddressesTheServiceByEventIDAlone is the byte-fidelity
+// obligation as it is observable at THIS layer.
+//
+// Acceptance criterion V-9 requires a replayed event to be byte-for-byte identical to the
+// original aside from its failure metadata, and the only way to keep that promise is for
+// the re-publish to send the STORED BYTES. A handler that unmarshalled the event, filled a
+// struct and re-marshalled it would reorder JSON keys and break the guarantee while every
+// field-by-field assertion still passed.
+//
+// What is provable here is the necessary condition: the handler hands the service NOTHING
+// BUT AN IDENTIFIER. It never reads a payload, never constructs an event envelope and
+// never touches a topic — so there is no place for a re-marshal to happen on this side of
+// the boundary. The sufficient condition, that the service publishes the stored bytes
+// unchanged, is proved end to end in the root package's event_replay_fidelity_test.go
+// against a real broker.
+func TestReplayDeadLetterEvent_AddressesTheServiceByEventIDAlone(t *testing.T) {
+	eventID := uuid.NewString()
+	row := eventsReplayableRow(eventID)
+
+	router, ds := setupEventsRouter(t, nil)
+	ds.On("ClaimEventForReplay", mock.Anything, mock.Anything, mock.Anything).Return(row, nil).Once()
+	ds.On("ReleaseEventReplay", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	// A body is deliberately sent. If the handler read one — a topic override, a payload
+	// patch, a "replay as" envelope — the replay would no longer be byte-faithful, and the
+	// route would have a second, undocumented input.
+	request := httptest.NewRequest(http.MethodPost,
+		"/events/dead-letter/"+eventID+"/replay",
+		jsonReader(`{"topic":"blnk.attacker","payload":{"event":"transaction.applied","data":{}}}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Blnk-Key", eventsMockMasterKey)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	// The claim is addressed by the event id and nothing else: the arguments are the
+	// context, the id and the lease. No payload, no topic, no envelope.
+	var claims []mock.Arguments
+	for _, call := range ds.Calls {
+		if call.Method == "ClaimEventForReplay" {
+			claims = append(claims, call.Arguments)
+		}
+	}
+	require.Len(t, claims, 1, "the replay must look the event up exactly once")
+	require.Len(t, claims[0], 3,
+		"ClaimEventForReplay takes a context, an event id and a lease — nothing else may be "+
+			"threaded through it from the request")
+	assert.Equal(t, eventID, claims[0].Get(1),
+		"the identifier the service receives must be the one in the route, untransformed")
+	assert.IsType(t, time.Duration(0), claims[0].Get(2),
+		"and the third argument is the claim lease, which the handler does not choose")
+
+	// The destination came from the STORED ROW, never from the request body.
+	assert.NotContains(t, recorder.Body.String(), "blnk.attacker",
+		"a topic supplied in the body must be ignored: the replay's destination is the "+
+			"original topic recorded on the row")
+
+	ds.AssertExpectations(t)
+}
+
+// TestReplayDeadLetterEvent_RequiresAnEventIDInTheRoute pins the parameter guard, and it
+// pins the CODE rather than merely a non-200.
+//
+// GEN_MISSING_PARAMETER is a 400 that tells an operator the request was malformed. The
+// alternatives are both wrong in a way that costs them time: a 404 would send them looking
+// for an event, and a 500 would send them looking at the service.
+func TestReplayDeadLetterEvent_RequiresAnEventIDInTheRoute(t *testing.T) {
+	t.Run("a whitespace-only identifier is a missing parameter", func(t *testing.T) {
+		// The route DOES match this — " " is a legal path segment — so it reaches the
+		// handler and is refused there. Trimming to empty is the same rule every other
+		// parameter in this package follows.
+		router, ds := setupEventsRouter(t, nil)
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/%20/replay", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMissingParameter)
+		assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+			"a malformed route must be refused before the lookup")
+	})
+
+	t.Run("no parameter at all is a missing parameter", func(t *testing.T) {
+		// Reached by calling the handler directly, because gin cannot route a path with the
+		// segment absent — and the guard has to hold for a caller that reaches the handler
+		// by any means, including a future route registration that forgets the parameter.
+		apiInstance, ds := newEventsAPIOverMockDatasource(t, nil)
+
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("isMasterKey", true)
+		c.Request = httptest.NewRequest(http.MethodPost, "/events/dead-letter//replay", nil)
+
+		apiInstance.ReplayDeadLetterEvent(c)
+
+		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMissingParameter)
+		assert.Contains(t, recorder.Body.String(), "event_id",
+			"the refusal must name the parameter that is missing")
+		assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds))
+	})
+
+	t.Run("a malformed identifier is a validation error and not a missing one", func(t *testing.T) {
+		// The two are different mistakes and the distinction is useful: "you did not send
+		// an id" and "what you sent cannot be an id" send an operator to different places.
+		router, ds := setupEventsRouter(t, nil)
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodPost, "/events/dead-letter/NOT-A-UUID/replay", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenValidation)
+		assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+			"an identifier that cannot be an event id must not reach the lookup: an "+
+				"uppercased spelling of a REAL event would otherwise miss the row and be "+
+				"reported as a nonexistent event")
+	})
+}
+
+// TestReplayEventResponse_IsTheShapeASuccessfulReplayReturns pins the success DTO at the
+// type level.
+//
+// A 200 from this endpoint cannot be produced without a broker, and a broker is
+// deliberately absent from every test in this file — the listing and the statistics must
+// work without one, and the replay's own no-broker refusal is asserted above. The success
+// path is exercised end to end in the root package against a real broker; what belongs
+// here is the CONTRACT of the body that path returns, because that contract is declared in
+// api/model and a client is written against it.
+//
+// Status is omitempty and the other three are not, which is the shape a client must handle:
+// the event id, the ORIGINAL topic and the acknowledgement instant are always present.
+func TestReplayEventResponse_IsTheShapeASuccessfulReplayReturns(t *testing.T) {
+	replayedAt := time.Date(2026, time.May, 6, 7, 8, 9, 0, time.UTC)
+	eventID := uuid.NewString()
+
+	body, err := json.Marshal(model.ReplayEventResponse{
+		EventID:    eventID,
+		Topic:      deadLetterFixtureTopic,
+		Status:     string(coremodel.PublishStatusDispatched),
+		ReplayedAt: replayedAt,
+	})
+	require.NoError(t, err)
+
+	var decoded map[string]interface{}
+	require.NoError(t, json.Unmarshal(body, &decoded))
+
+	assert.Equal(t, eventID, decoded["event_id"],
+		"the id is UNCHANGED by a replay, which is what lets a subscriber deduplicating on "+
+			"event_id absorb the copy")
+	assert.Equal(t, deadLetterFixtureTopic, decoded["topic"],
+		"the ORIGINAL category topic the event went back to, never the dead-letter topic it "+
+			"was listed from")
+	assert.Equal(t, string(coremodel.PublishStatusDispatched), decoded["status"])
+	assert.Equal(t, replayedAt.Format(time.RFC3339), decoded["replayed_at"],
+		"instants on this surface are RFC3339, matching the envelope's occurred_at")
+
+	// The dead-letter topic must not be what a client is told to reason about, and the
+	// failure metadata has no place on a success.
+	assert.NotContains(t, string(body), ".dlt")
+	assert.NotContains(t, string(body), "failure")
+
+	// Status is the only optional field: a handler with nothing more specific to add than
+	// the 200 itself omits it rather than reporting an empty string.
+	withoutStatus, err := json.Marshal(model.ReplayEventResponse{
+		EventID:    eventID,
+		Topic:      deadLetterFixtureTopic,
+		ReplayedAt: replayedAt,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, string(withoutStatus), "status")
+}
+
+// eventsStatsCounts is a per-status census with a DISTINCT value for every status.
+//
+// Distinct on purpose: with two statuses sharing a number, a projection that reads the
+// wrong key still produces the right answer and the test passes on a bug.
+var eventsStatsCounts = map[string]int64{
+	coremodel.EventOutboxStatusPending:        11,
+	coremodel.EventOutboxStatusProcessing:     22,
+	coremodel.EventOutboxStatusWebhookPending: 33,
+	coremodel.EventOutboxStatusDispatched:     44,
+	coremodel.EventOutboxStatusFailed:         55,
+	coremodel.EventOutboxStatusDeadLettered:   66,
+	coremodel.EventOutboxStatusReplaying:      77,
+}
+
+// expectEventsStatsCensus programs the two producer-atomicity reads the statistics take.
+//
+// They are separate from the per-status counts because they answer a different question:
+// an outstanding INTENT is an event that is OWED but not yet written, and it is invisible
+// to a per-status count of the outbox because the row does not exist yet.
+//
+// Parameters:
+//   - ds *mocks.MockDataSource: the datasource to program.
+//   - handoffs map[string]int64: the balance-monitor handoff census.
+//   - batches int: how many bulk batches have not reported an outcome.
+//   - oldest *time.Time: when the oldest of those began, or nil.
+func expectEventsStatsCensus(
+	ds *mocks.MockDataSource,
+	handoffs map[string]int64,
+	batches int,
+	oldest *time.Time,
+) {
+	ds.On("CountBalanceMonitorHandoffByStatus", mock.Anything).Return(handoffs, nil).Once()
+	ds.On("CountUnfinalizedBulkTransactionBatches", mock.Anything, mock.Anything).
+		Return(batches, oldest, nil).Once()
+}
+
+// eventsStatsResponse issues a statistics request and decodes the DTO.
+//
+// Parameters:
+//   - t *testing.T: the test, failed on a non-200 or an undecodable body.
+//   - router *gin.Engine: the router under test.
+//   - query string: the query string WITHOUT the leading "?", or "" for none.
+//
+// Returns:
+//   - model.EventOutboxStatsResponse: the decoded statistics.
+//   - map[string]json.RawMessage: the raw body, for asserting a field is ABSENT rather
+//     than zero — which the typed DTO cannot distinguish.
+func eventsStatsResponse(
+	t *testing.T,
+	router *gin.Engine,
+	query string,
+) (model.EventOutboxStatsResponse, map[string]json.RawMessage) {
+	t.Helper()
+
+	target := "/events/stats"
+	if query != "" {
+		target += "?" + query
+	}
+
+	recorder := eventsKeyedRequest(t, router, http.MethodGet, target, eventsMockMasterKey)
+	require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+	var statistics model.EventOutboxStatsResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &statistics),
+		"body: %s", recorder.Body.String())
+
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &raw))
+
+	return statistics, raw
+}
+
+// TestGetEventOutboxStats_ReportsThePerStatusCountsTheReconciliationIsBuiltOn is the
+// outbox half of acceptance criterion V-2.
+//
+// The daily zero-loss reconciliation the operations runbook describes compares these
+// counts against the broker's own records. Every status therefore has to be reported and
+// reported from the right key: a projection that read `failed` where it meant
+// `dead_lettered` would understate the events that reached a dead-letter topic and
+// overstate the ones whose dead-letter write is still owed, and the verdict drawn from
+// those two numbers is the whole point of the endpoint.
+//
+// The census values are distinct per status so a mis-keyed projection cannot pass.
+func TestGetEventOutboxStats_ReportsThePerStatusCountsTheReconciliationIsBuiltOn(t *testing.T) {
+	oldestBatch := time.Date(2026, time.June, 7, 8, 9, 10, 0, time.UTC)
+
+	router, ds := setupEventsRouter(t, nil)
+	ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+		Return(eventsStatsCounts, nil).Once()
+	expectEventsStatsCensus(ds, map[string]int64{
+		coremodel.OutboxStatusPending:    3,
+		coremodel.OutboxStatusProcessing: 4,
+		coremodel.OutboxStatusCompleted:  5,
+		coremodel.OutboxStatusFailed:     6,
+	}, 7, &oldestBatch)
+
+	statistics, raw := eventsStatsResponse(t, router, "")
+
+	assert.Equal(t, int64(11), statistics.Pending)
+	assert.Equal(t, int64(22), statistics.Processing)
+	assert.Equal(t, int64(33), statistics.WebhookPending,
+		"the legacy leg's outstanding rows are reported separately; folding them into "+
+			"dispatched would hide the dual-delivery backlog")
+	assert.Equal(t, int64(44), statistics.Dispatched)
+	assert.Equal(t, int64(55), statistics.Failed,
+		"failed is the retry budget being spent, and the dead-letter write may still be owed")
+	assert.Equal(t, int64(66), statistics.DeadLettered,
+		"dead_lettered is the event having additionally reached its .dlt sibling")
+	assert.Equal(t, int64(77), statistics.Replaying)
+
+	// THE PRODUCER-ATOMICITY CENSUS. An outstanding intent is an event that is OWED, and
+	// it is invisible to the per-status counts because its row does not exist yet — so
+	// omitting it would make the reconciliation look complete while events were still
+	// unwritten.
+	require.NotNil(t, statistics.ProducerAtomicity,
+		"the census must be reported when it can be read")
+	assert.Equal(t, int64(3), statistics.ProducerAtomicity.MonitorHandoffPending)
+	assert.Equal(t, int64(4), statistics.ProducerAtomicity.MonitorHandoffProcessing)
+	assert.Equal(t, int64(5), statistics.ProducerAtomicity.MonitorHandoffCompleted)
+	assert.Equal(t, int64(6), statistics.ProducerAtomicity.MonitorHandoffFailed)
+	assert.Equal(t, int64(7), statistics.ProducerAtomicity.UnfinalizedBatches)
+	require.NotNil(t, statistics.ProducerAtomicity.OldestUnfinalizedBatchAt)
+	assert.True(t, oldestBatch.Equal(*statistics.ProducerAtomicity.OldestUnfinalizedBatchAt))
+
+	assert.False(t, statistics.GeneratedAt.IsZero(),
+		"the snapshot instant is what an operator correlates the counts against")
+
+	// GRACEFUL DEGRADATION, ASSERTED EXPLICITLY. No broker is configured — the legitimate
+	// steady state every deployment ran in before this pipeline existed — so the counts are
+	// returned with 200, offsets_complete is false, and the offset keys are OMITTED rather
+	// than emitted as nulls a reconciliation script would have to special-case.
+	assert.False(t, statistics.OffsetsComplete,
+		"with no broker there is no broker side, so the reconciliation is not complete")
+	assert.NotContains(t, raw, "topic_end_offsets",
+		"an unmeasured offset map must be absent, not null: a script cannot tell a measured "+
+			"empty map from an unmeasured one otherwise")
+	assert.NotContains(t, raw, "reconciliation",
+		"and no verdict may be reported when only one side of it was measured")
+	assert.NotContains(t, raw, "offsets_measured_at")
+	assert.Nil(t, statistics.OffsetsMeasuredAt)
+	assert.Empty(t, statistics.MissingTopics)
+
+	ds.AssertExpectations(t)
+}
+
+// TestGetEventOutboxStats_MeasuresTheWindowTheCallerAsked pins the parameter that was once
+// accepted and then silently discarded.
+//
+// `window` is in the accepted set, so `?window=15m` is not refused as unknown — and until
+// it was actually read, it was thrown away: an operator investigating a twenty-minute
+// incident received a day's counts and nothing in the response said so. Silently answering
+// a different question than the one asked is the worst of the three possible behaviours,
+// worse than refusing.
+//
+// The assertion is on the instant the REPOSITORY received, because that is the only place
+// the difference is visible: `window_seconds` in the response could be rendered from the
+// request while the query behind it still read a day.
+func TestGetEventOutboxStats_MeasuresTheWindowTheCallerAsked(t *testing.T) {
+	for name, tt := range map[string]struct {
+		query   string
+		window  time.Duration
+		seconds int64
+	}{
+		"no window takes the daily default the runbook uses": {"", 24 * time.Hour, 86400},
+		"an incident-sized window is honoured":               {"window=15m", 15 * time.Minute, 900},
+		"a whole-second window is honoured":                  {"window=90s", 90 * time.Second, 90},
+		"the weekly ceiling is honoured":                     {"window=168h", 7 * 24 * time.Hour, 604800},
+	} {
+		t.Run(name, func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+				Return(eventsStatsCounts, nil).Once()
+			expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+			before := time.Now().UTC()
+			statistics, _ := eventsStatsResponse(t, router, tt.query)
+			after := time.Now().UTC()
+
+			var since []time.Time
+			for _, call := range ds.Calls {
+				if call.Method != "CountEventOutboxByStatus" {
+					continue
+				}
+				instant, ok := call.Arguments.Get(1).(time.Time)
+				require.True(t, ok, "the count is bounded by an instant")
+				since = append(since, instant)
+			}
+			require.Len(t, since, 1, "the outbox is counted exactly once per request")
+
+			// The window has to reach the QUERY, not merely the response. Bracketed against
+			// the wall clock either side of the request rather than compared to a fixed
+			// instant, so this cannot flake on a slow machine while still failing outright
+			// if the default were substituted for the requested window.
+			assert.False(t, since[0].Before(before.Add(-tt.window).Add(-5*time.Second)),
+				"the count must be bounded by the window the caller asked for; %s is earlier "+
+					"than %s allows", since[0], tt.window)
+			assert.False(t, since[0].After(after.Add(-tt.window).Add(5*time.Second)),
+				"the count must not be bounded by a SHORTER window than asked for either; %s "+
+					"is later than %s allows", since[0], tt.window)
+
+			assert.Equal(t, tt.seconds, statistics.WindowSeconds,
+				"the response must report the interval it measured, so an operator can check "+
+					"the counts against the window they meant")
+			require.NotNil(t, statistics.WindowStart)
+			assert.True(t, since[0].Equal(*statistics.WindowStart),
+				"and the reported window start must be the one the query used, or the two "+
+					"halves of the answer describe different intervals")
+
+			ds.AssertExpectations(t)
+		})
+	}
+
+	for name, query := range map[string]string{
+		"a window that is not a duration": "window=lastweek",
+		"a zero window":                   "window=0s",
+		"a negative window":               "window=-1h",
+		"beyond the weekly ceiling":       "window=169h",
+		"a sub-second window":             "window=500ms",
+	} {
+		t.Run(name+" is refused before the count", func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+
+			recorder := eventsKeyedRequest(t, router,
+				http.MethodGet, "/events/stats?"+query, eventsMockMasterKey)
+
+			assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenValidation)
+			assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+				"an unusable window must be refused before the outbox is read")
+		})
+	}
+}
+
+// TestGetEventOutboxStats_OmitsTheProducerAtomicityCensusRatherThanReportingZeros is the
+// degradation rule for the one reading that is allowed to fail.
+//
+// Reporting zeros would say the opposite of the truth. An outstanding monitor handoff is a
+// balance movement whose monitor conditions have not been judged yet; "zero pending" is
+// exactly the reassurance an operator must not be given when the figure could not be read
+// at all. Omission is the honest answer, and the counts around it are still worth
+// returning.
+func TestGetEventOutboxStats_OmitsTheProducerAtomicityCensusRatherThanReportingZeros(t *testing.T) {
+	t.Run("when the handoff census cannot be read", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+			Return(eventsStatsCounts, nil).Once()
+		ds.On("CountBalanceMonitorHandoffByStatus", mock.Anything).
+			Return(nil, errors.New("blnk: the handoff table could not be read")).Once()
+
+		statistics, raw := eventsStatsResponse(t, router, "")
+
+		assert.Nil(t, statistics.ProducerAtomicity)
+		assert.NotContains(t, raw, "producer_atomicity",
+			"an unread census must be ABSENT; a zeroed one asserts that nothing is outstanding")
+		assert.Equal(t, int64(11), statistics.Pending,
+			"and the counts that WERE read must still be reported")
+
+		// The second census read must not have been attempted after the first failed:
+		// a partial answer is not published.
+		ds.AssertNotCalled(t, "CountUnfinalizedBulkTransactionBatches", mock.Anything, mock.Anything)
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("when the bulk-batch census cannot be read", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+			Return(eventsStatsCounts, nil).Once()
+		ds.On("CountBalanceMonitorHandoffByStatus", mock.Anything).
+			Return(map[string]int64{coremodel.OutboxStatusPending: 2}, nil).Once()
+		ds.On("CountUnfinalizedBulkTransactionBatches", mock.Anything, mock.Anything).
+			Return(0, nil, errors.New("blnk: the batch table could not be read")).Once()
+
+		statistics, raw := eventsStatsResponse(t, router, "")
+
+		assert.Nil(t, statistics.ProducerAtomicity,
+			"half a census is not a census: the handoff figures are dropped with the batches "+
+				"rather than reported beside a missing half")
+		assert.NotContains(t, raw, "producer_atomicity")
+		assert.Equal(t, int64(66), statistics.DeadLettered)
+
+		ds.AssertExpectations(t)
+	})
+}
+
+// TestGetEventOutboxStats_AnswersATypedErrorWhenTheOutboxCannotBeRead is the one reading
+// whose failure is NOT tolerable.
+//
+// The per-status counts are the outbox side of the reconciliation. Without them there is
+// nothing to reconcile, so the endpoint refuses rather than returning a body that looks
+// like an answer — and it refuses with a sanitized message, because a PostgreSQL error
+// renders with the schema, table, constraint, source file and routine that produced it.
+func TestGetEventOutboxStats_AnswersATypedErrorWhenTheOutboxCannotBeRead(t *testing.T) {
+	driverText := `pq: permission denied for table event_outbox (SQLSTATE 42501) in aclchk.c:2843`
+
+	router, ds := setupEventsRouter(t, nil)
+	ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+		Return(nil, errors.New(driverText)).Once()
+
+	recorder := eventsKeyedRequest(t, router, http.MethodGet, "/events/stats", eventsMockMasterKey)
+
+	assertErrorCode(t, recorder, http.StatusInternalServerError, apierror.ErrGenInternal)
+	assert.Equal(t, sanitizedInternalMessage, eventsErrorDetail(t, recorder).Message)
+
+	body := recorder.Body.String()
+	for _, leak := range []string{"pq:", "SQLSTATE", "aclchk.c", "permission denied"} {
+		assert.NotContains(t, body, leak, "the driver's own text must not reach a client: %q", leak)
+	}
+
+	ds.AssertExpectations(t)
+}
+
+// TestGetEventOutboxStats_HonoursTheThreeOffsetPostures pins include_offsets.
+//
+// The three postures exist because "the broker could not be read" means different things
+// to different callers, and guessing which is wrong in both directions.
+//
+//	absent   best effort. The runbook's daily check uses this: it wants the verdict when
+//	         it can have it and the counts when it cannot.
+//	true     required. The caller asked for the half of the reconciliation that is
+//	         missing, so a failure is a 503 rather than a quietly halved answer.
+//	false    skipped. No broker round trip at all.
+//
+// An unrecognised value is refused rather than read as false: a caller would otherwise
+// receive offsets_complete=false for a reason they cannot see and read a missing verdict as
+// an unreachable broker.
+func TestGetEventOutboxStats_HonoursTheThreeOffsetPostures(t *testing.T) {
+	t.Run("required offsets with no broker is a 503 rather than a halved answer", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+			Return(eventsStatsCounts, nil).Once()
+		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/stats?include_offsets=true", eventsMockMasterKey)
+
+		assertErrorCode(t, recorder, http.StatusServiceUnavailable, apierror.ErrKafkaUnavailable)
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("skipped offsets answer from PostgreSQL alone", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+			Return(eventsStatsCounts, nil).Once()
+		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+		statistics, raw := eventsStatsResponse(t, router, "include_offsets=false")
+
+		assert.Equal(t, int64(44), statistics.Dispatched)
+		assert.False(t, statistics.OffsetsComplete)
+		assert.NotContains(t, raw, "topic_end_offsets")
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("best effort with no broker is a 200 with the counts", func(t *testing.T) {
+		// The posture the runbook's daily check runs in, and the posture every
+		// broker-less deployment runs in permanently.
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+			Return(eventsStatsCounts, nil).Once()
+		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+		statistics, _ := eventsStatsResponse(t, router, "")
+
+		assert.Equal(t, int64(66), statistics.DeadLettered,
+			"an unreachable broker must not cost the operator the outbox counts as well")
+		ds.AssertExpectations(t)
+	})
+
+	// The accepted vocabulary here is narrower than include_count's on purpose: this
+	// parameter selects a POSTURE rather than a boolean, and "1" or "t" would have to be
+	// guessed into one of three. So only "true" and "false" are honoured — case and
+	// surrounding whitespace aside — and everything else is refused rather than read as a
+	// posture the caller did not name.
+	for _, value := range []string{"maybe", "1", "0", "yes", "t"} {
+		t.Run("include_offsets="+value+" is refused", func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+
+			recorder := eventsKeyedRequest(t, router,
+				http.MethodGet, "/events/stats?include_offsets="+value, eventsMockMasterKey)
+
+			assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenValidation)
+			assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+				"an unusable posture must be refused before the counts are taken")
+		})
+	}
 }
