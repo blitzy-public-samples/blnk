@@ -1054,6 +1054,20 @@ SUMMARY_TOPICS=()
 # Reported in the summary so a deliberate refusal is visible rather than only warned about
 # in passing, since a throughput limit nobody notices is one nobody fixes.
 SUMMARY_GROWTH_REFUSED=()
+# What this run actually DID to the catalogue, as opposed to what the catalogue now looks
+# like. Both are needed and they answer different questions: the geometry table says the
+# layout is correct, and these say whether it was correct when the run started.
+#
+# Without them a run that silently rebuilt a lost catalogue was indistinguishable from a run
+# that found everything in place - both printed eight topics with the right partition counts
+# and nothing else. That distinction is the whole value of the output as an audit trail, and
+# it is what the daily outbox-versus-offset reconciliation in docs/kafka-operations.md needs:
+# a topic recreated between two runs has offsets that start again from zero.
+#
+# The vocabulary is event_admin.go's, deliberately - created / grown / unchanged - so the
+# shell provisioner and the Go assurance path can be read against each other.
+SUMMARY_CREATED=()
+SUMMARY_GROWN=()
 SUMMARY_PARTITIONS=()
 SUBSCRIBER_TOPICS=()
 SUBSCRIBER_USER=""
@@ -2953,7 +2967,33 @@ require_topic_geometry() {
 # rather than what was requested.
 ensure_topic() {
     local topic="$1" target="$2"
-    local output geometry current replication
+    local output geometry current replication existed_before
+
+    # PROBED BEFORE THE CREATE, so this run can say what it actually DID.
+    #
+    # --if-not-exists makes creation idempotent by making it indistinguishable: an existing
+    # topic and a freshly created one both leave exit 0 and both fall into the same
+    # reconciliation below. Without this probe the equal-partition arm reported EVERY topic as
+    # "already correct", including one it had just created seconds earlier - so a bring-up whose
+    # catalogue had been lost and silently rebuilt produced output identical to one where
+    # nothing had changed, and the run could not be used as evidence for the outbox-versus-
+    # offset reconciliation in docs/kafka-operations.md.
+    #
+    # An empty answer means the topic is absent. It can also mean the geometry is momentarily
+    # unreadable, and that ambiguity is safe HERE and only here: the value is used for wording
+    # alone, never for a decision, and require_topic_geometry below refuses the run outright if
+    # the geometry cannot be read after the create. So the worst case is one line that says
+    # "created" about a topic that already existed - while the geometry it then reports is the
+    # broker's own, verified either way. The reverse mistake, silence about a real creation, is
+    # the one that costs an operator the audit trail.
+    #
+    # event_admin.go's EnsureTopics resolves this the same way, probing partition counts into
+    # partitionsBefore ahead of its create pass and reporting created/grown/unchanged from it.
+    if [[ -z "$(topic_geometry "$topic")" ]]; then
+        existed_before="no"
+    else
+        existed_before="yes"
+    fi
 
     # --if-not-exists is Kafka's own creation idempotency: an existing topic is a no-op with
     # exit 0, whatever its partition count, so the reconciliation below is reached either way.
@@ -3029,6 +3069,7 @@ ensure_topic() {
         fi
 
         if [[ "$grow_permitted" == "yes" ]]; then
+            SUMMARY_GROWN+=("$topic")
             log "growing '${topic}' from ${current} to ${target} partitions"
             if ! output="$(kafka_topics --alter --topic "$topic" --partitions "$target" 2>&1)"; then
                 # Re-read before deciding this is a failure. Two provisioners racing each other -
@@ -3060,7 +3101,11 @@ ensure_topic() {
             fi
         fi
     elif ((10#$current == 10#$target)); then
-        log "'${topic}' exists with ${current} partitions, already correct"
+        if [[ "$existed_before" == "no" ]]; then
+            log "created '${topic}' with ${current} partitions"
+        else
+            log "'${topic}' exists with ${current} partitions, already correct"
+        fi
     else
         # More partitions than configured. Left alone, reported, and NOT an error - matching
         # event_admin.go, which counts this as a refused shrink rather than a failure.
@@ -3079,6 +3124,10 @@ ensure_topic() {
     fi
 
     require_topic_replication "$topic" "$replication"
+
+    if [[ "$existed_before" == "no" ]]; then
+        SUMMARY_CREATED+=("$topic")
+    fi
 
     SUMMARY_TOPICS+=("$topic")
     SUMMARY_PARTITIONS+=("$current")
@@ -3135,11 +3184,20 @@ ensure_topics() {
     SUMMARY_TOPICS=()
     SUMMARY_PARTITIONS=()
     SUMMARY_REPLICATION=()
+    SUMMARY_CREATED=()
+    SUMMARY_GROWN=()
     for topic in "${ALL_TOPICS[@]}"; do
         ensure_topic "$topic" "$TARGET_PARTITIONS"
     done
 
-    ok "all ${#SUMMARY_TOPICS[@]} topics are present with a verified geometry"
+    # Counts, not just a total, so the line records what this run CHANGED. "created=0 grown=0
+    # unchanged=8" is a catalogue that was already right; "created=8" on a deployment that has
+    # been publishing for weeks says the catalogue was lost and rebuilt, and every offset with
+    # it. The same three words in the same order as event_admin.go's assurance log.
+    ok "all ${#SUMMARY_TOPICS[@]} topics are present with a verified geometry" \
+        "created   : ${#SUMMARY_CREATED[@]}${SUMMARY_CREATED[*]:+ (${SUMMARY_CREATED[*]})}" \
+        "grown     : ${#SUMMARY_GROWN[@]}${SUMMARY_GROWN[*]:+ (${SUMMARY_GROWN[*]})}" \
+        "unchanged : $((${#SUMMARY_TOPICS[@]} - ${#SUMMARY_CREATED[@]} - ${#SUMMARY_GROWN[@]}))"
 }
 
 # ---------------------------------------------------------------------------------------

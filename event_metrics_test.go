@@ -2415,6 +2415,196 @@ func prometheusRuleMounts(t *testing.T, deployment map[string]interface{}) map[s
 	return projected
 }
 
+// TestPrometheusDiscovery_ShipsBothHalvesTogether binds the Kubernetes scrape configuration
+// to the identity it needs in order to work.
+//
+// # What was wrong
+//
+// prometheus-configmap.yaml moved both scrape jobs from static Service targets to
+// `kubernetes_sd_configs: role: pod`, and prometheus-rbac.yaml added the ServiceAccount, Role
+// and RoleBinding that discovery needs — but prometheus-deployment.yaml never named that
+// ServiceAccount, and it set `automountServiceAccountToken: false`. Three files, each correct
+// in isolation, adding up to a Prometheus that discovered nothing:
+//
+//	level=ERROR msg="Cannot create service discovery" err="open
+//	  /var/run/secrets/kubernetes.io/serviceaccount/token: no such file or directory"
+//
+// The pod was 1/1 Running, /-/ready was green, /api/v1/rules listed every rule, and
+// /api/v1/targets was empty. No series was recorded, so all fourteen rules — including the
+// dead-letter-age and consumer-lag rules acceptance criterion V-4 names — sat permanently
+// unable to fire, and an alert that cannot fire looks exactly like a system with nothing
+// wrong.
+//
+// # Why a test rather than a comment
+//
+// Every file involved already documents the requirement in prose: the ConfigMap says the
+// configuration "REQUIRES prometheus-rbac.yaml AND serviceAccountName on the Prometheus
+// Deployment", and prometheus-rbac.yaml says applying one without the other "yields a
+// monitoring stack that looks correct and collects nothing". Both were accurate and neither
+// was enforced. This test is what makes the halves inseparable, and it asserts the chain
+// end to end — Deployment names the ServiceAccount, the ServiceAccount exists, the
+// RoleBinding binds THAT subject to a Role that can actually list pods — because a break
+// anywhere along it produces the identical silent outcome.
+//
+// It is CONDITIONAL on discovery being in use: a deployment that reverts to static targets
+// needs none of this, and the test then only holds it to the least-privilege posture the
+// other workloads keep.
+func TestPrometheusDiscovery_ShipsBothHalvesTogether(t *testing.T) {
+	root := moduleRootDir(t)
+	manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
+
+	configMap := readYAMLFile(t, filepath.Join(manifests, "prometheus-configmap.yaml"))
+	data, ok := configMap["data"].(map[string]interface{})
+	require.True(t, ok, "the ConfigMap must carry a data section")
+
+	embeddedText, ok := data["prometheus.yml"].(string)
+	require.True(t, ok, "the ConfigMap must carry a prometheus.yml key")
+
+	var embedded map[string]interface{}
+	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &embedded),
+		"the embedded prometheus.yml must be valid YAML")
+
+	jobs, ok := embedded["scrape_configs"].([]interface{})
+	require.True(t, ok, "the embedded configuration must declare scrape jobs")
+
+	discoveringJobs := []string{}
+	for _, entry := range jobs {
+		job, isMap := entry.(map[string]interface{})
+		require.True(t, isMap)
+
+		if _, discovers := job["kubernetes_sd_configs"]; discovers {
+			name, _ := job["job_name"].(string)
+			discoveringJobs = append(discoveringJobs, name)
+		}
+	}
+
+	podSpec := k8sPodSpec(t, root, "prometheus-deployment.yaml")
+
+	if len(discoveringJobs) == 0 {
+		// Static targets need no API access, so the least-privilege default applies and
+		// the rest of this test has nothing to hold.
+		assert.Equal(t, false, podSpec["automountServiceAccountToken"],
+			"no scrape job discovers through the Kubernetes API, so the Prometheus pod "+
+				"must not mount a ServiceAccount token")
+
+		return
+	}
+
+	serviceAccount, named := podSpec["serviceAccountName"].(string)
+	require.Truef(t, named,
+		"jobs %v discover their targets through the Kubernetes API, so "+
+			"prometheus-deployment.yaml must name a serviceAccountName. Without one the pod "+
+			"runs as the namespace's `default` account, which prometheus-rbac.yaml's "+
+			"RoleBinding does not bind — the API server answers 403, discovery finds nothing, "+
+			"and Prometheus starts cleanly with an empty /api/v1/targets", discoveringJobs)
+	require.NotEmpty(t, serviceAccount, "serviceAccountName must not be empty")
+
+	assert.Equalf(t, true, podSpec["automountServiceAccountToken"],
+		"jobs %v discover through the Kubernetes API, so the token must be mounted. Naming "+
+			"the ServiceAccount is not sufficient on its own: with automount false there is "+
+			"no token file for the client to read and discovery fails at startup with "+
+			"`Cannot create service discovery`, after which the pod serves normally and "+
+			"scrapes nothing", discoveringJobs)
+
+	// The identity the Deployment names has to be the identity the RBAC file grants. These
+	// are three separate objects in a file nothing else references, so each link is
+	// asserted rather than assumed.
+	rbac := readYAMLDocuments(t, filepath.Join(manifests, "prometheus-rbac.yaml"))
+
+	var (
+		accountFound bool
+		roles        = map[string][]interface{}{}
+		bindings     []map[string]interface{}
+	)
+
+	for _, document := range rbac {
+		metadata, isMap := document["metadata"].(map[string]interface{})
+		require.True(t, isMap, "every RBAC document must carry metadata")
+
+		name, _ := metadata["name"].(string)
+		assert.Equal(t, "blnk", metadata["namespace"],
+			"RBAC object %q must live in the blnk namespace alongside the pod it grants", name)
+
+		switch document["kind"] {
+		case "ServiceAccount":
+			if name == serviceAccount {
+				accountFound = true
+			}
+		case "Role":
+			rules, _ := document["rules"].([]interface{})
+			roles[name] = rules
+		case "RoleBinding":
+			bindings = append(bindings, document)
+		}
+	}
+
+	require.Truef(t, accountFound,
+		"prometheus-deployment.yaml names ServiceAccount %q, but prometheus-rbac.yaml "+
+			"declares no such account. Kubernetes admits the pod anyway and the API server "+
+			"then refuses its requests, so the symptom is an empty /api/v1/targets rather "+
+			"than a failed apply", serviceAccount)
+
+	var boundRole string
+	for _, binding := range bindings {
+		subjects, isList := binding["subjects"].([]interface{})
+		require.True(t, isList, "a RoleBinding must declare subjects")
+
+		for _, entry := range subjects {
+			subject, isMap := entry.(map[string]interface{})
+			require.True(t, isMap)
+
+			if subject["kind"] == "ServiceAccount" && subject["name"] == serviceAccount {
+				assert.Equal(t, "blnk", subject["namespace"],
+					"the RoleBinding subject must name the blnk namespace explicitly")
+
+				roleRef, isMap := binding["roleRef"].(map[string]interface{})
+				require.True(t, isMap, "a RoleBinding must declare a roleRef")
+				boundRole, _ = roleRef["name"].(string)
+			}
+		}
+	}
+
+	require.NotEmptyf(t, boundRole,
+		"no RoleBinding in prometheus-rbac.yaml binds ServiceAccount %q. The account exists "+
+			"and the Role exists, and without the binding between them the API server still "+
+			"answers 403 — the one failure mode that leaves the deployment looking healthy",
+		serviceAccount)
+
+	rules, granted := roles[boundRole]
+	require.Truef(t, granted,
+		"the RoleBinding references Role %q, which prometheus-rbac.yaml does not declare",
+		boundRole)
+
+	// role: pod discovery performs an initial list and then maintains a watch, so a Role
+	// granting only list works once and then never notices a replacement pod — which under
+	// an HPA that replaces pods continuously is the same defect arriving slowly.
+	var podRule map[string]interface{}
+	for _, entry := range rules {
+		rule, isMap := entry.(map[string]interface{})
+		require.True(t, isMap)
+
+		resources, _ := rule["resources"].([]interface{})
+		for _, resource := range resources {
+			if resource == "pods" {
+				podRule = rule
+			}
+		}
+	}
+
+	require.NotNilf(t, podRule,
+		"Role %q must grant the `pods` resource: role: pod discovery reads pods and nothing "+
+			"else, and without the grant it finds no targets and reports no error", boundRole)
+
+	verbs, isList := podRule["verbs"].([]interface{})
+	require.True(t, isList, "the pod rule must declare verbs")
+	for _, verb := range []string{"get", "list", "watch"} {
+		assert.Containsf(t, verbs, verb,
+			"Role %q must grant %q on pods. All three are required: discovery lists once and "+
+				"then watches, so a Role without `watch` discovers the pods present at "+
+				"startup and never sees another one", boundRole, verb)
+	}
+}
+
 // TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot is the automated guard
 // the duplicated monitoring configuration was missing.
 //
@@ -3998,7 +4188,7 @@ func (r *collectorFakeRegistry) CountEventSubscribers(_ context.Context) (int64,
 // to matter, and the boolean could not distinguish one unmeasured subscriber from a thousand.
 //
 // So the shortfall is published as a metric, with the registry size beside it, and
-// ConsumerLagCoverageIncomplete fires on any non-zero value.
+// SubscriberLagCoverageIncomplete fires on any non-zero value.
 //
 // # Why each arm is asserted separately
 //
@@ -4037,7 +4227,7 @@ func TestEventMetricsCollector_PublishesHowMuchOfTheLagSignalIsMissing(t *testin
 			"890 subscribers have no lag series: 900 registered less the 10 the budget allowed")
 
 		assert.Equal(t, []int64{890}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons),
-			"the shortfall must reach the gauge ConsumerLagCoverageIncomplete evaluates")
+			"the shortfall must reach the gauge SubscriberLagCoverageIncomplete evaluates")
 		assert.Equal(t, []int64{900}, gauges.registered.values(),
 			"the registry size must accompany it, or 890 cannot be read as a proportion")
 
@@ -4270,7 +4460,7 @@ func TestRelayDefaults_AgreeWithTheCollector(t *testing.T) {
 			"declarations of one budget, and only this test keeps them equal")
 	assert.Equal(t, 200, DefaultSubscriberMetricsBudget,
 		"200 is the documented default in .env.example, blnk-config.yaml, docs/metrics.md and the "+
-			"ConsumerLagCoverageIncomplete remediation; changing it means changing all of them")
+			"SubscriberLagCoverageIncomplete remediation; changing it means changing all of them")
 
 	t.Run("the configured value is what the collector is wired with", func(t *testing.T) {
 		// cmd/server.go passes cfg.Relay.SubscriberMetricsBudget into WithSubscriberBudget.
@@ -4461,4 +4651,293 @@ func TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere(t *testing.T) {
 			})
 		}
 	})
+}
+
+// perTickByReason folds an ATTRIBUTED gauge's writes into one reason-to-value map per tick.
+//
+// perTickTotals answers "how much of the lag signal is missing"; this answers "and why", which
+// is the question the coverage alert's remediation branches on. They are separate helpers
+// because a total that is right for the wrong reasons is precisely the defect OBS-07 closed:
+// an operator sent to raise a measurement budget for a broker fault acts on the label, not on
+// the sum.
+//
+// Parameters:
+//   - t *testing.T: fails when the writes do not divide evenly into whole ticks, which would
+//     mean a reason was skipped and one tick's values would be read as another's.
+//   - reasons int: how many reason labels one tick writes.
+//
+// Returns:
+//   - []map[string]int64: one map per tick, in order, carrying every reason including zeros.
+func (g *collectorRecordedInt64Gauge) perTickByReason(t *testing.T, reasons int) []map[string]int64 {
+	t.Helper()
+
+	records := g.snapshot()
+	require.Zerof(t, len(records)%reasons,
+		"every tick must publish all %d reasons, zeros included; got %d writes", reasons, len(records))
+
+	ticks := []map[string]int64{}
+	for start := 0; start < len(records); start += reasons {
+		tick := map[string]int64{}
+		for _, record := range records[start : start+reasons] {
+			reason, ok := record.attributes["reason"]
+			require.Truef(t, ok, "every unmeasured write must carry its reason; %v does not",
+				record.attributes)
+			tick[reason] = record.value
+		}
+		ticks = append(ticks, tick)
+	}
+
+	return ticks
+}
+
+// TestEventMetricsCollector_AttributesEachCoverageGapToExactlyOneReason is OBS-07.
+//
+// # The defect this closes
+//
+// The shortfall was "registered minus the subscribers currently exported", which is the count of
+// registry rows with NO SERIES AT ALL — every one of them, whatever the cause. The reason map
+// then counted three of those populations again by name, so every explained gap was counted
+// TWICE and the aggregate exceeded the registry it is a subset of. Observed in ordinary
+// operation, with a healthy broker and no fault injection: three registered subscribers, one of
+// them freshly created with no authorised topics yet, exported unprovisioned=1 AND budget=1 —
+// two unmeasured subscribers out of three, for one gap — while the budget of 200 had 197
+// subscribers of headroom. Under a broker outage two registered subscribers exported
+// measure_failed=2 AND budget=2, a total of four against a registry of two.
+//
+// Two things broke as a result. SubscriberLagCoverageIncomplete's remediation branches on this
+// label, so 'budget' sent an operator to raise EVENT_METRICS_SUBSCRIBER_BUDGET for what was a
+// broker fault or an ordinary un-granted row; and the documented proportion query — unmeasured
+// over registered — read 200%.
+//
+// Every case below therefore asserts the per-reason attribution AND the invariant that makes the
+// gauge meaningful at all: the sum over reasons is never greater than the registry.
+func TestEventMetricsCollector_AttributesEachCoverageGapToExactlyOneReason(t *testing.T) {
+	t.Run("an unprovisioned subscriber is counted once, under its own reason", func(t *testing.T) {
+		// The QA-observed shape, and the natural state immediately after POST /subscribers:
+		// two measurable rows and one with no authorised topics yet.
+		gauges := captureCoverageGauges(t)
+
+		registry := &collectorFakeRegistry{rows: []model.EventSubscriber{
+			collectorSubscriber("blnk.transactions"),
+			collectorSubscriber("blnk.balances"),
+			collectorSubscriber(),
+		}}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(50)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		require.False(t, report.BudgetReached, "the budget must be nowhere near reached for this to mean anything")
+		require.Equal(t, int64(3), report.SubscribersRegistered)
+		require.Equal(t, 1, report.SubscribersSkipped, "the row with no topics is the skipped one")
+
+		tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+		require.Len(t, tick, 1)
+
+		assert.EqualValues(t, 1, tick[0][metrics.SubscribersUnmeasuredReasonUnprovisioned],
+			"the gap belongs to the row that has no topics to measure")
+		assert.Zero(t, tick[0][metrics.SubscribersUnmeasuredReasonBudget],
+			"and NOT to the budget, which had 49 subscribers of headroom: 'budget' is the label "+
+				"whose remediation is a configuration change, and it must not be attached to a gap "+
+				"configuration cannot close")
+		assert.EqualValues(t, 1, report.SubscribersUnmeasured,
+			"one unmeasured subscriber is one, not two")
+	})
+
+	t.Run("a broker outage attributes the whole gap to measure_failed", func(t *testing.T) {
+		// The second QA-observed shape. Both rows are measurable and the broker refuses both,
+		// so the registry is entirely unmeasured — for a reason no budget change can fix.
+		gauges := captureCoverageGauges(t)
+
+		registry := &collectorFakeRegistry{rows: []model.EventSubscriber{
+			collectorSubscriber("blnk.transactions"),
+			collectorSubscriber("blnk.balances"),
+		}}
+		admin := newCollectorFakeAdmin()
+		admin.err = errors.New("broker refused the offset fetch")
+
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, admin,
+		).WithSubscriberBudget(50)
+
+		// The refusals are REPORTED as well as counted, so Collect returns them joined. The
+		// coverage gauge is published either way, which is the property that matters here: a
+		// collection that failed must still say how much of the signal is missing.
+		report, err := collector.Collect(context.Background())
+		require.Error(t, err, "a refused measurement is reported to the caller, not swallowed")
+
+		require.Equal(t, int64(2), report.SubscribersRegistered)
+		require.Equal(t, 2, report.SubscribersFailed)
+
+		tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+		require.Len(t, tick, 1)
+
+		assert.EqualValues(t, 2, tick[0][metrics.SubscribersUnmeasuredReasonMeasureFailed])
+		assert.Zero(t, tick[0][metrics.SubscribersUnmeasuredReasonBudget],
+			"a broker or ACL fault must never be reported as a budget shortfall: the remedies are "+
+				"different and only one of them works")
+		assert.EqualValues(t, 2, report.SubscribersUnmeasured,
+			"two subscribers are unmeasured, not four")
+	})
+
+	t.Run("the budget keeps the residue it is genuinely responsible for", func(t *testing.T) {
+		// The widening must not empty the label of meaning. A registry larger than one tick can
+		// measure DOES have a rotation gap, and it belongs to 'budget' — alongside, not instead
+		// of, the rows this tick explained for itself.
+		gauges := captureCoverageGauges(t)
+
+		rows := []model.EventSubscriber{collectorSubscriber(), collectorSubscriber()}
+		for i := 0; i < 28; i++ {
+			rows = append(rows, collectorSubscriber("blnk.transactions"))
+		}
+		total := int64(900)
+
+		registry := &collectorFakeRegistry{rows: rows, total: &total}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(10)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		require.True(t, report.BudgetReached, "the fixture must actually reach the budget")
+		require.Equal(t, int64(900), report.SubscribersRegistered)
+		require.Equal(t, 2, report.SubscribersSkipped)
+
+		tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+		require.Len(t, tick, 1)
+
+		assert.EqualValues(t, 2, tick[0][metrics.SubscribersUnmeasuredReasonUnprovisioned])
+		assert.EqualValues(t, 890, tick[0][metrics.SubscribersUnmeasuredReasonBudget],
+			"900 registered less the 8 measured and the 2 explained: the rotation has not reached "+
+				"the rest, which is exactly what raising the budget fixes")
+		assert.EqualValues(t, 892, report.SubscribersUnmeasured,
+			"and the total is the sum of the two real populations, still inside the registry")
+	})
+
+	t.Run("a missing topic is attributed without inventing a budget gap", func(t *testing.T) {
+		// The shape that makes the floor load-bearing. A subscriber whose OTHER topics are
+		// measurable is both COVERED and explained as topic_missing, so the subtraction goes
+		// negative and a naive expression would report a negative or wrapped budget figure.
+		gauges := captureCoverageGauges(t)
+
+		registry := &collectorFakeRegistry{rows: []model.EventSubscriber{
+			collectorSubscriber("blnk.transactions", "blnk.balances"),
+			collectorSubscriber("blnk.identities"),
+		}}
+		admin := newCollectorFakeAdmin()
+		admin.missingTopics["blnk.balances"] = true
+
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, admin,
+		).WithSubscriberBudget(50)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		require.Equal(t, int64(2), report.SubscribersRegistered)
+		require.Equal(t, 1, report.SubscribersTopicMissing)
+		require.Equal(t, 2, report.SubscribersMeasured, "both rows were measured; one names an absent topic")
+
+		tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+		require.Len(t, tick, 1)
+
+		assert.EqualValues(t, 1, tick[0][metrics.SubscribersUnmeasuredReasonTopicMissing])
+		assert.Zero(t, tick[0][metrics.SubscribersUnmeasuredReasonBudget],
+			"the floor holds: a gap that is both covered and explained must not become a budget claim")
+		assert.EqualValues(t, 1, report.SubscribersUnmeasured)
+	})
+}
+
+// TestEventMetricsCollector_NeverReportsMoreUnmeasuredSubscribersThanExist states OBS-07 as the
+// invariant rather than as a set of cases, because that is the property the gauge's own
+// definition asserts and the one a future change would have to break to reintroduce the defect.
+//
+// blnk_kafka_subscribers_unmeasured is documented as "registered subscribers the last collection
+// did not measure lag for at all", so Σ(unmeasured) ≤ blnk_subscribers_registered holds BY
+// DEFINITION. It held for none of the mixed shapes below before the reasons stopped
+// double-counting, and the documented proportion query is unreadable without it.
+func TestEventMetricsCollector_NeverReportsMoreUnmeasuredSubscribersThanExist(t *testing.T) {
+	for name, build := range map[string]func() (*collectorFakeRegistry, *collectorFakeAdmin, int){
+		"every row unprovisioned": func() (*collectorFakeRegistry, *collectorFakeAdmin, int) {
+			return &collectorFakeRegistry{rows: []model.EventSubscriber{
+				collectorSubscriber(), collectorSubscriber(), collectorSubscriber(),
+			}}, newCollectorFakeAdmin(), 50
+		},
+		"a mix of unprovisioned and measurable rows": func() (*collectorFakeRegistry, *collectorFakeAdmin, int) {
+			return &collectorFakeRegistry{rows: []model.EventSubscriber{
+				collectorSubscriber("blnk.transactions"),
+				collectorSubscriber(),
+				collectorSubscriber("blnk.balances"),
+				collectorSubscriber(),
+			}}, newCollectorFakeAdmin(), 50
+		},
+		"every measurement refused": func() (*collectorFakeRegistry, *collectorFakeAdmin, int) {
+			admin := newCollectorFakeAdmin()
+			admin.err = errors.New("broker refused the offset fetch")
+
+			return &collectorFakeRegistry{rows: []model.EventSubscriber{
+				collectorSubscriber("blnk.transactions"), collectorSubscriber("blnk.balances"),
+			}}, admin, 50
+		},
+		"refusals beside unprovisioned rows": func() (*collectorFakeRegistry, *collectorFakeAdmin, int) {
+			admin := newCollectorFakeAdmin()
+			admin.err = errors.New("broker refused the offset fetch")
+
+			return &collectorFakeRegistry{rows: []model.EventSubscriber{
+				collectorSubscriber("blnk.transactions"), collectorSubscriber(),
+			}}, admin, 50
+		},
+		"missing topics beside unprovisioned rows": func() (*collectorFakeRegistry, *collectorFakeAdmin, int) {
+			admin := newCollectorFakeAdmin()
+			admin.missingTopics["blnk.balances"] = true
+
+			return &collectorFakeRegistry{rows: []model.EventSubscriber{
+				collectorSubscriber("blnk.transactions", "blnk.balances"),
+				collectorSubscriber("blnk.balances"),
+				collectorSubscriber(),
+			}}, admin, 50
+		},
+		"a budget smaller than the registry, with explained gaps inside it": func() (*collectorFakeRegistry, *collectorFakeAdmin, int) {
+			rows := []model.EventSubscriber{collectorSubscriber(), collectorSubscriber()}
+			for i := 0; i < 10; i++ {
+				rows = append(rows, collectorSubscriber("blnk.transactions"))
+			}
+			total := int64(60)
+
+			return &collectorFakeRegistry{rows: rows, total: &total}, newCollectorFakeAdmin(), 6
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			gauges := captureCoverageGauges(t)
+			registry, admin, budget := build()
+
+			collector := NewEventMetricsCollector(
+				newCollectorFakeOutbox(), registry, nil, admin,
+			).WithSubscriberBudget(budget)
+
+			// The error is deliberately not asserted either way: half of these shapes fail
+			// measurements and half do not, and the invariant is a property of the PUBLISHED
+			// gauge on every one of them — including, especially, the ticks that failed.
+			report, _ := collector.Collect(context.Background())
+
+			tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+			require.Len(t, tick, 1)
+
+			var exported int64
+			for _, value := range tick[0] {
+				assert.GreaterOrEqual(t, value, int64(0), "no reason may carry a negative count")
+				exported += value
+			}
+
+			assert.LessOrEqual(t, exported, report.SubscribersRegistered,
+				"Σ(unmeasured) must never exceed the registry it is a subset of; %d against %d "+
+					"means at least one gap was counted twice", exported, report.SubscribersRegistered)
+			assert.Equal(t, report.SubscribersUnmeasured, exported,
+				"and the report's total must be the exported sum, so the log line and the series "+
+					"cannot disagree about how much is missing")
+		})
+	}
 }

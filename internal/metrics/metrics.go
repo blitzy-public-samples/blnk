@@ -331,11 +331,14 @@ var EventCaptureToDispatchDuration metric.Float64Histogram
 // Attributes: topic, event_type
 var EventsDeadLetteredTotal metric.Int64Counter
 
-// The six gauges below are maintained by ONE production caller, the periodic
-// EventMetricsCollector in event_metrics.go, and by nothing else — the dead-letter age,
-// the consumer-lag pair, the outbox backlog and the two revocation gauges. That single
-// ownership is a correctness requirement rather than tidiness, for two reasons that apply
-// to every gauge in an exporter and to these six in particular.
+// EVERY GAUGE BELOW is maintained by ONE production caller, the periodic
+// EventMetricsCollector in event_metrics.go, and by nothing else — the dead-letter age, the
+// consumer-lag pair and its coverage gauges, the outbox backlog, the registry size, and the
+// revocation, orphan and settlement gauges. The set has grown as the subscriber lifecycle
+// did, so it is named by its OWNER rather than by a count that would drift the next time one
+// is added; what matters is that no other caller writes any of them. That single ownership is
+// a correctness requirement rather than tidiness, for two reasons that apply to every gauge in
+// an exporter and to these in particular.
 //
 // A gauge RETAINS ITS LAST VALUE until it is written again or the process restarts, so a
 // value recorded once at the moment something went wrong keeps alerting long after the

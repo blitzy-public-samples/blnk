@@ -1717,3 +1717,119 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 			"and still claims no verified exclusivity: reading a row observes no broker grant")
 	})
 }
+
+// TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation is SEC-01's API half.
+//
+// # The gap this closes
+//
+// The declaration's negative facts were complete: partition_key_prefix_enforced false,
+// not_enforced_by naming the key dimension, client_side_key_filtering_required saying whose job
+// the narrowing is. What none of them said is what to do INSTEAD, and the answer existed only
+// outside the response — in docs/kafka-operations.md, in a WARNING in Blnk's own log, and in the
+// SubscriberKeyScopeGuidance constant, which was declared and referenced by nothing at all.
+//
+// A runtime security review reproduced the consequence: a subscriber granted blnk.transactions
+// read tens of thousands of records whose keys fell outside its recorded prefix, exactly as this
+// declaration says it would, while a reader of the requirement that promised key-prefix scoping
+// had no way to learn from any response how to obtain a boundary that is actually kept. The two
+// readings could not be reconciled from the API alone.
+//
+// So the remedy now travels in the same object as the limitation. This asserts it is there, that
+// it is the shared constant rather than a per-handler paraphrase, and that it is present for
+// every subscriber rather than only for the key-scoped ones — a remedy that appeared only beside
+// a prefix would let a reader of any other subscriber conclude the key dimension is enforced for
+// them.
+func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing.T) {
+	subscriberID := "acme_prod"
+	topics := []string{"blnk.transactions"}
+
+	t.Run("the remedy is the shared constant, not a paraphrase", func(t *testing.T) {
+		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+
+		assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, declared.Guidance,
+			"one sentence, from one constant, so the registry view and the credential view cannot "+
+				"give different advice about the same limitation")
+		assert.NotEmpty(t, declared.Guidance,
+			"an empty remedy is the state this field was added to end: the limitation was stated "+
+				"and the answer to it was not")
+	})
+
+	t.Run("the remedy names what IS enforced, so it is actionable", func(t *testing.T) {
+		// The value of a remedy is that it points somewhere real. authorized_topics is the
+		// dimension the broker does evaluate, so guidance that did not name it would restate
+		// the problem rather than answer it.
+		assert.Contains(t, apimodel.SubscriberKeyScopeGuidance, "authorized_topics",
+			"the remedy must name the dimension the broker actually enforces")
+		assert.Contains(t, apimodel.SubscriberKeyScopeGuidance, "readable in full",
+			"and must state the exposure plainly, because a granted topic is read whole")
+	})
+
+	t.Run("it is present whether or not a prefix is recorded", func(t *testing.T) {
+		// It describes what Kafka's authorizer can evaluate, which is not a property of this
+		// row. A remedy that appeared only for key-scoped subscribers would read, on every
+		// other subscriber, as though the key dimension were enforced for them.
+		for name, prefix := range map[string]string{
+			"with a prefix": "ldg_9f2c",
+			"without one":   "",
+			"whitespace":    "   ",
+		} {
+			t.Run(name, func(t *testing.T) {
+				declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix)
+				assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, declared.Guidance)
+
+				keys := marshalToKeys(t, declared)
+				assert.Contains(t, keys, "guidance",
+					"no omitempty: an absent remedy is what the review found, and it must not be "+
+						"reachable again by leaving the prefix out")
+			})
+		}
+	})
+
+	t.Run("every subscriber and credential body carries it", func(t *testing.T) {
+		// The two projections an integrator actually reads. The credential is delivered once,
+		// so a later reader learns the boundary — and now the remedy — from the subscriber
+		// projection instead.
+		prefix := "ldg_9f2c"
+		subscriber := apimodel.NewSubscriberResponse(model.EventSubscriber{
+			SubscriberID:       subscriberID,
+			AuthorizedTopics:   topics,
+			PartitionKeyPrefix: &prefix,
+		})
+		assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, subscriber.EnforcedAccess.Guidance)
+
+		credential := apimodel.KafkaCredentialsResponse{
+			EnforcedAccess: apimodel.NewVerifiedSubscriberEnforcedAccess(
+				subscriberID, topics, prefix,
+			),
+		}
+		assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, credential.EnforcedAccess.Guidance,
+			"the issuance response is where a consumer is configured, so it is the one body that "+
+				"must not state the limitation without the remedy")
+
+		for name, body := range map[string]interface{}{
+			"subscriber": subscriber,
+			"credential": credential,
+		} {
+			t.Run(name, func(t *testing.T) {
+				enforced := marshalToKeys(t, body)["enforced_access"]
+				require.NotNil(t, enforced, "the declaration must be present to carry a remedy")
+				assert.Contains(t, string(enforced), `"guidance"`,
+					"the remedy must survive marshalling into the body an integrator reads")
+			})
+		}
+	})
+
+	t.Run("verifying exclusivity does not change the remedy", func(t *testing.T) {
+		// The verified constructor differs from the unverified one in exactly one field, and
+		// this keeps the remedy out of that difference: advice that changed depending on
+		// whether a broker round trip happened would be advice about the wrong thing.
+		unverified := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+		verified := apimodel.NewVerifiedSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+
+		assert.Equal(t, unverified.Guidance, verified.Guidance)
+
+		verified.ExclusiveGrantVerified = false
+		assert.Equal(t, unverified, verified,
+			"the two constructors must still differ in exactly one field")
+	})
+}

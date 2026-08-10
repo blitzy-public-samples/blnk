@@ -787,6 +787,44 @@ func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
 		assert.Contains(t, message, "host")
 	})
 
+	t.Run("the length is bounded, and the bound is a byte count", func(t *testing.T) {
+		// Every other caller-supplied text on blnk.event_subscribers is bounded — the name at
+		// 256 by a CHECK, each topic at 249 by Kafka — and this one was not: a
+		// 100,020-character https URL was accepted and stored. No security consequence, since
+		// the destination is validated and the surface is master-key gated behind a body cap,
+		// but an unbounded column only stays harmless while nothing reads it, and this one is a
+		// future request sink.
+		prefix := "https://hooks.example.com/"
+		atLimit := prefix + strings.Repeat("a", MaxWebhookURLLength-len(prefix))
+		require.Len(t, atLimit, MaxWebhookURLLength)
+
+		message, reason := ValidateWebhookURL(atLimit)
+		assert.Empty(t, message, "the bound is inclusive: exactly the maximum is acceptable")
+		assert.Empty(t, reason)
+
+		overLimit := atLimit + "a"
+		message, reason = ValidateWebhookURL(overLimit)
+		require.NotEmpty(t, message, "one byte over the maximum must be refused")
+		assert.Contains(t, message, "too long")
+
+		// BOTH NUMBERS, so a caller can see by how much, and NEITHER the URL nor any part of
+		// its path — the length is the caller's own value, the endpoint is a third party's.
+		assert.Contains(t, reason, "2049")
+		assert.Contains(t, reason, "2048")
+		assert.NotContains(t, reason, "hooks.example.com")
+	})
+
+	t.Run("an over-long URL is refused without being parsed", func(t *testing.T) {
+		// The refusal has to precede url.Parse: parsing a 100 KB string is work spent on a
+		// value that was never going to be accepted. It is observable through the ANSWER —
+		// a value that is both over-length and unparseable is refused for its length.
+		message, reason := ValidateWebhookURL("https://exa mple.com/" + strings.Repeat("z", 100000))
+		require.NotEmpty(t, message)
+		assert.Contains(t, message, "too long",
+			"length is checked first, so this is not reported as a parser failure")
+		assert.NotContains(t, reason, "exa mple")
+	})
+
 	t.Run("neither the message nor the reason echoes the whole URL", func(t *testing.T) {
 		// The URL is a third party's endpoint, and its path and query can carry a token. The HOST
 		// is named deliberately — it is the one thing the caller needs to see — but nothing else.

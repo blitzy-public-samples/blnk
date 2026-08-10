@@ -5578,9 +5578,12 @@ func (s *EventSubscriberService) ClearLegacyWebhookSubscription(
 // transition.
 //
 // It must NOT be used on a row that still holds a URL: the result asserts that a subscriber
-// both has and has not stopped receiving legacy pushes, and the schema's
-// event_subscribers_webhook_migration_chk refuses it outright, so such a call fails rather
-// than corrupting the row.
+// both has and has not stopped receiving legacy pushes. Such a call FAILS rather than
+// corrupting the row — the repository's statement carries `AND webhook_url IS NULL` and
+// answers ErrGenConflict — so the rule is enforced rather than merely documented. It is
+// enforced there, at the write, and not by a schema CHECK: see MarkSubscriberMigrated in
+// database/event_subscriber.go for why the self-contradicting pair has to stay
+// representable for the retention purge to have anything to clean up.
 //
 // A NULL migrated_at means NOT YET MIGRATED, which is exactly what migration-progress
 // reporting counts during the dual-delivery window. Re-stamping an already-migrated

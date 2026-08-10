@@ -1160,11 +1160,16 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 		container string
 		probePath string
 		uid       int
+		// mountsAPIToken marks the one workload that legitimately needs a
+		// ServiceAccount token: Prometheus, whose scrape jobs discover their targets
+		// through the Kubernetes API. See the token subtest for why asserting
+		// otherwise silences the whole alerting pipeline.
+		mountsAPIToken bool
 	}{
 		{manifest: "server-deployment.yaml", container: "server", probePath: "/", uid: 10001},
 		{manifest: "worker-deployment.yaml", container: "worker", probePath: "/health", uid: 10001},
 		{manifest: "prometheus-deployment.yaml", container: "prometheus", probePath: "/-/",
-			uid: 65534},
+			uid: 65534, mountsAPIToken: true},
 	}
 
 	for _, workload := range workloads {
@@ -1212,14 +1217,41 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 					workload.manifest)
 			})
 
-			t.Run("mounts no ServiceAccount token", func(t *testing.T) {
-				// None of these workloads calls the Kubernetes API. The server is the
-				// process most exposed to the network and the worker processes untrusted
-				// transaction payloads off a queue, so a namespace-scoped credential is
-				// exactly what should not be sitting in either filesystem.
-				assert.Equalf(t, false, podSpec["automountServiceAccountToken"],
-					"%s must set automountServiceAccountToken: false", workload.manifest)
-			})
+			t.Run("mounts a ServiceAccount token only where one is called for",
+				func(t *testing.T) {
+					// The application workloads call no Kubernetes API. The server is the
+					// process most exposed to the network and the worker processes
+					// untrusted transaction payloads off a queue, so a namespace-scoped
+					// credential is exactly what should not be sitting in either
+					// filesystem.
+					//
+					// PROMETHEUS IS THE EXCEPTION, and asserting `false` for it was the
+					// defect rather than the safeguard. Its scrape jobs discover targets
+					// through `kubernetes_sd_configs: role: pod`, so it calls the API on
+					// every discovery refresh — and with no token file it logs `Cannot
+					// create service discovery` once and then serves happily with zero
+					// targets. Pod healthy, rules loaded, nothing collected, every alert
+					// permanently unable to fire. `automountServiceAccountToken: false`
+					// on this workload is therefore not hardening, it is the thing that
+					// silences the alerting pipeline; the least-privilege statement that
+					// belongs here instead is the namespace-scoped Role in
+					// prometheus-rbac.yaml, which grants pods and nothing else.
+					//
+					// TestPrometheusDiscovery_ShipsBothHalvesTogether owns the positive
+					// side of that in full.
+					if workload.mountsAPIToken {
+						assert.Equalf(t, true, podSpec["automountServiceAccountToken"],
+							"%s calls the Kubernetes API for target discovery, so it must "+
+								"mount its ServiceAccount token; without the token file "+
+								"discovery fails at startup and the pod then reports "+
+								"healthy while scraping nothing", workload.manifest)
+
+						return
+					}
+
+					assert.Equalf(t, false, podSpec["automountServiceAccountToken"],
+						"%s must set automountServiceAccountToken: false", workload.manifest)
+				})
 
 			t.Run("declares requests and limits", func(t *testing.T) {
 				resources, isMap := container["resources"].(map[string]interface{})
@@ -1731,4 +1763,92 @@ func TestKafkaStatefulSet_CanColdStartAndIsHardened(t *testing.T) {
 				"for metaspace, thread stacks, direct byte buffers and page cache",
 			limitMiB, heapMiB)
 	})
+}
+
+// TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce is the guard for a duplication that
+// Kubernetes accepts and then behaves unpredictably under.
+//
+// # What was wrong
+//
+// Two PodDisruptionBudgets targeted the identical Kafka pod selector: a generic `kafka` in
+// blnk-poddisruptionbudgets.yaml and the purpose-built `kafka-quorum` shipped alongside the
+// StatefulSet it protects. Kubernetes documents a pod matched by more than one budget as an
+// UNSUPPORTED configuration — it admits both, `kubectl get pdb` lists both, and which one the
+// eviction API honours is not something the manifests decide.
+//
+// # Why it was benign, and why that is the problem
+//
+// The two agreed: both said maxUnavailable: 1. So nothing was observably wrong, which is
+// precisely what let it ship. The eviction budget only ever matters during a node drain or a
+// cluster upgrade, and that is exactly when a later edit to either file — raising one to
+// maxUnavailable: 2, or narrowing a selector — would silently change how many of three KRaft
+// voters may go at once. Losing two brokers costs the controller quorum AND the in-sync
+// replica minimum simultaneously, so the blast radius of the ambiguity is the whole cluster's
+// availability.
+//
+// # What this asserts
+//
+// One budget per selector across the WHOLE manifest folder, not per file — the duplication
+// spanned two files, so a per-file check would have found nothing. Multi-document files are
+// read in full for the same reason: `kafka-quorum` is the second document of
+// kafka-statefulset.yaml, which is where it belongs.
+func TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce(t *testing.T) {
+	root := moduleRootDir(t)
+	manifestDir := filepath.Join(root, "infrastructure", "k8s-manifests")
+
+	entries, err := os.ReadDir(manifestDir)
+	require.NoError(t, err, "the manifest folder must be readable")
+
+	// selector fingerprint -> the budgets claiming it, each named with its file so a failure
+	// says where both copies are rather than only that there are two.
+	claimed := map[string][]string{}
+	var budgets int
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+			continue
+		}
+
+		for _, document := range readYAMLDocuments(t, filepath.Join(manifestDir, entry.Name())) {
+			if document["kind"] != "PodDisruptionBudget" {
+				continue
+			}
+			budgets++
+
+			metadata, isMap := document["metadata"].(map[string]interface{})
+			require.Truef(t, isMap, "%s: a PodDisruptionBudget must carry metadata", entry.Name())
+			name, _ := metadata["name"].(string)
+
+			spec, isMap := document["spec"].(map[string]interface{})
+			require.Truef(t, isMap, "%s: budget %q must carry a spec", entry.Name(), name)
+
+			// A budget whose selector matches nothing is admitted, reports zero expected
+			// pods and protects nothing — the same silent shape as the duplication.
+			selector, isMap := spec["selector"].(map[string]interface{})
+			require.Truef(t, isMap,
+				"%s: budget %q must declare a selector; an empty selector matches every pod "+
+					"in the namespace", entry.Name(), name)
+			labels, isMap := selector["matchLabels"].(map[string]interface{})
+			require.Truef(t, isMap && len(labels) > 0,
+				"%s: budget %q must select by matchLabels", entry.Name(), name)
+
+			fingerprint := fmt.Sprintf("%s|%v", metadata["namespace"], labels)
+			claimed[fingerprint] = append(claimed[fingerprint],
+				fmt.Sprintf("%s (%s)", name, entry.Name()))
+		}
+	}
+
+	require.NotZero(t, budgets,
+		"the manifest folder must ship PodDisruptionBudgets; without them a single node drain "+
+			"can take every replica of a role")
+
+	for fingerprint, owners := range claimed {
+		assert.Lenf(t, owners, 1,
+			"selector %s is governed by %d PodDisruptionBudgets — %v. Kubernetes documents a "+
+				"pod matched by several budgets as unsupported: both are admitted and which "+
+				"one the eviction API honours is undefined, so the budget actually protecting "+
+				"these pods during a node drain is whichever was consulted. Keep the one whose "+
+				"name and location state its purpose and delete the other, or give them "+
+				"non-overlapping selectors", fingerprint, len(owners), owners)
+	}
 }

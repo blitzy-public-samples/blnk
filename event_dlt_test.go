@@ -1314,6 +1314,23 @@ func dltCaptureDeadLetterCounter(t *testing.T) *dltRecordedCounter {
 	return recorder
 }
 
+// dltCaptureBrokerAcknowledgements swaps the shared broker-acknowledgement counter for a
+// recorder, so the PURPOSE a dead-letter write is counted under can be asserted.
+//
+// The instrument is shared with the ordinary publish path, which is the whole point: the
+// counter's value is that the three purposes are summable on one query, and a dead-letter
+// write that recorded nothing left the documented triage breakdown permanently unanswerable.
+func dltCaptureBrokerAcknowledgements(t *testing.T) *dltRecordedCounter {
+	t.Helper()
+
+	recorder := &dltRecordedCounter{}
+	original := metrics.EventBrokerAcknowledgementsTotal
+	t.Cleanup(func() { metrics.EventBrokerAcknowledgementsTotal = original })
+	metrics.EventBrokerAcknowledgementsTotal = recorder
+
+	return recorder
+}
+
 // dltCapturePublishAttempts swaps the shared publish-attempt counter for a recorder, so the
 // outcome label a dead-letter write is recorded under can be asserted.
 func dltCapturePublishAttempts(t *testing.T) *dltRecordedCounter {
@@ -6365,4 +6382,183 @@ func TestDeadLetterAgeGauge_ReadsNoWindowAtAll(t *testing.T) {
 			"and a bounded read caps the age the gauge can ever publish")
 	assert.Empty(t, store.snapshotPages(),
 		"nor the offset-paged listing, for the same reason")
+}
+
+// TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement is OBS-06.
+//
+// # The gap this closes
+//
+// blnk.events.broker_acknowledgements.total is declared "by topic, event type and purpose", the
+// publisher's increment site states that EVERY purpose is counted because "a replay and a
+// dead-letter write are both real acknowledgements", and docs/metrics.md tells an operator to
+// break the counter out by purpose to see how much of the broker traffic is triage. The
+// increment existed only on the ordinary publish path, so purpose="dead_letter" was never
+// written: four acknowledged dead-letter writes produced four dead_lettered attempt records,
+// four rows carrying a dlt_topic and four records on the `.dlt` topics, and a triage query that
+// returned nothing at all. An absent series reads as no dead-letter traffic, which is
+// indistinguishable from a pipeline with nothing wrong.
+//
+// # Why the two counters are asserted together
+//
+// EventsDeadLetteredTotal counts EVENTS whose dead-lettering is complete and is attributed to
+// the ORIGINAL category topic; this counter counts WRITES the broker accepted and is attributed
+// to the `.dlt` sibling that received them. Both are asserted here so the pair cannot be
+// collapsed into one increment on one topic, which would break the dead-letter RATE query — it
+// divides EventsDeadLetteredTotal against EventsPublishedTotal on matching topic names.
+func TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	t.Run("an acknowledged dead-letter write is counted under purpose=dead_letter", func(t *testing.T) {
+		row := dltExhaustedRow(t, "evt_ack_counted", "transaction.applied", "blnk.transactions")
+		store := newDltFakeStore().withRow(row)
+		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+		acknowledgements := dltCaptureBrokerAcknowledgements(t)
+		deadLettered := dltCaptureDeadLetterCounter(t)
+
+		outcome, err := service.DeadLetter(context.Background(), row, errors.New(dltPublishFailureReason))
+		require.NoError(t, err)
+		require.True(t, outcome.Published, "the fixture must actually reach the broker")
+
+		records := acknowledgements.snapshot()
+		require.Len(t, records, 1,
+			"one acknowledged write is one acknowledgement: not zero, which is the defect, and "+
+				"not two, which would inflate the broker-traffic reading")
+		assert.EqualValues(t, 1, records[0].value)
+
+		assert.Equal(t, string(PublishPurposeDeadLetter), records[0].attributes["purpose"],
+			"the purpose is what makes the triage share readable, and dead_letter is the value the "+
+				"instrument, the publisher's own comment and docs/metrics.md all promise")
+		assert.Equal(t, "blnk.transactions.dlt", records[0].attributes["topic"],
+			"the acknowledgement names the topic the record was WRITTEN to, which is the `.dlt` sibling")
+		assert.Equal(t, "transaction.applied", records[0].attributes["event_type"],
+			"and the event type, so triage traffic is attributable to the event family producing it")
+
+		// The event-level counter keeps its own attribution, on the ORIGINAL topic, so the
+		// dead-letter rate still divides against published events without a name mismatch.
+		deadLetterRecords := deadLettered.snapshot()
+		require.Len(t, deadLetterRecords, 1)
+		assert.Equal(t, "blnk.transactions", deadLetterRecords[0].attributes["topic"],
+			"EventsDeadLetteredTotal is attributed to the original category topic; the two counters "+
+				"answer different questions and must not be collapsed")
+	})
+
+	t.Run("a write the broker refused is not counted as an acknowledgement", func(t *testing.T) {
+		// The counter measures traffic the broker ACCEPTED. Counting a refused write here would
+		// make acknowledgements run ahead of deliveries, which is the pipeline's documented
+		// leading indicator of duplicate delivery — a false reading of the one signal that is
+		// supposed to catch rows not being marked.
+		row := dltExhaustedRow(t, "evt_ack_refused", "balance.created", "blnk.balances")
+		store := newDltFakeStore().withRow(row)
+		transport := &dltFakeTransport{writeErr: errors.New("broken pipe")}
+		service := dltNewService(store, &dltFakePublisher{}, transport)
+
+		acknowledgements := dltCaptureBrokerAcknowledgements(t)
+		attempts := dltCapturePublishAttempts(t)
+
+		_, err := service.DeadLetter(context.Background(), row, errors.New(dltPublishFailureReason))
+		dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
+
+		assert.Zero(t, acknowledgements.total(),
+			"nothing was acknowledged, so nothing may be counted as acknowledged")
+		assert.EqualValues(t, 1, attempts.total(),
+			"while the ATTEMPT is still counted, because a refused dead-letter write is exactly "+
+				"what an operator needs to see")
+	})
+
+	t.Run("no transport means no acknowledgement", func(t *testing.T) {
+		row := dltExhaustedRow(t, "evt_ack_no_broker", "identity.created", "blnk.identities")
+		store := newDltFakeStore().withRow(row)
+
+		noop := NewNoopEventPublisher()
+		service := NewEventDeadLetterService(store, nil)
+		service.now = func() time.Time { return dltFixedNow }
+		service.withTransport(noop, publisherWriterResolver(noop))
+
+		acknowledgements := dltCaptureBrokerAcknowledgements(t)
+
+		_, err := service.DeadLetter(context.Background(), row, errors.New("no sink"))
+		dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
+
+		assert.Zero(t, acknowledgements.total(),
+			"a deployment with no broker must not report broker traffic")
+	})
+}
+
+// TestDeadLetterOutcomeLogFields_RedactsBrokerTopologyFromTheFailureReason is DATA-02.
+//
+// # The disclosure this closes
+//
+// The failure reason was SANITIZED — control characters stripped, length capped — and not
+// REDACTED, so its content reached the log intact. Every line built from this projection
+// therefore named the broker's host and port, and a resolution failure named the internal DNS
+// resolver's address as well, at the default info level and in the two lines a failing pipeline
+// emits most: "the Kafka broker did not acknowledge a dead-letter message" and "ledger event
+// dead-lettered and preserved on its dead-letter topic".
+//
+// docs/kafka-operations.md §"Reading the logs" publishes the policy as a three-row table, and
+// the two rows that are NOT the log line are asserted elsewhere: the row's last_error and the
+// dead-letter message's failure_metadata.error_reason keep the verbatim text, because both are
+// reachable only behind the master key. This test covers the row that was wrong — the log line —
+// and it asserts the diagnosis survives, because redaction that took the diagnosis with it would
+// lengthen every outage it protected.
+func TestDeadLetterOutcomeLogFields_RedactsBrokerTopologyFromTheFailureReason(t *testing.T) {
+	for name, reason := range map[string]struct {
+		text      string
+		diagnosis string
+		leaks     []string
+	}{
+		"a refused dial names the broker's address and port": {
+			text: "kafka.(*Client).Produce: dial tcp 172.21.0.2:9092: connect: connection refused",
+			// The words that tell an operator what to do.
+			diagnosis: "connection refused",
+			leaks:     []string{"172.21.0.2", "9092", "172.21.0.2:9092"},
+		},
+		"a resolution failure names the internal resolver too": {
+			text:      "kafka.(*Client).Produce: dial tcp: lookup kafka on 127.0.0.11:53: no such host",
+			diagnosis: "no such host",
+			leaks:     []string{"127.0.0.11", "127.0.0.11:53", "lookup kafka on"},
+		},
+		"a broken pipe names both ends of the connection": {
+			text:      "write tcp 10.0.0.4:34918->10.0.0.7:9092: write: broken pipe",
+			diagnosis: "broken pipe",
+			leaks:     []string{"10.0.0.4", "10.0.0.7", "34918"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fields := DeadLetterOutcome{
+				EventID:         "evt_topology",
+				EventType:       "transaction.applied",
+				OriginalTopic:   "blnk.transactions",
+				DeadLetterTopic: "blnk.transactions.dlt",
+				PartitionKey:    "bln_7d3ac6f1",
+				Status:          model.PublishStatusDeadLettered,
+				Metadata: model.FailureMetadata{
+					OriginalTopic: "blnk.transactions",
+					ErrorReason:   reason.text,
+					AttemptCount:  5,
+				},
+			}.LogFields()
+
+			rendered, ok := fields["error_reason"].(string)
+			require.True(t, ok, "the reason must still be reported: an operator needs to know what failed")
+
+			for _, leak := range reason.leaks {
+				assert.NotContains(t, rendered, leak,
+					"%q must not reach a log that is retained, shipped onwards and readable by more "+
+						"people than hold the master key", leak)
+			}
+
+			assert.Contains(t, rendered, reason.diagnosis,
+				"the diagnosis is the whole reason this field exists beside the closed failure_class; "+
+					"redaction removes addresses, not words")
+			assert.Contains(t, rendered, "[redacted]",
+				"and the removal is visible, so nobody reads the line as a truncated or corrupted error")
+
+			// The closed class is untouched, so a log query can still group on it — and it still
+			// agrees with the reason, which is what makes the pair readable together.
+			assert.Equal(t, "broker_unavailable", fields["failure_class"],
+				"the class is derived from the reason and must survive the redaction of its addresses")
+		})
+	}
 }

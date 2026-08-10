@@ -206,14 +206,23 @@ const (
 	// would answer a different question from the one asked, with nothing to say so.
 	subscriberInvalidLimitMessage = "Invalid " + subscriberQueryParamLimit + " value"
 
-	// subscriberInvalidCursorMessage answers a cursor this endpoint did not issue.
+	// subscriberInvalidCursorMessage answers a cursor value this endpoint cannot decode
+	// into a page position.
 	//
 	// It is REFUSED rather than treated as "start from the beginning" (PERF-P08). A
 	// paging client that receives page one in answer to a cursor it thought pointed
 	// into the middle of the registry pages for ever.
+	//
+	// It says DECODE and not "a cursor this endpoint issued", which is what it used to
+	// claim. A keyset cursor is a coordinate rather than a capability — unsigned, with no
+	// issuer recorded — so any value that decodes to a well-formed position is accepted as
+	// one, including a token another listing produced. Harmless, since the cursor carries
+	// no authorization, but the stronger wording invited a client to hunt for an issuance
+	// record that does not exist. The dead-letter listing answers in the same terms; the
+	// two must not describe one mechanism two ways.
 	subscriberInvalidCursorMessage = "\"" + subscriberQueryParamCursor +
-		"\" is not a cursor this endpoint issued; omit it for the first page, or pass back the " +
-		"\"next_cursor\" value from a previous response verbatim"
+		"\" could not be decoded as a page position; omit it for the first page, or pass back " +
+		"the \"next_cursor\" value from a previous response verbatim"
 
 	// subscriberMissingRowMessage covers a service that reported success without
 	// returning the row. It cannot happen through any current path, and it is
@@ -1830,10 +1839,16 @@ func (a *Api) UpdateWebhookSubscription(c *gin.Context) {
 // already-migrated subscriber moves the timestamp forward rather than failing, so
 // repeating this request after any failure is always safe.
 //
-// The invariant is enforced in the schema as well, by
-// event_subscribers_webhook_migration_chk, so no path — this handler, a psql
-// session or a restored backup — can write a row that is migrated and still carries
-// a live endpoint.
+// The invariant is enforced at every repository write, not only here: recording a
+// URL clears migrated_at in the same statement, and MarkSubscriberMigrated refuses
+// to stamp a row that still holds one. So no path THROUGH THE API can produce a row
+// that is migrated and still carries a live endpoint.
+//
+// It is NOT a schema CHECK, and an operator should not assume one. A psql session or
+// a restored backup CAN hold that pair, and deliberately so: the RETAIN-01 retention
+// purge selects exactly it, so a constraint forbidding it would leave that control
+// with nothing it could ever match. Audits that need the guarantee should read it as
+// "true for API-managed rows".
 //
 // # Every status this route can answer, and the ones it no longer can
 //

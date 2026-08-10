@@ -648,7 +648,8 @@ func startEventMetricsCollector(
 	//
 	// setRelayDefaults guarantees a positive value, so this never trips the configurator's
 	// own non-positive fallback. The shortfall, whatever the budget, is published on
-	// blnk.subscribers.lag_unmeasured and alerted on by ConsumerLagCoverageIncomplete.
+	// blnk.kafka.subscribers_unmeasured under reason="budget" and alerted on by
+	// SubscriberLagCoverageIncomplete.
 	collector := blnk.NewBlnkEventMetricsCollector(instance, deadLetters, admin).
 		WithSubscriberBudget(cfg.Relay.SubscriberMetricsBudget)
 	collector.Start(ctx)

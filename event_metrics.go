@@ -39,9 +39,9 @@ limitations under the License.
 //     remembers the label sets it published on the previous tick and explicitly zeroes any
 //     that are gone.
 //
-// Without this file the six gauges are declared, initialised, documented and never
-// recorded: `/metrics` carries no series for them, and none of the four rules in
-// alerts/blnk-kafka-alerts.yml can fire at all — including the two acceptance-criterion
+// Without this file every gauge the alert rules read is declared, initialised, documented
+// and never recorded: `/metrics` carries no series for them, and NONE of the thirteen rules
+// in alerts/blnk-kafka-alerts.yml can fire at all — including the two acceptance-criterion
 // alerts, dead-letter age above 900 seconds and consumer lag above 10,000 messages —
 // whatever the system is actually doing.
 //
@@ -78,7 +78,7 @@ limitations under the License.
 // collectors would write the same gauges from two processes and each would zero the other's
 // series as stale.
 //
-// Until that call exists the six gauges have no maintainer and none of the four rules in
+// Until that call exists those gauges have no maintainer and none of the thirteen rules in
 // alerts/blnk-kafka-alerts.yml can fire, which is the precise defect this file was added
 // to fix. NewBlnkEventMetricsCollector is deliberately a one-liner so the wiring cannot
 // pair one instance's datasource with another's admin client.
@@ -329,7 +329,7 @@ type lagSeries struct {
 	topic      string
 }
 
-// EventMetricsCollector recomputes the event pipeline's six gauges on a fixed interval.
+// EventMetricsCollector recomputes the event pipeline's gauges on a fixed interval.
 //
 // One instance per process is enough and it is safe for concurrent use: its dependencies
 // are read-only after construction and its lifecycle state is mutex-guarded.
@@ -947,7 +947,7 @@ func (r EventMetricsReport) LogFields() logrus.Fields {
 	}
 }
 
-// Collect performs ONE collection of all six gauges and returns what it observed.
+// Collect performs ONE collection of every gauge it owns and returns what it observed.
 //
 // It is exported so that a caller can drive a collection on demand — a test, or an
 // operational endpoint — without owning a loop, and so that the loop itself has nothing in
@@ -1617,8 +1617,41 @@ func (c *EventMetricsCollector) publishSweepCoverage(
 	// tick, including one that stopped at its budget, and reporting the gap as unknown there
 	// would blind the gauge on precisely the ticks that produce one. It is zero when the count
 	// itself failed, and no shortfall is claimed from a size that was never read.
+	//
+	// # OBS-07: THE GAPS THIS TICK ALREADY EXPLAINED ARE SUBTRACTED, OR THEY ARE COUNTED TWICE
+	//
+	// registered minus exported is the count of subscribers with NO SERIES AT ALL — every one
+	// of them, whatever the reason. The reasons below then count three of those populations
+	// AGAIN by name: a row with no authorised topics (unprovisioned), a row whose measurement
+	// the broker refused (measure_failed), and a row naming a topic that does not exist
+	// (topic_missing). Assigning the whole difference to a fourth reason therefore
+	// DOUBLE-COUNTED every explained gap, and the aggregate exceeded the registry it is
+	// supposed to be a subset of: three registered subscribers with one unprovisioned exported
+	// unprovisioned=1 AND budget=1 — two unmeasured subscribers out of three, for one gap — and
+	// a broker outage with two registered subscribers exported measure_failed=2 AND budget=2,
+	// a total of four against a registry of two.
+	//
+	// Both consequences were operational, not cosmetic. SubscriberLagCoverageIncomplete's
+	// remediation branches on this label, so 'budget' sent an operator to raise
+	// EVENT_METRICS_SUBSCRIBER_BUDGET for what was actually a broker fault or an ordinary
+	// un-granted subscriber — with, in the observed case, 189 subscribers of headroom still
+	// unused. And the documented proportion query, unmeasured over registered, read 200%.
+	//
+	// So what is left for 'budget' is the RESIDUE: gaps this tick could not explain any other
+	// way, which is exactly the rotation not getting back to a subscriber inside the reading
+	// TTL. The subtraction is safe because measurePage puts every examined row in exactly one
+	// of skipped, failed or measured, and topic_missing is a subset of measured, so the three
+	// subtrahends sum to at most the number of rows examined and therefore at most the registry
+	// size. Flooring at zero holds the invariant Σ(unmeasured) ≤ registered on the one shape
+	// where the terms disagree: a subscriber counted topic_missing whose OTHER topics still
+	// export a series is both covered and explained, so the arithmetic can go negative without
+	// any gap existing at all.
+	//
+	// The same rule the ListingFailed exclusion below already stated, applied to the three
+	// reasons it did not cover.
 	budgetShortfall := 0
-	if shortfall := int(report.SubscribersRegistered) - c.coveredSubscriberCount(); shortfall > 0 {
+	explained := report.SubscribersSkipped + report.SubscribersFailed + report.SubscribersTopicMissing
+	if shortfall := int(report.SubscribersRegistered) - c.coveredSubscriberCount() - explained; shortfall > 0 {
 		budgetShortfall = shortfall
 	}
 

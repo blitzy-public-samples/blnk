@@ -931,7 +931,8 @@ type RelayConfig struct {
 	// SubscriberConsumerLagHigh rule has nothing to evaluate and the subscriber can fall
 	// arbitrarily far behind while every dashboard reads clean. Silence and health become
 	// indistinguishable, which is why the shortfall is published on
-	// blnk.subscribers.lag_unmeasured and alerted on rather than only logged.
+	// blnk.kafka.subscribers_unmeasured, attributed by reason, and alerted on rather than
+	// only logged.
 	//
 	// # Why there is a budget at all
 	//
@@ -943,9 +944,10 @@ type RelayConfig struct {
 	// reasons to make the ceiling an explicit, observable, operator-set number.
 	//
 	// ZERO TAKES THE DEFAULT of 200, which is far above any plausible subscriber count for
-	// one ledger deployment. Raise it when blnk_subscribers_lag_unmeasured is non-zero and
-	// the collection is comfortably inside its interval; that gauge and
-	// blnk.subscribers.registered together say whether there is headroom.
+	// one ledger deployment. Raise it when blnk.kafka.subscribers_unmeasured is non-zero
+	// UNDER THE reason="budget" LABEL specifically — that is the only one of its five reasons
+	// a larger budget closes — and the collection is comfortably inside its interval; that
+	// gauge and blnk.subscribers.registered together say whether there is headroom.
 	SubscriberMetricsBudget int `json:"subscriber_metrics_budget" envconfig:"RELAY_SUBSCRIBER_METRICS_BUDGET"`
 }
 

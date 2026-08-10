@@ -334,10 +334,17 @@ data:
   # SIZE THIS ABOVE YOUR SUBSCRIBER REGISTRY, with headroom. A value far above the
   # registry costs nothing, because the sweep stops when the registry runs out;
   # a value below it costs coverage. The shortfall is published as
-  # blnk_subscribers_lag_unmeasured beside the registry size as
-  # blnk_subscribers_registered, and ConsumerLagCoverageIncomplete fires on any
+  # blnk_kafka_subscribers_unmeasured{reason="budget"} beside the registry size as
+  # blnk_subscribers_registered, and SubscriberLagCoverageIncomplete fires on any
   # non-zero shortfall — so the gap is visible rather than silent, but visible is
-  # not measured.
+  # not measured. Read the reason label before acting: the gauge's other four
+  # values (unprovisioned, measure_failed, registry_failed, topic_missing) are
+  # gaps this number cannot close.
+  #
+  # TWO NAMES, ONE KNOB. EVENT_METRICS_SUBSCRIBER_BUDGET sets the same ceiling and
+  # is the name the alert remediations use. Both are honoured and reconciled onto
+  # one value; if they disagree, EVENT_METRICS_SUBSCRIBER_BUDGET wins and start-up
+  # warns naming both.
   #
   # 200 matches the application default and is stated explicitly here so the
   # deployed budget is greppable rather than implicit. Zero or a negative value is

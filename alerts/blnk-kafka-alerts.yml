@@ -18,10 +18,20 @@
 # prometheus.yml. A gauge nothing evaluates is never alerted on, and a rule whose
 # series is never recorded can never fire, so both halves have to be in place.
 #
-# SIX rules. Two are the thresholds the requirement names — DeadLetterMessageStuck
-# on dead-letter age and SubscriberConsumerLagHigh on consumer lag — and the other
-# four exist because a threshold alert can only fire on a number that was measured,
-# and because two states that look alike in a log line need different work:
+# THIRTEEN rules, in one group, and they divide in two. SEVEN are CONDITION rules —
+# something in the pipeline is wrong — of which two are the thresholds the
+# requirement names: DeadLetterMessageStuck on dead-letter age and
+# SubscriberConsumerLagHigh on consumer lag. The remaining five conditions are
+# SubscriberRevocationOutstanding, SubscriberCredentialOrphaned,
+# SubscriberRevocationRefused, SubscriberSettlementNotProgressing and
+# SubscriberSettlementOutstanding. The other SIX are MEASURABILITY rules —
+# ConsumerLagMeasurementDegraded, SubscriberLagCoverageStale,
+# SubscriberLagCoverageIncomplete, EventMetricsCollectionStale,
+# EventMetricsCollectionFailing and EventMetricsCollectionAbsent — and they exist
+# because a threshold alert can only fire on a number that was measured, and
+# because two states that look alike in a log line need different work.
+#
+# Four of them carry the reasoning that is least obvious from the expression alone:
 #
 #   * ConsumerLagMeasurementDegraded covers the gap the lag threshold leaves.
 #     Consumer lag is a sum over partitions, so a partition the broker will not
@@ -45,9 +55,16 @@
 #     stores one credential per principal) while a pending revocation is settled by
 #     retrying the deregistration, and issuance is refused for a pending row.
 #
-# The count is stated because it is checkable: `promtool check rules` prints it,
-# and the prometheus-config ConfigMap in infrastructure/k8s-manifests carries a
-# verbatim copy of this group that has to agree.
+# The count is stated because it is checkable: `promtool check rules` prints it —
+# "SUCCESS: 13 rules found" — /rules shows thirteen under blnk-kafka-alerts, and the
+# prometheus-config ConfigMap in infrastructure/k8s-manifests carries a verbatim copy
+# of this group that has to agree. It states thirteen too, in its own
+# blnk-kafka-alerts group, alongside a separate blnk-infra-alerts group holding the
+# one rule that only exists on Kubernetes. Every other file that describes this set
+# is reconciled against this one by TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere,
+# so adding a rule fails that test with the list of places to update rather than
+# silently invalidating them; this header is the one statement the test cannot check,
+# because it is prose about the file the test derives its expectations from.
 
 # EVERY runbook_url IS ABSOLUTE, and each points at the SECTION for its own alert.
 # They were repository-relative paths ("docs/kafka-operations.md"), which resolve
@@ -59,7 +76,7 @@
 # section rather than to the top of the runbook saves the same reader a scroll
 # through a thousand-line document while they are being paged.
 #
-# A fork serving its own documentation should rewrite the base of these four URLs;
+# A fork serving its own documentation should rewrite the base of these thirteen URLs;
 # the anchors are the alert names, lowercased, so they follow the rule names.
 
 groups:

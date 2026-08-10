@@ -7,10 +7,24 @@
 # every replica of a role that happens to be co-located, and the update strategies next door
 # will not have prevented it.
 #
-# These three budgets are what the eviction API consults. They constrain only VOLUNTARY
-# disruption: a node that fails outright, an OOM kill or a crash is involuntary and no budget
-# can stop it, which is why they are an availability floor for planned work rather than a
-# reliability guarantee.
+# These two budgets are what the eviction API consults for the application roles. They
+# constrain only VOLUNTARY disruption: a node that fails outright, an OOM kill or a crash is
+# involuntary and no budget can stop it, which is why they are an availability floor for
+# planned work rather than a reliability guarantee.
+#
+# THE KAFKA BROKER'S BUDGET IS NOT HERE. It ships as `kafka-quorum` in the second document of
+# kafka-statefulset.yaml, co-located with the workload it protects, and it is the most
+# consequential budget in this folder: three KRaft voters with min.insync.replicas=2 tolerate
+# exactly one voluntary eviction at a time.
+#
+# A budget for it lived here as well, and that was the defect. Kubernetes documents a pod
+# matched by MORE THAN ONE PodDisruptionBudget as an unsupported configuration, and two
+# budgets over one selector are benign only for as long as they happen to agree — the moment
+# either is edited, the budget actually protecting a quorum during a node drain or a cluster
+# upgrade is whichever one the eviction API consulted, which is not a question this folder
+# should leave open. So the broker has exactly one budget, and it is the one that names its
+# purpose. Add a budget for a new workload here; for a workload that ships its own manifest
+# with its own policy, add it there instead, and never in both.
 #
 # maxUnavailable rather than minAvailable throughout, and deliberately: the server and worker
 # are autoscaled between 2 and 10 replicas, so a fixed minAvailable would either be too weak
@@ -48,27 +62,3 @@ spec:
   selector:
     matchLabels:
       io.kompose.service: worker
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  labels:
-    io.kompose.service: kafka
-  name: kafka
-  namespace: blnk
-spec:
-  # THE MOST CONSEQUENTIAL OF THE THREE, and the one whose absence is least survivable.
-  # kafka-statefulset.yaml runs three brokers as three KRaft voters with
-  # min.insync.replicas=2, so losing TWO brokers simultaneously does two things at once: the
-  # controller quorum loses its majority and can elect no leader, and every partition falls
-  # below its in-sync minimum so every produce with acks=all is rejected. The relay then
-  # cannot publish, cannot dead-letter, and retries until the cluster returns.
-  #
-  # One at a time is therefore not a preference, it is the cluster's tolerance. A drain that
-  # would take a second broker is blocked until the first is back and in-sync — which is
-  # exactly what the eviction API is for, since nothing else in this folder can express it:
-  # a StatefulSet's ordered replacement governs rollouts, not evictions.
-  maxUnavailable: 1
-  selector:
-    matchLabels:
-      io.kompose.service: kafka

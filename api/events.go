@@ -692,6 +692,16 @@ func deadLetterPageLimitFromQuery(c *gin.Context) (int, bool) {
 // paging client at page one, which is an infinite loop for any client that pages until the
 // cursor is absent.
 //
+// # The check is a DECODE, and the refusal says so
+//
+// It used to read "is not a cursor this endpoint issued", which claimed more than it does. A
+// keyset cursor is a coordinate, not a capability: it carries no signature and no issuer, so any
+// value that decodes to a well-formed (occurred_at, id) pair is accepted as a position —
+// including one another endpoint's listing produced. That is harmless, because the cursor
+// carries no authorization and the request is master-key gated either way, but a message
+// promising provenance invites the opposite mental model, and a client debugging a rejected
+// cursor would go looking for an issuance record that does not exist.
+//
 // Parameters:
 //   - c *gin.Context: the request. On refusal the response is already written
 //     when this returns.
@@ -703,8 +713,8 @@ func deadLetterCursorFromQuery(c *gin.Context) (*coremodel.DeadLetterCursor, boo
 	cursor, err := coremodel.ParseDeadLetterCursor(c.Query(eventQueryParamCursor))
 	if err != nil {
 		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
-			"%q is not a cursor this endpoint issued; omit it for the first page, or pass back the "+
-				"%q value from a previous response verbatim",
+			"%q could not be decoded as a page position; omit it for the first page, or pass back "+
+				"the %q value from a previous response verbatim",
 			eventQueryParamCursor, "next_cursor",
 		), nil)
 

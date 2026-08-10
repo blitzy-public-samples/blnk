@@ -313,14 +313,58 @@ run_workers:
 # positive costs one info line from the application and a false negative would resurrect exactly
 # the bug being fixed. Requiring jq for a decision this coarse would add a dependency to a
 # target that needs none.
+#
+# # WHY .env IS SOURCED, AND WHY IT IS THE FIFTH SOURCE RATHER THAN THE FIRST
+#
+# The four sources above are read from the PROCESS ENVIRONMENT, and `./stack.sh --init` writes
+# KAFKA_BROKERS and the producer pair into a mode-0600 .env — a file, whose assignments are not
+# exported into anyone's shell. So a target that consulted only the environment refused the
+# operator who had just run the setup instruction this recipe's own error message recommends,
+# and pointed them at the very file it declined to read. That was the defect, and it was worse
+# than a plain refusal because the remedy printed was already satisfied.
+#
+# So .env is sourced here exactly as `kafka_provision` sources it, and the ordering is the same
+# one Compose applies to --env-file: .env SUPPLIES DEFAULTS, THE CALLER'S ENVIRONMENT WINS.
+#
+# THE SNAPSHOT-AND-RESTORE IS WHAT ENFORCES THAT ORDERING. A bare `set -a; . ./.env; set +a`
+# runs after the caller's environment already exists, so every key .env declares OVERWRITES the
+# value just passed on the command line — the precedence inverted, and only for keys that
+# happen to appear in both, which is the most confusing possible half of the behaviour. Sourcing
+# is still the right mechanism, because .env is shell-quoted data that hand-parsing would get
+# wrong. So the caller's environment is captured in re-inputtable form FIRST, .env is sourced
+# with allexport, and the snapshot is replayed on top.
+#
+# A DELIBERATELY EMPTY VALUE FROM THE CALLER WINS TOO, because `export -p` records a set-but-
+# empty variable: `KAFKA_BROKERS= make run_relay` means "no brokers for this run", so it is
+# refused rather than quietly falling back to .env. docs/kafka-operations.md documents that
+# behaviour by example and it is a property of the replay, not a special case in the guard.
+#
+# THE START HAPPENS IN THE SAME SHELL, and that is not a style choice. Each line of a recipe is
+# its own shell, so a `./${PROJECT} start` on a line of its own would run with the environment
+# make handed it and see NONE of what was just sourced — the guard would pass and the server
+# would still come up with no brokers, which is the silent failure this target exists to
+# prevent, reached by a longer route. Nothing else reads .env for the binary: configuration
+# arrives through envconfig, which reads the environment and no file. `exec` replaces the shell
+# so signals and the exit status reach the server directly.
 CONFIG_FILE?=blnk.json
 
 run_server_relay:
-	@brokers=""; \
+	@caller_environment="$$(export -p)"; \
+	caller_brokers=""; \
+	for candidate in "$${KAFKA_BROKERS}" "$${BLNK_KAFKA_KAFKA_BROKERS}" "$${BLNK_KAFKA_BROKERS}"; do \
+		if [ -n "$$candidate" ]; then caller_brokers="$$candidate"; break; fi; \
+	done; \
+	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	eval "$$caller_environment"; \
+	brokers=""; \
 	for candidate in "$${KAFKA_BROKERS}" "$${BLNK_KAFKA_KAFKA_BROKERS}" "$${BLNK_KAFKA_BROKERS}"; do \
 		if [ -n "$$candidate" ]; then brokers="$$candidate"; break; fi; \
 	done; \
-	source_name="the environment"; \
+	if [ -n "$$caller_brokers" ]; then \
+		source_name="the environment"; \
+	else \
+		source_name=".env"; \
+	fi; \
 	if [ -z "$$brokers" ] && [ -f "${CONFIG_FILE}" ] && grep -q '"brokers"' "${CONFIG_FILE}"; then \
 		brokers="(declared in ${CONFIG_FILE})"; \
 		source_name="${CONFIG_FILE}"; \
@@ -333,16 +377,20 @@ run_server_relay:
 		echo "  BLNK_KAFKA_KAFKA_BROKERS  (envconfig's derived key)"; \
 		echo "  BLNK_KAFKA_BROKERS        (the BLNK_-prefixed alias, which wins over the bare name)"; \
 		echo "  \"kafka\": { \"brokers\": [...] } in ${CONFIG_FILE}"; \
-		echo "and set the KAFKA_SASL_USER/KAFKA_SASL_SECRET producer pair — './stack.sh --init'"; \
-		echo "writes all of them to a 0600 .env."; \
+		echo "  any of those three names in a .env file in this directory, which this target"; \
+		echo "  sources — './stack.sh --init' writes them there, at mode 0600, along with the"; \
+		echo "  KAFKA_SASL_USER/KAFKA_SASL_SECRET producer pair the publisher authenticates with."; \
+		echo "A value passed on the command line WINS over .env, including an empty one:"; \
+		echo "'KAFKA_BROKERS= make run_relay' means no brokers for this run and is refused here"; \
+		echo "rather than falling back to the file."; \
 		exit 1; \
 	fi; \
 	echo "Starting the SERVER role from $$source_name: HTTP API, lineage outbox processor,"; \
 	echo "event metrics collector and the event outbox relay. This is not the relay alone —"; \
 	echo "the API will be listening and the other background workers will be running."; \
 	echo "The application validates the Kafka configuration itself and will refuse to start"; \
-	echo "if it is malformed."
-	./${PROJECT} start
+	echo "if it is malformed."; \
+	exec ./${PROJECT} start
 
 # The AAP-named alias. Identical behaviour, including the announcement above, so neither
 # spelling can leave an operator believing a bare relay is what came up.

@@ -496,6 +496,22 @@ Isolation is delivered by three things and three things only:
 2. **The ACL bindings** — literal `Read`/`Describe` on the authorised topics, and nothing beyond them.
 3. **The consumer group namespace** — a prefixed `Read` grant that reserves the subscriber's own group space and no one else's.
 
+##### The operational consequence: a topic grant is a grant over every tenant's events on it
+
+This follows directly from the two facts above and is the sentence to have in mind when you approve a grant.
+
+A category topic carries **every** event of its category for the whole deployment. `blnk.transactions` holds every ledger's transaction events; `blnk.balances`, `blnk.identities` and `blnk.system` do the same for theirs. So granting `blnk.transactions` to a subscriber grants it read access to **every ledger's** transaction events and to the events of **every other subscriber** of that topic. Nothing narrows that: not the `partition_key_prefix`, not the consumer group, not the number of subscribers sharing the topic.
+
+Approve a topic grant on that basis. The question to ask is not "which slice of this topic does the subscriber need?" — there is no mechanism that answers it — but **"is this subscriber trusted with the whole category?"** If the answer is no, the grant is the wrong instrument:
+
+| What you need | The enforceable instrument | What it costs |
+|---|---|---|
+| A subscriber must not see a *category* | Omit that topic from `authorized_topics`. The broker refuses it outright. | Nothing. This is the intended mechanism. |
+| A subscriber must not see *another tenant's records within a category* | **Separate the deployments.** A distinct Blnk deployment, with its own broker or its own topic namespace via `KAFKA_TOPIC_PREFIX`, is the only boundary that holds. | A second deployment to operate. |
+| A subscriber should *process* only its own records, and is trusted with the rest | Record a `partition_key_prefix` and rely on the consumer to filter — see immediately below. | It is not a security boundary. Read the next section in full. |
+
+Do not reach for a per-subscriber topic and a filtering republisher as a middle option; both are ruled out by design, and the reasons are in [Why not enforce it at the broker?](#the-partition-key-prefix-is-a-consumer-side-filtering-contract) below.
+
 #### The partition-key prefix is a consumer-side filtering contract
 
 A subscriber row may carry a `partition_key_prefix`. It is the third dimension of the access model, and it is the one the broker does not evaluate — so it is worth knowing exactly what it does and does not do.
@@ -512,9 +528,14 @@ Credential issuance says so rather than guessing. The response carries the recor
   "consumer_group_namespace": "blnk-sub-sub_9f8d3c214b7a5e6f.",
   "partition_key_prefix_enforced": false,
   "partition_key_prefix": "ldg_9f1c8a72",
-  "partition_key_prefix_enforced_by": "consumer_side"
+  "client_side_key_filtering_required": true,
+  "partition_key_prefix_enforced_by": "consumer_side",
+  "exclusive_grant_verified": true,
+  "guidance": "Kafka authorises whole topics and consumer groups and has no message-key dimension, so a partition-key prefix is never enforced: a granted topic is readable in full, including records written for other ledgers and other subscribers. To confine a subscriber, narrow its authorized_topics, which the broker does enforce, or isolate the data at the deployment boundary."
 }
 ```
+
+`client_side_key_filtering_required` is the field a subscriber's client branches on: it is `true` exactly when a prefix is recorded, and it names the consumer as the component that applies the narrowing. `guidance` carries the remedy in the same object as the limitation, so an integrator who has just read that the key is not enforced also reads what to narrow instead; it is prose for a human and its wording may change, so nothing should match on it.
 
 `enforced_by` and `not_enforced_by` together enumerate every dimension this API names, and they are disjoint — so the message-key dimension is stated as unenforced rather than left to be deduced from its absence, and a dimension moving between the two lists is a visible contract change. `not_enforced_by` carries `partition_key` for **every** subscriber, with or without a prefix recorded, because it describes what the broker can evaluate and not what the row configured. `partition_key_prefix_enforced` is **always** `false` and `partition_key_prefix_enforced_by` is `consumer_side` whenever a prefix is recorded, `none` when one is not. Issuance also logs a WARNING naming the prefix, the enforcement point and the topics the credential really covers, so the moment a key-scoped principal comes into existence is visible in the operator log.
 
@@ -532,6 +553,24 @@ Recording a prefix in the other order — onto a subscriber that **already** hol
 This is the same posture the event contract takes for duplicate suppression: delivery is at-least-once, so `event_id` idempotency is a documented subscriber obligation rather than a broker guarantee. A key scope is that pattern applied to authorization.
 
 **Why not enforce it at the broker?** The two designs that could are both ruled out. A topic per key scope contradicts the model's own first rule — there are no per-tenant topics, which is what makes a new subscriber cost no new topics. An interposed filtering gateway that re-emits already-isolated streams is subscriber-side consumer machinery, which Blnk does not build. If broker-enforced record-level isolation is a hard requirement for your deployment, it needs one of those two designs and cannot come from this column.
+
+##### Accepted deviation: "ACLs scoped to the partition-key prefix" is not delivered, and will not be
+
+The subscriber access model was specified as *"ACLs scoped to its authorized topics, consumer group, and partition-key prefix"*. **Two of those three are delivered as ACLs. The third is not, and it is recorded here as an accepted deviation rather than as outstanding work**, because it is not implementable — a reader comparing the specification against the running system should find the discrepancy explained here instead of assuming a gap that a later release will close.
+
+**What was verified.** A subscriber was registered with `partition_key_prefix` set, issued a credential, and used to read the granted topic from the first offset. It read tens of thousands of records, none of whose keys carried the prefix. That is the designed behaviour of the grant, and every response the subscriber received said so.
+
+**Why no ACL can do better.** Kafka's authorizer evaluates a fixed set of resource types — cluster, topic, group, transactional id, delegation token, user. **A message key is not among them**, so there is no binding, pattern type or permission that narrows a principal to a subset of a topic's records. This is a property of Kafka, not of Blnk's provisioning code, and it holds for every Kafka release and every authorizer implementation that follows the standard resource model.
+
+**Why the two workarounds are worse, not merely unbuilt.**
+
+- *A topic per subscriber or per key scope* would satisfy the letter of the requirement and contradict its own first sentence — the access model exists to avoid per-tenant topics, which is what keeps a new subscriber from costing new topics, new partitions and new provisioning state. It also multiplies the write path by the number of subscribers.
+- *A Blnk-owned filtering consumer that republishes in-prefix records* is subscriber-side consumer machinery, which Blnk deliberately does not build — the same boundary that leaves subscriber-side dead-lettering to subscribers. It would also make Blnk the availability and ordering bottleneck for every stream it re-emitted, and would need its own outbox to avoid being a new loss window.
+- *Binding a `PREFIXED` topic pattern instead of a `LITERAL` one* deserves a specific warning, because it looks like the answer and is the most dangerous option on the list: topic-name prefixes and message-key prefixes are unrelated, so such a binding would **widen** the grant to every topic sharing the name prefix while appearing to narrow it. `NewSubscriberProvisioningRequest` refuses to construct it for exactly this reason.
+
+**What is delivered instead, and it is not silence.** The prefix is accepted, recorded, and returned to the subscriber inside the same object that states it is unenforced, names the consumer as the enforcing party, carries `client_side_key_filtering_required`, and carries the remedy in `guidance`. Issuance logs a WARNING naming the prefix and the topics the credential really covers, and recording a prefix onto an already-provisioned subscriber logs its own. The obligation is documented for subscribers in [event-streaming.md](event-streaming.md#your-partition_key_prefix-is-yours-to-enforce--this-is-a-contract-not-a-hint) in the same voice as the `event_id` deduplication obligation.
+
+**What an operator must do about it.** Treat the topic grant as the isolation boundary — see [the operational consequence](#the-operational-consequence-a-topic-grant-is-a-grant-over-every-tenants-events-on-it) above. Where records must be unreachable rather than filtered, separate the deployments. Do not represent the prefix to a subscriber as an isolation guarantee in a contract, a security questionnaire or an audit response: the API does not, and neither should the surrounding paperwork.
 
 > **Changed behaviour.** Issuance used to **refuse** any row carrying a prefix with `409 SUBSCRIBER_ISOLATION_UNENFORCEABLE`, and the schema forbade the prefix alongside a credential. Both are gone: the refusal implemented no part of the third scope, it withheld the credential instead, so a key-scoped subscriber could not consume at all. `sql/1781249138.sql` drops `event_subscribers_key_scope_chk`, and the error code is retired rather than left unraisable. Recording a prefix on an already-provisioned subscriber is now accepted and **takes effect on the next issuance** — re-issue to hand the consumer its new boundary; the credential already in the field still carries the old one.
 
@@ -630,6 +669,34 @@ Two consequences to plan around:
 
 If compensation itself cannot finish inside its window — a broker that is hanging rather than refusing — it is **abandoned and logged at ERROR with the principal named**. That is the manual-revocation case: find the principal in the log, delete it with `kafka-configs.sh --alter --delete-config 'SCRAM-SHA-512' --entity-type users --entity-name <principal>`, and remove its bindings as [The ACL Model](#the-acl-model) describes. The log names the principal precisely so this is possible; see [Reading the logs](#reading-the-logs-redacted-is-the-log-not-the-failure) for what else it will and will not tell you.
 
+#### `503` and `504` are different failures, and the one you will actually see is `503`
+
+Both appear in the refusal table above and it is worth knowing which to expect, because reaching for the wrong one wastes an incident.
+
+**`503 SUBSCRIBER_PROVISIONING_FAILED` is the broker saying no, or not being there.** Every inducible broker fault produces it, and produces it fast — a refused connection or a broker that accepts and never answers is reported in tens of milliseconds, not after the budget expires, because the failure is observed rather than waited for. If issuance is failing, this is almost certainly the code, and the thing to check is the admin credential, the authorizer, and whether `KAFKA_BROKERS` names a reachable listener.
+
+**`504 SUBSCRIBER_PROVISIONING_TIMEOUT` is Blnk saying it ran out of time**, which needs the work to be genuinely *slow* rather than broken — a broker answering but pathologically late, a registry write blocked behind a long-running transaction, or a host under enough pressure that the process does not get scheduled. It is rare by construction: the forward path is bounded well under the ceiling and a broker that is merely unreachable fails long before the clock runs out. Treat a `504` as a latency investigation, not an authorization one, and note that the request may have taken longer than five seconds to answer — see the bound table above for why.
+
+Both are safe to retry, and neither leaves a live credential behind: whichever code you receive, the compensation described above has already run or has been logged at ERROR with the principal named for manual revocation. A `504` in particular does **not** mean "it may have half-worked" — that is the whole point of holding the reserve back.
+
+### Rate limiting the credential endpoint
+
+`POST /subscribers/{id}/kafka-credentials` is master-key-only, so rate limiting is not the control that keeps strangers out — the key is. It is worth setting anyway, for two reasons that have nothing to do with authentication.
+
+**Issuance is destructive to the previous secret.** A loop that calls the endpoint repeatedly rotates the credential every time, and every rotation breaks whatever consumer is holding the old password. A limit turns a runaway script or a retry storm in an onboarding job into rejected requests rather than a rotation storm.
+
+**The default is permissive, and deliberately so.** With neither variable set, Blnk applies **2000 requests per second with a burst of 4000, per client**, and says so at start-up. That is sized for the ledger's transaction endpoints, not for an endpoint an operator calls by hand a few times a week:
+
+| Variable | What it sets | Default |
+|---|---|---|
+| `BLNK_RATE_LIMIT_RPS` | Sustained requests per second, per client | `2000` |
+| `BLNK_RATE_LIMIT_BURST` | Burst allowance, per client | `4000` (twice the rps when only the rps is set) |
+| `BLNK_SERVER_TRUSTED_PROXIES` | CIDR blocks or bare IPs whose forwarded-for header is believed | *(unset — forwarded headers are ignored)* |
+
+**`BLNK_SERVER_TRUSTED_PROXIES` is the one that decides whether the limit means anything.** Until it is set, every request behind a load balancer keys to the *proxy's* address, so all your callers share one bucket: one noisy client can exhaust the allowance for every other, and a per-client limit is not what you have. Set it to the proxy's address range and each caller is limited separately.
+
+The limiter is global middleware, so lowering it lowers it for the ledger endpoints too. If you want a tight bound on issuance specifically, put it at the ingress in front of Blnk — this endpoint is administrative and belongs behind a narrower path there anyway.
+
 ### A lost credential is re-issued, never recovered
 
 **There is no procedure in this runbook for looking up a subscriber's password, because none exists.** Only a non-reversible reference and the issuance instant are persisted, and `blnk.event_subscribers` has no column able to hold the secret. No endpoint returns it on a read, and re-calling the issuance endpoint mints a **new** credential rather than returning the old one.
@@ -691,19 +758,35 @@ $BLNK_PSQL -c "
   WHERE webhook_url IS NOT NULL
   ORDER BY created_at;"
 
-# Migration PROGRESS needs no database access — migrated_at is on the API.
+# Migration PROGRESS needs no database access — migrated_at is on the API. include_count is
+# required: total_count is omitted from the envelope unless you ask for it.
+#
+# This counts subscribers with NO migration record, which is not the same as subscribers still
+# to be moved: a subscriber onboarded after the cutover never had an endpoint and is counted
+# here with nothing to migrate. For outstanding WORK, use the webhook_url query above.
 curl -sS "$BLNK_API/subscribers?limit=100&include_count=true" --config "$BLNK_CURL_CONFIG" \
 | jq -r '.total_count as $n | .data
-         | map(select(.migrated_at == null)) as $pending
-         | "\($pending | length) of \($n) subscribers are still awaiting migration",
-           ($pending[] | .subscriber_id)'
+         | map(select(.migrated_at == null)) as $unrecorded
+         | "\($unrecorded | length) of \($n) subscribers carry no migration record",
+           ($unrecorded[] | .subscriber_id)'
 
 # One subscriber's recorded address, through the guarded route.
 curl -sS "$BLNK_API/subscribers/$SUBSCRIBER_ID/webhook-subscription" \
   --config "$BLNK_CURL_CONFIG" | jq '{subscriber_id, webhook_url, migrated_at}'
 ```
 
-A row with a `webhook_url` is a subscriber still to be moved — and it **cannot** also carry a `migrated_at`, because `event_subscribers_webhook_migration_chk` forbids the combination: recording an address clears the migration and completing the migration clears the address, each in one statement. The two can never disagree, so `webhook_url IS NOT NULL` and `migrated_at IS NULL` select the same population and either is a correct audit.
+A row with a `webhook_url` is a subscriber still to be moved, and the API will not let it also carry a `migrated_at`: recording an address clears the migration, completing the migration clears the address, and stamping a migration on a row that still holds an address is **refused** — each of the three in one statement. So for any row written through this API the two columns cannot disagree.
+
+**That guarantee is application-enforced, not database-enforced, and the difference decides which query is a correct audit.** There is no CHECK constraint forbidding the pair, deliberately: the retention purge below is *defined* on `webhook_url IS NOT NULL AND migrated_at IS NOT NULL`, so a constraint would leave it with nothing it could ever match, and it would fail `blnk migrate up` on any database already holding such a row. A `psql` session, a bulk import or a restored backup can therefore still produce one — and if you find one, it came from outside the API and the purge is what clears it.
+
+**`webhook_url IS NOT NULL` and `migrated_at IS NULL` are therefore NOT the same population**, and only one of them answers "who is still to be moved":
+
+| Question | Query |
+|---|---|
+| Who is still to be moved? | `webhook_url IS NOT NULL` — the only column that says "this subscriber receives HTTP pushes today" |
+| Who has been recorded as migrated? | `migrated_at IS NOT NULL` |
+
+`migrated_at IS NULL` is **not** a synonym for the first. It counts every subscriber onboarded after the cutover as well — those never had an endpoint and have nothing to migrate from — so it **over-reports** the outstanding work, and on a row that came from outside the API and holds both values it **under-reports**, by excluding a subscriber whose endpoint is still recorded. Use it to answer what it actually measures: which subscribers carry no migration record.
 
 The timeline and the sunset behaviour are in [webhook-to-kafka-migration.md](webhook-to-kafka-migration.md).
 
@@ -824,15 +907,14 @@ Paged and filtered:
 | Parameter | Effect |
 |----------|--------|
 | `limit` | Page size. Default `20`, maximum `100`; an out-of-range value resets to `20`, a non-numeric one is refused. |
-| `offset` | Page offset. A negative value becomes `0`. Prefer `cursor` for anything deeper than a page or two: an offset's cost grows with its depth. |
-| `cursor` | Keyset cursor naming the `(occurred_at, id)` coordinate of the last entry on the previous page. It is the stable way to page: a row cannot be shown twice or skipped when new failures arrive between requests. |
+| `cursor` | Keyset cursor naming the `(occurred_at, id)` coordinate of the last entry on the previous page. It is the **only** way to page — there is no `offset`, and sending one is refused — and it is the stable way: a row cannot be shown twice or skipped when new failures arrive between requests. |
 | `event_type` | Exact match on the event name, e.g. `transaction.applied`. |
 | `topic` | Exact match on the **original category** topic, e.g. `blnk.transactions`. |
 | `dlt_topic` | The same filter expressed as the `.dlt` sibling, e.g. `blnk.transactions.dlt`. |
 | `status` | `failed` or `dead_lettered`. Anything else is refused. |
 | `occurred_from` | RFC3339 instant. **Inclusive** lower bound on `occurred_at`. |
 | `occurred_to` | RFC3339 instant. **Inclusive** upper bound on `occurred_at`. |
-| `include_count` | Adds `total_count` to the envelope, which is present either way. Supported alongside **every** filter in this table: the total is counted through the same predicate the page is selected by, **in the same database snapshot**, so the total and the page you are holding describe one population. It is not a fixed size to page towards — the inventory is live. |
+| `include_count` | Adds `total_count` to the envelope. The key is **absent** when the option is not supplied — omitted, not zero — so a script must ask for it rather than read it. Supported alongside **every** filter in this table: the total is counted through the same predicate the page is selected by, **in the same database snapshot**, so the total and the page you are holding describe one population. It is not a fixed size to page towards — the inventory is live. |
 | `sort_by` | Accepted and **inert**, for compatibility with a generic list-endpoint client. |
 | `sort_order` | Accepted and **inert**, for the same reason. |
 
@@ -922,7 +1004,9 @@ kafka-console-consumer.sh --bootstrap-server "$KAFKA_BROKERS" \
   | jq -r 'select(.event_id == "<event_id>") | .failure_metadata.error_reason'
 ```
 
-The outbox row's `last_error` column is the same text `failure_metadata.error_reason` was built from, so the two agree. Prefer the row: it exists for a `failed` event too, which has no dead-letter message yet.
+The outbox row's `last_error` column is the same text `failure_metadata.error_reason` was built from, so the two agree **at the moment the event was dead-lettered**. Prefer the row: it exists for a `failed` event too, which has no dead-letter message yet.
+
+> **They stop agreeing after a failed replay, and knowing which is which is the difference between triaging the original fault and triaging your own retry.** A replay that fails writes its own reason into `last_error`, so the row — and therefore the API's `failure_reason`, which is classified from that column — now describes the **most recent** attempt. `failure_metadata`, on the row and in the dead-letter message alike, is never rewritten: it preserves the reason the event was dead-lettered in the first place. So read `failure_reason` for "what is wrong now" and `failure_metadata.error_reason` for "what went wrong originally", and when the two disagree, treat the disagreement as the useful signal — the original cause was fixed, or was never the cause, and something else is refusing the event now.
 
 **The two timestamps together are the most useful field in the object**, because their difference bounds the window the failure persisted over, and that is how you tell a transient outage from a poison message:
 
@@ -1158,66 +1242,93 @@ curl -sS "$BLNK_API/events/stats" --config "$BLNK_CURL_CONFIG" | jq . > recon-$(
 cat recon-*.json | jq .
 ```
 
-One call gets both sides. A realistic response:
+One call gets both sides. The response below is a REAL one, taken verbatim from a running
+deployment so that every member is one the API actually emits — the numbers are small because the
+deployment was, and `measured_windows` is abridged to two of its 48 entries:
 
 ```json
 {
-  "pending": 12,
-  "processing": 3,
+  "pending": 0,
+  "processing": 0,
   "webhook_pending": 0,
-  "dispatched": 1048571,
+  "dispatched": 2,
   "failed": 0,
-  "dead_lettered": 4,
+  "dead_lettered": 2,
   "replaying": 0,
   "producer_atomicity": {
-    "monitor_handoff_pending": 2,
-    "monitor_handoff_processing": 1,
-    "monitor_handoff_completed": 813402,
+    "monitor_handoff_pending": 0,
+    "monitor_handoff_processing": 0,
+    "monitor_handoff_completed": 0,
     "monitor_handoff_failed": 0,
     "unfinalized_batches": 0
   },
   "topic_end_offsets": {
-    "blnk.transactions": 981204,
-    "blnk.transactions.dlt": 3,
-    "blnk.balances": 61118,
-    "blnk.balances.dlt": 1,
-    "blnk.identities": 5902,
-    "blnk.identities.dlt": 0,
-    "blnk.system": 12,
+    "blnk.transactions": 0,
+    "blnk.transactions.dlt": 0,
+    "blnk.balances": 0,
+    "blnk.balances.dlt": 0,
+    "blnk.identities": 2,
+    "blnk.identities.dlt": 2,
+    "blnk.system": 0,
     "blnk.system.dlt": 0
   },
   "offsets_complete": true,
   "partitions_unavailable": 0,
   "measured_windows": [
-    { "topic": "blnk.transactions", "partition": 0, "first_offset": 0, "end_offset": 163534, "records": 163534 },
-    { "topic": "blnk.transactions", "partition": 1, "first_offset": 0, "end_offset": 163521, "records": 163521 }
+    { "topic": "blnk.identities", "partition": 4, "first_offset": 0, "end_offset": 1, "records": 1 },
+    { "topic": "blnk.identities", "partition": 5, "first_offset": 0, "end_offset": 0, "records": 0 }
   ],
-  "offsets_measured_at": "2026-05-02T02:00:04.117Z",
-  "generated_at": "2026-05-02T02:00:03.902Z",
+  "offsets_measured_at": "2026-08-10T01:10:12.645984448Z",
+  "window_start": "2026-08-09T01:10:12.591082402Z",
+  "window_seconds": 86400,
+  "generated_at": "2026-08-10T01:10:12.592071725Z",
   "reconciliation": {
-    "terminal_events": 1048575,
-    "corroborated_events": 1048575,
+    "terminal_events": 4,
+    "corroborated_events": 4,
     "unconfirmed_events": 0,
     "unmeasured_events": 0,
     "aged_out_events": 0,
     "beyond_end_events": 0,
     "duplicated_records": 0,
-    "messages_written": 1048581,
-    "purged_events": 0,
-    "all_time_terminal_events": 1048575,
-    "verified_records": 1048575,
-    "unverifiable_records": 0,
-    "missing_records": 0,
-    "overhead": 6,
+    "messages_written": 4,
+    "records_retained": 4,
+    "blnk_record_share": 4,
+    "overhead": 0,
     "loss_detected": false,
     "conclusive": true,
-    "summary": "NO LOSS DETECTED: 1048575 all-time events (1048575 rows plus 0 purged) against 1048581 broker records, 6 of which are redelivery, replay or dead-letter overhead. The two sides cover the same interval, every one of the 1048575 rows names a distinct record, and all 1048575 named records were verified to exist on the broker — so the surplus cannot be masking an equal number of losses",
-    "measured_at": "2026-05-02T02:00:04.117Z"
+    "window_start": "2026-08-09T01:10:12.591082402Z",
+    "windowed": false,
+    "covered_from": "2026-08-10T00:27:53.816226Z",
+    "covered_to": "2026-08-10T00:47:02.967735Z",
+    "oldest_terminal_at": "2026-08-10T00:27:53.816226Z",
+    "summary": "NO LOSS DETECTED: every one of the 4 outbox rows published between 2026-08-10T00:27:53Z and 2026-08-10T00:47:02Z names the distinct broker record it produced, inside the measured offset window of its own partition, so no event this outbox still retains is missing from the broker. The broker's 4 record(s) are a CUMULATIVE total for the topics rather than a count inside a shared window, so the difference against the row count is not a surplus and no shortfall can be computed from it",
+    "measured_at": "2026-08-10T01:10:12.645984448Z"
   }
 }
 ```
 
-`missing_topics` and `caveats` are absent here because both are omitted when empty, which on this response is the healthy reading. `measured_windows` is abridged above — a real response carries one entry per partition of every measured topic.
+`missing_topics` and `caveats` are absent here because both are omitted when empty, which on this
+response is the healthy reading. So are `producer_atomicity.oldest_unfinalized_batch_at`, for the
+same reason, and `reconciliation.covered_from` / `covered_to` when nothing was corroborated.
+
+**FIVE FIELDS THAT USED TO BE DOCUMENTED HERE NO LONGER EXIST**, and a script asserting on them
+reads a constant. They were `purged_events`, `all_time_terminal_events`, `verified_records`,
+`unverifiable_records` and `missing_records`, and they belonged to a whole-history reconciliation
+that corrected for retention with a purge log. The comparison is now drawn inside the
+per-partition windows the offsets were measured in, so there is nothing to correct for, and each
+question they answered has a better home: `corroborated_events` replaces `verified_records`,
+`beyond_end_events` replaces `missing_records` and is the one signal that is unambiguous loss,
+and `unverifiable_records` split into the two causes it used to fuse — `aged_out_events`, where
+retention removed a record the stored offset still evidences, and `unmeasured_events`, where the
+measurement did not cover that topic or partition.
+
+**`windowed` is the field to read before believing `overhead`**, and on the response above it is
+`false` while `window_start` is present: the request bounded the OUTBOX side to 24 hours, and the
+broker's end offsets are cumulative for the life of each topic, so the two sides do not describe
+one interval. The verdict is unchanged and rests on the per-row coordinate mapping rather than on
+the totals — which is exactly what the summary says, and why it declines to call the difference a
+surplus. A response whose two sides do share a window reports `windowed: true` and a summary that
+names `overhead` as redelivery, replay and dead-letter copies.
 
 The **seven per-status counts are explicit fields**, one per member of the outbox state machine, so a status with a count of zero reads as "none in that state" rather than "no such state":
 
@@ -1258,18 +1369,28 @@ The server computes the verdict itself, so you do not re-implement the arithmeti
 jq -r '
   if .reconciliation == null then
     "INCONCLUSIVE: no broker side was measured"
-  elif (.reconciliation.missing_records // 0) > 0 then
-    "LOSS DETECTED: " + .reconciliation.summary
+  elif (.reconciliation.beyond_end_events // 0) > 0 then
+    .reconciliation.summary
   elif .reconciliation.loss_detected then
-    "LOSS DETECTED: " + .reconciliation.summary
+    .reconciliation.summary
   elif (.reconciliation.conclusive | not) then
     "INCONCLUSIVE: " + ((.reconciliation.caveats // []) | join("; "))
   else
-    "PASS: " + .reconciliation.summary
+    .reconciliation.summary
   end' recon-*.json
 ```
 
+**Three branches print `summary` unlabelled because `summary` is already the verdict line.** The
+server writes it beginning `LOSS DETECTED:`, `NO LOSS DETECTED:` or `INCONCLUSIVE:`, so a script
+that prepends its own label emits `LOSS DETECTED: LOSS DETECTED: …` and an operator reads a
+stutter instead of a reason. The two branches that DO add a label are the two with no summary to
+print: a `reconciliation` that is absent entirely, and the inconclusive branch, which deliberately
+prints the `caveats` list rather than the summary because the caveats name every reason in plain
+words. `grep -q '^LOSS DETECTED'` still works on the output either way.
+
 **Loss is tested BEFORE inconclusiveness, and the order is load-bearing.** An incomplete measurement can only ever *understate* what the broker holds, so it cannot manufacture a shortfall — which means a shortfall on an inconclusive measurement is still a shortfall. Checking `conclusive` first would print `INCONCLUSIVE` and bury it, and an operator reading a caveat list would go looking for a measurement problem instead of missing events.
+
+**The first branch reads `beyond_end_events`, and it is not redundant with `loss_detected`.** That field is the one unambiguous signal in the whole check — a row naming an offset at or above the end of its partition's log, which the broker itself once assigned, so the log reached it and does not now. `loss_detected` covers it too, and also covers the arithmetic shortfall that only a windowed comparison can produce; branching on the stronger signal first is what makes the printed line say *which* kind of loss without reading the summary. This branch used to read `missing_records`, a field the API no longer returns: it always evaluated to the `// 0` default, so the branch was dead and the whole verdict rested on the next one. It degraded safely — `loss_detected` still caught the loss — but a script that asserted on `missing_records` itself asserted on a constant.
 
 1. **`reconciliation` absent** → no offsets could be read at all. Either no brokers are configured — a legitimate steady state, not an error — or the broker was unreachable. There is nothing to compare. Not a pass and not a failure.
 2. **`conclusive` false** → counting cannot decide the matter today. Read `caveats`, which names every reason in plain words. **This is the field to check before reporting anything green**, and it is the one an eager script skips.
@@ -1462,7 +1583,7 @@ Two caveats. The consumer must start from an offset **inside** the window, or re
 
 ## Alert Response
 
-`alerts/blnk-kafka-alerts.yml` defines **one rule group, `blnk-kafka-alerts`, evaluated every 30 seconds**, holding five rules. Each names this document as its `runbook_url`. The sections below are in the same order as the file.
+`alerts/blnk-kafka-alerts.yml` defines **one rule group, `blnk-kafka-alerts`, evaluated every 30 seconds**, holding **thirteen** rules. Seven are CONDITION rules — a dead-letter entry left unresolved, a subscriber falling behind, a credential awaiting revocation, an unaccounted credential, a refused revocation, and the two settlement rules — and six are MEASURABILITY rules, which fire when Blnk cannot tell whether a condition rule should. Each names this document as its `runbook_url`. The sections below are in the same order as the file.
 
 Before working any of them, satisfy yourself that the alert is *loaded* — see [Is the alert armed at all?](#is-the-alert-armed-at-all) — because "the alert did not fire" and "the alert was never evaluated" look identical from the outside.
 
@@ -1514,7 +1635,7 @@ A warning rather than a page: the events are durably in Kafka and a consumer cat
      | jq -r '.data[] | "\(.subscriber_id)\t\(.kafka_principal)\t\(.consumer_group_id)"'
    ```
 
-   `GET /subscribers` answers with the `{data, next_cursor, has_more, total_count}` envelope for **every** reading, including this one, so read `.data[]`. A one-element `data` resolved it; an empty `data` with **200** means the registry was searched to its end and holds no such subscriber. `total_count` is exact here because the resolution is complete rather than paged, and `limit` and `cursor` are **refused** on this reading — there is no page to bound. **500** `GEN_INTERNAL` means the registry exceeds the resolver's bound of 100 pages × 100 rows, so the answer is **unknown rather than negative** — query the table directly in that case:
+   `GET /subscribers` answers with an **object carrying `data`** on every reading, including this one — never a bare array — so read `.data[]`. Which keys accompany `data` depends on the reading: this one carries `total_count` and `has_more` and **no** `next_cursor`, because it resolves the whole registry rather than a page. A one-element `data` resolved it; an empty `data` with **200** means the registry was searched to its end and holds no such subscriber. `total_count` is exact here, and is present without `include_count`, for that same reason — the resolution is complete rather than paged — and `limit` and `cursor` are **refused** on this reading, because there is no page to bound. **500** `GEN_INTERNAL` means the registry exceeds the resolver's bound of 100 pages × 100 rows, so the answer is **unknown rather than negative** — query the table directly in that case:
 
    ```bash
    $BLNK_PSQL -c "
@@ -1926,7 +2047,7 @@ Verify, in this order:
 docker compose --profile monitoring up -d prometheus
 ```
 
-1. **Open `http://localhost:9090/rules`.** The group `blnk-kafka-alerts` must be listed with all five rules and a 30-second evaluation interval. **Check `/rules`, not `/targets`** — a target can show `UP` while the rules never loaded, and a rule that never loaded reports no error anywhere.
+1. **Open `http://localhost:9090/rules`.** The group `blnk-kafka-alerts` must be listed with all **thirteen** rules and a 30-second evaluation interval. **Check `/rules`, not `/targets`** — a target can show `UP` while the rules never loaded, and a rule that never loaded reports no error anywhere.
 2. **Validate the file before you ship a change to it**, which also catches a bad glob:
 
    ```bash
@@ -1938,6 +2059,22 @@ docker compose --profile monitoring up -d prometheus
 
    ```bash
    curl -sS "http://localhost:9090/api/v1/query?query=blnk_dlt_oldest_message_age_seconds" | jq '.data.result | length'
+   ```
+
+4. **On Kubernetes, assert that Prometheus has targets at all.** This step has no Compose equivalent and it is the one that catches the failure the two steps above cannot see:
+
+   ```bash
+   kubectl -n blnk exec deploy/prometheus -- \
+     wget -qO- http://localhost:9090/api/v1/targets | jq '.data.activeTargets | length'
+   ```
+
+   **The answer must be greater than zero, and every target's `health` must be `up`.** Kubernetes discovers its scrape targets from the API server rather than from static DNS names — the server and worker are autoscaled, and a Service target load-balances, so a static address would reach one arbitrary replica per scrape and collapse every per-process counter into one series that appears to reset. Discovery is therefore correct, and it costs a prerequisite: the Prometheus pod needs `serviceAccountName: prometheus` **and** `automountServiceAccountToken: true` (both are in `prometheus-deployment.yaml`) so that the ServiceAccount and Role in `prometheus-rbac.yaml` actually apply to it.
+
+   With either missing, Prometheus logs `Cannot create service discovery` once at startup — or is refused by the API server with a 403 — and then serves normally with **zero** targets. The pod is `1/1 Running`, `/-/ready` is green, `/rules` lists all fourteen rules, and nothing is collected, so every rule evaluates against nothing and none can ever fire. **That is why both `/rules` and `/api/v1/targets` have to be checked on Kubernetes: a loaded rule over an absent series and a healthy system are the same observation.** Confirm the credential is present and sufficient with:
+
+   ```bash
+   kubectl -n blnk exec deploy/prometheus -- ls /var/run/secrets/kubernetes.io/serviceaccount/token
+   kubectl -n blnk auth can-i list pods --as=system:serviceaccount:blnk:prometheus
    ```
 
 > **If `metrics_bearer_token` is set, the scrape fails and every rule sits permanently unable to fire.** Prometheus shows the target down; the rules report nothing wrong. `prometheus.yml` carries the two commented `authorization:` blocks and the mount instructions that fix it — use `credentials_file`, never inline `credentials`, so the token stays out of the committed file and can be rotated without a restart.

@@ -288,12 +288,22 @@ type DeadLetterOutcome struct {
 // surfaces broker hostnames and ports through *net.OpError, its length is bounded by
 // nothing, and a newline in it forges a second entry in a line-oriented aggregator.
 //
-// So it is SANITIZED rather than dropped — control characters removed, newlines folded to
-// spaces, and the result capped with a visible truncation marker — which is the same
-// treatment internal/notification applies to a system error's text for the same reasons.
+// So it is REDACTED AND BOUNDED rather than dropped — addresses and secret values replaced,
+// control characters removed, newlines folded to spaces, and the result capped with a visible
+// truncation marker. redactLogValue and not sanitizeLogValue, and that difference is DATA-02:
+// sanitizing alone made the value's FORM safe and left its CONTENT intact, so every line
+// below rendered the broker's host and port, and a resolution failure rendered the internal
+// DNS server's address as well — at the default info level, in the two lines a failing
+// pipeline emits most. The diagnosis is what survives redaction: "connection refused",
+// "i/o timeout" and "Cluster Authorization Failed" all still reach the line, beside the
+// closed failure_class, which is everything this field is read for.
+//
 // The verbatim, unbounded value stays where it is already protected and where triage can
 // still reach it: the dead-lettered message's failure_metadata, which the dead-letter API
-// returns, and the row's last_error.
+// returns, and the row's last_error. Both are behind the master key, and `.dlt` topics are
+// not grantable to a subscriber, so the audience there is already entitled to the
+// deployment's internals — which is precisely what a log aggregator's audience is not.
+// docs/kafka-operations.md §"Reading the logs" publishes exactly this three-way split.
 //
 // Returns:
 //   - logrus.Fields: a fresh map the caller may extend.
@@ -306,7 +316,7 @@ func (o DeadLetterOutcome) LogFields() logrus.Fields {
 		"partition_key_hash": hashLogIdentifier(o.PartitionKey),
 		"attempt_count":      o.Metadata.AttemptCount,
 		"failure_class":      classifyDeadLetterFailure(o.Metadata.ErrorReason),
-		"error_reason":       sanitizeLogValue(o.Metadata.ErrorReason, maxLoggedErrorLength),
+		"error_reason":       redactLogValue(o.Metadata.ErrorReason, maxLoggedErrorLength),
 		"published":          o.Published,
 		"status":             string(o.Status),
 		"message_bytes":      len(o.Message),
@@ -1692,6 +1702,36 @@ func (s *EventDeadLetterService) writeDeadLetterMessage(
 	// this message, but the pipeline-level statement about the event is that it ended its
 	// life on a dead-letter topic.
 	record(model.PublishStatusDeadLettered)
+
+	// AND COUNTED AS A REAL BROKER ACKNOWLEDGEMENT, under purpose="dead_letter" (OBS-06).
+	//
+	// This write is traffic the broker accepted, so it belongs on the acknowledgement counter
+	// exactly as an original publish and a replay do. The instrument is declared "by topic,
+	// event type and purpose", the publisher's own increment site states that EVERY purpose is
+	// counted because "a replay and a dead-letter write are both real acknowledgements", and
+	// docs/metrics.md tells an operator to break the counter out by purpose to see how much of
+	// the broker traffic is triage. All three promised a series that was never written: the
+	// increment lived only on the ordinary publish path, so purpose="dead_letter" did not
+	// exist and the documented triage query could only ever return the original and replay
+	// shares. An absent series reads as zero dead-letter traffic, which is indistinguishable
+	// from a healthy pipeline.
+	//
+	// It is placed HERE, after the acknowledgement and beside the attempt record, rather than
+	// in PublishToDeadLetter beside EventsDeadLetteredTotal, because the two counters answer
+	// different questions: this one counts WRITES the broker accepted, and EventsDeadLettered
+	// Total counts EVENTS whose dead-lettering is complete — which requires the row to have
+	// been recorded as well, and so is incremented once the bookkeeping succeeds. A write whose
+	// row update then fails is a real acknowledgement and a dead-lettering that is not yet
+	// finished, and the two series say so independently.
+	//
+	// Both labels are bounded by the same helpers the publisher uses, so the purpose shares
+	// can be summed on one query without a name mismatch. The topic is the `.dlt` sibling,
+	// which is the topic this record was actually written to.
+	metrics.EventBrokerAcknowledgementsTotal.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String(publishAttrTopic, boundedTopicLabel(outcome.DeadLetterTopic)),
+		attribute.String(publishAttrEventType, boundedEventTypeLabel(outcome.EventType)),
+		attribute.String(publishAttrPurpose, string(PublishPurposeDeadLetter)),
+	))
 
 	// The coordinate names the record on the DEAD-LETTER topic, which is where this event's
 	// only surviving copy now lives. Persisting it is what lets an operator triaging the

@@ -1659,9 +1659,17 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 // awaiting migration; refusing the write instead would leave an operator unable to
 // correct a record whose correction is the entire purpose of the column.
 //
-// The schema enforces the same invariant through event_subscribers_webhook_migration_chk,
-// so a row breaking it cannot be written by any path — this method, a psql session, or a
-// restored backup.
+// The same invariant is enforced from the other direction by MarkSubscriberMigrated, whose
+// statement refuses to stamp a row that still holds a URL. Between the two, no path THROUGH
+// THIS REPOSITORY can write a row that both has and has not stopped receiving legacy pushes.
+//
+// It is NOT a schema CHECK, and that is deliberate rather than an omission: the RETAIN-01
+// retention control, PurgeMigratedSubscriberWebhookURLs, selects exactly the pair
+// (webhook_url IS NOT NULL AND migrated_at IS NOT NULL), so a constraint forbidding it would
+// make that control unreachable and would fail `migrate up` on any database already holding
+// such a row. The pair therefore stays REPRESENTABLE — a psql session, a restored backup or a
+// direct UpdateEventSubscriber call can still produce one, and the purge is what clears
+// them — while nothing here creates one.
 //
 // The URL is VALIDATED here, at the persistence boundary, because the column is a future
 // request sink: nothing sends to it today, and the moment anything does, whatever is
@@ -1743,7 +1751,8 @@ func (d Datasource) RecordSubscriberWebhookURL(ctx context.Context, subscriberID
 // for an operator correcting a record or honouring an erasure request before the
 // retention period elapses. migrated_at is untouched: whether the subscriber migrated is
 // an audit fact that forgetting an address does not change, and CLEARING a URL cannot
-// break event_subscribers_webhook_migration_chk from either starting state.
+// produce the self-contradicting pair from either starting state — it only ever moves a
+// row further away from it.
 //
 // It is deliberately NOT CompleteSubscriberWebhookMigration. Deleting an address is not
 // evidence that a subscriber moved to Kafka, and conflating the two would let a purge
@@ -1805,6 +1814,37 @@ func (d Datasource) ClearSubscriberWebhookURL(ctx context.Context, subscriberID 
 // Re-stamping simply moves the timestamp forward. It is idempotent in effect — a
 // subscriber that is migrated stays migrated — so a retried migration step needs no
 // guard at the call site.
+//
+// # A ROW THAT STILL HOLDS A webhook_url IS REFUSED, and the refusal is HERE
+//
+// migrated_at means "this subscriber no longer receives legacy HTTP pushes";
+// webhook_url means "this is the endpoint it receives them on". A row holding both
+// asserts the opposite of itself, and every reader of the registry then disagrees:
+// the migration report counts it as done, and an operator reading the row sees a live
+// endpoint on a subscriber that has supposedly finished migrating. Stamping ALONE on
+// such a row is exactly that misuse, so the statement below carries
+// `AND webhook_url IS NULL` and the caller gets ErrGenConflict steering them to
+// CompleteSubscriberWebhookMigration, which moves both columns in one statement.
+//
+// The predicate is in the STATEMENT rather than in a read-then-write, because a
+// separate check would be a race: the URL can be recorded between the check and the
+// update, and the write would then land on precisely the row the check existed to
+// protect.
+//
+// THIS IS NOT A DATABASE CONSTRAINT, and the distinction is load-bearing rather than
+// pedantic. There is deliberately no CHECK forbidding the pair, because
+// PurgeMigratedSubscriberWebhookURLs — the RETAIN-01 retention control documented on
+// blnk.event_subscribers — selects exactly `webhook_url IS NOT NULL AND migrated_at
+// IS NOT NULL`. A CHECK would make that control unreachable by construction and would
+// fail `migrate up` on any database already holding such a row, so rows in that state
+// must remain REPRESENTABLE (a restored backup, a psql session, or a direct
+// UpdateEventSubscriber call can produce one) while no path through this repository
+// CREATES one. The purge is what cleans up the ones that predate or bypass it.
+//
+// Returns ErrGenConflict when the row still holds a URL and ErrSubscriberNotFound when
+// there is no such subscriber. Both arrive as zero rows affected, so they are told
+// apart by re-reading the row rather than guessed at — reporting "not found" for a
+// subscriber that plainly exists would send an operator looking for the wrong problem.
 func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberMigrated")
 	defer span.End()
@@ -1826,15 +1866,24 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 		SET migrated_at = $1,
 			updated_at = $2
 		WHERE subscriber_id = $3
+		  AND webhook_url IS NULL
 	`, migratedAt, time.Now(), subscriberID)
 	if err != nil {
 		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", "mark_subscriber_migrated", err)
 	}
 
-	if err := assertSubscriberRowAffected(result, "Failed to mark subscriber migrated"); err != nil {
+	affected, err := result.RowsAffected()
+	if err != nil {
 		failDatabaseSpan(span, err)
-		return err
+		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", "mark_subscriber_migrated", err)
+	}
+
+	if affected == 0 {
+		refusal := d.explainRefusedMigrationStamp(ctx, subscriberID)
+		failDatabaseSpan(span, refusal)
+
+		return refusal
 	}
 
 	span.AddEvent("Subscriber marked migrated", trace.WithAttributes(
@@ -1842,6 +1891,62 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 		attribute.String("subscriber.migrated_at", migratedAt.UTC().Format(time.RFC3339)),
 	))
 	return nil
+}
+
+// explainRefusedMigrationStamp tells the two reasons MarkSubscriberMigrated updated no
+// row apart, by re-reading the row the statement declined to touch.
+//
+// A subscriber that exists is a subscriber whose webhook_url was non-NULL when the
+// statement ran, because subscriber_id is the only other term in the predicate. That is
+// the conflict, and it is reported as one. No row at all is a plain not-found.
+//
+// A URL cleared concurrently between the two statements also lands here and is reported
+// as the conflict, which is the correct answer for the attempt that was refused: the
+// state it was refused against was real, and the caller's remedy — repeat the
+// request — succeeds on the next try.
+//
+// The read failing is reported as an internal error rather than being collapsed into
+// either answer, because "we could not tell you why" is a different fact from either
+// reason and only one of the three is the caller's to fix.
+//
+// It probes EXISTENCE rather than re-reading webhook_url, because the answer does not
+// depend on the column's value now. subscriber_id is the only other term in the refused
+// predicate, so a row that exists is a row the URL predicate declined — and if the URL
+// was cleared in between, the refusal still describes the attempt that was actually
+// made, whose remedy is to repeat it.
+func (d Datasource) explainRefusedMigrationStamp(ctx context.Context, subscriberID string) error {
+	var exists int
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT 1
+		FROM blnk.event_subscribers
+		WHERE subscriber_id = $1
+	`, subscriberID).Scan(&exists)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
+	case err != nil:
+		return loggedDatabaseError(
+			apierror.ErrInternalServer,
+			"Failed to mark subscriber migrated",
+			"explain_refused_migration_stamp",
+			err,
+		)
+	default:
+		return apierror.NewAPIError(
+			apierror.ErrGenConflict,
+			"This subscriber still has a legacy webhook URL recorded, so it cannot be marked "+
+				"migrated on its own. Complete the migration instead, which forgets the URL and "+
+				"records the instant together.",
+			errors.New(
+				"database: migrated_at was not stamped because webhook_url is still set; a row "+
+					"holding both asserts that the subscriber has and has not stopped receiving "+
+					"legacy pushes. Use CompleteSubscriberWebhookMigration, which moves both "+
+					"columns in one statement",
+			),
+		)
+	}
 }
 
 // CompleteSubscriberWebhookMigration forgets a subscriber's legacy endpoint and records that it

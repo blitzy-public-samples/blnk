@@ -97,6 +97,32 @@ func sanitizeLogValue(value string, max int) string {
 	return logsafe.Value(value, max)
 }
 
+// redactLogValue is sanitizeLogValue with NETWORK TOPOLOGY REDACTED: the rendering for a
+// dependency's own words when they arrive as a STRING rather than as an error.
+//
+// It is to sanitizeLogValue what loggableCause is to an error, and the distinction is the
+// same one: sanitizeLogValue makes a value's FORM safe, while a broker or driver message
+// whose form is perfectly safe still names the broker's address, the resolver's address or
+// the connection string it failed on. That is reconnaissance for anybody who can read the
+// log and is not needed to know that the broker is unreachable.
+//
+// The reason it is needed at all is that not every failure reaches a log site as an error.
+// A dead-lettered event's reason has already been recorded — on the row's last_error and in
+// the dead-letter message's failure_metadata — before it is logged, so what the log site
+// holds is text. Those two durable copies deliberately keep the verbatim address, because
+// both are reachable only behind the master key; the LOG is the copy with the wider
+// audience, and it gets this rendering.
+//
+// Parameters:
+//   - value string: the untrusted text.
+//   - max int: the maximum number of runes to keep. Values below 1 yield an empty string.
+//
+// Returns:
+//   - string: the redacted, sanitized, bounded text.
+func redactLogValue(value string, max int) string {
+	return logsafe.RedactedValue(value, max)
+}
+
 // loggableCause renders an error for an operational log line at a normal level: control
 // characters stripped, NETWORK TOPOLOGY REDACTED, and length bounded.
 //

@@ -702,24 +702,43 @@ Two dimensions of a subscriber's access are enforced at the broker, and they are
 
 All four categories can be granted, `blnk.system` included — it carries `ledger.created` as well as `system.error`, so withholding it would make a currently-delivered event unreachable. It is granted per subscriber rather than by default. No dead-letter topic is grantable to a subscriber.
 
-### Your `partition_key_prefix` is yours to enforce
+### A topic you are granted, you read whole — including other subscribers' records
 
-Your subscriber record may carry a `partition_key_prefix`, and your credential response reports it inside `enforced_access` next to two fields that tell you exactly what it is:
+This is the one property of the access model that surprises people, so it is stated before the field that invites the wrong reading.
+
+**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances`, `blnk.identities` and `blnk.system`.
+
+The topic grant is therefore not merely *a* boundary, it is **the** boundary. If two parties must not see each other's events, they must not be granted the same topic — and because the four category topics are fixed, that means separating them at the deployment boundary rather than at the grant. There is no third option, and no field on a subscriber changes this.
+
+### Your `partition_key_prefix` is yours to enforce — this is a contract, not a hint
+
+Your subscriber record may carry a `partition_key_prefix`, and it is the field most likely to be mistaken for an access boundary. It is not one. Your credential response reports it inside `enforced_access` beside the five fields that say so:
 
 ```json
 "partition_key_prefix": "ldg_9f1c8a72",
 "partition_key_prefix_enforced": false,
 "partition_key_prefix_enforced_by": "consumer_side",
-"not_enforced_by": ["partition_key"]
+"client_side_key_filtering_required": true,
+"not_enforced_by": ["partition_key"],
+"guidance": "Kafka authorises whole topics and consumer groups and has no message-key dimension, so a partition-key prefix is never enforced: a granted topic is readable in full, including records written for other ledgers and other subscribers. To confine a subscriber, narrow its authorized_topics, which the broker does enforce, or isolate the data at the deployment boundary."
 ```
 
-**Read those two fields before you design around the prefix.** Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topic*, so your credential reads **every** record on every topic it is granted, whatever the keys are. The prefix is the scope you are expected to apply *in your consumer*, against the message key — `key.startsWith(prefix)`, a byte-exact prefix test on an opaque identifier, with no case folding and no trimming. Records outside it will be delivered to you; discarding them is your side of the contract.
+**Read them before you design around the prefix.** Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topic*, so your credential reads **every** record on every topic it is granted, whatever the keys are.
 
-If you need records outside your scope to be *unreachable* rather than filtered, that is a topic-grant question, not a key question — ask your operator to narrow `authorized_topics` or to publish your domain to a topic of its own. Both are real ACLs.
+**`client_side_key_filtering_required` is your obligation, in the same sense that `event_id` deduplication is.** It is `true` exactly when a prefix is recorded, and when it is true the narrowing is applied **in your consumer and nowhere else**. Blnk does not filter for you. It cannot: nothing between the topic and your consumer inspects a key on your behalf, and no ACL exists that would.
+
+Your side of the contract, then, is two lines of consumer code and one piece of discipline:
+
+- **Filter on the key.** `key.startsWith(prefix)` — a byte-exact prefix test on an opaque identifier, with no case folding, no trimming and no Unicode normalisation. Records outside your prefix **will** be delivered to you; discarding them is yours to do.
+- **Do not treat the prefix as a security control.** Your process is *able* to read out-of-prefix records, so anything that reads the stream — a debug log of raw records, a dead-letter of your own, a metric labelled by key, an operator with your credential — can see them too. Handle the whole topic as data you are trusted with, because that is what you have been granted.
+
+If you need records outside your scope to be *unreachable* rather than filtered, that is a topic-grant question, not a key question — ask your operator to narrow `authorized_topics`, or to isolate your domain at the deployment boundary. Those are the two enforceable answers, and `guidance` in every response names them so the remedy travels with the limitation rather than living only here.
 
 `partition_key_prefix_enforced_by` is `none` when no prefix is recorded, which means the topic and consumer-group grants are your whole boundary and there is nothing for you to filter. The field is always present, so you can branch on it without first testing whether the prefix is empty.
 
 `not_enforced_by` says the same thing as a list, and it is the one to assert on if you want a test that fails when the contract changes: it carries `partition_key` for every subscriber, and together with `enforced_by` it enumerates every dimension this API names. Compare it against a fixed expectation rather than checking that `partition_key` is absent from `enforced_by` — an absence proves nothing, because a dimension the server never mentions reads identically to one it forgot.
+
+`guidance` is prose for a human reading a response or a support ticket, and its wording may change. Branch on `client_side_key_filtering_required`, or assert on the `enforced_by` / `not_enforced_by` pair; those are the machine-readable contract.
 
 ## Observability
 
@@ -757,7 +776,13 @@ A practical checklist. The reasoning behind each item is in the sections above.
 - **Consumer group.** Use the group id your credentials were issued with. ACLs are scoped to that
   group's namespace; joining another group is refused.
 - **Topics.** Subscribe only to the topics your credentials list. Every other topic, and every
-  `.dlt` topic, is refused with an authorisation error.
+  `.dlt` topic, is refused with an authorisation error. A topic you *are* granted, you read whole:
+  it carries every ledger's events and every other subscriber's, because there are no per-tenant
+  topics.
+- **Key filtering (required when `client_side_key_filtering_required` is `true`).** Discard records
+  whose key does not begin with your `partition_key_prefix`, with a byte-exact `startsWith`. The
+  broker performs no key check — this is your obligation, in the same sense that deduplicating on
+  `event_id` is.
 - **Offsets.** Commit offsets after your handler has recorded the `event_id`, so a redelivery after
   a crash is suppressed by your idempotency store rather than reprocessed.
 - **Message size.** Blnk refuses to publish an event larger than 768 KiB, so a consumer's

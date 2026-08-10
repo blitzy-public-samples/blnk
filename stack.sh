@@ -1658,7 +1658,29 @@ main() {
                 fi
             fi
             ;;
-        * ) help
+        # An explicit request for the usage banner, and a bare invocation, which is read as
+        # one. Both SUCCEED: printing what was asked for is not an error, and a wrapper that
+        # runs "./stack.sh --help" to check the script is present should not see a failure.
+        --help | -h | "" )
+            help
+            ;;
+        # ANYTHING ELSE IS A MISTAKE, AND IT EXITS NON-ZERO.
+        #
+        # This arm used to be `* ) help`, sharing the success path above, so `./stack.sh
+        # --buld` printed the usage banner and returned 0. Nothing was brought up, nothing was
+        # torn down, and every caller was told it had worked — a CI job or a provisioning
+        # wrapper that mistyped a subcommand recorded success against a stack that had never
+        # started. That is the one class of failure this script otherwise avoids everywhere:
+        # `--down` with no ${env} exits 1, a broker that never becomes healthy exits non-zero,
+        # and a purge without consent refuses. A typo was the sole exception.
+        #
+        # The argument is named back rather than only the usage printed, because the mistake is
+        # usually a single transposed character and an operator reading a wall of usage text
+        # does not always see which word of theirs was not understood.
+        * )
+            printf "\n ${RED}==> error:${NC} unrecognised argument ${YEL}%s${NC}. Nothing was started, stopped or changed.\n" "${1}"
+            help
+            exit 1
             ;;
     esac
 

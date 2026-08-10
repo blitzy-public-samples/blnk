@@ -1461,3 +1461,115 @@ func TestNullableTime_TurnsTheZeroInstantIntoSQLNull(t *testing.T) {
 	instant := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
 	assert.Equal(t, instant, nullableTime(instant))
 }
+
+// ---------------------------------------------------------------------------------------
+// The webhook-migration invariant, enforced at the write rather than by the schema
+// ---------------------------------------------------------------------------------------
+
+// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository pins the statement
+// that makes an invariant real instead of merely documented.
+//
+// # The defect this replaces
+//
+// Four comments and the operations runbook asserted that a CHECK constraint named
+// event_subscribers_webhook_migration_chk forbade a row from being migrated while it still
+// carried a live endpoint. No such constraint exists in any migration, and none is wanted:
+// PurgeMigratedSubscriberWebhookURLs — the RETAIN-01 retention control documented on the
+// table itself — selects exactly `webhook_url IS NOT NULL AND migrated_at IS NOT NULL`, so a
+// constraint forbidding that pair would leave it unable to match anything, and would fail
+// `migrate up` on any database already holding such a row.
+//
+// The pair therefore has to stay representable. What must not happen is this repository
+// CREATING one, and the only method that could was this one: it stamped migrated_at with
+// `WHERE subscriber_id = $1` alone. The refusal its own documentation promised did not
+// happen, and the registry double in the root package mirrored a constraint that was not
+// there — so the assertion that the call is refused passed against a fake STRICTER than
+// PostgreSQL, which is the one way a green test becomes a false one.
+//
+// # What is asserted
+//
+// The predicate, and the two answers it produces. Both arrive as zero rows affected, and
+// telling them apart is the point: answering "not found" for a subscriber that plainly
+// exists sends an operator looking for the wrong problem.
+func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository(t *testing.T) {
+	t.Run("the statement carries the webhook_url predicate", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec(regexp.QuoteMeta("webhook_url IS NULL")).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		require.NoError(t, source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now()),
+			"a row with no recorded URL is stamped normally")
+		require.NoError(t, mock.ExpectationsWereMet(),
+			"the UPDATE must narrow on webhook_url IS NULL; without it the repository writes the "+
+				"self-contradicting row this test exists to prevent")
+	})
+
+	t.Run("a row that still holds a URL is a conflict, not a success", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		// Zero rows affected, and the row exists: the predicate declined it.
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT 1")).
+			WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
+
+		err := source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
+		require.Error(t, err, "stamping alone on a row with a live URL must be refused")
+
+		var apiErr apierror.APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, apierror.ErrGenConflict, apiErr.Code,
+			"the row's state conflicts with the operation; it is not a missing subscriber and not "+
+				"an internal fault")
+		assert.Contains(t, apiErr.Message, "Complete the migration instead",
+			"the refusal must steer the caller to CompleteSubscriberWebhookMigration, which moves "+
+				"both columns in one statement, or it is a dead end")
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("no such subscriber is still a plain not-found", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT 1")).
+			WillReturnError(sql.ErrNoRows)
+
+		err := source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
+		require.Error(t, err)
+
+		var apiErr apierror.APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, apierror.ErrSubscriberNotFound, apiErr.Code,
+			"a subscriber that does not exist must not be reported as a state conflict")
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// TestPurgeMigratedSubscriberWebhookURLs_StillTargetsThePairNoConstraintForbids is the guard
+// that keeps the decision above from being quietly reversed.
+//
+// The retention control and a CHECK constraint on the same pair are mutually exclusive: one
+// of them is dead code the moment the other exists. Anybody reintroducing
+// event_subscribers_webhook_migration_chk has to delete this predicate first, and this test
+// is where they find out that deleting it removes the only thing that ever clears a legacy
+// URL from a migrated subscriber.
+func TestPurgeMigratedSubscriberWebhookURLs_StillTargetsThePairNoConstraintForbids(t *testing.T) {
+	db, mock := newSQLMock(t)
+	source := Datasource{Conn: db}
+
+	mock.ExpectExec(regexp.QuoteMeta("webhook_url IS NOT NULL")).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+
+	purged, err := source.PurgeMigratedSubscriberWebhookURLs(context.Background(), time.Now())
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, purged)
+	require.NoError(t, mock.ExpectationsWereMet(),
+		"the purge must still select webhook_url IS NOT NULL AND migrated_at IS NOT NULL. That "+
+			"pair is representable ON PURPOSE — a CHECK forbidding it would make this control "+
+			"unreachable and would fail migrate up on a database already holding such a row")
+}

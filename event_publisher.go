@@ -1047,26 +1047,31 @@ func IsBrokerUnavailableError(err error) bool {
 // brokerUnavailable classifies a RAW publish failure — one that has not been through
 // kafkaPublisher.fail and so carries no verdict of its own.
 //
-// It starts from the transient classification, because every recoverable failure that
-// function recognises (a Temporary or Timeout error, a context expiry, a refused or reset
-// connection) is by definition the broker not being reachable or not being ready. Three
-// additions cover what it deliberately does not:
+// # ONE CLASSIFIER, TWO QUESTIONS (RETRY-01)
 //
-//   - kafka.WriteErrors, so a batch is judged by its members exactly as the transient
-//     classification judges it.
-//   - BrokerNotAvailable and ReplicaNotAvailable. kafka-go does NOT list these in
-//     Error.Temporary, yet both are the broker stating plainly that it cannot serve the
-//     partition right now. They are the two codes a caller most expects to see during a
-//     rolling restart, so leaving them out would report the commonest planned outage as an
-//     internal error.
-//   - *net.OpError and *net.DNSError, which cover a dial, route or resolution failure
-//     whose underlying errno is outside the small set classifyTransientPublishError names.
+// This is now exactly classifyTransientPublishError, and the delegation is the fix rather
+// than a shortcut. The two questions — "will another attempt help?" and "is the broker the
+// reason?" — have one answer for a publish failure, because a broker that cannot accept the
+// write right now is precisely the failure a later attempt succeeds at.
 //
-// The net checks are deliberately made against those CONCRETE types and never against the
-// net.Error interface: kafka.Error implements Error, Timeout and Temporary, so it satisfies
-// net.Error, and an interface test would silently reclassify every Kafka protocol error —
-// including genuine defects such as an invalid topic or an oversized message — as a
-// broker outage.
+// While they were two functions they DISAGREED, and the disagreement was reachable in
+// ordinary operation: brokerUnavailable recognised *net.DNSError and *net.OpError while the
+// transient classification did not, so a broker whose name stopped resolving — a container
+// or pod replacement, a Service recreation, a resolver restart — produced one failure that
+// was simultaneously reported terminal=true (skipping the whole retry budget and
+// dead-lettering the event on the spot) and failure_class=broker_unavailable on the very
+// next log line. A rolling restart therefore dead-lettered every event in flight instead of
+// self-healing, which breaks requirement R-4's bounded five-attempt budget and blows
+// acceptance criterion V-3's 0.1% dead-letter budget during planned maintenance.
+//
+// The invariant this delegation makes structural, rather than a property two functions had
+// to be kept in step to preserve: A FAILURE CLASSIFIED broker_unavailable IS NEVER TERMINAL
+// ON AN UNSPENT BUDGET.
+//
+// The set of failures it reports is UNCHANGED. It always contained everything the transient
+// classification recognised plus the three signatures kafka-go does not mark retriable, and
+// those three now live in brokerUnavailableSignature, which the transient classification
+// consults as its last rule. What changed is the retry verdict, which widened to match.
 //
 // Parameters:
 //   - err error: the raw failure. May be nil.
@@ -1074,23 +1079,41 @@ func IsBrokerUnavailableError(err error) bool {
 // Returns:
 //   - bool: true when the failure is the broker being unavailable.
 func brokerUnavailable(err error) bool {
+	return classifyTransientPublishError(err)
+}
+
+// brokerUnavailableSignature recognises the three broker-outage signatures kafka-go's own
+// retriability judgement does not report, so they can be named in ONE place and consulted by
+// both the retry verdict and the broker-unavailability verdict.
+//
+// It exists as a leaf helper rather than as a branch inside either caller because the two
+// used to hold separate copies of this knowledge and drifted apart; a single leaf cannot
+// drift, and it cannot recurse into either caller.
+//
+//   - BrokerNotAvailable and ReplicaNotAvailable. kafka-go does NOT list these in
+//     Error.Temporary, yet both are the broker stating plainly that it cannot serve the
+//     partition right now. They are the two codes a caller most expects to see during a
+//     rolling restart, so leaving them out would report the commonest planned outage as an
+//     internal error.
+//   - *net.OpError and *net.DNSError, which cover a dial, route or resolution failure whose
+//     underlying errno is outside the small set classifyTransientPublishError names — a
+//     resolution failure has no errno at all, which is exactly how it escaped.
+//
+// The net checks are deliberately made against those CONCRETE types and never against the
+// net.Error interface: kafka.Error implements Error, Timeout and Temporary, so it satisfies
+// net.Error, and an interface test would silently reclassify every Kafka protocol error —
+// including genuine defects such as an invalid topic or an oversized message — as a
+// broker outage. A kafka.Error is answered from its code alone and does not fall through to
+// the net checks, because a protocol code is never a network operation error.
+//
+// Parameters:
+//   - err error: the failure. Never nil in practice; a nil is reported false.
+//
+// Returns:
+//   - bool: true when the failure carries one of the three signatures.
+func brokerUnavailableSignature(err error) bool {
 	if err == nil {
 		return false
-	}
-
-	var writeErrors kafka.WriteErrors
-	if errors.As(err, &writeErrors) {
-		for _, writeErr := range writeErrors {
-			if brokerUnavailable(writeErr) {
-				return true
-			}
-		}
-
-		return false
-	}
-
-	if classifyTransientPublishError(err) {
-		return true
 	}
 
 	var kafkaErr kafka.Error
@@ -3125,7 +3148,7 @@ func KafkaBrokersConfigured(brokers []string) bool {
 // classification buys is that a relay need not burn its whole budget on a failure that can
 // never succeed, and need not give up on one that plainly can.
 //
-// Four sources of truth are consulted, in the order a failure is most likely to arrive:
+// Five sources of truth are consulted, in the order a failure is most likely to arrive:
 //
 //   - kafka.WriteErrors, the per-message slice a failed batch returns. It exposes no
 //     Unwrap, so errors.As cannot see inside it and its elements must be inspected
@@ -3142,10 +3165,31 @@ func KafkaBrokersConfigured(brokers []string) bool {
 //   - Raw connection failures, which reach the caller unwrapped often enough to be worth
 //     naming: a refused, reset or broken connection is the ordinary signature of a broker
 //     restart.
+//   - brokerUnavailableSignature, the three broker-outage shapes none of the four rules
+//     above recognises: BrokerNotAvailable, ReplicaNotAvailable, and a *net.OpError or
+//     *net.DNSError whose cause is outside the small errno set named above.
 //
-// Anything unrecognised is reported as permanent. That is the conservative direction for an
-// unknown failure, because an unbounded retry of something that can never succeed is worse
-// than a dead-letter entry an operator can see and replay.
+// # RETRY-01: why the fifth rule is here and not only in brokerUnavailable
+//
+// It used to be only there, and a DNS failure was the consequence. A broker whose NAME stops
+// resolving — the ordinary shape of a container or pod replacement, a Service recreation or a
+// resolver restart — surfaces as a *net.DNSError, which carries no errno, is not Temporary
+// and is not a Timeout, so all four rules above reported it permanent. The relay then
+// dead-lettered the event IMMEDIATELY with its whole budget unspent, on a condition that
+// clears by itself in seconds, while the very next log line classified the same error
+// failure_class=broker_unavailable. A rolling restart converted every event in flight into a
+// manual replay and a DeadLetterMessageStuck page.
+//
+// So the two verdicts are ONE predicate now: brokerUnavailable delegates here, and the rule
+// they used to disagree about lives in one leaf both consult. The invariant that buys —
+// a failure classified broker_unavailable is never terminal on an unspent budget — is
+// requirement R-4's bounded five-attempt budget doing what it says.
+//
+// Anything unrecognised is still reported as permanent. That is the conservative direction
+// for an unknown failure, because an unbounded retry of something that can never succeed is
+// worse than a dead-letter entry an operator can see and replay — and it is why this widening
+// names three concrete signatures rather than reaching for the net.Error interface, which
+// kafka.Error also satisfies.
 //
 // Parameters:
 //   - err error: the error returned by WriteMessages. May be nil.
@@ -3182,11 +3226,15 @@ func classifyTransientPublishError(err error) bool {
 		return true
 	}
 
-	return errors.Is(err, syscall.ECONNREFUSED) ||
+	if errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.EOF)
+		errors.Is(err, io.EOF) {
+		return true
+	}
+
+	return brokerUnavailableSignature(err)
 }
 
 // recordPublishAttempt records the two per-attempt instruments.
@@ -3369,12 +3417,50 @@ type kafkaLogger struct {
 // Printf satisfies kafka-go's logger interface, forwarding the formatted message to logrus
 // at this logger's level with the topic attached.
 //
+// # DATA-02: the client's message is a dependency's own words, so it is redacted at a
+// normal level
+//
+// kafka-go writes its failures for a developer at a terminal: "kafka.(*Client).Produce: dial
+// tcp 10.0.3.14:9092: connect: connection refused" and "dial tcp: lookup kafka on
+// 127.0.0.11:53: no such host" are both verbatim renderings of what it tried and where. This
+// hook is installed at ERROR level, so forwarding the string unchanged put the broker's
+// address, its port and the internal resolver's address into every deployment's log at the
+// default level — the same disclosure the event pipeline redacts everywhere it renders an
+// error itself, arriving through the one path that was not this codebase's own text.
+//
+// So a line at Warn or worse is redacted through redactLogValue, which removes
+// address-shaped tokens and secret values and keeps the prose: the diagnosis an operator
+// acts on survives, and the topic that failed is already carried as its own field. The
+// verbatim text is not lost — when the standard logger is at debug it is attached as
+// message_verbatim, exactly the asymmetry withLoggableCause applies to an error, so the
+// detail a broker investigation needs stays one explicit, auditable act away.
+//
+// The DEBUG hook is forwarded verbatim and deliberately so: it is only ever emitted when a
+// deployment has asked for debug, which is the same consent gate cause_verbatim sits behind.
+//
 // Parameters:
 //   - format string: the format string kafka-go supplies.
 //   - args ...interface{}: its arguments.
 func (l kafkaLogger) Printf(format string, args ...interface{}) {
-	logrus.WithFields(logrus.Fields{
+	entry := logrus.WithFields(logrus.Fields{
 		"component": "kafka-writer",
 		"topic":     l.topic,
-	}).Logf(l.level, format, args...)
+	})
+
+	// logrus orders its levels from Panic (0) to Trace (6), so "at Warn or worse" is a
+	// numeric comparison against WarnLevel. Anything below it — debug and trace — is already
+	// gated on a deployment having asked for that detail.
+	if l.level > logrus.WarnLevel {
+		entry.Logf(l.level, format, args...)
+
+		return
+	}
+
+	message := fmt.Sprintf(format, args...)
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		entry = entry.WithField("message_verbatim", sanitizeLogValue(message, maxLoggedErrorLength))
+	}
+
+	entry.Log(l.level, redactLogValue(message, maxLoggedErrorLength))
 }

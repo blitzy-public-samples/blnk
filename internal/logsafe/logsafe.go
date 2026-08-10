@@ -168,6 +168,36 @@ func Value(value string, max int) string {
 	return bound(clean(value), max)
 }
 
+// RedactedValue is Value with network topology removed as well: the rendering for a STRING
+// that carries a dependency's own words to a log line at a normal level.
+//
+// It is Cause's pipeline — clean, then RedactEndpoints, then bound — applied to text rather
+// than to an error, and it exists because a failure reason does not always arrive as an
+// error. A dead-lettered event's reason has already been recorded on its outbox row and in
+// the dead-letter message's failure_metadata by the time it is logged, so what the log site
+// holds is a string; passing it through Value alone made its FORM safe while leaving the
+// broker's address and the resolver's address in it. The order matters and is why this is
+// not a composition a caller can safely make itself: redaction has to run on cleaned text,
+// because it splits on whitespace, and it has to run BEFORE bounding, or an address the cap
+// truncated mid-token stops matching the endpoint rules and survives.
+//
+// The cap is a parameter rather than MaxErrorLength because callers apply their own bound —
+// an error string and a caller-supplied filter value are held to different lengths.
+//
+// Parameters:
+//   - value string: the untrusted text.
+//   - max int: the maximum number of runes to keep. Values below 1 yield an empty string.
+//
+// Returns:
+//   - string: the sanitized, redacted, bounded text.
+func RedactedValue(value string, max int) string {
+	if value == "" || max < 1 {
+		return ""
+	}
+
+	return bound(RedactEndpoints(clean(value)), max)
+}
+
 // Cause renders an error for an operational log line: control characters stripped,
 // network topology redacted, length bounded.
 //

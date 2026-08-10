@@ -318,3 +318,87 @@ func isValidUTF8(value string) bool {
 
 	return true
 }
+
+// TestRedactedValue_RemovesTopologyFromTextTheSameWayCauseDoesFromAnError is the guard on the
+// rendering a failure gets when it arrives as a STRING rather than as an error.
+//
+// The two have to agree. A dead-lettered event's reason is recorded on its outbox row before it
+// is ever logged, so the log site holds text — and it used to pass that text through Value,
+// which makes a value's FORM safe and leaves the broker's address, its port and the internal
+// resolver's address exactly where they were. The consequence was a log line at the default
+// level naming the deployment's internal topology, from the one path whose input was not an
+// error value.
+//
+// The ORDER inside this helper is the reason it exists rather than being composed at the call
+// site: redaction splits on whitespace, so it must run on cleaned text, and it must run BEFORE
+// bounding, or a cap that truncated an address mid-token would leave the fragment unmatched by
+// every endpoint rule and therefore unredacted.
+func TestRedactedValue_RemovesTopologyFromTextTheSameWayCauseDoesFromAnError(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		text      string
+		diagnosis string
+		leaks     []string
+	}{
+		"a refused dial": {
+			text:      "kafka.(*Client).Produce: dial tcp 172.21.0.2:9092: connect: connection refused",
+			diagnosis: "connection refused",
+			leaks:     []string{"172.21.0.2", "9092"},
+		},
+		"a resolution failure, which also names the resolver": {
+			text:      "dial tcp: lookup kafka on 127.0.0.11:53: no such host",
+			diagnosis: "no such host",
+			leaks:     []string{"127.0.0.11", ":53", "lookup kafka on"},
+		},
+		"a connection tuple with both ends": {
+			text:      "write tcp 10.0.0.4:34918->10.0.0.7:9092: write: broken pipe",
+			diagnosis: "broken pipe",
+			leaks:     []string{"10.0.0.4", "10.0.0.7", "34918"},
+		},
+		"a quoted connection string": {
+			text:      `pq: connection failed password=hunter2 host=db.internal:5432`,
+			diagnosis: "connection failed",
+			leaks:     []string{"hunter2", "db.internal", "5432"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rendered := RedactedValue(testCase.text, MaxErrorLength)
+
+			for _, leak := range testCase.leaks {
+				assert.NotContains(t, rendered, leak,
+					"%q is reconnaissance once it is sitting in a log aggregator", leak)
+			}
+
+			assert.Contains(t, rendered, testCase.diagnosis,
+				"the diagnosis must survive: redaction removes addresses and secrets, not prose")
+			assert.Contains(t, rendered, Placeholder,
+				"and the removal must be visible, so the line is not read as corrupted")
+
+			// The identical text handed to Cause as an error must render identically, or the two
+			// sinks disagree about the same failure.
+			assert.Equal(t, Cause(errors.New(testCase.text)), rendered,
+				"a failure must render the same whether it reached the log site as text or as an error")
+		})
+	}
+}
+
+// TestRedactedValue_SanitizesAndBoundsLikeValue pins the properties it inherits, because
+// redaction is an ADDITION to sanitization rather than a replacement for it: a forged newline
+// still splits a line and an unbounded broker error still dominates a log, redacted or not.
+func TestRedactedValue_SanitizesAndBoundsLikeValue(t *testing.T) {
+	forged := "dial tcp 10.0.0.4:9092: connect: connection refused\nERROR everything is fine\x07" +
+		strings.Repeat("y", MaxErrorLength*2)
+
+	rendered := RedactedValue(forged, MaxErrorLength)
+
+	assert.NotContains(t, rendered, "\n", "a newline would forge a second log entry")
+	assert.NotContains(t, rendered, "\x07", "control characters corrupt terminals and parsers")
+	assert.NotContains(t, rendered, "10.0.0.4", "and the address is still removed")
+	assert.LessOrEqual(t, len([]rune(rendered)), MaxErrorLength+len([]rune(TruncationSuffix)),
+		"the cap still applies")
+	assert.True(t, strings.HasSuffix(rendered, TruncationSuffix), "truncation stays marked")
+
+	assert.Empty(t, RedactedValue("", MaxErrorLength),
+		"an empty input yields an empty string rather than a placeholder for nothing")
+	assert.Empty(t, RedactedValue("dial tcp 10.0.0.4:9092", 0),
+		"and a non-positive cap yields nothing at all, exactly as Value does")
+}

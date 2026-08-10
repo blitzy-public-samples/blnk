@@ -16,10 +16,46 @@ spec:
       labels:
         io.kompose.service: prometheus
     spec:
-      # Prometheus scrapes Blnk over the pod network and never calls the Kubernetes
-      # API — the scrape targets in prometheus-configmap.yaml are static DNS names,
-      # not a kubernetes_sd_config — so no ServiceAccount token is needed.
-      automountServiceAccountToken: false
+      # THE SECOND HALF OF POD DISCOVERY, and the half that has no symptom of its own.
+      #
+      # prometheus-configmap.yaml discovers its targets with `kubernetes_sd_configs:
+      # role: pod` rather than static DNS names, because the server and worker are
+      # autoscaled between 2 and 10 replicas and a Service target load-balances — a
+      # static `server:5001` reaches one arbitrary pod per scrape, so per-process
+      # counters appear to reset and the other replicas' backlogs have no series at
+      # all. Pod discovery is therefore correct here. But it means Prometheus CALLS
+      # THE KUBERNETES API, and to call it the pod needs an identity and a token.
+      #
+      # BOTH LINES BELOW ARE REQUIRED, AND EACH FAILS DIFFERENTLY.
+      #
+      #   serviceAccountName: without it the pod runs as the namespace's `default`
+      #   ServiceAccount, which the RoleBinding in prometheus-rbac.yaml does not bind
+      #   — so the API server answers 403 and discovery finds nothing.
+      #
+      #   automountServiceAccountToken: with it false there is no token file at
+      #   /var/run/secrets/kubernetes.io/serviceaccount/token at all, and Prometheus
+      #   logs `Cannot create service discovery … no such file or directory` once at
+      #   startup and then serves normally with zero targets.
+      #
+      # Either way the pod is 1/1 Running, /-/ready is green, /api/v1/rules lists
+      # every rule, and /api/v1/targets is EMPTY — so no series is ever recorded and
+      # every rule in blnk-kafka-alerts.yml sits permanently unable to fire, including
+      # the dead-letter-age and consumer-lag rules that acceptance criterion V-4 names.
+      # An absent alert is indistinguishable from a healthy system, which is why this
+      # is stated at length rather than left to be inferred: the deployment looks
+      # correct and collects nothing.
+      #
+      # Verify at /api/v1/targets after any change here — `activeTargets` must be
+      # non-empty — never at /-/ready. docs/kafka-operations.md carries the command.
+      #
+      # This is the one workload in this folder that mounts a token. server-deployment
+      # .yaml and worker-deployment.yaml keep `automountServiceAccountToken: false`
+      # because neither calls the Kubernetes API, and the token is exactly what should
+      # not be sitting in the filesystem of the process most exposed to the network.
+      # Widening discovery beyond this namespace means widening the Role to a
+      # ClusterRole in the same change, or discovery fails silently again.
+      serviceAccountName: prometheus
+      automountServiceAccountToken: true
       # The prom/prometheus image already runs as nobody (65534), which the
       # metrics-bearer-token mode below is chosen for. Stating it here makes it
       # enforced rather than inherited: runAsNonRoot turns an image that is later

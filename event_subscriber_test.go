@@ -751,19 +751,29 @@ func (s *subscriberTestStore) MarkSubscriberMigrated(
 		return s.notFound(subscriberID)
 	}
 
-	// THE SCHEMA'S INVARIANT, mirrored: event_subscribers_webhook_migration_chk refuses a
-	// row that is migrated and still carries a live URL. Stamping alone on such a row is
-	// exactly the misuse the constraint catches, so the double refuses it too — otherwise
-	// a test could prove a call path works that the real database rejects.
+	// THE REPOSITORY'S REFUSAL, mirrored. Datasource.MarkSubscriberMigrated carries
+	// `AND webhook_url IS NULL` in its statement and answers ErrGenConflict when the row
+	// still holds one, because stamping alone there would assert that the subscriber both
+	// has and has not stopped receiving legacy pushes. The double refuses identically —
+	// same code, same steering — so a test cannot prove a call path works that the real
+	// repository rejects, and cannot prove one is rejected more harshly than it is.
+	//
+	// This used to cite a schema CHECK named event_subscribers_webhook_migration_chk. No
+	// such constraint exists, and none is wanted: the RETAIN-01 retention purge selects
+	// exactly the pair a CHECK would forbid. The double was therefore STRICTER than
+	// production — it refused what PostgreSQL happily wrote — which is the one way a fake
+	// can turn a green test into a false one. The refusal now lives in the repository, so
+	// this mirrors something real.
 	if row.WebhookURL != nil && strings.TrimSpace(*row.WebhookURL) != "" {
 		return apierror.NewAPIError(
-			apierror.ErrInternalServer,
-			"Failed to mark subscriber migrated",
+			apierror.ErrGenConflict,
+			"This subscriber still has a legacy webhook URL recorded, so it cannot be marked "+
+				"migrated on its own. Complete the migration instead, which forgets the URL and "+
+				"records the instant together.",
 			errors.New(
-				"subscriber test store: event_subscribers_webhook_migration_chk — this row still "+
-					"holds a webhook_url, so stamping migrated_at alone would assert that it both "+
-					"has and has not stopped receiving legacy pushes; use "+
-					"CompleteSubscriberWebhookMigration",
+				"subscriber test store: this row still holds a webhook_url, so stamping "+
+					"migrated_at alone would assert that it both has and has not stopped "+
+					"receiving legacy pushes; use CompleteSubscriberWebhookMigration",
 			),
 		)
 	}
@@ -4319,12 +4329,18 @@ func TestClearLegacyWebhookSubscription_PreservesAnExistingMigrationInstant(t *t
 // MarkSubscriberMigrated stamps migrated_at ALONE, which is correct for a subscriber that
 // never had an endpoint recorded — an onboarding completed entirely on Kafka, the ordinary
 // case after the cutover. On a row that still holds a URL it would write the
-// self-contradicting state, so the schema's event_subscribers_webhook_migration_chk refuses
-// it and the registry double mirrors that refusal.
+// self-contradicting state, so the repository's statement refuses it — `AND webhook_url IS
+// NULL`, answered as ErrGenConflict — and the registry double mirrors that refusal.
 //
 // The point of asserting the refusal rather than avoiding the call: this method remains
-// exported and reachable, so what stops it corrupting a row is the invariant, not a
-// convention about which method to call.
+// exported and reachable, so what stops it corrupting a row is the refusal at the write, not
+// a convention about which method to call.
+//
+// The refusal is enforced in the repository and NOT by a schema CHECK. That matters to this
+// test's honesty: the double used to cite a constraint that does not exist, which made this
+// assertion pass against a fake stricter than PostgreSQL. See
+// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository in
+// database/event_subscriber_test.go, which pins the statement itself.
 func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURL(t *testing.T) {
 	endpoint := "https://hooks.example.com/blnk"
 

@@ -1337,6 +1337,38 @@ func (a EventRecordIntervalAudit) FullyCorroborated() bool {
 // The legacy webhook URL policy — ONE definition, for every layer that records the column
 // ---------------------------------------------------------------------------------------
 
+// MaxWebhookURLLength bounds blnk.event_subscribers.webhook_url, in bytes.
+//
+// # Why a bound exists at all
+//
+// Every other caller-supplied text on that table is bounded — the subscriber name at 256
+// characters by event_subscribers_name_length_chk, each authorized topic at 249 by Kafka's own
+// limit — and this column was not. A 100,020-character https URL was accepted and stored: no
+// security consequence, because the scheme and destination are validated and the surface is
+// master-key-only behind a request size cap, but an unbounded column is an inconsistency that
+// only stays harmless for as long as nothing reads it. This column is a future request sink,
+// and the moment anything dials it, whatever is stored becomes a request Blnk makes.
+//
+// # Why 2048
+//
+// It is the length every mainstream client, proxy and gateway handles without truncation —
+// Internet Explorer's 2,083-byte address bar was the historical floor the whole web settled
+// above — and it is far above any legitimate webhook endpoint, which is a host and a path. A
+// URL longer than this would not survive the round trip to a real receiver, so refusing it at
+// the registry is refusing something that could never have worked.
+//
+// It is measured in BYTES rather than runes, deliberately: the limit exists to bound what is
+// stored and transmitted, and a rune count would let a multi-byte URL occupy several times the
+// intended space. The refusal states both numbers so a caller can see by how much.
+//
+// # Why not a database CHECK as well
+//
+// The two dual-run columns are dropped at sunset, and a validating scan added now would have to
+// truncate or null URLs already stored — destroying a third party's endpoint to enforce a bound
+// on a column with weeks left to live. The policy function below is the single point both
+// writers already share, so a bound here covers the API and the repository alike.
+const MaxWebhookURLLength = 2048
+
 // ValidateWebhookURL judges a legacy webhook URL against the single policy every layer that
 // writes blnk.event_subscribers.webhook_url must apply.
 //
@@ -1356,14 +1388,16 @@ func (a EventRecordIntervalAudit) FullyCorroborated() bool {
 //
 // # What the policy is
 //
-// An https URL, with a host, that is not visibly internal, carrying no surrounding whitespace.
-// Each clause earns its place:
+// An https URL, with a host, no longer than MaxWebhookURLLength, that is not visibly internal and
+// carries no surrounding whitespace. Each clause earns its place:
 //
 //   - HTTPS ONLY, because the payload is a ledger, identity or balance event and pushing it in
 //     cleartext is a disclosure whatever the destination.
 //   - NO SURROUNDING WHITESPACE, refused rather than trimmed, because the column is stored
 //     VERBATIM: trimming for validation and storing the original would persist a destination that
 //     never passed the check. It also keeps the repository and the DTO honest about one value.
+//   - BOUNDED LENGTH, because every other caller-supplied text on this table is bounded and this
+//     one was not. See MaxWebhookURLLength.
 //   - NOT AN INTERNAL DESTINATION, because a webhook URL is third-party input that Blnk itself
 //     dials, which makes it a server-side request forgery vector straight at the cloud metadata
 //     endpoint and at every service that trusts the network rather than the caller.
@@ -1391,6 +1425,21 @@ func ValidateWebhookURL(raw string) (message, reason string) {
 			"a URL differing from another only by whitespace is a copy-paste artefact, and this " +
 				"column is stored verbatim, so trimming it would persist a destination the caller " +
 				"did not supply"
+	}
+
+	// LENGTH BEFORE PARSING. url.Parse on a 100 KB string is work done on a value that was
+	// never going to be accepted, and the check is cheaper than the parse.
+	//
+	// The reason names the two NUMBERS and nothing else. The length is the caller's own value
+	// and the one fact they need in order to fix the request; the URL itself is a third
+	// party's endpoint and stays out of Blnk's error responses and logs, exactly as it does
+	// for the parser failure below.
+	if len(raw) > MaxWebhookURLLength {
+		return "The webhook URL is too long",
+			fmt.Sprintf(
+				"the URL is %d bytes, over the %d byte maximum",
+				len(raw), MaxWebhookURLLength,
+			)
 	}
 
 	// THE PARSER'S ERROR IS NOT RETURNED. url.Parse quotes the input back, and the input is a

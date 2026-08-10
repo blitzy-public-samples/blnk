@@ -25,14 +25,17 @@ global:
   #   runbook_base_url: 'https://runbooks.internal.example/blnk/kafka'
 
 # Alerting rules to evaluate. A rule file is inert unless it is listed here,
-# so this stanza — not the mere presence of the file — is what arms the EIGHT
-# rules in alerts/blnk-kafka-alerts.yml: three CONDITION rules (a dead-letter
-# entry unresolved for more than 15 minutes, a subscriber consumer group
-# trailing by more than 10,000 messages, and a credential awaiting revocation
-# for over an hour) and five MEASURABILITY rules that fire when Blnk cannot
-# tell whether a condition rule should. Those rules match on the Prometheus
-# forms of the OTel instrument names declared in internal/metrics/metrics.go,
-# dots becoming underscores.
+# so this stanza — not the mere presence of the file — is what arms the
+# THIRTEEN rules in alerts/blnk-kafka-alerts.yml: seven CONDITION rules (a
+# dead-letter entry unresolved for more than 15 minutes, a subscriber consumer
+# group trailing by more than 10,000 messages, a credential awaiting revocation
+# for over an hour, an unaccounted credential, a revocation the broker refused,
+# and the two subscriber-settlement rules) and six MEASURABILITY rules that
+# fire when Blnk cannot tell whether a condition rule should — degraded lag
+# measurement, a stale or incomplete lag rotation, and the three
+# event-metrics-collector rules. Those rules match on the Prometheus forms of
+# the OTel instrument names declared in internal/metrics/metrics.go, dots
+# becoming underscores.
 #
 # NONE OF THEM CAN FIRE UNLESS /metrics EXISTS, which takes
 # BLNK_ENABLE_OBSERVABILITY=true on the scraped role — both Compose files now
@@ -81,10 +84,10 @@ rule_files:
 #      as written.
 #   2. metrics_bearer_token SET                      -> every request without
 #      `Authorization: Bearer <token>` is refused. The jobs below then collect
-#      NOTHING, every series the alert rules match on is absent, and all four
-#      Kafka alerts sit permanently unable to fire. Prometheus shows the target
-#      as down; the rules report no error. An alert that cannot fire looks
-#      exactly like a system with nothing wrong.
+#      NOTHING, every series the alert rules match on is absent, and all
+#      thirteen Kafka alerts sit permanently unable to fire. Prometheus shows
+#      the target as down; the rules report no error. An alert that cannot fire
+#      looks exactly like a system with nothing wrong.
 #   3. server.secure true with NO metrics_bearer_token -> the endpoint refuses
 #      every request outright, including authenticated ones.
 #

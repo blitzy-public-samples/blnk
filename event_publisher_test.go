@@ -55,6 +55,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3773,5 +3774,292 @@ func TestRequireLocalBrokersForPlaintext_ScopesTheAcknowledgementToLocalBrokers(
 					"the refusal must name the remedy, not only the problem")
 			})
 		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// RETRY-01: the retry verdict and the broker-unavailability verdict are ONE verdict
+// ---------------------------------------------------------------------------
+
+// publisherBrokerOutages are the failure shapes that mean THE BROKER could not take the write.
+//
+// Each one is the real value a client produces, not a message that reads like it: a resolution
+// failure is a *net.DNSError, a refused or unreachable dial is a *net.OpError, and a broker
+// declaring itself unable to serve a partition is a kafka.Error code. Asserting over the values
+// is what makes these tests a contract about classification rather than about error text.
+func publisherBrokerOutages() map[string]error {
+	return map[string]error{
+		// THE FINDING. A broker whose name stops resolving is the ordinary shape of a container
+		// or pod replacement, a Service recreation, or a resolver restart. It carries no errno,
+		// is not Temporary and is not a Timeout, so every rule that predates this map reported it
+		// permanent — and the relay dead-lettered the event on the spot with four attempts unspent.
+		"the broker name does not resolve": &net.DNSError{
+			Err: "no such host", Name: "kafka.internal", IsNotFound: true,
+		},
+		"the resolver itself is unreachable": &net.DNSError{
+			Err: "server misbehaving", Name: "kafka.internal", IsTemporary: false,
+		},
+		"the dial was refused": &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+			Err:  syscall.ECONNREFUSED,
+		},
+		"the host is unreachable": &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+			Err:  syscall.EHOSTUNREACH,
+		},
+		"the broker declares itself unavailable": kafka.BrokerNotAvailable,
+		"a replica is not available":             kafka.ReplicaNotAvailable,
+		"a batch member could not be resolved": kafka.WriteErrors{
+			&net.DNSError{Err: "no such host", Name: "kafka.internal", IsNotFound: true},
+		},
+		"a resolution failure reached through a wrapper": fmt.Errorf(
+			"kafka.(*Client).Produce: %w",
+			&net.DNSError{Err: "no such host", Name: "kafka.internal", IsNotFound: true},
+		),
+	}
+}
+
+// TestClassifyTransientPublishError_KeepsTheBudgetForEveryBrokerOutage is RETRY-01.
+//
+// # The defect this pins closed
+//
+// Two functions answered two questions that have one answer, and they disagreed.
+// classifyTransientPublishError decided whether another attempt was worth making;
+// brokerUnavailable decided whether the broker was the reason. The second recognised
+// *net.DNSError and *net.OpError and the first did not, so a broker whose name stopped
+// resolving produced ONE error that was reported terminal — skipping the whole retry budget and
+// dead-lettering a live ledger event immediately — while the very next log line classified it
+// failure_class=broker_unavailable. An ordinary rolling restart therefore converted every event
+// in flight into a manual replay, breaching requirement R-4's bounded five-attempt budget and
+// acceptance criterion V-3's 0.1% dead-letter budget during planned maintenance.
+//
+// The verdicts are one predicate now, and the assertion below is the invariant that states it:
+// a failure the pipeline calls broker_unavailable is ALWAYS retryable while budget remains.
+func TestClassifyTransientPublishError_KeepsTheBudgetForEveryBrokerOutage(t *testing.T) {
+	for name, cause := range publisherBrokerOutages() {
+		t.Run(name, func(t *testing.T) {
+			assert.True(t, classifyTransientPublishError(cause),
+				"a broker that cannot take the write right now is the archetypal recoverable "+
+					"failure; reporting it permanent spends none of the budget and dead-letters "+
+					"a deliverable event")
+
+			assert.True(t, brokerUnavailable(cause),
+				"and the broker-unavailability verdict must agree, because it is the same verdict")
+
+			assert.True(t, IsBrokerUnavailableError(cause),
+				"the exported form the API boundary reads must agree too, or one response says "+
+					"503-retry-this while the pipeline has already given up")
+		})
+	}
+}
+
+// TestClassifyTransientPublishError_StillRefusesToRetryWhatCannotSucceed is the other half of
+// RETRY-01, and it is the half that keeps the widening honest.
+//
+// Widening a retry classification is only safe if it widened by the failures a later attempt
+// can succeed at and nothing else. An unrecognised error, an authorisation refusal and an
+// oversized record are all conditions no amount of waiting changes, and each must still be
+// reported permanent so the event reaches the dead-letter inventory an operator can see rather
+// than spending five attempts first.
+func TestClassifyTransientPublishError_StillRefusesToRetryWhatCannotSucceed(t *testing.T) {
+	for name, cause := range map[string]error{
+		"a bare error this pipeline never recognised": errors.New("publisher test: unknown failure"),
+		"the principal may not write to the topic":    kafka.TopicAuthorizationFailed,
+		"the record is larger than the broker allows": kafka.MessageSizeTooLarge,
+		"the event exceeded Blnk's own size ceiling":  ErrEventMessageTooLarge,
+		"the destination is not a Blnk topic":         ErrTopicNotOwned,
+		"an empty batch of write errors": kafka.WriteErrors{
+			errors.New("publisher test: unknown batch failure"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.False(t, classifyTransientPublishError(cause),
+				"a condition no later attempt can change must not consume the retry budget")
+			assert.False(t, brokerUnavailable(cause),
+				"and it is not the broker's fault either, so the two verdicts still agree")
+		})
+	}
+}
+
+// TestPublishToTopic_SpendsTheBudgetWhenTheBrokerNameStopsResolving carries RETRY-01 through the
+// PUBLISH PATH rather than asserting the classifier in isolation.
+//
+// The classifier's verdict only matters because of what it becomes: PublishError.Transient,
+// PublishResult.Retryable, PublishResult.Terminal and PermanentFailure — the field the relay
+// actually branches on. A fix that corrected the predicate and left any one of those reading the
+// old way would leave the event dead-lettered exactly as before, so each is asserted here.
+func TestPublishToTopic_SpendsTheBudgetWhenTheBrokerNameStopsResolving(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	unresolvable := &net.DNSError{Err: "no such host", Name: "kafka.internal", IsNotFound: true}
+	event := publisherEvent(model.EventTypeTransactionApplied, "txn_dns_failure", publisherPayload)
+
+	t.Run("with budget remaining the event is retried, not abandoned", func(t *testing.T) {
+		transport := newPublisherFakeTransport()
+		transport.transportErr = unresolvable
+		publisher := publisherWithFakeTransport(t, transport)
+
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Topic:       TopicForEvent(event.EventType),
+			Key:         publisherLedgerID,
+			Attempt:     2,
+			MaxAttempts: 5,
+		})
+
+		require.Error(t, err)
+		assert.True(t, result.Transient,
+			"a name that does not resolve says nothing about the event: the next attempt publishes it")
+		assert.True(t, result.Retryable, "attempt 2 of 5 leaves budget, so another attempt is available")
+		assert.False(t, result.Terminal,
+			"and the attempt is not terminal, which is what the `terminal` metric attribute and the "+
+				"log line report")
+		assert.False(t, result.PermanentFailure(),
+			"the relay reads this field, and true here is the dead-lettering that must no longer happen")
+
+		assert.False(t, IsPermanentPublishError(err),
+			"nor may the error alone report permanence, because the relay's terminal branch reads it")
+		assert.True(t, IsTransientPublishError(err))
+		assert.True(t, IsBrokerUnavailableError(err),
+			"the API boundary answers 503 for this error, so the two verdicts must not contradict")
+
+		var publishErr *PublishError
+		require.ErrorAs(t, err, &publishErr)
+		assert.True(t, publishErr.Transient)
+
+		// AND THE BATCH IS WHY THE CLASSIFIER HAS TO RECURSE BY HAND. kafka-go returns the
+		// failure as a kafka.WriteErrors slice, which exposes no Unwrap — so errors.As can reach
+		// the slice and cannot see the *net.DNSError inside it. A classifier written with
+		// errors.As alone therefore never sees the resolution failure at all, which is half of how
+		// the two verdicts came to disagree.
+		var writeErrors kafka.WriteErrors
+		require.ErrorAs(t, err, &writeErrors,
+			"the library's own error must remain reachable through the wrapper")
+		require.Equal(t, 1, writeErrors.Count())
+
+		var dnsErr *net.DNSError
+		assert.False(t, errors.As(err, &dnsErr),
+			"errors.As cannot see through kafka.WriteErrors, which is exactly why the "+
+				"classification inspects its members directly")
+		assert.True(t, errors.As(writeErrors[0], &dnsErr),
+			"and the member IS the resolution failure, so the recursion is reading a real value")
+	})
+
+	t.Run("on the last permitted attempt it is terminal because the BUDGET is spent", func(t *testing.T) {
+		// The distinction the finding turned on. Terminal is legitimate here — five of five —
+		// and it must be reached by spending the budget rather than by skipping it.
+		transport := newPublisherFakeTransport()
+		transport.transportErr = unresolvable
+		publisher := publisherWithFakeTransport(t, transport)
+
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Topic:       TopicForEvent(event.EventType),
+			Key:         publisherLedgerID,
+			Attempt:     5,
+			MaxAttempts: 5,
+		})
+
+		require.Error(t, err)
+		assert.True(t, result.Transient, "the classification is unchanged by which attempt this was")
+		assert.False(t, result.Retryable, "there is no sixth attempt")
+		assert.True(t, result.Terminal,
+			"so the attempt is reported terminal, which is what the `terminal` metric attribute and "+
+				"the dead-letter triage query read")
+
+		// AND STILL NOT A PERMANENT FAILURE, which is the distinction the fix turns on.
+		// PermanentFailure covers only the reasons the database cannot see; budget exhaustion is
+		// decided inside MarkEventFailed's UPDATE so that two instances racing on one row cannot
+		// both conclude they were last. A DNS failure reaching the dead-letter topic therefore
+		// gets there by SPENDING the budget, never by skipping it.
+		assert.False(t, result.PermanentFailure(),
+			"a transient failure on the last attempt is terminal because the BUDGET ran out, and "+
+				"that decision belongs to the database, not to this predicate")
+	})
+}
+
+// TestKafkaLogger_RedactsBrokerTopologyAtANormalLevel is DATA-02 on the one path whose text is
+// not this codebase's own.
+//
+// kafka-go writes its failures for a developer at a terminal, and this hook is installed at
+// ERROR level, so forwarding the string unchanged published the broker's address and port — and,
+// for a resolution failure, the internal resolver's address — into every deployment's log at the
+// default level. docs/kafka-operations.md publishes the opposite policy in a table: redacted in
+// a line at info, warn or error; verbatim only at debug, and in the row's own columns.
+//
+// Both halves are asserted, because either alone is a different defect: redacting without a
+// debug escape hatch lengthens an outage by withholding the address a broker investigation needs,
+// and the escape hatch without redaction is the leak itself.
+func TestKafkaLogger_RedactsBrokerTopologyAtANormalLevel(t *testing.T) {
+	// The exact shape kafka-go produces, both failures the fault-injection runs observed.
+	const dialFailure = "kafka.(*Client).Produce: dial tcp 10.0.3.14:9092: connect: connection refused"
+	const resolveFailure = "kafka.(*Client).Produce: dial tcp: lookup kafka on 127.0.0.11:53: no such host"
+
+	t.Run("at error level the addresses are gone and the diagnosis survives", func(t *testing.T) {
+		relayPinLogLevel(t, logrus.InfoLevel)
+		hook := logtest.NewGlobal()
+
+		kafkaLogger{level: logrus.ErrorLevel, topic: "blnk.transactions"}.Printf("%s", dialFailure)
+		kafkaLogger{level: logrus.ErrorLevel, topic: "blnk.identities"}.Printf("%s", resolveFailure)
+
+		entries := hook.AllEntries()
+		require.Len(t, entries, 2, "both failures must still be reported; redaction is not suppression")
+
+		for _, entry := range entries {
+			assert.NotContains(t, entry.Message, "10.0.3.14",
+				"the broker's address must not reach a log an aggregator ships onwards")
+			assert.NotContains(t, entry.Message, "9092",
+				"nor its port, which is the other half of the endpoint")
+			assert.NotContains(t, entry.Message, "127.0.0.11",
+				"nor the internal resolver's address, which a resolution failure names")
+			assert.NotContains(t, entry.Message, "lookup kafka on",
+				"and the resolver clause must not survive with its address merely reformatted")
+			assert.NotContains(t, entry.Data, "message_verbatim",
+				"the verbatim text is a debug-only companion, so it must be absent at info, "+
+					"which is the level this line is emitted at")
+
+			assert.Equal(t, "kafka-writer", entry.Data["component"],
+				"the line must stay attributable to the writer that produced it")
+			assert.NotEmpty(t, entry.Data["topic"],
+				"and to the topic, which is the field that replaces the address as the locator")
+		}
+
+		assert.Contains(t, entries[0].Message, "connection refused",
+			"the diagnosis is what an operator acts on and must survive redaction")
+		assert.Contains(t, entries[1].Message, "no such host",
+			"the same for a resolution failure: the class of failure is still legible")
+	})
+
+	t.Run("at debug the verbatim text is reachable, which is what makes redaction acceptable", func(t *testing.T) {
+		relayPinLogLevel(t, logrus.DebugLevel)
+		hook := logtest.NewGlobal()
+
+		kafkaLogger{level: logrus.ErrorLevel, topic: "blnk.transactions"}.Printf("%s", dialFailure)
+
+		entries := hook.AllEntries()
+		require.Len(t, entries, 1)
+
+		verbatim, ok := entries[0].Data["message_verbatim"].(string)
+		require.True(t, ok,
+			"an operator who set BLNK_LOG_LEVEL=debug has asked for exactly this detail")
+		assert.Contains(t, verbatim, "10.0.3.14:9092",
+			"and the address is the most useful part of a broker investigation")
+		assert.NotContains(t, entries[0].Message, "10.0.3.14",
+			"while the message itself stays redacted, so one grep still finds no topology")
+	})
+
+	t.Run("the debug hook is forwarded verbatim, because debug is itself the consent", func(t *testing.T) {
+		relayPinLogLevel(t, logrus.DebugLevel)
+		hook := logtest.NewGlobal()
+
+		kafkaLogger{level: logrus.DebugLevel, topic: "blnk.balances"}.Printf(
+			"writing %d messages to %s", 3, "10.0.3.14:9092")
+
+		entries := hook.AllEntries()
+		require.Len(t, entries, 1)
+		assert.Contains(t, entries[0].Message, "10.0.3.14:9092",
+			"the chatty hook is only ever emitted when a deployment asked for debug")
 	})
 }

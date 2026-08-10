@@ -190,17 +190,40 @@ step followed verbatim cannot leak the key. It is the same shell environment
 
 ### The walkthrough
 
-**1. Register the subscriber** (operator, master key). `name` is the only required field. `authorized_topics` must name Blnk-owned category topics (any of the four; never a dead-letter topic); `webhook_url` records the legacy endpoint you receive pushes on today, so that your cutover can be tracked.
+**1. Register the subscriber** (operator, master key). `name` is the only required field. `authorized_topics` must name Blnk-owned category topics (any of the four; never a dead-letter topic).
 
 ```json
 {
   "name": "acme-payments-service",
-  "authorized_topics": ["blnk.transactions", "blnk.balances"],
-  "webhook_url": "https://events.acme.example/blnk"
+  "authorized_topics": ["blnk.transactions", "blnk.balances"]
 }
 ```
 
-`POST /subscribers` returns the registered subscriber, including the `subscriber_id` to use in step 2 — supply your own canonical identifier or let the service generate one.
+```bash
+curl -sS -X POST --config "$BLNK_CURL_CONFIG" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"acme-payments-service","authorized_topics":["blnk.transactions","blnk.balances"]}' \
+  "$BLNK_API/subscribers"
+```
+
+`POST /subscribers` returns the registered subscriber, including the `subscriber_id` to use in the steps below — supply your own canonical identifier as `subscriber_id`, or omit it and let the service generate one.
+
+**Do not put `webhook_url` in this body.** `POST /subscribers` accepts only `subscriber_id`, `name`,
+`authorized_topics` and `partition_key_prefix`; a body naming any other field is refused with `400
+GEN_VALIDATION_ERROR` naming it, rather than being accepted with the extra field quietly dropped. The
+legacy URL is recorded by the separate call in step 1b, and that separation is deliberate — see
+[The generic `/subscribers` routes have no `webhook_url` field at all](#what-replaces-it-and-why-the-registry-has-legacy-columns).
+
+**1b. Record the legacy endpoint** (operator, master key) — **only if this subscriber receives HTTP pushes today.** Skip it entirely for a subscriber onboarded after the cutover; it never had an endpoint, and there is nothing to migrate it from.
+
+```bash
+curl -sS -X POST --config "$BLNK_CURL_CONFIG" \
+  -H 'Content-Type: application/json' \
+  -d '{"webhook_url":"https://events.acme.example/blnk"}' \
+  "$BLNK_API/subscribers/sub_9f8d3c214b7a5e6f8a120c4d/webhook-subscription"
+```
+
+This records the endpoint you receive pushes on today so that your cutover can be tracked, and it clears `migrated_at` in the same statement — recording an address puts the subscriber back into the population awaiting migration. It **does not** start, stop or redirect any delivery: read [The webhook-subscription routes track migration only](#the-webhook-subscription-routes-track-migration-only) before you rely on it. The route is one of the four deprecated ones, so it answers `410 Gone` once the retirement instant has passed; by then there is nothing left to record.
 
 **2. Issue the credentials** (operator, master key).
 

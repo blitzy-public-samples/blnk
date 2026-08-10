@@ -3058,7 +3058,7 @@ func TestMockConfig_KafkaAndRelayDefaultsApplied(t *testing.T) {
 // examines none and a negative value examines none — and a subscriber the collector does not
 // examine has NO blnk_kafka_consumer_lag series, so SubscriberConsumerLagHigh cannot fire for
 // it however far behind it falls. Honouring either value would therefore reach the exact
-// condition blnk_subscribers_lag_unmeasured exists to expose, by configuration rather than by
+// condition blnk_kafka_subscribers_unmeasured exists to expose, by configuration rather than by
 // scale, and it would do so while reporting no error at all.
 //
 // Zero additionally arrives by accident: an operator who writes RELAY_SUBSCRIBER_METRICS_BUDGET=
