@@ -141,15 +141,17 @@ type dltCategoryRoute struct {
 	deadLetterTopic string
 }
 
-// dltCategoryRoutes is the dead-letter routing expectation for all four categories, with
+// dltCategoryRoutes is the dead-letter routing expectation for all five categories, with
 // every topic name SPELLED OUT AS A LITERAL.
 //
 // Deriving these from DLTFor would make the test agree with the implementation by
-// construction and prove nothing. Three of the four dead-letter names —
+// construction and prove nothing. Three of the five dead-letter names —
 // blnk.transactions.dlt, blnk.balances.dlt and blnk.identities.dlt — are verbatim
-// user-supplied examples from the requirement and must match byte for byte; the fourth,
-// blnk.system.dlt, carries the two event types that belong to none of the three named
-// categories and follows the identical convention.
+// user-supplied examples from the requirement and must match byte for byte. The fourth,
+// blnk.ledgers.dlt, carries ledger.created, which is a tenant-owned record a subscriber
+// may be granted like any other. The fifth, blnk.system.dlt, carries system.error and
+// every event whose type the catalogue does not recognise. Both follow the identical
+// convention.
 var dltCategoryRoutes = []dltCategoryRoute{
 	{
 		eventType:       "transaction.applied",
@@ -178,8 +180,8 @@ var dltCategoryRoutes = []dltCategoryRoute{
 	},
 	{
 		eventType:       "ledger.created",
-		originalTopic:   "blnk.system",
-		deadLetterTopic: "blnk.system.dlt",
+		originalTopic:   "blnk.ledgers",
+		deadLetterTopic: "blnk.ledgers.dlt",
 	},
 	{
 		eventType:       "system.error",
@@ -195,12 +197,16 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	// The system category's sibling. That category holds ledger.created, system.error and
-	// every event whose type the catalogue does not recognise, and those last are exactly
-	// the events most likely to fail to publish, so its dead-letter topic must be covered
-	// by the age gauge like any other — a stalled entry there being invisible would hide
-	// the failure of an event that was already a routing defect. A dead-letter topic is
-	// never grantable, whatever its category is.
+	// The ledgers category's sibling. ledger.created is a tenant-owned record, so its
+	// dead-letter topic is covered by the age gauge for the same reason the other
+	// tenant categories' siblings are.
+	"blnk.ledgers.dlt",
+	// The system category's sibling. That category holds system.error and every event
+	// whose type the catalogue does not recognise, and those last are exactly the events
+	// most likely to fail to publish, so its dead-letter topic must be covered by the age
+	// gauge like any other — a stalled entry there being invisible would hide the failure
+	// of an event that was already a routing defect. A dead-letter topic is never
+	// grantable, whatever its category is.
 	"blnk.system.dlt",
 }
 
@@ -3496,6 +3502,7 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.Equal(t, 20*time.Minute, report.OldestByTopic["blnk.balances.dlt"],
 		"a failed row must be attributed to the dead-letter topic it is bound for")
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.identities.dlt"])
+	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.ledgers.dlt"])
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.system.dlt"])
 	assert.Equal(t, 45*time.Minute, report.OldestAge(),
 		"OldestAge is the single number the 15-minute alert is expressed against")
@@ -3507,6 +3514,7 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.InDelta(t, (45 * time.Minute).Seconds(), values["blnk.transactions.dlt"], 0.0001)
 	assert.InDelta(t, (20 * time.Minute).Seconds(), values["blnk.balances.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.identities.dlt"], 0.0001)
+	assert.InDelta(t, 0.0, values["blnk.ledgers.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.system.dlt"], 0.0001)
 	assert.Greater(t, values["blnk.transactions.dlt"], 900.0,
 		"45 minutes must exceed the 900-second alert threshold, which is what makes the rule fire")

@@ -57,26 +57,30 @@ both matter operationally:
 
 ## Topic Catalogue
 
-Events are grouped into four **category topics**, each with a **dead-letter sibling** named by appending `.dlt`. Eight names in total, and they are the complete inventory — Blnk writes to no other topic.
+Events are grouped into five **category topics**, each with a **dead-letter sibling** named by appending `.dlt`. Ten names in total, and they are the complete inventory — Blnk writes to no other topic.
 
 | Category topic | Dead-letter topic | Audience | Carries |
 |---------------|-------------------|----------|---------|
 | `blnk.transactions` | `blnk.transactions.dlt` | Subscribers may be granted it | Transaction lifecycle, including bulk batch progress |
 | `blnk.balances` | `blnk.balances.dlt` | Subscribers may be granted it | Balance creation and balance monitor alerts |
 | `blnk.identities` | `blnk.identities.dlt` | Subscribers may be granted it | Identity creation |
-| `blnk.system` | `blnk.system.dlt` | **Operators only — never granted to a subscriber** | Ledger creation, Blnk's own error notifications, and any event type the catalogue does not recognise |
+| `blnk.ledgers` | `blnk.ledgers.dlt` | Subscribers may be granted it | Ledger creation |
+| `blnk.system` | `blnk.system.dlt` | **Operators by default.** Grantable only on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` | Blnk's own error notifications, and any event type the catalogue does not recognise |
 
-**Three of the four categories are grantable: transactions, balances and identities.**
-`blnk.system` is an internal topic — no subscriber principal is ever given an ACL over it, and a
-registration or credential request that names it is refused. Neither is any `.dlt` sibling. So the
-topics you can be granted are exactly the three tenant categories, and which of those you hold is
-decided by the grant you were issued. Read [why `blnk.system` is not grantable, and what that
-costs you](#why-four-categories-and-why-blnksystem-is-not-grantable) — particularly if you consume
-`ledger.created` today.
+**Four of the five categories are grantable by default: transactions, balances, identities and
+ledgers.** Those four carry your own records, and which of them you hold is decided by the grant
+you were issued.
+
+`blnk.system` is an internal topic. It is withheld unless **two** independent declarations are in
+place: the deployment sets `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`, and your subscriber's own
+grant then names the topic. Absent either one, a registration or credential request that names it
+is refused with a message saying which declaration is missing. No `.dlt` sibling is grantable under
+any configuration. Read [why five categories, and what `blnk.system`
+costs](#why-five-categories-and-what-blnksystem-costs) before asking for it.
 
 ### The topic prefix
 
-Every one of those eight names is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. A deployment that sets `KAFKA_TOPIC_PREFIX=acme` therefore consumes `acme.transactions`, `acme.transactions.dlt`, `acme.balances`, and so on down the table. The category tokens themselves — `transactions`, `balances`, `identities`, `system` — never change.
+Every one of those ten names is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. A deployment that sets `KAFKA_TOPIC_PREFIX=acme` therefore consumes `acme.transactions`, `acme.transactions.dlt`, `acme.balances`, and so on down the table. The category tokens themselves — `transactions`, `balances`, `identities`, `ledgers`, `system` — never change.
 
 Nothing Blnk writes to production routes on a literal topic name. `model.EventCategory` resolves an event type to its category token and `event_topics.go` composes the topic name from that token and the configured prefix, so the whole namespace moves together when the prefix changes. Literal names do appear where a name is being *described* rather than resolved — in this document, in the provisioning scripts, in operator commands and in test fixtures — so treat those as illustrations of the default prefix, not as the routing rule.
 
@@ -105,22 +109,26 @@ It is an explicit allowlist rather than "accept any prefix with a known category
 
 As a subscriber you are unaffected either way: you are granted topics under the **current** prefix, and a historical namespace is never granted. What you notice is that events captured before the rename arrive on the old topic you were already reading, rather than stopping.
 
-### Why four categories, and why `blnk.system` is not grantable
+### Why five categories, and what `blnk.system` costs
 
-The three category topics the requirement names — transactions, balances, identities — do not cover everything Blnk emits. `ledger.created` and `system.error` belong to none of them, while the coverage rule admits no exceptions: every event type that reached the legacy webhook sender is published to Kafka. One further category closes that gap, following the identical naming convention, so nothing about the scheme is special-cased and each dead-letter sibling is derived by the same rule as every other.
+The three category topics the requirement names — transactions, balances, identities — do not cover everything Blnk emits. `ledger.created` and `system.error` belong to none of them, while the coverage rule admits no exceptions: every event type that reached the legacy webhook sender is published to Kafka. Two further categories close that gap, both following the identical naming convention, so nothing about the scheme is special-cased and each dead-letter sibling is derived by the same rule as every other.
 
-**`blnk.system` carries both of those event types, and two properties of it make it an operator topic rather than a subscriber one.**
+**They are two categories rather than one because the two event types have different audiences, and a shared topic can only have one.**
+
+`blnk.ledgers` carries `ledger.created` and nothing else. A ledger is one of *your* records — you created it through the API, you can read it back through the API, and its event body is the same object the ledger endpoint returns. There is nothing in it an operator needs to withhold, so it is grantable exactly as transactions, balances and identities are, and a subscriber that wants complete coverage of its own records asks for all four. That is also why it is not folded into the transactions topic: a consumer filtering the transaction stream should not have to skip ledger records, and a consumer that wants only ledger records should not have to read the transaction stream to find them.
+
+`blnk.system` carries `system.error`, and two properties make it an operator topic rather than a subscriber one:
 
 - `system.error`'s payload is a frozen legacy contract that carries **verbatim error text**, and error text names internal detail: database schemas, tables and routines, broker addresses, sometimes a record or tenant identifier. That body cannot be narrowed without breaking the payload guarantee below, so the disclosure cannot be redacted away.
-- It is the catalogue's **catch-all**. An event type Blnk adds later without extending the table lands here, so a grant of this topic would be a standing grant over payloads nobody has reviewed — access widened by a future routing omission rather than by a decision.
+- It is the catalogue's **catch-all**. An event type Blnk adds later without extending the table lands here, so a grant of this topic is a standing grant over payloads nobody has reviewed — access that a future routing omission widens rather than a decision.
 
-Containing that by audience — grantable, but "grant it deliberately" — was the previous rule, and a rule an operator can undo with one request is not a boundary: a single mis-grant, or a grant retained on a subscriber whose purpose changed, hands one subscriber Blnk's internal error text for the whole deployment. **The name is therefore withheld from every subscriber**, exactly as every `.dlt` name is, and for the same reason: these are surfaces for whoever runs Blnk, read under the master key.
+So it is withheld by default, and widening it takes **two declarations that are hard to make by accident**. The deployment must set `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`, which is a change to the deployment's own configuration rather than to a subscriber record; and the subscriber's grant must then name `<prefix>.system`. Either one alone refuses. The provisioning script never grants it whatever the variable says, because a bring-up script has made no entitlement decision. A dead-letter sibling is not grantable under any configuration at all — those are operator surfaces read under the master key, triaged and replayed through the internal events API.
 
-> **Read this if you consume `ledger.created` over webhooks today.** It shares `blnk.system` with `system.error`, and that topic cannot be granted to you, so **`ledger.created` has no Kafka route for subscribers.** You keep receiving it over webhooks for the remainder of the dual-delivery window; after the sunset it is published, retained and replayable but readable only by your operator. Plan for that now: if `ledger.created` drives something on your side, ask your operator how they intend to relay it to you, because Blnk will not be delivering it to a subscriber credential. A fifth, subscriber-facing `blnk.ledgers` topic was implemented to close the gap and then removed, because the topic catalogue is a published contract and adding to it obliges every subscriber that wants universal coverage to hold a grant it was never told about. Making the event consumable again means revising that catalogue — a deliberate change, not an implementation detail.
+**If you consume `ledger.created` over webhooks today, it has a Kafka route and nothing about your migration is unusual.** Ask for `<prefix>.ledgers` in your grant alongside the other categories you need, and the event arrives on a subscriber credential like any other. What has no subscriber route by default is `system.error`, and it never had one: it is Blnk telling its own operator that Blnk failed.
 
-Coverage is unaffected by any of this: every event type, `ledger.created` and `system.error` included, is captured in the same transaction as the ledger mutation, published, observable in metrics and replayable from its dead-letter topic. What the exclusion decides is the **audience**, not whether the event exists.
+Coverage is unaffected by any of this: every event type, `ledger.created` and `system.error` included, is captured in the same transaction as the ledger mutation, published, observable in metrics and replayable from its dead-letter topic. What the grant model decides is the **audience**, not whether the event exists.
 
-The system category is not a placeholder. Folding its events into an unrelated topic would corrupt that topic's meaning for everyone filtering on it, and dropping them would breach coverage outright.
+Neither extra category is a placeholder. Folding their events into an unrelated topic would corrupt that topic's meaning for everyone filtering on it, and dropping them would breach coverage outright.
 
 ## The `LedgerEvent` Envelope
 
@@ -227,8 +235,8 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 | `balance.created` | `blnk.balances` | A balance is created. |
 | `balance.monitor` | `blnk.balances` | A balance monitor's condition is met. Fires on every occurrence, so the same monitor produces many of these. |
 | `identity.created` | `blnk.identities` | An identity is created. |
-| `ledger.created` | `blnk.system` | A ledger is created. **Not consumable by a subscriber**: `blnk.system` is an operator topic and cannot appear in your `authorized_topics`. See [why `blnk.system` is not grantable](#why-four-categories-and-why-blnksystem-is-not-grantable). |
-| `system.error` | `blnk.system` | Blnk raises an internal error notification. **Not consumable by a subscriber**, and the reason the whole category is withheld: this body carries Blnk's own error text verbatim. |
+| `ledger.created` | `blnk.ledgers` | A ledger is created. Grantable like the three categories above — ask for `<prefix>.ledgers` in your grant. |
+| `system.error` | `blnk.system` | Blnk raises an internal error notification. **Not consumable by a subscriber by default**, and the reason the category is withheld: this body carries Blnk's own error text verbatim. See [why five categories, and what `blnk.system` costs](#why-five-categories-and-what-blnksystem-costs). |
 
 The seven `transaction.*` names are derived from the transaction's status by a single mapping, which is why a transaction's whole lifecycle appears under this one prefix.
 
@@ -268,7 +276,7 @@ The statuses emitted today are `applied`, `inflight` and `failed`, giving `bulk_
 
 ### An unrecognised event type is published, not dropped
 
-If Blnk ever emits an event type absent from the table above, it is routed to `blnk.system` rather than refused or discarded. The outbox row is already committed by the time routing happens, so dropping it would lose a durable event, and `blnk.system` is grantable to nobody — so a routing omission reaches an operator and no subscriber at all, which is the other half of why that category is withheld. Blnk logs a warning when this happens; the resolution is always to catalogue the event type, never to rely on the fallback.
+If Blnk ever emits an event type absent from the table above, it is routed to `blnk.system` rather than refused or discarded. The outbox row is already committed by the time routing happens, so dropping it would lose a durable event, and `blnk.system` is granted to nobody by default — so a routing omission reaches an operator rather than an unreviewed payload reaching a subscriber, which is the other half of why that category is withheld. Blnk logs a warning when this happens; the resolution is always to catalogue the event type, never to rely on the fallback.
 
 ## The Payload
 
@@ -337,7 +345,7 @@ Read this section before you write a consumer. It states what Blnk guarantees, w
 
 There is **no event type that is exempt** from that rule by category. What varies is whether a producing mutation is still open at the instant the event comes into existence: three event types are produced where it is not, and they are named, with their exact residual window, in [Three event types are at-most-once](#three-event-types-are-at-most-once) below. Read that section before you rely on guarantee 1 for one of them.
 
-For `balance.monitor` the residual is narrower than that section's title suggests, and it is worth stating here because it is the event type most likely to matter to you. A monitor alert exists only once a balance has been **committed** across a threshold, so the alert's row cannot be inserted by that transaction. What that transaction does insert — on any deployment with a broker configured — is either the alert row itself, evaluated before the write, or a **handoff row carrying both of the alert's decision inputs**: the balance exactly as it was written, and the monitor definitions in force at that moment. Which alerts exist, and what each says, is therefore fixed when the movement commits. Editing or deleting a monitor afterwards cannot retroactively change the verdict for a movement already committed, and the handoff cannot be lost — only drained late. What arrives after the commit is the *write*, not the *decision*.
+For `balance.monitor` the residual is narrower than that section's title suggests, and it is worth stating here because it is the event type most likely to matter to you. On any deployment with a broker configured, **the alert row is inserted by the transaction that moved the balance** — evaluated before the write on the single-transaction path, and evaluated inside the transaction by the writer itself on every other path, including a coalesced batch. Which alerts exist, and what each says, is therefore fixed when the movement commits, and editing or deleting a monitor afterwards cannot retroactively change the verdict for a movement already committed. Nothing about the alert arrives after the commit.
 
 **2. Kafka delivery is at-least-once.** That is the delivery guarantee, full stop. Blnk makes no stronger promise about delivery, and it does not use Kafka transactions or the idempotent-producer path to manufacture one.
 
@@ -373,11 +381,11 @@ Three event types are captured by a write that stands alone, for one shared reas
 
 The set is declared in the code, once, as `PostCommitEventCaptureContract`, and this section is asserted against it. Anything not listed here — every per-transaction status event, including those of a **coalesced** batch, and every `ledger.created`, `balance.created` and `identity.created` — is captured inside its mutation's transaction and carries guarantee 1 in full.
 
-Two of the three reach their standalone write only in the narrow circumstances named in the table below, so on a healthy deployment with a broker configured they behave like every other event. For `balance.monitor` those circumstances are a deployment with **no broker at all** — which cannot be the deployment you are consuming from, so if you are reading this as a Kafka subscriber, that row's window does not apply to you. `system.error` is standalone always, and for a different reason. Read the "Where the standalone write is reached" column before you build a reconciliation path: the circumstance, not the event type, is what decides whether you need one.
+Two of the three reach their standalone write only in the narrow circumstances named in the table below, so on a healthy deployment with a broker configured they behave like every other event — and `balance.monitor` is now fully atomic with its mutation there. For `balance.monitor` those circumstances are a deployment with **no broker at all** — which cannot be the deployment you are consuming from, so if you are reading this as a Kafka subscriber, that row's window does not apply to you. `system.error` is standalone always, and for a different reason. Read the "Where the standalone write is reached" column before you build a reconciliation path: the circumstance, not the event type, is what decides whether you need one.
 
 | Event type | Where the standalone write is reached | What is lost if it fails |
 |-----------|--------------------------------------|--------------------------|
-| `balance.monitor` | Only on a deployment with **no Kafka broker**, where there is no event pipeline to capture into and the alert goes down the legacy transport. With a broker configured the alert is captured inside the balance's own transaction — either evaluated before the write and committed with it, or from a durable **handoff row committed with it**, carrying the balance as written *and* the monitor definitions in force, which the handoff processor evaluates and whose alerts it writes in one transaction with the handoff's completion. A pre-write monitor read that fails falls to the handoff, not to the standalone write. | On a broker-less deployment, the threshold notification; the balance movement stands. With a broker, nothing: a handoff that cannot be evaluated is retried and then recorded as failed, so it is countable rather than absent — see `monitor_handoff_failed` in `GET /events/stats`. |
+| `balance.monitor` | Only on a deployment with **no Kafka broker**, where there is no event pipeline to capture into and the alert goes down the legacy transport. With a broker configured the alert row is inserted inside the balance's own transaction — evaluated before the write on the single-transaction path, or evaluated by the writer inside that transaction on every other path, from monitor definitions it reads there. A pre-write monitor read that fails falls to the writer's own evaluation, not to the standalone write. | On a broker-less deployment, the threshold notification; the balance movement stands. With a broker, nothing: the alert commits with the movement or neither commits. Handoff rows written by releases that predate the in-transaction capture are still drained, and one that cannot be evaluated is retried and then recorded as failed, so it is countable rather than absent — see `monitor_handoff_failed` in `GET /events/stats`. |
 | `bulk_transaction.<status>` | Only when the **finalising transaction cannot commit** after its retry budget. The summary is otherwise inserted in the same transaction as the coordinator's terminal transition — including for a batch whose start was never recorded, which is *adopted* into that transaction rather than captured outside one — so the outcome and its event commit together. | The batch *summary* only. Every member transaction's own event is atomic with that member's mutation, and the batch is left non-terminal so `GET /events/stats` and the unfinalized-batch count still show it. |
 | `system.error` | Always. It describes no mutation — it reports that something failed — so there has never been a transaction it could have joined. | The error notification. Nothing about the ledger. |
 
@@ -389,7 +397,7 @@ Two of the three spend a **bounded retry budget** on that standalone insert — 
 
 #### `system.error` is at-most-once for a different reason, and it is not an exception to R-2
 
-Requirement R-2 binds an event to the transaction of **the mutation that produced it**. `balance.monitor` and `bulk_transaction.<status>` both describe ledger state that a transaction did commit, so for those two the question "why was this not atomic?" has an answer — and in both cases the answer is that the mutation's transaction commits the thing that *decides* the event even though it cannot insert the event itself: the monitor alert's two decision inputs on a handoff row, and the batch outcome on its coordinator record. A missing event therefore leaves state behind that is both reconcilable and countable.
+Requirement R-2 binds an event to the transaction of **the mutation that produced it**. `balance.monitor` and `bulk_transaction.<status>` both describe ledger state that a transaction did commit, so for those two the question "why was this not atomic?" has an answer. For `balance.monitor` the answer is that it now *is* atomic: the transaction that moves the balance evaluates its monitors and inserts the alert row before committing. For the batch summary the mutation's transaction commits the thing that *decides* the event — the batch outcome on its coordinator record — even though the summary itself belongs to no single member mutation. A missing event therefore leaves state behind that is both reconcilable and countable.
 
 `system.error` has no producing mutation at all — it reports that something failed. There was never a transaction it could have joined, and there is no ledger state behind it. So if you are enumerating the exceptions to R-2, **it is not in this set**: it is standalone by nature rather than by concession. Reconcile a missing `balance.monitor` against the balance and a missing batch summary against the batch; treat a missing `system.error` as a lost operator notification, not as ledger data to recover.
 
@@ -526,11 +534,12 @@ This section publishes a naming convention. Read it before you name a dead-lette
 
 ### `<topic>.dlt` names are Blnk-owned
 
-The dead-letter sibling of a Blnk topic is that topic's name with `.dlt` appended. Blnk **creates, writes to and manages** all four:
+The dead-letter sibling of a Blnk topic is that topic's name with `.dlt` appended. Blnk **creates, writes to and manages** all five:
 
 - `blnk.transactions.dlt`
 - `blnk.balances.dlt`
 - `blnk.identities.dlt`
+- `blnk.ledgers.dlt`
 - `blnk.system.dlt`
 
 The rule generalises: for any topic Blnk owns, Blnk also owns `<topic>.dlt`. If your deployment sets a different `KAFKA_TOPIC_PREFIX`, the owned set moves with it — `acme.transactions.dlt` and so on. The suffix is applied once and only once, so a name is never derived twice into `blnk.transactions.dlt.dlt`.
@@ -744,7 +753,7 @@ have Kafka running before it passes. If you are not migrating, leave the sunset 
 
 Each subscriber is a Kafka principal with its own SASL/SCRAM credentials and ACLs scoped to the topics it is authorised for and to its own consumer-group namespace. Credentials are issued once, through `POST /subscribers/{subscriber_id}/kafka-credentials`, which returns the broker endpoint, your topic list, your consumer group id and the credentials themselves. Provisioning, the ACL model and the exact request and response are documented in [kafka-operations.md](kafka-operations.md).
 
-Three categories can be granted: transactions, balances and identities. `blnk.system` cannot — it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catalogue's catch-all, so it is an operator topic. No dead-letter topic is grantable either. `ledger.created` shares `blnk.system` and therefore has no subscriber route; see [why `blnk.system` is not grantable](#why-four-categories-and-why-blnksystem-is-not-grantable).
+Four categories can be granted by default: transactions, balances, identities and ledgers. `blnk.system` is withheld unless the deployment has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` **and** your grant names it — it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catalogue's catch-all, so it is an operator topic by default. No dead-letter topic is grantable under any configuration. See [why five categories, and what `blnk.system` costs](#why-five-categories-and-what-blnksystem-costs).
 
 ### The topic grant is the isolation boundary
 
@@ -753,15 +762,15 @@ Two dimensions of a subscriber's access are enforced at the broker, and they are
 - **`topic`** — literal `Read` and `Describe` on exactly the topics you were granted. Every other topic, including every `.dlt` topic, is refused by the broker rather than filtered by your client.
 - **`consumer_group`** — a prefixed `Read` grant reserving your own consumer-group namespace. Joining a group outside it is refused.
 
-The three tenant categories can be granted, and which of them you hold is decided per subscriber. `blnk.system` is granted to nobody, and neither is any dead-letter topic: both are operator surfaces, and asking for either is refused rather than quietly dropped.
+The four tenant categories can be granted, and which of them you hold is decided per subscriber. `blnk.system` is granted to nobody unless the deployment has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`, and no dead-letter topic is granted to anybody ever: both are operator surfaces, and asking for one you are not entitled to is refused rather than quietly dropped.
 
 ### A topic you are granted, you read whole — including other subscribers' records
 
 This is the one property of the access model that surprises people, so it is stated before the field that invites the wrong reading.
 
-**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances` and `blnk.identities`.
+**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances`, `blnk.identities` and `blnk.ledgers`.
 
-The topic grant is therefore not merely *a* boundary, it is **the** boundary. If two parties must not see each other's events, they must not be granted the same topic — and because the four category topics are fixed, that means separating them at the deployment boundary rather than at the grant. There is no third option, and no field on a subscriber changes this.
+The topic grant is therefore not merely *a* boundary, it is **the** boundary. If two parties must not see each other's events, they must not be granted the same topic — and because the category topics are fixed, that means separating them at the deployment boundary rather than at the grant. There is no third option, and no field on a subscriber changes this.
 
 ### Your `partition_key_prefix` is enforced outside the broker, and it decides whether you get a credential at all
 
@@ -778,7 +787,18 @@ Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topi
 | `broker_gateway`, and the component does not confirm your exact key scope | **`409 SUBSCRIBER_KEY_SCOPE_UNATTESTED`.** The component answered, and answered with something other than your recorded prefix. |
 | `broker_gateway`, with `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` naming that component's own addresses **and** a control endpoint that confirms your key scope | `200`. The response's `broker_endpoint` is **that component's** address, not the Kafka brokers', and `partition_key_prefix_enforced_by` reads `broker_gateway`. |
 
-The two remedies travel with the refusal, and they are the only two: have your operator declare a key-authorising component and its endpoint, or drop the prefix and narrow `authorized_topics` instead — the topic dimension is enforced at the broker in full.
+All three remedies travel with the refusal: have your operator declare a key-authorising component and its endpoint, drop the prefix to accept whole-topic access explicitly, or narrow `authorized_topics` instead — the topic dimension is enforced at the broker in full.
+
+**A registry read tells you which of these applies before you make the credential call.** `GET /subscribers/{id}` reports `enforced_access.partition_key_scope_state`, and it distinguishes the state a row is *in* from the boundary it *asks for*:
+
+| `partition_key_scope_state` | What it means | `partition_key_prefix_enforced` | `credential_issuance_blocked` |
+|---|---|---|---|
+| `not_requested` | No prefix is recorded. Your topic grant and consumer-group namespace are the whole boundary, and the broker keeps both. | `false` | `false` unless something else blocks it |
+| `requested` | A prefix is recorded and **this deployment declares nothing that can keep it**. The intent is stored and currently unrealisable. | `false` | `true`, with the three remedies in `credential_issuance_blocked_reason` |
+| `available` | A prefix is recorded and the deployment declares a component with a reachable control endpoint. A credential can be minted. | `true` | `false` |
+| `attested` | Reported only on a credential response: the component confirmed **this** principal and **this** prefix before the secret was generated. | `true` | n/a |
+
+`requested` is the state the shipped default produces, and it is deliberately not called enforced. A registry read used to report `partition_key_prefix_enforced: true` with `broker_gateway` named for *any* recorded prefix — so a registration announced a verified isolation boundary and the very next credential call refused it for want of the component that had just been named. If you are branching on an isolation claim, branch on this field or on `partition_key_prefix_enforced`; both now answer from the deployment rather than from the column.
 
 #### A `200` for a key-scoped subscriber means the component confirmed *your* boundary
 
@@ -786,7 +806,7 @@ Blnk does not take the declaration on trust. Before your secret exists — and b
 
 Two consequences for you as an integrator:
 
-- **`partition_key_prefix_enforced: true` is backed by a confirmation, not by a configuration value.** A deployment cannot produce that field by naming a component that is not there.
+- **On a credential response, `partition_key_prefix_enforced: true` is backed by a confirmation rather than by a configuration value**, and `partition_key_scope_state` reads `attested` to say so. A deployment cannot produce that pair by naming a component that is not there. On a *registry* read no round trip is made, so the strongest state you will see is `available` — the deployment can keep the boundary, and nothing has yet confirmed that it does for your subscriber.
 - **The confirmation is a control-plane fact, so per-record filtering is still that component's behaviour.** Blnk establishes that the broker will not serve your principal a record directly and that the component accepted your boundary; it cannot observe what the component forwards. If you need evidence of the filter itself, ask your operator for the component's own instrumentation.
 
 When your subscriber is deregistered, Blnk withdraws that binding from the component after revoking your broker credential — so a principal that no longer exists does not keep an entry a later subscriber with the same identifier could inherit.
@@ -801,6 +821,7 @@ A credential response for a key-scoped subscriber therefore always describes a l
 
 ```json
 "partition_key_prefix": "ldg_9f1c8a72",
+"partition_key_scope_state": "attested",
 "partition_key_prefix_enforced": true,
 "partition_key_prefix_enforced_by": "broker_gateway",
 "gateway_delivery_required": true,
@@ -809,14 +830,15 @@ A credential response for a key-scoped subscriber therefore always describes a l
 "not_enforced_by": []
 ```
 
-**`gateway_delivery_required` is the field to branch on.** It is `true` exactly when a prefix is recorded, and it is the one field whose wrong answer is a broken integration:
+**`gateway_delivery_required` is the field to branch on.** It is `true` exactly when `partition_key_prefix_enforced` is, and it is the one field whose wrong answer is a broken integration:
 
-| `gateway_delivery_required` | Your grant | How you consume |
-|-----------------------------|-----------|-----------------|
-| `false` | `Read` and `Describe` on each authorised topic | An ordinary Kafka consumer, directly from the broker at `broker_endpoint`. Your `authorized_topics` are your whole boundary — see the section above. |
-| `true` | `Describe` only; **no `Read`** | An ordinary Kafka consumer pointed at the `broker_endpoint` in your response, which is the declared key-authorising component rather than a broker. A fetch against the Kafka brokers is refused with `TOPIC_AUTHORIZATION_FAILED`. |
+| `gateway_delivery_required` | `broker_record_access` | Your grant | How you consume |
+|-----------------------------|------------------------|-----------|-----------------|
+| `false` | `true` | `Read` and `Describe` on each authorised topic | An ordinary Kafka consumer, directly from the broker at `broker_endpoint`. Your `authorized_topics` are your whole boundary — see the section above. |
+| `true` | `false` | `Describe` only; **no `Read`** | An ordinary Kafka consumer pointed at the `broker_endpoint` in your response, which is the declared key-authorising component rather than a broker. A fetch against the Kafka brokers is refused with `TOPIC_AUTHORIZATION_FAILED`. |
+| `false` | `false` | Nothing usable yet | This pair appears only on a **registry read** whose `partition_key_scope_state` is `requested`: the prefix withholds direct broker reads and no component is declared to supply them instead. There is no credential to hold, so there is nothing to consume with — read `credential_issuance_blocked_reason` instead of picking a transport. |
 
-`broker_record_access` is its exact complement and says *why* a direct fetch fails: no `Read` binding exists for your principal. Both are always present, so you can branch without first testing whether the prefix string is empty. `broker_endpoint` is the address to dial in either case — read it rather than assuming it names a Kafka broker.
+`broker_record_access` says *why* a direct fetch fails when it does: no `Read` binding exists for your principal. Both fields are always present, so you can branch without first testing whether the prefix string is empty. `broker_endpoint` is the address to dial in either of the first two rows — read it rather than assuming it names a Kafka broker.
 
 #### What the boundary does and does not cover
 
@@ -826,7 +848,7 @@ A credential response for a key-scoped subscriber therefore always describes a l
 - **Clearing your prefix widens you.** An operator who removes it re-grants topic `Read`, and you go back to consuming directly from the brokers — and to reading the whole topic. `PUT /subscribers/{id}` is where that happens, and your next credential response will say so.
 - **`event_id` deduplication remains yours either way.** Kafka delivery is at-least-once on both paths; nothing about a key scope changes that obligation.
 
-`not_enforced_by` is now **empty for every subscriber**, and it stays in the body deliberately: it is where a future dimension the broker cannot evaluate would appear, and an absent key would read as "not stated" rather than as "nothing is unenforced". `enforced_by` carries `partition_key` exactly when a prefix is recorded — assert on the pair if you want a test that fails when the contract changes.
+`not_enforced_by` carries `partition_key` for exactly one state — `requested`, a prefix your deployment declares nothing to keep — and is empty otherwise. It stays in the body even when empty, because an absent key would read as "not stated" rather than as "nothing is unenforced". `enforced_by` carries `partition_key` in the complementary `available` and `attested` states, so the dimension is always in one list or the other and never both — assert on the pair if you want a test that fails when the contract changes.
 
 `guidance` is prose for a human reading a response or a support ticket, and its wording may change. Branch on `gateway_delivery_required`, or assert on the `enforced_by` / `not_enforced_by` pair; those are the machine-readable contract.
 

@@ -487,16 +487,17 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxIdentityID,
 		},
 
-		// The two events that motivate the fourth category. Neither belongs to the
-		// transactions, balances or identities topic, and the coverage requirement
-		// forbids dropping them. Both share the one extra category the frozen catalogue
-		// gives them, which is internal — see model.EventCategorySystem for the
-		// reachability consequence that follows for ledger.created.
+		// The two events that belong to none of the three categories the requirement
+		// names, and that the coverage requirement forbids dropping. They do NOT share
+		// a category: ledger.created is a tenant-owned record and carries its own
+		// grantable category so a subscriber can be granted it, while system.error is
+		// operator diagnostics and stays in the internal one — see
+		// model.EventCategoryLedgers and model.EventCategorySystem.
 		{
 			name:         "ledger.created",
 			eventType:    "ledger.created",
 			payload:      outboxSampleLedger(),
-			topic:        "blnk.system",
+			topic:        "blnk.ledgers",
 			aggregateID:  outboxLedgerID,
 			partitionKey: outboxLedgerID,
 		},
@@ -1560,7 +1561,7 @@ func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *te
 	require.NotNil(t, row)
 
 	assert.Equal(t, "ledger.created", row.EventType, "event_type must be trimmed")
-	assert.Equal(t, "blnk.system", row.Topic, "the trimmed name must be what routing sees")
+	assert.Equal(t, "blnk.ledgers", row.Topic, "the trimmed name must be what routing sees")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(row.Payload),
 		"the payload must remain the legacy body byte for byte, untrimmed")
 	assert.Contains(t, string(row.Payload), `"event":"  ledger.created\t"`,
@@ -2777,7 +2778,7 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	standalone := datasource.standalone()
 	require.Len(t, standalone, 1, "exactly one standalone insert must have been issued")
 	assert.Equal(t, "ledger.created", standalone[0].EventType)
-	assert.Equal(t, "blnk.system", standalone[0].Topic)
+	assert.Equal(t, "blnk.ledgers", standalone[0].Topic)
 	assert.Equal(t, outboxLedgerID, standalone[0].PartitionKey)
 	assert.Equal(t, outboxLedgerID, standalone[0].LedgerID,
 		"a balance payload DOES carry a ledger, so the ledger column is populated as well as the key")

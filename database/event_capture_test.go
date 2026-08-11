@@ -400,6 +400,37 @@ func TestRegisterTransactionEventCapture_LastRegistrationWinsAndNilClears(t *tes
 	assert.Same(t, marker, row, "the most recent registration must be the one in force")
 }
 
+// TestRegisterBalanceMonitorAlertCapture_LastRegistrationWinsAndNilClears documents the same
+// semantics for the monitor alert capture, which a test relies on to restore the pre-test state.
+//
+// NIL IS NOT MERELY "UNSET" HERE. Clearing this registration changes which path the atomic writers
+// take: with a capture in force they insert the canonical blnk.event_outbox row for a crossing
+// inside the mutation's transaction, and with none they commit a balance_monitor_handoff for a
+// second transaction to convert. A test that installed a capture and did not restore the previous
+// value would silently move every later test in this package onto the other path.
+func TestRegisterBalanceMonitorAlertCapture_LastRegistrationWinsAndNilClears(t *testing.T) {
+	previous := registeredBalanceMonitorAlertCapture()
+	t.Cleanup(func() { RegisterBalanceMonitorAlertCapture(previous) })
+
+	RegisterBalanceMonitorAlertCapture(nil)
+	require.Nil(t, registeredBalanceMonitorAlertCapture(), "nil must clear the registration")
+
+	RegisterBalanceMonitorAlertCapture(func(context.Context, *model.Balance, model.BalanceMonitor) (*model.EventOutbox, error) {
+		return newEventOutboxFixture("first-"), nil
+	})
+	require.NotNil(t, registeredBalanceMonitorAlertCapture())
+
+	marker := newEventOutboxFixture("second-")
+	RegisterBalanceMonitorAlertCapture(func(context.Context, *model.Balance, model.BalanceMonitor) (*model.EventOutbox, error) {
+		return marker, nil
+	})
+
+	row, err := registeredBalanceMonitorAlertCapture()(context.Background(),
+		&model.Balance{BalanceID: "bln_x"}, model.BalanceMonitor{MonitorID: "mon_x"})
+	require.NoError(t, err)
+	assert.Same(t, marker, row, "the most recent registration must be the one in force")
+}
+
 // TestExistingEventIDs_ReportsOnlyTheIDsThatExist covers the batched durability lookup the
 // post-commit path uses to decide whether a capture is still owed.
 func TestExistingEventIDs_ReportsOnlyTheIDsThatExist(t *testing.T) {

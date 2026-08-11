@@ -195,7 +195,7 @@ failed permanently, it did not run out of tries.
 | `blnk_subscribers_revocation_pending` | Gauge | — | Subscribers whose broker-side credential revocation is still owed. Normally zero. |
 | `blnk_subscribers_oldest_revocation_age_seconds` | Gauge | — | How long the oldest outstanding revocation has been owed. Zero when nothing is owed. |
 | `blnk_kafka_consumer_lag_pass_age_seconds` | Gauge | — | How long the consumer-lag rotation took to get back round the whole subscriber registry. This is the series `SubscriberLagCoverageStale` reads. It matters because a reading EXPIRES after ten minutes: a subscriber the rotation does not return to inside that retention has its `blnk_kafka_consumer_lag` series stop being exported, and an absent series breaches no threshold — so `SubscriberConsumerLagHigh` goes quiet for exactly the subscribers it can no longer see. |
-| `blnk_kafka_consumer_lag_covered_subscribers` | Gauge | — | How many subscribers currently have an exported lag reading. Read it against `blnk_subscribers_registered` to see what proportion of the registry the rotation is actually covering; the remedy for a shortfall is a larger `EVENT_METRICS_SUBSCRIBER_BUDGET` or a shorter collection interval. |
+| `blnk_kafka_consumer_lag_covered_subscribers` | Gauge | — | How many subscribers currently have an exported lag reading. Read it against `blnk_subscribers_registered` to see what proportion of the registry the rotation is actually covering; the remedy for a shortfall is a larger `EVENT_METRICS_SUBSCRIBER_BUDGET`, or narrowing over-broad grants so each subscriber costs fewer round trips per tick. The collection interval is fixed at 15 seconds and is not operator-configurable, so it is not a lever. |
 | `blnk_kafka_subscribers_unmeasured` | Gauge | `reason` | Registered subscribers the last collection did not measure lag for **at all**, attributed by why. Non-zero means those subscribers have NO `blnk_kafka_consumer_lag` series, so `SubscriberConsumerLagHigh` cannot fire for them however far behind they fall. Normally zero. The `reason` domain is closed at five values and every one of them is written on every tick, zeros included, so a healthy collection is distinguishable from a stopped one: `budget` (the rotation has not got back to them, which is the only reason a configuration change fixes), `unprovisioned` (the row has no authorised topics, or identifiers the registry did not generate), `measure_failed` (the broker refused the measurement), `registry_failed` (the registry enumeration itself failed) and `topic_missing` (a row authorises a topic that does not exist). Each subscriber is counted under exactly ONE reason, so `sum without(reason)(…)` never exceeds `blnk_subscribers_registered`. Sum the reasons away for the total; read them apart to know what to do. See the note below — this is not the same condition as `blnk_kafka_consumer_lag_unmeasured_partitions`. |
 | `blnk_subscribers_registered` | Gauge | — | Subscribers the registry holds. Published so the row above reads as a proportion, and so the measurement budget's headroom is visible before it is exhausted rather than only after. |
 | `blnk_subscribers_measurement_budget` | Gauge | — | Subscribers **one consumer-lag sweep may measure**, as configured — `EVENT_METRICS_SUBSCRIBER_BUDGET`, alias `RELAY_SUBSCRIBER_METRICS_BUDGET`, default 200. Exported so headroom is a difference of two series: `blnk_subscribers_measurement_budget - blnk_subscribers_registered`, which goes negative before any subscriber goes unmeasured. It is the figure the sweep actually stops at rather than the configured value re-read, so it cannot disagree with the behaviour. Published on every tick, like the row above, so a reconfiguration is visible and a stopped collector is not mistaken for a small registry. |
@@ -272,9 +272,9 @@ selects a label value, so accepting arbitrary strings would reopen the domain it
 close. `original` is the only purpose the relay publishes under and therefore the only one that
 can appear in `blnk_events_published_total`.
 
-**`topic` values**: the four category topics `blnk.transactions`, `blnk.balances`,
-`blnk.identities`, `blnk.system`, and their four dead-letter siblings
-`blnk.transactions.dlt`, `blnk.balances.dlt`, `blnk.identities.dlt`,
+**`topic` values**: the five category topics `blnk.transactions`, `blnk.balances`,
+`blnk.identities`, `blnk.ledgers`, `blnk.system`, and their five dead-letter siblings
+`blnk.transactions.dlt`, `blnk.balances.dlt`, `blnk.identities.dlt`, `blnk.ledgers.dlt`,
 `blnk.system.dlt`
 
 Every one of those names derives from `KAFKA_TOPIC_PREFIX`, whose default is `blnk`; both the
@@ -407,13 +407,13 @@ so:
   correct: the collector is server-only, because two processes writing the same gauges would each
   retire the other's series as stale.
 
-**`blnk_outbox_pending` counts captured events only, and two families are captured one step
-removed.** A monitor alert and a bulk batch summary are captured from an intent recorded
-atomically with their mutation — a balance-monitor handoff and a batch coordinator row — so
-while an intent is outstanding its event is OWED and exists in no outbox status, and therefore
-in no gauge here. There is deliberately no instrument for it: an owed event is not a backlog,
-and a gauge that summed the two would make a healthy poll interval of monitor evaluation look
-like relay lag. The outstanding counts are reported by `GET /events/stats` under
+**`blnk_outbox_pending` counts captured events only, and some events are captured one step
+removed.** An event captured from an intent recorded atomically with its mutation — a bulk batch
+coordinator row, or a balance-monitor handoff left over from a release that predates the
+in-transaction alert capture — is OWED while that intent is outstanding: it exists in no outbox
+status, and therefore in no gauge here. There is deliberately no instrument for it: an owed event
+is not a backlog, and a gauge that summed the two would make a healthy poll interval of batch
+finalisation look like relay lag. The outstanding counts are reported by `GET /events/stats` under
 `producer_atomicity`, and
 [kafka-operations.md](kafka-operations.md#producer_atomicity--events-that-are-owed-and-not-yet-in-the-table-at-all)
 states which of them are actionable.
@@ -743,7 +743,7 @@ blnk_transaction_batch_total{result="success"} / blnk_transaction_batch_total
 # Event publish throughput (per second, 5 minute window)
 #
 # sum(rate(...)), NOT rate(...). This counter carries `topic` and `event_type`, so a bare
-# rate() returns ONE SERIES PER LABEL COMBINATION — four category topics against thirteen
+# rate() returns ONE SERIES PER LABEL COMBINATION — five category topics against thirteen
 # event types. Every one of those lines is a fraction of the pipeline's output, none of them is
 # the throughput figure, and reading the largest as "the rate" understates the total by most of
 # an order of magnitude. The 500 events/sec target is a statement about the pipeline's total

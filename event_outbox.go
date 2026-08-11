@@ -1491,16 +1491,24 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // mutation's own transaction commits everything that DECIDES the event, so the deferred write
 // cannot change which events exist or what they say.
 //
-//	balance.monitor            A monitor's condition is met by a balance that some other
-//	                           transaction has already committed, so the alert exists only once
-//	                           the condition has been evaluated. BOTH INPUTS TO THAT EVALUATION
-//	                           ARE COMMITTED BY THE MUTATION: recordBalanceMonitorHandoffs writes
-//	                           a handoff row inside the balance's transaction carrying the balance
-//	                           as written AND the monitor definitions in force. The verdict is
-//	                           therefore fixed at commit, and BalanceMonitorHandoffProcessor
-//	                           writes the resulting alerts in one transaction with the handoff's
-//	                           completion. What is deferred is the insert, not the decision, and
-//	                           the handoff cannot be lost — only drained late, or recorded failed.
+//	balance.monitor            A monitor's condition is met by a balance a transaction has just
+//	                           moved, so the alert exists only once the condition has been
+//	                           evaluated — and THE EVALUATION NOW HAPPENS INSIDE THAT
+//	                           TRANSACTION. The pre-write pass covers the single-transaction
+//	                           path (prepareBalanceMonitorEvents) and the writer covers every
+//	                           other, reading the monitor definitions and applying
+//	                           CheckCondition in its own transaction and inserting the canonical
+//	                           row there (database.captureBalanceMonitorAlertsInTx). A movement
+//	                           made with the alert capture registered — which every process
+//	                           built through NewBlnk has — satisfies R-2 with no deferral at
+//	                           all, so this member is listed for the population that predates
+//	                           that capture rather than for new movements. Those older handoff
+//	                           rows still commit BOTH INPUTS TO THE EVALUATION inside the
+//	                           balance's transaction, so their verdict was fixed at commit too,
+//	                           and BalanceMonitorHandoffProcessor writes the resulting alerts in
+//	                           one transaction with the handoff's completion: what was deferred
+//	                           was the insert, not the decision, and the handoff cannot be lost
+//	                           — only drained late, or recorded failed.
 //	bulk_transaction.<status>  A batch summary. Every transaction the batch describes has
 //	                           already committed under its own transaction; a bulk request is
 //	                           executed one transaction at a time, with compensating void or
@@ -1542,11 +1550,12 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // of them:
 //
 //   - balance.monitor reaches a standalone insert ONLY on a deployment with no broker, where there
-//     is no event pipeline to capture into at all. With one configured, the alert is captured in
-//     the balance's own transaction (evaluated before the write) or decided by it (the handoff
-//     row's two snapshots) and inserted atomically with the handoff's completion — and a handoff
-//     whose evaluation budget is spent is RECORDED as failed, so it is countable rather than
-//     absent.
+//     is no event pipeline to capture into at all. With one configured, the alert row is inserted
+//     in the balance's own transaction — evaluated before the write by the pre-write pass, or
+//     inside the transaction by the writer for every path that pass does not reach. A handoff row
+//     left over from before the writer's capture existed is decided by its mutation and inserted
+//     atomically with the handoff's completion, and one whose evaluation budget is spent is
+//     RECORDED as failed, so it is countable rather than absent.
 //   - bulk_transaction.<status> is inserted in the same transaction as the coordinator's terminal
 //     transition. The budget buys that transaction's transient failures; a batch that never
 //     finalises stays non-terminal and is countable as an unfinalized batch.
@@ -1562,8 +1571,9 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // restructuring the transaction-processing pipeline AAP §0.6.2 freezes. Note what closing
 // balance.monitor's did NOT take: monitor CONDITION EVALUATION is still frozen domain logic and
 // is untouched (AAP §0.6.2, and §0.4.1 scoping the balance.go edit to the transport with "monitor
-// condition evaluation is untouched") — what the mutation captures is the evaluation's INPUTS, not
-// the evaluation.
+// condition evaluation is untouched"). model.BalanceMonitor.CheckCondition is the one evaluator,
+// called with the same argument by all three routes; what changed is only WHERE it is called from,
+// and moving the call inside the transaction is what lets the canonical row go in there too.
 //
 // docs/event-streaming.md states the same three in subscriber-facing terms. If you change this
 // set, change that section in the same commit.
@@ -1595,13 +1605,16 @@ const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<statu
 //
 // # This is no longer the primary path for either event that used it
 //
-// Both events that were captured this way now have a durable intent written INSIDE a
-// transaction, which is what closes the crash window this method cannot:
+// Both events that were captured this way are now written INSIDE a transaction, which is
+// what closes the crash window this method cannot:
 //
-//   - `balance.monitor` is captured by BalanceMonitorHandoffProcessor, from a handoff row
-//     written inside the balance's own transaction. checkBalanceMonitors — the caller
-//     below — is reached only on a deployment with NO Kafka broker, where there is no
-//     handoff processor and the alert goes straight down the legacy webhook transport.
+//   - `balance.monitor` is captured in the transaction that moved the balance: by the
+//     pre-write pass on the single-transaction path, and by the writer itself on every other,
+//     which reads the monitor definitions and applies CheckCondition inside its own
+//     transaction. checkBalanceMonitors — the caller below — is reached only on a deployment
+//     with NO Kafka broker, where there is no relay and the alert goes straight down the legacy
+//     webhook transport. BalanceMonitorHandoffProcessor still converts handoff rows written
+//     before the writer's capture existed.
 //   - `bulk_transaction.<status>` is captured by finalizeBulkBatchOutcome, in one
 //     transaction with the batch coordinator's terminal transition — including for a batch
 //     whose start was never recorded, which the repository ADOPTS into that transaction
@@ -1609,9 +1622,8 @@ const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<statu
 //     capture is unconfigured, so there is no row for a transaction to carry.
 //
 // So the residual at-most-once behaviour is now confined to narrow, named shapes — a
-// broker-less deployment, a pre-write monitor read that failed, and a finalising
-// transaction that could not commit at all — rather than being the standing behaviour of
-// two event families. docs/event-streaming.md states which.
+// broker-less deployment and a finalising transaction that could not commit at all — rather
+// than being the standing behaviour of two event families. docs/event-streaming.md states which.
 //
 // # Why the row is prepared once and the INSERT is what retries
 //
@@ -1638,9 +1650,9 @@ const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<statu
 // event_producer_atomicity_test.go, which pins each site's budgeted call by source text:
 //
 //  1. `balance.monitor` — checkBalanceMonitors in balance.go, through this method. Reached only
-//     on a deployment with no broker; with one configured the alert is captured inside the
-//     balance's own transaction — evaluated before the write, or through the durable handoff —
-//     and that site returns early.
+//     on a deployment with no broker; with one configured the alert row is inserted inside the
+//     balance's own transaction — evaluated before the write, or evaluated by the writer in that
+//     transaction — and that site returns early.
 //  2. `bulk_transaction.<status>` — sendBulkTransactionWebhook in transaction_bulk.go, which
 //     spends the same budget through its own equivalent loop so that it can additionally
 //     carry batch context in its log fields. The summary itself is ATOMIC — it commits with

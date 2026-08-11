@@ -96,22 +96,25 @@ In production, point `--bootstrap-server` at your brokers and `--command-config`
 
 ### What gets created
 
-Four category topics and their four dead-letter siblings — **eight topics, and they are the complete inventory**. Blnk writes to no other topic.
+Five category topics and their five dead-letter siblings — **ten topics, and they are the complete inventory**. Blnk writes to no other topic.
 
 | Category topic | Dead-letter topic | Grantable to a subscriber |
 |---------------|-------------------|---------------------------|
 | `blnk.transactions` | `blnk.transactions.dlt` | Yes |
 | `blnk.balances` | `blnk.balances.dlt` | Yes |
 | `blnk.identities` | `blnk.identities.dlt` | Yes |
-| `blnk.system` | `blnk.system.dlt` | **No — operator-only, like every `.dlt`** |
+| `blnk.ledgers` | `blnk.ledgers.dlt` | Yes |
+| `blnk.system` | `blnk.system.dlt` | **Only where you declare `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`.** Every `.dlt` is operator-only under all configurations |
 
-Every name is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. Set `KAFKA_TOPIC_PREFIX=acme` and the whole inventory moves to `acme.transactions` and so on; the category tokens never change. What each topic carries, and why there are four categories rather than the three the requirement names, is in [event-streaming.md](event-streaming.md#topic-catalogue).
+Every name is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. Set `KAFKA_TOPIC_PREFIX=acme` and the whole inventory moves to `acme.transactions` and so on; the category tokens never change. What each topic carries, and why there are five categories rather than the three the requirement names, is in [event-streaming.md](event-streaming.md#topic-catalogue).
 
-**No dead-letter topic is ever granted to a subscriber**, so the four `.dlt` names are operator-only. **Neither is `blnk.system`**: it carries `system.error`, whose frozen payload renders verbatim error text naming internal detail, and it is the catalogue's catch-all, so a grant of it would also stand over every event type nobody has catalogued yet. That leaves exactly **three grantable names** — the three tenant category topics.
+**No dead-letter topic is ever granted to a subscriber**, under any configuration, so the five `.dlt` names are operator-only. **`blnk.system` is withheld by default too**: it carries `system.error`, whose frozen payload renders verbatim error text naming internal detail, and it is the catalogue's catch-all, so a grant of it also stands over every event type nobody has catalogued yet. That leaves **four grantable names by default** — the four tenant category topics.
 
-The consequence to plan around: `ledger.created` shares `blnk.system`, so it has no subscriber Kafka route. It is still created, published, retained and replayable, and you read it as an operator. See [why `blnk.system` is not grantable](event-streaming.md#why-four-categories-and-why-blnksystem-is-not-grantable), which is the page a subscriber reads.
+`blnk.system` is grantable, but only with two declarations that no single action produces: you set `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` on the server, and the subscriber's own grant then names `<prefix>.system`. Either one missing and the create, the update and the credential issuance all refuse, naming the declaration that is absent. The provisioning script never grants it whatever the variable says — a bring-up script makes no entitlement decision — so the sample principal is granted the four tenant topics and nothing more. Grant it when a subscriber genuinely operates the deployment with you; withhold it otherwise, and read `system.error` yourself.
 
-> Do not "tidy" the inventory to a different count. `model.EventCategory` routes events into exactly these four categories and `event_topics.go` composes exactly these eight names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment.
+`ledger.created` needs none of that: it is on `blnk.ledgers`, a tenant category granted exactly like the other three. See [why five categories, and what `blnk.system` costs](event-streaming.md#why-five-categories-and-what-blnksystem-costs), which is the page a subscriber reads.
+
+> Do not "tidy" the inventory to a different count. `model.EventCategory` routes events into exactly these five categories and `event_topics.go` composes exactly these ten names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment.
 
 ### Partitions
 
@@ -218,11 +221,11 @@ scripts/kafka-bootstrap.sh kafka-server-start.sh /etc/kafka/server.properties
 
 Run `scripts/kafka-provision.sh` against a **running** broker. It creates, in this order:
 
-1. Every category topic and its dead-letter sibling — the eight names above, derived from `KAFKA_TOPIC_PREFIX`.
+1. Every category topic and its dead-letter sibling — the ten names above, derived from `KAFKA_TOPIC_PREFIX`.
 2. The **producer** principal (`KAFKA_SASL_USER`, falling back to `KAFKA_PRODUCER_USER`, default `blnk-producer`) with `Write` and `Describe` on the Blnk-owned topics and nothing else.
-3. One **sample subscriber** principal (`KAFKA_SAMPLE_SUBSCRIBER_USER`, default `blnk-sample-subscriber`) with `Read` and `Describe` on **three** category topics — `<prefix>.transactions`, `<prefix>.balances` and `<prefix>.identities` — and `Read` on its own prefixed consumer-group namespace.
+3. One **sample subscriber** principal (`KAFKA_SAMPLE_SUBSCRIBER_USER`, default `blnk-sample-subscriber`) with `Read` and `Describe` on **four** category topics — `<prefix>.transactions`, `<prefix>.balances`, `<prefix>.identities` and `<prefix>.ledgers` — and `Read` on its own prefixed consumer-group namespace.
 
-   **Those three are the whole grantable allowlist.** `<prefix>.system` is not on it — it carries `system.error`, whose payload is an internal error message, and it is the catch-all for any uncatalogued event type — so the script will not grant it and neither will `POST /subscribers/{id}/kafka-credentials`. `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` narrows the sample's grant to a subset and refuses anything off the allowlist: the system topic, a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it. Use it when you want a **grantable** topic outside the sample's grant to prove a denial on; a `.dlt` name and `<prefix>.system` are always outside it.
+   **Those four are the whole allowlist this script will grant from.** `<prefix>.system` is not on it — it carries `system.error`, whose payload is an internal error message, and it is the catch-all for any uncatalogued event type. `POST /subscribers/{id}/kafka-credentials` will grant it on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`; **this script never will**, whatever that variable says, because a bring-up script makes no entitlement decision. `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` narrows the sample's grant to a subset and refuses anything off the script's allowlist: the system topic, a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it. Use it when you want a **grantable** topic outside the sample's grant to prove a denial on; a `.dlt` name and `<prefix>.system` are always outside it.
 
 **Both principals' ACLs are RECONCILED, not merely added to.** Each run computes the grant the configuration asks for, then makes the broker hold exactly that: bindings the configuration no longer asks for are **revoked**, missing ones are created, and the end state is read back and compared. This matters because `kafka-acls --add` is idempotent without being convergent — it can only widen. Three ordinary changes therefore used to take no effect at all, each leaving the broker serving more than the configuration described while the run reported success:
 
@@ -368,7 +371,7 @@ For a **subscriber**, do not run it by hand. Use `POST /subscribers/{subscriber_
 ### Verifying provisioning
 
 ```bash
-# The eight topics, with their partition counts and replication factors.
+# The ten topics, with their partition counts and replication factors.
 docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:9092 \
   --command-config /tmp/blnk-kafka/client-admin.properties \
@@ -384,7 +387,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-configs.sh \
   --describe --entity-type users --entity-name blnk-sample-subscriber
 ```
 
-Expect eight topic names, six partitions each and a replication factor of 1 locally.
+Expect ten topic names, six partitions each and a replication factor of 1 locally.
 
 ## The ACL Model
 
@@ -404,7 +407,35 @@ The **group binding is `PREFIXED` on purpose**. Granting the group *id* literall
 
 Kafka's own implication rules make `Read` imply `Describe` on the same resource, and the group `Read` binding already implies the group `Describe` that `FindCoordinator` and `OffsetFetch` require. The topic `Describe` binding is therefore technically redundant and is requested anyway, so the grant is auditable from the binding list alone without the reader having to know the implication table. It costs one binding per topic.
 
-The **three tenant categories** may appear in a grant. `blnk.system` may not: it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catch-all for any event type the catalogue does not yet recognise. Every `<topic>.dlt` is ungrantable for the same class of reason, so neither a dead-letter name nor the internal category name can ever appear in a subscriber's topic list — the DTO, the persistence boundary and the ACL provisioner all read one allowlist, `model.SubscriberGrantableEventCategories`.
+The **four tenant categories** may appear in a grant unconditionally. `blnk.system` may appear only where you have declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`: it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catch-all for any event type the catalogue does not yet recognise. Every `<topic>.dlt` is ungrantable outright, under every configuration, so a dead-letter name can never appear in a subscriber's topic list — the DTO, the persistence boundary and the ACL provisioner all read one allowlist, `model.SubscriberAuthorizableTopics`, resolved against that one declaration.
+
+#### Granting the internal system topic
+
+`<prefix>.system` is the one name whose grantability is a **deployment decision** rather than a fixed rule. Two declarations are required, and neither implies the other:
+
+```bash
+# 1. On the server (and the worker, if it issues credentials): permit the grant to exist at all.
+KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true
+```
+
+```bash
+# 2. Per subscriber: name the topic in that subscriber's own grant.
+curl -X PUT "http://localhost:5001/subscribers/sub_9f8d3c214b7a5e6f" \
+  -H "X-Blnk-Key: $BLNK_SERVER_SECRET_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"authorized_topics": ["blnk.transactions", "blnk.system"]}'
+```
+
+Default is `false`, and the default is deliberate: with the variable unset or false, the create, the update and the credential issuance each refuse a grant naming the topic, and the refusal names the variable so the remedy is readable without consulting the source. Setting the variable alone grants nobody anything — it only makes the second step possible.
+
+**Four properties of this are worth knowing before you turn it on:**
+
+- It is read in **every mode**, not only under `BLNK_SERVER_SECURE=true`. The `BLNK_`-prefixed alias `BLNK_KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS` also resolves, as with every other variable in this document.
+- `scripts/kafka-provision.sh` **never** grants the topic, whatever the variable says. A bring-up script makes no entitlement decision, and a sample principal granted every category would make the subscriber-isolation criterion vacuous by leaving it no outside.
+- A grant that passes is **logged as a warning** by the ACL provisioner, carrying the subscriber's id hash and the topic, so an entitlement this unusual leaves a record even when nobody was watching the request.
+- Turning the variable back to `false` does **not** revoke a live principal on its own. Remove the topic from the subscriber's `authorized_topics` — the ACL grant is reconciled against the record on the next issuance, so the record is what has to change.
+
+Grant it when a subscriber genuinely operates the deployment with you and needs to see Blnk's own failures. Withhold it otherwise: `system.error`'s body is a frozen legacy contract that cannot be narrowed, so there is no redacted version of this topic to offer instead.
 
 ### Foreign ACL bindings, and why issuance refuses on them
 
@@ -496,10 +527,11 @@ Expect exactly `authorizer.class.name=org.apache.kafka.metadata.authorizer.Stand
 
 ```bash
 # 2. The behavioural proof: a principal reading OUTSIDE its grant must be refused.
-#    A DEAD-LETTER topic is the right probe: no subscriber is ever granted one, so an
-#    authorization failure is the correct and expected outcome. blnk.system is an
-#    equally valid probe now that no subscriber may hold it, but a .dlt name is the
-#    one that stays valid whatever a deployment grants. Use a SUBSCRIBER's own
+#    A DEAD-LETTER topic is the right probe: no subscriber is ever granted one under
+#    any configuration, so an authorization failure is the correct and expected
+#    outcome. blnk.system is only a valid probe on a deployment that has NOT declared
+#    KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS; a .dlt name is the one that stays valid
+#    whatever a deployment grants. Use a SUBSCRIBER's own
 #    client properties file —
 #    never the admin one, which is in super.users and is allowed everything by
 #    design, so it would prove nothing. The path must be visible INSIDE the
@@ -561,7 +593,7 @@ The corresponding functions are `SubscriberKafkaPrincipal`, `SubscriberConsumerG
 ### There are no per-tenant topics
 
 There is no topic per tenant, per subscriber or per ledger — looking for one is looking for something
-that does not exist. Every subscriber reads from the **same three grantable category topics**, and each
+that does not exist. Every subscriber reads from the **same four grantable category topics**, and each
 one is granted **only the subset it was authorised for**: its `authorized_topics`. Two subscribers can
 therefore hold entirely different grants over one shared inventory, and no subscriber is ever granted a
 `.dlt` topic.
@@ -700,7 +732,20 @@ Credential issuance states which shape was provisioned:
 }
 ```
 
-`gateway_delivery_required` is the field a subscriber's client branches on — it is `true` exactly when a prefix is recorded — and `broker_record_access` is its exact complement, stating whether a topic `Read` binding exists. `not_enforced_by` is now **empty for every subscriber**; it stays in the body because an absent key would read as "not stated" rather than as "nothing is unenforced", and because it is where a future unenforceable dimension would appear. `enforced_by` carries `partition_key` exactly when a prefix is recorded. `partition_key_prefix_enforced_by` uses the **same word** the deployment declares in `KAFKA_KEY_SCOPE_ENFORCEMENT`, so a response and the configuration that made it issuable cannot name two different components.
+`gateway_delivery_required` is the field a subscriber's client branches on — it is `true` exactly when `partition_key_prefix_enforced` is — and `broker_record_access` states whether a topic `Read` binding exists. `partition_key_prefix_enforced_by` uses the **same word** the deployment declares in `KAFKA_KEY_SCOPE_ENFORCEMENT`, so a response and the configuration that made it issuable cannot name two different components.
+
+**Every one of those fields answers from the DEPLOYMENT, not from the column**, and `enforced_access.partition_key_scope_state` is where you read which:
+
+| State | Prefix recorded? | Component declared? | Attested for this principal? |
+|---|---|---|---|
+| `not_requested` | no | — | — |
+| `requested` | yes | **no** | — |
+| `available` | yes | yes | not yet (registry reads make no round trip) |
+| `attested` | yes | yes | yes — credential responses only |
+
+`enforced_by` carries `partition_key` in the `available` and `attested` states; `not_enforced_by` carries it in `requested`, and is empty otherwise. That pairing is the correction: these fields previously derived from whether the prefix column was non-empty, so a row on the shipped default reported `partition_key_prefix_enforced: true` with `broker_gateway` named — while `POST /subscribers/{id}/kafka-credentials` refused the same row with `SUBSCRIBER_KEY_SCOPE_UNENFORCED`. If an audit or a dashboard asks "which subscribers actually have an enforced key boundary?", `partition_key_scope_state` is the field to group by.
+
+`credential_issuance_blocked` on a subscriber read now predicts **every** refusal that is knowable without a broker round trip, in the order issuance applies them: a deregistration in flight, a recorded prefix with no component declared, a *missing* prefix under a declared component, an unacknowledged whole-topic model in secure mode, an empty topic grant, and unadvertised `KAFKA_SUBSCRIBER_BROKERS`. `credential_issuance_blocked_reason` names the field or variable to change. The one refusal it does not predict is `SUBSCRIBER_KEY_SCOPE_UNATTESTED`, because attestation is a live call to the component and not a property of the row or the configuration.
 
 Issuance to a key-scoped subscriber logs an INFO line naming the prefix, the enforcement point and the topics, so the moment a key-scoped principal comes into existence is visible in the operator log. A **refused** issuance logs the refusal with the same identifiers, so the state is equally visible.
 
@@ -787,7 +832,7 @@ The `200` response carries everything the subscriber needs to start consuming, a
 |-------|---------|
 | `brokers` | The subscriber-facing bootstrap list, from `KAFKA_SUBSCRIBER_BROKERS`. |
 | `broker_endpoint` | The same list as one connection string, for convenience. |
-| `authorized_topics` | The topics the credential may `Read` and `Describe` — the authorised subset of the three grantable category topics. **Never a `.dlt` name, and never `<prefix>.system`.** |
+| `authorized_topics` | The topics the credential may `Read` and `Describe` — the authorised subset of the grantable category topics. **Never a `.dlt` name. Never `<prefix>.system` either, unless the deployment has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`.** |
 | `consumer_group_id` | The derived default group, `blnk-sub-<subscriber_id>.default`. |
 | `enforced_access` | Each dimension of the access model and the component that enforces it: topic and consumer group at the broker's authorizer, the recorded `partition_key_prefix` at the key-authorising component the deployment declared. Assembled by the model, never by the handler, and it carries `gateway_delivery_required` so a client knows which endpoint to dial. |
 | `username` | The derived principal, `blnk-sub-<subscriber_id>`. |
@@ -1365,7 +1410,7 @@ Branch on the `failure_reason` the listing gave you. It is the field the API exp
 |-----------------|-------|---------|
 | `broker_unavailable` | The broker did not answer, or dropped the connection, during the window | Restore the broker, confirm the healthcheck passes, then replay. Check `blnk_outbox_pending` is falling before you replay in bulk. |
 | `timeout` | An attempt exceeded its deadline — usually load rather than a fault | Confirm the cluster is healthy and the backlog is draining, then replay. If it recurs at a steady rate, the cluster is undersized for the publish rate rather than broken. |
-| `topic_missing` | Provisioning never ran, or `KAFKA_TOPIC_PREFIX` changed and the new namespace was never created | Re-run provisioning (`make kafka_provision`), verify the eight names with `kafka-topics.sh --describe`, then replay. |
+| `topic_missing` | Provisioning never ran, or `KAFKA_TOPIC_PREFIX` changed and the new namespace was never created | Re-run provisioning (`make kafka_provision`), verify the ten names with `kafka-topics.sh --describe`, then replay. |
 | `authorization_denied` | The producer principal's credential or ACLs are wrong | Repair `KAFKA_SASL_USER`/`KAFKA_SASL_SECRET` and confirm the producer holds `Write` and `Describe` on the owned topics, then replay. **Do not** work around it with `KAFKA_ALLOW_ADMIN_PRODUCER`. |
 | `message_too_large` | The event exceeds the 768 KiB publish limit | **Replay will fail again.** Investigate the producer: this is an oversized payload, not a transport fault. Capture the `event_id`, `event_type` and `payload_bytes` and raise it against the emitting code path. |
 | `persistence_failure` | Blnk's own database failed, not Kafka. The event may well have reached the topic while the bookkeeping did not | Check PostgreSQL health first. Then read the row: if `kafka_topic`/`kafka_partition`/`kafka_offset` are populated the message is already on the topic, and replaying would publish a **second** copy that subscribers must deduplicate on `event_id`. |
@@ -1604,6 +1649,8 @@ deployment was, and `measured_windows` is abridged to two of its 48 entries:
     "blnk.balances.dlt": 0,
     "blnk.identities": 2,
     "blnk.identities.dlt": 2,
+    "blnk.ledgers": 0,
+    "blnk.ledgers.dlt": 0,
     "blnk.system": 0,
     "blnk.system.dlt": 0
   },
@@ -1679,11 +1726,13 @@ The **seven per-status counts are explicit fields**, one per member of the outbo
 
 #### `producer_atomicity` — events that are owed and not yet in the table at all
 
-The seven counts above are a census of rows that **exist**. Two event families are captured from an *intent* recorded atomically with their mutation — a balance-monitor handoff and a bulk-batch coordinator row — and while an intent is outstanding, its event has not been captured yet and appears in **no** status. A reconciliation that read only the census would find it internally consistent while monitor alerts and batch summaries were still owed, so this object is reported alongside it.
+The seven counts above are a census of rows that **exist**. Some events are captured from an *intent* recorded atomically with their mutation rather than as an outbox row, and while an intent is outstanding its event has not been captured yet and appears in **no** status. A reconciliation that read only the census would find it internally consistent while those events were still owed, so this object is reported alongside it.
+
+There are two such intents, and they are not equally common. A **bulk-batch coordinator row** is the ordinary route for every batch summary. A **balance-monitor handoff** is not: the atomic writers evaluate a moved balance's monitors inside their own transaction and insert the alert row there, so a movement made by any current release writes no handoff at all. The handoff counts therefore describe a finite, draining population — rows written by releases that predate the in-transaction capture, and rows written by a process with no alert capture registered. On a deployment that has finished draining them they sit at zero permanently, and a `monitor_handoff_pending` that starts climbing again after that is worth investigating rather than ignoring.
 
 | Field | Meaning | What to do |
 |-------|---------|-----------|
-| `monitor_handoff_pending` | Balance movements whose monitors have not been judged yet | Nothing. A small non-zero number is one poll interval of work |
+| `monitor_handoff_pending` | Balance movements whose monitors have not been judged yet. Only pre-capture rows reach this count | Nothing while the pre-capture population is draining. A number that climbs after it has reached zero means something is writing handoffs, so check that the process moving balances is one that registers the alert capture |
 | `monitor_handoff_processing` | Handoffs a processor currently holds | Nothing |
 | `monitor_handoff_completed` | Handoffs judged, overwhelmingly "judged, nothing fired" — which is why it dwarfs the number of alerts ever published | Nothing |
 | `monitor_handoff_failed` | **Evaluation budget spent.** Each one is a balance movement whose monitor conditions were never judged, so any alert it should have produced does not exist and never will without intervention | Investigate. `last_error` on the row names the cause; the ERROR log carries the handoff id, the balance and the attempt count |
@@ -1694,7 +1743,28 @@ The seven counts above are a census of rows that **exist**. Two event families a
 
 These counts are a **separate signal from the loss verdict** and do not feed it. An owed event is not a lost one — its intent is durable, and the event still arrives when the handoff is evaluated or the batch finalises. Only `monitor_handoff_failed` and a stale `unfinalized_batches` describe an event that will never exist, and neither can be seen anywhere in the arithmetic of Step 2.
 
-Leave `include_offsets` off. Absent means **best effort**: the broker is read when one is configured, and a failure is logged and omitted, which is what this procedure wants. `include_offsets=true` makes the broker read *required* and answers `503 EVENT_KAFKA_UNAVAILABLE` on failure; `include_offsets=false` skips the broker entirely. There is deliberately no topic-narrowing parameter — the verdict compares the broker against **every** outbox row that claims a publication, so measuring a subset of topics would manufacture a shortfall and report loss that has not happened.
+**`include_offsets=true` is required here, and it must be spelled out.** Omitting the parameter — or
+passing `false` — SKIPS the broker entirely and does not count `dispatched`, so the response carries
+no offsets and no verdict: `offsets_complete` is `false` and there is nothing to reconcile against.
+An earlier revision of this procedure said to leave the parameter off on the grounds that absent
+meant best effort. It no longer does; see the posture table earlier in
+[this procedure](#the-daily-outbox-versus-offset-reconciliation), which is authoritative. Following
+the old instruction produces a snapshot that looks healthy because it measured nothing.
+
+The three postures, and which one this check wants:
+
+- **`true` — use this.** The broker read is REQUIRED, so a broker that cannot be read answers
+  `503 EVENT_KAFKA_UNAVAILABLE`. A reconciliation that silently dropped half its input would report
+  a verdict it did not compute, and this is the one procedure where failing loudly is the point.
+- **`best_effort`** — attempts the broker, degrades to the counts and still answers `200`. Correct
+  for a deployment with **no brokers configured at all**, where `true` would answer `503` for a
+  reason that is not a fault; it is the only other posture that counts the dispatched history.
+- **absent or `false`** — skips the broker and omits `dispatched`. Right for a dashboard, a health
+  check or a drain loop, and wrong for this check.
+
+There is deliberately no topic-narrowing parameter — the verdict compares the broker against
+**every** outbox row that claims a publication, so measuring a subset of topics would manufacture a
+shortfall and report loss that has not happened.
 
 ### Step 2 — Read the verdict, in this order
 
@@ -1739,7 +1809,7 @@ The screen condition, stated as arithmetic:
 
 ```text
 terminal_events  = dispatched + webhook_pending + dead_lettered   (rows claiming publication)
-messages_written = SUM(topic_end_offsets)                         (the four topics + the four .dlt siblings)
+messages_written = SUM(topic_end_offsets)                         (the five topics + the five .dlt siblings)
 overhead         = messages_written - terminal_events             (SIGNED, never clamped)
 
 Every terminal row lands in exactly one bucket, and the five sum to terminal_events:
@@ -1774,7 +1844,7 @@ The five buckets are separate because the remedies are:
 Useful when you want the offsets independently of the API, or when the API's broker read is the thing you suspect:
 
 ```bash
-# End offsets for all eight topics, one line per topic-partition.
+# End offsets for all ten topics, one line per topic-partition.
 for t in transactions balances identities system; do
   for topic in "blnk.$t" "blnk.$t.dlt"; do
     docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
@@ -2440,7 +2510,9 @@ docker compose --profile monitoring up -d prometheus
 
 ## Relay Operations
 
-**The event relay runs in the server process role**, started immediately after the fund-lineage outbox processor it is modelled on — this repository's established home for an outbox relay, which also avoids standing up a fourth asynq server for one poll loop. There is no separate relay binary and no relay subcommand: `blnk start` *is* how the relay is run. `make run_relay` is an alias for the server role, provided so that "where does the relay run" is answerable without reading `cmd/server.go`, and so the relay can be run in isolation for a load test or while watching a backlog drain. It loads `.env` the way `make kafka_provision` does — the file supplies defaults, the caller's environment wins — and then execs `blnk start --config blnk.json --require-kafka`.
+**The event relay runs in the server process role**, started immediately after the fund-lineage outbox processor it is modelled on — this repository's established home for an outbox relay, which also avoids standing up a fourth asynq server for one poll loop. There is no separate relay binary and no relay subcommand: `blnk start` *is* how the relay is run. `make run_relay` is a CONVENIENCE ALIAS for the server role and nothing more — `make run_server_relay` is the same target under the name that says what starts. It exists so that "where does the relay run" is answerable without reading `cmd/server.go`, and because AAP §0.5.1 Group 7 names that target. It loads `.env` the way `make kafka_provision` does — the file supplies defaults, the caller's environment wins — and then execs `blnk start --config blnk.json --require-kafka`.
+
+**IT IS NOT ISOLATED RELAY EXECUTION.** `blnk start` brings up the HTTP API on its port, the fund-lineage outbox processor, the balance-monitor handoff processor and the metrics collector alongside the event relay, and every one of them claims rows or serves traffic. That matters for two things operators reach for this target to do: a load test taken against it measures the whole server role rather than the relay, and a backlog you are watching drain is being drained by more than the relay. If you need the relay's own numbers, read `blnk.events.publish.duration` and `blnk_outbox_pending` rather than inferring them from process behaviour.
 
 **`--require-kafka` is where the refusal lives, and it lives in the application on purpose.** The flag makes `blnk start` resolve its own configuration and refuse to start when that resolution yields no usable broker, printing every source and its precedence and exiting non-zero without serving. The target itself decides nothing about brokers.
 
@@ -2715,7 +2787,7 @@ Confirm the stack:
 # 1. The broker is healthy — meaning SASL works, not merely that a port is open.
 docker compose ps kafka
 
-# 2. The eight topics exist with the local geometry: 6 partitions, factor 1.
+# 2. The ten topics exist with the local geometry: 6 partitions, factor 1.
 docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:9092 \
   --command-config /tmp/blnk-kafka/client-admin.properties --describe

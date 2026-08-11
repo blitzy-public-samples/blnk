@@ -327,9 +327,9 @@ func (c balanceMonitorCapture) holds(balanceID, monitorID string) bool {
 // # Error policy, split by what the failure means
 //
 //   - A MONITOR READ that fails is reported and stepped past, and the affected balance is left
-//     out of the capture so the OTHER route still evaluates it durably — the writer's monitor
-//     handoff when publishing is configured, the post-commit hook when it is not. The
-//     alternative would make every ledger movement depend on the monitor cache and the
+//     out of the capture so the OTHER route still evaluates it durably — the writer's own
+//     in-transaction capture when publishing is configured, the post-commit hook when it is not.
+//     The alternative would make every ledger movement depend on the monitor cache and the
 //     monitors table being readable, which is a far worse trade than a late alert.
 //   - A PAYLOAD that will not serialise is returned as an error, which fails the write. That is a
 //     producer defect rather than a transient condition, and it is the same answer the
@@ -337,18 +337,17 @@ func (c balanceMonitorCapture) holds(balanceID, monitorID string) bool {
 //
 // # This is one of TWO mechanisms, and they compose
 //
-// The writer also records a durable monitor HANDOFF inside the same transaction, which
-// BalanceMonitorHandoffProcessor drains — see database.recordBalanceMonitorHandoffs. That is
-// what covers the paths this function is not wired into (the coalesced batch, whose argument
-// list AAP §0.6.2 freezes) and the balances whose monitors could not be read here. The two
-// mechanisms give that transaction the same guarantee by different means: this one commits the
-// alert row, the handoff commits the alert's two decision inputs — the balance as written and
-// the monitor definitions in force — so a balance that falls to the handoff is not evaluated
-// against whatever the monitors happen to say when the row is drained. The writer
-// suppresses the handoff for exactly the balances this pass covered, so a crossing is captured
-// once: by this function when it can, by the handoff otherwise. Publishing from both would
-// deliver every alert twice under two different event ids, which nothing downstream could
-// collapse.
+// The writer performs the same evaluation itself for the balances this pass did not cover, from
+// monitor definitions it reads inside the same transaction, and inserts the same canonical rows
+// there — see database.recordBalanceMonitorEvaluation. That is what covers the paths this
+// function is not wired into (the coalesced batch, whose argument list AAP §0.6.2 freezes) and
+// the balances whose monitors could not be read here. The two routes insert the SAME ROW, built
+// by prepareBalanceMonitorAlertRow below through the registered capture, in the SAME
+// transaction; they differ only in where the monitor definitions were read, which is the monitor
+// cache here and one indexed statement inside the transaction there. The writer suppresses its
+// own evaluation for exactly the balances this pass covered, so a crossing is captured once: by
+// this function when it can, by the writer otherwise. Capturing from both would deliver every
+// alert twice under two different event ids, which nothing downstream could collapse.
 //
 // Parameters:
 //   - ctx context.Context: the context for the reads; no write happens here.
@@ -411,15 +410,7 @@ func (l *Blnk) prepareBalanceMonitorEvents(
 				continue
 			}
 
-			// The SAME event string and the SAME payload object the fallback publishes, so the
-			// stored bytes are identical whichever route captures the crossing — which is what
-			// keeps the dual-delivery guarantee true for this producer as well. The ledger is
-			// supplied from the monitored balance because model.BalanceMonitor carries none and
-			// requirement R-6 partitions by ledger.
-			row, prepareErr := l.PrepareEventOutbox(ctx, NewWebhook{
-				Event:   "balance.monitor",
-				Payload: monitor,
-			}, WithEventLedgerID(balance.LedgerID))
+			row, prepareErr := l.prepareBalanceMonitorAlertRow(ctx, balance, monitor)
 			if prepareErr != nil {
 				span.RecordError(prepareErr)
 
@@ -448,6 +439,56 @@ func (l *Blnk) prepareBalanceMonitorEvents(
 	)
 
 	return rows, capture, nil
+}
+
+// prepareBalanceMonitorAlertRow builds the canonical balance.monitor outbox row for ONE
+// crossing: one monitor, on one balance, as that balance has just been written.
+//
+// # One builder, three routes, one row
+//
+// Three routes can decide a monitor crossing, and all three build the row here:
+//
+//   - prepareBalanceMonitorEvents above, before the write, on the single-transaction path.
+//   - database.captureBalanceMonitorAlertsInTx, inside the writer's transaction, for the
+//     balances that pass did not cover and for the coalesced batch it is not wired into. It
+//     reaches this function through the capture registered in NewBlnk, which is the only
+//     direction that compiles: the database package cannot import this one.
+//   - BalanceMonitorHandoffProcessor, draining a handoff row written before the
+//     in-transaction capture existed, which supplies the handoff's own event identity.
+//
+// Having one builder is what makes the routes interchangeable to a subscriber. The event
+// string, the payload object and the ledger are identical whichever route decided the
+// crossing, so the STORED BYTES are identical — which is what keeps the dual-delivery
+// equivalence guarantee true for this producer as well as for transactions.
+//
+// # Why the event id is left to PrepareEventOutbox
+//
+// No identity is supplied here, so PrepareEventOutbox mints a fresh id. That is deliberate and
+// it is the same answer model.EventIdentityFor gives for this event type: a monitor fires every
+// time its condition is met, and deriving an id from the (balance, monitor) pair would collapse
+// every later firing into a duplicate the unique index rejects — after which the pipeline would
+// stop delivering that monitor's alerts with no error anywhere. The two routes that DO derive an
+// id both name a per-firing artefact rather than the pair: the handoff drain uses
+// model.BalanceMonitorEventIdentity(handoffID, monitorID) because one handoff row is one firing
+// and the drain may re-evaluate it, whereas an in-transaction insert commits with its mutation
+// or rolls back with it and has nothing to re-evaluate.
+//
+// Parameters:
+//   - ctx context.Context: the caller's context, for tracing only. No I/O happens here.
+//   - balance *model.Balance: the monitored balance in its post-mutation state. It supplies the
+//     ledger, because model.BalanceMonitor carries none and requirement R-6 partitions by
+//     ledger; it is not part of the payload.
+//   - monitor model.BalanceMonitor: the monitor whose condition the balance met. It is the
+//     payload, exactly as the legacy webhook carried it.
+//
+// Returns:
+//   - *model.EventOutbox: the row to insert, or nil when event publishing is not configured.
+//   - error: a payload that cannot be serialised or a partition key that cannot be resolved.
+func (l *Blnk) prepareBalanceMonitorAlertRow(ctx context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+	return l.PrepareEventOutbox(ctx, NewWebhook{
+		Event:   balanceMonitorEventType,
+		Payload: monitor,
+	}, WithEventLedgerID(balance.LedgerID))
 }
 
 // getBalanceMonitorsCached retrieves balance monitors with caching.

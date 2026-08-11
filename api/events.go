@@ -80,13 +80,22 @@ import (
 // # WHAT THE RESPONSES DO NOT SAY
 //
 // Write-side exactly-once is a property of the events captured INSIDE their
-// mutation's database transaction, not of the catalogue as a whole: balance
-// monitor alerts, bulk batch summaries, system errors and the transaction
-// fallback are captured standalone, after their mutation has committed, and can
-// be lost if the process dies in that window. docs/event-streaming.md carries the
-// per-event-type table. Kafka delivery is at-least-once regardless of how a row
-// was captured, and event_id is the subscriber's idempotency key, so no message
-// or field below claims a stronger guarantee than that.
+// mutation's database transaction, not of the catalogue as a whole. That is every
+// event type but two, and the two differ from each other:
+//
+//   - `bulk_transaction.<status>` is captured in the same transaction as the batch
+//     coordinator's terminal transition, so it is lost only if that transaction
+//     never commits — which leaves the batch countable as unfinalized.
+//   - `system.error` reports a process fault rather than a ledger mutation, so it
+//     has no transaction to join and is captured standalone. It is the one type
+//     that is at-most-once as a matter of course.
+//
+// Everything else, `balance.monitor` and a coalesced batch's `transaction.*`
+// events included, has its row inserted before the mutation commits.
+// docs/event-streaming.md carries the per-event-type table. Kafka delivery is
+// at-least-once regardless of how a row was captured, and event_id is the
+// subscriber's idempotency key, so no message or field below claims a stronger
+// guarantee than that.
 
 const (
 	// deadLetterPageDefaultLimit and deadLetterPageMaxLimit are the page bounds

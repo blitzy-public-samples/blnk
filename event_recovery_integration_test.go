@@ -2138,7 +2138,8 @@ func TestEventRecovery_MidBatchRestartLosesNoEventsAndDuplicatesAreDedupableByEv
 		first.Stop()
 	})
 
-	first.Start(crashCtx)
+	require.NoError(t, first.Start(crashCtx),
+		"the relay refused to start; the returned obstacle names the missing precondition")
 	require.True(t, first.IsRunning(), "the relay must be running before it can be interrupted")
 
 	frozenAt, parkedAtCrash := publisher.awaitFreeze(t, recoveryGateTimeout)
@@ -2189,7 +2190,8 @@ func TestEventRecovery_MidBatchRestartLosesNoEventsAndDuplicatesAreDedupableByEv
 		second.Stop()
 	})
 
-	second.Start(restartCtx)
+	require.NoError(t, second.Start(restartCtx),
+		"the restarted relay refused to start; the returned obstacle names the missing precondition")
 	require.True(t, second.IsRunning(), "the restarted relay must be running")
 
 	states := fixture.waitForTerminalStates(ctx, seededEvents, recoveryDrainTimeout)
@@ -2329,7 +2331,8 @@ func TestEventRecovery_PublishedButUnmarkedRowIsRepublishedAndTheDuplicateDedupe
 	// The lease expiring is the recovery. The relay needs no knowledge of the crash.
 	relay := fixture.relay(publisher)
 	t.Cleanup(relay.Stop)
-	relay.Start(ctx)
+	require.NoError(t, relay.Start(ctx),
+		"the relay refused to start; the returned obstacle names the missing precondition")
 
 	states := fixture.waitForTerminalStates(ctx, seededEvents, recoveryDrainTimeout)
 	relay.Stop()
@@ -2534,7 +2537,7 @@ func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *t
 		beta.Stop()
 	})
 
-	alpha.Start(ctx)
+	require.NoError(t, alpha.Start(ctx), "alpha refused to start; the returned obstacle names why")
 
 	_, parked := alphaPublisher.awaitFreeze(t, recoveryGateTimeout)
 	require.GreaterOrEqual(t, parked, 1,
@@ -2560,7 +2563,7 @@ func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *t
 
 	// Beta now polls for the whole overrun. Every poll is a claim attempt against rows whose
 	// lease alpha is renewing, and every one of them must come back with nothing of ours.
-	beta.Start(ctx)
+	require.NoError(t, beta.Start(ctx), "beta refused to start; the returned obstacle names why")
 
 	t.Logf("holding alpha's batch of %d rows for %s, which is %.0f times its own %s lease",
 		len(held), recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease), recoveryLease)
@@ -2790,14 +2793,14 @@ func TestEventRecovery_ConcurrentRelaysShareTheBacklogWithoutDoubleProcessing(t 
 		beta.Stop()
 	})
 
-	alpha.Start(ctx)
+	require.NoError(t, alpha.Start(ctx), "alpha refused to start; the returned obstacle names why")
 
 	_, alphaParked := alphaPublisher.awaitFreeze(t, recoveryGateTimeout)
 	require.GreaterOrEqual(t, alphaParked, 1,
 		"alpha must be holding a claimed batch it cannot finish before beta is asked to work around it")
 
 	// Alpha now holds a claimed batch it cannot finish. Beta must still make progress.
-	beta.Start(ctx)
+	require.NoError(t, beta.Start(ctx), "beta refused to start; the returned obstacle names why")
 	fixture.awaitDeliveries(betaPublisher, betaProgress, recoveryGateTimeout)
 
 	betaWhileAlphaHeld, _, _ := betaPublisher.counts()
@@ -2897,7 +2900,8 @@ func TestEventRecovery_ADeadLetterWriteThatFailedIsRetriedUntilTheEventIsPreserv
 		relay.Stop()
 	})
 
-	relay.Start(ctx)
+	require.NoError(t, relay.Start(ctx),
+		"the relay refused to start; the returned obstacle names the missing precondition")
 
 	// STEP 1 — the hazard is reproduced. Every row spends its budget on its first publish and
 	// its dead-letter write is refused, so each one lands in the limbo described above.
@@ -3314,7 +3318,8 @@ func TestEventRecovery_MidBatchRestartDeliversEveryEventToKafka(t *testing.T) {
 		first.Stop()
 	})
 
-	first.Start(crashCtx)
+	require.NoError(t, first.Start(crashCtx),
+		"the relay refused to start; the returned obstacle names the missing precondition")
 	require.True(t, first.IsRunning(), "the relay must be running before it can be interrupted")
 
 	_, parkedAtCrash := publisher.awaitFreeze(t, recoveryGateTimeout)
@@ -3339,7 +3344,8 @@ func TestEventRecovery_MidBatchRestartDeliversEveryEventToKafka(t *testing.T) {
 		second.Stop()
 	})
 
-	second.Start(restartCtx)
+	require.NoError(t, second.Start(restartCtx),
+		"the restarted relay refused to start; the returned obstacle names the missing precondition")
 
 	states := fixture.waitForTerminalStates(ctx, seededEvents, recoveryDrainTimeout)
 

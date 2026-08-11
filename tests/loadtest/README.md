@@ -96,9 +96,11 @@ module, which is why the acceptance run is the one case that may legitimately be
 key and the metrics bearer token.
 
 The `event-streaming` case does not run that script. It runs `tests/loadtest/events.js`, which recognises
-exactly one scenario, `event_publish`, and reads **53** distinct environment variables. The ones
-that change what a run measures or whether it is allowed to start are grouped below with their
-defaults; the rest are documented in the file itself, beside the constant each one feeds.
+exactly one scenario, `event_publish`, and is configured entirely through environment variables. The
+ones that change what a run measures or whether it is allowed to start are grouped below with their
+defaults; the rest are documented in the file itself, beside the constant each one feeds — which is
+the authoritative inventory, since a count repeated here goes stale the first time a knob is added.
+`grep -o '__ENV\.[A-Z_0-9]*' tests/loadtest/events.js | sort -u` lists them all.
 
 **Load shape** — every default here is the criterion's own figure, so overriding any of them
 produces a run whose numbers are real for the load it offered and not for the load V-1 is stated

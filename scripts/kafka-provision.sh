@@ -33,10 +33,10 @@
 # The producer's grant is Write and Describe on the Blnk-owned topics and nothing else: no
 # Read, no consumer group, no cluster operation. The subscriber's is the mirror image - Read
 # and Describe on the topics it may consume, and Read on its own consumer-group namespace -
-# and it is granted only the topics model.SubscriberGrantableTopics allows, which excludes
-# every dead-letter sibling. The sample principal's default grant is narrower still: the three
-# domain category topics, without the system topic a real subscriber may be granted
-# deliberately.
+# and it is granted only the topics model.SubscriberAuthorizableTopics allows, which excludes
+# every dead-letter sibling. The sample principal's default grant is narrower still: the four
+# tenant category topics, without the internal system topic a real subscriber may be granted
+# where the deployment has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS.
 #
 # NO CREDENTIAL IS EVER PRINTED. A generated password is written to a mode-0600 file the
 # operator nominates through KAFKA_PRODUCER_SECRET_FILE or
@@ -56,34 +56,33 @@
 #     <prefix>.transactions        <prefix>.transactions.dlt
 #     <prefix>.balances            <prefix>.balances.dlt
 #     <prefix>.identities          <prefix>.identities.dlt
+#     <prefix>.ledgers             <prefix>.ledgers.dlt
 #     <prefix>.system              <prefix>.system.dlt
 #
 # Only the CATEGORY names are written down below; each dead-letter name is derived by
 # appending ".dlt", exactly as event_topics.go's DLTFor does. Deriving rather than listing
 # is what structurally prevents the two halves of the catalogue drifting apart.
 #
-# There is ONE category more than the three named in the requirement because two real event
+# There are TWO categories more than the three named in the requirement because two real event
 # types - ledger.created and system.error - belong to none of transactions, balances or
-# identities, while the requirement also demands that every event formerly delivered by
-# webhook be published. Both go to <prefix>.system, which follows the identical naming
-# convention and doubles as the catch-all for an event type the catalogue does not
-# recognise, so no event type is silently dropped.
+# identities, while the requirement also demands that every event formerly delivered by webhook
+# be published AND, once the webhook transport retires, still be reachable by a subscriber
+# credential. They get a category each, split by audience: <prefix>.ledgers is tenant data and is
+# granted like any other tenant topic, and <prefix>.system holds the internal error stream and
+# doubles as the catch-all for an event type the catalogue does not recognise, so no event type
+# is silently dropped.
 #
-# <prefix>.system IS CREATED AND IS NEVER GRANTED TO A SUBSCRIBER. It is an operator topic: the
-# events on it reach an operator, not a subscriber principal. It is absent from
-# SUBSCRIBER_GRANTABLE_CATEGORIES below — mirroring model.SubscriberGrantableEventCategories —
-# because system.error's payload is frozen by R-8 and renders Blnk's own error text verbatim,
-# and because the category is the catch-all, so a grant of it would stand over every event type
-# nobody has catalogued yet. The consequence, recorded rather than hidden, is that
-# ledger.created has no subscriber Kafka route: it is still created here, still published, still
-# observable and replayable. A fifth
-# <prefix>.ledgers topic was implemented to close that gap and then removed: the catalogue is a
-# published contract, so an extra topic obliges every subscriber wanting universal coverage
-# to hold a grant it was never told about, and widening a frozen contract belongs to a
-# revision of the agreed plan rather than to this script.
+# <prefix>.system IS CREATED AND THIS SCRIPT GRANTS IT TO NOBODY. It is an operator topic: it is
+# absent from SUBSCRIBER_GRANTABLE_CATEGORIES below — mirroring
+# model.SubscriberGrantableEventCategories — because system.error's payload is frozen by R-8 and
+# renders Blnk's own error text verbatim, and because the category is the catch-all, so a grant
+# of it would stand over every event type nobody has catalogued yet. A deployment that needs a
+# subscriber reading it declares KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and grants the topic
+# through the subscriber API, against a named subscriber; the sample principal this script
+# creates for a local walkthrough must not teach that grant as a default.
 #
-# Do not "correct" this to six or ten topics: model.EventCategory routes events into exactly
-# these four and event_topics.go composes exactly these eight names from them. A name this
+# Do not "correct" this to eight or twelve topics: model.EventCategory routes events into exactly
+# these five and event_topics.go composes exactly these ten names from them. A name this
 # script does not create is a name the relay cannot publish to, and a name it creates that
 # the code never writes to is dead weight in every environment.
 #
@@ -871,33 +870,33 @@ readonly REQUIRED_AUTHORIZER="org.apache.kafka.metadata.authorizer.StandardAutho
 # it fixes the order of event_topics.go's AllTopics, AllDeadLetterTopics and
 # AllTopicsWithDeadLetters, which provisioning is compared against.
 #
-# FOUR CATEGORIES AND EIGHT TOPICS is the frozen catalogue. A fifth 'ledgers' category was
-# added here and then reverted: ledger.created belongs to none of the three named categories,
-# so it shares the one extra category with system.error, and separating them to keep it
-# grantable is a contract change decided by whoever owns the catalogue rather than by a
-# provisioning script. model.EventCategorySystem records the consequence.
+# FIVE CATEGORIES AND TEN TOPICS is the published catalogue. 'ledgers' exists so that
+# ledger.created - ordinary tenant data - has a subscriber-grantable home of its own instead of
+# sharing the internal category with system.error: while the two shared a topic, granting one
+# meant disclosing the other and withholding it left ledger.created with no subscriber route at
+# all after the webhook transport retires. model.EventCategoryLedgers records that reasoning.
 #
-# 'system' is INTERNAL and is provisioned anyway, which is not a contradiction. No
-# subscriber may be granted it - it is excluded from SubscriberGrantableEventCategories -
-# but Blnk publishes system.error AND ledger.created to it, and it is also where an event
-# type the mapping table does not recognise is routed, precisely so the "every event is
-# published, with zero exceptions" guarantee survives a producer that forgot to extend the
-# table. A topic that
+# 'system' is INTERNAL and is provisioned anyway, which is not a contradiction. It is not in the
+# default grant set - a subscriber may hold it only where the deployment has declared
+# KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS - but Blnk publishes system.error to it, and it is also
+# where an event type the mapping table does not recognise is routed, precisely so the "every
+# event is published, with zero exceptions" guarantee survives a producer that forgot to extend
+# the table. A topic that
 # does not exist cannot receive one: against a broker with auto.create.topics.enable=false
 # the publish fails, the row retries until its budget is spent, and the dead-letter write
 # then fails too because <prefix>.system.dlt is missing as well - so the very events the
 # internal category exists to keep durable are the ones that get stranded.
 # It is asserted against model.AllEventCategories by TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns.
-readonly EVENT_CATEGORIES=(transactions balances identities system)
+readonly EVENT_CATEGORIES=(transactions balances identities ledgers system)
 
 # There is NO list of ungrantable categories here, and the absence is deliberate.
 #
 # One stood in this position, mirroring an internalEventCategories set in model/event.go, and
-# both are gone. Withholding 'system' would have withheld ledger.created with it, because the
-# four-category catalogue seats that event on the same topic - so a subscriber migrating off the
-# webhook transport would silently stop receiving an event that transport delivers today. The
-# concern the list was reaching for is answered per subscriber, in authorized_topics, and what a
-# grant of the system category discloses is documented at model.EventCategorySystem.
+# both are gone. The distinction that matters is expressed positively instead, by
+# SUBSCRIBER_GRANTABLE_CATEGORIES below: it is the default grant set, 'system' is outside it, and
+# a deployment that has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS may still grant that
+# topic per subscriber through authorized_topics. What such a grant discloses is documented at
+# model.EventCategorySystem.
 
 # The categories a SUBSCRIBER may be granted, in that same canonical order: this is
 # model.SubscriberGrantableEventCategories written in shell, and
@@ -914,33 +913,36 @@ readonly EVENT_CATEGORIES=(transactions balances identities system)
 #
 # What a grant of each category carries, so the per-subscriber decision is made with the facts:
 #
+#   ledgers  carries ledger.created: a ledger's name, id, creation instant and the caller's own
+#            metadata. Ordinary tenant data, granted like any other tenant category.
 #   system   carries system.error, whose payload is the FROZEN legacy body, so it carries
 #            Blnk's own error text verbatim - a driver message naming schema, table and
 #            column, a broker error naming internal addresses. It is also the catalogue's
-#            CATCH-ALL, where an event type no mapping recognises is routed. It carries
-#            ledger.created too, which is why the category is grantable at all: withholding it
-#            would make that event unreachable. Grant it to the subscribers that need ledger
-#            events and to no others.
+#            CATCH-ALL, where an event type no mapping recognises is routed. It is NOT in this
+#            default list: a subscriber holds it only where the deployment has declared
+#            KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and its authorized_topics names it.
 #   *.dlt    holds events that already failed, together with failure metadata naming broker
 #            addresses and internal error reasons. Granting one would hand a subscriber every
 #            OTHER subscriber's failed events. Read through GET /events/dead-letter under the
 #            master key. The dead-letter names are excluded by not being category names at
 #            all, so no entry here can ever produce one.
 #
-# THE THREE TENANT CATEGORIES ARE GRANTABLE. 'system' IS NOT, and that exclusion is a
+# THE FOUR TENANT CATEGORIES ARE GRANTABLE BY DEFAULT. 'system' IS NOT, and that exclusion is a
 # deliberate authorization decision rather than an oversight.
 #
 # <prefix>.system carries system.error, whose payload is frozen by requirement R-8 and therefore
 # renders Blnk's error text verbatim — a PostgreSQL error names schema, table, column and
 # routine; a broker error names internal addresses — and it is the catalogue's CATCH-ALL, so a
 # grant of it would also stand over every event type nobody has catalogued yet. It is an
-# OPERATOR topic, in the same class as every .dlt sibling, and no subscriber principal is given
-# an ACL over it.
+# OPERATOR topic, in the same class as every .dlt sibling, and this script grants no principal
+# an ACL over it: the sample subscriber a local walkthrough uses must not be the thing that
+# teaches that grant as a default.
 #
-# The category was grantable-but-deliberate before this, and an operator rule that one grant can
-# violate is not a boundary. The cost is recorded rather than hidden: ledger.created shares that
-# topic, so it has no subscriber Kafka route — it is still created, published, observable and
-# replayable, and an operator reads it. See model.SubscriberGrantableEventCategories and
+# It is reachable, and only deliberately: a deployment that sets
+# KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS may name the topic in a subscriber's authorized_topics
+# through POST/PUT /subscribers, and Blnk's own provisioning path then binds the ACL and logs
+# the grant. That is a decision recorded at deployment level rather than an operator rule one
+# request can walk around. See model.SubscriberPrivilegedEventCategories and
 # docs/event-streaming.md.
 #
 # Kept as a separate list rather than derived by filtering EVENT_CATEGORIES because the
@@ -949,7 +951,7 @@ readonly EVENT_CATEGORIES=(transactions balances identities system)
 # routed to goes uncreated. model.SubscriberGrantableEventCategories states the same policy on
 # the Go side, and TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns asserts the two
 # agree name for name and in the same order.
-readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities)
+readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities ledgers)
 
 # What the SAMPLE principal is granted when KAFKA_SAMPLE_SUBSCRIBER_TOPICS is unset.
 #
@@ -962,16 +964,19 @@ readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities)
 #
 # IT IS A SUBSET OF SUBSCRIBER_GRANTABLE_CATEGORIES, and the two stay separate for the reason
 # stated above: what a subscriber MAY be granted is a policy, what the sample IS granted is a
-# default. It currently equals the allowlist, because every remaining category is tenant data
-# and a local walkthrough consumer has nobody on this stack to be isolated from; the one
-# category that used to make the two differ — `system` — is no longer grantable to any
-# subscriber, so the narrowing that mattered now lives in the allowlist itself.
+# default. It currently equals the allowlist, because every category in it is tenant data and a
+# local walkthrough consumer has nobody on this stack to be isolated from; the one category that
+# makes the two differ — `system` — is outside the default allowlist, so the narrowing that
+# matters lives in the allowlist itself.
 #
 # `system` must never appear here. The allowlist check would refuse it anyway, and stating it
-# again costs one assertion and catches the edit that adds it to both lists at once.
+# again costs one assertion and catches the edit that adds it to both lists at once. A
+# deployment that really wants a subscriber reading the internal topic declares
+# KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and grants it through the subscriber API, where the
+# decision is recorded against a named subscriber rather than baked into a sample.
 #
 # Ordered as a subset of the allowlist so the two lists read against each other.
-readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=(transactions balances identities)
+readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=(transactions balances identities ledgers)
 
 # The suffix that forms a dead-letter sibling. This is the published <topic>.dlt naming
 # convention and it must equal event_topics.go's DeadLetterTopicSuffix. Blnk owns the .dlt
@@ -1070,7 +1075,7 @@ SUMMARY_GROWTH_REFUSED=()
 # layout is correct, and these say whether it was correct when the run started.
 #
 # Without them a run that silently rebuilt a lost catalogue was indistinguishable from a run
-# that found everything in place - both printed eight topics with the right partition counts
+# that found everything in place - both printed ten topics with the right partition counts
 # and nothing else. That distinction is the whole value of the output as an audit trail, and
 # it is what the daily outbox-versus-offset reconciliation in docs/kafka-operations.md needs:
 # a topic recreated between two runs has offsets that start again from zero.
@@ -1791,19 +1796,21 @@ is_grantable_topic() {
 #      granting it is a deliberate decision about one subscriber's entitlement - and a
 #      provisioning script has made no such decision. Excluding it also gives the
 #      subscriber-isolation criterion something to prove: a principal granted every category
-#      has no outside, so the isolation assertion would be vacuous. Name it explicitly in
-#      KAFKA_SAMPLE_SUBSCRIBER_TOPICS to grant it, which is also how a subscriber that needs
-#      ledger.created is set up.
+#      has no outside, so the isolation assertion would be vacuous. ledger.created needs none of
+#      this: it is on <prefix>.ledgers, a tenant topic the sample principal is granted by
+#      default.
 #   2. NO DEAD-LETTER SIBLING, and this one is not a policy but a rule the API enforces too. A
 #      subscriber consumes events; a dead-letter topic holds events Blnk failed to publish and
 #      is operator-facing, triaged and replayed through the internal events API. A principal
 #      that could read the DLTs would make the isolation assertion vacuous from the other side.
 #
-# KAFKA_SAMPLE_SUBSCRIBER_TOPICS overrides the default, and it may name any topic on the
-# allowlist - including the system topic - but nothing outside it: a dead-letter sibling, a
-# category that does not exist, or a topic outside this stack's prefix is refused, because an
-# override that could name any topic could grant a principal this stack minted something the
-# API would have rejected.
+# KAFKA_SAMPLE_SUBSCRIBER_TOPICS overrides the default, and it may name any topic on this
+# script's allowlist - the four tenant category topics - but nothing outside it: the internal
+# system topic, a dead-letter sibling, a category that does not exist, or a topic outside this
+# stack's prefix is refused, because an override that could name any topic could grant a
+# principal this stack minted something the API would have rejected. The internal topic is
+# granted through the subscriber API in a deployment that has declared
+# KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, never from here.
 resolve_subscriber_topics() {
     local entry
 
@@ -1815,16 +1822,22 @@ resolve_subscriber_topics() {
 
     while IFS= read -r entry; do
         if ! is_grantable_topic "$entry"; then
-            die "KAFKA_SAMPLE_SUBSCRIBER_TOPICS names a topic no subscriber may be granted: '${entry}'." \
+            die "KAFKA_SAMPLE_SUBSCRIBER_TOPICS names a topic this script may not grant: '${entry}'." \
                 "Grantable topics under prefix '$(trim "$KAFKA_TOPIC_PREFIX")':" \
                 "  $(join_commas "${GRANTABLE_TOPICS[@]}")" \
-                "This is the same allowlist model.SubscriberGrantableTopics enforces, so a" \
-                "grant refused here is one POST /subscribers/{id}/kafka-credentials would" \
-                "also refuse. Two kinds of name are commonly attempted and both are excluded" \
-                "on purpose:" \
+                "This is the same default allowlist model.SubscriberGrantableTopics enforces," \
+                "so a grant refused here is one POST /subscribers/{id}/kafka-credentials" \
+                "would also refuse by default. Three kinds of name are commonly attempted and" \
+                "all three are excluded on purpose:" \
                 "  - any '${DEAD_LETTER_SUFFIX}' sibling, which is operator-facing and is triaged and" \
-                "    replayed through the internal events API rather than consumed;" \
-                "  - any name that is not one of the four category topics above, including a" \
+                "    replayed through the internal events API rather than consumed. No" \
+                "    subscriber may be granted one, from here or from the API;" \
+                "  - the internal category topic$( ((${#INTERNAL_TOPICS[@]} > 0)) && printf ' %s' "$(join_commas "${INTERNAL_TOPICS[@]}")"), which carries operator diagnostics." \
+                "    A subscriber CAN be granted it, but only through the subscriber API on a" \
+                "    deployment that has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true," \
+                "    because that grant is a deliberate entitlement decision and a bring-up" \
+                "    script has made no such decision;" \
+                "  - any name that is not one of the category topics above, including a" \
                 "    category this deployment does not have." \
                 "Fix: list a subset of the grantable topics above, or unset the variable to" \
                 "take the sample default: $(join_commas "${SAMPLE_DEFAULT_TOPICS[@]}")."
@@ -1845,13 +1858,16 @@ resolve_subscriber_topics() {
         fi
 
         die "KAFKA_SAMPLE_SUBSCRIBER_TOPICS names '${entry}', which is not a grantable topic." \
-            "Only Blnk-owned category topics may be granted, and the comparison is exact - a" \
-            "wildcard, a dead-letter topic, a broker-internal topic or a differently-cased or" \
-            "whitespace-padded name is refused here for the same reason event_topics.go's" \
-            "IsSubscriberGrantableTopic refuses it." \
+            "Only Blnk-owned tenant category topics may be granted from here, and the" \
+            "comparison is exact - a wildcard, a dead-letter topic, an internal category" \
+            "topic, a broker-internal topic or a differently-cased or whitespace-padded name" \
+            "is refused here for the same reason event_topics.go's IsSubscriberGrantableTopic" \
+            "refuses it." \
             "Grantable (${#GRANTABLE_TOPICS[@]}): $(join_commas "${GRANTABLE_TOPICS[@]}")" \
             "Refused because it is a dead-letter sibling, if it looked familiar:" \
-            "$(join_commas "${DEAD_LETTER_TOPICS[@]}")"
+            "$(join_commas "${DEAD_LETTER_TOPICS[@]}")" \
+            "Refused because it is internal, if it looked familiar:" \
+            "$(join_commas "${INTERNAL_TOPICS[@]}")"
     done
 }
 
@@ -5360,15 +5376,17 @@ print_summary() {
             printf '%s\n' "                       own internals, triaged through the events API"
             if ((${#INTERNAL_TOPICS[@]} > 0)); then
                 printf '%s\n' "  created, never       $(join_commas "${INTERNAL_TOPICS[@]}")"
-                printf '%s\n' "  granted              published to, and grantable to nobody: the system topic"
-                printf '%s\n' "                       carries system.error's verbatim error text and every"
-                printf '%s\n' "                       uncatalogued event type. ledger.created shares it and is"
-                printf '%s\n' "                       therefore operator-only over Kafka"
+                printf '%s\n' "  granted              published to, and granted by this script to nobody: the"
+                printf '%s\n' "                       system topic carries system.error's verbatim error text and"
+                printf '%s\n' "                       every uncatalogued event type. Grant it through the"
+                printf '%s\n' "                       subscriber API where KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS"
+                printf '%s\n' "                       is declared"
             fi
             # WITHHELD IS COMPUTED, not written out, so this line describes the grant that was
             # actually made and keeps describing it if the default set changes. It reports only
             # GRANTABLE topics the sample did not receive; the internal topic is reported above,
-            # because it is withheld from every subscriber rather than from this one.
+            # because this script withholds it from every principal it creates rather than from
+            # this one in particular.
             if ((${#withheld_topics[@]} > 0)); then
                 printf '%s\n' "  grantable, withheld  $(join_commas "${withheld_topics[@]}")"
                 printf '%s\n' "                       on the allowlist and not in this run's grant - name"

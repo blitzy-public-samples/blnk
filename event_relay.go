@@ -874,24 +874,54 @@ func (p *EventRelayProcessor) startupObstacle() error {
 // spawning a second loop, and stopCh is RE-CREATED here, which is what makes Start after
 // Stop work rather than returning immediately on a closed channel.
 //
-// It refuses to start when it could not publish — see startupObstacle — logging the reason;
-// IsRunning then stays false and Stop remains safe, so an unconditional call site is correct.
+// It refuses to start when it could not publish — see startupObstacle — and the obstacle is
+// BOTH logged and RETURNED. IsRunning then stays false and Stop remains safe, so an
+// unconditional call site is still correct.
+//
+// # Why the obstacle is returned and not only logged
+//
+// It used to be logged and discarded, and the return type was void, so no caller could see
+// the refusal. That made the worst configuration in the matrix indistinguishable from a
+// healthy one: with KAFKA_BROKERS set and the dual-delivery window not yet open, every
+// producer captured its outbox row, the relay refused, and NEITHER transport delivered —
+// no Kafka publish because the relay was not running, and no legacy webhook because the
+// relay is the only thing that enqueues one during the window. The process reported itself
+// healthy, served traffic, and accumulated undeliverable rows behind one ERROR line at boot
+// that nothing acted on. Nor could it recover on its own: the refusal is evaluated once, so
+// the relay stayed stopped for the lifetime of the process even after the window opened.
+//
+// Every obstacle is a configuration or construction fault rather than a transient one — a
+// missing dependency, the no-op publisher, or a window that has not opened or cannot be
+// read — so returning it lets the caller that owns the process lifecycle refuse to serve.
+// cmd/server.go does exactly that, before the listener binds. Transient conditions are
+// deliberately NOT in this set: a broker that is not listening yet is handled by topic
+// assurance being stepped past and by the catalogue gate holding claims back, so a slow
+// broker still recovers without a restart.
 //
 // Parameters:
 //   - ctx context.Context: when cancelled, processing stops; rows already claimed keep their
 //     lease and become claimable again when it expires.
-func (p *EventRelayProcessor) Start(ctx context.Context) {
+//
+// Returns:
+//   - error: the startup obstacle, already logged, or nil when the relay is running. A
+//     second Start while already running returns nil, because the relay IS running and the
+//     caller's requirement — that it be draining — is satisfied.
+func (p *EventRelayProcessor) Start(ctx context.Context) error {
 	if err := p.startupObstacle(); err != nil {
 		withLoggableCause(nil, err).Error("Event outbox relay not started")
 
-		return
+		return err
 	}
 
 	p.mu.Lock()
 	if p.running {
 		p.mu.Unlock()
 
-		return
+		// NIL, not an error. Idempotency is the contract: the caller asked for a draining
+		// relay and there is one. Returning an error here would make a harmless double call
+		// look like the refusal that CR-2 exists to surface, and cmd/server.go would refuse
+		// to serve over it.
+		return nil
 	}
 	p.running = true
 	p.stopCh = make(chan struct{})
@@ -921,6 +951,8 @@ func (p *EventRelayProcessor) Start(ctx context.Context) {
 		"base_backoff":  p.retry.baseBackoff.String(),
 		"max_backoff":   p.retry.maxBackoff.String(),
 	}).Info("Event outbox relay started")
+
+	return nil
 }
 
 // Stop gracefully stops the relay.

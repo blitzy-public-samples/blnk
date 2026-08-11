@@ -94,7 +94,8 @@ const zeroLossEvents = 6
 // zeroLossBudget bounds the live statistics projection.
 //
 // Generous rather than tight: it covers six publishes, two full-inventory offset reads across
-// eight topics and two audits against a real database, and a timeout that fires part-way through
+// the whole topic inventory and two audits against a real database, and a timeout that fires
+// part-way through
 // would report as a reconciliation failure rather than as the slow broker it is.
 const zeroLossBudget = 90 * time.Second
 

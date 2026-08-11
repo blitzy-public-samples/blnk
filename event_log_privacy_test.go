@@ -864,10 +864,13 @@ func TestListSubscribersAwaitingRevocation_IsTheAlertsFirstStep(t *testing.T) {
 // boolean must appear even when false — an omitted false makes "settled" and "this version does
 // not report it" the same wire state.
 func TestSubscriberResponse_PublishesTheRevocationMarkerTheAlertTellsRespondersToRead(t *testing.T) {
+	// The deployment state is irrelevant to what this test asserts — the revocation marker is a
+	// row fact — so the fail-closed zero value is passed rather than a fixture that would imply
+	// the assertions depend on it.
 	settled := apimodel.NewSubscriberResponse(model.EventSubscriber{
 		SubscriberID: "sub_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
 		Name:         "ledger-ops",
-	})
+	}, model.SubscriberAccessDeployment{})
 
 	body, err := json.Marshal(settled)
 	require.NoError(t, err)
@@ -888,7 +891,7 @@ func TestSubscriberResponse_PublishesTheRevocationMarkerTheAlertTellsRespondersT
 		Name:                "ledger-ops",
 		KafkaPrincipal:      "blnk-sub-sub_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
 		RevocationPendingAt: &pendingSince,
-	})
+	}, model.SubscriberAccessDeployment{})
 
 	assert.True(t, outstanding.RevocationPending)
 	require.NotNil(t, outstanding.RevocationPendingAt)

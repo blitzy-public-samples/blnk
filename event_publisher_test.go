@@ -638,7 +638,7 @@ func TestWriterFor_ADeclaredHistoricalPrefixIsExactRatherThanAPattern(t *testing
 		// The declared prefix as a SEGMENT rather than the whole namespace.
 		"acme.blnk.transactions",
 		// The declared namespace with an unknown category.
-		"blnk.ledgers",
+		"blnk.ledger",
 		// A dead-letter topic's dead-letter topic.
 		"blnk.transactions.dlt.dlt",
 	} {
@@ -2166,7 +2166,7 @@ func TestEventPublisher_MandatedSignatureIsPinnedByReflection(t *testing.T) {
 //
 // The inventory is taken from AllTopicsWithDeadLetters rather than hardcoded, so this test and
 // event_topics.go work from ONE list and a new category cannot leave a topic without a writer.
-// The eight names — four category topics and their four `.dlt` siblings — are then required
+// The ten names — five category topics and their five `.dlt` siblings — are then required
 // individually, because deriving the whole expectation from the implementation would let a
 // silently-dropped category pass.
 func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
@@ -2187,8 +2187,8 @@ func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
 	// names. Written out as literals so a renamed topic or a dropped dead-letter sibling
 	// fails here.
 	for _, topic := range []string{
-		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
-		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
+		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system",
+		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.ledgers.dlt", "blnk.system.dlt",
 	} {
 		writer, present := writers[topic]
 		require.True(t, present, "topic %q must have its own writer", topic)

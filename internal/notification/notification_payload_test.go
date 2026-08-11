@@ -138,9 +138,11 @@ func TestSystemErrorPayload_IsTheFrozenLegacyContract(t *testing.T) {
 // It asserts the OPPOSITE of what those tests asserted, and deliberately: the error text IS
 // the contract, so it reaches the payload intact however awkward its content. The concern the
 // hostile fixtures encode is real and is addressed by the ACL model — system.error routes to
-// the internal blnk.system category, which model.SubscriberGrantableTopics excludes, so no
-// subscriber can be granted it at all — and by keeping the raw text off the structured log
-// lines. It is NOT addressed by silently reshaping a published payload.
+// the internal blnk.system category, which model.SubscriberGrantableTopics excludes, so a
+// subscriber is granted it only where a deployment has declared
+// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and that subscriber's grant names the topic — and by
+// keeping the raw text off the structured log lines. It is NOT addressed by silently reshaping
+// a published payload.
 func TestSystemErrorPayload_CarriesEveryErrorTextVerbatim(t *testing.T) {
 	for name, hostile := range hostileErrors() {
 		t.Run(name, func(t *testing.T) {

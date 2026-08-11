@@ -41,15 +41,17 @@ import (
 //
 // # The access model, stated once
 //
-// THERE ARE NO PER-TENANT TOPICS. Blnk owns four category topics and a `.dlt` sibling for each
-// (event_topics.go). THREE of those categories — transactions, balances and identities — may be
-// granted to a subscriber. `<prefix>.system` may NOT, and no dead-letter topic may ever be,
-// whatever its category: the system topic carries system.error's frozen body, which renders
-// verbatim internal error text, and it is the catalogue's catch-all, so it is an operator
-// surface rather than a subscriber one. That decision lives in
-// model.SubscriberGrantableEventCategories and is enforced identically by the request DTO, the
-// persistence boundary and the ACL provisioner. A subscriber is granted a SUBSET of the
-// grantable set, whatever its registry row authorises, and isolation comes from four things:
+// THERE ARE NO PER-TENANT TOPICS. Blnk owns five category topics and a `.dlt` sibling for each
+// (event_topics.go). FOUR of those categories — transactions, balances, identities and
+// ledgers — may be granted to any subscriber. `<prefix>.system` may be granted ONLY where the
+// deployment has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, and no dead-letter topic may
+// ever be granted, whatever its category: the system topic carries system.error's frozen body,
+// which renders verbatim internal error text, and it is the catalogue's catch-all, so it is an
+// operator surface that a tenant reads only when somebody has decided it may. That decision
+// lives in model.SubscriberGrantableEventCategories and
+// model.SubscriberPrivilegedEventCategories, and is enforced identically by the request DTO,
+// the persistence boundary and the ACL provisioner. A subscriber is granted a SUBSET of the
+// resolved set, whatever its registry row authorises, and isolation comes from four things:
 //
 //  1. The KAFKA PRINCIPAL. Each subscriber is a distinct SASL/SCRAM identity derived
 //     from its immutable subscriber id, so one subscriber's credential can never
@@ -136,17 +138,36 @@ import (
 // budget while every individual call looks healthy. The budget is therefore applied once,
 // around the whole operation, and every step inherits the remaining time.
 //
-// WHAT IT BOUNDS IS THE ATTEMPT, NOT THE WHOLE REQUEST, and the distinction is worth
-// stating because the requirement is quoted as a wall-clock promise. A successful issuance
-// completes inside it. A FAILING one may spend this budget and then a COMPENSATION budget on
-// top: compensating writes run synchronously on fresh detached contexts, precisely because an
-// expired deadline is one of the commonest reasons they are needed (CLEAN-01), and their own
-// ceilings are subscriberCleanupBudget here and kafkaCleanupBudget in event_admin.go. Trimming
-// compensation to fit inside five seconds would make it fail more often than it succeeds — the
-// broker dial timeout alone is a meaningful fraction of it — and the residue it exists to
-// remove is a live SASL credential the registry does not record. A slow error response is the
-// better failure. Callers set their own deadline accordingly, and the operator-facing bound is
-// documented in docs/kafka-operations.md rather than left to be inferred from this constant.
+// # WHAT IT BOUNDS, IN ONE SENTENCE (SLA-01)
+//
+// FORWARD PROVISIONING AND THE HTTP RESPONSE ARE BOUNDED BY THIS BUDGET. Owed cleanup may
+// continue after the answer is written, under its own bounded context, and is reported by the
+// settlement markers rather than waited for.
+//
+// That is the whole contract, and it is worth stating in one sentence because it has been stated
+// in three incompatible ways. Concretely:
+//
+//   - ONE ABSOLUTE INSTANT is fixed at the start of the operation, now + this budget, and travels
+//     as a context value so it survives the WithoutCancel a compensation needs.
+//   - THE FORWARD PATH — the row read, up to four broker round trips, the issuance record — runs
+//     on a real deadline of that instant MINUS subscriberCompensationReserve, which is why a
+//     failure still has time to compensate in. An expiry there is answered, never waited out; see
+//     classifyIssuanceTimeout.
+//   - COMPENSATION AND THE PROVISIONING FENCE RELEASE are SCHEDULED OFF THE RESPONSE PATH, in one
+//     task, compensation first. They are detached from the caller's cancellation and bounded by
+//     the earlier of the absolute instant and subscriberCleanupBudget — see
+//     subscriberCleanupContext — so they cannot extend what a caller waits for and cannot run
+//     unbounded either. With no scheduler installed, which is a CLI or a test, schedule runs them
+//     inline and the ordering is exactly what it was.
+//
+// So a caller waits at most this budget on every path, success or failure. What it does NOT get
+// is a promise that everything the attempt owed is finished by then: a compensation still in
+// flight reports compensation_pending in the error detail, and one that could not finish leaves a
+// durable settlement marker — credential_orphaned_at, credential_cleanup_pending_at,
+// grant_reconcile_pending_at — which the subscriber projection publishes and the runbook in
+// docs/kafka-operations.md acts on. Trimming compensation to fit inside the response would make
+// it fail more often than it succeeds, and the residue it exists to remove is a live SASL
+// credential the registry does not record.
 const SubscriberCredentialIssuanceBudget = 5 * time.Second
 
 // subscriberCompensationReserve is how much of the issuance budget is HELD BACK so that a
@@ -804,9 +825,25 @@ func (c SubscriberCredential) KeyScope() (scope string, enforcedByBroker bool) {
 //   - enforced bool: whether config.KafkaConfig.KeyScopeGateway reported active enforcement,
 //     read once by the caller so the refusal and this value cannot disagree.
 //
+// # It reports a place only where one is actually declared
+//
+// The unenforced branch answers None rather than deferring to the row, and that is deliberate
+// even though issuance cannot reach it: requireProvisionableKeyScope has already refused a
+// key-scoped row whenever `enforced` is false, so the combination is unreachable on every path
+// that exists today. Deferring to the row there would nonetheless name broker_gateway on a
+// deployment that declared no gateway — the same fabrication the registry projection was
+// corrected for — and an unreachable wrong answer is one refactor away from being a reachable
+// one. The fail-closed answer costs nothing and cannot become a false claim.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row being issued for. May be nil, which reports
+//     none.
+//   - enforced bool: whether config.KafkaConfig.KeyScopeGateway reported active enforcement,
+//     read once by the caller so the refusal and this value cannot disagree.
+//
 // Returns:
 //   - model.KeyScopeEnforcementStatus: broker_gateway for a key-scoped subscriber under active
-//     enforcement, otherwise whatever the row itself reports.
+//     enforcement, otherwise none.
 func issuedKeyScopeEnforcement(
 	subscriber *model.EventSubscriber,
 	enforced bool,
@@ -815,7 +852,7 @@ func issuedKeyScopeEnforcement(
 		return model.KeyScopeEnforcementGateway
 	}
 
-	return subscriber.KeyScopeEnforcement()
+	return model.KeyScopeEnforcementNone
 }
 
 // LogFields is the safe projection of an issuance for structured logging.
@@ -1578,7 +1615,8 @@ func generateSubscriberPassword() (string, error) {
 // validateSubscriberGrant checks an authorised-topic list against the ALLOWLIST.
 //
 // Every entry must be an exact member of event_topics.SubscriberGrantableTopics() — the four
-// category topics under the configured prefix. The test is membership,
+// tenant category topics under the configured prefix, plus `<prefix>.system` where the
+// deployment has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS. The test is membership,
 // never a prefix match: a prefix match would accept "blnk.transactions.something-else" and,
 // with a caller-supplied prefix, very nearly anything.
 //
@@ -1600,6 +1638,23 @@ func validateSubscriberGrant(topics []string) error {
 	for _, topic := range topics {
 		if IsSubscriberGrantableTopic(topic) {
 			continue
+		}
+
+		// The privileged name gets its own message, for the reason the DTO's validator gives:
+		// "not grantable" sends an operator to read the allowlist, and the allowlist does not
+		// contain the answer when the missing piece is a deployment declaration.
+		if IsSubscriberPrivilegedTopic(topic) {
+			return apierror.NewAPIError(
+				apierror.ErrGenValidation,
+				"The internal category topic is grantable only where the deployment has acknowledged it",
+				fmt.Errorf(
+					"topic %q carries Blnk's own error text verbatim and every event type the catalogue "+
+						"does not yet recognise, so it is grantable only where "+
+						"KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS is set; the topics grantable here are %s",
+					sanitizeLogValue(topic, maxLoggedFilterLength),
+					strings.Join(SubscriberGrantableTopics(), ", "),
+				),
+			)
 		}
 
 		return apierror.NewAPIError(
@@ -1911,8 +1966,13 @@ func subscriberCredentialIssuedAt(subscriber *model.EventSubscriber) string {
 	return subscriber.CredentialIssuedAt.UTC().Format(time.RFC3339)
 }
 
-// requireProvisionableKeyScope refuses to mint a credential for a subscriber whose row records
-// a partition key prefix, because Kafka cannot enforce one.
+// requireProvisionableKeyScope refuses to mint a credential for a subscriber whose row records a
+// partition key prefix WHILE THIS DEPLOYMENT DECLARES NOTHING ABLE TO ENFORCE ONE.
+//
+// The conjunction is the contract. A recorded prefix is a legitimate, permanently supported state,
+// and under a declared key-authorising component it is provisionable — the `enforced` parameter is
+// how the caller says which deployment this is. What is refused is the combination: a boundary the
+// registry describes and nothing in the deployment keeps.
 //
 // It guards ONE of the two orders in which that state is reachable — record the prefix, then ask
 // for a credential. requireRecordableKeyScope guards the other, and both are needed: on its own
@@ -1940,11 +2000,19 @@ func subscriberCredentialIssuedAt(subscriber *model.EventSubscriber) string {
 // boundary, so disclosure changed what Blnk said and nothing about what the principal could
 // read.
 //
-// So issuance fails closed, and says exactly what to do about it. Both remedies are real:
-// clearing the prefix accepts whole-topic access explicitly, which is a decision somebody has
-// now made rather than one the system made silently; narrowing authorized_topics is the
-// enforceable form of the same intent whenever the ledgers in question map onto topics, and the
-// broker really does keep it.
+// So issuance fails closed, and says exactly what to do about it. ALL THREE remedies are real and
+// all three are named. Declaring an enforcing component
+// (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway, with its gateway addresses and its attestation
+// endpoint) realises the recorded intent as stated and is the exit an operator who WANTS key
+// scoping needs; clearing the prefix accepts whole-topic access explicitly, which is a decision
+// somebody has now made rather than one the system made silently; narrowing authorized_topics is
+// the enforceable form of the same intent whenever the ledgers in question map onto topics, and
+// the broker really does keep it.
+//
+// The first was MISSING from the message, and its absence changed what the refusal meant. An
+// operator was told to abandon or approximate the boundary they had recorded, with no indication
+// that the platform supports keeping it — so the only supported path to the capability was
+// invisible at exactly the moment somebody was looking for it.
 //
 // # What is NOT refused
 //
@@ -1963,9 +2031,12 @@ func subscriberCredentialIssuedAt(subscriber *model.EventSubscriber) string {
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the row about to be provisioned.
+//   - enforced bool: whether config.KafkaConfig.KeyScopeGateway reported an active, attestable
+//     enforcement point. True makes a recorded prefix provisionable rather than refused.
 //
 // Returns:
-//   - error: a typed conflict when the row records an unenforceable key scope, otherwise nil.
+//   - error: a typed conflict when the row records a key scope this deployment cannot enforce,
+//     otherwise nil.
 func requireProvisionableKeyScope(subscriber *model.EventSubscriber, enforced bool) error {
 	if subscriber == nil || !subscriber.DeclaresKeyScope() || enforced {
 		return nil
@@ -1977,15 +2048,19 @@ func requireProvisionableKeyScope(subscriber *model.EventSubscriber, enforced bo
 		// cannot express — see apierror.ErrSubscriberKeyScopeUnenforced, whose documentation
 		// describes exactly this refusal and both of the orders it is reachable from.
 		apierror.ErrSubscriberKeyScopeUnenforced,
-		"This subscriber records a partition key prefix, which Kafka cannot enforce, so no "+
-			"credential will be issued for it: the credential would read every record on every "+
-			"authorized topic, including other ledgers' and other subscribers'. Clear the "+
-			"partition key prefix to accept access to whole topics, or narrow the subscriber's "+
-			"authorized topics, which the broker does enforce",
+		"This subscriber records a partition key prefix and this deployment declares no component "+
+			"that can enforce one, so no credential will be issued for it: Kafka's authorizer has "+
+			"no message-key dimension, so the credential would read every record on every "+
+			"authorized topic, including other ledgers' and other subscribers'. Declare a "+
+			"key-authorising component by setting KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with "+
+			"its gateway addresses and attestation endpoint, or clear the partition key prefix to "+
+			"accept access to whole topics, or narrow the subscriber's authorized topics, which "+
+			"the broker does enforce",
 		fmt.Errorf(
-			"event subscriber: subscriber %q records a partition key prefix; Kafka's authorizer has "+
-				"no message-key dimension, so any credential issued would grant every record on every "+
-				"authorised topic and the registry would describe a narrower boundary than exists",
+			"event subscriber: subscriber %q records a partition key prefix and no key-scope "+
+				"enforcement component is declared; Kafka's authorizer has no message-key dimension, "+
+				"so any credential issued would grant every record on every authorised topic and the "+
+				"registry would describe a narrower boundary than exists",
 			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
 		),
 	)
@@ -4096,6 +4171,66 @@ func (s *EventSubscriberService) keyScopeEnforcement() (gateway []string, enforc
 	return cnf.Kafka.KeyScopeGateway()
 }
 
+// SubscriberAccessDeployment resolves the three configuration facts that decide what a
+// subscriber's access ACTUALLY is, for the projection that has to describe it.
+//
+// # Why this exists at all
+//
+// The registry projection used to derive its enforcement claims from the row alone: any
+// recorded partition_key_prefix reported the scope enforced, by broker_gateway, with gateway
+// delivery required — on a deployment that had declared no gateway and would refuse the very
+// next credential call for exactly that reason. Registration announced a verified isolation
+// boundary and issuance denied it, in two consecutive requests, and nothing in either body said
+// which was right.
+//
+// The fix is not a better guess in the projection. It is that the projection stops guessing:
+// these are the SAME three predicates IssueSubscriberCredential consults before it will mint
+// anything — keyScopeEnforcement, SubscriberFacingBrokers and the whole-topic acknowledgement —
+// so a body assembled from this answer cannot claim access the next call refuses, and
+// credential_issuance_blocked predicts the refusal instead of contradicting it.
+//
+// It is a package-level function rather than a method because it needs neither a datasource nor
+// an administrative client: it is configuration and nothing else, so making a caller construct
+// and Close an EventSubscriberService to ask a question about the environment would be a
+// connection lifecycle imposed for no reason.
+//
+// # What an unreadable configuration answers
+//
+// The zero value, which understates every capability: no enforcement point, no advertised
+// subscriber brokers, no acknowledged whole-topic access. That is the fail-closed direction for
+// an authorization claim — a response that says "issuance is blocked, here is what to set" on a
+// deployment whose configuration cannot be read is telling the truth about that deployment, and
+// every other reader on the path has already failed by then.
+//
+// Returns:
+//   - model.SubscriberAccessDeployment: the resolved deployment state, safe to project from.
+func SubscriberAccessDeployment() model.SubscriberAccessDeployment {
+	cnf, err := fetchConfiguration()
+	if err != nil || cnf == nil {
+		return model.SubscriberAccessDeployment{
+			KeyScopeEnforcement: model.KeyScopeEnforcementNone,
+		}
+	}
+
+	deployment := model.SubscriberAccessDeployment{
+		KeyScopeEnforcement: model.KeyScopeEnforcementNone,
+	}
+
+	if _, enforced := cnf.Kafka.KeyScopeGateway(); enforced {
+		deployment.KeyScopeEnforcement = model.KeyScopeEnforcementGateway
+	}
+
+	_, deployment.SubscriberBrokersAdvertised = cnf.Kafka.SubscriberFacingBrokers()
+
+	// THE COMPOSED PREDICATE, spelled exactly as requireAcknowledgedSharedTopicAccess spells it:
+	// outside secure mode nothing is asked of the operator, and in secure mode the declaration is
+	// what unblocks a whole-topic credential. Recomputing it from Server.Secure and the variable
+	// separately in the projection is how the two would come to disagree.
+	deployment.WholeTopicAccessPermitted = !cnf.Server.Secure || cnf.Kafka.SubscriberSharedTopicAccess
+
+	return deployment
+}
+
 // subscriberFacingBrokers resolves the bootstrap list to report to a subscriber, or refuses.
 //
 // # Why this is not admin.Brokers()
@@ -4512,14 +4647,24 @@ func subscriberPendingSince(subscriber *model.EventSubscriber) string {
 // IssueSubscriberCredential mints a subscriber's SASL/SCRAM credential, binds its ACLs, and
 // returns the secret to the caller.
 //
-// # The 5-second budget is enforced here, explicitly
+// # The 5-second budget is enforced here, explicitly (SLA-01)
 //
-// The whole operation runs under context.WithTimeout(ctx, SubscriberCredentialIssuanceBudget)
-// and that derived context is passed into every step, so the ceiling covers the four possible
-// broker round trips AND the database write together. The admin client's own per-request
-// timeout would not do: four ten-second timeouts serialised is forty seconds while every
-// individual call looks healthy. A caller whose own context expires sooner still wins, because
-// WithTimeout only ever shortens.
+// FORWARD PROVISIONING AND THE RESPONSE ARE BOUNDED BY SubscriberCredentialIssuanceBudget. Owed
+// cleanup may continue afterwards under its own bounded context and is reported by the settlement
+// markers rather than waited for. That single sentence is the contract; the constant's own
+// documentation gives the mechanism, and api/subscribers.go states the same thing at the HTTP
+// boundary.
+//
+// One absolute instant is fixed here and every step of the forward path runs on a deadline
+// derived from it — minus the compensation reserve — so the ceiling covers the four possible
+// broker round trips AND the database write together. The admin client's own per-request timeout
+// would not do: four ten-second timeouts serialised is forty seconds while every individual call
+// looks healthy. A caller whose own deadline is earlier still wins, because WithDeadline never
+// extends.
+//
+// Compensation and the fence release are scheduled off the response path rather than run before
+// returning; the deferred block below is where that happens and explains why the order inside it
+// is load-bearing.
 //
 // # Nothing is generated for a request that cannot succeed
 //
@@ -4638,27 +4783,25 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 			ctx, subscriberID, "claiming the subscriber for provisioning", err,
 		)
 	}
-	// THE RELEASE LEAVES THE RESPONSE PATH. It is a write the caller's answer does not depend
-	// on, so with a scheduler installed the issuance budget bounds the RESPONSE rather than the
-	// response plus its cleanup; with none — a CLI, a test — schedule runs it inline and the
-	// ordering is exactly what it was.
+
+	// THE COMPENSATION THIS ATTEMPT TURNS OUT TO OWE, AND THE CLAIM RELEASE, LEAVE THE RESPONSE
+	// PATH TOGETHER — in ONE scheduled task, compensation FIRST.
 	//
-	// Any compensation this attempt owes has already run by the time this does, because it runs
-	// inline on the failure paths below. That order is load-bearing rather than tidy: Kafka
-	// stores one SCRAM credential per principal, so a claim released before the compensation
-	// finished would let an immediate retry mint a working credential and have this attempt's
-	// cleanup delete it moments later. Holding the claim until then makes that retry a conflict
-	// instead, which is a refusal the caller can act on. The heartbeat keeps the claim alive
-	// throughout.
-	// The compensation this attempt turns out to owe, and the claim release, in ONE scheduled
-	// task — compensation FIRST. The order is load-bearing rather than tidy: Kafka stores one
-	// SCRAM credential per principal, so a claim released before the compensation finished would
-	// let an immediate retry mint a working credential and have this attempt's cleanup delete it
-	// moments later — a 200 whose password stops working, with nothing recording why. Holding the
-	// claim until the compensation is done makes that retry a conflict instead, which is a
-	// refusal the caller can act on. The fence's heartbeat keeps the claim alive throughout.
-	// Takes the compensation window as a parameter rather than closing over one resolved at the
-	// top of the request, so the compensation and the claim release SHARE the window the
+	// Neither is a write the caller's answer depends on, so with a scheduler installed the
+	// issuance budget bounds the RESPONSE rather than the response plus its cleanup; with none —
+	// a CLI, a test — schedule runs the task inline and the ordering is exactly what it was.
+	// SLA-01 is stated in one place, on SubscriberCredentialIssuanceBudget, and this is the code
+	// that makes it true.
+	//
+	// THE ORDER INSIDE THE TASK is load-bearing rather than tidy: Kafka stores one SCRAM
+	// credential per principal, so a claim released before the compensation finished would let an
+	// immediate retry mint a working credential and have this attempt's cleanup delete it moments
+	// later — a 200 whose password stops working, with nothing recording why. Holding the claim
+	// until the compensation is done makes that retry a conflict instead, which is a refusal the
+	// caller can act on. The fence's heartbeat keeps the claim alive throughout.
+	//
+	// THE COMPENSATION TAKES ITS WINDOW AS A PARAMETER rather than closing over one resolved at
+	// the top of the request, so the compensation and the claim release SHARE the window the
 	// scheduled task opens. One request, one window: nesting subscriberCleanupContext inside it
 	// clamps to the same instant rather than carving a second slice.
 	var owedCompensation func(base context.Context)

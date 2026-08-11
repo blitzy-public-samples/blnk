@@ -2707,24 +2707,55 @@ func (r SubscriberProvisioningRequest) validateKeyScope() error {
 //     together with Blnk's own failure metadata, so it has no subscriber audience. That
 //     exclusion is structural rather than listed, since SubscriberGrantableTopics composes
 //     only "<prefix>.<category>" names and a ".dlt" name can never be one.
-//   - THE INTERNAL CATEGORY TOPIC "<prefix>.system", because system.error's frozen payload
-//     renders Blnk's error text verbatim and the category is the catalogue's catch-all. The
-//     grantable set is the three tenant categories; model.SubscriberGrantableEventCategories
-//     owns that decision.
+//   - THE INTERNAL CATEGORY TOPIC "<prefix>.system", UNLESS this deployment has declared
+//     KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS. system.error's frozen payload renders Blnk's
+//     error text verbatim and the category is the catalogue's catch-all, so the default
+//     grantable set is the four tenant categories; model.SubscriberPrivilegedEventCategories
+//     owns that decision, and the refusal below names the variable rather than the allowlist
+//     when the name IS a category topic and only the acknowledgement is missing.
 //
-// IsSubscriberGrantableTopic is the single test for all three, so the API layer, this path
+// IsSubscriberGrantableTopic is the single test for all of them, so the API layer, this path
 // and the provisioning script cannot disagree about what is grantable.
+//
+// A PRIVILEGED GRANT THAT PASSES IS LOGGED, at warning level, once per provisioning. It is
+// legitimate — the deployment declared it and the subscriber asked for it — and it is also the
+// one grant in the model that hands a tenant Blnk's own operational detail, so the binding
+// that carries it should be visible in the log an operator reads afterwards rather than only
+// in the registry row.
 //
 // Returns:
 //   - error: naming the first offending topic, nil when every topic is grantable.
 func (r SubscriberProvisioningRequest) validateTopics() error {
 	for _, topic := range normalizeTopicList(r.Topics) {
 		if !IsSubscriberGrantableTopic(topic) {
+			if IsSubscriberPrivilegedTopic(topic) {
+				return fmt.Errorf(
+					"kafka admin: refusing to grant the internal category topic %q; it carries Blnk's "+
+						"own error text verbatim and every event type the catalogue does not yet "+
+						"recognise, so it is grantable only where the deployment has acknowledged that "+
+						"by setting KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS. Set it, or grant only the "+
+						"tenant category topics (%s)",
+					topic, strings.Join(SubscriberGrantableTopics(), ", "),
+				)
+			}
+
 			return fmt.Errorf(
 				"kafka admin: refusing to grant topic %q; only Blnk-owned category topics may be "+
 					"granted (%s). Dead-letter topics carry other subscribers' failed events together "+
 					"with Blnk's failure metadata and have no subscriber audience",
 				topic, strings.Join(SubscriberGrantableTopics(), ", "),
+			)
+		}
+
+		if IsSubscriberPrivilegedTopic(topic) {
+			logrus.WithFields(logrus.Fields{
+				"subscriber_id_hash": hashLogIdentifier(strings.TrimSpace(r.SubscriberID)),
+				"topic":              topic,
+			}).Warn(
+				"kafka admin: granting the internal category topic to a subscriber, which this " +
+					"deployment has acknowledged with KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS. The " +
+					"principal will read Blnk's own error text verbatim, for the whole deployment, " +
+					"plus every event type the catalogue does not yet recognise",
 			)
 		}
 	}
@@ -7124,14 +7155,17 @@ type eventStatisticsStore interface {
 	// two PRE-RECORDED INTENT censuses, and they answer the one question the per-status
 	// counts above cannot.
 	//
-	// Two event families are not captured inside the transaction that produces them, because
-	// neither event exists at that point: a monitor alert does not exist until the balance is
-	// committed, and a bulk batch's summary belongs to no single member transaction. Each
-	// therefore has an INTENT written atomically instead — a balance-monitor handoff, and a
-	// batch coordinator row — from which the event is captured later, also atomically. An
-	// outstanding intent is an event that is OWED and that no outbox row exists for yet, so a
-	// reconciliation reading only the outbox would find it consistent while alerts and batch
-	// summaries were still pending.
+	// An event captured from an INTENT written atomically with its mutation — rather than as an
+	// outbox row inside it — is OWED while that intent is outstanding, and no outbox row exists
+	// for it yet. A reconciliation reading only the outbox would find it consistent while those
+	// events were still pending.
+	//
+	// There are two such intents. A batch coordinator row is the ordinary route for every bulk
+	// summary, because a summary belongs to no single member transaction. A balance-monitor
+	// handoff is not: the atomic writers insert a monitor alert's canonical row inside the
+	// mutation's own transaction, so the handoff census describes a finite, draining population
+	// — rows written before that capture existed, and rows written by a process with no alert
+	// capture registered.
 	//
 	// They are on this seam rather than left to a separate endpoint because they are part of
 	// the same answer, and the statistics response declares a field for them.

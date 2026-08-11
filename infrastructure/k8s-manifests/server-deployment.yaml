@@ -453,6 +453,19 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS
+            # THE DEPLOYMENT'S DECLARATION ABOUT THE INTERNAL CATEGORY TOPIC.
+            # "true" acknowledges that a subscriber granted blnk.system reads
+            # Blnk's own error text verbatim, for the whole cluster, plus every
+            # event type the catalogue does not yet recognise. It decides only
+            # whether that name may appear in a grant; publishing is unaffected.
+            # Projected to the SERVER only, like the keys above: validating a
+            # grant and binding its ACLs are subscriber-management operations,
+            # and the worker serves none of them.
+            - name: KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS
             - name: KAFKA_TOPIC_PREFIX
               valueFrom:
                 configMapKeyRef:
@@ -488,70 +501,35 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_SASL_USER
-            # The upgrade-window escape hatch that lets this pod keep publishing
-            # as
-            # the ADMINISTRATIVE principal while its own producer principal is
-            # being
-            # provisioned. It ships "false" in blnk-config.yaml and belongs at
-            # "false"; every publisher built on it logs a security warning.
+            # ONE RULE FOR THE TWO ROLES, and every Kafka entry on both Deployments
+            # follows it: THE SERVER PUBLISHES AND ADMINISTERS; THE WORKER CAPTURES
+            # OUTBOX ROWS AND HOLDS NO KAFKA CREDENTIAL AT ALL.
             #
-            # IT IS PROJECTED BECAUSE THE REFUSAL IT RELEASES IS FATAL IN THIS
-            # ROLE.
-            # With brokers and the administrative pair set but KAFKA_SASL_USER
-            # still
-            # empty, the publisher refuses to authenticate as the administrator
-            # and
-            # NewBlnk fails, so the container exits and this Deployment enters
-            # CrashLoopBackOff. That refusal names KAFKA_ALLOW_ADMIN_PRODUCER as
-            # the
-            # deliberate way out, and an operator who sets it in the ConfigMap
-            # can
-            # only be obeyed if the variable actually reaches this process — so
-            # omitting this entry would leave the ConfigMap key inert and the
-            # documented remedy unreachable from inside a crash-looping pod.
+            # The server publishes because the only two producers in Blnk — the event
+            # relay and the dead-letter writer — run in this role, started by
+            # cmd/server.go. It administers because the topic assurance at start-up and
+            # POST /subscribers/{id}/kafka-credentials both go through the Kafka admin
+            # client. So this pod is given the producer pair (KAFKA_SASL_USER plus the
+            # producer secret) and the administrative pair, and worker-deployment.yaml
+            # is given neither.
             #
-            # worker-deployment.yaml does not project it, which is correct
-            # rather
-            # than inconsistent: the flag only chooses BETWEEN credentials, and
-            # the
-            # worker is given no administrative pair to fall back to, so it
-            # cannot
-            # change what the worker does.
-            # KAFKA_ALLOW_ADMIN_PRODUCER IS DELIBERATELY NOT PROJECTED (F-20).
+            # The worker publishes nothing. Its event work is a WRITE TO POSTGRESQL:
+            # every capture site funnels into Blnk.publishEvent, which inserts a
+            # blnk.event_outbox row and returns — it never touches a broker. A rejected
+            # transaction is the clearest case, since it looks like a worker-side
+            # emission and is not: handleTransactionRejection calls RejectTransaction,
+            # which prepares an outbox row and hands it to the atomic writer, and this
+            # role's relay is what later publishes it.
             #
-            # It permits the event publisher to authenticate as the
-            # ADMINISTRATIVE
-            # principal when no dedicated producer is configured. That is a
-            # supported
-            # single-process convenience and it is unusable here, because this
-            # deployment is not the only publisher: worker-deployment.yaml emits
-            # transaction.rejected from the same codebase and is deliberately
-            # given
-            # NO administrative credential, since the administrator can create
-            # topics,
-            # alter SCRAM credentials and rewrite ACLs and a worker never needs
-            # to.
-            #
-            # Projecting the flag on this side only produced a silent split. An
-            # operator who set it instead of provisioning a producer got a
-            # server that
-            # published as the administrator and a worker with nothing to fall
-            # back
-            # to — so events emitted by the worker failed or went
-            # unauthenticated,
-            # while the server's own metrics showed publishing working normally.
-            # The
-            # two roles disagreed about who Blnk publishes as, and nothing
-            # reported
-            # it.
-            #
-            # With the flag absent from both Deployments, KAFKA_SASL_USER and
-            # the
-            # kafka-credentials producer-secret are REQUIRED for publishing in
-            # Kubernetes, and both roles authenticate identically. If they are
-            # missing, the publisher refuses to construct and says so — which is
-            # the
-            # correct failure, because the alternative is an asymmetric cluster.
+            # A STALE COMMENT USED TO SIT HERE saying the opposite twice over — that
+            # KAFKA_ALLOW_ADMIN_PRODUCER "IS DELIBERATELY NOT PROJECTED" while it is
+            # projected below, and that worker-deployment.yaml "emits
+            # transaction.rejected from the same codebase" and therefore publishes too.
+            # Both statements were left behind by an earlier design, and either one
+            # would send an operator hunting a Kafka credential the worker must not have
+            # or reasoning about a producer that does not exist there. The variable's
+            # own documentation lives at its entry further down this file, which is the
+            # only place it is described.
             - name: KAFKA_SASL_ADMIN_USER
               valueFrom:
                 configMapKeyRef:

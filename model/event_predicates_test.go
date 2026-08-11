@@ -144,6 +144,7 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
@@ -168,8 +169,7 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		// somebody created under our prefix is still not a topic we own, and treating it as ours
 		// would let a stray name reach a writer and a dead-letter composition.
 		"blnk.unknown":            "the namespace is right but there is no such category",
-		"blnk.ledgers":            "a well-formed name inside the namespace whose category does not exist: the catalogue is four categories and ledger.created routes to blnk.system, so a ledgers topic is a name this deployment does not create",
-		"blnk.quarantine":         "the catalogue is four categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
+		"blnk.quarantine":         "the catalogue is five categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
 		"blnk.transaction":        "the singular is not the category name",
 		"blnk.orders":             "a category this deployment does not have",
 		"blnk.transactions.other": "a deeper name is not a category topic",
@@ -540,8 +540,9 @@ func TestIsCanonicalUUID_AcceptsOnlyTheCanonicalForm(t *testing.T) {
 // contract from both directions: exactly what it admits, and everything of Blnk's that it does
 // not.
 //
-// The set is exactly the THREE TENANT categories the requirement names. The topic catalogue has
-// a fourth, `blnk.system`, and it is deliberately NOT in this list.
+// The set is exactly the FOUR TENANT categories — the three the requirement names plus
+// `blnk.ledgers`. The topic catalogue has a fifth, `blnk.system`, and it is deliberately NOT in
+// this list.
 //
 // TWO CLASSES OF NAME ARE WITHHELD, and both are operator surfaces read under the master key:
 //
@@ -549,17 +550,17 @@ func TestIsCanonicalUUID_AcceptsOnlyTheCanonicalForm(t *testing.T) {
 //     failure metadata — broker error text, attempt windows, internal topic names — and is
 //     triaged through the master-key-gated dead-letter API. A subscriber that wants its own
 //     dead-lettering builds its own topic under its own namespace, which is what the published
-//     `<topic>.dlt` convention exists to keep clear of.
+//     `<topic>.dlt` convention exists to keep clear of. No acknowledgement makes a `.dlt` name
+//     grantable.
 //   - `blnk.system`. It carries `system.error`, whose frozen payload renders Blnk's error text
 //     verbatim, and it is the catalogue's catch-all, so a grant of it would also stand over
-//     every event type nobody has catalogued yet. Making it grantable "but only deliberately"
-//     was the previous contract, and an operator rule that one PUT can violate is not a
-//     boundary.
+//     every event type nobody has catalogued yet. It is absent from THIS list — the default one —
+//     and reachable only through SubscriberPrivilegedTopics, which takes a deployment-level
+//     acknowledgement rather than an operator rule one PUT can violate.
 //
-// The cost — `ledger.created` shares `blnk.system` and therefore has no subscriber Kafka route —
-// is recorded on EventCategorySystem, in docs/event-streaming.md and in
-// docs/webhook-to-kafka-migration.md rather than resolved by inventing a fifth category the
-// frozen topic contract does not have.
+// `ledger.created` is on `blnk.ledgers` precisely so that the ordinary tenant event no longer
+// depends on that acknowledgement: while it shared the internal topic it was either disclosed
+// alongside Blnk's error text or unreachable, and R-12 makes the second a defect.
 //
 // Grantable is not the same as granted: this list is what MAY be granted, and any given
 // subscriber holds only the subset recorded on it.
@@ -572,10 +573,12 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 	}, grantable,
-		"a subscriber may be granted exactly the three TENANT category topics; every over-grant "+
-			"finding in this area reduces to this one enumerated boundary, and blnk.system is absent "+
-			"from it because it carries system.error's verbatim body and every uncatalogued event")
+		"a subscriber may be granted exactly the four TENANT category topics by default; every "+
+			"over-grant finding in this area reduces to this one enumerated boundary, and blnk.system "+
+			"is absent from it because it carries system.error's verbatim body and every uncatalogued "+
+			"event")
 
 	for _, topic := range grantable {
 		assert.Truef(t, IsSubscriberGrantableTopicName(topic, prefix),
@@ -583,9 +586,8 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 	}
 
 	ungrantable := map[string]string{
-		"blnk.system":             "the internal category: system.error's frozen body renders Blnk's own error text, and the category is the catalogue's catch-all",
-		"blnk.ledgers":            "ledger events live in the system category, so a ledgers topic is a name this deployment neither creates nor grants",
-		"blnk.quarantine":         "not a catalogued category at all; the four-category inventory is closed, so it can be neither owned nor granted",
+		"blnk.system":             "the internal category is outside the DEFAULT grant set: system.error's frozen body renders Blnk's own error text, and the category is the catalogue's catch-all, so it takes a deployment-level acknowledgement",
+		"blnk.quarantine":         "not a catalogued category at all; the five-category inventory is closed, so it can be neither owned nor granted",
 		"blnk.transactions.dlt":   "a dead-letter topic is Blnk's own; a subscriber builds its own <topic>.dlt",
 		"blnk.balances.dlt":       "the same, for every category",
 		"blnk.identities.dlt":     "the same",

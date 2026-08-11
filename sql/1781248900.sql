@@ -279,13 +279,18 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     credential_issued_at  TIMESTAMP WITH TIME ZONE  NULL,
 
     -- ===================================================================
-    -- Group 4: dual-run migration tracking — TEMPORARY BY DESIGN
+    -- Group 4: dual-run migration tracking — ONE COLUMN TEMPORARY, ONE PERMANENT
     --
-    -- These two columns exist only for the 30-day window in which Kafka
-    -- publishing and legacy HTTP webhook delivery run side by side, and they are
-    -- the columns a post-sunset migration removes. Nothing else in this table is
-    -- temporary: if a later migration drops columns from here, it should drop
-    -- exactly these two and the index over migrated_at, and nothing more.
+    -- Both columns exist because of the 30-day window in which Kafka publishing and
+    -- legacy HTTP webhook delivery run side by side, and that shared origin is why
+    -- they were once described as a pair. They do NOT share a fate:
+    --
+    --   * webhook_url is temporary. It is a third party's endpoint and it is the
+    --     column a post-sunset migration removes.
+    --   * migrated_at is PERMANENT. It is an audit fact about Blnk — when this
+    --     subscriber's cutover completed — and nothing drops it.
+    --
+    -- Nothing else in this table is affected either way.
     --
     -- # THE RETENTION CONTRACT FOR THESE COLUMNS (RETAIN-01)
     --
@@ -299,31 +304,44 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     -- cut-off. The URL is nulled rather than the row deleted, because the
     -- subscriber is still a live subscriber; only the migration artefact expires.
     --
-    -- migrated_at is DELIBERATELY EXEMPT and is never purged. It is an audit fact
-    -- — when this subscriber's cutover completed — it is neither personal nor
-    -- third-party data, and it is what migration-progress reporting counts. That
-    -- exemption is the audit exception this table's retention policy carries; it
-    -- has no others.
+    -- migrated_at is DELIBERATELY EXEMPT, is never purged, and IS NEVER DROPPED. It
+    -- is an audit fact — when this subscriber's cutover completed — it is neither
+    -- personal nor third-party data, and it is what migration-progress reporting
+    -- counts. That exemption is the audit exception this table's retention policy
+    -- carries; it has no others.
+    --
+    -- The exemption used to be stated here and then contradicted a few lines below,
+    -- where the specified post-sunset migration dropped the column it had just
+    -- called permanent. An operator following that specification would have
+    -- destroyed the only record that the cutover happened, in the name of a cleanup
+    -- whose entire justification — that a third party's endpoint should not be
+    -- retained — does not apply to an instant Blnk recorded about itself.
     --
     -- # THE POST-SUNSET MIGRATION, SPECIFIED BUT DELIBERATELY NOT SHIPPED
     --
-    -- No migration in this repository drops these columns, and that is a decision
+    -- No migration in this repository drops webhook_url, and that is a decision
     -- rather than an omission. sql-migrate applies every pending migration
     -- unconditionally on `blnk migrate up`: a drop committed today would run on the
-    -- next deployment and remove the dual-run columns DURING the 30-day window,
-    -- ending dual delivery early and destroying the URLs the window exists to
-    -- migrate away from. The drop is a post-sunset operator action, so it is
-    -- specified here and authored then:
+    -- next deployment and remove the column DURING the 30-day window, ending dual
+    -- delivery early and destroying the URLs the window exists to migrate away
+    -- from. The drop is a post-sunset operator action, so it is specified here and
+    -- authored then:
     --
     --     -- +migrate Up
     --     DROP INDEX IF EXISTS blnk.idx_event_subscribers_migrated_at;
     --     ALTER TABLE blnk.event_subscribers DROP COLUMN IF EXISTS webhook_url;
-    --     ALTER TABLE blnk.event_subscribers DROP COLUMN IF EXISTS migrated_at;
+    --
+    -- THAT IS THE WHOLE OF IT. migrated_at stays, and the drop above is the entire
+    -- cleanup: one column, plus the index that existed to answer "how far has the
+    -- cutover got?" — a question with no remaining askers once the window has
+    -- closed. Dropping the index leaves the column readable; a deployment that
+    -- later wants progress queries again can rebuild it in one statement, which is
+    -- not true of a column whose values have been discarded.
     --
     -- Run it only after WEBHOOK_DEPRECATION_SUNSET_DATE has passed AND after the
-    -- migration report shows every subscriber migrated, because dropping
-    -- migrated_at destroys the evidence that it did. Nothing else in this table is
-    -- affected.
+    -- migration report shows every subscriber migrated, because a URL still needed
+    -- by an unmigrated subscriber is a subscriber that cannot be moved. Nothing
+    -- else in this table is affected.
     --
     -- They exist because the requirement to migrate existing subscribers off the
     -- webhook subscription REST API meets a repository in which no such API
@@ -622,7 +640,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS event_subscribers_kafka_principal_uidx
 -- Unique would be wrong outright: any number of subscribers may migrate in the
 -- same instant, and every unmigrated row holds NULL.
 --
--- This index goes at sunset, together with the two dual-run columns.
+-- THE INDEX goes at sunset; THE COLUMN does not. Once the window has closed nothing
+-- asks how far the cutover has got, so the index has no remaining reader — but
+-- migrated_at is the permanent audit record that it completed, and it is exempt from
+-- the drop for the reason Group 4's retention contract gives. An index is one
+-- statement to rebuild; discarded column values are not recoverable at all.
 CREATE INDEX IF NOT EXISTS idx_event_subscribers_migrated_at
     ON blnk.event_subscribers (migrated_at);
 

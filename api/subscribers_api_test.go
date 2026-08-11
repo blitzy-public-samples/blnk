@@ -996,7 +996,9 @@ func TestSubscriberCRUD_CarriesNoLegacyWebhookState(t *testing.T) {
 			AuthorizedTopics: []string{"blnk.transactions"},
 			WebhookURL:       &endpoint,
 			MigratedAt:       &migrated,
-		}))
+			// The deployment state does not affect what this asserts — the legacy endpoint is a
+			// row fact — so the fail-closed zero value is passed.
+		}, coremodel.SubscriberAccessDeployment{}))
 		require.NoError(t, err)
 
 		assert.NotContains(t, string(body), "webhook_url",
@@ -1036,6 +1038,73 @@ func subscribersRouter(t *testing.T, isMaster bool) *gin.Engine {
 	t.Helper()
 
 	return eventsRouter(t, isMaster)
+}
+
+// subscribersRouterUnderDeclaredKeyScope is subscribersRouter over a deployment that DECLARES a
+// key-authorising component, with the same real datasource.
+//
+// It exists because the registry projection is now truthful about deployment state, so the two
+// halves of the key-scope contract cannot be asserted against one router: the same registration
+// must report the scope requested-and-blocked where nothing is declared, and enforced-and-
+// provisionable where something is. eventsRouter installs no Kafka block at all, which is the
+// first of those deployments; this is the second.
+//
+// The declaration is complete rather than partial — mode, a distinct gateway address list, and an
+// attestation endpoint — because config.KafkaConfig.KeyScopeGateway reports enforcement active only
+// when all three hold, and a partial declaration is deliberately read as no declaration.
+// SubscriberBrokers is set too, so credential_issuance_blocked is not answered by the unadvertised-
+// brokers precondition instead of the one under test.
+//
+// The previous configuration is saved and restored: config.ConfigStore is a process-global
+// atomic.Value, so a gateway installed here would otherwise be read by every later test in the
+// package — including the ones asserting the shipped default.
+func subscribersRouterUnderDeclaredKeyScope(t *testing.T) *gin.Engine {
+	t.Helper()
+
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+
+			return
+		}
+
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
+	router := eventsRouter(t, true)
+
+	cnf, err := config.Fetch()
+	require.NoError(t, err)
+
+	endpoint, token := startKeyScopeGatewayStub(t)
+
+	updated := *cnf
+	// REQUIRED ONCE BROKERS ARE SET. config.MockConfig refuses a Kafka deployment with no usable
+	// dual-delivery window, because the runtime reads an absent sunset date as ALREADY past.
+	updated.WebhookDeprecationSunsetDate = time.Now().Add(20 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	updated.Kafka = config.KafkaConfig{
+		Brokers:                         []string{"127.0.0.1:9092"},
+		SubscriberBrokers:               []string{"127.0.0.1:9092"},
+		TopicPrefix:                     coremodel.DefaultEventTopicPrefix,
+		MinPartitions:                   blnk.MinTopicPartitions,
+		ReplicationFactor:               1,
+		InsecureLocalDev:                true,
+		KeyScopeEnforcement:             config.KeyScopeEnforcementBrokerGateway,
+		KeyScopeGatewayBrokers:          []string{"keyscope-gateway.invalid:9095"},
+		KeyScopeGatewayAttestationURL:   endpoint,
+		KeyScopeGatewayAttestationToken: token,
+	}
+	config.MockConfig(&updated)
+
+	fetched, err := config.Fetch()
+	require.NoError(t, err)
+	_, active := fetched.Kafka.KeyScopeGateway()
+	require.True(t, active,
+		"the harness must declare an ACTIVE enforcement point, or it is asserting the shipped "+
+			"default a second time")
+
+	return router
 }
 
 // subscriberRequest performs one request against the subscriber surface.
@@ -1241,61 +1310,169 @@ func TestSubscribersAPI_CRUDThroughTheRealRouter(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_RecordsAndReturnsTheKeyScope is the F-05 contract at the HTTP boundary.
+// TestSubscribersAPI_RecordsAndReturnsTheKeyScope is the F-05 contract at the HTTP boundary, and
+// after MAJ-1 it is TWO contracts because the same row means two different things in two
+// deployments.
 //
-// A subscriber registered WITH a key scope must be accepted, and every response about it must
-// carry the scope beside the component that enforces it. The adjacency is the property: the scope
-// alone reads as a limit the credential itself carries, and it is not — the credential is refused
-// record access at the broker, and the records must arrive through the key-authorising component
-// the deployment declared, which is what applies the prefix. Registration accepts the intent
-// whether or not such a component is declared; ISSUANCE is where the absence of one is refused.
+// A subscriber registered with a key scope must be accepted either way — recording an intent is
+// always legitimate — and every response about it must carry the scope beside a TRUTHFUL statement
+// of what keeps it. That second half is what this test previously got wrong, and it got it wrong in
+// the direction that matters: it asserted `partition_key_prefix_enforced: true` and
+// `partition_key_prefix_enforced_by: "broker_gateway"` on a harness that declared NO gateway, and
+// the very next test in this file asserts that credential issuance refuses exactly that row for
+// exactly that missing component. Two consecutive tests pinned two contradictory contracts, and the
+// registry was telling operators and clients that a verified isolation boundary existed when none
+// did.
+//
+// So the assertions are split by deployment, and `partition_key_scope_state` is the field that
+// names which one a reader is looking at.
 func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
-	router := subscribersRouter(t, true)
-	subscriberID := uniqueSubscriberID()
-	topic := grantableTopic(t)
-	keyScope := "ldg_" + subscriberID
+	// THE SHIPPED DEFAULT: brokers configured, no key-authorising component declared. The
+	// registration must be accepted and every enforcement claim must be withheld.
+	t.Run("with nothing declared the scope is recorded, not enforced", func(t *testing.T) {
+		// DELIBERATELY NO key-scope gateway: eventsRouter installs no Kafka block, which is the
+		// shipped default resolved the way SubscriberAccessDeployment resolves it.
+		router := subscribersRouter(t, true)
 
-	t.Cleanup(func() { deleteSubscriber(t, router, subscriberID) })
+		subscriberID := uniqueSubscriberID()
+		topic := grantableTopic(t)
+		keyScope := "ldg_" + subscriberID
 
-	body := fmt.Sprintf(
-		`{"subscriber_id":%q,"name":"key scoped consumer","authorized_topics":[%q],"partition_key_prefix":%q}`,
-		subscriberID, topic, keyScope,
-	)
+		body := fmt.Sprintf(
+			`{"subscriber_id":%q,"name":"key scoped consumer","authorized_topics":[%q],"partition_key_prefix":%q}`,
+			subscriberID, topic, keyScope,
+		)
 
-	w := subscriberRequest(t, router, http.MethodPost, "/subscribers", body)
-	require.Equal(t, http.StatusCreated, w.Code,
-		"a key scope must be ACCEPTED at registration. body: %s", w.Body.String())
+		w := subscriberRequest(t, router, http.MethodPost, "/subscribers", body)
+		require.Equal(t, http.StatusCreated, w.Code,
+			"a key scope must be ACCEPTED at registration whatever the deployment declares: "+
+				"recording an intent is how an operator states one before realising it. body: %s",
+			w.Body.String())
 
-	var created map[string]interface{}
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+		var created map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
 
-	assert.Equal(t, keyScope, created["partition_key_prefix"],
-		"the recorded scope must be reported, or an operator cannot see what was stored")
+		assert.Equal(t, keyScope, created["partition_key_prefix"],
+			"the recorded scope must be reported, or an operator cannot see what was stored")
 
-	enforced, ok := created["enforced_access"].(map[string]interface{})
-	require.True(t, ok, "body: %s", w.Body.String())
-	assert.Equal(t, keyScope, enforced["partition_key_prefix"],
-		"and the scope must appear in enforced_access, which is where a consumer reads it")
-	assert.Equal(t, true, enforced["partition_key_prefix_enforced"],
-		"BESIDE the statement that it IS kept — the two cannot be read apart, and a false here "+
-			"was the declaration that a recorded boundary was the subscriber's own problem")
-	assert.Equal(t, string(coremodel.KeyScopeEnforcementGateway),
-		enforced["partition_key_prefix_enforced_by"],
-		"and the component is named, because 'enforced' without one is unverifiable")
+		enforced, ok := created["enforced_access"].(map[string]interface{})
+		require.True(t, ok, "body: %s", w.Body.String())
+		assert.Equal(t, keyScope, enforced["partition_key_prefix"],
+			"and the scope must appear in enforced_access, which is where a consumer reads it")
 
-	// THE TRANSPORT INSTRUCTION, which is the field a broken integration turns on: a client that
-	// read false here would point a consumer at a broker that refuses its fetches.
-	assert.Equal(t, true, enforced["gateway_delivery_required"])
-	assert.Equal(t, false, enforced["broker_record_access"],
-		"and its complement states why: no topic Read binding exists for a key-scoped principal")
+		assert.Equal(t, string(coremodel.SubscriberKeyScopeStateRequested),
+			enforced["partition_key_scope_state"],
+			"REQUESTED: an intent recorded on a deployment with nothing able to keep it. This is "+
+				"the state the whole correction exists to name")
+		assert.Equal(t, false, enforced["partition_key_prefix_enforced"],
+			"NOT enforced, because nothing enforces it. A true here was a false isolation "+
+				"guarantee published on every read of the resource")
+		assert.Equal(t, string(coremodel.KeyScopeEnforcementNone),
+			enforced["partition_key_prefix_enforced_by"],
+			"and no component may be named: a place name for something never deployed sends an "+
+				"operator looking for a host instead of at their configuration")
+		assert.Equal(t, false, enforced["gateway_delivery_required"],
+			"nor may a client be instructed to dial an endpoint this deployment does not have")
+		assert.Equal(t, false, enforced["broker_record_access"],
+			"and the prefix still withholds direct broker reads, so both transport fields are "+
+				"false — which is the honest description of a subscriber with no usable path yet")
 
-	// The key dimension joins the ENFORCED list for a subscriber that recorded a prefix, and
-	// nothing is left in the unenforced one.
-	dimensions, ok := enforced["enforced_by"].([]interface{})
-	require.True(t, ok)
-	assert.Contains(t, dimensions, "partition_key")
-	assert.Empty(t, enforced["not_enforced_by"],
-		"no dimension of this subscriber's access is enforced by nobody")
+		dimensions, ok := enforced["not_enforced_by"].([]interface{})
+		require.True(t, ok)
+		assert.Contains(t, dimensions, "partition_key",
+			"the key dimension belongs in the UNENFORCED list here; asserting that list is always "+
+				"empty is how the projection came to claim a boundary it did not have")
+		assert.NotContains(t, enforced["enforced_by"], "partition_key")
+
+		// AND THE PREDICTION MATCHES THE REFUSAL. The very next call would be refused with
+		// SUBSCRIBER_KEY_SCOPE_UNENFORCED — see
+		// TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway — so the row
+		// has to say so, with the remedy, rather than reporting itself provisionable.
+		require.Equal(t, true, created["credential_issuance_blocked"],
+			"the registry must predict the refusal instead of contradicting it. body: %s",
+			w.Body.String())
+		reason, ok := created["credential_issuance_blocked_reason"].(string)
+		require.True(t, ok, "body: %s", w.Body.String())
+		assert.Contains(t, reason, "KAFKA_KEY_SCOPE_ENFORCEMENT",
+			"and it must name the variable that unblocks it")
+
+		// AND ON EVERY LATER READ, not only on the registration that produced it. The credential is
+		// delivered once, so an operator auditing tenancy months later reads the row rather than the
+		// registration response — and a projection that told the truth at create time and reverted
+		// to the claim on GET would be the same defect with a longer fuse. Asserted here because all
+		// six subscriber projections funnel through one place; if GET agrees, so do list, update,
+		// the pseudonym lookup and the revocation listing.
+		read := subscriberRequest(t, router, http.MethodGet, "/subscribers/"+subscriberID, "")
+		require.Equal(t, http.StatusOK, read.Code, "body: %s", read.Body.String())
+
+		var fetched map[string]interface{}
+		require.NoError(t, json.Unmarshal(read.Body.Bytes(), &fetched))
+
+		readEnforced, ok := fetched["enforced_access"].(map[string]interface{})
+		require.True(t, ok, "body: %s", read.Body.String())
+		assert.Equal(t, string(coremodel.SubscriberKeyScopeStateRequested),
+			readEnforced["partition_key_scope_state"])
+		assert.Equal(t, false, readEnforced["partition_key_prefix_enforced"])
+		assert.Equal(t, string(coremodel.KeyScopeEnforcementNone),
+			readEnforced["partition_key_prefix_enforced_by"])
+		assert.Equal(t, true, fetched["credential_issuance_blocked"])
+
+		deleteSubscriber(t, router, subscriberID)
+	})
+
+	// AND WITH A COMPONENT DECLARED: the same registration, and now every claim above reverses.
+	// This is the deployment the enforced shape belongs to.
+	t.Run("with a component declared the scope is enforced and provisionable", func(t *testing.T) {
+		router := subscribersRouterUnderDeclaredKeyScope(t)
+
+		subscriberID := uniqueSubscriberID()
+		topic := grantableTopic(t)
+		keyScope := "ldg_" + subscriberID
+
+		body := fmt.Sprintf(
+			`{"subscriber_id":%q,"name":"key scoped consumer","authorized_topics":[%q],"partition_key_prefix":%q}`,
+			subscriberID, topic, keyScope,
+		)
+
+		w := subscriberRequest(t, router, http.MethodPost, "/subscribers", body)
+		require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+
+		var created map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+
+		enforced, ok := created["enforced_access"].(map[string]interface{})
+		require.True(t, ok, "body: %s", w.Body.String())
+		assert.Equal(t, keyScope, enforced["partition_key_prefix"])
+
+		assert.Equal(t, string(coremodel.SubscriberKeyScopeStateAvailable),
+			enforced["partition_key_scope_state"],
+			"AVAILABLE and not attested: a registry read makes no round trip to the component, so "+
+				"nothing has confirmed it is keeping THIS binding. Only a credential response can "+
+				"report attested")
+		assert.Equal(t, true, enforced["partition_key_prefix_enforced"],
+			"BESIDE the statement that it IS kept — the two cannot be read apart, and this may be "+
+				"true here because something is declared to keep it")
+		assert.Equal(t, string(coremodel.KeyScopeEnforcementGateway),
+			enforced["partition_key_prefix_enforced_by"],
+			"and the component is named, because 'enforced' without one is unverifiable")
+
+		// THE TRANSPORT INSTRUCTION, which is the field a broken integration turns on: a client
+		// that read false here would point a consumer at a broker that refuses its fetches.
+		assert.Equal(t, true, enforced["gateway_delivery_required"])
+		assert.Equal(t, false, enforced["broker_record_access"],
+			"and its complement states why: no topic Read binding exists for a key-scoped principal")
+
+		dimensions, ok := enforced["enforced_by"].([]interface{})
+		require.True(t, ok)
+		assert.Contains(t, dimensions, "partition_key")
+		assert.Empty(t, enforced["not_enforced_by"],
+			"no dimension of this subscriber's access is enforced by nobody in THIS deployment")
+
+		assert.Equal(t, false, created["credential_issuance_blocked"],
+			"and issuance is genuinely unblocked here, which is why the claim is safe to make")
+
+		deleteSubscriber(t, router, subscriberID)
+	})
 }
 
 // TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the F-1 contract
@@ -1383,8 +1560,11 @@ func TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(
 	assert.Contains(t, body, string(apierror.ErrSubscriberKeyScopeUnenforced),
 		"and the TYPED code, because a client branches on it — a bare 409 is indistinguishable from "+
 			"a concurrent re-issuance")
-	assert.Contains(t, body, "Clear the partition key prefix",
-		"the first remedy travels in the body: a refusal naming none is a dead end")
+	assert.Contains(t, body, "KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway",
+		"the remedy that KEEPS the recorded boundary travels in the body too: it was absent, so the "+
+			"only supported route to the capability was invisible at the moment somebody wanted it")
+	assert.Contains(t, body, "clear the partition key prefix",
+		"the remedy that abandons it: a refusal naming none is a dead end")
 	assert.Contains(t, body, "narrow the subscriber's authorized topics",
 		"and the enforceable alternative for an operator who wanted isolation")
 

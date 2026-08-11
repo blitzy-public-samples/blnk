@@ -3280,47 +3280,62 @@ func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T)
 	})
 }
 
-// TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed HAS BEEN REMOVED.
+// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint covers the
+// REGISTRY AND ISSUANCE path for a key-scoped subscriber against a real broker: that the credential
+// exists, that it names the declared component rather than the brokers, that criterion V-5 still
+// holds for the principal, and that a prefix may be recorded on a subscriber that already holds a
+// credential.
 //
-// It asserted the disclosure posture against a real broker: a key-scoped subscriber received a
-// credential, the credential carried the prefix labelled consumer-side, and the principal then
-// read its granted topic in full. The last of those three facts is why the first two were
-// withdrawn — the credential really does read every record on a shared category topic, so what the
-// row described and what the principal could do were different widths, and a label does not change
-// a principal's reach.
+// # What this test does NOT establish, and where that lives instead
 //
-// This test used to assert the opposite: that a subscriber recording a partition_key_prefix was
-// REFUSED a credential, that no credential existed at the broker, and that recording a prefix on
-// a provisioned subscriber was refused too. The concern behind it was real — Kafka's authorizer
-// has no message-key dimension, so a registry row carrying a prefix must never be readable as
-// "the broker confines this subscriber to those keys" — and the remedy was the wrong one.
+// It says nothing about whether the principal can FETCH RECORDS. Every broker probe here is
+// eventIsolationListOffsets, which exercises metadata and offset visibility — the Describe
+// dimension — and a Describe that succeeds is not evidence about Read. The record-access boundary
+// is TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced's subject,
+// below, where eventIsolationFetch is required to be REFUSED with TopicAuthorizationFailed.
 //
-// A subscriber that is refused a credential CONSUMES NOTHING, so an unconditional refusal was not
-// a narrower boundary but the absence of one — and it left a mandatory endpoint unable to serve a
-// state the registry is designed to hold. Nor is unconditional ISSUANCE right: the sub-tests below
-// show the broker serving the whole partition to a key-scoped principal, so a credential whose
-// response merely says the prefix is unenforced is still unrestricted access to a shared stream.
+// That separation is the correction, and the header this replaces got it wrong twice over. It
+// opened by declaring the test REMOVED while the function was still defined and running
+// immediately beneath it, and it described the assertions as proving that "the prefix grants and
+// withholds NOTHING at the broker" and that "the principal reads its granted topic in full" —
+// which was the disclosure posture, is no longer true of the shipped grant, and was never what a
+// ListOffsets call could show even when it was.
 //
-// The resolution is CONDITIONAL. Registration and update accept a prefix freely; ISSUANCE refuses
-// it unless the deployment declares a component that authorises record keys
-// (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with a distinct KAFKA_KEY_SCOPE_GATEWAY_BROKERS), and
-// under that declaration the credential names the gateway as both the endpoint to dial and the
-// enforcement point. Both halves are asserted here, against the same real registry row.
+// # The three positions this area has held
+//
+// The concern was always real: Kafka's authorizer has no message-key dimension, so a registry row
+// carrying a prefix must never be readable as "the broker confines this subscriber to those keys".
+// Two remedies failed before the current one.
+//
+// Refusing the credential unconditionally was the first. A subscriber refused a credential
+// CONSUMES NOTHING, so that was not a narrower boundary but the absence of one, and it left a
+// mandatory endpoint unable to serve a state the registry is designed to hold.
+//
+// Issuing unconditionally with the limitation DISCLOSED was the second, and it is the posture this
+// header used to describe. The credential was granted whole-topic Read and the response said the
+// prefix was the consumer's own business — every word true, and still unrestricted access to a
+// shared stream, because the party asked to filter was the party holding the credential.
+//
+// What ships is CONDITIONAL AND NARROWED. Registration and update accept a prefix freely; issuance
+// refuses it unless the deployment declares a component that authorises record keys
+// (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with a distinct KAFKA_KEY_SCOPE_GATEWAY_BROKERS and
+// an attestation endpoint); and the credential it then mints carries Describe and NO topic Read,
+// with the gateway named as both the endpoint to dial and the enforcement point.
 //
 // # What is asserted here, and why the broker is required for it
 //
 // Two claims, and only a real authorizer can settle either:
 //
-//  1. The prefix grants and withholds NOTHING at the broker. The principal reads its granted
-//     topic in full — every partition, whatever the keys on it — which is exactly why issuance
-//     refuses a key-scoped subscriber unless something in front of the broker evaluates keys.
+//  1. The credential exists, discloses its scope, and names the DECLARED COMPONENT as its
+//     endpoint. A credential declaring key-scoped isolation beside an address that bypasses the
+//     thing enforcing it is the substitution that pairing exists to prevent.
 //  2. Acceptance criterion V-5 still holds for this principal. A key-scoped subscriber is refused
 //     every topic, dead-letter topic, listing and consumer group outside its grant exactly as a
 //     subscriber with no prefix is, because the two broker-enforced dimensions are untouched by
 //     any of this. This is the assertion that would break if a future change tried to "honour"
 //     the prefix by binding a PREFIXED topic pattern, which would widen the grant to every topic
 //     sharing that prefix while appearing to narrow it.
-func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed(t *testing.T) {
+func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
 	granted, withheld := eventIsolationGrantSplit(fixture)
@@ -3372,19 +3387,30 @@ func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed(
 		assert.Equal(t, keyPrefix, *stored.PartitionKeyPrefix)
 	})
 
-	t.Run("the key scope withholds nothing at the broker", func(t *testing.T) {
-		// THE HONEST HALF. The credential reads the granted topic in FULL: both offset ends
-		// of the partition it probes are disclosed, and the broker never consults a key.
-		// This is what consumer-side enforcement means, and it is asserted rather than
-		// documented because a subscriber that assumed otherwise would build a tenancy
-		// boundary on it.
+	t.Run("the granted topic stays DESCRIBABLE, which is all this proves", func(t *testing.T) {
+		// A DESCRIBE-ONLY ASSERTION, said so in the name because the claim it used to carry was
+		// wider than the probe could support: it read "the credential reads the granted topic in
+		// FULL … the broker never consults a key", from a ListOffsets call that resolves metadata
+		// and offsets and never fetches a record. Under the shipped grant that claim is also
+		// false — a key-scoped principal holds no topic Read at all — so the subtest was passing
+		// while asserting the opposite of the boundary.
+		//
+		// What Describe surviving DOES matter for: a consumer measures its own lag from its
+		// topics' offsets, so a key-scoped subscriber that lost Describe as well would be narrowed
+		// further than its prefix asks for.
+		//
+		// THE RECORD-ACCESS PROOF IS ELSEWHERE, deliberately:
+		// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced requires
+		// eventIsolationFetch on this same topic to be REFUSED with TopicAuthorizationFailed. Two
+		// assertions, two dimensions, neither standing in for the other.
 		outcome, disclosed := eventIsolationListOffsets(ctx, principal.client, granted)
 		eventIsolationAssertAllowed(t,
-			fmt.Sprintf("reading the granted topic %q as a key-scoped principal", granted),
+			fmt.Sprintf("describing the granted topic %q as a key-scoped principal", granted),
 			outcome.any())
 		assert.NotEmpty(t, disclosed,
-			"a key-scoped credential must read its granted topic exactly as an unscoped one does; "+
-				"the prefix is not an ACL and nothing at the broker evaluates it")
+			"the granted topic must remain describable for a key-scoped subscriber exactly as for an "+
+				"unscoped one: the prefix narrows RECORD access, and a subscriber that cannot see its "+
+				"own offsets cannot measure its lag")
 	})
 
 	t.Run("V-5 still holds: everything outside the grant is refused", func(t *testing.T) {
@@ -3741,21 +3767,25 @@ func eventIsolationIsCredentialPropagating(err error) bool {
 	return errors.Is(err, kafka.SASLAuthenticationFailed)
 }
 
-// TestEventIsolation_AKeyScopedSubscriberIsRefusedAndTheKeyIsNoBoundary is the key-scope rule
-// stated as a property of the RUNNING SYSTEM, and it carries the evidence for why the rule is
-// what it is.
+// WHERE THE KEY-SCOPE COVERAGE LIVES, in four places and none of it optional. This block used to
+// stand under the names of two tests that no longer exist —
+// TestEventIsolation_AKeyScopedSubscriberIsRefusedAndTheKeyIsNoBoundary and
+// TestEventIsolation_AKeyScopedSubscribersDisclosureMatchesWhatTheBrokerEnforces — and a doc
+// comment naming absent functions sends a reader looking for coverage they cannot find and
+// concluding it is missing.
 //
-// # The two positions this area has held
-//
-// The coverage now lives in three places, none of it optional:
-//
-//   - TestEventIsolation_AKeyScopedSubscribersDisclosureMatchesWhatTheBrokerEnforces, below,
-//     which measures the broker and requires Blnk's statement about it to be true.
-//   - TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed, above, which
-//     covers the registry and issuance path.
-//   - The api/model validation tests for the value itself, and
-//     TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package, which asserts the
-//     prefix comes back beside partition_key_prefix_enforced=false.
+//   - TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced, directly
+//     below, is the RECORD-ACCESS proof: it requires the broker to REFUSE this principal's fetch
+//     with TopicAuthorizationFailed, and it covers replacing and clearing the prefix.
+//   - TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint, above,
+//     covers the registry and issuance path, the gateway endpoint substitution, criterion V-5 and
+//     the Describe dimension. It deliberately asserts nothing about record access.
+//   - TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared covers the shipped
+//     default: no component declared, no credential minted, nothing left at the broker.
+//   - TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists covers
+//     the attestation ordering, and the api/model validation tests plus
+//     TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package cover the response
+//     projection in both deployments.
 
 // TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced is C-02
 // against a REAL broker, and it is the finding's resolution stated as a property of the running
@@ -4117,8 +4147,11 @@ func TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared(t 
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, apierror.ErrSubscriberKeyScopeUnenforced, apiErr.Code,
 		"the typed refusal, so an operator tells it from a broker outage")
-	assert.Contains(t, err.Error(), "Clear the partition key prefix",
-		"naming the first remedy")
+	assert.Contains(t, err.Error(), "KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway",
+		"naming the remedy that REALISES the recorded intent, which is the one an operator wanting "+
+			"key scoping needs and the one the message used to omit entirely")
+	assert.Contains(t, err.Error(), "clear the partition key prefix",
+		"and the remedy that abandons it")
 	assert.Contains(t, err.Error(), "narrow the subscriber's authorized topics",
 		"and the enforceable alternative")
 

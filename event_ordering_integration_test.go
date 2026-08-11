@@ -1954,9 +1954,10 @@ func relayContentionStartRelay(t *testing.T, f *orderingFixture, ctx context.Con
 		cancelRelay()
 	})
 
-	relay.Start(relayCtx)
+	require.NoErrorf(t, relay.Start(relayCtx),
+		"relay %s refused to start; the returned obstacle names the missing precondition", label)
 	require.Truef(t, relay.IsRunning(),
-		"relay %s refused to start; startupObstacle logs which precondition was missing", label)
+		"relay %s reported no obstacle yet is not running", label)
 
 	return relay
 }
@@ -2286,9 +2287,10 @@ func orderingAssertDeliveryPreservesPerAggregateOrder(t *testing.T, f *orderingF
 		cancelRelay()
 	})
 
-	relay.Start(relayCtx)
+	require.NoError(t, relay.Start(relayCtx),
+		"the relay refused to start; the returned obstacle names the missing precondition")
 	require.True(t, relay.IsRunning(),
-		"the relay refused to start; startupObstacle logs which precondition was missing")
+		"the relay reported no obstacle yet is not running")
 
 	f.requireAllDispatched(ctx, t, eventIDs)
 	observed, _ := f.consumeRun(t, startOffsets, len(eventIDs))
@@ -3186,9 +3188,11 @@ func orderingAssertConcurrentRelaysPreserveOrder(
 			WithBatchSize(orderingRelayBatchSize).
 			WithLockDuration(orderingRelayLockDuration)
 
-		relay.Start(relayCtx)
+		require.NoErrorf(t, relay.Start(relayCtx),
+			"relay instance %d refused to start; the returned obstacle names the missing precondition",
+			instance)
 		require.Truef(t, relay.IsRunning(),
-			"relay instance %d refused to start; startupObstacle logs which precondition was missing",
+			"relay instance %d reported no obstacle yet is not running",
 			instance)
 
 		relays = append(relays, relay)

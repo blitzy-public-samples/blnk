@@ -582,15 +582,45 @@ func optionalSubscriberField(value string) *string {
 // is the single place the credential reference is reduced to a non-sensitive
 // fingerprint and the enforced-access declaration is assembled. No handler here
 // builds a subscriber body field by field, so none can leak the reference or
-// imply that the advisory partition-key prefix is an enforced boundary.
-func respondSubscriber(c *gin.Context, status int, subscriber *coremodel.EventSubscriber) {
+// imply that a partition-key prefix nothing keeps is an enforced boundary.
+//
+// It is a METHOD rather than a function because the projection needs the resolved
+// deployment state, which only an instance holding the service can supply — see
+// subscriberAccessDeployment.
+func (a *Api) respondSubscriber(c *gin.Context, status int, subscriber *coremodel.EventSubscriber) {
 	if subscriber == nil {
 		respondCode(c, apierror.ErrGenInternal, subscriberMissingRowMessage, nil)
 
 		return
 	}
 
-	c.JSON(status, subscriberResponse(*subscriber))
+	c.JSON(status, a.subscriberResponse(*subscriber))
+}
+
+// subscriberAccessDeployment resolves the configuration facts a subscriber body has to be
+// truthful about, once per response.
+//
+// # Why it is asked here and not in api/model
+//
+// The three facts are whether this deployment can enforce a partition-key scope, whether it
+// advertises subscriber-facing brokers, and whether whole-topic subscriber access has been
+// declared. All three are configuration, and api/model cannot read configuration: the root
+// package that owns these predicates imports api/model in its own tests, so the reverse edge
+// would close a cycle. It is asked HERE, where the root package is already a dependency, and
+// answered by blnk.SubscriberAccessDeployment — the same predicates
+// IssueSubscriberCredential consults before it will mint anything.
+//
+// That shared source is the point. The projection used to derive its enforcement claims from
+// the registry row alone, so a registration announced an enforced key-scope boundary and
+// reported issuance unblocked on a deployment that declared no enforcing component, and the
+// very next call refused for exactly that reason. One read, two consumers, no disagreement.
+//
+// Returns:
+//   - coremodel.SubscriberAccessDeployment: the resolved state. Fail-closed when configuration
+//     cannot be read, so a body understates the deployment's capability rather than
+//     overstating it.
+func (a *Api) subscriberAccessDeployment() coremodel.SubscriberAccessDeployment {
+	return blnk.SubscriberAccessDeployment()
 }
 
 // subscriberResponse projects a stored row and then applies the ONE post-sunset
@@ -618,14 +648,14 @@ func respondSubscriber(c *gin.Context, status int, subscriber *coremodel.EventSu
 //
 // Returns:
 //   - model.SubscriberResponse: the body to write.
-func subscriberResponse(subscriber coremodel.EventSubscriber) model.SubscriberResponse {
+func (a *Api) subscriberResponse(subscriber coremodel.EventSubscriber) model.SubscriberResponse {
 	// NOTHING TO SUPPRESS HERE, and that is the stronger position. The registry-read shape does
 	// not carry the legacy webhook URL AT ALL — see model.NewSubscriberResponse — so a
 	// third-party endpoint cannot leak through this route either before or after the retirement
 	// instant. Blanking it post-sunset, which is what this function used to do, would have left
 	// it disclosed for the whole dual-run window. The URL is readable only from the dedicated
 	// webhook-subscription route, which the sunset guard retires outright.
-	return model.NewSubscriberResponse(subscriber)
+	return model.NewSubscriberResponse(subscriber, a.subscriberAccessDeployment())
 }
 
 // respondWebhookSubscription writes the legacy webhook-subscription read shape.
@@ -872,6 +902,28 @@ func (a *Api) subscriberTopicPrefix() string {
 	return ""
 }
 
+// subscriberInternalTopicAccess reports whether this deployment has acknowledged that a
+// subscriber may be granted the internal category topic, `<prefix>.system`.
+//
+// It is read live from the same configuration store as the prefix, for the same reason: the
+// store's contents are replaced wholesale, so a value captured when the router was assembled
+// would describe the deployment as it stood then. An unloaded configuration answers FALSE,
+// which is the fail-closed direction — a missing configuration must never be the thing that
+// makes Blnk's own error stream grantable.
+//
+// The value reaches the request DTOs as model.WithInternalTopicAccess, so the DTO validates
+// against the deployment it is running in without reading configuration itself.
+//
+// Returns:
+//   - bool: KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, or false when configuration is unavailable.
+func (a *Api) subscriberInternalTopicAccess() bool {
+	if configuration := a.blnk.Config(); configuration != nil {
+		return configuration.Kafka.SubscriberInternalTopicAccess
+	}
+
+	return false
+}
+
 // ---------------------------------------------------------------------------------------
 // Registry CRUD
 // ---------------------------------------------------------------------------------------
@@ -929,7 +981,10 @@ func (a *Api) CreateSubscriber(c *gin.Context) {
 	// respondError because a DTO refusal is a KNOWN condition: routing it through
 	// the message-pattern table would risk a validation message being classified
 	// as some unrelated domain's error.
-	if err := req.Validate(a.subscriberTopicPrefix()); err != nil {
+	if err := req.Validate(
+		a.subscriberTopicPrefix(),
+		model.WithInternalTopicAccess(a.subscriberInternalTopicAccess()),
+	); err != nil {
 		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
 
 		return
@@ -956,7 +1011,7 @@ func (a *Api) CreateSubscriber(c *gin.Context) {
 		return
 	}
 
-	respondSubscriber(c, http.StatusCreated, subscriber)
+	a.respondSubscriber(c, http.StatusCreated, subscriber)
 }
 
 // ListSubscribers serves GET /subscribers: the paged registry an operator answers
@@ -1131,7 +1186,7 @@ func (a *Api) ListSubscribers(c *gin.Context) {
 	// Allocated with make so an empty page marshals as [] rather than null.
 	items := make([]model.SubscriberResponse, 0, len(page.Subscribers))
 	for _, subscriber := range page.Subscribers {
-		items = append(items, subscriberResponse(subscriber))
+		items = append(items, a.subscriberResponse(subscriber))
 	}
 
 	// The page and the position to resume from. A caller pages by handing next_cursor back
@@ -1216,7 +1271,7 @@ func (a *Api) GetSubscriber(c *gin.Context) {
 		return
 	}
 
-	respondSubscriber(c, http.StatusOK, subscriber)
+	a.respondSubscriber(c, http.StatusOK, subscriber)
 }
 
 // UpdateSubscriber serves PUT /subscribers/:subscriber_id: it applies the mutable
@@ -1305,7 +1360,10 @@ func (a *Api) UpdateSubscriber(c *gin.Context) {
 		return
 	}
 
-	if err := req.Validate(a.subscriberTopicPrefix()); err != nil {
+	if err := req.Validate(
+		a.subscriberTopicPrefix(),
+		model.WithInternalTopicAccess(a.subscriberInternalTopicAccess()),
+	); err != nil {
 		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
 
 		return
@@ -1328,7 +1386,7 @@ func (a *Api) UpdateSubscriber(c *gin.Context) {
 		return
 	}
 
-	respondSubscriber(c, http.StatusOK, subscriber)
+	a.respondSubscriber(c, http.StatusOK, subscriber)
 }
 
 // DeleteSubscriber serves DELETE /subscribers/:subscriber_id: it deregisters a
@@ -1430,43 +1488,51 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 // a deployment that still carries the password over a plaintext hop — which is the
 // normal ingress shape unless somebody thought about it.
 //
-// # The five-second budget is enforced here, in code
+// # The five-second SLA, stated once (SLA-01)
 //
-// The service applies the same budget internally, and this handler applies it again
-// at the boundary so the guarantee holds for the HTTP request whatever a future
-// service refactor does with its own timeout. context.WithTimeout only ever
-// shortens, so the two cannot conflict and a caller whose own context expires
-// sooner still wins. blnk.SubscriberCredentialIssuanceBudget is used rather than a
-// literal duration so the endpoint's ceiling cannot drift from the operation's.
+// FORWARD PROVISIONING AND THIS HTTP RESPONSE ARE BOUNDED BY
+// blnk.SubscriberCredentialIssuanceBudget. Owed cleanup may continue after the
+// answer is written, under its own bounded context, and is reported by the
+// settlement markers rather than waited for.
 //
-// SLA-01: THE BUDGET COVERS THE COMPENSATION TOO. It once covered only the work,
-// and the compensation that follows a failure then ran on budgets of its own — a
-// ten-second broker cleanup, a five-second registry cleanup and a five-second fence
-// release — so a five-second promise could answer in roughly twenty. The service
-// now divides ONE absolute instant into three phases (work, compensation, durable
-// record), so a failed issuance still answers inside the budget AND still finishes
-// what it owes; see blnk.subscriberPhaseContext. The context this handler installs
-// is what the service adopts as that instant, since it is the sooner of the two.
+// That is the entire contract and it is the same sentence
+// blnk.SubscriberCredentialIssuanceBudget carries, deliberately: this comment
+// previously said the budget covered the compensation AND, twenty lines later, that
+// the cleanups were scheduled off the response path — two readings of one promise, in
+// one doc block, and no way for a reader to tell which described the code.
 //
-// An expiry is answered, not waited out: see respondCredentialIssuanceError. The
-// request therefore always ends within the budget and always ends with a code that
-// says whether retrying is sensible — never a hang and never a bare 500.
+// What the caller is guaranteed:
 //
-// # The budget bounds the RESPONSE, including on the failure paths (PERF-P09)
+//   - The request ends within the budget on EVERY path. The service fixes one
+//     absolute instant and this handler installs the same ceiling at the boundary, so
+//     the guarantee holds whatever a future service refactor does with its own
+//     timeout. context.WithTimeout only ever shortens, so the two cannot conflict and
+//     a caller whose own context expires sooner still wins.
+//     blnk.SubscriberCredentialIssuanceBudget is used rather than a literal duration
+//     so the endpoint's ceiling cannot drift from the operation's.
+//   - An expiry is ANSWERED, not waited out: see respondCredentialIssuanceError. So
+//     the request always ends with a code that says whether retrying is sensible —
+//     never a hang and never a bare 500.
 //
-// That guarantee used to hold for the operation and not for the request. Every
-// cleanup the operation owed — releasing the provisioning fence, revoking a
-// credential the registry could not record, clearing a record that no longer
-// described anything — ran synchronously afterwards on a fresh budget of its own,
-// so a five-second endpoint answered in ten on success and could take considerably
-// longer when it failed. Those cleanups are now scheduled off the response path by
-// the service, which is why this ceiling is now a statement about what a caller
-// waits for rather than about what the service starts.
+// What the caller is NOT guaranteed, and how it finds out:
 //
-// A failure whose broker-side compensation has been scheduled but not yet confirmed
-// reports `compensation_pending` in its detail. It means retry: the subscriber stays
-// fenced until the cleanup finishes, so an immediate retry is refused with a
-// conflict rather than racing it.
+//   - That everything a failed attempt owed is finished by the time it answers. The
+//     compensation and the provisioning-fence release are scheduled off the response
+//     path by the service, bounded by the earlier of the absolute instant and the
+//     cleanup budget — they cannot extend what the caller waits for, and they cannot
+//     run unbounded either. Before this they ran synchronously on fresh budgets of
+//     their own (a ten-second broker cleanup, a five-second registry cleanup, a
+//     five-second fence release), so a five-second endpoint could answer in roughly
+//     twenty.
+//   - A failure whose broker-side compensation has been scheduled but not yet
+//     confirmed reports `compensation_pending` in its detail. It means retry: the
+//     subscriber stays fenced until the cleanup finishes, so an immediate retry is
+//     refused with a conflict rather than racing it.
+//   - A cleanup that could NOT finish leaves a durable settlement marker on the row —
+//     credential_orphaned_at, credential_cleanup_pending_at,
+//     grant_reconcile_pending_at — which GET /subscribers publishes and the
+//     docs/kafka-operations.md runbook acts on. Nothing owed is silently dropped; it
+//     stops being the caller's wait and becomes an operator's queue.
 //
 // # The boundary the response describes, and it has TWO shapes
 //
@@ -2137,7 +2203,7 @@ func (a *Api) resolveSubscriberPseudonym(c *gin.Context, pseudonym string) {
 	}
 
 	c.JSON(http.StatusOK, completeSubscriberPage(
-		[]model.SubscriberResponse{model.NewSubscriberResponse(*subscriber)},
+		[]model.SubscriberResponse{a.subscriberResponse(*subscriber)},
 	))
 }
 
@@ -2414,7 +2480,7 @@ func (a *Api) listSubscribersAwaitingRevocation(c *gin.Context) {
 
 	items := make([]model.SubscriberResponse, 0, len(subscribers))
 	for _, subscriber := range subscribers {
-		items = append(items, model.NewSubscriberResponse(subscriber))
+		items = append(items, a.subscriberResponse(subscriber))
 	}
 
 	// THE SAME ENVELOPE as every other reading of this route. It used to be a bare array, so the

@@ -14,34 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// event_producer_atomicity.go is the repository implementation for the two
-// mechanisms that bring the last two event families under requirement R-2:
-// blnk.balance_monitor_handoff and blnk.bulk_transaction_batches.
+// event_producer_atomicity.go is the repository implementation for the last two event families
+// to be brought under requirement R-2: balance.monitor and bulk_transaction.<status>.
 //
 // Every other event type is captured inside the database transaction that performs
-// its mutation — see the three atomic writers in transaction.go. Two could not be,
-// and for two different structural reasons:
+// its mutation — see the three atomic writers in transaction.go. These two looked as though
+// they could not be, and for two different structural reasons:
 //
-//   - balance.monitor fires because a CONDITION was met on a balance a transaction
-//     has ALREADY committed. By the time the alert exists there is no open
-//     transaction to enrol it in.
+//   - balance.monitor fires because a CONDITION was met on a balance, and the original design
+//     evaluated that condition after the movement had committed. By the time the alert existed
+//     there was no open transaction to enrol it in.
 //   - bulk_transaction.<status> summarises a batch executed one transaction at a
 //     time, each under its own transaction. There is no batch-spanning transaction
 //     for the summary to join.
 //
 // Neither is solved by retrying the capture, because retrying cannot close a
-// process-crash window. Both are solved by giving the event something durable to be
-// atomic WITH:
+// process-crash window. They are solved differently from each other, and the difference matters:
 //
-//   - the handoff table records, inside the balance's own transaction, the INTENT to
-//     evaluate that balance's monitors. The evaluation's result and the handoff's
-//     transition to terminal then commit together.
-//   - the batch coordinator records, before any member transaction runs, that a batch
-//     began. Its transition to a terminal outcome and the outcome event then commit
-//     together.
+//   - balance.monitor is now DECIDED INSIDE the mutation's transaction. The writer reads the
+//     monitor definitions there, applies model.BalanceMonitor.CheckCondition, and inserts the
+//     canonical blnk.event_outbox row before the COMMIT — see recordBalanceMonitorEvaluation and
+//     captureBalanceMonitorAlertsInTx. There is no intent and no conversion.
+//   - bulk_transaction.<status> is given something durable to be atomic WITH. The batch
+//     coordinator records, before any member transaction runs, that a batch began; its
+//     transition to a terminal outcome and the outcome event then commit together.
 //
-// In both cases the pattern is the same and is worth naming: a pre-recorded intent
-// plus an atomic completion. What is left over is never a lost event — it is an
+// blnk.balance_monitor_handoff remains, and this file still implements it, for a finite
+// population: rows written by releases that predate the in-transaction capture, and rows written
+// by a process with no BalanceMonitorAlertCapture registered, which cannot build an event row at
+// all. For those the pattern is the coordinator's — a pre-recorded intent carrying both decision
+// inputs, plus an atomic completion — so what is left over is never a lost event but an
 // unfinished intent, which is visible, countable and finishable.
 //
 // The claim query, the apierror wrapping and the status vocabulary are lifted from
@@ -200,6 +202,18 @@ func selectBalanceMonitorsInTx(
 // evaluation of every supplied balance's monitors — together with both inputs that
 // evaluation depends on.
 //
+// # THIS IS THE FALLBACK, not the ordinary path — read captureBalanceMonitorAlertsInTx first
+//
+// A writer that can build an event row inserts the CANONICAL blnk.event_outbox row for each
+// crossing in this transaction and writes no handoff at all; that is what requirement R-2 asks
+// for and what recordBalanceMonitorEvaluation does whenever a BalanceMonitorAlertCapture is
+// registered, which the service constructor always does. This function is reached when NO
+// capture is registered — a Datasource built directly, without the root service, which is what
+// the repository's own tests do — and it is what stops such a process from committing a movement
+// whose alerts would be decided later against whatever the monitors table says then.
+// BalanceMonitorHandoffProcessor converts the row, and it remains the drain for handoff rows
+// written by releases that predate the in-transaction capture.
+//
 // # This is the atomicity, and it is why the function takes a *sql.Tx
 //
 // The transaction belongs to the atomic writer that is updating these balances. Writing
@@ -208,13 +222,15 @@ func selectBalanceMonitorsInTx(
 // commit and the guarantee is gone while every happy-path test still passes, which is
 // precisely the failure the handoff exists to remove.
 //
-// # BOTH DECISION INPUTS ARE CAPTURED, and that is what R-2 requires
+// # BOTH DECISION INPUTS ARE CAPTURED, which is what makes the deferred insert safe
 //
 // selectBalanceMonitorsInTx reads the monitor definitions in this same transaction, and
 // model.PrepareBalanceMonitorHandoffs stores them beside the balance snapshot. So a
 // committed movement carries the complete decision: the balance as written, and the
 // definitions in force when it was. The evaluator is then a pure function of the row —
-// see the note on selectBalanceMonitorsInTx for the three ways a live read diverged.
+// see the note on selectBalanceMonitorsInTx for the three ways a live read diverged. What it
+// does NOT carry is the canonical event row itself, which is the one respect in which this path
+// falls short of the in-transaction capture above.
 //
 // # A row is written only for a balance that HAS a monitor
 //
@@ -355,11 +371,10 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 //     monitors before the write and hands the resulting `balance.monitor` rows to the
 //     writer, so the alert is inserted in the very transaction that moved the balance.
 //     It runs on the single-transaction path only.
-//   - the WRITER-SIDE handoff — recordBalanceMonitorHandoffs below — commits the
-//     evaluation's two INPUTS (the balance as written and the monitor definitions in force)
-//     and leaves the evaluation itself to BalanceMonitorHandoffProcessor, which drains the
-//     row and commits the alerts with the handoff's completion. It runs on every atomic
-//     writer, including the coalescing path the plan freezes.
+//   - the WRITER-SIDE capture — recordBalanceMonitorEvaluation below — reads those
+//     definitions inside the writer's own transaction, applies the same
+//     model.BalanceMonitor.CheckCondition, and inserts the canonical alert row there. It
+//     runs on every atomic writer, including the coalescing path the plan freezes.
 //
 // Both are correct in isolation. Run together on one balance they publish the SAME
 // crossing twice, under two different event ids — and a `balance.monitor` id is a fresh
@@ -369,15 +384,15 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 //
 // # Why the two compose rather than one replacing the other
 //
-// The caller-side pass gives the ALERT ROW itself the mutation's transaction, which is what
-// requirement R-2 asks for literally, and it delivers with no added latency. The writer-side
-// handoff gives that transaction the alert's DECISION instead — both inputs, frozen — and
-// reaches paths the caller cannot: the coalesced batch, whose argument list is frozen, and any
-// balance whose monitors could not be read before the write. So the two differ in when the row
-// is inserted and never in what the row says: a movement's verdict is settled by its own
-// transaction either way. Keeping both, with the handoff suppressed exactly where the caller
-// already evaluated, is strictly better than either alone: every path is covered, nothing is
-// published twice, and the hot path keeps the lower latency.
+// They insert the SAME ROW, built by the same code, in the SAME transaction; they differ only
+// in where the monitor definitions were read. The caller-side pass reads them from the monitor
+// cache before the write, so it costs no statement inside the transaction and it is the hot
+// path. The writer-side capture reads them from blnk.balance_monitors inside the transaction,
+// which is one indexed lookup, and it reaches what the caller cannot: the coalesced batch,
+// whose argument list is frozen, and any balance whose monitors could not be read before the
+// write. Keeping both, with the writer-side capture suppressed exactly where the caller already
+// evaluated, is strictly better than either alone: every path is covered, nothing is published
+// twice, and the hot path keeps the cheaper read.
 //
 // # Reading the coverage from the rows rather than from a new parameter
 //
@@ -389,7 +404,7 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 // writer is already inserting state exactly.
 //
 // A payload that will not parse yields no coverage, which is the safe direction: the
-// handoff is written, the processor evaluates, and the worst case is the duplicate this
+// writer-side capture evaluates the balance as well, and the worst case is the duplicate this
 // function exists to avoid rather than an alert nobody evaluates. It cannot happen in
 // practice — the row was produced by marshalling a BalanceMonitor — and a bookkeeping
 // read must not be the thing that refuses a money write.
@@ -473,20 +488,168 @@ func balancesAwaitingMonitorEvaluation(balances []*model.Balance, evaluated map[
 	return awaiting
 }
 
-// recordBalanceMonitorHandoffs is the gate the atomic writers call.
+// captureBalanceMonitorAlertsInTx evaluates the monitors of the supplied balances inside the
+// caller's transaction and inserts the CANONICAL balance.monitor event rows for the crossings
+// it decides.
+//
+// # This is requirement R-2 for balance.monitor, met literally
+//
+// Everything the verdict depends on is available here: the balance in its post-mutation state
+// because the writer has just updated it, and the monitor definitions because
+// selectBalanceMonitorsInTx reads them in this transaction. So the crossing is DECIDED here and
+// the blnk.event_outbox row announcing it is INSERTED here, before the commit. A committed
+// movement therefore carries its alerts, and a rolled-back one carries none, with no second
+// transaction in between.
+//
+// This is what replaced the deferred conversion. The writer used to commit a
+// balance_monitor_handoff row carrying the same two inputs and leave the evaluation and the
+// canonical insert to BalanceMonitorHandoffProcessor, so the event R-2 names did not exist until
+// that second transaction succeeded. See recordBalanceMonitorEvaluation for the one shape that
+// still takes the handoff.
+//
+// # The condition is evaluated by the frozen model method, unchanged
+//
+// model.BalanceMonitor.CheckCondition is the single evaluator in this repository and AAP §0.6.2
+// freezes monitor condition evaluation. It is called here exactly as the caller-side pass
+// (blnk.prepareBalanceMonitorEvents) and the handoff drain (BalanceMonitorHandoffProcessor) call
+// it, against the same balance value, so which alerts exist does not depend on which route
+// decided them. The row is built by the registered capture, which is the same construction all
+// three routes use, so what each alert SAYS does not depend on the route either.
+//
+// # Writing only what fired is strictly less write amplification than the handoff
+//
+// The handoff wrote one row per MONITORED balance whether or not anything fired, to be
+// evaluated and then deleted. This writes one row per CROSSING. A balance carrying ten monitors
+// that meets none of them now costs one indexed read and no write at all, where it previously
+// cost a jsonb row round trip through a second transaction.
+//
+// # Failure is fatal to the movement, deliberately
+//
+// A capture error — a payload that will not serialise, a partition key that cannot be resolved —
+// is a producer defect rather than a transient condition, and it aborts the writer. That is the
+// same answer resolveBatchEventOutboxes gives for a transaction event and the same answer the
+// caller-side pass gives, and it is the answer R-2 requires: a mutation whose event cannot be
+// captured must not commit. A nil row is NOT a failure; it is the unconfigured case, and it is
+// unreachable from here because recordBalanceMonitorEvaluation has already checked the same
+// predicate, so it is skipped rather than inserted.
+//
+// Parameters:
+//   - ctx context.Context: the writer's context.
+//   - d Datasource: the datasource whose InsertEventOutboxInTx performs the insert, passed
+//     explicitly for the same reason captureEntityEvent takes it — one exported in-transaction
+//     insert serves every producer.
+//   - tx *sql.Tx: the caller's open transaction. Required.
+//   - balances []*model.Balance: the balances this transaction is updating, POST-mutation.
+//     Nil entries and blank ids are skipped.
+//   - capture BalanceMonitorAlertCapture: the registered row builder. Must not be nil.
+//
+// Returns:
+//   - int: the number of balances that carried at least one monitor and were evaluated.
+//   - int: the number of canonical alert rows inserted.
+//   - error: the monitor read's error, the capture's error, or the insert's error. Each
+//     correctly rolls the writer back.
+func captureBalanceMonitorAlertsInTx(
+	ctx context.Context,
+	d Datasource,
+	tx *sql.Tx,
+	balances []*model.Balance,
+	capture BalanceMonitorAlertCapture,
+) (int, int, error) {
+	if len(balances) == 0 {
+		return 0, 0, nil
+	}
+
+	if tx == nil {
+		return 0, 0, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to capture balance monitor alerts",
+			errors.New("a balance monitor alert must be written inside the balance's own transaction"),
+		)
+	}
+
+	balanceIDs := make([]string, 0, len(balances))
+	for _, balance := range balances {
+		if balance == nil {
+			continue
+		}
+		if trimmed := strings.TrimSpace(balance.BalanceID); trimmed != "" {
+			balanceIDs = append(balanceIDs, trimmed)
+		}
+	}
+
+	monitors, err := selectBalanceMonitorsInTx(ctx, tx, balanceIDs)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// NOTHING MONITORED, NOTHING EVALUATED, and the read is the whole guard: this is the
+	// common case for a deployment with no monitors configured, and it costs one indexed
+	// statement rather than a row per balance.
+	if len(monitors) == 0 {
+		return 0, 0, nil
+	}
+
+	evaluatedBalances, capturedAlerts := 0, 0
+
+	for _, balance := range balances {
+		if balance == nil {
+			continue
+		}
+
+		balanceMonitors, monitored := monitors[strings.TrimSpace(balance.BalanceID)]
+		if !monitored || len(balanceMonitors) == 0 {
+			continue
+		}
+
+		evaluatedBalances++
+
+		for _, monitor := range balanceMonitors {
+			if !monitor.CheckCondition(balance) {
+				continue
+			}
+
+			row, captureErr := capture(ctx, balance, monitor)
+			if captureErr != nil {
+				return evaluatedBalances, capturedAlerts, apierror.NewAPIError(
+					apierror.ErrInternalServer,
+					"Failed to capture the balance monitor alert for a moved balance",
+					fmt.Errorf("blnk: capturing the balance.monitor event for monitor %q on balance %q: %w",
+						monitor.MonitorID, balance.BalanceID, captureErr),
+				)
+			}
+
+			// Unreachable from the gate, which has already established that publishing is
+			// configured, and skipped rather than inserted so a capture that answers nil for a
+			// reason of its own cannot become a nil-pointer dereference inside a money write.
+			if row == nil {
+				continue
+			}
+
+			if err := d.InsertEventOutboxInTx(ctx, tx, row); err != nil {
+				return evaluatedBalances, capturedAlerts, err
+			}
+
+			capturedAlerts++
+		}
+	}
+
+	return evaluatedBalances, capturedAlerts, nil
+}
+
+// recordBalanceMonitorEvaluation is the gate the atomic writers call.
 //
 // It answers two questions — does this deployment capture events at all, and did the
-// caller already evaluate these monitors inside this very transaction — and writes the
-// handoffs only for what is left. The first gate is not an optimisation; it is what keeps
-// two deployment shapes correct at once:
+// caller already evaluate these monitors inside this very transaction — and evaluates only
+// what is left. The first gate is not an optimisation; it is what keeps two deployment
+// shapes correct at once:
 //
-//   - With Kafka configured, the handoff is written and the handoff processor owns the
-//     evaluation. The post-commit evaluation stands down, so the alert is captured
-//     exactly once, transactionally.
-//   - With no Kafka configured there is no relay and no handoff processor, so a handoff
-//     row would be an intent nothing can ever drain — the alert would simply never be
-//     evaluated. The gate writes nothing, and the post-commit path publishes down the
-//     legacy transport exactly as it did before this feature existed (AAP §0.5.4).
+//   - With Kafka configured, the monitors are evaluated here and the canonical alert rows are
+//     inserted in this transaction. The post-commit evaluation stands down, so the alert is
+//     captured exactly once, transactionally.
+//   - With no Kafka configured there is no relay and no outbox to drain, so a row written here
+//     would be one nothing can ever publish. The gate writes nothing, and the post-commit path
+//     publishes down the legacy transport exactly as it did before this feature existed
+//     (AAP §0.5.4).
 //
 // The predicate is config.Configuration.EventPublishingConfigured, deliberately shared
 // with the root package's eventPublishingConfigured so the writer and the post-commit
@@ -495,6 +658,18 @@ func balancesAwaitingMonitorEvaluation(balances []*model.Balance, evaluated map[
 // The SECOND gate is what keeps the two R-2 mechanisms from publishing one crossing
 // twice — see balancesAlreadyEvaluatedInTx for why both exist and how they compose.
 //
+// # The handoff is the fallback, and what it is still for
+//
+// When a balance monitor alert capture is registered — which the service constructor always
+// does — the canonical blnk.event_outbox row is inserted here and no handoff is written. With
+// NO capture registered the writer cannot build a row at all, so it falls back to committing the
+// handoff: both decision inputs, frozen inside this transaction, for
+// BalanceMonitorHandoffProcessor to convert. That reaches a Datasource constructed directly
+// without the root service, which is what the repository's own tests do, and it keeps such a
+// process from committing a movement whose alerts are decided against whatever the monitors
+// table says later. The processor also remains the drain for handoff rows written by releases
+// that predate this change, so an upgrade loses nothing that was in flight.
+//
 // A configuration read failure is NOT fatal to the ledger write. It is logged by
 // config.Fetch's own path and treated here as "not configured", which is the safe
 // direction: the post-commit path still evaluates, so the alert is delayed at worst,
@@ -502,16 +677,17 @@ func balancesAwaitingMonitorEvaluation(balances []*model.Balance, evaluated map[
 // failed.
 //
 // Parameters:
-//   - ctx context.Context: the context for the statement.
+//   - ctx context.Context: the context for the statements.
+//   - d Datasource: the datasource whose InsertEventOutboxInTx inserts the alert rows.
 //   - tx *sql.Tx: the writer's open transaction.
-//   - span trace.Span: the writer's span, annotated with the handoff count.
+//   - span trace.Span: the writer's span, annotated with what was evaluated and captured.
 //   - balances []*model.Balance: the balances this transaction is updating.
 //   - capturedEvents []*model.EventOutbox: the event rows this transaction is inserting,
 //     read for the balances whose monitors the caller already evaluated.
 //
 // Returns:
-//   - error: only a genuine statement failure, which correctly rolls the writer back.
-func recordBalanceMonitorHandoffs(ctx context.Context, tx *sql.Tx, span trace.Span, balances []*model.Balance, capturedEvents []*model.EventOutbox) error {
+//   - error: only a genuine capture or statement failure, which correctly rolls the writer back.
+func recordBalanceMonitorEvaluation(ctx context.Context, d Datasource, tx *sql.Tx, span trace.Span, balances []*model.Balance, capturedEvents []*model.EventOutbox) error {
 	cnf, err := config.Fetch()
 	if err != nil || !cnf.EventPublishingConfigured() {
 		return nil
@@ -521,11 +697,27 @@ func recordBalanceMonitorHandoffs(ctx context.Context, tx *sql.Tx, span trace.Sp
 	awaiting := balancesAwaitingMonitorEvaluation(balances, evaluated)
 	if len(awaiting) == 0 {
 		// Every moved balance was evaluated with the mutation, so there is nothing left to
-		// hand off. Recorded on the span rather than passed silently: "no handoffs" and
-		// "handoffs suppressed because the caller covered every balance" are different
-		// facts, and only one of them means the alerts are already durable.
-		span.AddEvent("Balance monitor handoffs not needed; every balance was evaluated with the mutation", trace.WithAttributes(
+		// evaluate here. Recorded on the span rather than passed silently: "nothing to do" and
+		// "suppressed because the caller covered every balance" are different facts, and only
+		// one of them means the alerts are already durable.
+		span.AddEvent("Balance monitor evaluation not needed; every balance was evaluated with the mutation", trace.WithAttributes(
 			attribute.Int("balance_monitor_handoff.balances_evaluated_by_caller", len(evaluated)),
+		))
+
+		return nil
+	}
+
+	if capture := registeredBalanceMonitorAlertCapture(); capture != nil {
+		evaluatedHere, capturedAlerts, captureErr := captureBalanceMonitorAlertsInTx(ctx, d, tx, awaiting, capture)
+		if captureErr != nil {
+			return captureErr
+		}
+
+		span.AddEvent("Balance monitor alerts captured with the mutation", trace.WithAttributes(
+			attribute.Int("balance_monitor_alert.balances", len(awaiting)),
+			attribute.Int("balance_monitor_alert.balances_monitored", evaluatedHere),
+			attribute.Int("balance_monitor_alert.alerts_captured", capturedAlerts),
+			attribute.Int("balance_monitor_alert.balances_evaluated_by_caller", len(evaluated)),
 		))
 
 		return nil

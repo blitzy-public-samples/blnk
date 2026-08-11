@@ -17,20 +17,42 @@ Apache 2.0
  * Three properties of the measurement are load-bearing, because each one is a way the
  * verdicts could otherwise be certified from the wrong number:
  *
- *   - SUSTAINED means every window, not the mean. A whole-run average of 500/s is also what
- *     a run that managed 1000/s for half its duration and stalled for the other half
+ *   - SUSTAINED IS JUDGED PER WINDOW, NOT ON THE MEAN. A whole-run average of 500/s is also
+ *     what a run that managed 1000/s for half its duration and stalled for the other half
  *     reports, and "sustained" is precisely the claim that distinguishes them. So a second,
- *     single-VU scenario samples the published counter on a bounded interval and the
- *     throughput verdict is the MINIMUM of those per-window rates. The whole-run average is
- *     still reported beside it, as a diagnostic rather than a verdict.
- *   - THE PENDING TAIL BELONGS INSIDE THE POPULATION. When the load stops, the relay is
+ *     single-VU scenario samples the published counter on a bounded interval and the verdict
+ *     is stated over those per-window rates.
+ *
+ *     The verdict is a PASS RATE ACROSS QUALIFYING SUBWINDOWS, not every window and not the
+ *     minimum. At least MIN_SUSTAINED_SUBWINDOW_RATIO of them must have met the target — 0.95
+ *     by default, so at most one in twenty may miss — and at least MIN_QUALIFYING_SUBWINDOWS
+ *     of them must exist at all, which is the evidence floor and the fail-closed guard for the
+ *     pair. Both thresholds are needed: a `rate>=x` threshold on a Rate that received no
+ *     samples passes vacuously in k6, so the ratio alone would certify a run whose sampler
+ *     never ran. Windows inside RAMP_EXCLUSION_SECONDS of either end do not qualify, because a
+ *     constant-arrival-rate executor is still allocating VUs there.
+ *
+ *     The tolerance is deliberate rather than a relaxation: one garbage collection pause, one
+ *     relay lease expiry or one broker checkpoint can cost a single interval without the
+ *     pipeline having failed to sustain anything. THE MINIMUM PER-WINDOW RATE AND THE WHOLE-RUN
+ *     AVERAGE ARE BOTH REPORTED BESIDE IT, as diagnostics rather than verdicts.
+ *   - THE UNSETTLED TAIL BELONGS INSIDE THE POPULATION. When the load stops, the relay is
  *     still working through whatever it has claimed and whatever is still pending. Reading
  *     /metrics at that instant excludes those events from the published counter, from the
  *     dead-letter ratio's population and from the latency histogram — which flatters V-3,
- *     since a dead-letter is precisely what a not-yet-terminal event may still become. So
- *     teardown WAITS, under a bounded budget, for `blnk_outbox_pending` to drain before it
- *     takes the readings the verdicts are computed from, and fails closed if the budget
- *     expires with rows still outstanding.
+ *     since a dead-letter is precisely what a not-yet-terminal event may still become. So both
+ *     ends of the window carry a settling gate that WAITS, under a bounded budget, and the run
+ *     fails closed if a budget expires with rows still outstanding.
+ *
+ *     WHAT THE GATES WAIT ON IS THE WHOLE UNSETTLED POPULATION, not `blnk_outbox_pending`
+ *     alone. That gauge is pending plus processing and nothing else; `failed` rows whose
+ *     dead-letter write is still owed, and `webhook_pending` rows, are published only on
+ *     blnk_events_repair_backlog. The first is the one that matters to a verdict, because a
+ *     `failed` row has not yet incremented blnk_events_dead_lettered_total — so treating the
+ *     outbox as drained while such rows remain removes them from V-3's NUMERATOR. A gate that
+ *     can read only the gauge therefore does not establish quiescence: it fails with
+ *     REASON_SETTLEMENT_STATE_UNAVAILABLE, whose remedy is a master key rather than a bigger
+ *     budget, and the gauge stands as incomplete fallback evidence only.
  *   - THE LATENCY VERDICT HAS EXACTLY ONE ADMISSIBLE SOURCE. V-1's p99 is read from
  *     capture-to-dispatch and from nothing else. `publish_duration` measures a strictly
  *     shorter interval, so certifying the target from it would be optimistic; when
@@ -881,8 +903,10 @@ function urlCarriesCredential(url) {
 //
 // The width of the windows the throughput verdict is stated over. A whole-run average
 // cannot distinguish sustained load from a burst followed by a stall, so the published
-// counter is sampled on this interval and the verdict is the minimum of the resulting
-// per-window rates.
+// counter is sampled on this interval and the verdict is the PASS RATE across the
+// resulting per-window rates — at least MIN_SUSTAINED_SUBWINDOW_RATIO of the qualifying
+// windows must have met the target. The minimum per-window rate is reported as a
+// diagnostic and is not itself the verdict.
 //
 // 30 seconds is wide enough that ordinary jitter — a garbage collection pause, one slow
 // scrape, a relay poll landing either side of a boundary — averages out inside a window

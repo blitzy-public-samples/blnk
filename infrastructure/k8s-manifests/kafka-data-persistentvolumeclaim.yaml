@@ -29,7 +29,7 @@
 #
 # It also makes the storage REVIEWABLE as an object rather than as a field
 # inside a workload: `kubectl get pvc -n blnk` before the brokers start tells
-# you whether the cluster can actually provision 3 x 160Gi, which is a much
+# you whether the cluster can actually provision 3 x 200Gi, which is a much
 # better time to find out than during a cold start.
 #
 # # Why this is NOT one claim, which is the mistake it replaces
@@ -59,12 +59,12 @@
 #      requires adding an entry here in the same change, or the new broker's
 #      claim is created from the template while its siblings came from this file
 #      and the two can differ.
-#   3. THE SIZE. 160Gi, identical to the volumeClaimTemplate. Kubernetes does
+#   3. THE SIZE. 200Gi, identical to the volumeClaimTemplate. Kubernetes does
 #      NOT reconcile a pre-existing claim against the template — it adopts what
 #      it finds — so a claim smaller than the template is adopted at the
 #      smaller size, silently, and the broker's retention arithmetic no longer
-#      fits its disk. See the template for the derivation: 48 partitions x 2 GiB
-#      of log.retention.bytes = 96 GiB, which is 60% of 160Gi.
+#      fits its disk. See the template for the derivation: 60 partitions x 2 GiB
+#      of log.retention.bytes = 120 GiB, which is 60% of 200Gi.
 #      TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate asserts this
 #      correspondence so it cannot drift.
 #   4. THE ACCESS MODE. ReadWriteOnce, matching the template. A claim the
@@ -106,7 +106,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 160Gi
+      storage: 200Gi
 status: {}
 ---
 apiVersion: v1
@@ -122,7 +122,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 160Gi
+      storage: 200Gi
 status: {}
 ---
 apiVersion: v1
@@ -138,5 +138,5 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 160Gi
+      storage: 200Gi
 status: {}

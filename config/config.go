@@ -897,6 +897,47 @@ type KafkaConfig struct {
 	// explicit, not to break a walkthrough.
 	SubscriberSharedTopicAccess bool `json:"subscriber_shared_topic_access" envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
 
+	// SubscriberInternalTopicAccess is the deployment ACKNOWLEDGING that a subscriber granted
+	// the internal category topic — `<KAFKA_TOPIC_PREFIX>.system` — reads Blnk's own error text
+	// verbatim, for the whole deployment, plus every event type the catalogue does not yet
+	// recognise.
+	//
+	// # Why the acknowledgement exists
+	//
+	// `system.error` was delivered to webhook subscribers, so requirement R-12 needs it to have
+	// a credential-reachable route once the HTTP transport retires: a subscriber that watched
+	// Blnk's own error stream must be able to keep watching it. But its payload is frozen
+	// field-for-field by requirement R-8 and renders the error as it comes — a PostgreSQL error
+	// names schema, table, column and routine; a broker error names internal addresses — so the
+	// disclosure cannot be narrowed by redaction, and the category is also the catalogue's
+	// catch-all, which makes a grant of it a standing grant over payloads of unknown
+	// provenance.
+	//
+	// Those two facts make it a decision rather than a default. Only an operator knows whether
+	// the subscribers of this deployment are internal consumers who may see its internals or
+	// third parties who may not, and the previous two attempts at answering it in code both
+	// failed: making the category ordinarily grantable put the disclosure one PUT away, and
+	// withholding it entirely stranded the ordinary ledger event that used to share the topic
+	// (now `<prefix>.ledgers`, which needs no acknowledgement).
+	//
+	// # What it changes, exactly
+	//
+	// One thing: whether `<prefix>.system` may appear in a subscriber's authorized_topics. With
+	// it false — the shipped default — the request DTO, the persistence boundary and the ACL
+	// provisioner all refuse that name, naming this variable as the remedy. With it true the
+	// name becomes grantable, and a subscriber still receives it only by listing it explicitly;
+	// nothing derives it, no default includes it, and no wildcard reaches it.
+	//
+	// It grants nothing on its own, changes no topic, and does not affect publishing: the
+	// internal topic is created and written to either way.
+	//
+	// Unlike SubscriberSharedTopicAccess this is read in EVERY mode, not only secure mode. The
+	// shared-topic acknowledgement decides how wide an already-authorised grant is, which is a
+	// production judgement; this one decides whether Blnk's internal diagnostics may leave the
+	// deployment at all, and a local stack that granted them by default would teach the wrong
+	// default to whoever copied its configuration.
+	SubscriberInternalTopicAccess bool `json:"subscriber_internal_topic_access" envconfig:"KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS"`
+
 	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
 	// PRODUCER principal: the identity the event publisher authenticates as. It needs
 	// only Write and Describe on the topics Blnk owns.
@@ -1363,12 +1404,17 @@ type eventStreamingEnvOverride struct {
 	// governing the subscriber access model resolves through one mechanism: a deployment that
 	// declared the acknowledgement by a name this struct honoured and the mode by one it did not
 	// would get the widest behaviour from the narrowest-looking configuration.
-	KafkaSubscriberSharedTopicAccess *bool   `envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
-	KafkaTopicPrefix                 *string `envconfig:"KAFKA_TOPIC_PREFIX"`
-	KafkaSASLAdminUser               *string `envconfig:"KAFKA_SASL_ADMIN_USER"`
-	KafkaSASLAdminSecret             *string `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
-	KafkaMinPartitions               *int    `envconfig:"KAFKA_MIN_PARTITIONS"`
-	KafkaReplicationFactor           *int    `envconfig:"KAFKA_REPLICATION_FACTOR"`
+	KafkaSubscriberSharedTopicAccess *bool `envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
+	// KafkaSubscriberInternalTopicAccess is the internal-topic ACKNOWLEDGEMENT, and it is here
+	// for the same reason as the acknowledgement above: every variable governing the subscriber
+	// access model resolves through one mechanism, so a deployment cannot declare one of them by
+	// a name this struct honours and another by a name it does not.
+	KafkaSubscriberInternalTopicAccess *bool   `envconfig:"KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS"`
+	KafkaTopicPrefix                   *string `envconfig:"KAFKA_TOPIC_PREFIX"`
+	KafkaSASLAdminUser                 *string `envconfig:"KAFKA_SASL_ADMIN_USER"`
+	KafkaSASLAdminSecret               *string `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
+	KafkaMinPartitions                 *int    `envconfig:"KAFKA_MIN_PARTITIONS"`
+	KafkaReplicationFactor             *int    `envconfig:"KAFKA_REPLICATION_FACTOR"`
 
 	RelayMaxRetryAttempts                 *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RelayRetryBaseBackoffMS               *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
@@ -1437,6 +1483,9 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	}
 	if override.KafkaSubscriberSharedTopicAccess != nil {
 		cnf.Kafka.SubscriberSharedTopicAccess = *override.KafkaSubscriberSharedTopicAccess
+	}
+	if override.KafkaSubscriberInternalTopicAccess != nil {
+		cnf.Kafka.SubscriberInternalTopicAccess = *override.KafkaSubscriberInternalTopicAccess
 	}
 	if override.KafkaTopicPrefix != nil {
 		cnf.Kafka.TopicPrefix = *override.KafkaTopicPrefix

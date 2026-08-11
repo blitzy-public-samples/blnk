@@ -491,10 +491,12 @@ func TestNotifyError_KafkaConfiguredWithNoSenderRegistered_DoesNotPanic(t *testi
 // one payload for another under the same event name is a BREAKING CHANGE to a published
 // contract, delivered as a side effect of a transport migration. It is addressed instead by
 // two things that cost no contract anything: system.error routes to blnk.system, which
-// model.SubscriberGrantableEventCategories withholds from every subscriber, so no credential
-// Blnk issues can read this body at all — and the bounded classification is logged rather than
-// published. The audience for this body is therefore the OPERATOR and nobody else, which is
-// what model.EventCategorySystem records.
+// model.SubscriberGrantableEventCategories withholds from every subscriber by default, so no
+// credential Blnk issues reads this body unless a deployment has deliberately declared
+// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and named the topic in that subscriber's own grant —
+// and the bounded classification is logged rather than published. The default audience for
+// this body is therefore the OPERATOR and nobody else, which is what
+// model.EventCategorySystem records.
 //
 // The LENGTH ASSERTION is the point of this test: a third key is a change to a published
 // contract, and it should fail here rather than reach a subscriber. The three keys the

@@ -786,8 +786,8 @@ func monitorCaptureBlnk(t *testing.T) (*Blnk, *mocks.MockDataSource) {
 //
 // Two guards decide what this function does, and they read the same fact from opposite
 // sides. With a broker configured, balanceMonitorHandoffEnabled is true and the function
-// returns immediately, because the durable handoff owns the evaluation and publishing from
-// both would deliver every alert twice. With no broker configured there is no outbox row to
+// returns immediately, because the mutation's own transaction owns the evaluation and publishing
+// from both would deliver every alert twice. With no broker configured there is no outbox row to
 // capture — PrepareEventOutbox returns nil, deliberately, since no relay would ever drain it
 // — and the alert goes straight down the legacy webhook transport instead.
 //
@@ -1049,7 +1049,8 @@ func TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured(t *
 	instance.checkBalanceMonitors(context.Background(), monitoredBalance(), balanceMonitorCapture{})
 
 	assert.Never(t, func() bool { return spy.count() > 0 }, waitForPostActions, pollPostActions,
-		"with Kafka configured the handoff owns the capture; publishing here too would double every alert")
+		"with Kafka configured the mutation's transaction owns the capture; publishing here too "+
+			"would double every alert")
 	datasource.AssertNotCalled(t, "GetBalanceMonitors", "bln_monitored")
 }
 
@@ -1058,10 +1059,11 @@ func TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured(t *
 // and the cache getBalanceMonitorsCached reads before it reaches the datasource.
 //
 // The two deployment shapes take genuinely different paths and both have to be covered. With
-// brokers, the handoff owns monitor capture and this producer must publish nothing. Without
-// them there is nothing to drain a handoff — database.recordBalanceMonitorHandoffs reads the
-// SAME predicate and writes none — so this post-commit evaluation is the ONLY capture, and it
-// must keep delivering exactly as it did before the event pipeline existed (AAP §0.5.4).
+// brokers, the writer owns monitor capture — it evaluates inside the mutation's transaction and
+// inserts the canonical row there — and this producer must publish nothing. Without them there is
+// no outbox to capture into at all: database.recordBalanceMonitorEvaluation reads the SAME
+// predicate and writes nothing, so this post-commit evaluation is the ONLY capture, and it must
+// keep delivering exactly as it did before the event pipeline existed (AAP §0.5.4).
 //
 // Parameters:
 //   - t *testing.T: the test, for the Redis, client and cache lifecycles.
@@ -1249,6 +1251,107 @@ func TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite(t *test
 	assert.False(t, captured.holds("bln_monitored", "mon_unmet"),
 		"an unmet monitor must not be reported as captured, or the fallback would skip it on a "+
 			"later movement that DOES meet its condition")
+}
+
+// TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses is what keeps the three routes
+// to a `balance.monitor` row interchangeable to a subscriber.
+//
+// # Why this matters more than it looks
+//
+// Three routes can decide a crossing: the pre-write pass on the single-transaction path, the
+// writer's own in-transaction evaluation for every other path (through the registered
+// database.BalanceMonitorAlertCapture), and the handoff drain for a row written before that
+// capture existed. If any of them built its own envelope, the STORED BYTES for one crossing would
+// depend on which route happened to see it — and a subscriber cannot tell the routes apart, so the
+// difference would look like Blnk emitting two different shapes for one event type. It would also
+// break the dual-delivery payload-equivalence guarantee for this producer, since the legacy HTTP
+// leg is spliced from those same bytes.
+//
+// So the assertion is field-by-field equality of the two rows, with the event id excluded — that
+// one is a fresh UUID by design for this event type, which is asserted separately below.
+func TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+
+	datasource.On("GetBalanceMonitors", "bln_monitored").
+		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
+
+	// The pre-write pass, which is the route that runs on the single-transaction path.
+	passRows, _, err := instance.prepareBalanceMonitorEvents(context.Background(),
+		[]*model.Balance{monitoredBalance()})
+	require.NoError(t, err)
+	require.Len(t, passRows, 1)
+
+	// The builder the writer reaches through the registered capture.
+	direct, err := instance.prepareBalanceMonitorAlertRow(context.Background(),
+		monitoredBalance(), crossedMonitor())
+	require.NoError(t, err)
+	require.NotNil(t, direct)
+
+	assert.Equal(t, passRows[0].EventType, direct.EventType)
+	assert.Equal(t, passRows[0].AggregateID, direct.AggregateID)
+	assert.Equal(t, passRows[0].PartitionKey, direct.PartitionKey)
+	assert.Equal(t, passRows[0].LedgerID, direct.LedgerID)
+	assert.Equal(t, passRows[0].Topic, direct.Topic)
+	assert.Equal(t, passRows[0].SchemaVersion, direct.SchemaVersion)
+	assert.JSONEq(t, string(passRows[0].Payload), string(direct.Payload),
+		"the stored bytes must not depend on which route decided the crossing")
+	assert.Equal(t, passRows[0].Payload, direct.Payload,
+		"and byte equality, not merely JSON equivalence: the legacy HTTP leg is spliced from "+
+			"these exact bytes during the dual-delivery window")
+
+	assert.NotEqual(t, passRows[0].EventID, direct.EventID,
+		"a balance.monitor id is a fresh UUID by design — deriving it from the (balance, monitor) "+
+			"pair would collapse every firing after the first into a duplicate the unique index "+
+			"rejects, and the alerts would silently stop")
+}
+
+// TestNewBlnk_RegistersBothInTransactionEventCaptures is the wiring assertion for the two captures
+// the atomic writers cannot work without.
+//
+// # Why the registration is the whole feature, and why nothing else fails without it
+//
+// database.recordBalanceMonitorEvaluation inserts the canonical `balance.monitor` row inside the
+// mutation's transaction ONLY when a BalanceMonitorAlertCapture is registered; with none it falls
+// back to committing a balance_monitor_handoff for a second transaction to convert. A constructor
+// that omitted the call would therefore leave requirement R-2 unmet for that producer on every
+// path, and NOTHING would fail: the handoff is durable, the alert still arrives, and every test of
+// the handoff still passes. The same is true of the transaction capture the coalesced batch writer
+// derives its rows from — without it a coalesced batch commits balance updates and publishes
+// nothing.
+//
+// # Why this asserts on the constructor's source rather than on the registry
+//
+// The registry is unexported package state in `database`, and exporting an accessor purely so this
+// test could read it would widen a production API to serve a test. The registration is a
+// STRUCTURAL fact about NewBlnk — the call is either in the constructor or it is not — so the
+// constructor's own source is the honest thing to assert on, and it is the same technique
+// cmd/server_test.go uses for the relay's startup wiring. What the registered function then
+// PRODUCES is covered behaviourally by
+// TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses above, and the path it unlocks
+// by the real-database tests in database/event_producer_atomicity_test.go.
+func TestNewBlnk_RegistersBothInTransactionEventCaptures(t *testing.T) {
+	source, err := os.ReadFile("blnk.go")
+	require.NoError(t, err)
+
+	constructor := string(source)
+
+	require.Contains(t, constructor, "database.RegisterTransactionEventCapture(",
+		"NewBlnk must register the transaction event capture, or a coalesced batch commits its "+
+			"balance updates and publishes nothing")
+	require.Contains(t, constructor, "database.RegisterBalanceMonitorAlertCapture(",
+		"NewBlnk must register the balance monitor alert capture, or the atomic writers cannot "+
+			"insert the canonical alert row inside the mutation's transaction and fall back to "+
+			"the handoff on every path")
+	assert.Contains(t, constructor, "b.prepareBalanceMonitorAlertRow(ctx, balance, monitor)",
+		"the registered capture must be the SHARED builder: a second envelope built here would "+
+			"make one crossing's stored bytes depend on which route decided it")
+
+	registerAt := strings.Index(constructor, "database.RegisterBalanceMonitorAlertCapture(")
+	returnAt := strings.LastIndex(constructor, "return b, nil")
+	require.Positive(t, returnAt)
+	assert.Less(t, registerAt, returnAt,
+		"the registration must happen before the constructor returns the instance, or a writer "+
+			"reached by the first request finds no capture")
 }
 
 // TestPrepareBalanceMonitorEventOutboxes_DegradesToTheFallbackWhenTheLookupFails is the

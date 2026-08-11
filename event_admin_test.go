@@ -63,7 +63,7 @@ import (
 // isolation integration test. Keeping this file broker-free is what keeps
 // `go test -short ./...` and CI green with no Kafka service.
 //
-// The eight topic names, the six-partition floor, the 4096-iteration minimum and the
+// The ten topic names, the six-partition floor, the 4096-iteration minimum and the
 // three gauge attribute keys are all written out LONGHAND below rather than derived from
 // the code under test. A test that asks the implementation what it expects agrees with
 // any implementation, including a broken one.
@@ -75,21 +75,25 @@ import (
 // names the pipeline actually publishes to.
 
 // expectedEventTopics is the topic inventory, spelled out independently of
-// event_topics.go: the four category topics followed by their four dead-letter siblings,
+// event_topics.go: the five category topics followed by their five dead-letter siblings,
 // in the canonical order provisioning uses.
 //
-// blnk.system carries ledger.created and system.error and is also where an event type the
-// catalogue does not recognise is routed, so it must be provisioned with the same geometry as
-// every other topic. A system topic that does not exist would strand both Blnk's own records
-// and exactly the events that already indicate a routing defect.
+// blnk.system carries system.error and is also where an event type the catalogue does not
+// recognise is routed, so it must be provisioned with the same geometry as every other topic. A
+// system topic that does not exist would strand both Blnk's own records and exactly the events
+// that already indicate a routing defect. It is provisioned for every deployment and granted to
+// a subscriber only where KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS is declared — provisioning and
+// grantability are separate questions, and this list answers the first.
 var expectedEventTopics = []string{
 	"blnk.transactions",
 	"blnk.balances",
 	"blnk.identities",
+	"blnk.ledgers",
 	"blnk.system",
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
+	"blnk.ledgers.dlt",
 	"blnk.system.dlt",
 }
 
@@ -1104,18 +1108,18 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 		"the inventory this file asserts against must be exactly the inventory event_topics.go composes, "+
 			"so the test and the implementation share one source of truth")
 
-	const categoryCount = 4
+	const categoryCount = 5
 
 	require.Len(t, expectedEventTopics, categoryCount*2,
-		"four category topics and one dead-letter sibling each")
+		"five category topics and one dead-letter sibling each")
 	assert.Equal(t, expectedEventTopics[:categoryCount], AllTopics(),
-		"the first four entries are the category topics, in canonical provisioning order")
+		"the first five entries are the category topics, in canonical provisioning order")
 	assert.Equal(t, expectedEventTopics[categoryCount:], AllDeadLetterTopics(),
-		"the last four entries are their dead-letter siblings, in the same order")
+		"the last five entries are their dead-letter siblings, in the same order")
 
 	categories := EventCategories()
 	require.Len(t, categories, categoryCount,
-		"four categories are what give every emitted event type a home — including the system category an unrecognised type routes to; a fifth would need a topic here and a change to the published topic contract")
+		"five categories are what give every emitted event type a home — including the system category an unrecognised type routes to; a sixth would need a topic here and a change to the published topic contract")
 
 	// EVERY CATEGORY TOPIC IS PROVISIONED. GRANTABILITY IS A SEPARATE QUESTION, and the two are
 	// asserted separately here because conflating them is how a topic events route to goes
@@ -1124,11 +1128,13 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 	// Provisioned, because Blnk writes to all of them. A topic nobody created is a topic the
 	// relay cannot publish to, so its events would strand in the outbox.
 	//
-	// Grantable for the three TENANT categories only. The system category is provisioned and NOT
-	// grantable: it carries system.error's frozen verbatim-error body and is the catalogue's
-	// catch-all, so it is an operator topic in the same class as a dead-letter sibling. Which of
-	// the tenant topics a PARTICULAR subscriber holds is decided per subscriber by its
-	// authorized_topics, not here.
+	// Grantable for the four TENANT categories only. The system category is provisioned and NOT
+	// in the default grant set: it carries system.error's frozen verbatim-error body and is the
+	// catalogue's catch-all, so it is an operator topic in the same class as a dead-letter
+	// sibling, reachable only where the deployment declares
+	// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS (which this test does not). Which of the tenant
+	// topics a PARTICULAR subscriber holds is decided per subscriber by its authorized_topics,
+	// not here.
 	//
 	// Never the dead-letter siblings: they carry failure metadata and every subscriber's failed
 	// events, and are read under the master key through GET /events/dead-letter.
@@ -1139,8 +1145,11 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 
 		if category == model.EventCategorySystem {
 			assert.False(t, IsSubscriberGrantableTopic(topic),
-				"the system topic %q must NOT be grantable: it carries system.error's verbatim error "+
-					"body and every uncatalogued event", topic)
+				"the system topic %q must NOT be grantable without the deployment acknowledgement: it "+
+					"carries system.error's verbatim error body and every uncatalogued event", topic)
+			assert.True(t, IsSubscriberPrivilegedTopic(topic),
+				"and it must be reported as PRIVILEGED rather than unknown, so a refusal names the "+
+					"acknowledgement instead of the allowlist")
 		} else {
 			assert.True(t, IsSubscriberGrantableTopic(topic),
 				"tenant category topic %q must be grantable, or an event type the legacy transport delivers has no authorized Kafka route", topic)
@@ -2807,13 +2816,17 @@ func TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist(
 		"a foreign topic":         "attacker.transactions",
 		"a dead-letter topic":     "blnk.transactions.dlt",
 		"the system dead-letter":  "blnk.system.dlt",
-		"a retired category name": "blnk.ledgers",
+		"the ledger dead-letter":  "blnk.ledgers.dlt",
 		"an internal Kafka topic": "__consumer_offsets",
 		"a prefix fragment":       "blnk.",
 		"the prefix alone":        "blnk",
-		// Ledger events are published, but to blnk.system, so a ledgers topic is a name
-		// nothing creates and nobody may be granted.
-		"a category this contract does not have": "blnk.ledgers",
+		// A plausible near-miss: `ledgers` IS a category and `ledger` is not, so the singular
+		// names a topic nothing creates and nobody may be granted.
+		"a category this contract does not have": "blnk.ledger",
+		// The internal category, refused because this test's configuration declares no
+		// acknowledgement. TestProvisionSubscriberPrincipal_GrantsTheInternalTopicOnlyWhenTheDeploymentAcknowledgesIt
+		// covers the other direction.
+		"the internal category without the acknowledgement": "blnk.system",
 	}
 
 	for name, topic := range cases {
@@ -2834,6 +2847,79 @@ func TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist(
 				"one ungrantable topic must refuse the whole request rather than being dropped silently")
 		})
 	}
+}
+
+// TestProvisionSubscriberPrincipal_GrantsTheInternalTopicOnlyWhenTheDeploymentAcknowledgesIt is
+// the other half of the allowlist contract, and the half a security review has to be able to
+// read: `<prefix>.system` reaches an ACL binding when — and only when — the deployment has
+// declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS.
+//
+// Both directions matter and they fail differently. Without the acknowledgement, provisioning
+// must refuse and name the variable, because a refusal that only says "not grantable" sends an
+// operator to read an allowlist that does not contain the answer. With it, provisioning must
+// actually bind the topic: requirement R-12 needs system.error to have a credential-reachable
+// route once the webhook transport retires, and an acknowledgement that changed nothing would
+// leave that route missing while appearing to provide it.
+func TestProvisionSubscriberPrincipal_GrantsTheInternalTopicOnlyWhenTheDeploymentAcknowledgesIt(t *testing.T) {
+	t.Run("refused, naming the acknowledgement, when the deployment has not declared it", func(t *testing.T) {
+		storeSubscriberInternalTopicAccess(t, false)
+
+		fake := newFakeAdminClient()
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		subscriber := testSubscriber()
+		subscriber.AuthorizedTopics = []string{"blnk.transactions", "blnk.system"}
+
+		_, err := admin.ProvisionSubscriberPrincipal(
+			context.Background(),
+			NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+		)
+		require.Error(t, err, "the internal topic must be refused where nothing acknowledged it")
+		assert.Contains(t, err.Error(), "KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS",
+			"the refusal must name the declaration that would allow it; without it the operator is "+
+				"sent to read the allowlist, which does not contain the answer")
+		assert.Zero(t, fake.totalCalls(),
+			"nothing may reach the broker: the refusal is a validation, not a partial provisioning")
+	})
+
+	t.Run("granted when the deployment has declared it", func(t *testing.T) {
+		storeSubscriberInternalTopicAccess(t, true)
+
+		fake := newFakeAdminClient()
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		subscriber := testSubscriber()
+		subscriber.AuthorizedTopics = []string{"blnk.transactions", "blnk.system"}
+
+		report, err := admin.ProvisionSubscriberPrincipal(
+			context.Background(),
+			NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+		)
+		require.NoError(t, err,
+			"an acknowledged deployment must be able to provision the internal topic, or system.error "+
+				"has no subscriber route after the webhook transport retires")
+		assert.Positive(t, report.ACLBindings,
+			"the provisioning must report the bindings it created")
+		assert.Contains(t, report.Topics, "blnk.system",
+			"and must report the internal topic among the topics it granted")
+
+		granted := map[string]struct{}{}
+		for _, request := range fake.createACLsRequests {
+			for _, acl := range request.ACLs {
+				if acl.ResourceType == kafka.ResourceTypeTopic {
+					granted[acl.ResourceName] = struct{}{}
+				}
+			}
+		}
+
+		assert.Contains(t, granted, "blnk.system",
+			"the acknowledged grant must reach a LITERAL topic binding; an acknowledgement that "+
+				"validated and then dropped the topic would report success over an absent route")
+		assert.Contains(t, granted, "blnk.transactions",
+			"and the ordinary topics must be bound alongside it")
+		assert.NotContains(t, granted, "blnk.system.dlt",
+			"no acknowledgement makes a dead-letter sibling grantable")
+	})
 }
 
 // TestProvisionSubscriberPrincipal_ReportsAReplacedCredential proves re-issuing is a
@@ -4593,8 +4679,11 @@ func TestNormalizeTopicList_DropsBlanksAndDuplicatesInOrder(t *testing.T) {
 func TestMissingTopics_NamesTheAbsentOnesInRequestedOrder(t *testing.T) {
 	present := map[string][]int{"blnk.transactions": {0}, "blnk.balances": {0}}
 
-	assert.Equal(t, []string{"blnk.identities", "blnk.system"},
-		missingTopics([]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.system"}, present))
+	assert.Equal(t, []string{"blnk.identities", "blnk.ledgers", "blnk.system"},
+		missingTopics(
+			[]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.ledgers", "blnk.system"},
+			present,
+		))
 	assert.Nil(t, missingTopics([]string{"blnk.transactions"}, present))
 	assert.Equal(t, []string{"blnk.transactions"}, missingTopics([]string{"blnk.transactions"}, nil))
 }

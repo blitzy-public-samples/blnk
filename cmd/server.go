@@ -674,7 +674,7 @@ func startEventMetricsCollector(
 }
 
 // startEventRelay assures the Kafka topics exist and starts the transactional event outbox
-// relay, returning the function that stops it.
+// relay, returning the function that stops it and the startup obstacle, if any.
 //
 // # Without this the pipeline has no production driver at all
 //
@@ -708,12 +708,32 @@ func startEventMetricsCollector(
 // With KAFKA_BROKERS unset there is nothing to relay to and the producers deliver over the
 // legacy webhook transport directly. That is reported at info level once, not treated as a
 // misconfiguration: it is how every deployment runs before it opts into Kafka, and it is what
-// the graceful-degradation contract promises.
+// the graceful-degradation contract promises. It returns a NIL error, because nothing is
+// wrong: this branch is a supported steady state, not a refusal.
+//
+// # A refused relay is returned, not swallowed
+//
+// The relay refuses on a configuration or construction fault — a missing dependency, the
+// no-op publisher, or a dual-delivery window that has not opened or cannot be read. For a
+// deployment that reached this function, KAFKA_BROKERS IS set, so a refusal means every
+// producer keeps capturing outbox rows while NEITHER transport delivers: no Kafka publish
+// because the relay is not running, and no legacy webhook because the relay is the only thing
+// that enqueues one during the window. That state does not self-heal — the obstacle is
+// evaluated once per process — so the error is returned to runServer, which refuses to serve
+// over it rather than accumulating undeliverable rows behind a boot-time log line.
+//
+// The stopper is returned ALONGSIDE the error and is always callable, so the caller's
+// `defer stop()` is correct whether the relay started or not: topic assurance may have
+// started a background pass before the relay refused, and that pass still has to be stopped.
+//
+// Returns:
+//   - func(): stops the relay and topic assurance. Never nil, and safe to call after a refusal.
+//   - error: the relay's startup obstacle, or nil when it is running or deliberately not run.
 func startEventRelay(
 	ctx context.Context,
 	instance *blnk.Blnk,
 	cfg *config.Configuration,
-) func() {
+) (func(), error) {
 	if cfg == nil || !blnk.KafkaBrokersConfigured(cfg.Kafka.Brokers) {
 		logrus.Info(
 			"no Kafka brokers are configured, so the event outbox relay is not started; ledger events " +
@@ -721,7 +741,7 @@ func startEventRelay(
 				"for a deployment that has not migrated",
 		)
 
-		return func() {}
+		return func() {}, nil
 	}
 
 	stopAssurance := assureEventTopics(ctx, instance, cfg)
@@ -742,12 +762,29 @@ func startEventRelay(
 	// to every pending row before anyone noticed the topics were absent.
 	relay := blnk.NewEventRelayProcessor(instance).
 		WithCatalogueGate(blnk.NewTopicCatalogueGate(cfg))
-	relay.Start(ctx)
+	startErr := relay.Start(ctx)
 
-	return func() {
+	stop := func() {
 		relay.Stop()
 		stopAssurance()
 	}
+
+	if startErr != nil {
+		// WRAPPED with what the operator has to decide, because the obstacle alone says what
+		// is wrong and not what it costs. Every remedy is one of these two, and both are
+		// configuration: open the window, or stop asking for Kafka.
+		return stop, fmt.Errorf(
+			"the event outbox relay refused to start while KAFKA_BROKERS is configured, so every "+
+				"captured ledger event would stay undelivered by BOTH transports — no Kafka publish "+
+				"and no legacy webhook, because the relay is what enqueues the legacy leg during the "+
+				"dual-delivery window. Refusing to serve rather than accumulating undeliverable rows. "+
+				"Fix the configuration this names, or unset KAFKA_BROKERS to run on the legacy "+
+				"transport alone: %w",
+			startErr,
+		)
+	}
+
+	return stop, nil
 }
 
 // reportStrandedTopicPrefixes names, at start-up, any topic namespace that outbox rows still
@@ -1451,8 +1488,21 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 	// worker role as well would have two processes claiming the same rows — which
 	// the FOR UPDATE SKIP LOCKED claim tolerates, but it would double the broker
 	// connections and the dual-delivery enqueues for no gain.
-	stopEventRelay := startEventRelay(ctx, b.blnk, cfg)
+	//
+	// A REFUSAL IS FATAL TO THIS PROCESS, and the defer is registered before the check so
+	// the topic-assurance pass the helper may already have started is still stopped on the
+	// way out. The obstacle set is configuration and construction faults only — see the
+	// helper — so there is nothing to wait for and nothing that a retry would fix; a
+	// transient broker is covered by assurance being stepped past and by the catalogue gate,
+	// neither of which reaches here. Serving anyway is the CR-2 failure itself: with brokers
+	// configured and no relay, every producer captures a row that neither transport will ever
+	// deliver, and the process reports itself healthy while doing it.
+	stopEventRelay, relayErr := startEventRelay(ctx, b.blnk, cfg)
 	defer stopEventRelay()
+
+	if relayErr != nil {
+		return relayErr
+	}
 
 	// The retention sweeper is NOT started here. Without it blnk.event_outbox grows without
 	// bound — every delivered and every dead-lettered row stays for ever, so the table the
@@ -1674,23 +1724,29 @@ func startEventRetention(ctx context.Context, instance *blnk.Blnk) func() {
 //
 // # What it owns, and why nothing else can
 //
-// The atomic writers record a handoff row inside every ledger transaction that moves a
-// monitored balance. That row is an INTENT — "these monitors have not been judged yet" —
-// and this processor is the only thing that acts on it. It evaluates the snapshot with the
-// unchanged condition logic and writes the resulting alerts and the handoff's completion in
-// one database transaction, which is what brings `balance.monitor` under requirement R-2:
-// the alert can no longer be lost to a crash between a balance commit and an insert.
+// A handoff row is an INTENT — "these monitors have not been judged yet" — and this processor
+// is the only thing that acts on one. It evaluates the snapshot with the unchanged condition
+// logic and writes the resulting alerts and the handoff's completion in one database
+// transaction.
 //
-// The post-commit evaluation in transaction_execution.go stands down whenever the handoff
-// is in play, so this is not a second opinion — it is the sole owner. That is why a missing
-// start here would produce no alerts at all rather than merely slower ones, and why the
-// no-broker case is answered by not writing handoffs in the first place rather than by
-// starting this and hoping.
+// It is NO LONGER on the path of a new movement. The atomic writers now evaluate a moved
+// balance's monitors inside their own transaction and insert the canonical alert row there
+// (database.recordBalanceMonitorEvaluation), which is requirement R-2 met without any handoff
+// at all. What this processor drains is the finite, real population that remains: rows written
+// by releases that predate that capture, and rows written by a process that has no alert
+// capture registered. Starting it is therefore an UPGRADE obligation rather than a
+// steady-state one — a server that skipped it would strand whatever was in flight across the
+// upgrade, which is exactly the loss the handoff was built to prevent.
+//
+// The post-commit evaluation in transaction_execution.go stands down whenever the writer owns
+// evaluation, so this is not a second opinion on any row it claims. The no-broker case is
+// answered by the writer capturing nothing in the first place rather than by starting this and
+// hoping.
 //
 // # The obstacle is logged at INFO, not at WARN
 //
 // No Kafka broker is a legitimate, shipped steady state, not a misconfiguration. Such a
-// deployment writes no handoffs — database.recordBalanceMonitorHandoffs reads the same
+// deployment writes no handoffs — database.recordBalanceMonitorEvaluation reads the same
 // predicate — and keeps the post-commit evaluation, so declining to start here is the
 // correct and complete behaviour and there is nothing for an operator to fix. Logging it
 // at WARN would make every Kafka-less deployment emit a warning on every start for

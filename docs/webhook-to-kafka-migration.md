@@ -285,6 +285,7 @@ The response carries everything a consumer needs *from Blnk* — where the broke
     "not_enforced_by": [],
     "topics": ["blnk.transactions", "blnk.balances"],
     "consumer_group_namespace": "blnk-sub-sub_9f8d3c214b7a5e6f8a120c4d.",
+    "partition_key_scope_state": "not_requested",
     "partition_key_prefix_enforced": false,
     "partition_key_prefix_enforced_by": "none",
     "gateway_delivery_required": false,
@@ -302,10 +303,13 @@ The response carries everything a consumer needs *from Blnk* — where the broke
 
 Every member above is present in every response, with one exception: `partition_key_prefix` is omitted
 when no prefix is recorded for the subscriber, which is the case shown here — hence
-`partition_key_prefix_enforced_by: "none"` and `gateway_delivery_required: false`. In particular
-`not_enforced_by` is **empty for every subscriber**: every dimension the response names is enforced
-somewhere, and a subscriber whose prefix nothing would enforce is refused a credential rather than
-issued one with an unenforced dimension listed. `credential_fingerprint` is a non-reversible
+`partition_key_scope_state: "not_requested"`, `partition_key_prefix_enforced_by: "none"` and
+`gateway_delivery_required: false`. In particular `not_enforced_by` is **empty on every credential
+response**: every dimension a credential names is enforced somewhere, and a subscriber whose prefix
+nothing would enforce is refused a credential rather than issued one with an unenforced dimension
+listed. A *registry* read of such a subscriber does list `partition_key` there, reports
+`partition_key_scope_state: "requested"`, and predicts the refusal in
+`credential_issuance_blocked_reason` — see docs/event-streaming.md for the full state table. `credential_fingerprint` is a non-reversible
 reference you can compare against the registry to confirm which credential is live without ever
 handling the secret; and `replaced` tells you whether this call superseded an existing credential —
 `true` means any consumer still using the previous password is now failing authentication.
@@ -349,7 +353,7 @@ You are not restricted to the one group id. `enforced_access.consumer_group_name
 Two limits are worth stating outright, because the narrower one is the natural assumption and it is wrong:
 
 - The credential grants **Read and Describe on your authorised topics** and **Read on your consumer-group namespace**, and nothing further. No dead-letter topic is ever granted to a subscriber, so no `<topic>.dlt` appears in `authorized_topics`.
-- **`ledger.created` HAS NO KAFKA ROUTE FOR SUBSCRIBERS, and it is the one event you lose at the cutover.** The topic catalogue has four categories, and `ledger.created` shares `blnk.system` with `system.error` — whose payload is a frozen legacy body carrying verbatim internal error text — and with every event type the catalogue does not yet recognise. `blnk.system` is therefore an operator topic: it cannot appear in any subscriber's `authorized_topics`, and a request that names it is refused. A webhook subscriber that consumes `ledger.created` today keeps receiving it over webhooks for the remainder of the window and must plan for the sunset now: read ledgers from the REST API, or agree with your operator how they will relay ledger creations to you. The event itself is not lost — it is captured, published to `blnk.system`, retained and replayable — but the audience is the operator, not you. See [why `blnk.system` is not grantable](event-streaming.md#why-four-categories-and-why-blnksystem-is-not-grantable).
+- **`system.error` HAS NO KAFKA ROUTE FOR SUBSCRIBERS BY DEFAULT, and it is the one event that does not simply carry over.** The topic catalogue has five categories, and `system.error` sits on `blnk.system` — whose payload is a frozen legacy body carrying verbatim internal error text — together with every event type the catalogue does not yet recognise. `blnk.system` is therefore an operator topic unless the deployment says otherwise: it appears in a subscriber's `authorized_topics` only where the deployment has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` **and** that subscriber's grant names it. Either declaration missing, and the request is refused with a message naming the one that is absent. If `system.error` drives something on your side, ask your operator for both declarations before the sunset; the event itself is captured, published, retained and replayable either way. **`ledger.created` needs none of this** — it is on `blnk.ledgers`, a tenant category you can be granted exactly like transactions, balances and identities, so ask for `<prefix>.ledgers` in your grant and it carries over with everything else. See [why five categories, and what `blnk.system` costs](event-streaming.md#why-five-categories-and-what-blnksystem-costs).
 - **Within an authorised topic the BROKER applies no further restriction.** Kafka authorises at topic and consumer-group granularity and has no message-key dimension, so per-key filtering cannot be enforced by the broker and is never claimed to be. That is why a key scope, when one is recorded, is kept *outside* the broker and why the broker-side grant for such a subscriber is narrowed to `Describe`.
 - **`enforced_access.gateway_delivery_required` decides which endpoint you dial.** If the subscriber records a `partition_key_prefix`, its principal is granted `Describe` but **not** `Read` on its topics and the Kafka brokers refuse every fetch it attempts; its records arrive from the key-authorising component the deployment declared, whose address `broker_endpoint` carries, and `gateway_delivery_required` is `true` on every response about it. **Blnk does not ship that component and serves no records itself** — there is no read path under `/subscribers` — so where no component is declared such a subscriber is refused a credential with `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED` rather than issued one it could not use. When no prefix is recorded the field is `false`, `broker_record_access` is `true`, and the subscriber consumes directly from the brokers confined by its `authorized_topics` alone — which means a granted topic is readable in full, including other ledgers' records on it. **Check this field before you point a consumer at a bootstrap address**: it is the difference between a working migration and a consumer whose every fetch is refused. See [event-streaming.md](event-streaming.md#your-partition_key_prefix-is-enforced-outside-the-broker-and-it-decides-whether-you-get-a-credential-at-all) for the contract and [kafka-operations.md](kafka-operations.md#the-partition-key-prefix-is-enforced-outside-the-broker) for the grant it implies.
 - **To narrow what the BROKER enforces, narrow the topic grant** — that is the dimension the broker can actually check.

@@ -2252,6 +2252,11 @@ var workerExemptEventStreamingEnv = map[string]string{
 	"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS": "it bounds a call this role does not make",
 	"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS": "the deployment's declaration about what a SUBSCRIBER " +
 		"credential may read, consulted only where credentials are issued",
+	"KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS": "the deployment's declaration about whether a " +
+		"SUBSCRIBER may hold the internal category topic, consulted where a grant is validated and " +
+		"where ACLs are bound — both of which are subscriber-management operations the server " +
+		"serves alone. It cannot affect a capture: an outbox row's destination comes from the event " +
+		"type and the configured prefix, never from who may read the topic",
 	"KAFKA_HISTORICAL_TOPIC_PREFIXES": "a new row's topic is composed from the CONFIGURED prefix alone, so the " +
 		"historical list can never decide whether an insert is accepted; only the publisher, the " +
 		"dead-letter write and replay read stored topics, and all three run in the server",

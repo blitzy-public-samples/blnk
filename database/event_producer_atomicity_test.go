@@ -14,15 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// event_producer_atomicity_test.go exercises the two tables that bring the last two event
-// families under requirement R-2, AGAINST A REAL POSTGRESQL.
+// event_producer_atomicity_test.go exercises the writer-side capture that brings the last two
+// event families under requirement R-2, AGAINST A REAL POSTGRESQL.
 //
-// A mock cannot answer the questions that matter here. The monitor-handoff insert is one
-// statement whose VALUES list is filtered by an EXISTS against blnk.balance_monitors — whether
-// it writes a row depends on the planner resolving that join and on the jsonb casts being in
-// the right place, neither of which a mock evaluates. The batch finalise's guarantee is that a
-// guarded UPDATE and an INSERT commit together, which only a real transaction can demonstrate.
-// The schema's own CHECK constraints are part of the contract too, and a mock has none.
+// Three claims are made here, and they are about transaction boundaries rather than about SQL:
+//
+//   - A `balance.monitor` crossing is decided AND its canonical blnk.event_outbox row inserted
+//     inside the transaction that moved the balance, whenever a BalanceMonitorAlertCapture is
+//     registered — which is what recordBalanceMonitorEvaluation does and what R-2 asks for.
+//   - With no capture registered, the same transaction commits a balance_monitor_handoff instead:
+//     both decision inputs, frozen, for BalanceMonitorHandoffProcessor to convert. That is the
+//     fallback and the drain path for rows written before the in-transaction capture existed.
+//   - A bulk batch's outcome and its summary event commit together.
+//
+// A mock cannot answer any of them. Whether a row is visible after a COMMIT, and invisible after a
+// ROLLBACK, is the whole assertion, and only a real transaction demonstrates it. The monitor read
+// the capture depends on resolves an index on blnk.balance_monitors that a mock does not have, and
+// the schema's own CHECK constraints are part of the contract too.
 //
 // Every test skips when no database is reachable, matching the convention the other real-database
 // tests in this package use.
@@ -35,14 +43,17 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/brianvoe/gofakeit/v6"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // monitoredTestBalance creates a balance, and optionally a monitor on it, returning the
@@ -250,6 +261,314 @@ func countHandoffsForBalance(t *testing.T, ds Datasource, balanceID string) int 
 		`SELECT COUNT(*) FROM blnk.balance_monitor_handoff WHERE balance_id = $1`, balanceID).Scan(&count))
 
 	return count
+}
+
+// storeEventPublishingConfigured installs a configuration that reports event publishing as
+// configured, for the duration of one test, and restores whatever was installed before it.
+//
+// recordBalanceMonitorEvaluation's first gate is config.Configuration.EventPublishingConfigured,
+// which answers false with no brokers — and false there means the whole gate returns without
+// writing anything, so a test that skipped this would assert on a no-op and pass for the wrong
+// reason. The existing handoff tests do not need it because they call the insert directly, beneath
+// the gate.
+//
+// The previous configuration is restored rather than cleared: the store is process-wide, and a
+// zero-value Configuration is not "no configuration" — it answers every lookup with a default the
+// test never chose.
+func storeEventPublishingConfigured(t *testing.T) {
+	t.Helper()
+
+	previous, _ := config.Fetch()
+	t.Cleanup(func() {
+		if previous == nil {
+			config.ConfigStore = atomic.Value{}
+
+			return
+		}
+		config.ConfigStore.Store(previous)
+	})
+
+	replacement := config.Configuration{}
+	if previous != nil {
+		replacement = *previous
+	}
+	if !replacement.EventPublishingConfigured() {
+		replacement.Kafka.Brokers = []string{"localhost:9092"}
+	}
+
+	config.ConfigStore.Store(&replacement)
+}
+
+// stubMonitorAlertCapture installs a BalanceMonitorAlertCapture for the duration of one test and
+// restores whatever was registered before it.
+//
+// The registry is process-wide, so a test that installed one and walked away would silently change
+// the path every later test in this package takes — which is the whole difference between "the
+// writer captures the canonical row" and "the writer commits a handoff". Restoring the previous
+// value rather than clearing it is what lets these tests run in any order.
+//
+// Parameters:
+//   - t *testing.T: the test, for cleanup registration.
+//   - capture BalanceMonitorAlertCapture: the capture to install; nil reaches the handoff fallback.
+func stubMonitorAlertCapture(t *testing.T, capture BalanceMonitorAlertCapture) {
+	t.Helper()
+
+	previous := registeredBalanceMonitorAlertCapture()
+	RegisterBalanceMonitorAlertCapture(capture)
+	t.Cleanup(func() { RegisterBalanceMonitorAlertCapture(previous) })
+}
+
+// monitorAlertRowFor builds the row a real capture would build for one crossing, without importing
+// the root package.
+//
+// It is deliberately minimal: this file is asserting WHERE the row is written and WHETHER it is
+// written, not how the envelope is constructed, which blnk.prepareBalanceMonitorAlertRow owns and
+// the root package's own tests pin. Every column the schema requires NOT NULL is populated so the
+// insert exercises the real statement rather than failing a constraint for a fixture reason.
+func monitorAlertRowFor(balance *model.Balance, monitor model.BalanceMonitor) *model.EventOutbox {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"event": model.EventTypeBalanceMonitor,
+		"data":  monitor,
+	})
+
+	return &model.EventOutbox{
+		EventID:       model.NewEventID(),
+		EventType:     model.EventTypeBalanceMonitor,
+		AggregateID:   monitor.MonitorID,
+		PartitionKey:  balance.LedgerID,
+		LedgerID:      balance.LedgerID,
+		Topic:         "blnk.balances",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       payload,
+		OccurredAt:    time.Now().UTC(),
+		Status:        model.OutboxStatusPending,
+	}
+}
+
+// countMonitorAlertsForLedger returns how many balance.monitor event rows exist for a ledger.
+//
+// The ledger is the right predicate because it is this event type's partition key and ledger
+// column; the alert's aggregate is the MONITOR, so a balance-keyed count would find nothing.
+func countMonitorAlertsForLedger(t *testing.T, ds Datasource, ledgerID string) int {
+	t.Helper()
+
+	var count int
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT COUNT(*) FROM blnk.event_outbox WHERE ledger_id = $1 AND event_type = $2
+	`, ledgerID, model.EventTypeBalanceMonitor).Scan(&count))
+
+	return count
+}
+
+// TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction is the
+// R-2 assertion for `balance.monitor`, and it is the whole point of the in-transaction capture.
+//
+// # The gap it closes
+//
+// The writer used to commit a balance_monitor_handoff row — an INTENT — and leave the canonical
+// blnk.event_outbox row to a second transaction run later by BalanceMonitorHandoffProcessor. That
+// intent is durable and it fixes the verdict at commit time, but it is not the row R-2 names: until
+// the conversion succeeded, the event announcing the crossing did not exist. This asserts the row
+// itself is committed by the transaction that moved the balance, and that no handoff is written
+// alongside it — because writing both would publish one crossing twice under two different event
+// ids, which no subscriber could collapse.
+//
+// It runs against real PostgreSQL because the claim being made is about a transaction boundary:
+// the row is read back only AFTER the commit, from a fresh connection, so a row visible here
+// cannot have been written by anything but that transaction.
+func TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	captured := 0
+	stubMonitorAlertCapture(t, func(_ context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+		captured++
+
+		return monitorAlertRowFor(balance, monitor), nil
+	})
+
+	// The fixture's condition is balance >= 100 at precision 100, so this balance crosses it.
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, nil)
+
+	assert.Equal(t, 1, captured,
+		"the writer must evaluate the monitor itself and ask the capture to build exactly one row")
+	assert.Equal(t, 1, countMonitorAlertsForLedger(t, ds, ledgerID),
+		"the canonical balance.monitor row must be committed by the transaction that moved the balance")
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID),
+		"a handoff written alongside the canonical row would have the processor publish the same "+
+			"crossing a second time under a different event id")
+}
+
+// TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet asserts the writer does not
+// pay for a monitor that did not fire.
+//
+// This is strictly less write amplification than the handoff it replaces. The handoff wrote one
+// jsonb row per MONITORED balance whether or not anything fired, to be drained, evaluated to
+// "nothing fired" and deleted. Evaluating in the transaction means a balance carrying monitors it
+// does not cross costs one indexed read and no write at all.
+func TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	asked := 0
+	stubMonitorAlertCapture(t, func(_ context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+		asked++
+
+		return monitorAlertRowFor(balance, monitor), nil
+	})
+
+	// Below the fixture's >= 100 threshold, so the condition is not met.
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(1)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, nil)
+
+	assert.Zero(t, asked,
+		"the capture must be reached once per CROSSING, not once per monitored balance")
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID))
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID))
+}
+
+// TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered asserts the
+// fallback that keeps a Datasource built without the root service correct.
+//
+// Such a process cannot BUILD an event row — the envelope, the partition-key resolution and the
+// topic binding live in the root package — so if it wrote nothing here, a committed movement would
+// have its alerts decided later against whatever blnk.balance_monitors says then. The handoff is
+// what stops that: both decision inputs, frozen inside the mutation's transaction.
+func TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	stubMonitorAlertCapture(t, nil)
+
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, nil)
+
+	assert.Equal(t, 1, countHandoffsForBalance(t, ds, balanceID),
+		"with no capture registered the movement must still commit its evaluation's inputs")
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID),
+		"and it cannot have built a canonical row, because building one is what it lacks")
+}
+
+// TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated asserts the
+// second gate: the pre-write pass and the writer must not both capture one crossing.
+//
+// The coverage is read from the event rows the transaction is already inserting, so a balance whose
+// alert the caller prepared is skipped entirely — neither re-evaluated nor handed off.
+func TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	asked := 0
+	stubMonitorAlertCapture(t, func(_ context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+		asked++
+
+		return monitorAlertRowFor(balance, monitor), nil
+	})
+
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	// The caller's own alert for this balance, shaped exactly as balancesAlreadyEvaluatedInTx
+	// reads it: the balance id inside the marshalled monitor payload.
+	callerPayload, err := json.Marshal(map[string]interface{}{
+		"event": model.EventTypeBalanceMonitor,
+		"data":  map[string]interface{}{"balance_id": balanceID},
+	})
+	require.NoError(t, err)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, []*model.EventOutbox{
+		{EventType: model.EventTypeBalanceMonitor, Payload: callerPayload},
+	})
+
+	assert.Zero(t, asked, "the writer must not evaluate a balance the caller already evaluated")
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID))
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID),
+		"the caller's own row is inserted by the writer's event loop, not by this gate")
+}
+
+// TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails asserts that a
+// capture failure fails the WRITE.
+//
+// A payload that will not serialise or a partition key that cannot be resolved is a producer
+// defect, not a transient condition, and R-2's whole point is that a mutation whose event cannot be
+// captured must not commit. Committing the movement and logging the failure is the pre-R-2
+// behaviour: it trades a visible failure for an invisible one.
+func TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	stubMonitorAlertCapture(t, func(context.Context, *model.Balance, model.BalanceMonitor) (*model.EventOutbox, error) {
+		return nil, errors.New("the payload could not be serialized")
+	})
+
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	err = recordBalanceMonitorEvaluation(context.Background(), ds, tx, trace.SpanFromContext(context.Background()),
+		[]*model.Balance{moved}, nil)
+	require.Error(t, err, "a capture failure must be returned so the writer rolls back")
+	assert.Contains(t, err.Error(), "balance monitor alert",
+		"the error must name what failed, or an operator reads it as an unrelated statement error")
+
+	require.NoError(t, tx.Rollback())
+
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID))
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID),
+		"a failed capture must not silently fall back to the handoff: the mutation is refused instead")
+}
+
+// TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction guards the one mistake that
+// would look like it worked.
+//
+// Inserting the alert on the connection rather than in the writer's transaction would pass every
+// happy-path assertion while reopening the exact loss window this capture exists to close.
+func TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction(t *testing.T) {
+	_, _, err := captureBalanceMonitorAlertsInTx(context.Background(), Datasource{}, nil,
+		[]*model.Balance{{BalanceID: "bln_x"}},
+		func(context.Context, *model.Balance, model.BalanceMonitor) (*model.EventOutbox, error) {
+			return nil, nil
+		})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Failed to capture balance monitor alerts")
+}
+
+// recordEvaluationInOwnTx runs the writer's monitor gate inside a transaction of its own and
+// commits it, so a row read back afterwards is one the gate committed.
+func recordEvaluationInOwnTx(t *testing.T, ds Datasource, balances []*model.Balance, capturedEvents []*model.EventOutbox) {
+	t.Helper()
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	require.NoError(t, recordBalanceMonitorEvaluation(context.Background(), ds, tx,
+		trace.SpanFromContext(context.Background()), balances, capturedEvents))
+	require.NoError(t, tx.Commit())
 }
 
 // TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance is the assertion that

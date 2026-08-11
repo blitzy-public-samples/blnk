@@ -182,6 +182,15 @@ services:
       # With BLNK_SERVER_SECURE=true and neither this nor the key-scoped model declared,
       # issuance refuses with 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED.
       KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: ${KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS:-false}
+      # THE INTERNAL-TOPIC ACKNOWLEDGEMENT, and it is read in every mode rather than only in
+      # secure mode. "true" acknowledges that a subscriber granted <prefix>.system reads
+      # Blnk's own error text verbatim, for the whole deployment, plus every event type the
+      # catalogue does not yet recognise — that topic being the catch-all as well as
+      # system.error's home. False, the default here, makes the request DTO, the persistence
+      # boundary and the ACL provisioner all refuse that topic in a grant and name this
+      # variable as the remedy. ledger.created needs none of it: it is on <prefix>.ledgers,
+      # an ordinary tenant topic every subscriber may be granted.
+      KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS: ${KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS:-false}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
       # The namespaces this deployment USED TO own, so a KAFKA_TOPIC_PREFIX rename does
       # not strand the events captured before it. Empty in every stack that has never
@@ -198,7 +207,16 @@ services:
       # capability and would imply the role honours a setting it cannot reach.
       KAFKA_HISTORICAL_TOPIC_PREFIXES: ${KAFKA_HISTORICAL_TOPIC_PREFIXES:-}
       # Steady-state producer principal — the identity Blnk publishes ledger events
-      # as, and deliberately NOT the administrator. A publisher authenticating as the
+      # as, and deliberately NOT the administrator.
+      #
+      # ONE RULE FOR THE TWO ROLES: the SERVER publishes and administers; the WORKER
+      # captures outbox rows and holds no Kafka credential at all. The relay and the
+      # dead-letter writer are the only producers in Blnk and both run in the server,
+      # so a worker-side capture — a rejected transaction, say — is a write to
+      # PostgreSQL and the server's relay is what later sends it. That is why the
+      # worker service below receives only KAFKA_BROKERS, KAFKA_TOPIC_PREFIX,
+      # RELAY_MAX_RETRY_ATTEMPTS and the sunset date: what it needs to compose a row's
+      # destination topic and decide dual delivery, and neither credential pair. A publisher authenticating as the
       # administrator holds authority to create topics, mint SCRAM credentials and
       # rewrite ACLs, so a leaked producer credential would compromise the cluster's
       # access model rather than merely permit publishing. The Go publisher REFUSES to
@@ -365,6 +383,7 @@ services:
       BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN:
       BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS:
       BLNK_KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS:
+      BLNK_KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS:
       BLNK_KAFKA_SASL_USER:
       BLNK_KAFKA_SASL_SECRET:
       BLNK_KAFKA_SASL_ADMIN_USER:
@@ -948,32 +967,37 @@ services:
   # then exits.
   #
   # It creates one topic per event category and a dead-letter sibling for each —
-  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, plus
-  # blnk.transactions.dlt and so on, EIGHT names in total — then the sample
+  # blnk.transactions, blnk.balances, blnk.identities, blnk.ledgers and blnk.system,
+  # plus blnk.transactions.dlt and so on, TEN names in total — then the sample
   # subscriber principal and its ACLs. The category list is pinned to
   # model.EventCategory rather than restated, and each .dlt name is derived by
   # appending the suffix, which is what keeps a topic the relay publishes to from
   # ever being a topic nobody created.
   #
-  # There is ONE category beyond the three the requirement names, because two event
-  # types — ledger.created and system.error — belong to none of transactions,
-  # balances or identities while every event formerly delivered by webhook still has
-  # to be published. Both go to blnk.system, which also catches an event type no
-  # mapping recognises, keeping it durable and replayable.
+  # There are TWO categories beyond the three the requirement names, because two event
+  # types — ledger.created and system.error — belong to none of transactions, balances
+  # or identities while every event formerly delivered by webhook still has to be
+  # published. They get a category each rather than sharing one, because their audiences
+  # differ and a topic has only one: ledger.created is a tenant record and goes to
+  # blnk.ledgers, while system.error goes to blnk.system, which also catches an event
+  # type no mapping recognises, keeping it durable and replayable.
   #
-  # blnk.system is NOT GRANTABLE to any subscriber, and it is created all the same. Those
-  # are two different questions and scripts/kafka-provision.sh keeps two lists for them:
-  # EVENT_CATEGORIES is all four, because the relay publishes to all four, while
-  # SUBSCRIBER_GRANTABLE_CATEGORIES is the three tenant categories any explicit
+  # blnk.system is NOT GRANTED BY DEFAULT, and it is created all the same. Those are two
+  # different questions and scripts/kafka-provision.sh keeps two lists for them:
+  # EVENT_CATEGORIES is all five, because the relay publishes to all five, while
+  # SUBSCRIBER_GRANTABLE_CATEGORIES is the four tenant categories any explicit
   # KAFKA_SAMPLE_SUBSCRIBER_TOPICS is checked against. The provisioning summary reports
   # blnk.system as "created, never granted" for exactly that reason.
   #
   # It is withheld because it carries system.error's verbatim internal error text under a
-  # payload requirement R-8 freezes, and because it is the catch-all, so a grant of it would
-  # also stand over every event type nobody has catalogued yet. Making it grantable "but
-  # deliberately" was the previous contract and one grant is all it took to undo. The cost is
-  # that ledger.created, which shares the topic, has no subscriber Kafka route — it stays
-  # published, observable and replayable for an operator. See docs/event-streaming.md.
+  # payload requirement R-8 freezes, and because it is the catch-all, so a grant of it also
+  # stands over every event type nobody has catalogued yet. A subscriber CAN be granted it
+  # through POST /subscribers/{id}/kafka-credentials on a deployment that has declared
+  # KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true and whose grant names the topic — two
+  # declarations, neither implying the other. THIS SCRIPT never grants it whatever that
+  # variable says, because a bring-up script makes no entitlement decision and a sample
+  # principal granted every category would leave the isolation criterion nothing to prove.
+  # See docs/event-streaming.md.
   kafka-init:
     # The SAME profile as the kafka service above, and it has to be the same one: provisioning
     # a broker that is not running cannot succeed, and a broker with no topics is one the relay
@@ -1105,7 +1129,7 @@ services:
       KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-}
       # Narrows the sample grant to a subset of the grantable topics. It CANNOT widen it:
       # every entry is checked against the same allowlist, so a dead-letter topic, the
-      # internal blnk.system topic, or a name outside the four-category catalogue cannot be
+      # internal blnk.system topic, or a name outside the category catalogue cannot be
       # granted through it.
       KAFKA_SAMPLE_SUBSCRIBER_TOPICS: ${KAFKA_SAMPLE_SUBSCRIBER_TOPICS:-}
 

@@ -266,16 +266,35 @@ data:
   # "false" ships, so a cluster that turns on BLNK_SERVER_SECURE has to choose.
   KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: "false"
 
+  # THE INTERNAL-TOPIC ACKNOWLEDGEMENT, and unlike the declaration above it is read
+  # in every mode rather than only in secure mode.
+  #
+  # "true" acknowledges that a subscriber granted blnk.system reads Blnk's own error
+  # text verbatim — a PostgreSQL error naming schema, table, column and routine; a
+  # broker error naming internal addresses — for the whole cluster, plus every event
+  # type the catalogue does not yet recognise, that topic being the catch-all as
+  # well as system.error's home. The payload is frozen by the event schema, so the
+  # disclosure cannot be narrowed by redaction; only an operator knows whether this
+  # cluster's subscribers may see its internals.
+  #
+  # It changes exactly one thing: whether blnk.system may appear in a subscriber's
+  # authorized_topics. "false" ships, and with it the request DTO, the persistence
+  # boundary and the ACL provisioner all refuse that name and say which variable
+  # would allow it. Publishing is unaffected either way — the topic is created and
+  # written to regardless. ledger.created needs none of this: it is on
+  # blnk.ledgers, an ordinary tenant topic.
+  KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS: "false"
+
   # The prefix every topic name derives from: the category topics
-  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, and their
-  # blnk.<category>.dlt dead-letter siblings — eight owned topics. THREE of those
-  # category topics are grantable to a subscriber, per subscriber: transactions,
-  # balances and identities. blnk.system is NOT grantable — it carries
-  # system.error's verbatim internal error text and is the catch-all for any
-  # uncatalogued event type, so it is an operator topic. No dead-letter topic is
-  # ever grantable either. ledger.created shares blnk.system and therefore has no
-  # subscriber Kafka route; it stays published, observable and replayable for an
-  # operator. See docs/event-streaming.md.
+  # blnk.transactions, blnk.balances, blnk.identities, blnk.ledgers and blnk.system,
+  # and their blnk.<category>.dlt dead-letter siblings — ten owned topics. FOUR of
+  # those category topics are grantable to a subscriber, per subscriber:
+  # transactions, balances, identities and ledgers. blnk.system is outside that
+  # default set — it carries system.error's verbatim internal error text and is the
+  # catch-all for any uncatalogued event type, so it is an operator topic and is
+  # grantable only where KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS is set above. No
+  # dead-letter topic is ever grantable, whatever is declared. See
+  # docs/event-streaming.md.
   KAFKA_TOPIC_PREFIX: "blnk"
 
   # The topic namespaces this deployment USED TO own and must still be able to publish
@@ -348,8 +367,10 @@ data:
   #
   # Running on it means the pod that serves the API also holds unconditional
   # authority over every ACL and SCRAM credential in the cluster. It affects the
-  # server alone: the worker projects no producer credential and no administrative
-  # credential, so there is nothing for this flag to choose between there.
+  # server alone, and for two reasons rather than one: the worker projects no producer
+  # credential and no administrative credential, so there is nothing for this flag to
+  # choose between there — and the worker builds no producer at all, since it captures
+  # outbox rows and the server's relay is what publishes them.
   KAFKA_ALLOW_ADMIN_PRODUCER: "false"
 
   # The SASL/SCRAM principal used ONLY for provisioning — topic assurance,
@@ -358,8 +379,10 @@ data:
   # what KAFKA_SASL_USER above is for.
   #
   # IT REACHES THE SERVER ONLY, AND THAT SPLIT IS ALREADY IMPLEMENTED. cmd/server.go
-  # is the one process that builds a Kafka admin client; the worker publishes and
-  # drains asynq queues and never does. Both Deployments name each ConfigMap key
+  # is the one process that builds a Kafka admin client — and the one that builds a
+  # PRODUCER. The worker drains asynq queues and CAPTURES event rows into
+  # blnk.event_outbox; it publishes nothing, because every capture site funnels into
+  # Blnk.publishEvent, which inserts a row and never touches a broker. Both Deployments name each ConfigMap key
   # individually rather than using envFrom, which is what makes the asymmetry
   # expressible: server-deployment.yaml projects this key and pairs it with
   # `kafka-credentials/admin-secret`, and worker-deployment.yaml projects NEITHER

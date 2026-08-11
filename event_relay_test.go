@@ -1794,7 +1794,14 @@ func TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens(t *testing.T) {
 	assert.NotContains(t, err.Error(), "WEBHOOK_DEPRECATION_START_DATE",
 		"and it must not name a retired key")
 
-	harness.processor.Start(context.Background())
+	// AND THE OBSTACLE REACHES THE CALLER (CR-2). Start used to log this and return nothing,
+	// so cmd/server.go could not see it and served anyway — with brokers configured and no
+	// relay, every producer captured a row that NEITHER transport would deliver.
+	startErr := harness.processor.Start(context.Background())
+	require.Error(t, startErr, "Start must return the obstacle, not only log it")
+	assert.Equal(t, err.Error(), startErr.Error(),
+		"and it must be the SAME obstacle startupObstacle reports, so the process fails with the "+
+			"remedy in it rather than with a generic message")
 	assert.False(t, harness.processor.IsRunning(), "and it must not be running")
 	harness.processor.Stop()
 
@@ -1858,7 +1865,12 @@ func TestEventRelayProcessor_RefusesToStartWithAnUnusableWindow(t *testing.T) {
 			assert.Contains(t, err.Error(), "WEBHOOK_DEPRECATION_SUNSET_DATE",
 				"the error must name the variable an operator has to set, or it is not actionable")
 
-			harness.processor.Start(context.Background())
+			startErr := harness.processor.Start(context.Background())
+			require.Error(t, startErr,
+				"Start must RETURN the obstacle: a logged-and-discarded refusal is how a "+
+					"deployment came to serve while draining nothing")
+			assert.Equal(t, err.Error(), startErr.Error(),
+				"and it must be the same obstacle, so the variable to set survives the return")
 			assert.False(t, harness.processor.IsRunning(), "and it must not be running")
 			harness.processor.Stop()
 		})
@@ -1891,10 +1903,18 @@ func TestNewEventRelayProcessor_IsNilSafe(t *testing.T) {
 		"the schedule is still resolved so the value is fully formed")
 
 	assert.NotPanics(t, func() {
-		processor.Start(context.Background())
+		assert.Error(t, processor.Start(context.Background()),
+			"a processor built from nothing must return its refusal rather than only logging it")
 		processor.Stop()
 	})
 	assert.False(t, processor.IsRunning(), "a refused Start must not report as running")
+
+	var nilStart *EventRelayProcessor
+	assert.NotPanics(t, func() {
+		assert.Error(t, nilStart.Start(context.Background()),
+			"a nil receiver must answer with an error rather than panicking; the return type is "+
+				"now what a caller branches on")
+	})
 
 	var absent *EventRelayProcessor
 	assert.NotPanics(t, func() {
@@ -1945,9 +1965,14 @@ func TestEventRelayProcessor_RefusesToStartWithoutAUsableTransport(t *testing.T)
 			assert.Contains(t, obstacle.Error(), testCase.needle,
 				"the refusal must name what is missing")
 
-			harness.processor.Start(context.Background())
+			startErr := harness.processor.Start(context.Background())
 			t.Cleanup(harness.processor.Stop)
 
+			require.Error(t, startErr,
+				"Start must return the obstacle so the process that owns the lifecycle can refuse "+
+					"to serve; logging alone is what let this state ship")
+			assert.Equal(t, obstacle.Error(), startErr.Error(),
+				"and it must be the same obstacle, naming what is missing")
 			assert.False(t, harness.processor.IsRunning(), "a refused Start must not run")
 			assert.Empty(t, harness.store.snapshotClaims(),
 				"a refused relay must not claim a single row")
@@ -2025,9 +2050,12 @@ func TestEventRelayProcessor_StartIsIdempotent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	harness.processor.Start(ctx)
-	harness.processor.Start(ctx)
-	harness.processor.Start(ctx)
+	// EVERY Start MUST ANSWER nil, including the two that do nothing. Idempotency is the
+	// contract — cmd/server.go refuses to serve when Start reports an obstacle — so a repeated
+	// call that reported one would make a harmless double start look like a real refusal.
+	require.NoError(t, harness.processor.Start(ctx))
+	require.NoError(t, harness.processor.Start(ctx), "a second Start is a no-op, not an obstacle")
+	require.NoError(t, harness.processor.Start(ctx), "and so is a third")
 
 	require.True(t, harness.processor.IsRunning())
 
@@ -2072,14 +2100,16 @@ func TestEventRelayProcessor_StartAfterStopRunsAgain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx))
 	require.Eventually(t, func() bool { return len(harness.store.snapshotClaims()) > 0 },
 		2*time.Second, 5*time.Millisecond, "the first run must poll")
 	harness.processor.Stop()
 
 	claimsAfterFirstRun := len(harness.store.snapshotClaims())
 
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx),
+		"a relay that was stopped and started again must not report an obstacle: Stop clears the "+
+			"running flag, it does not withdraw a precondition")
 	require.True(t, harness.processor.IsRunning(), "a restarted relay must report as running")
 	require.Eventually(t, func() bool {
 		return len(harness.store.snapshotClaims()) > claimsAfterFirstRun
@@ -2095,7 +2125,7 @@ func TestEventRelayProcessor_ContextCancellationStopsTheLoop(t *testing.T) {
 	harness.processor.WithPollInterval(5 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx))
 
 	require.Eventually(t, func() bool { return len(harness.store.snapshotClaims()) > 0 },
 		2*time.Second, 5*time.Millisecond, "the relay must be polling before cancellation")
@@ -2125,7 +2155,7 @@ func TestEventRelayProcessor_StopWaitsForInFlightWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx))
 
 	select {
 	case <-hit:
@@ -2174,10 +2204,14 @@ func TestEventRelayProcessor_IsRunningTracksTheLifecycle(t *testing.T) {
 
 	assert.False(t, harness.processor.IsRunning(), "before Start: not running")
 
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx), "a usable relay must start")
 	assert.True(t, harness.processor.IsRunning(), "after Start: running")
 
-	harness.processor.Start(ctx)
+	// A SECOND Start RETURNS NIL, and that is a contract rather than an accident: the caller
+	// asked for a draining relay and there is one. cmd/server.go refuses to serve on a
+	// non-nil return, so an error here would turn a harmless double call into a failed boot.
+	assert.NoError(t, harness.processor.Start(ctx),
+		"an idempotent second Start must not report the running relay as a refusal")
 	assert.True(t, harness.processor.IsRunning(),
 		"an ignored second Start must leave the flag alone rather than toggling it")
 
@@ -2187,7 +2221,8 @@ func TestEventRelayProcessor_IsRunningTracksTheLifecycle(t *testing.T) {
 	harness.processor.Stop()
 	assert.False(t, harness.processor.IsRunning(), "a second Stop must leave it that way")
 
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx),
+		"a restart after two Stops must not report an obstacle")
 	assert.True(t, harness.processor.IsRunning(), "after a restart: running again")
 	harness.processor.Stop()
 	assert.False(t, harness.processor.IsRunning(), "and stoppable again")
@@ -2198,7 +2233,9 @@ func TestEventRelayProcessor_IsRunningTracksTheLifecycle(t *testing.T) {
 	refused := newRelayHarness(t)
 	refused.processor.publisher = nil
 
-	refused.processor.Start(ctx)
+	assert.Error(t, refused.processor.Start(ctx),
+		"and the refusal must be RETURNED as well as reflected in the flag, so a caller that "+
+			"never reads IsRunning still cannot serve over it")
 	t.Cleanup(refused.processor.Stop)
 
 	assert.False(t, refused.processor.IsRunning(),
@@ -2225,7 +2262,7 @@ func TestEventRelayProcessor_AClaimFailureDoesNotStopTheLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	harness.processor.Start(ctx)
+	require.NoError(t, harness.processor.Start(ctx))
 	t.Cleanup(harness.processor.Stop)
 
 	require.Eventually(t, func() bool { return len(harness.store.snapshotClaims()) >= 3 },

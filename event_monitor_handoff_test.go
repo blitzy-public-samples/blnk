@@ -686,11 +686,11 @@ func TestBalanceMonitorHandoffProcessor_RejectsUnusableConfiguration(t *testing.
 func TestBalanceMonitorHandoffEnabled_TracksTheOneSharedPredicate(t *testing.T) {
 	withBrokers := newOutboxBlnk(t, outboxPublishingConfiguration(), new(mocks.MockDataSource))
 	assert.True(t, withBrokers.balanceMonitorHandoffEnabled(),
-		"with a broker configured the handoff owns monitor capture")
+		"with a broker configured the writer owns monitor capture")
 
 	brokerless := newOutboxBlnk(t, &config.Configuration{}, new(mocks.MockDataSource))
 	assert.False(t, brokerless.balanceMonitorHandoffEnabled(),
-		"with no broker there is nothing to drain a handoff, so the post-commit path must own it")
+		"with no broker there is no outbox to capture into, so the post-commit path must own it")
 	assert.False(t, brokerless.bulkBatchCoordinationEnabled(),
 		"and the batch coordinator is gated on exactly the same fact")
 

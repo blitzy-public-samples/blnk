@@ -259,7 +259,7 @@ const (
 // disclosure channel, publishing whatever string was stored to anyone who can read
 // /metrics.
 //
-// A Blnk-owned name is a member of a small, enumerable set — prefix times four categories,
+// A Blnk-owned name is a member of a small, enumerable set — prefix times the five categories,
 // times the optional `.dlt` suffix — so it is safe to report verbatim, and reporting it is
 // what makes the dead-letter-rate and per-topic queries in docs/metrics.md work. Anything
 // else collapses to one fixed label: the series count stays bounded, and the anomaly is
@@ -277,7 +277,7 @@ func boundedTopicLabel(topic string) string {
 	// name to the "unowned" label would report a legitimate delivery as an anomaly — and
 	// would hide, behind one shared series, exactly the traffic an operator draining that
 	// generation needs to watch. The set stays bounded because the allowlist is bounded by
-	// config.MaxHistoricalTopicPrefixes: at most (1 + 4) prefixes times four categories
+	// config.MaxHistoricalTopicPrefixes: at most (1 + 4) prefixes times the five categories
 	// times the optional `.dlt` suffix.
 	if IsOwnedTopicUnderAnyConfiguredPrefix(topic) {
 		return topic
@@ -1425,17 +1425,39 @@ var (
 // instance with nothing but a Redis DSN configured, and this must not turn that into a
 // network call, a delay, or an error.
 //
-// The returned publisher owns writers for every topic Blnk owns — the four category topics
-// and their four dead-letter siblings, eight in all — enumerated from AllTopicsWithDeadLetters
+// The returned publisher owns writers for every topic Blnk owns — the five category topics
+// and their five dead-letter siblings, ten in all — enumerated from AllTopicsWithDeadLetters
 // so that this file and the provisioning path work from one list.
 //
-// The errors it can return both come from the administrative SASL credential: the pair
-// is half-configured (exactly one of KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET
-// set), or the credentials cannot be prepared because SASLprep rejects the username or
-// password. Both ARE fatal misconfigurations and must not be silently downgraded to the
-// no-op: silently publishing nothing because a password was malformed, or publishing
-// anonymously because a username was missing, are precisely the failure modes the loud
-// error prevents.
+// # WHAT IT CAN FAIL ON, and it is the whole transport rather than one credential
+//
+// Every check below is a FATAL MISCONFIGURATION and none is silently downgraded to the
+// no-op. Publishing nothing because a password was malformed, publishing anonymously
+// because a username was missing, or publishing ledger amounts and identity records in
+// cleartext because TLS material could not be read, are precisely the outcomes the loud
+// error prevents — and the no-op is reserved for the one honest case, which is no brokers
+// configured at all.
+//
+// Four groups, in the order they are evaluated:
+//
+//   - THE ADMINISTRATIVE PAIR, via config.ValidateSASLAdminCredentials: half-configured,
+//     with exactly one of KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET set.
+//   - THE PRODUCER CREDENTIAL, which is the pair this publisher actually authenticates
+//     with. NewKafkaTransport resolves it for KafkaTransportRoleProducer, so a
+//     half-configured KAFKA_SASL_USER / KAFKA_SASL_SECRET pair, or a producer credential
+//     that SASLprep rejects, fails here exactly as the administrative pair does. It also
+//     refuses to borrow the administrative pair as a producer unless
+//     KAFKA_ALLOW_ADMIN_PRODUCER says so deliberately.
+//   - TLS MATERIAL: a CA file, client certificate or key that cannot be read or does not
+//     parse, or a configuration that asks for TLS it cannot assemble.
+//   - THE PLAINTEXT POLICY: brokers configured with neither TLS nor the explicit
+//     KAFKA_INSECURE_LOCAL_DEV acknowledgement, which is refused rather than dialled in
+//     the clear.
+//
+// The transport checks are shared with the ADMIN client through NewKafkaTransport, so the
+// two paths cannot diverge on what they accept. A previous version of this comment named
+// only the administrative credential as the error surface, which would have an operator
+// diagnosing a producer, TLS or plaintext refusal by inspecting the wrong pair of variables.
 //
 // Parameters:
 //   - cnf *config.Configuration: the loaded configuration. May be nil.
@@ -1443,7 +1465,9 @@ var (
 // Returns:
 //   - EventPublisher: the Kafka publisher when brokers are configured, otherwise the
 //     no-op. Never nil when the error is nil.
-//   - error: non-nil only when configured SASL credentials cannot be prepared.
+//   - error: non-nil when the transport cannot be assembled from the configuration —
+//     administrative or producer SASL credentials, TLS material, or the plaintext policy.
+//     Never returned for an unconfigured deployment, which is the no-op.
 func NewEventPublisher(cnf *config.Configuration) (EventPublisher, error) {
 	if cnf == nil {
 		logrus.Debug(

@@ -87,19 +87,19 @@ const logIdentifierHashLength = logsafe.IdentifierHashLength
 //
 // The number is a literal because a const cannot call a function, which makes it exactly the
 // kind of value that goes stale when a category is added or removed. It HAS gone stale in both
-// directions: it read 16 while the catalogue briefly carried five categories, and it read 20
-// after the catalogue was returned to its frozen four. Nothing failed at build or run time
-// either time. TestMaxLazyTopicWriters_IsTwoPrefixGenerations ties it back to the inventory so
-// the arithmetic is checked rather than trusted, which is what turns that silent staleness into
-// a failing test.
+// directions: it read 16 against a five-category catalogue, and 20 against a four-category one.
+// Nothing failed at build or run time either time.
+// TestMaxLazyTopicWriters_IsTwoPrefixGenerations ties it back to the inventory so the
+// arithmetic is checked rather than trusted, which is what turns that silent staleness into a
+// failing test.
 //
-// Four categories → 8 writers per generation → 16 for two.
+// Five categories → 10 writers per generation → 20 for two.
 //
 // Past the bound the oldest lazily-created writer is retired. Retirement is an eviction and
 // never a refusal: a retired topic published to again simply gets a new writer, so bounding
 // this cache costs at most one reconnection for a topic that has not been used recently, and
 // prevents a pool of connections that only ever grows.
-const maxLazyTopicWriters = 16
+const maxLazyTopicWriters = 20
 
 // PublishPurpose distinguishes the three reasons a message is written, so that one event's
 // telemetry cannot be confused with another's.

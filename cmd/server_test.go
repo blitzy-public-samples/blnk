@@ -469,8 +469,15 @@ func TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable(t *testi
 
 			// A nil instance is deliberate: it makes the assertion structural. If this branch
 			// ever built a relay, it would be building one from nothing.
-			stop := startEventRelay(context.Background(), nil, cfg)
+			stop, err := startEventRelay(context.Background(), nil, cfg)
 
+			// NIL ERROR, and this is the half of CR-2's fix that had to not break: the relay
+			// now returns its startup obstacle and runServer refuses to serve over one, so an
+			// error here would make every Kafka-less deployment — the shipped default — fail
+			// to start. No brokers is a steady state, not an obstacle.
+			assert.NoError(t, err,
+				"a deployment with no brokers must start cleanly: this is the documented "+
+					"graceful-degradation contract, not a misconfiguration")
 			assert.NotContains(t, stopperSymbol(t, stop), "EventRelayProcessor",
 				"no relay may be constructed without brokers: its publisher would be the no-op one, "+
 					"which reports every publish as dispatched while sending nothing")
@@ -480,8 +487,11 @@ func TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable(t *testi
 	}
 
 	t.Run("a nil configuration", func(t *testing.T) {
-		stop := startEventRelay(context.Background(), nil, nil)
+		stop, err := startEventRelay(context.Background(), nil, nil)
 
+		assert.NoError(t, err,
+			"an unloaded configuration resolves to no brokers, which is the steady state and not "+
+				"an obstacle to serving")
 		assert.NotContains(t, stopperSymbol(t, stop), "EventRelayProcessor",
 			"an unloaded configuration must not be read as a configured broker list")
 
@@ -514,7 +524,18 @@ func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testi
 	}
 
 	started := time.Now()
-	stop := startEventRelay(context.Background(), nil, cfg)
+	stop, err := startEventRelay(context.Background(), nil, cfg)
+
+	// THE OBSTACLE IS RETURNED NOW (CR-2), and this instance has one: the Blnk instance is nil,
+	// so the relay has no datasource and no publisher. That is exactly the shape of refusal
+	// runServer must not serve over, and asserting it here is what proves the value reaches the
+	// caller rather than being logged and dropped as it was before.
+	require.Error(t, err,
+		"a relay that refused to start must say so to its caller: a logged-and-discarded refusal "+
+			"is how a deployment came to capture outbox rows that neither transport would deliver")
+	assert.Contains(t, err.Error(), "KAFKA_BROKERS",
+		"the returned error must name what the operator has to change, because the obstacle alone "+
+			"says what is wrong and not what it costs")
 
 	// The property protected here is unchanged — the returned stop must really shut the relay
 	// down, because a local no-op means nothing drains the outbox — but PERF-P18 changed the
@@ -539,6 +560,60 @@ func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testi
 	assert.Less(t, time.Since(started), eventTopicAssuranceTimeout,
 		"an unreachable broker must not hold start-up for the whole assurance budget: it is refused, "+
 			"logged and stepped past")
+}
+
+// TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of the
+// TestRunServer_RefusesToServeWhenTheEventRelayRefusesToStart is the process-visibility half of
+// CR-2, and it is the half that decides whether the refusal costs anything.
+//
+// # The state being closed
+//
+// Take a deployment with KAFKA_BROKERS set and a dual-delivery window that has not opened yet —
+// a plain configuration mistake, and one the loader accepts because a future start date is a
+// legitimate thing to write down. Every producer captures its event into blnk.event_outbox
+// inside the ledger transaction, exactly as designed. The relay then refuses, because publishing
+// to Kafka while enqueuing no legacy webhooks would silently cut off every subscriber that has
+// not migrated. So NEITHER transport delivers: no Kafka publish, because the relay is not
+// running, and no legacy webhook, because the relay is the only thing that enqueues one during
+// the window.
+//
+// The process used to serve anyway. It bound its listener, answered health checks, accepted
+// transactions, and accumulated undeliverable rows behind a single ERROR line at boot. Nor could
+// it recover: the obstacle is evaluated once per process, so the relay stayed stopped even after
+// the window opened. Refusing to serve converts that into a failed boot with the remedy in the
+// message, which is the only signal an operator reliably acts on.
+//
+// # Why this is asserted against the source text
+//
+// runServer cannot be executed in a unit test: it loads configuration, binds a listener, needs a
+// database, a router and a TypeSense client, and blocks. The property is STRUCTURAL — that the
+// returned error is propagated rather than assigned and dropped, and that the stopper's defer is
+// registered BEFORE the check so a topic-assurance pass already running is still joined — and
+// the source is the artefact that carries it. startEventRelay's own behaviour is covered
+// above by TestStartEventRelay_*.
+func TestRunServer_RefusesToServeWhenTheEventRelayRefusesToStart(t *testing.T) {
+	body := functionBody(t, "runServer")
+
+	assert.Contains(t, body, "stopEventRelay, relayErr := startEventRelay(ctx, b.blnk, cfg)",
+		"runServer must take the relay's startup obstacle; discarding it with _ is the defect, "+
+			"because then nothing in the process can tell a running relay from a refused one")
+
+	assignAt := strings.Index(body, "stopEventRelay, relayErr := startEventRelay(ctx, b.blnk, cfg)")
+	deferAt := strings.Index(body, "defer stopEventRelay()")
+	returnAt := strings.Index(body, "return relayErr")
+
+	require.Positive(t, assignAt)
+	require.Positive(t, deferAt, "the stopper must still be deferred")
+	require.Positive(t, returnAt,
+		"the obstacle must be RETURNED, so the Cobra RunE exits non-zero and the listener never "+
+			"binds. Logging it and serving is what let a deployment capture rows that neither "+
+			"transport would ever deliver")
+
+	assert.Less(t, assignAt, deferAt)
+	assert.Less(t, deferAt, returnAt,
+		"the defer must be registered BEFORE the refusal returns: startEventRelay may already "+
+			"have started a background topic-assurance pass, and that pass has to be joined on "+
+			"the way out even when the relay itself never ran")
 }
 
 // TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of the

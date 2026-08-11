@@ -144,17 +144,29 @@ spec:
   # kafka-data-kafka-0, -1 and -2 and re-binds each to the same ordinal across
   # restarts.
   #
-  # THERE IS NO STANDALONE KAFKA PVC MANIFEST, deliberately. This folder used to
-  # carry a Kompose-generated kafka-data-persistentvolumeclaim.yaml declaring one
-  # 10Gi ReadWriteOnce claim named kafka-data, and it was removed rather than kept
-  # as documentation: nothing mounted it, so applying the folder provisioned a
-  # tenth of a terabyte-hour of storage nobody read, and its name collided
-  # confusingly with the per-ordinal claims the template really creates. It could
-  # never have been the brokers' storage either — one ReadWriteOnce claim is
-  # mountable by one node at a time, whereas each broker needs its own KRaft
-  # metadata log, and three brokers writing into one log directory corrupt it
-  # rather than reporting an error. The claim's shape now lives in exactly one
-  # place, the volumeClaimTemplates entry itself.
+  # THE SINGLETON PVC MANIFEST WAS REMOVED; THREE OPTIONAL PER-ORDINAL CLAIMS
+  # REPLACED IT. This folder used to carry a Kompose-generated
+  # kafka-data-persistentvolumeclaim.yaml declaring ONE 10Gi ReadWriteOnce claim
+  # named `kafka-data`, and that object is gone: nothing mounted it, so applying
+  # the folder provisioned storage nobody read, and its name collided confusingly
+  # with the per-ordinal claims the template really creates. It could never have
+  # been the brokers' storage either — one ReadWriteOnce claim is mountable by one
+  # node at a time, whereas each broker needs its own KRaft metadata log, and three
+  # brokers writing into one log directory corrupt it rather than reporting an
+  # error.
+  #
+  # WHAT EXISTS NOW, under the same file name, is three claims — kafka-data-kafka-0,
+  # -1 and -2 — matching the names Kubernetes derives from the template, and they
+  # are OPTIONAL: applying that file BEFORE this StatefulSet pre-provisions them and
+  # the StatefulSet adopts each one, while applying it afterwards or not at all is
+  # equally valid because the StatefulSet creates the same three itself. Its reason
+  # for existing is pre-provisioning — a chosen storageClassName, a bound volume
+  # verified before the brokers start — not being the source of the claim shape.
+  #
+  # So the volumeClaimTemplates entry remains the single definition of a broker
+  # volume's shape, and kafka-data-persistentvolumeclaim.yaml is a pre-provisioning
+  # convenience that must agree with it. Change the size in one and change it in the
+  # other.
   selector:
     io.kompose.service: kafka
 status:

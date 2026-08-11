@@ -88,10 +88,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/brianvoe/gofakeit/v6"
@@ -133,6 +135,48 @@ const testSettlementLease = 30 * time.Second
 // value applied by normalizeDeadLetterHandoffLease, so the tests could not tell a supplied
 // lease from a normalised one. A distinct value makes the argument observable.
 const testDeadLetterHandoffLease = 45 * time.Second
+
+// storeSubscriberInternalTopicAccess installs a configuration declaring — or withholding —
+// subscriber access to the internal category topic, and restores the previous one on cleanup.
+//
+// It exists because the persistence boundary's allowlist is a FUNCTION of that declaration,
+// read from config.Fetch rather than taken as an argument (see
+// subscriberInternalTopicAccessDeclared for why), so a test that could not set it could only
+// ever assert one of the two states.
+//
+// THE PREVIOUS VALUE IS PUT BACK. config.ConfigStore is process-wide, and this package's
+// real-database tests deliberately install nothing into it; a helper that left a fixture behind
+// would hand every later test in the package a configuration it never asked for. The prefix and
+// broker fields are carried over from whatever was already stored so that only the one field
+// under test changes.
+//
+// Parameters:
+//   - t *testing.T: the test, for Helper and Cleanup.
+//   - declared bool: whether the deployment acknowledges the internal-topic grant.
+func storeSubscriberInternalTopicAccess(t *testing.T, declared bool) {
+	t.Helper()
+
+	previous, _ := config.Fetch()
+	t.Cleanup(func() {
+		if previous == nil {
+			// Nothing was installed, so nothing may be left installed. A zero-value
+			// Configuration is not "no configuration" — it answers every lookup with a
+			// default the test never chose.
+			config.ConfigStore = atomic.Value{}
+
+			return
+		}
+		config.ConfigStore.Store(previous)
+	})
+
+	replacement := config.Configuration{}
+	if previous != nil {
+		replacement = *previous
+	}
+	replacement.Kafka.SubscriberInternalTopicAccess = declared
+
+	config.ConfigStore.Store(&replacement)
+}
 
 // requireAPIError asserts that err is an apierror.APIError carrying the expected code.
 //
@@ -8779,13 +8823,15 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		"the composed grantable list must itself be accepted, or two layers disagree")
 
 	refused := map[string]string{
-		"the any-resource wildcard":              "*",
-		"a wildcarded category":                  "blnk.*",
-		"a foreign topic":                        "attacker.transactions",
-		"a dead-letter topic":                    "blnk.transactions.dlt",
-		"the internal system topic":              "blnk.system",
-		"the system dead-letter":                 "blnk.system.dlt",
-		"a category this contract does not have": "blnk.ledgers",
+		"the any-resource wildcard": "*",
+		"a wildcarded category":     "blnk.*",
+		"a foreign topic":           "attacker.transactions",
+		"a dead-letter topic":       "blnk.transactions.dlt",
+		"the internal system topic": "blnk.system",
+		"the system dead-letter":    "blnk.system.dlt",
+		// The singular form of a real category. ledger.created is published to
+		// blnk.ledgers, so blnk.ledger is the plausible typo and a name nothing creates.
+		"the singular form of a real category": "blnk.ledger",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -8793,24 +8839,40 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS REFUSED AT THIS LAYER TOO, and it is worth saying so here rather
-	// than leaving it as one entry in the table above.
+	// THE SYSTEM CATEGORY IS REFUSED AT THIS LAYER TOO BY DEFAULT, and it is worth saying so
+	// here rather than leaving it as one entry in the table above.
 	//
 	// `blnk.system` carries `system.error`, whose payload is the FROZEN legacy body and
 	// therefore renders the error text as it comes — a PostgreSQL error names schema, table,
 	// column and routine; a broker error names internal addresses — and R-8 forbids narrowing
-	// that body. It is also the catalogue's catch-all. So it is an OPERATOR topic, and the
-	// refusal lives in one place, model.SubscriberGrantableEventCategories, which the DTO, this
-	// persistence boundary and the ACL provisioner all read.
+	// that body. It is also the catalogue's catch-all. So it is an OPERATOR topic unless the
+	// deployment says otherwise, and that decision lives in one place,
+	// model.SubscriberPrivilegedEventCategories resolved against
+	// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, which the DTO, this persistence boundary and the
+	// ACL provisioner all read.
 	//
 	// This layer matters because it is the door a caller reaches WITHOUT the DTO: a service, CLI
-	// or migration caller writing a row directly. A row seeded past both would still be refused
-	// at issuance, but it would already describe a grant the deployment does not permit.
+	// or migration caller writing a row directly. Such a caller cannot supply the answer either
+	// — subscriberInternalTopicAccessDeclared reads the deployment's own configuration rather
+	// than taking an argument — so the acknowledgement is the deployment's and not the caller's.
 	//
-	// The cost is that `ledger.created` — which shares the topic — has no subscriber Kafka
-	// route. It is still captured, published, observable and replayable for an operator.
-	t.Run("refuses the internal system category", func(t *testing.T) {
+	// `ledger.created` is unaffected: it is on `blnk.ledgers`, a tenant category granted like
+	// any other, so nothing about withholding this topic costs a subscriber a ledger event.
+	t.Run("refuses the internal system category by default", func(t *testing.T) {
 		requireAPIError(t, requireGrantableTopics([]string{"blnk.system"}), apierror.ErrInvalidInput)
+	})
+
+	t.Run("accepts the internal system category once the deployment declares it", func(t *testing.T) {
+		// The complement, and the reason the refusal above is not vacuous: a boundary that
+		// refused the topic under EVERY configuration would pass the refusal case while making
+		// the acknowledgement a variable that does nothing.
+		storeSubscriberInternalTopicAccess(t, true)
+
+		assert.NoError(t, requireGrantableTopics([]string{"blnk.system"}),
+			"the acknowledged deployment must be able to record the grant the API will make")
+		// And the acknowledgement must NOT reach the dead-letter sibling, which has no
+		// subscriber audience under any configuration.
+		requireAPIError(t, requireGrantableTopics([]string{"blnk.system.dlt"}), apierror.ErrInvalidInput)
 	})
 
 	t.Run("refuses an offending topic in any position", func(t *testing.T) {
@@ -8822,14 +8884,24 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 	t.Run("the persistence allowlist matches the model allowlist exactly", func(t *testing.T) {
 		// One answer to "which topics may a subscriber be granted?", checked rather
 		// than assumed: drift between layers means a topic one refuses and another
-		// grants.
-		prefixes := grantableTopicPrefixes()
-		composed := model.SubscriberGrantableTopics(configuredEventTopicPrefix())
+		// grants. Asserted in BOTH deployment states, because the allowlist is now a
+		// function of one and a layer that ignored it would agree in one state only.
+		for name, declared := range map[string]bool{
+			"undeclared": false,
+			"declared":   true,
+		} {
+			t.Run(name, func(t *testing.T) {
+				storeSubscriberInternalTopicAccess(t, declared)
 
-		assert.Len(t, prefixes, len(composed))
-		for _, topic := range composed {
-			_, present := prefixes[topic]
-			assert.True(t, present, "%q is grantable per model but absent here", topic)
+				prefixes := grantableTopicPrefixes()
+				composed := model.SubscriberAuthorizableTopics(configuredEventTopicPrefix(), declared)
+
+				assert.Len(t, prefixes, len(composed))
+				for _, topic := range composed {
+					_, present := prefixes[topic]
+					assert.True(t, present, "%q is authorizable per model but absent here", topic)
+				}
+			})
 		}
 	})
 }
@@ -11159,6 +11231,37 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 	marker := newRealEventOutboxMarker("purgelog")
 	quiesceEventOutbox(t, ds, marker)
 
+	cutoff := dbTimestamp(time.Now().AddDate(0, 0, -30))
+
+	// DRAIN THE ELIGIBLE ROWS FIRST, and take the baseline after.
+	//
+	// A delta is not sufficient isolation on its own. The delete is TABLE-WIDE by design —
+	// retention sweeps the outbox, not one test's fixtures — so any terminal row already older
+	// than the cutoff is removed by this test's own purge and counted in the same log row.
+	// quiesceEventOutbox cannot prevent that: it removes rows carrying THIS test's marker, and
+	// the rows in question belong to whatever ran before.
+	//
+	// It happened. A suite run left 36 dispatched rows dated a year back, and the confirmed-
+	// subset assertion below read 38 where it expected 2 — a failure that says nothing about the
+	// purge log and everything about the table it ran against.
+	//
+	// Draining first makes the later delta attributable, WITHOUT weakening the assertion: the
+	// exact `+2` is still asserted, over a table whose only eligible rows are the two fixtures
+	// this test inserts. The loop is bounded because a delete that keeps reporting removals
+	// while the table never empties is a defect to fail on, not to spin on.
+	for sweep := 0; ; sweep++ {
+		require.Less(t, sweep, 200,
+			"draining the pre-existing eligible rows must terminate; a purge that keeps "+
+				"reporting removals is not converging")
+
+		drained, drainErr := ds.PurgeTerminalEventsBefore(ctx, cutoff, 250)
+		require.NoError(t, drainErr)
+
+		if drained == 0 {
+			break
+		}
+	}
+
 	// Deltas rather than absolutes: the purge log has no per-test marker because it
 	// describes the whole table, and the suite may run against a database another clone
 	// has also purged. What this test owns is the CHANGE its own purge causes.
@@ -11256,7 +11359,6 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 		claimEventOutboxToken(t, ds, survivor),
 		model.BrokerRecord{Topic: survivor.Topic, Partition: 1, Offset: 9500}))
 
-	cutoff := dbTimestamp(time.Now().AddDate(0, 0, -30))
 	purged, err := ds.PurgeTerminalEventsBefore(ctx, cutoff, 100)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, purged, purgeableCount,

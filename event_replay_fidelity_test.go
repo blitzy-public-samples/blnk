@@ -130,7 +130,7 @@ const replayFidelityBalancePayload = `{"data": {"condition": {"field": "debit_ba
 // identities category.
 const replayFidelityIdentityPayload = `{"data": {"dob": "1815-12-10T00:00:00.000000+00:00", "last_name": "Lovelace", "first_name": "Ada", "identity_id": "idt_replay_fidelity_003", "risk_weight": 0.70000000000000006661, "credit_score": 9007199254740993, "email_address": "ada@example.test", "scaled_income": 123456789012345678901234, "unmodelled_extension": {"vendor_flag": true}}, "event": "identity.created"}`
 
-// replayFidelityLedgerPayload is a ledger.created body. It routes to the system
+// replayFidelityLedgerPayload is a ledger.created body. It routes to the ledgers
 // category — one of the two that exist because ledger.created and system.error belong to
 // none of the three categories the requirements name, and coverage is absolute. It is a
 // category of its own rather than sharing the internal one because ledger.created must
@@ -223,13 +223,14 @@ func replayFidelityFixtures() []replayFidelityFixture {
 			// ledger.created is one of the two shapes that genuinely DO carry a
 			// ledger, so both columns hold it — which is how requirement R-6's
 			// "partitioned by ledger ID" is honoured wherever a ledger exists. It
-			// routes to the system category, which is where both event types outside
-			// the three named categories are published.
+			// routes to the ledgers category, its own grantable category, so a
+			// subscriber can be granted ledger records without being granted the
+			// internal system stream.
 			partitionKey:    "ldg_replay_fidelity_004",
 			ledgerID:        "ldg_replay_fidelity_004",
 			payload:         replayFidelityLedgerPayload,
-			topic:           "blnk.system",
-			deadLetterTopic: "blnk.system.dlt",
+			topic:           "blnk.ledgers",
+			deadLetterTopic: "blnk.ledgers.dlt",
 		},
 	}
 }

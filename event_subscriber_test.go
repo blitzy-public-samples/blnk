@@ -4517,10 +4517,11 @@ func TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNo
 // TestIssueSubscriberCredential_CarriesNoPrefixWhenTheRowRecordsNone is the negative half, and
 // the mutant it kills is the one that matters most.
 //
-// The response's client_side_key_filtering_required flag is DERIVED from this field, so a
-// credential that carried a prefix unconditionally would tell every subscriber it must filter by
-// key — and a client that always has to filter learns nothing from the flag and stops reading it.
-// The obligation is only worth stating because it is sometimes absent.
+// The response's transport fields are DERIVED from this one — gateway_delivery_required,
+// broker_record_access and partition_key_scope_state all read it — so a credential that carried a
+// prefix unconditionally would tell every subscriber to dial a key-authorising component instead of
+// the broker, and a client that always has to be redirected learns nothing from the field and stops
+// reading it. The instruction is only worth stating because it is sometimes absent.
 func TestIssueSubscriberCredential_CarriesNoPrefixWhenTheRowRecordsNone(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -8766,8 +8767,11 @@ func TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGate
 	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
 		"409 and never the 500 an unmapped code resolves to: the request is well formed, nothing "+
 			"is unavailable, and no retry changes the answer")
-	assert.Contains(t, err.Error(), "Clear the partition key prefix",
-		"the first remedy, or the endpoint is a dead end for this row")
+	assert.Contains(t, err.Error(), "KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway",
+		"the remedy that KEEPS the boundary, which was missing: without it the refusal offered only "+
+			"ways to abandon or approximate an intent the platform actually supports")
+	assert.Contains(t, err.Error(), "clear the partition key prefix",
+		"the remedy that abandons it, or the endpoint is a dead end for this row")
 	assert.Contains(t, err.Error(), "narrow the subscriber's authorized topics",
 		"and the enforceable alternative an operator wanting isolation needs")
 
@@ -9078,7 +9082,10 @@ func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t 
 		assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
 			"409, and never the 500 an unmapped code would resolve to: the request carries no body, "+
 				"nothing is unavailable and no retry helps — the row's state has to change")
-		assert.Contains(t, err.Error(), "Clear the partition key prefix",
+		assert.Contains(t, err.Error(), "KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway",
+			"the refusal must name the remedy that realises the intent, not only the two that give "+
+				"it up")
+		assert.Contains(t, err.Error(), "clear the partition key prefix",
 			"the refusal must name the remedy, or the endpoint is a dead end")
 		assert.Contains(t, err.Error(), "narrow the subscriber's authorized topics",
 			"and the enforceable alternative, which is what an operator wanting isolation needs")
@@ -9174,4 +9181,100 @@ func TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard(t *testing.T) {
 	cleared.CredentialReference = stringPointer("cref_live")
 	assert.NoError(t, requireRecordableKeyScope(&cleared, false),
 		"clearing a prefix must never be refused: it is the remedy the refusal itself names")
+}
+
+// TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies is the anti-drift
+// assertion behind MAJ-1, and it is the only thing standing between the fix and the defect coming
+// back.
+//
+// # The defect it guards
+//
+// The registry projection used to answer its enforcement claims from the row alone. A subscriber
+// recording a partition_key_prefix reported partition_key_prefix_enforced=true with broker_gateway
+// named and issuance unblocked — on a deployment that had declared no such component and would
+// refuse the very next credential call for precisely that reason. The API told operators and
+// clients that a verified isolation boundary existed when none did.
+//
+// The fix is that one function resolves the deployment and both readers consult it. That property
+// is not enforced by the type system: somebody adding a fourth precondition to issuance, or
+// deriving one of these three differently in the resolver, restores the disagreement silently and
+// every existing test still passes. So each field is asserted against THE SAME EXPRESSION the
+// issuance path evaluates, rather than against a literal.
+func TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies(t *testing.T) {
+	t.Run("the shipped default, resolved the way issuance resolves it", func(t *testing.T) {
+		// The lifecycle configuration: brokers and an advertised subscriber list, no key-scope
+		// component, secure mode off.
+		cnf := subscriberLifecycleConfiguration(t)
+
+		deployment := SubscriberAccessDeployment()
+		service := NewEventSubscriberService(nil, nil)
+
+		_, enforced := service.keyScopeEnforcement()
+		assert.False(t, enforced,
+			"the harness must be the shipped default, or this subtest asserts the other posture")
+		assert.Equal(t, model.KeyScopeEnforcementNone, deployment.KeyScopeEnforcement,
+			"the projection must read the SAME answer requireProvisionableKeyScope acts on: a "+
+				"resolver that said gateway here would put the false claim straight back")
+
+		_, advertised := cnf.Kafka.SubscriberFacingBrokers()
+		assert.Equal(t, advertised, deployment.SubscriberBrokersAdvertised,
+			"and the same answer subscriberFacingBrokers refuses on, or credential_issuance_blocked "+
+				"contradicts a 503 the caller is about to receive")
+
+		assert.True(t, deployment.WholeTopicAccessPermitted,
+			"outside secure mode a whole-topic credential needs no declaration, which is what "+
+				"requireAcknowledgedSharedTopicAccess returns nil for")
+	})
+
+	t.Run("a declared component is reported as available", func(t *testing.T) {
+		gateway, _ := enforceKeyScopeGatewayWithDouble(t)
+		require.NotEmpty(t, gateway)
+
+		deployment := SubscriberAccessDeployment()
+		service := NewEventSubscriberService(nil, nil)
+
+		_, enforced := service.keyScopeEnforcement()
+		require.True(t, enforced,
+			"the harness must declare an ACTIVE enforcement point — mode, a distinct address list "+
+				"AND an attestation endpoint — or this asserts the default a second time")
+		assert.Equal(t, model.KeyScopeEnforcementGateway, deployment.KeyScopeEnforcement,
+			"so a key-scoped row projects as available rather than requested")
+
+		// AND THE STATE SCALE, from the one derivation both the projection and this resolver use.
+		assert.Equal(t, model.SubscriberKeyScopeStateAvailable,
+			deployment.KeyScopeStateFor("ldg_9f1c"))
+		assert.Equal(t, model.SubscriberKeyScopeStateNotRequested,
+			deployment.KeyScopeStateFor("  "),
+			"a whitespace-only column is not a scope, matching EventSubscriber's own predicates")
+	})
+
+	t.Run("secure mode without the declaration withholds whole-topic access", func(t *testing.T) {
+		cnf := subscriberLifecycleConfiguration(t)
+		cnf.Server.Secure = true
+		outboxStoreConfiguration(t, cnf)
+
+		assert.False(t, SubscriberAccessDeployment().WholeTopicAccessPermitted,
+			"this is the exact predicate requireAcknowledgedSharedTopicAccess refuses on, so a "+
+				"prefix-less row must predict SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED")
+
+		cnf.Kafka.SubscriberSharedTopicAccess = true
+		outboxStoreConfiguration(t, cnf)
+
+		assert.True(t, SubscriberAccessDeployment().WholeTopicAccessPermitted,
+			"and one declaration clears it, which is the whole of SEC-01's ask")
+	})
+
+	t.Run("an unresolvable configuration fails closed", func(t *testing.T) {
+		// A configuration carrying nothing: no brokers, no subscriber list, no mode. Every
+		// capability must be reported OFF, because understating a deployment costs an operator a
+		// spurious remedy while overstating one publishes an isolation guarantee that does not
+		// exist.
+		outboxStoreConfiguration(t, &config.Configuration{})
+
+		deployment := SubscriberAccessDeployment()
+		assert.Equal(t, model.KeyScopeEnforcementNone, deployment.KeyScopeEnforcement)
+		assert.False(t, deployment.SubscriberBrokersAdvertised,
+			"there is no fallback to KAFKA_BROKERS, so an unset subscriber list is a refusal rather "+
+				"than a substitution")
+	})
 }

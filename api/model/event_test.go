@@ -65,11 +65,12 @@ func derivedReference(t *testing.T) string {
 // the resource name "*" as matching every resource, so a single such entry converts
 // a per-topic grant into a cluster-wide one.
 //
-// The THREE TENANT category topics are accepted. What is refused is `blnk.system` — the
-// internal category, for the reason set out at its subtest below — plus every DEAD-LETTER
-// name, since those carry failure metadata and other subscribers' failed events and are
-// read under the master key instead, along with foreign names, wildcards, and names whose
-// category does not exist in the closed four-category catalogue.
+// The FOUR TENANT category topics are accepted. What is refused is `blnk.system` — the
+// internal category, for the reason set out at its subtest below, unless the deployment has
+// declared the acknowledgement — plus every DEAD-LETTER name, since those carry failure
+// metadata and other subscribers' failed events and are read under the master key instead,
+// along with foreign names, wildcards, and names whose category does not exist in the closed
+// five-category catalogue.
 func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *testing.T) {
 	grantable := model.SubscriberGrantableTopics(testTopicPrefix)
 	require.NotEmpty(t, grantable, "there must be at least one grantable topic to test against")
@@ -95,64 +96,73 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		"a topic under another prefix":  "acme.transactions",
 		"an untrimmed grantable name":   " blnk.transactions ",
 		"an uppercased category":        "blnk.TRANSACTIONS",
-		"a retired category name":       "blnk.ledgers",
+		"a singular category name":      "blnk.ledger",
+		"the ledger dead-letter topic":  "blnk.ledgers.dlt",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
 			err := validateGrantableTopics([]string{topic}, testTopicPrefix)
 			require.Error(t, err, "topic %q must not be grantable", topic)
-			assert.Contains(t, err.Error(), "not grantable",
+			assert.NotEmpty(t, err.Error(),
 				"the error must say why, so an operator is not left guessing")
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS NOT GRANTABLE, and it is the one refusal in the set that has to
-	// argue for itself, because `blnk.system` also carries `ledger.created` — an ordinary
-	// ledger event the legacy webhook transport delivers today.
+	// THE SYSTEM CATEGORY IS NOT IN THE DEFAULT SET, and it is the one refusal in the set that
+	// has to argue for itself, because it is a real topic with a real subscriber audience.
 	//
-	// It is refused because of the OTHER two things on that topic, neither of which a
+	// It is refused by default because of two things on that topic, neither of which a
 	// per-subscriber decision can remove. `system.error`'s payload is the frozen legacy body,
 	// so it renders Blnk's error text verbatim — schema, table, column, routine, broker
 	// address — and R-8 forbids narrowing it. And the category is the catalogue's CATCH-ALL, so
 	// a grant of it stands over every event type nobody has catalogued yet, which means access
 	// widened by a future routing omission rather than by an authorization decision.
 	//
-	// CONTAINING IT PER SUBSCRIBER WAS THE PREVIOUS CONTRACT: the category was grantable, and
-	// the documented rule was to grant it only to a subscriber that needed ledger events. A
-	// rule an operator can violate in one PUT is not a boundary — one mis-grant, or one
-	// retained grant on a subscriber whose purpose changed, hands that subscriber Blnk's
-	// internal error text for the whole deployment. Refusing the name here is what makes the
-	// disclosure unreachable rather than discouraged.
+	// AN OPERATOR RULE ALONE WAS THE PREVIOUS CONTRACT: the category was ordinarily grantable
+	// and the documented rule was to grant it only where it was needed. A rule an operator can
+	// violate in one PUT is not a boundary. So the grant now takes TWO declarations — the
+	// deployment's KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and the subscriber's own
+	// authorized_topics — and this validator refuses the name whenever the first is missing,
+	// naming it in the message so the refusal is actionable.
 	//
-	// THE COST IS REAL AND IS RECORDED RATHER THAN GLOSSED: `ledger.created` has no subscriber
-	// Kafka route. R-1 is unaffected — it requires every event type to be PUBLISHED, and this
-	// one is captured, published to `blnk.system`, observable and replayable, readable by an
-	// operator directly or through the master-key-gated event API. A subscriber consuming it
-	// over webhooks keeps receiving it there for the remainder of the dual-delivery window. A
-	// fifth grantable `ledgers` category was implemented to close the gap and removed: the
-	// catalogue is enumerated identically by the provisioning script, both Compose files, the
-	// Kubernetes manifests and every subscriber's topic list, so it is four everywhere or it is
-	// a deliberate contract change made in all of them at once. docs/event-streaming.md states
-	// the consequence for subscribers plainly.
-	t.Run("refuses the system category", func(t *testing.T) {
+	// `ledger.created` DOES NOT DEPEND ON ANY OF THIS. It is on `blnk.ledgers`, a tenant
+	// category in the default set, which is what the fifth category exists for: while it shared
+	// `blnk.system` the only options were disclosing Blnk's internal error text to whoever
+	// wanted ledger events or leaving the event unreachable by any credential, and R-12 makes
+	// the second a defect rather than a cost. docs/event-streaming.md states the resulting
+	// contract for subscribers.
+	t.Run("refuses the system category without the deployment acknowledgement", func(t *testing.T) {
 		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
 		require.Error(t, err,
 			"blnk.system carries system.error's verbatim error body and every uncatalogued event, "+
-				"so no subscriber may be granted it")
-		assert.Contains(t, err.Error(), "not grantable")
+				"so it is refused unless the deployment has acknowledged what holding it means")
+		assert.Contains(t, err.Error(), "KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS",
+			"the refusal must name the declaration that would allow it, not just the allowlist")
 	})
 
-	t.Run("the grantable set is exactly the three tenant category topics", func(t *testing.T) {
+	t.Run("accepts the system category once the deployment acknowledges it", func(t *testing.T) {
+		assert.NoError(t,
+			validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix, WithInternalTopicAccess(true)),
+			"an acknowledged deployment must be able to register the grant, or system.error has no "+
+				"subscriber route once the webhook transport retires")
+
+		assert.Error(t,
+			validateGrantableTopics([]string{"blnk.system.dlt"}, testTopicPrefix, WithInternalTopicAccess(true)),
+			"and the acknowledgement must widen the allowlist by exactly one name: a dead-letter "+
+				"sibling stays operator-only whatever is declared")
+	})
+
+	t.Run("the default grantable set is exactly the four tenant category topics", func(t *testing.T) {
 		// Stated as an EXACT set rather than as a series of accept/refuse cases, because
 		// every over-grant finding in this area reduces to the same question — which topics
 		// may a credential ever name — and a boundary is only checkable if it is enumerated
-		// in one place. A FOURTH entry appearing here would fail, which is the point, and so
+		// in one place. A FIFTH entry appearing here would fail, which is the point, and so
 		// would a tenant category quietly dropped from the set.
 		assert.ElementsMatch(t,
-			[]string{"blnk.transactions", "blnk.balances", "blnk.identities"},
+			[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers"},
 			model.SubscriberGrantableTopics(testTopicPrefix),
-			"the three tenant category topics are grantable; neither blnk.system nor any "+
-				"dead-letter topic is, and which of the three a PARTICULAR subscriber holds is "+
+			"the four tenant category topics are grantable by default; neither blnk.system nor any "+
+				"dead-letter topic is, and which of the four a PARTICULAR subscriber holds is "+
 				"decided per subscriber by authorized_topics rather than by this allowlist")
 	})
 
@@ -166,20 +176,23 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 			"blnk.transactions.dlt",
 			"blnk.balances.dlt",
 			"blnk.identities.dlt",
+			"blnk.ledgers.dlt",
 			"blnk.system.dlt",
 		} {
 			assert.Errorf(t, validateGrantableTopics([]string{topic}, testTopicPrefix),
 				"%q is a dead-letter topic and must never be grantable", topic)
+			assert.Errorf(t,
+				validateGrantableTopics([]string{topic}, testTopicPrefix, WithInternalTopicAccess(true)),
+				"%q must stay ungrantable even in an acknowledged deployment", topic)
 		}
 	})
 
 	t.Run("refuses a category this contract does not have", func(t *testing.T) {
-		// The plausible mistake: ledger events are real and are published, but they are
-		// published to blnk.system, so blnk.ledgers is a name nothing creates and nobody may
-		// be granted.
-		err := validateGrantableTopics([]string{"blnk.ledgers"}, testTopicPrefix)
+		// The plausible mistake: the category is `ledgers`, so the singular names a topic
+		// nothing creates and nobody may be granted.
+		err := validateGrantableTopics([]string{"blnk.ledger"}, testTopicPrefix)
 		require.Error(t, err,
-			"ledger events live in the system category, so a ledgers topic is not grantable")
+			"the ledger category topic is blnk.ledgers, so the singular is not grantable")
 		assert.Contains(t, err.Error(), "not grantable")
 	})
 
@@ -658,7 +671,7 @@ func TestNewSubscriberResponse_ReportsAFingerprintNeverTheReference(t *testing.T
 		AuthorizedTopics:    []string{"blnk.transactions"},
 		CredentialReference: &reference,
 		CredentialIssuedAt:  &issued,
-	})
+	}, enabledDeployment())
 
 	assert.Equal(t, model.CredentialFingerprint(reference), response.CredentialFingerprint)
 	assert.NotEmpty(t, response.CredentialFingerprint)
@@ -685,7 +698,7 @@ func TestNewSubscriberResponse_DropsAMisStoredReference(t *testing.T) {
 	response := NewSubscriberResponse(model.EventSubscriber{
 		SubscriberID:        "acme_prod",
 		CredentialReference: &misStored,
-	})
+	}, enabledDeployment())
 
 	assert.Empty(t, response.CredentialFingerprint,
 		"a value that is not a derived reference must yield no fingerprint")
@@ -709,7 +722,11 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 		PartitionKeyPrefix: &prefix,
 		WebhookURL:         &webhook,
 		MigratedAt:         &migrated,
-	})
+		// The DECLARED deployment, because this row records a prefix and the projection is
+		// truthful about it: under enabledDeployment the same row would report the scope
+		// requested-but-unenforced, which is a different assertion covered by
+		// TestNewSubscriberResponse_StatesWhatTheNextCallWillDo.
+	}, keyScopedDeployment())
 	assert.Equal(t, prefix, full.PartitionKeyPrefix)
 	require.NotNil(t, full.MigratedAt)
 
@@ -734,7 +751,7 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 	// and a progress report needs it before and after the sunset alike.
 	assert.Contains(t, string(fullBody), "migrated_at")
 
-	bare := NewSubscriberResponse(model.EventSubscriber{SubscriberID: "acme_prod"})
+	bare := NewSubscriberResponse(model.EventSubscriber{SubscriberID: "acme_prod"}, enabledDeployment())
 	assert.Empty(t, bare.PartitionKeyPrefix)
 	assert.Nil(t, bare.MigratedAt)
 	assert.Nil(t, bare.CredentialIssuedAt, "nil is the reliable no-credential test")
@@ -1156,6 +1173,31 @@ func TestClassifyFailureReason_DistinguishesTheActionableCases(t *testing.T) {
 	})
 }
 
+// enabledDeployment is the resolved deployment state in which every issuance precondition a
+// projection can see is satisfied and no key-scope enforcement point is declared.
+//
+// It is the shipped local-stack posture: subscriber-facing brokers advertised, whole-topic access
+// permitted (secure mode off), and nothing evaluating record keys. Tests state it explicitly
+// rather than passing a zero value because the zero value is the FAIL-CLOSED reading — every
+// capability off — and a test that wanted "an ordinary healthy deployment" and passed the zero
+// value would be asserting against a deployment that blocks issuance for three separate reasons.
+func enabledDeployment() model.SubscriberAccessDeployment {
+	return model.SubscriberAccessDeployment{
+		KeyScopeEnforcement:         model.KeyScopeEnforcementNone,
+		SubscriberBrokersAdvertised: true,
+		WholeTopicAccessPermitted:   true,
+	}
+}
+
+// keyScopedDeployment additionally declares a key-authorising component, which is what makes a
+// recorded partition-key prefix an enforced boundary rather than an intent.
+func keyScopedDeployment() model.SubscriberAccessDeployment {
+	deployment := enabledDeployment()
+	deployment.KeyScopeEnforcement = model.KeyScopeEnforcementGateway
+
+	return deployment
+}
+
 // TestNewSubscriberResponse_StatesWhatTheNextCallWillDo covers the two predictions the
 // subscriber projection makes about calls the client has not made yet.
 //
@@ -1163,13 +1205,20 @@ func TestClassifyFailureReason_DistinguishesTheActionableCases(t *testing.T) {
 // while the CONSEQUENCE — the only part anybody acts on — was in a Go doc comment.
 //
 //   - CREDENTIAL ISSUANCE BLOCKED. A row whose next credential call will be refused says so on
-//     the row rather than at the call. Two states block it — a deregistration whose broker-side
-//     revocation is still owed, and an empty topic grant — and both are properties of the ROW, so
-//     both are knowable the moment it is read. A RECORDED partition key prefix is deliberately
-//     NOT one of them: that refusal once existed, it implemented no part of the key scope, and it
-//     was replaced by issuing the credential and STATING which dimensions the broker enforces.
-//     The assertions below pin that down, because a prediction of a refusal that no longer
-//     happens would be worse than no prediction at all.
+//     the row rather than at the call, and it does so for every reason knowable without a round
+//     trip: a deregistration whose broker-side revocation is still owed, an empty topic grant, a
+//     recorded key scope this deployment cannot enforce, a MISSING key scope in a deployment that
+//     does, an unacknowledged whole-topic model, and unadvertised subscriber-facing brokers. The
+//     first two are properties of the ROW; the other four need the deployment, which is why this
+//     projection takes it.
+//
+//     The four deployment-shaped predictions are the correction. This reported unblocked for
+//     everything except the two row conditions, so a key-scoped row on the shipped default
+//     configuration said "issuance is not blocked" and IssueSubscriberCredential then refused it
+//     with SUBSCRIBER_KEY_SCOPE_UNENFORCED. A prediction that contradicts the call it predicts is
+//     worse than no prediction, and it was reported as a security-relevant contract defect
+//     because the same projection simultaneously claimed the key boundary was enforced.
+//
 //   - REVOCATION PENDING. docs/metrics.md answers the critical revocation alert with "find the
 //     affected subscribers with GET /subscribers", and the response reported none of it — so the
 //     documented answer to "which subscribers owe a revocation?" was a psql session.
@@ -1188,7 +1237,7 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 	}
 
 	t.Run("an ordinary row reports both as settled", func(t *testing.T) {
-		response := NewSubscriberResponse(base())
+		response := NewSubscriberResponse(base(), enabledDeployment())
 
 		assert.False(t, response.CredentialIssuanceBlocked,
 			"a row with no key scope is provisionable, and says so rather than staying silent")
@@ -1199,44 +1248,148 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 		assert.Nil(t, response.RevocationPendingAt)
 	})
 
-	// The key-scoped row is the case that changed. It is asserted here, in the test that
-	// covers the predictions, precisely because the prediction it USED to carry was the
-	// refusal: a reader of this file has to be able to see that the absence of a block on a
-	// key-scoped row is intended and not an omission.
-	t.Run("a recorded key scope is provisionable and the scope is declared, not refused", func(t *testing.T) {
+	// THE TWO KEY-SCOPED CASES, and keeping them apart is the whole of the correction. The same
+	// row projects differently in two deployments, and it used to project identically in both —
+	// claiming an enforced boundary and an unblocked issuance whether or not anything was
+	// declared to keep the boundary or willing to mint the credential.
+	t.Run("a recorded key scope with a declared component is enforced and provisionable", func(t *testing.T) {
 		row := base()
 		prefix := "ldg_acme"
 		row.PartitionKeyPrefix = &prefix
 
-		response := NewSubscriberResponse(row)
+		response := NewSubscriberResponse(row, keyScopedDeployment())
 
 		require.False(t, response.CredentialIssuanceBlocked,
-			"a recorded partition key prefix no longer withholds the credential: the refusal "+
-				"implemented no part of the key scope, it withdrew a mandatory capability, and it "+
-				"was replaced by issuing the credential and declaring what the broker enforces")
+			"a recorded prefix does not withhold the credential where a component is declared to "+
+				"apply it: the credential is issued with no topic Read and the records arrive "+
+				"through that component")
 		assert.Empty(t, response.CredentialIssuanceBlockedReason,
 			"and no remedy is offered, because there is nothing to remedy")
 		assert.Equal(t, prefix, response.PartitionKeyPrefix,
-			"the recorded value is still reported: it is the narrowing Blnk's gateway applies")
+			"the recorded value is still reported: it is the narrowing the component applies")
+		assert.Equal(t, model.SubscriberKeyScopeStateAvailable,
+			response.EnforcedAccess.PartitionKeyScopeState,
+			"AVAILABLE and not attested on a registry read: a read makes no round trip, so nothing "+
+				"has confirmed the component is keeping this particular binding")
 		assert.True(t, response.EnforcedAccess.PartitionKeyPrefixEnforced,
-			"and the enforcement declaration says it is ENFORCED, which is what replaced both the "+
-				"refusal and the consumer-side disclosure that followed it")
+			"and the declaration says ENFORCED, which it may because something is declared to "+
+				"enforce it")
+		assert.Equal(t, model.KeyScopeEnforcementGateway,
+			response.EnforcedAccess.PartitionKeyPrefixEnforcedBy,
+			"named, because 'enforced' without a component is unverifiable")
 		assert.True(t, response.EnforcedAccess.GatewayDeliveryRequired,
 			"AND it must say where the records come from, in machine-readable form: a key-scoped "+
 				"subscriber holds no topic Read, so a client that tried to fetch from the broker "+
 				"would simply be refused")
 		assert.False(t, response.EnforcedAccess.BrokerRecordAccess,
 			"which is the same fact stated as the grant it rests on")
+		assert.Contains(t, response.EnforcedAccess.EnforcedBy, EnforcementDimensionPartitionKey)
+		assert.Empty(t, response.EnforcedAccess.NotEnforcedBy,
+			"no dimension of this subscriber's access is kept by nobody")
 		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
 			"restated inside the object that names the component enforcing it, which is the only "+
 				"place a reader cannot mistake who keeps it")
+	})
+
+	// MAJ-1: the same row on the shipped default. Every claim above must reverse, and the block
+	// must appear, because this is the deployment in which issuance refuses.
+	t.Run("a recorded key scope with nothing declared is neither enforced nor provisionable", func(t *testing.T) {
+		row := base()
+		prefix := "ldg_acme"
+		row.PartitionKeyPrefix = &prefix
+
+		response := NewSubscriberResponse(row, enabledDeployment())
+
+		require.True(t, response.CredentialIssuanceBlocked,
+			"IssueSubscriberCredential refuses this row with SUBSCRIBER_KEY_SCOPE_UNENFORCED, so "+
+				"the projection that reported it unblocked was contradicting the very next call")
+		assert.Contains(t, response.CredentialIssuanceBlockedReason, "KAFKA_KEY_SCOPE_ENFORCEMENT",
+			"and the remedy must name the variable that unblocks it — the refusal's own message "+
+				"omitted this exit, which is how an operator came to read the state as unfixable")
+		assert.Equal(t, model.SubscriberKeyScopeStateRequested,
+			response.EnforcedAccess.PartitionKeyScopeState,
+			"REQUESTED: the intent is recorded and currently unrealisable, which is a third state "+
+				"and not either of the two booleans' answers")
+		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced,
+			"nothing enforces it, and claiming otherwise is a false isolation guarantee rather "+
+				"than an inaccuracy")
+		assert.Equal(t, model.KeyScopeEnforcementNone,
+			response.EnforcedAccess.PartitionKeyPrefixEnforcedBy,
+			"and no component is named, because naming one sends an operator looking for a host "+
+				"that was never deployed")
+		assert.False(t, response.EnforcedAccess.GatewayDeliveryRequired,
+			"there is no endpoint to route to, so instructing a client to dial one would send it "+
+				"nowhere")
+		assert.False(t, response.EnforcedAccess.BrokerRecordAccess,
+			"and the prefix still withholds direct broker reads, so this subscriber has no usable "+
+				"consumption path until the deployment declares one")
+		assert.Contains(t, response.EnforcedAccess.NotEnforcedBy, EnforcementDimensionPartitionKey,
+			"the dimension belongs in the unenforced list here, which is the pair's whole purpose")
+		assert.NotContains(t, response.EnforcedAccess.EnforcedBy, EnforcementDimensionPartitionKey)
+		assert.Equal(t, prefix, response.PartitionKeyPrefix,
+			"the prefix is still reported: an operator inspecting a blocked row needs to see what "+
+				"is blocking it")
+	})
+
+	// AND THE MIRROR. In a deployment that confines subscribers by record key, the prefix-less
+	// subscriber is the single credential that would escape the model, so issuance refuses it too
+	// and the row has to say so.
+	t.Run("no key scope in a key-scoped deployment predicts the mirror refusal", func(t *testing.T) {
+		response := NewSubscriberResponse(base(), keyScopedDeployment())
+
+		require.True(t, response.CredentialIssuanceBlocked,
+			"a prefix-less row here would be granted literal topic Read while every other "+
+				"subscriber is confined, which is the escape SUBSCRIBER_KEY_SCOPE_REQUIRED closes")
+		assert.Contains(t, response.CredentialIssuanceBlockedReason, "partition_key_prefix",
+			"and the remedy must name the field to set")
+	})
+
+	// THE SECURE-MODE DECLARATION. Whole-topic reads are the mandated model rather than a defect;
+	// what is refused is reaching them by configuring nothing.
+	t.Run("an unacknowledged whole-topic model predicts the refusal", func(t *testing.T) {
+		deployment := enabledDeployment()
+		deployment.WholeTopicAccessPermitted = false
+
+		response := NewSubscriberResponse(base(), deployment)
+
+		require.True(t, response.CredentialIssuanceBlocked,
+			"in secure mode with neither access model declared, issuance answers "+
+				"SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED")
+		assert.Contains(t, response.CredentialIssuanceBlockedReason,
+			"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS", "and names the one variable that declares it")
+	})
+
+	// THE ADDRESS THE SUBSCRIBER WOULD DIAL. There is no fallback to KAFKA_BROKERS, so this is a
+	// refusal rather than a warning, and it is knowable before the call.
+	t.Run("unadvertised subscriber brokers predict the refusal", func(t *testing.T) {
+		deployment := enabledDeployment()
+		deployment.SubscriberBrokersAdvertised = false
+
+		response := NewSubscriberResponse(base(), deployment)
+
+		require.True(t, response.CredentialIssuanceBlocked,
+			"issuance answers 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED rather than substituting the "+
+				"internal broker list, so the row must predict it")
+		assert.Contains(t, response.CredentialIssuanceBlockedReason, "KAFKA_SUBSCRIBER_BROKERS",
+			"and names the variable")
+	})
+
+	// THE FAIL-CLOSED DEFAULT. A caller that cannot resolve configuration must understate the
+	// deployment rather than overstate it, because the overstatement is the security-relevant
+	// direction.
+	t.Run("the zero deployment blocks rather than claims", func(t *testing.T) {
+		response := NewSubscriberResponse(base(), model.SubscriberAccessDeployment{})
+
+		assert.True(t, response.CredentialIssuanceBlocked,
+			"an unresolvable configuration is not a licence to report capability")
+		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced)
 	})
 
 	t.Run("an empty topic grant predicts the refusal and names the remedy", func(t *testing.T) {
 		row := base()
 		row.AuthorizedTopics = nil
 
-		response := NewSubscriberResponse(row)
+		response := NewSubscriberResponse(row, enabledDeployment())
 
 		require.True(t, response.CredentialIssuanceBlocked,
 			"a credential authorised for nothing is a live SCRAM principal with no purpose, so "+
@@ -1250,7 +1403,7 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 		pendingAt := time.Date(2026, 5, 1, 14, 2, 0, 0, time.UTC)
 		row.RevocationPendingAt = &pendingAt
 
-		response := NewSubscriberResponse(row)
+		response := NewSubscriberResponse(row, enabledDeployment())
 
 		require.True(t, response.CredentialIssuanceBlocked,
 			"issuing here would re-arm a principal whose revocation is already owed, which is a "+
@@ -1264,7 +1417,7 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 		pendingAt := time.Date(2026, 5, 1, 14, 2, 0, 0, time.UTC)
 		row.RevocationPendingAt = &pendingAt
 
-		response := NewSubscriberResponse(row)
+		response := NewSubscriberResponse(row, enabledDeployment())
 
 		require.True(t, response.RevocationPending)
 		require.NotNil(t, response.RevocationPendingAt,

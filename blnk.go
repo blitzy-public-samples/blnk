@@ -549,6 +549,28 @@ func NewBlnkForRole(db database.IDataSource, role ProcessRole) (*Blnk, error) {
 			}, WithEventLedgerID(ledgerID))
 		})
 
+	// SAME-TRANSACTION CAPTURE FOR BALANCE MONITOR ALERTS (requirement R-2), and the third
+	// indirection in this constructor, for the same structural reason as the two above.
+	//
+	// The writer decides the crossing — it holds the balance it just wrote and reads the monitor
+	// definitions in its own transaction — but it cannot BUILD the row, because the envelope, the
+	// partition-key resolution and the topic binding all live in this package. Registering the
+	// builder lets the canonical blnk.event_outbox row be inserted in the transaction that moved
+	// the balance. Before this, that transaction committed a balance_monitor_handoff row instead
+	// and a second transaction converted it, so the event R-2 names did not exist until the
+	// conversion succeeded.
+	//
+	// The row is built by the SAME function the pre-write pass uses, so an alert captured by the
+	// writer is indistinguishable from one captured before the write — see
+	// prepareBalanceMonitorAlertRow for why one builder serves all three routes.
+	//
+	// Returning (nil, nil) when publishing is unconfigured is PrepareEventOutbox's own behaviour
+	// and is preserved deliberately, though the writer's gate has already excluded that case.
+	database.RegisterBalanceMonitorAlertCapture(
+		func(ctx context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+			return b.prepareBalanceMonitorAlertRow(ctx, balance, monitor)
+		})
+
 	return b, nil
 }
 

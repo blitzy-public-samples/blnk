@@ -1500,7 +1500,7 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 	topics := []string{"blnk.transactions", "blnk.balances"}
 	const keyScope = "ldg_9f1c8a72"
 
-	enforced := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, keyScope)
+	enforced := declaredEnforcedAccess(subscriberID, topics, keyScope)
 
 	t.Run("partition key filtering is declared ENFORCED, in the body", func(t *testing.T) {
 		assert.True(t, enforced.PartitionKeyPrefixEnforced,
@@ -1534,7 +1534,7 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 	t.Run("with no key scope the enforcement point is reported as none", func(t *testing.T) {
 		// Always present, so a client can branch on it without first testing whether the
 		// prefix is empty.
-		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		unscoped := declaredEnforcedAccess(subscriberID, topics, "")
 		assert.Empty(t, unscoped.PartitionKeyPrefix, "nothing recorded means nothing echoed")
 		assert.Equal(t, model.KeyScopeEnforcementNone, unscoped.PartitionKeyPrefixEnforcedBy)
 		assert.False(t, unscoped.PartitionKeyPrefixEnforced,
@@ -1551,7 +1551,7 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 		// absent for the same reason: a scope on nothing is not an intent anybody has. It must
 		// not produce an ENFORCED declaration either, or a body would claim a filter that
 		// matches every key is a boundary.
-		blank := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "   \t ")
+		blank := declaredEnforcedAccess(subscriberID, topics, "   \t ")
 		assert.Empty(t, blank.PartitionKeyPrefix)
 		assert.Equal(t, model.KeyScopeEnforcementNone, blank.PartitionKeyPrefixEnforcedBy)
 		assert.False(t, blank.PartitionKeyPrefixEnforced)
@@ -1567,7 +1567,7 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 			"three dimensions for a key-scoped subscriber, and exactly those: a missing one "+
 				"understates the isolation that exists, an extra one claims isolation that does not")
 
-		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		unscoped := declaredEnforcedAccess(subscriberID, topics, "")
 		assert.Equal(t, []string{
 			apimodel.EnforcementDimensionTopic,
 			apimodel.EnforcementDimensionConsumerGroup,
@@ -1588,7 +1588,7 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 			"a key-scoped subscriber has no unenforced dimension: the prefix is applied by the "+
 				"gateway, which is what replaced asking the subscriber to apply it")
 
-		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		unscoped := declaredEnforcedAccess(subscriberID, topics, "")
 		assert.Empty(t, unscoped.NotEnforcedBy,
 			"and neither does a subscriber with no prefix, which has nothing to enforce rather "+
 				"than something enforced by nobody")
@@ -1627,8 +1627,47 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 				"the report describes a boundary the subscriber's own group falls outside")
 	})
 
+	// MAJ-1: the state scale, on the wire and in every state. Before it, every enforcement field
+	// in this object derived from one fact — whether the prefix column was non-empty — so a
+	// registry read on the shipped default announced a verified key boundary that the next
+	// credential call refused for want of the very component it had named.
+	t.Run("the key scope state distinguishes requested from enforceable", func(t *testing.T) {
+		keys := marshalToKeys(t, enforced)
+		require.Contains(t, keys, "partition_key_scope_state",
+			"the scale must be in the BODY: a client auditing isolation claims cannot branch on a "+
+				"Go doc comment, and the booleans alone cannot express the third state")
+
+		requested := apimodel.NewSubscriberEnforcedAccessUnder(
+			subscriberID, topics, keyScope, model.KeyScopeEnforcementNone,
+		)
+		assert.Equal(t, model.SubscriberKeyScopeStateRequested, requested.PartitionKeyScopeState,
+			"the SAME prefix on a deployment that declares nothing is REQUESTED, not enforced")
+		assert.False(t, requested.PartitionKeyPrefixEnforced,
+			"and the boolean must agree with it, or the pair is back to contradicting itself")
+		assert.Equal(t, model.KeyScopeEnforcementNone, requested.PartitionKeyPrefixEnforcedBy,
+			"and no component may be named, because naming one sends an operator hunting a host "+
+				"that was never deployed")
+		assert.False(t, requested.GatewayDeliveryRequired,
+			"nor may a client be told to dial an endpoint this deployment does not have")
+		assert.Contains(t, requested.NotEnforcedBy, apimodel.EnforcementDimensionPartitionKey,
+			"the dimension moves to the unenforced list, which is what the pair exists to express")
+		assert.NotContains(t, requested.EnforcedBy, apimodel.EnforcementDimensionPartitionKey,
+			"and it must never be in both lists at once")
+
+		unscoped := apimodel.NewSubscriberEnforcedAccessUnder(
+			subscriberID, topics, "", model.KeyScopeEnforcementGateway,
+		)
+		assert.Equal(t, model.SubscriberKeyScopeStateNotRequested, unscoped.PartitionKeyScopeState,
+			"and a row with NO prefix is not_requested even where a component is declared: the "+
+				"deployment fact is not a per-subscriber boundary")
+		assert.Equal(t, model.KeyScopeEnforcementNone, unscoped.PartitionKeyPrefixEnforcedBy,
+			"so no component is named for a subscriber that has no key scope for it to enforce")
+		assert.Empty(t, unscoped.NotEnforcedBy,
+			"and nothing is listed unenforced, because there is no third dimension to enforce")
+	})
+
 	t.Run("an empty grant reports an empty set rather than null", func(t *testing.T) {
-		keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, nil, ""))
+		keys := marshalToKeys(t, declaredEnforcedAccess(subscriberID, nil, ""))
 		assert.NotNil(t, keys["topics"],
 			"a fail-closed empty grant is a state an operator must be able to read; null would "+
 				"force every client to special-case it")
@@ -1644,32 +1683,42 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 			"a projection built from a registry row makes no broker round trip, so it must not "+
 				"claim the grant was observed to be exclusive")
 
+		assert.Equal(t, model.SubscriberKeyScopeStateAvailable, enforced.PartitionKeyScopeState,
+			"and for the same reason it reports AVAILABLE rather than attested: the deployment can "+
+				"keep this boundary, and no round trip has confirmed that it does for this principal")
+
 		// THE SAME key scope the unverified fixture was built with. The two constructors are
-		// compared field by field below, so passing a different scope here would make them
-		// differ in three fields and the comparison would pass for the wrong reason — it is
-		// asserting that they differ in exactly ONE.
-		verified := apimodel.NewVerifiedSubscriberEnforcedAccess(subscriberID, topics, keyScope)
+		// compared field by field below, so passing a different scope here would make them differ
+		// in more fields than the comparison expects and it would pass for the wrong reason.
+		verified := declaredVerifiedEnforcedAccess(subscriberID, topics, keyScope)
 		assert.True(t, verified.ExclusiveGrantVerified,
 			"issuance reads the principal's complete ACL grant and refuses a broader one, so the "+
 				"credential response may state that it verified exclusivity")
+		assert.Equal(t, model.SubscriberKeyScopeStateAttested, verified.PartitionKeyScopeState,
+			"AND it reports the key scope ATTESTED, because issuance also required the declared "+
+				"component to confirm this principal and this prefix before a secret existed")
 
-		// Identical in every other respect: the two constructors must not be able to drift
-		// into describing different boundaries.
+		// IDENTICAL IN EVERY OTHER RESPECT, and the two fields that do differ are exactly the two
+		// that describe what Blnk OBSERVED rather than what it asked for: the broker's complete
+		// grant, and the component's confirmation. Neither is knowable from a registry row, and no
+		// other field may drift between the two constructors — that is what stops a subscriber
+		// read and a credential response describing different boundaries.
 		verified.ExclusiveGrantVerified = false
+		verified.PartitionKeyScopeState = enforced.PartitionKeyScopeState
 		assert.Equal(t, enforced, verified,
-			"the verified form must differ from the unverified one in exactly one field")
+			"the verified form must differ from the unverified one in exactly the two observed fields")
 	})
 
 	t.Run("the exclusivity claim is always present in the body", func(t *testing.T) {
 		// No omitempty: false must be transmitted rather than dropped. A client that reads a
 		// missing key as "verified" would draw exactly the wrong conclusion, and false is the
 		// value on the path where nothing was verified.
-		keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, ""))
+		keys := marshalToKeys(t, declaredEnforcedAccess(subscriberID, topics, ""))
 		assert.Contains(t, keys, "exclusive_grant_verified",
 			"an absent key would be indistinguishable from a verified boundary")
 
 		assert.Contains(t,
-			marshalToKeys(t, apimodel.NewVerifiedSubscriberEnforcedAccess(subscriberID, topics, "")),
+			marshalToKeys(t, declaredVerifiedEnforcedAccess(subscriberID, topics, "")),
 			"exclusive_grant_verified")
 	})
 
@@ -1682,7 +1731,7 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 			SubscriberID:       subscriberID,
 			AuthorizedTopics:   topics,
 			PartitionKeyPrefix: &prefix,
-		})
+		}, declaredKeyScopeDeployment())
 
 		// The prefix and what enforces it travel in ONE body, and that adjacency is the point:
 		// the two cannot be read apart, so whoever finds the prefix also reads where it applies.
@@ -1737,7 +1786,7 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 	topics := []string{"blnk.transactions"}
 
 	t.Run("a recorded prefix declares an enforced boundary and where records come from", func(t *testing.T) {
-		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+		declared := declaredEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 
 		assert.Equal(t, "ldg_9f2c", declared.PartitionKeyPrefix,
 			"the prefix is echoed, because it is the boundary the declared component applies on this "+
@@ -1767,7 +1816,7 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 		// The mutant this kills is the one that hard-codes true. A flag that is always true
 		// teaches a client nothing and gets ignored, which returns the contract to the state
 		// where the boundary was implied rather than stated.
-		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		declared := declaredEnforcedAccess(subscriberID, topics, "")
 
 		assert.Empty(t, declared.PartitionKeyPrefix)
 		assert.False(t, declared.GatewayDeliveryRequired,
@@ -1793,7 +1842,7 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 			"plain":      "ldg_9f2c",
 		} {
 			t.Run(name, func(t *testing.T) {
-				declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix)
+				declared := declaredEnforcedAccess(subscriberID, topics, prefix)
 				scoped := declared.PartitionKeyPrefix != ""
 
 				assert.Equal(t, scoped, declared.GatewayDeliveryRequired,
@@ -1814,7 +1863,7 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 		// applicable", and it has to read as a definite yes or no.
 		for name, prefix := range map[string]string{"with a prefix": "ldg_9f2c", "without one": ""} {
 			t.Run(name, func(t *testing.T) {
-				keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix))
+				keys := marshalToKeys(t, declaredEnforcedAccess(subscriberID, topics, prefix))
 				assert.Contains(t, keys, "gateway_delivery_required",
 					"an absent key would be indistinguishable from direct broker consumption")
 				assert.Contains(t, keys, "broker_record_access")
@@ -1835,7 +1884,7 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 			SubscriberID:       subscriberID,
 			AuthorizedTopics:   topics,
 			PartitionKeyPrefix: &prefix,
-		})
+		}, declaredKeyScopeDeployment())
 
 		assert.Equal(t, prefix, response.PartitionKeyPrefix)
 		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
@@ -1875,7 +1924,7 @@ func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing
 	topics := []string{"blnk.transactions"}
 
 	t.Run("the remedy is the shared constant, not a paraphrase", func(t *testing.T) {
-		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+		declared := declaredEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 
 		assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, declared.Guidance,
 			"one sentence, from one constant, so the registry view and the credential view cannot "+
@@ -1905,7 +1954,7 @@ func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing
 			"whitespace":    "   ",
 		} {
 			t.Run(name, func(t *testing.T) {
-				declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix)
+				declared := declaredEnforcedAccess(subscriberID, topics, prefix)
 				assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, declared.Guidance)
 
 				keys := marshalToKeys(t, declared)
@@ -1925,11 +1974,11 @@ func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing
 			SubscriberID:       subscriberID,
 			AuthorizedTopics:   topics,
 			PartitionKeyPrefix: &prefix,
-		})
+		}, declaredKeyScopeDeployment())
 		assert.Equal(t, apimodel.SubscriberKeyScopeGuidance, subscriber.EnforcedAccess.Guidance)
 
 		credential := apimodel.KafkaCredentialsResponse{
-			EnforcedAccess: apimodel.NewVerifiedSubscriberEnforcedAccess(
+			EnforcedAccess: declaredVerifiedEnforcedAccess(
 				subscriberID, topics, prefix,
 			),
 		}
@@ -1951,16 +2000,59 @@ func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing
 	})
 
 	t.Run("verifying exclusivity does not change the remedy", func(t *testing.T) {
-		// The verified constructor differs from the unverified one in exactly one field, and
-		// this keeps the remedy out of that difference: advice that changed depending on
-		// whether a broker round trip happened would be advice about the wrong thing.
-		unverified := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
-		verified := apimodel.NewVerifiedSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+		// The verified constructor differs from the unverified one in the two OBSERVED fields, and
+		// this keeps the remedy out of that difference: advice that changed depending on whether a
+		// broker round trip happened would be advice about the wrong thing.
+		unverified := declaredEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+		verified := declaredVerifiedEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 
 		assert.Equal(t, unverified.Guidance, verified.Guidance)
 
 		verified.ExclusiveGrantVerified = false
+		verified.PartitionKeyScopeState = unverified.PartitionKeyScopeState
 		assert.Equal(t, unverified, verified,
-			"the two constructors must still differ in exactly one field")
+			"the two constructors must still differ in exactly the two observed fields")
 	})
+}
+
+// declaredKeyScopeDeployment is the resolved deployment state these contract assertions are made
+// under: one that DECLARES a key-authorising component, with subscriber-facing brokers advertised
+// and whole-topic access acknowledged.
+//
+// It is stated rather than defaulted because the projection is now truthful about deployment
+// state, and the enforced shape these tests pin — partition_key_prefix_enforced true,
+// broker_gateway named, gateway delivery required — is the shape of a deployment that has such a
+// component. Passing the zero value would assert against a deployment that has none, where the
+// honest projection reports the scope requested-but-unenforced; that case is covered by
+// TestNewSubscriberResponse_StatesWhatTheNextCallWillDo in api/model.
+func declaredKeyScopeDeployment() model.SubscriberAccessDeployment {
+	return model.SubscriberAccessDeployment{
+		KeyScopeEnforcement:         model.KeyScopeEnforcementGateway,
+		SubscriberBrokersAdvertised: true,
+		WholeTopicAccessPermitted:   true,
+	}
+}
+
+// declaredEnforcedAccess builds a registry-read declaration under declaredKeyScopeDeployment.
+//
+// A thin wrapper so the wire-shape assertions below read as they did while still going through
+// the constructor that takes the deployment. api/model.NewSubscriberEnforcedAccess — the overload
+// with no deployment argument — deliberately claims NO enforcement point, which is the right
+// answer for a caller that does not know and the wrong fixture for a test asserting the enforced
+// shape.
+func declaredEnforcedAccess(
+	subscriberID string, topics []string, partitionKeyPrefix string,
+) apimodel.SubscriberEnforcedAccess {
+	return apimodel.NewSubscriberEnforcedAccessUnder(
+		subscriberID, topics, partitionKeyPrefix, model.KeyScopeEnforcementGateway,
+	)
+}
+
+// declaredVerifiedEnforcedAccess is the issuance form of declaredEnforcedAccess.
+func declaredVerifiedEnforcedAccess(
+	subscriberID string, topics []string, partitionKeyPrefix string,
+) apimodel.SubscriberEnforcedAccess {
+	return apimodel.NewVerifiedSubscriberEnforcedAccessUnder(
+		subscriberID, topics, partitionKeyPrefix, model.KeyScopeEnforcementGateway,
+	)
 }

@@ -18,21 +18,39 @@
 // processor that drains blnk.balance_monitor_handoff, judges each snapshot against its
 // monitors, and captures the resulting alerts transactionally.
 //
-// # The gap it closes
+// # THIS IS NO LONGER THE ORDINARY PATH FOR A NEW MOVEMENT
+//
+// The atomic writers now decide a crossing and insert the canonical blnk.event_outbox row
+// inside the transaction that moved the balance, which is requirement R-2 met literally —
+// see database.captureBalanceMonitorAlertsInTx and, for the builder they share with the
+// pre-write pass, blnk.prepareBalanceMonitorAlertRow. A movement made by a process with the
+// alert capture registered, which every process built through NewBlnk is, writes NO handoff.
+//
+// This processor remains, and is still started by the server, for two populations that are
+// real and finite:
+//
+//   - Handoff rows written by releases that PREDATE the in-transaction capture. They are
+//     durable, they carry both decision inputs, and an upgrade must not strand them.
+//   - Handoff rows written by a process with NO capture registered — a Datasource constructed
+//     directly, without the root service, which is what this repository's own tests do.
+//     database.recordBalanceMonitorEvaluation falls back to the handoff there rather than
+//     leaving the movement's alerts to be decided later against a monitors table an operator
+//     can edit in the meantime.
+//
+// # The gap it closed, and why the fallback is still sound
 //
 // Requirement R-2 puts every event in the same database transaction as the ledger
-// mutation that produced it. `balance.monitor` could not honour that, because a monitor
-// fires on a balance a transaction has ALREADY committed — at the instant the alert
-// exists there is no open transaction to enrol it in. The capture was therefore a
-// standalone insert taken after the commit, and a process that died in the window, or a
-// database outage that outlasted a small retry budget, destroyed the alert outright: the
-// balance movement stood, the low-balance or overdraft notification never existed, and
-// nothing was left to replay because no row had ever been written.
+// mutation that produced it. `balance.monitor` was the hardest producer to bring under it,
+// because a monitor fires on a balance a transaction has ALREADY committed as far as the
+// original post-commit design was concerned. The capture was therefore a standalone insert
+// taken after the commit, and a process that died in the window, or a database outage that
+// outlasted a small retry budget, destroyed the alert outright: the balance movement stood,
+// the low-balance or overdraft notification never existed, and nothing was left to replay
+// because no row had ever been written.
 //
-// # How the gap is closed, in two halves
-//
+// The handoff closed that in two halves, and both halves still hold for the rows it drains.
 // The half that CAN be atomic is EVERY INPUT THE ALERT IS A FUNCTION OF.
-// database.recordBalanceMonitorHandoffs writes one handoff row per monitored balance inside
+// database.insertBalanceMonitorHandoffsInTx writes one handoff row per monitored balance inside
 // the balance's own transaction, carrying the balance as written AND the monitor definitions
 // read in that same transaction — so a committed movement always carries its pending
 // evaluation together with the complete decision it is pending on, and a rolled-back
@@ -43,11 +61,13 @@
 // could change after the mutation committed and two attempts at one row could disagree. The
 // snapshot is what makes this processor a pure function of the row it claimed.
 //
-// The half that cannot be atomic with the mutation is made atomic with the intent's
+// The half that is not atomic with the mutation is made atomic with the intent's
 // COMPLETION. This processor claims a handoff, evaluates it, and hands the alerts and the
 // completion to CompleteBalanceMonitorHandoffWithEvents, which writes both in one
 // transaction. So the sequence is at-least-once evaluation feeding an atomic capture, and
-// the only way to lose an alert is for its condition never to have been met.
+// the only way to lose an alert is for its condition never to have been met. What it does not
+// give, and what the in-transaction capture does, is the canonical event row in the mutation's
+// own transaction: until the conversion commits, the event R-2 names does not exist.
 //
 // # The condition evaluation itself is UNTOUCHED
 //
@@ -94,9 +114,11 @@ const (
 
 // balanceMonitorEventType is the event name a fired monitor publishes under.
 //
-// It is a constant here because two places must agree on it — this processor and the
-// legacy post-commit path in balance.go — and a typo in either would route the alert to
-// the wrong topic while every test that only checks "an event was captured" still passed.
+// It is a constant here because every route that can decide a crossing must agree on it —
+// this processor, the pre-write pass and the writer's in-transaction capture, which both reach
+// it through blnk.prepareBalanceMonitorAlertRow, and the legacy post-commit path in
+// balance.go — and a typo in any of them would route the alert to the wrong topic while every
+// test that only checks "an event was captured" still passed.
 const balanceMonitorEventType = "balance.monitor"
 
 // BalanceMonitorHandoffProcessor drains blnk.balance_monitor_handoff.
@@ -554,18 +576,19 @@ func isPermanentMonitorHandoffError(err error) bool {
 	return errors.As(err, &permanent)
 }
 
-// balanceMonitorHandoffEnabled reports whether the durable handoff owns monitor
-// evaluation on this deployment.
+// balanceMonitorHandoffEnabled reports whether the WRITER owns monitor evaluation on this
+// deployment, rather than the post-commit hook.
 //
 // # This is a SINGLE decision read from two places, and it has to be
 //
 // Two call sites depend on the answer and must never disagree:
 //
-//   - the atomic writers, which write the handoff row inside the balance transaction
-//     (through database.recordBalanceMonitorHandoffs), and
+//   - the atomic writers, which evaluate the monitors inside the balance transaction and insert
+//     the canonical alert rows there — or, with no capture registered, commit the handoff
+//     instead (both through database.recordBalanceMonitorEvaluation), and
 //   - the post-commit hook in transaction_execution.go, which evaluates monitors inline.
 //
-// If the writer wrote a handoff and the post-commit path also evaluated, every alert
+// If the writer captured the alert and the post-commit path also evaluated, every alert
 // would be delivered twice. If neither did, a movement's monitors would be evaluated by
 // nobody and the alert would be lost with nothing failing to say so. Both sides read the
 // same predicate — config.Configuration.EventPublishingConfigured — so the two faults are
@@ -573,15 +596,19 @@ func isPermanentMonitorHandoffError(err error) bool {
 //
 // # Why "Kafka is configured" is the right condition
 //
-// The handoff is only useful if something drains it, and the only thing that drains it is
-// this processor, which runs alongside the event relay. A deployment with no broker has
-// neither, so a handoff row there would be an intent nothing can ever act on — the alert
-// would simply never be evaluated. Such a deployment keeps the post-commit path, which
+// A captured alert is only useful if something publishes it, and what publishes it is the event
+// relay, which refuses to run without Kafka. A deployment with no broker has neither the relay
+// nor this processor, so a row written there would be one nothing can ever act on — the alert
+// would simply never be delivered. Such a deployment keeps the post-commit path, which
 // publishes down the legacy webhook transport exactly as it did before this feature
 // existed (AAP §0.5.4).
 //
+// The name predates the in-transaction capture and is kept because the predicate is unchanged:
+// it still answers "does the writer own this movement's monitor evaluation", which is what both
+// call sites ask.
+//
 // Returns:
-//   - bool: true when the handoff owns evaluation, false when the post-commit path does.
+//   - bool: true when the writer owns evaluation, false when the post-commit path does.
 func (l *Blnk) balanceMonitorHandoffEnabled() bool {
 	if l == nil {
 		return false

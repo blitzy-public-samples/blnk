@@ -95,6 +95,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/google/uuid"
@@ -470,9 +471,10 @@ func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 // bare category topics under the configured prefix.
 //
 // It is derived from the model's own category vocabulary rather than listed here, so a new
-// category is covered without an edit and an INTERNAL category is excluded automatically.
-// The repository cannot call into the root package — the root imports database — so the
-// prefix is read from configuration the same way the outbox's topic validation reads it.
+// category is covered without an edit and a PRIVILEGED category is excluded automatically
+// unless this deployment has acknowledged it. The repository cannot call into the root
+// package — the root imports database — so both facts are read from configuration the same
+// way the outbox's topic validation reads the prefix.
 //
 // THE CONFIGURED PREFIX ONLY, and not the historical allowlist the outbox validates against.
 // A historical namespace exists to be drained by the publisher, so granting a subscriber
@@ -481,11 +483,38 @@ func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 // goes quiet with nothing to show why.
 func grantableTopicPrefixes() map[string]struct{} {
 	grantable := make(map[string]struct{})
-	for _, topic := range model.SubscriberGrantableTopics(configuredEventTopicPrefix()) {
+	for _, topic := range model.SubscriberAuthorizableTopics(
+		configuredEventTopicPrefix(), subscriberInternalTopicAccessDeclared(),
+	) {
 		grantable[topic] = struct{}{}
 	}
 
 	return grantable
+}
+
+// subscriberInternalTopicAccessDeclared reports whether this deployment has acknowledged
+// that a subscriber may hold the internal category topic, `<prefix>.system`.
+//
+// It reads KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS directly rather than taking it as an
+// argument, because this guard exists precisely for the writes that arrive without a
+// request: a data migration, a psql session, a second service using this repository. A
+// parameter would let such a caller supply the answer, and the answer is the deployment's.
+//
+// blnk.SubscriberInternalTopicAccessDeclared is the root package's reader of the same field
+// for the same purpose; the duplication is forced by the import direction and is one field
+// read, not a second policy.
+//
+// A configuration that cannot be read answers FALSE, the fail-closed direction.
+//
+// Returns:
+//   - bool: true only when the deployment has declared the acknowledgement.
+func subscriberInternalTopicAccessDeclared() bool {
+	cnf, err := config.Fetch()
+	if err != nil || cnf == nil {
+		return false
+	}
+
+	return cnf.Kafka.SubscriberInternalTopicAccess
 }
 
 // requireGrantableTopics refuses an authorised-topic list containing anything a subscriber may
@@ -506,10 +535,12 @@ func grantableTopicPrefixes() map[string]struct{} {
 //     together with Blnk's own failure metadata, so it has no subscriber audience. That
 //     exclusion is structural, since the grantable set is composed of
 //     "<prefix>.<category>" names and a ".dlt" name can never be one.
-//   - THE INTERNAL CATEGORY TOPIC "<prefix>.system", because system.error's frozen payload
-//     renders Blnk's error text verbatim and the category is the catalogue's catch-all, so
-//     it is an operator surface. The grantable set is the three tenant categories, and
-//     model.SubscriberGrantableEventCategories owns that decision.
+//   - THE INTERNAL CATEGORY TOPIC "<prefix>.system", UNLESS the deployment has declared
+//     KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS. system.error's frozen payload renders Blnk's
+//     error text verbatim and the category is the catalogue's catch-all, so it is an
+//     operator surface: the default set is the four tenant categories, and the privileged
+//     name is admitted only where the deployment has acknowledged the disclosure.
+//     model.SubscriberPrivilegedEventCategories owns that decision.
 //
 // An EMPTY list is accepted: a subscriber authorised for nothing is the fail-closed default of
 // a fresh registration, and refusing it would make registration and authorisation one

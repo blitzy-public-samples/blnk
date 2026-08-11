@@ -583,9 +583,14 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
       echo "         A full acceptance run (500/s for 30m) writes on the order of tens of"
       echo "         millions of records and several GiB here, and that I/O competes with the"
       echo "         latency the run is measuring. Prefer a .gz destination, or a short DURATION:"
-      # `bash $0` rather than `$0`, because this file ships mode 0644 and every documented
-      # invocation in tests/loadtest/README.md spells it the same way. A hint that cannot be
-      # pasted is worse than no hint: it sends the reader to a permission error.
+      # `bash $0` rather than `$0`, to match every documented invocation in
+      # tests/loadtest/README.md, which spells it the same way. A hint that reads differently
+      # from the instructions beside it makes a reader wonder which one is right.
+      #
+      # It is NOT because the file is unexecutable: Git records mode 100755 and it is
+      # directly runnable. A comment here used to claim mode 0644, which would have made
+      # `$0` fail with a permission error — so anybody who checked the claim against
+      # `git ls-files -s` found the file's own reasoning wrong about the file.
       echo "         NDJSON_OUT=tests/loadtest/run-event-streaming.ndjson.gz bash $0 ${REQUESTED_CASE_NAME}"
     fi
   fi

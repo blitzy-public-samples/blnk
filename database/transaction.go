@@ -718,24 +718,24 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		))
 	}
 
-	// The balance-monitor handoff, and it goes in HERE for the same reason the event
+	// The balance-monitor alerts, and they go in HERE for the same reason the event
 	// rows do: the judgement of a balance's monitors belongs to the transaction that
-	// moved the balance, so a committed movement always carries its pending evaluation
-	// and a rolled-back one carries none.
+	// moved the balance, so a committed movement always carries its alerts and a
+	// rolled-back one carries none.
 	//
-	// What is written is not merely a marker to go and look later. The handoff carries BOTH
-	// inputs the judgement depends on — the balance exactly as this transaction wrote it, and
-	// the monitor definitions read inside this transaction — so which alerts exist, and what
-	// each says, is decided here and cannot be changed by an edit to blnk.balance_monitors
-	// afterwards. Only the alert's INSERT is deferred, to the processor that drains the row.
+	// Both inputs the judgement depends on are read in this transaction — the balance exactly
+	// as this transaction wrote it, and the monitor definitions as they stand now — the
+	// condition is applied here, and the canonical blnk.event_outbox row for every crossing is
+	// inserted here. Nothing about the alert is deferred: an edit to blnk.balance_monitors
+	// afterwards cannot change which alerts exist or what each says, and there is no second
+	// transaction the event has to wait for.
 	//
 	// The event rows are passed in because they answer whether it is needed. A caller
 	// that evaluated a balance's monitors BEFORE the write hands the resulting alerts to
-	// this writer, and those alerts are already inside this transaction — writing a
-	// handoff for that balance as well would have the processor publish the same crossing
-	// a second time under a different event id. See recordBalanceMonitorHandoffs and
-	// balancesAlreadyEvaluatedInTx.
-	if err := recordBalanceMonitorHandoffs(ctx, tx, span,
+	// this writer, and those alerts are already inside this transaction — evaluating that
+	// balance again here would insert the same crossing a second time under a different event
+	// id. See recordBalanceMonitorEvaluation and balancesAlreadyEvaluatedInTx.
+	if err := recordBalanceMonitorEvaluation(ctx, d, tx, span,
 		[]*model.Balance{sourceBalance, destinationBalance}, eventRows); err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -826,15 +826,15 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 		return nil, fmt.Errorf("failed to insert event outboxes: %w", err)
 	}
 
-	// The balance-monitor handoff for every balance this batch moved that was not already
+	// The balance-monitor alerts for every balance this batch moved that was not already
 	// evaluated with it. THIS is the path the coalescing pipeline reaches, and it is why
-	// the handoff is written by the writer rather than supplied by the caller:
+	// the evaluation is performed by the writer rather than supplied by the caller:
 	// transaction_coalescing.go is frozen by AAP §0.6.2 and cannot be given a new
-	// argument, so a caller-supplied handoff would have covered the single-transaction
+	// argument, so a caller-supplied alert would have covered the single-transaction
 	// path and silently missed every coalesced batch. Deriving it from the balances the
 	// writer is already updating covers both. The coalesced caller supplies no monitor
-	// alerts, so every balance here is handed off.
-	if err := recordBalanceMonitorHandoffs(ctx, tx, span, balances, eventRows); err != nil {
+	// alerts, so every balance here is evaluated here.
+	if err := recordBalanceMonitorEvaluation(ctx, d, tx, span, balances, eventRows); err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

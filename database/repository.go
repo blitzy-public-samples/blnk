@@ -40,14 +40,19 @@ type IDataSource interface {
 	chain           // Interface for hash-chain operations
 	eventOutbox     // Interface for event outbox operations
 	eventSubscriber // Interface for event subscriber operations
-	// balanceMonitorHandoff and bulkTransactionBatch are the two mechanisms that bring
-	// the last two event families under requirement R-2. Neither event could be captured
-	// inside the mutation that produced it — a monitor alert does not exist until its
-	// balance is committed, and a bulk summary belongs to no single transaction — so each
-	// captures atomically what CAN be: for a monitor alert, every input the alert is a
-	// function of (the post-mutation balance AND the monitor definitions in force), so the
-	// events that will exist are already decided at commit; for a bulk summary, the
-	// outcome itself. Each then pairs that with an atomic completion.
+	// balanceMonitorHandoff and bulkTransactionBatch serve the last two event families to be
+	// brought under requirement R-2, and they are no longer the same kind of mechanism.
+	//
+	// A monitor alert IS captured inside the mutation that produced it: the writer reads the
+	// monitor definitions in its own transaction, applies the condition there and inserts the
+	// canonical row before the COMMIT (see recordBalanceMonitorEvaluation). The handoff below
+	// serves the finite population that predates that capture, plus a process with no alert
+	// capture registered, and for those it captures atomically what it can — every input the
+	// alert is a function of, so the events that will exist are already decided at commit —
+	// and pairs it with an atomic completion.
+	//
+	// A bulk summary genuinely belongs to no single member transaction, so the coordinator
+	// captures the OUTCOME atomically and pairs that with an atomic completion.
 	balanceMonitorHandoff // Interface for balance monitor handoff operations
 	bulkTransactionBatch  // Interface for bulk transaction batch coordinator operations
 }
@@ -1269,19 +1274,29 @@ type chain interface {
 // that carries a committed movement's monitor evaluation — and every input that
 // evaluation depends on — until it has been performed.
 //
-// # Why this exists as its own contract
+// # THIS IS THE FALLBACK AND THE UPGRADE PATH, not the ordinary route
 //
-// `balance.monitor` is the one event type whose row cannot be inserted by the mutation
-// that causes it. A monitor fires because a CONDITION was met on a balance a transaction
-// has ALREADY committed, so at the instant the alert exists there is no open transaction
-// to enrol it in. Retrying the capture narrowed the window; it could not close it,
-// because a process that dies between the commit and the insert loses the alert outright
-// and leaves nothing to replay.
+// The atomic writers now evaluate a moved balance's monitors inside their own transaction and
+// insert the canonical blnk.event_outbox row there — see recordBalanceMonitorEvaluation and
+// captureBalanceMonitorAlertsInTx — so a movement made by a process with a
+// BalanceMonitorAlertCapture registered writes NO handoff at all. Two populations of handoff
+// rows remain, and this contract is what serves them: rows written by releases that predate
+// that capture, and rows written by a process with no capture registered, which cannot build an
+// event row and must not leave the verdict to be taken later.
 //
-// The handoff splits the problem in two, and the split is chosen so that only the WRITE
-// is deferred, never the DECISION. What the balance's own transaction commits — see
-// recordBalanceMonitorHandoffs, called by the atomic writers — is both decision inputs:
-// the balance exactly as that transaction wrote it, and the monitor definitions in force
+// # Why the handoff exists at all
+//
+// `balance.monitor` was the one event type whose row appeared to be uninsertable by the
+// mutation that causes it. A monitor fires because a CONDITION was met on a balance, and the
+// original design evaluated that condition AFTER the commit, so at the instant the alert
+// existed there was no open transaction to enrol it in. Retrying the capture narrowed the
+// window; it could not close it, because a process that dies between the commit and the insert
+// loses the alert outright and leaves nothing to replay.
+//
+// The handoff split the problem in two so that only the WRITE was deferred, never the
+// DECISION. What the balance's own transaction commits — see insertBalanceMonitorHandoffsInTx,
+// reached from recordBalanceMonitorEvaluation when no capture is registered — is both decision
+// inputs: the balance exactly as that transaction wrote it, and the monitor definitions in force
 // at that moment (BalanceSnapshot and MonitorSnapshot on model.BalanceMonitorHandoff).
 // Which alerts will exist, and what each will say, is therefore already fixed when the
 // movement commits; draining the row cannot change it, because the evaluation is a pure
@@ -1290,10 +1305,11 @@ type chain interface {
 // can lose or alter an alert: a crash leaves a claimable handoff, not a missing event,
 // and a later edit to blnk.balance_monitors cannot reach a movement already committed.
 //
-// The narrower guarantee this still is, stated plainly: the event ROW appears after the
-// mutation's commit rather than within it, so a subscriber sees `balance.monitor` a
-// poll interval behind the movement. What the row CONTAINS, and whether it exists at
-// all, is determined by the mutation transaction itself.
+// The narrower guarantee that is, stated plainly, and the reason the in-transaction capture
+// supersedes it: the event ROW appears after the mutation's commit rather than within it, so a
+// subscriber sees such a `balance.monitor` a poll interval behind the movement, and until the
+// conversion commits the row requirement R-2 names does not exist. What the row CONTAINS, and
+// whether it exists at all, was determined by the mutation transaction either way.
 //
 // # There is no in-transaction insert method here, and that is deliberate
 //

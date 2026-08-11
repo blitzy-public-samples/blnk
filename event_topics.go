@@ -74,35 +74,38 @@ type eventTopicBacklogStore interface {
 // new event type appears, extend model.EventCategory; this file then routes it with no
 // change at all.
 //
-// # Four categories, not three
+// # Five categories, not three
 //
 // The three category topics named in the requirements — transactions, balances,
 // identities — do not cover every event Blnk actually emits. "ledger.created" (raised
 // by the post-ledger-creation actions in ledger.go) and "system.error" (raised through
 // the notification package's registered webhook-sender indirection) belong to none of
 // them, while the coverage requirement is absolute: every event type that reached the
-// legacy webhook sender must be published, with zero exceptions.
+// legacy webhook sender must be published, with zero exceptions — and requirement R-12
+// adds that each of them must still be reachable by a subscriber credential once the
+// legacy transport retires.
 //
-// ONE further category resolves that tension while following the identical naming
-// convention, so nothing about the scheme is special-cased and each dead-letter sibling
-// is derived by the same rule as every other. This is the recorded resolution of the
-// coverage-versus-topic-list ambiguity, and it is a decision, not an oversight:
+// TWO further categories resolve that, both following the identical naming convention,
+// so nothing about the scheme is special-cased and each dead-letter sibling is derived
+// by the same rule as every other. The split between them is by AUDIENCE:
 //
-//	"<prefix>.system"   ledger.created, system.error, and anything this catalogue does
-//	                    not recognise. INTERNAL, because the frozen system.error body
-//	                    carries verbatim error text — PostgreSQL schema, table and
-//	                    routine names; broker addresses — and because an internal
-//	                    catch-all is what stops a routing omission delivering a domain
-//	                    payload to an audience that never asked for it.
+//	"<prefix>.ledgers"  ledger.created. A TENANT topic, grantable exactly like the three
+//	                    the requirements name, because a ledger's name, id, creation
+//	                    instant and metadata are ordinary tenant data.
+//	"<prefix>.system"   system.error, and anything this catalogue does not recognise.
+//	                    INTERNAL, because the frozen system.error body carries verbatim
+//	                    error text — PostgreSQL schema, table and routine names; broker
+//	                    addresses — and because an internal catch-all is what stops a
+//	                    routing omission delivering a domain payload to an audience that
+//	                    never asked for it. Grantable only where the deployment has
+//	                    declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS.
 //
-// The topic being internal means `ledger.created` has no subscriber route, which is a
-// real cost and is documented as one on model.EventCategorySystem and in
-// docs/event-streaming.md. A fifth `ledgers` category was implemented here to avoid it
-// and has been removed: the catalogue is a published contract that the provisioning
-// script, both Compose files, the Kubernetes manifests and every subscriber's topic
-// list enumerate identically, so a fifth name on this side of it names a topic the
-// broker was never told to create. Changing the catalogue is a deliberate change made
-// once and everywhere, not a constant added here.
+// The two used to be one category, and separating them is what gives every migrated
+// event type a credential-reachable route without making the internal one an ordinary
+// grant. While they shared a topic there were only two possible answers and both were
+// defects: grant the topic and disclose Blnk's own error text to whoever wanted ledger
+// events, or withhold it and leave `ledger.created` with no subscriber route at all
+// after the cutover. model.EventCategoryLedgers records that reasoning.
 //
 // Do NOT "tidy" either away. Folding these events into, say, the transactions topic
 // corrupts that topic's semantics for every subscriber filtering on it, and dropping
@@ -246,7 +249,7 @@ func eventCategoryOrder() []string {
 }
 
 // EventCategories returns the event category tokens in canonical order:
-// "transactions", "balances", "identities", "system".
+// "transactions", "balances", "identities", "ledgers", "system".
 //
 // These are bare tokens, not topic names. Compose a topic from one with
 // TopicForCategory; treating a returned value as a topic is a bug.
@@ -281,26 +284,52 @@ func EventCategories() []string {
 //     match would accept "blnk.transactions.something-else" and, with a
 //     caller-supplied prefix, very nearly anything.
 //
-// The list is the THREE TENANT category topics. `<prefix>.system` is on neither this list
-// nor the catalogue of names any subscriber may hold: it carries system.error's frozen
-// verbatim-error body and is the catalogue's catch-all, which makes it an operator topic
-// in the same class as a `.dlt` — see model.EventCategorySystem and
-// model.SubscriberGrantableEventCategories, which owns that decision. Which of the three
-// a given subscriber actually holds is the subset recorded on that subscriber.
+// The list is the FOUR TENANT category topics, plus `<prefix>.system` in a deployment that
+// has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS. That topic carries system.error's
+// frozen verbatim-error body and is the catalogue's catch-all, which makes it an operator
+// surface rather than tenant data — so it is absent by default and present only where the
+// deployment has acknowledged the disclosure. See model.EventCategorySystem and
+// model.SubscriberPrivilegedEventCategories, which own that decision. Which of the resolved
+// topics a given subscriber actually holds is the subset recorded on that subscriber.
 //
 // Returns:
 //   - []string: a fresh slice of fully-qualified topic names, in canonical category
 //     order.
 func SubscriberGrantableTopics() []string {
-	// Composed by model.SubscriberGrantableTopics rather than assembled here, so that this
+	// Composed by model.SubscriberAuthorizableTopics rather than assembled here, so that this
 	// package, the persistence boundary and the request DTO all read ONE list. Three
 	// independent reconstructions of the same allowlist is three chances for one to drift,
 	// and drift means a topic one layer refuses and another grants. All this function adds
-	// is the configured prefix, which model cannot see.
-	return model.SubscriberGrantableTopics(TopicPrefix())
+	// is what model cannot see: the configured prefix, and whether this deployment has
+	// acknowledged the privileged category.
+	return model.SubscriberAuthorizableTopics(TopicPrefix(), SubscriberInternalTopicAccessDeclared())
 }
 
-// IsSubscriberGrantableTopic reports whether a topic may be granted to a subscriber.
+// SubscriberInternalTopicAccessDeclared reports whether this deployment has acknowledged that
+// a subscriber may be granted the internal category topic.
+//
+// It is the ONE reader of KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS in this package, so the
+// allowlist, the refusal message and the provisioning warning cannot disagree about the
+// deployment's state. The persistence boundary reads the same field through its own
+// configuration accessor, because database may not import this package.
+//
+// A configuration that cannot be read answers FALSE — the fail-closed direction: an
+// unloaded configuration must not be the thing that makes Blnk's internal error stream
+// grantable.
+//
+// Returns:
+//   - bool: true only when the deployment has declared the acknowledgement.
+func SubscriberInternalTopicAccessDeclared() bool {
+	cnf, err := fetchConfiguration()
+	if err != nil || cnf == nil {
+		return false
+	}
+
+	return cnf.Kafka.SubscriberInternalTopicAccess
+}
+
+// IsSubscriberGrantableTopic reports whether a topic may be granted to a subscriber in this
+// deployment.
 //
 // The comparison is exact against SubscriberGrantableTopics. It is deliberately NOT a
 // prefix test and NOT a normalising test: the caller-supplied value is compared as
@@ -312,7 +341,7 @@ func SubscriberGrantableTopics() []string {
 //   - topic string: the candidate topic. Surrounding whitespace is ignored.
 //
 // Returns:
-//   - bool: true only for an exact match against one of the four category topics.
+//   - bool: true only for an exact match against a resolved grantable category topic.
 func IsSubscriberGrantableTopic(topic string) bool {
 	topic = strings.TrimSpace(topic)
 	if topic == "" {
@@ -326,6 +355,25 @@ func IsSubscriberGrantableTopic(topic string) bool {
 	}
 
 	return false
+}
+
+// IsSubscriberPrivilegedTopic reports whether a topic is one of the names that require the
+// deployment-level acknowledgement, independently of whether this deployment has made it.
+//
+// It is what lets a refusal name the right remedy. "blnk.system" refused in a deployment that
+// has not declared the acknowledgement is a configuration decision an operator can take;
+// "acme.transactions" refused is a caller error. Without this distinction both produce the
+// same message and the operator is sent to read the allowlist rather than to make the
+// decision.
+//
+// Parameters:
+//   - topic string: the candidate topic. Surrounding whitespace is ignored.
+//
+// Returns:
+//   - bool: true only for an exact match against a privileged category topic under the
+//     configured prefix.
+func IsSubscriberPrivilegedTopic(topic string) bool {
+	return model.IsSubscriberPrivilegedTopicName(strings.TrimSpace(topic), TopicPrefix())
 }
 
 // IsBlnkOwnedTopic reports whether a topic is one of the names Blnk itself publishes
@@ -435,9 +483,9 @@ func TopicPrefix() string {
 
 // TopicForCategory composes the fully-qualified topic name for a category token.
 //
-// The composition is "<prefix>.<category>", so with the default prefix the four
-// category tokens yield blnk.transactions, blnk.balances, blnk.identities and
-// blnk.system.
+// The composition is "<prefix>.<category>", so with the default prefix the five
+// category tokens yield blnk.transactions, blnk.balances, blnk.identities,
+// blnk.ledgers and blnk.system.
 //
 // An empty or blank category resolves to the system category rather than composing
 // "<prefix>." — a name with a trailing separator and an empty final segment, which
@@ -491,8 +539,9 @@ func TopicForCategory(category string) string {
 //	                   transaction.unknown, and any bulk_transaction.<status>
 //	blnk.balances      balance.created, balance.monitor
 //	blnk.identities    identity.created
-//	blnk.system        ledger.created, system.error, and anything this catalogue
-//	                   does not recognise                          (internal)
+//	blnk.ledgers       ledger.created
+//	blnk.system        system.error, and anything this catalogue does not
+//	                   recognise                                   (internal)
 //
 // Two properties of that resolution are easy to get wrong and are worth stating
 // explicitly, because both live in the delegated mapping rather than here:
@@ -542,7 +591,7 @@ func TopicForEvent(eventType string) string {
 //
 // The idempotency rule implies one invariant: NO CATEGORY MAY BE NAMED "dlt". A
 // blnk.dlt category topic would be indistinguishable from an already-derived name and
-// could never get a dead-letter sibling of its own. None of the four categories is, and
+// could never get a dead-letter sibling of its own. None of the five categories is, and
 // a test pins it.
 //
 // An empty or blank topic returns the empty string rather than a bare ".dlt". There is
@@ -807,7 +856,7 @@ func AllDeadLetterTopics() []string {
 }
 
 // AllTopicsWithDeadLetters returns every topic Blnk owns: every category topic
-// followed by every dead-letter sibling — eight names with the four categories the
+// followed by every dead-letter sibling — ten names with the five categories the
 // topic contract declares.
 //
 // THIS IS THE SINGLE SOURCE OF TRUTH FOR THE TOPIC INVENTORY. The admin client's topic

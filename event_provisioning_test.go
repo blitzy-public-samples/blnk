@@ -1152,15 +1152,16 @@ func topicSummaryStub(t *testing.T, failAfter int, listed []string) string {
 // was reachable at readiness and unreadable by the time each topic's pre-state was probed.
 //
 // Counted from the script's own invocations rather than read off the source: a stub that logged
-// every call recorded nine listings in a full run — one readiness probe and one per topic in the
-// eight-topic catalogue — with the first topic's `--create` arriving as the second call overall.
+// every call recorded one listing more than there are topics in a full run — one readiness probe
+// and one per topic in the catalogue — with the first topic's `--create` arriving as the second
+// call overall.
 const readinessListings = 1
 
-// allProvisionedTopics is the frozen eight-topic catalogue the script assures, in the order it
-// assures them: the four category topics, then their dead-letter siblings.
+// allProvisionedTopics is the topic catalogue the script assures, in the order it assures them:
+// the five category topics, then their dead-letter siblings.
 var allProvisionedTopics = []string{
-	"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
-	"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
+	"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system",
+	"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.ledgers.dlt", "blnk.system.dlt",
 }
 
 // TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions is finding F-10, executed.
@@ -1168,7 +1169,7 @@ var allProvisionedTopics = []string{
 // # What the summary is for, and what it was doing instead
 //
 // The closing line answers a question the geometry table cannot: not "is the catalogue correct
-// now" but "was it correct when this run started". `created: 8` on a deployment that has been
+// now" but "was it correct when this run started". A full `created` count on a deployment that has been
 // publishing for weeks means the catalogue was lost and silently rebuilt — and with it every
 // offset — which is an incident, and which the daily outbox-versus-offset reconciliation in
 // docs/kafka-operations.md relies on being able to detect. A count that is inferred rather than
@@ -1318,8 +1319,9 @@ func growthSummaryStub(t *testing.T, alterExit int) string {
 	dir := t.TempDir()
 
 	// THE MARKER IS PER TOPIC. A single shared marker made the first topic's alter change the
-	// describe answer for all eight, so seven of them looked already-correct and the test measured
-	// one growth instead of eight — the stub, not the script, deciding the outcome.
+	// describe answer for every topic in the catalogue, so all but the first looked
+	// already-correct and the test measured one growth instead of the whole catalogue — the stub,
+	// not the script, deciding the outcome.
 	topics := "#!/usr/bin/env bash\n" +
 		"topic=\"\"\n" +
 		"previous=\"\"\n" +
@@ -1510,7 +1512,7 @@ func TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation(t *testing.T) 
 // `kafka-topics --create --if-not-exists` makes creation idempotent by making it
 // INDISTINGUISHABLE: an existing topic and a freshly created one both leave exit 0 and both
 // land in the same reconciliation. So a run whose catalogue had been lost and silently rebuilt
-// printed output identical to a run where nothing had changed — eight topics, the right
+// printed output identical to a run where nothing had changed — the whole catalogue, the right
 // partition counts, and no hint that every offset had just restarted from zero. The daily
 // outbox-versus-offset reconciliation in docs/kafka-operations.md cannot be performed without
 // knowing the difference: it compares outbox rows against broker offsets, and a recreated
