@@ -206,8 +206,8 @@ data:
         rules:
           # THE BROKER'S DISK, which the retention policy in
           # kafka-statefulset.yaml bounds but cannot guarantee.
-          # log.retention.bytes is 2 GiB per partition against 60 partitions
-          # per broker on a 200Gi volume — 120 GiB, 60% — so the steady state
+          # log.retention.bytes is 2 GiB per partition against 48 partitions
+          # per broker on a 200Gi volume — 96 GiB, 48% — so the steady state
           # has ample headroom. What this rule catches is every way the
           # arithmetic stops holding: a topic added without recomputing the
           # per-partition budget, partitions grown past KAFKA_MIN_PARTITIONS,
@@ -215,8 +215,8 @@ data:
           # behaving unexpectedly.
           #
           # THE NUMBERS ARE DERIVED AND THE DERIVATION IS ASSERTED. The
-          # catalogue is five categories plus their five .dlt siblings, so
-          # 10 topics x 6 = 60 partitions, and the volumeClaimTemplate is
+          # catalogue is four categories plus their four .dlt siblings, so
+          # 8 topics x 6 = 48 partitions, and the volumeClaimTemplate is
           # 200Gi. A monitoring narrative describing a different cluster from
           # the one it watches is how an operator reading this rule concludes
           # the THRESHOLD is wrong rather than that the disk is filling — which

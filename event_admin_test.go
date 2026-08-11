@@ -75,10 +75,10 @@ import (
 // names the pipeline actually publishes to.
 
 // expectedEventTopics is the topic inventory, spelled out independently of
-// event_topics.go: the five category topics followed by their five dead-letter siblings,
+// event_topics.go: the four category topics followed by their four dead-letter siblings,
 // in the canonical order provisioning uses.
 //
-// blnk.system carries system.error and is also where an event type the catalogue does not
+// blnk.system carries ledger.created and system.error and is also where an event type the catalogue does not
 // recognise is routed, so it must be provisioned with the same geometry as every other topic. A
 // system topic that does not exist would strand both Blnk's own records and exactly the events
 // that already indicate a routing defect. It is provisioned for every deployment and granted to
@@ -88,12 +88,10 @@ var expectedEventTopics = []string{
 	"blnk.transactions",
 	"blnk.balances",
 	"blnk.identities",
-	"blnk.ledgers",
 	"blnk.system",
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	"blnk.ledgers.dlt",
 	"blnk.system.dlt",
 }
 
@@ -1108,18 +1106,18 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 		"the inventory this file asserts against must be exactly the inventory event_topics.go composes, "+
 			"so the test and the implementation share one source of truth")
 
-	const categoryCount = 5
+	const categoryCount = 4
 
 	require.Len(t, expectedEventTopics, categoryCount*2,
-		"five category topics and one dead-letter sibling each")
+		"four category topics and one dead-letter sibling each")
 	assert.Equal(t, expectedEventTopics[:categoryCount], AllTopics(),
-		"the first five entries are the category topics, in canonical provisioning order")
+		"the first four entries are the category topics, in canonical provisioning order")
 	assert.Equal(t, expectedEventTopics[categoryCount:], AllDeadLetterTopics(),
-		"the last five entries are their dead-letter siblings, in the same order")
+		"the last four entries are their dead-letter siblings, in the same order")
 
 	categories := EventCategories()
 	require.Len(t, categories, categoryCount,
-		"five categories are what give every emitted event type a home — including the system category an unrecognised type routes to; a sixth would need a topic here and a change to the published topic contract")
+		"four categories are what give every emitted event type a home — including the system category an unrecognised type routes to; a fifth would need a topic here and a change to the published topic contract")
 
 	// EVERY CATEGORY TOPIC IS PROVISIONED. GRANTABILITY IS A SEPARATE QUESTION, and the two are
 	// asserted separately here because conflating them is how a topic events route to goes
@@ -2816,13 +2814,14 @@ func TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist(
 		"a foreign topic":         "attacker.transactions",
 		"a dead-letter topic":     "blnk.transactions.dlt",
 		"the system dead-letter":  "blnk.system.dlt",
-		"the ledger dead-letter":  "blnk.ledgers.dlt",
 		"an internal Kafka topic": "__consumer_offsets",
 		"a prefix fragment":       "blnk.",
 		"the prefix alone":        "blnk",
-		// A plausible near-miss: `ledgers` IS a category and `ledger` is not, so the singular
-		// names a topic nothing creates and nobody may be granted.
-		"a category this contract does not have": "blnk.ledger",
+		// A plausible near-miss: `balances` IS a category and `balance` is not, so the singular
+		// names a topic nothing creates and nobody may be granted. `blnk.ledgers` is the same
+		// shape of mistake — a withdrawn fifth category that the catalogue does not have.
+		"a category this contract does not have":            "blnk.balance",
+		"a category withdrawn from the published catalogue": "blnk.ledgers",
 		// The internal category, refused because this test's configuration declares no
 		// acknowledgement. TestProvisionSubscriberPrincipal_GrantsTheInternalTopicOnlyWhenTheDeploymentAcknowledgesIt
 		// covers the other direction.
@@ -4679,9 +4678,9 @@ func TestNormalizeTopicList_DropsBlanksAndDuplicatesInOrder(t *testing.T) {
 func TestMissingTopics_NamesTheAbsentOnesInRequestedOrder(t *testing.T) {
 	present := map[string][]int{"blnk.transactions": {0}, "blnk.balances": {0}}
 
-	assert.Equal(t, []string{"blnk.identities", "blnk.ledgers", "blnk.system"},
+	assert.Equal(t, []string{"blnk.identities", "blnk.system"},
 		missingTopics(
-			[]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.ledgers", "blnk.system"},
+			[]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.system"},
 			present,
 		))
 	assert.Nil(t, missingTopics([]string{"blnk.transactions"}, present))

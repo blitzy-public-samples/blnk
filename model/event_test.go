@@ -126,22 +126,22 @@ func decodeObject(t *testing.T, b []byte) map[string]json.RawMessage {
 // "ledger.created", "identity.created", "balance.created", "balance.monitor",
 // and "system.error" raised through the registered webhook-sender indirection.
 //
-// On the two categories beyond the three the requirements name: both are deliberate.
+// On the one category beyond the three the requirements name: it is deliberate.
 // "ledger.created" and "system.error" are genuinely emitted yet belong to none of
 // the three named categories, while the coverage requirement is absolute — every
 // event type that reaches the legacy webhook sender must be published, with zero
 // exceptions — and R-12 adds that each must still be reachable by a subscriber
 // credential once the webhook transport retires.
 //
-// They resolve to a category each, split by AUDIENCE. `ledgers` is tenant data and is
-// grantable exactly like the three named categories. `system` is the internal error
-// stream and the catch-all: system.error's payload is the frozen legacy body and still
-// carries the error text as it renders, so the disclosure is contained by requiring a
-// deployment-level acknowledgement before any subscriber may hold it, and routing a
-// forgotten mapping there rather than to a broadly-held category is what keeps its
-// payload away from every subscriber at once. Forcing either event onto an unrelated
-// topic would corrupt that topic's semantics for every subscriber filtering on it, and
-// dropping them would breach coverage outright.
+// Both resolve to `system`, which is the published catalogue's fourth category: the
+// internal error stream, ledger creation, and the catch-all. system.error's payload is
+// the frozen legacy body and still carries the error text as it renders, so the
+// disclosure is contained by requiring a deployment-level acknowledgement before any
+// subscriber may hold the topic — which is also the route ledger.created reaches its
+// audience by — and routing a forgotten mapping there rather than to a broadly-held
+// category is what keeps its payload away from every subscriber at once. Forcing either
+// event onto an unrelated topic would corrupt that topic's semantics for every
+// subscriber filtering on it, and dropping them would breach coverage outright.
 func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -235,13 +235,13 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 			reason:    "identity events must route to the identities category",
 		},
 
-		// --- the two event types outside the three named categories, one in each of the
-		// two extra categories the catalogue adds for them ---
+		// --- the two event types outside the three named categories, both on the one extra
+		// category the catalogue adds for them ---
 		{
 			name:      "ledger created",
 			eventType: "ledger.created",
-			want:      EventCategoryLedgers,
-			reason:    "ledger.created belongs to none of the three named categories and IS ordinary tenant data - a ledger's name, id, creation instant and metadata - so it routes to its own grantable category, blnk.ledgers. It used to share blnk.system with system.error, which forced a choice between disclosing Blnk's verbatim internal error text to whoever wanted ledger events and leaving this event with no subscriber route at all after the webhook transport retires; R-12 makes the second a defect, so the two categories were separated",
+			want:      EventCategorySystem,
+			reason:    "ledger.created belongs to none of the three named categories, so the published four-category catalogue routes it to blnk.system alongside system.error. A subscriber therefore reaches it only through the privileged grant of that topic, which discloses Blnk's verbatim internal error text as well - a documented cost of the contract rather than a defect to work around by adding a fifth category, which a withdrawn revision did",
 		},
 		{
 			name:      "system error",
@@ -278,10 +278,10 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 // It asserts membership by NAME in both directions, because a count-only assertion passes just
 // as happily when one category is swapped for another as when the list is correct.
 //
-// # The four tenant categories are grantable by default; the system category is NOT
+// # The three tenant categories are grantable by default; the system category is NOT
 //
-// The catalogue holds five category topics. Four of them — transactions, balances, identities
-// and ledgers — are tenant data and are in the default grant set. `<prefix>.system` is withheld
+// The catalogue holds four category topics. Three of them — transactions, balances and
+// identities — are tenant data and are in the default grant set. `<prefix>.system` is withheld
 // from it, for two properties no per-subscriber decision can remove:
 //
 //   - system.error's payload is the frozen legacy body, so it renders Blnk's error text as it
@@ -297,18 +297,16 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 // R-12 requires the route to exist: system.error reached webhook subscribers, so retiring that
 // transport without a credential-reachable equivalent would drop the audience.
 //
-// `ledger.created` needs none of that. It is on `<prefix>.ledgers`, which is in the default
-// grant set, so the ordinary tenant event that used to share the internal topic is now reachable
-// with no privilege at all.
+// `ledger.created` shares that topic and therefore that route. It reached webhook subscribers
+// too, so the privileged grant is how it stays reachable after the cutover — with the
+// disclosure attached, which is the cost the four-category catalogue carries and which
+// docs/event-streaming.md publishes rather than hides.
 func TestSubscriberGrantableEventCategories_IsEveryTenantCategoryAndNotTheInternalOne(t *testing.T) {
 	grantable := SubscriberGrantableEventCategories()
 
 	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
-	assert.Contains(t, grantable, EventCategoryLedgers,
-		"ledgers is subscriber-facing ledger data and must be grantable with no privilege: it is the "+
-			"category that gives ledger.created a subscriber route after the webhook transport retires")
 
 	// THE ASSERTION THAT MATTERS MOST HERE, and the one a reader of the previous contract is
 	// most likely to expect the opposite of.
@@ -320,12 +318,11 @@ func TestSubscriberGrantableEventCategories_IsEveryTenantCategoryAndNotTheIntern
 
 	assert.Equal(t,
 		[]string{
-			EventCategoryTransactions, EventCategoryBalances,
-			EventCategoryIdentities, EventCategoryLedgers,
+			EventCategoryTransactions, EventCategoryBalances, EventCategoryIdentities,
 		},
 		grantable,
-		"the default grantable list is the four tenant categories in catalogue order: a missing one "+
-			"makes a tenant category unreachable, and a fifth means the internal category reached the "+
+		"the default grantable list is the three tenant categories in catalogue order: a missing one "+
+			"makes a tenant category unreachable, and a fourth means the internal category reached the "+
 			"default allowlist")
 
 	// The privileged list is the other half of the same decision, and asserting both is what
@@ -333,14 +330,14 @@ func TestSubscriberGrantableEventCategories_IsEveryTenantCategoryAndNotTheIntern
 	// type still routes to it, the topic is still created and published to, and a deployment can
 	// still authorise it.
 	assert.Equal(t, []string{EventCategorySystem}, SubscriberPrivilegedEventCategories(),
-		"the privileged list is exactly the internal category: empty would leave system.error with "+
-			"no subscriber route at all, and wider would make a tenant category conditional on an "+
-			"acknowledgement it does not need")
+		"the privileged list is exactly the internal category: empty would leave system.error and "+
+			"ledger.created with no subscriber route at all, and wider would make a tenant category "+
+			"conditional on an acknowledgement it does not need")
 
-	assert.Len(t, AllEventCategories(), 5,
-		"the topic catalogue holds five categories; changing that obliges the provisioning script, "+
+	assert.Len(t, AllEventCategories(), 4,
+		"the topic catalogue holds four categories; changing that obliges the provisioning script, "+
 			"both compose stacks, the Kubernetes configuration and the subscriber documentation to "+
-			"change with it")
+			"change with it — and every subscriber that has built against the published contract")
 	assert.Contains(t, AllEventCategories(), EventCategorySystem,
 		"the system category must still EXIST — it is the catch-all every uncatalogued event routes "+
 			"to and the home of system.error; it is privileged, not absent")
@@ -385,9 +382,9 @@ func TestSubscriberAuthorizableTopics_AddsTheInternalTopicOnlyWhenAcknowledged(t
 
 	withoutAck := SubscriberAuthorizableTopics(prefix, false)
 	assert.Equal(t,
-		[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers"},
+		[]string{"blnk.transactions", "blnk.balances", "blnk.identities"},
 		withoutAck,
-		"with no acknowledgement the allowlist is exactly the four tenant category topics")
+		"with no acknowledgement the allowlist is exactly the three tenant category topics")
 	assert.NotContains(t, withoutAck, "blnk.system",
 		"the internal topic must be absent by default: that default is the whole reason the "+
 			"acknowledgement exists")
@@ -397,7 +394,7 @@ func TestSubscriberAuthorizableTopics_AddsTheInternalTopicOnlyWhenAcknowledged(t
 
 	withAck := SubscriberAuthorizableTopics(prefix, true)
 	assert.Equal(t,
-		[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system"},
+		[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system"},
 		withAck,
 		"the acknowledgement APPENDS the privileged topic and reorders nothing, so an inventory "+
 			"rendered from either list reads the same up to the point the privileged names begin")
@@ -414,14 +411,14 @@ func TestSubscriberAuthorizableTopics_AddsTheInternalTopicOnlyWhenAcknowledged(t
 	assert.True(t, IsSubscriberPrivilegedTopicName("blnk.system", prefix),
 		"the privileged-name test is what lets a refusal name the acknowledgement instead of the "+
 			"allowlist")
-	assert.False(t, IsSubscriberPrivilegedTopicName("blnk.ledgers", prefix),
+	assert.False(t, IsSubscriberPrivilegedTopicName("blnk.identities", prefix),
 		"a tenant topic must never be reported as privileged, or an operator would be told to set a "+
 			"variable that has nothing to do with the refusal")
 
 	// A dead-letter sibling stays out of both lists, whatever is acknowledged. The
 	// acknowledgement widens the grant by exactly one name.
 	for _, acknowledged := range []bool{false, true} {
-		for _, dlt := range []string{"blnk.system.dlt", "blnk.ledgers.dlt", "blnk.transactions.dlt"} {
+		for _, dlt := range []string{"blnk.system.dlt", "blnk.identities.dlt", "blnk.transactions.dlt"} {
 			assert.Falsef(t, IsSubscriberAuthorizableTopicName(dlt, prefix, acknowledged),
 				"%q must never be grantable (acknowledged=%v): a dead-letter topic carries every other "+
 					"subscriber's failed events together with Blnk's failure metadata", dlt, acknowledged)
@@ -507,13 +504,11 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		"the balances token composes blnk.balances and blnk.balances.dlt")
 	assert.Equal(t, "identities", EventCategoryIdentities,
 		"the identities token composes blnk.identities and blnk.identities.dlt")
-	assert.Equal(t, "ledgers", EventCategoryLedgers,
-		"the ledgers token composes blnk.ledgers and blnk.ledgers.dlt — the tenant category that carries ledger.created and gives it a subscriber route with no privilege")
 	assert.Equal(t, "system", EventCategorySystem,
-		"the system token composes blnk.system and blnk.system.dlt — the internal category that carries system.error, and the catch-all that keeps an unrecognised event type published rather than dropped")
+		"the system token composes blnk.system and blnk.system.dlt — the internal category that carries ledger.created and system.error, and the catch-all that keeps an unrecognised event type published rather than dropped")
 
-	assert.Len(t, AllEventCategories(), 5,
-		"the topic contract is five categories and ten topics: changing it obliges the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
+	assert.Len(t, AllEventCategories(), 4,
+		"the topic contract is four categories and eight topics: changing it obliges the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
 
 	// Every token must be mutually distinct, or two categories would collapse onto
 	// one topic and a subscriber filtering by topic would receive events it never
@@ -522,7 +517,6 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		EventCategoryTransactions: {},
 		EventCategoryBalances:     {},
 		EventCategoryIdentities:   {},
-		EventCategoryLedgers:      {},
 		EventCategorySystem:       {},
 	}
 	assert.Len(t, distinct, len(AllEventCategories()),
@@ -537,7 +531,7 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 	// A category token must never contain the separator the topic-naming layer
 	// uses, or "<prefix>.<category>" would produce an extra segment and the
 	// resulting topic would not be the documented one.
-	for _, category := range []string{EventCategoryTransactions, EventCategoryBalances, EventCategoryIdentities, EventCategoryLedgers, EventCategorySystem} {
+	for _, category := range []string{EventCategoryTransactions, EventCategoryBalances, EventCategoryIdentities, EventCategorySystem} {
 		for i := 0; i < len(category); i++ {
 			assert.NotEqual(t, byte('.'), category[i],
 				"category token %q must not contain a dot: the topic-naming layer owns the separator, and an embedded one would add an unintended topic segment", category)
@@ -562,10 +556,12 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 // publish fails, the retry budget is spent, and the dead-letter write fails too because
 // the `.dlt` sibling is missing as well. Nothing in the build would have said so.
 //
-// `ledgers` is the most recent addition and it was made everywhere at once, which is what this
-// test exists to require: it gives `ledger.created` a grantable topic of its own so that the
-// ordinary tenant event no longer shares the internal category with `system.error`. Growing the
-// catalogue again is a deliberate change that starts by editing the expectation below.
+// `ledgers` was added here once, as a fifth category giving `ledger.created` a grantable topic
+// of its own, and was WITHDRAWN: the catalogue is a contract subscribers build against, so
+// widening it is a decision that needs its own approval rather than one an implementation may
+// take. `ledger.created` therefore shares `system` with `system.error`, and its subscriber route
+// is the privileged grant. Growing the catalogue is a deliberate change that starts by editing
+// the expectation below.
 //
 // The assertion is on the exact SET rather than the length, because a length assertion
 // passes just as happily when one category is swapped for another as when the list is
@@ -573,9 +569,9 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 // orphaned and every message already on it is stranded.
 func TestEventCatalogue_CategorySetIsClosed(t *testing.T) {
 	require.ElementsMatch(t,
-		[]string{"transactions", "balances", "identities", "ledgers", "system"},
+		[]string{"transactions", "balances", "identities", "system"},
 		AllEventCategories(),
-		"the topic catalogue is a published five-category contract. A sixth category here is a "+
+		"the topic catalogue is a published four-category contract. A fifth category here is a "+
 			"topic that events route to and that scripts/kafka-provision.sh, both compose "+
 			"stacks, blnk-config.yaml, .env.example, the makefile and the operator docs do "+
 			"not create. Change all of them, then change this expectation",
@@ -585,7 +581,7 @@ func TestEventCatalogue_CategorySetIsClosed(t *testing.T) {
 	// the order of AllTopics, AllDeadLetterTopics and AllTopicsWithDeadLetters, and
 	// operators diff those listings against the provisioning script's output.
 	assert.Equal(t,
-		[]string{"transactions", "balances", "identities", "ledgers", "system"},
+		[]string{"transactions", "balances", "identities", "system"},
 		AllEventCategories(),
 		"the canonical category order is what makes topic inventories, reports and their "+
 			"diffs against provisioning comparable; reordering it silently changes every "+

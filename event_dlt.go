@@ -2281,20 +2281,23 @@ const replayClaimLease = 2 * time.Minute
 // disagree about what went wrong. The three arms:
 //
 //   - The replay was ABANDONED — the caller went away, or the request's deadline expired,
-//     with no network or protocol failure anywhere in the error's chain.
-//     ErrEventReplayTimeout, which statusByCode maps to 504. TAXONOMY-01: this arm exists
-//     because such a failure used to take the arm below, so a cancelled request was
-//     answered with a 503 whose message told the operator to wait for a broker that was
-//     never unhealthy. The event stays dead-lettered, so repeating the request is safe.
+//     with no network or protocol failure anywhere in the error's chain. ErrEventReplayFailed,
+//     which statusByCode maps to 500, carrying a message that says the event is still
+//     dead-lettered so repeating the request is obviously safe. The arm exists to keep this
+//     case OUT of the availability arm below, which would answer a 503 whose message tells an
+//     operator to wait for a broker that was never unhealthy; what it must not do is answer
+//     with a code outside the approved contract, so the distinction lives in the message and
+//     the log line rather than in a fourth public code and a fourth status.
 //   - The broker is unavailable — unreachable, leaderless, under-replicated, or a
 //     transport that has been closed. ErrKafkaUnavailable, which statusByCode maps to 503.
 //     This is the same code the no-transport branch above returns, and deliberately so:
 //     both mean the event is intact and the request should be repeated once the broker is
 //     back. The message says the broker, not the event, is the problem, because an
 //     operator reading it needs to know where to look.
-//   - Anything else. ErrEventReplayFailed, which maps to 500. Reserved for failures this
-//     service owns — bytes that cannot be published, a destination that cannot be
-//     resolved — where a retry changes nothing.
+//   - Anything else. ErrEventReplayFailed too, with the message that names a failure this
+//     service owns — bytes that cannot be published, a destination that cannot be resolved —
+//     where a retry changes nothing. The first and third arms share a code and are told
+//     apart by their message, which is exactly the split a two-code contract can express.
 //
 // The abandonment verdict comes from localContextTermination and the availability verdict
 // from IsBrokerUnavailableError, both of which read concrete error signatures and the
@@ -2317,7 +2320,7 @@ const replayClaimLease = 2 * time.Minute
 //   - string: the message that accompanies it.
 func replayFailureOutcome(cause error) (apierror.ErrorCode, string) {
 	if localContextTermination(cause) {
-		return apierror.ErrEventReplayTimeout,
+		return apierror.ErrEventReplayFailed,
 			"The replay was abandoned before the broker acknowledged it; the event is still " +
 				"dead-lettered, so the request can be repeated"
 	}

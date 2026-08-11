@@ -96,25 +96,24 @@ In production, point `--bootstrap-server` at your brokers and `--command-config`
 
 ### What gets created
 
-Five category topics and their five dead-letter siblings — **ten topics, and they are the complete inventory**. Blnk writes to no other topic.
+Four category topics and their four dead-letter siblings — **eight topics, and they are the complete inventory**. Blnk writes to no other topic.
 
 | Category topic | Dead-letter topic | Grantable to a subscriber |
 |---------------|-------------------|---------------------------|
 | `blnk.transactions` | `blnk.transactions.dlt` | Yes |
 | `blnk.balances` | `blnk.balances.dlt` | Yes |
 | `blnk.identities` | `blnk.identities.dlt` | Yes |
-| `blnk.ledgers` | `blnk.ledgers.dlt` | Yes |
 | `blnk.system` | `blnk.system.dlt` | **Only where you declare `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`.** Every `.dlt` is operator-only under all configurations |
 
-Every name is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. Set `KAFKA_TOPIC_PREFIX=acme` and the whole inventory moves to `acme.transactions` and so on; the category tokens never change. What each topic carries, and why there are five categories rather than the three the requirement names, is in [event-streaming.md](event-streaming.md#topic-catalogue).
+Every name is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. Set `KAFKA_TOPIC_PREFIX=acme` and the whole inventory moves to `acme.transactions` and so on; the category tokens never change. What each topic carries, and why there is a fourth category beyond the three the requirement names, is in [event-streaming.md](event-streaming.md#topic-catalogue).
 
-**No dead-letter topic is ever granted to a subscriber**, under any configuration, so the five `.dlt` names are operator-only. **`blnk.system` is withheld by default too**: it carries `system.error`, whose frozen payload renders verbatim error text naming internal detail, and it is the catalogue's catch-all, so a grant of it also stands over every event type nobody has catalogued yet. That leaves **four grantable names by default** — the four tenant category topics.
+**No dead-letter topic is ever granted to a subscriber**, under any configuration, so the four `.dlt` names are operator-only. **`blnk.system` is withheld by default too**: it carries `system.error`, whose frozen payload renders verbatim error text naming internal detail, and it is the catalogue's catch-all, so a grant of it also stands over every event type nobody has catalogued yet. That leaves **three grantable names by default** — the three tenant category topics.
 
-`blnk.system` is grantable, but only with two declarations that no single action produces: you set `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` on the server, and the subscriber's own grant then names `<prefix>.system`. Either one missing and the create, the update and the credential issuance all refuse, naming the declaration that is absent. The provisioning script never grants it whatever the variable says — a bring-up script makes no entitlement decision — so the sample principal is granted the four tenant topics and nothing more. Grant it when a subscriber genuinely operates the deployment with you; withhold it otherwise, and read `system.error` yourself.
+`blnk.system` is grantable, but only with two declarations that no single action produces: you set `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` on the server, and the subscriber's own grant then names `<prefix>.system`. Either one missing and the create, the update and the credential issuance all refuse, naming the declaration that is absent. The provisioning script never grants it whatever the variable says — a bring-up script makes no entitlement decision — so the sample principal is granted the three tenant topics and nothing more. Grant it when a subscriber genuinely operates the deployment with you; withhold it otherwise, and read `system.error` yourself.
 
-`ledger.created` needs none of that: it is on `blnk.ledgers`, a tenant category granted exactly like the other three. See [why five categories, and what `blnk.system` costs](event-streaming.md#why-five-categories-and-what-blnksystem-costs), which is the page a subscriber reads.
+**`ledger.created` is on `blnk.system` too**, so a subscriber that needs ledger events needs that same privileged grant — the one operational consequence of the four-category catalogue you will actually field requests about. Granting it discloses `system.error`'s verbatim internal error text as well, so treat the request as the entitlement decision it is rather than a routine topic addition. See [why there is a fourth category, and what `blnk.system` costs](event-streaming.md#why-there-is-a-fourth-category-and-what-blnksystem-costs), which is the page a subscriber reads.
 
-> Do not "tidy" the inventory to a different count. `model.EventCategory` routes events into exactly these five categories and `event_topics.go` composes exactly these ten names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment.
+> Do not "tidy" the inventory to a different count, and do not add a category to it. `model.EventCategory` routes events into exactly these four categories and `event_topics.go` composes exactly these eight names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment. A fifth `blnk.ledgers` category was added here once, to give `ledger.created` a grantable home, and withdrawn: the catalogue is a published contract subscribers, grants and dashboards build against.
 
 ### Partitions
 
@@ -221,9 +220,9 @@ scripts/kafka-bootstrap.sh kafka-server-start.sh /etc/kafka/server.properties
 
 Run `scripts/kafka-provision.sh` against a **running** broker. It creates, in this order:
 
-1. Every category topic and its dead-letter sibling — the ten names above, derived from `KAFKA_TOPIC_PREFIX`.
+1. Every category topic and its dead-letter sibling — the eight names above, derived from `KAFKA_TOPIC_PREFIX`.
 2. The **producer** principal (`KAFKA_SASL_USER`, falling back to `KAFKA_PRODUCER_USER`, default `blnk-producer`) with `Write` and `Describe` on the Blnk-owned topics and nothing else.
-3. One **sample subscriber** principal (`KAFKA_SAMPLE_SUBSCRIBER_USER`, default `blnk-sample-subscriber`) with `Read` and `Describe` on **four** category topics — `<prefix>.transactions`, `<prefix>.balances`, `<prefix>.identities` and `<prefix>.ledgers` — and `Read` on its own prefixed consumer-group namespace.
+3. One **sample subscriber** principal (`KAFKA_SAMPLE_SUBSCRIBER_USER`, default `blnk-sample-subscriber`) with `Read` and `Describe` on **three** category topics — `<prefix>.transactions`, `<prefix>.balances` and `<prefix>.identities` — and `Read` on its own prefixed consumer-group namespace.
 
    **Those four are the whole allowlist this script will grant from.** `<prefix>.system` is not on it — it carries `system.error`, whose payload is an internal error message, and it is the catch-all for any uncatalogued event type. `POST /subscribers/{id}/kafka-credentials` will grant it on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`; **this script never will**, whatever that variable says, because a bring-up script makes no entitlement decision. `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` narrows the sample's grant to a subset and refuses anything off the script's allowlist: the system topic, a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it. Use it when you want a **grantable** topic outside the sample's grant to prove a denial on; a `.dlt` name and `<prefix>.system` are always outside it.
 
@@ -371,7 +370,7 @@ For a **subscriber**, do not run it by hand. Use `POST /subscribers/{subscriber_
 ### Verifying provisioning
 
 ```bash
-# The ten topics, with their partition counts and replication factors.
+# The eight topics, with their partition counts and replication factors.
 docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:9092 \
   --command-config /tmp/blnk-kafka/client-admin.properties \
@@ -387,7 +386,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-configs.sh \
   --describe --entity-type users --entity-name blnk-sample-subscriber
 ```
 
-Expect ten topic names, six partitions each and a replication factor of 1 locally.
+Expect eight topic names, six partitions each and a replication factor of 1 locally.
 
 ## The ACL Model
 
@@ -407,7 +406,7 @@ The **group binding is `PREFIXED` on purpose**. Granting the group *id* literall
 
 Kafka's own implication rules make `Read` imply `Describe` on the same resource, and the group `Read` binding already implies the group `Describe` that `FindCoordinator` and `OffsetFetch` require. The topic `Describe` binding is therefore technically redundant and is requested anyway, so the grant is auditable from the binding list alone without the reader having to know the implication table. It costs one binding per topic.
 
-The **four tenant categories** may appear in a grant unconditionally. `blnk.system` may appear only where you have declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`: it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catch-all for any event type the catalogue does not yet recognise. Every `<topic>.dlt` is ungrantable outright, under every configuration, so a dead-letter name can never appear in a subscriber's topic list — the DTO, the persistence boundary and the ACL provisioner all read one allowlist, `model.SubscriberAuthorizableTopics`, resolved against that one declaration.
+The **three tenant categories** may appear in a grant unconditionally. `blnk.system` may appear only where you have declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`: it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catch-all for any event type the catalogue does not yet recognise. Every `<topic>.dlt` is ungrantable outright, under every configuration, so a dead-letter name can never appear in a subscriber's topic list — the DTO, the persistence boundary and the ACL provisioner all read one allowlist, `model.SubscriberAuthorizableTopics`, resolved against that one declaration.
 
 #### Granting the internal system topic
 
@@ -889,8 +888,7 @@ The refusals worth recognising:
 | `409` | `GEN_CONFLICT`, *"No provisioning claim is held for this subscriber, so the operation was abandoned"* | A **concurrent issuance for the same subscriber superseded this one.** Another call won the race, so this request's credential is not the live one. Do not retry blindly: re-read the subscriber to see the issuance that landed, and re-issue only if you still need a credential of your own — a fresh issuance replaces whatever the other call created. |
 | `503` | `EVENT_KAFKA_UNAVAILABLE` | No broker configured, or the broker is down. |
 | `503` | `SUBSCRIBER_BROKERS_NOT_CONFIGURED` | `KAFKA_SUBSCRIBER_BROKERS` is not set. There is no fallback to `KAFKA_BROKERS`, whose addresses are internal to the deployment. Set the externally advertised list — to the same value as `KAFKA_BROKERS` if subscribers really are in-cluster. Nothing was minted. |
-| `503` | `SUBSCRIBER_PROVISIONING_FAILED` | The broker refused the credential or its bindings. Check the admin credential and the authorizer. |
-| `504` | `SUBSCRIBER_PROVISIONING_TIMEOUT` | The registry ran out of the issuance budget. Retry. |
+| `503` | `SUBSCRIBER_PROVISIONING_FAILED` | The broker refused the credential or its bindings, **or** the issuance budget ran out — see [what one code covering both means](#one-code-covers-both-a-refusal-and-a-spent-budget) below. Check the admin credential and the authorizer first; the message tells you which of the two happened. |
 
 ### The transport contract this endpoint requires
 
@@ -1000,15 +998,17 @@ Two consequences to plan around:
 
 If compensation itself cannot finish inside its window — a broker that is hanging rather than refusing — it is **abandoned, marked on the row, and logged at ERROR with the principal named**. The marker is what settlement then retries; the log line is what you read when even the marker could not be written. Both paths are described under [What to inspect before you retry](#what-to-inspect-before-you-retry-and-what-to-revoke-by-hand) above.
 
-#### `503` and `504` are different failures, and the one you will actually see is `503`
+#### One code covers both a refusal and a spent budget
 
-Both appear in the refusal table above and it is worth knowing which to expect, because reaching for the wrong one wastes an incident.
+`SUBSCRIBER_PROVISIONING_FAILED` and its `503` is the answer to **two** conditions, and the message is what tells them apart. That is deliberate: the endpoint's published error taxonomy carries no separate timeout code, because a status a client's retry logic branches on is part of the public contract rather than an implementation detail — and both conditions want the same reaction anyway, which is to retry.
 
-**`503 SUBSCRIBER_PROVISIONING_FAILED` is the broker saying no, or not being there.** Every inducible broker fault produces it, and produces it fast — a refused connection or a broker that accepts and never answers is reported in tens of milliseconds, not after the budget expires, because the failure is observed rather than waited for. If issuance is failing, this is almost certainly the code, and the thing to check is the admin credential, the authorizer, and whether `KAFKA_BROKERS` names a reachable listener.
+**The broker saying no, or not being there.** Every inducible broker fault produces it, and produces it fast — a refused connection or a broker that accepts and never answers is reported in tens of milliseconds, not after the budget expires, because the failure is observed rather than waited for. If issuance is failing, this is almost certainly what happened, and the thing to check is the admin credential, the authorizer, and whether `KAFKA_BROKERS` names a reachable listener. The message names the broker.
 
-**`504 SUBSCRIBER_PROVISIONING_TIMEOUT` is Blnk saying it ran out of time**, which needs the work to be genuinely *slow* rather than broken — a broker answering but pathologically late, a registry write blocked behind a long-running transaction, or a host under enough pressure that the process does not get scheduled. It is rare by construction: the forward path is bounded well under the ceiling and a broker that is merely unreachable fails long before the clock runs out. Treat a `504` as a latency investigation, not an authorization one, and note that the request may have taken longer than five seconds to answer — see the bound table above for why.
+**Blnk running out of time**, which needs the work to be genuinely *slow* rather than broken — a broker answering but pathologically late, a registry write blocked behind a long-running transaction, or a host under enough pressure that the process does not get scheduled. It is rare by construction: the forward path is bounded well under the ceiling and a broker that is merely unreachable fails long before the clock runs out. The message says the budget was not met (*"did not complete within …"*, *"was cancelled before it completed"*, or the ceiling's own wording), and the same message appears in the log line. Treat it as a latency investigation, not an authorization one, and note that the request may have taken longer than five seconds to answer — see the bound table above for why.
 
-Both are safe to retry, and for both the compensation described above is **owed and scheduled, not completed, by the time the answer is sent** — a retry re-provisions the same boundary idempotently either way, and the provisioning fence makes an immediate retry wait rather than race the cleanup. What neither code promises is that the compensation *succeeded*. Usually it does, and the revocation is confirmed: the broker is clean, the generated secret is dead, and the outcome is logged as a warning moments after your response. When the broker hangs rather than refusing, the compensation is abandoned inside its window and **a live SASL credential is left behind for a principal the registry records no issuance for** — recorded as `credential_cleanup_pending_at` for settlement to retry, and logged at ERROR naming the principal when even that record could not be written. So check the markers before concluding anything, and treat an ERROR line naming a principal as work to do; both procedures are above. A `504` in particular does **not** mean "the forward path may have half-worked and no cleanup was tried" — that is what holding the reserve back prevents.
+**Branch on the message, or better, on the log.** Every expiry in the issuance path — the broker half, the registry half and the request ceiling alike — reports this one code, so a client does not need to know which dependency consumed the budget in order to recognise the outcome, and it is not told a dependency is down when the truth is that time ran out. `error_detail.retryable` is `true` for both.
+
+Both are safe to retry, and for both the compensation described above is **owed and scheduled, not completed, by the time the answer is sent** — a retry re-provisions the same boundary idempotently either way, and the provisioning fence makes an immediate retry wait rather than race the cleanup. What the code does not promise is that the compensation *succeeded*. Usually it does, and the revocation is confirmed: the broker is clean, the generated secret is dead, and the outcome is logged as a warning moments after your response. When the broker hangs rather than refusing, the compensation is abandoned inside its window and **a live SASL credential is left behind for a principal the registry records no issuance for** — recorded as `credential_cleanup_pending_at` for settlement to retry, and logged at ERROR naming the principal when even that record could not be written. So check the markers before concluding anything, and treat an ERROR line naming a principal as work to do; both procedures are above. A spent budget in particular does **not** mean "the forward path may have half-worked and no cleanup was tried" — that is what holding the reserve back prevents.
 
 ### Rate limiting the credential endpoint
 
@@ -1410,7 +1410,7 @@ Branch on the `failure_reason` the listing gave you. It is the field the API exp
 |-----------------|-------|---------|
 | `broker_unavailable` | The broker did not answer, or dropped the connection, during the window | Restore the broker, confirm the healthcheck passes, then replay. Check `blnk_outbox_pending` is falling before you replay in bulk. |
 | `timeout` | An attempt exceeded its deadline — usually load rather than a fault | Confirm the cluster is healthy and the backlog is draining, then replay. If it recurs at a steady rate, the cluster is undersized for the publish rate rather than broken. |
-| `topic_missing` | Provisioning never ran, or `KAFKA_TOPIC_PREFIX` changed and the new namespace was never created | Re-run provisioning (`make kafka_provision`), verify the ten names with `kafka-topics.sh --describe`, then replay. |
+| `topic_missing` | Provisioning never ran, or `KAFKA_TOPIC_PREFIX` changed and the new namespace was never created | Re-run provisioning (`make kafka_provision`), verify the eight names with `kafka-topics.sh --describe`, then replay. |
 | `authorization_denied` | The producer principal's credential or ACLs are wrong | Repair `KAFKA_SASL_USER`/`KAFKA_SASL_SECRET` and confirm the producer holds `Write` and `Describe` on the owned topics, then replay. **Do not** work around it with `KAFKA_ALLOW_ADMIN_PRODUCER`. |
 | `message_too_large` | The event exceeds the 768 KiB publish limit | **Replay will fail again.** Investigate the producer: this is an oversized payload, not a transport fault. Capture the `event_id`, `event_type` and `payload_bytes` and raise it against the emitting code path. |
 | `persistence_failure` | Blnk's own database failed, not Kafka. The event may well have reached the topic while the bookkeeping did not | Check PostgreSQL health first. Then read the row: if `kafka_topic`/`kafka_partition`/`kafka_offset` are populated the message is already on the topic, and replaying would publish a **second** copy that subscribers must deduplicate on `event_id`. |
@@ -1464,8 +1464,8 @@ curl -sS -X POST \
 | `403` | `AUTH_MASTER_KEY_REQUIRED` | Use the master key. |
 | `404` | `EVENT_NOT_FOUND` | No event with that id. |
 | `409` | `EVENT_NOT_DEAD_LETTERED` | Not replayable: the row is `failed` rather than `dead_lettered`, already replayed, or a concurrent replay holds it. |
-| `500` | `EVENT_REPLAY_FAILED` | The re-publish failed, or it succeeded and the outbox entry could not be cleared. |
-| `503` | `EVENT_KAFKA_UNAVAILABLE` | No broker is configured, or the broker is down. Fix that first. |
+| `500` | `EVENT_REPLAY_FAILED` | The re-publish failed, or it succeeded and the outbox entry could not be cleared, **or** the request was abandoned before the broker acknowledged it — the caller disconnected, or its deadline expired. The message tells the three apart, and the abandoned case says the event is still dead-lettered, so the request can simply be repeated. |
+| `503` | `EVENT_KAFKA_UNAVAILABLE` | No broker is configured, or the broker is down. Fix that first. An abandoned request is deliberately **not** reported here: the broker never stopped answering, and sending you to look at it would waste the incident. |
 
 Replaying a backlog is a loop over the listing. Keep it deliberate — one topic and one cause at a time:
 
@@ -1649,8 +1649,6 @@ deployment was, and `measured_windows` is abridged to two of its 48 entries:
     "blnk.balances.dlt": 0,
     "blnk.identities": 2,
     "blnk.identities.dlt": 2,
-    "blnk.ledgers": 0,
-    "blnk.ledgers.dlt": 0,
     "blnk.system": 0,
     "blnk.system.dlt": 0
   },
@@ -1809,7 +1807,7 @@ The screen condition, stated as arithmetic:
 
 ```text
 terminal_events  = dispatched + webhook_pending + dead_lettered   (rows claiming publication)
-messages_written = SUM(topic_end_offsets)                         (the five topics + the five .dlt siblings)
+messages_written = SUM(topic_end_offsets)                         (the four topics + the four .dlt siblings)
 overhead         = messages_written - terminal_events             (SIGNED, never clamped)
 
 Every terminal row lands in exactly one bucket, and the five sum to terminal_events:
@@ -1844,7 +1842,7 @@ The five buckets are separate because the remedies are:
 Useful when you want the offsets independently of the API, or when the API's broker read is the thing you suspect:
 
 ```bash
-# End offsets for all ten topics, one line per topic-partition.
+# End offsets for all eight topics, one line per topic-partition.
 for t in transactions balances identities system; do
   for topic in "blnk.$t" "blnk.$t.dlt"; do
     docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
@@ -2787,7 +2785,7 @@ Confirm the stack:
 # 1. The broker is healthy — meaning SASL works, not merely that a port is open.
 docker compose ps kafka
 
-# 2. The ten topics exist with the local geometry: 6 partitions, factor 1.
+# 2. The eight topics exist with the local geometry: 6 partitions, factor 1.
 docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server kafka:9092 \
   --command-config /tmp/blnk-kafka/client-admin.properties --describe
@@ -2848,13 +2846,38 @@ The gate also enforces that the `migrate` init container and the `server` contai
 
 > **Third-party images.** The gate reports `postgres:16` and `typesense/typesense:29.0` as tag-only rather than digest-pinned, and **warns without failing**. Those references predate this work. Promoting them to errors would either block every run until an unrelated six-manifest change lands, or pressure whoever hits it into pinning images they were not reviewing. The warning keeps the gap visible and attributable; raising it is a deliberate follow-up.
 
-### There is no standalone Kafka PersistentVolumeClaim, and there must not be
+### The Kafka storage claims are three, and applying them is optional
 
-A reader coming from the PostgreSQL manifests will look for `kafka-data-persistentvolumeclaim.yaml`, because `pg-data-persistentvolumeclaim.yaml` sits beside `postgres-statefulset.yaml`. **There is no Kafka equivalent, deliberately.** One used to exist, generated by Kompose, and it was removed because it could not be used and cost money to exist.
+A reader coming from the PostgreSQL manifests will look for `kafka-data-persistentvolumeclaim.yaml`, because `pg-data-persistentvolumeclaim.yaml` sits beside `postgres-statefulset.yaml`. **There is a Kafka equivalent, and it holds three claims rather than one.**
 
-A PersistentVolumeClaim is one claim bound to one volume, and `ReadWriteOnce` means one node may mount it at a time. This StatefulSet runs three replicas, and **each broker needs its own KRaft metadata log and its own partition segments.** Three brokers sharing one claim would either fail to schedule onto separate nodes or — far worse — write concurrently into a single log directory, which corrupts the metadata log rather than reporting an error. Nothing ever mounted the standalone claim, so applying the folder simply provisioned an idle volume for someone to find later and reason about.
+`kafka-statefulset.yaml` declares a `volumeClaimTemplate` named `kafka-data` on a set named `kafka` with `replicas: 3`, and Kubernetes materialises one claim per pod from it under a **derived** name:
 
-`volumeClaimTemplates` is the only construct that gives each ordinal a volume of its own. Kubernetes materialises `kafka-data-kafka-0`, `-1` and `-2`, and rebinds each to the same pod across restarts and rescheduling — which is precisely what makes the KRaft log durable, since a broker returning with an empty volume would have lost its metadata and its share of every partition.
+```text
+<template name>-<StatefulSet name>-<ordinal>
+kafka-data      -kafka             -0 / -1 / -2
+```
+
+Those three names are exactly what `kafka-data-persistentvolumeclaim.yaml` declares. **Adoption is by name and nothing else:** apply that file *before* the StatefulSet and the set adopts each claim rather than creating a second one; apply it *after*, or not at all, and the StatefulSet creates the same three itself. Both are valid — this file pre-provisions, it does not add anything the workload could not do alone.
+
+**Apply it first when you need to control an individual broker's storage.** Because each claim exists before any pod does, you can bind a specific `PersistentVolume` to a specific ordinal — a named local NVMe disk, a cloud disk restored from a snapshot, or a different `StorageClass` for one broker — none of which a single template can express. Add `volumeName:` or `storageClassName:` to one entry and only that broker changes. It also makes the storage reviewable as an object: `kubectl get pvc -n blnk` before the brokers start tells you whether the cluster can really provision 3 × 200Gi, which is a far better moment to find out than during a cold start. **Skip it** when the cluster's default `StorageClass` is what you want for all three, which is the ordinary case.
+
+**Why it is three claims and not one.** A file at this path once held a *single* claim named `kafka-data`, 10Gi, `ReadWriteOnce`, generated by Kompose — and it was replaced rather than corrected, because a singleton is worse than useless here. A PersistentVolumeClaim is one claim bound to one volume, and `ReadWriteOnce` means one node may mount it at a time, while **each broker needs its own KRaft metadata log and its own partition segments.** Three brokers sharing one claim would either fail to schedule onto separate nodes or — far worse — write concurrently into a single log directory, which corrupts the metadata log rather than reporting an error. Nothing ever mounted that singleton, so applying the folder simply provisioned an idle volume for someone to find later and reason about. Per-ordinal names are what make the difference: a claim the StatefulSet will adopt is a claim that gets used.
+
+**Five properties must stay true, or the claims stop being adopted.** Kubernetes adopts a pre-existing claim *as it finds it* and never reconciles it against the template, so each of these is a silent-divergence hazard rather than a validation error — `kubectl apply` reports success either way.
+
+| # | Property | Value | What breaks if it diverges |
+|---|---|---|---|
+| 1 | The names | `kafka-data-kafka-0/-1/-2` | Renaming the StatefulSet or its template orphans all three: the set creates its own claims under the new names and these sit unbound — the idle-volume defect with extra steps |
+| 2 | The count | One entry per replica (3) | Raising `replicas` without adding an entry leaves the new broker provisioned from the template and its siblings from this file, differing in whatever the two disagree on |
+| 3 | The size | `200Gi`, identical to the template | A smaller claim is adopted at the smaller size, silently, and the broker fills a disk the retention arithmetic said had room: 48 partitions × 2 GiB of `log.retention.bytes` = 96 GiB, 48% of 200Gi |
+| 4 | The access mode | `ReadWriteOnce`, matching the template | A claim the scheduler treats differently from what the workload expects is a scheduling failure at the worst moment |
+| 5 | The storage class | Omitted in both, so both take the cluster default | Setting it on one side only backs the adopted claim with storage the template never asked for. Name the same class in both places, or name it *only* here, deliberately, to give one broker different storage |
+
+`TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate` derives all five from the StatefulSet rather than restating them, so a geometry change on one side alone fails the test instead of drifting.
+
+**`Pending` is the expected state, not a fault.** On a cluster whose default `StorageClass` uses `WaitForFirstConsumer` — the norm for zonal block storage, and the right choice here — the three claims stay `Pending` until the brokers are scheduled. The volume is then provisioned in whichever zone the pod landed in, which is what keeps a broker able to reattach its own disk after rescheduling. With `Immediate` binding they provision at once and are still adopted.
+
+> **`kubectl delete -f` on this file is destructive, not a cleanup.** The StatefulSet's default `persistentVolumeClaimRetentionPolicy` is `Retain`, so these claims outlive the StatefulSet deliberately — a broker returning with an empty volume has lost its KRaft metadata and its share of every partition. Deleting them on a running cluster deletes the cluster's metadata.
 
 ### Changing the broker's storage size is not a rolling update
 

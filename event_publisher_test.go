@@ -1918,9 +1918,9 @@ func (h *publisherRecordedHistogram) snapshot() []publisherMetricRecord {
 func publisherAttributeMap(set attribute.Set) map[string]string {
 	attributes := make(map[string]string, set.Len())
 	for _, keyValue := range set.ToSlice() {
-		// Value.String rather than the deprecated Value.Emit; the two agree exactly for the
-		// string, int64 and bool attributes the publisher records.
-		attributes[string(keyValue.Key)] = keyValue.Value.String()
+		// Value.Emit renders the string, int64 and bool attributes the publisher records
+		// exactly as they were recorded.
+		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
 	}
 
 	return attributes
@@ -2166,7 +2166,7 @@ func TestEventPublisher_MandatedSignatureIsPinnedByReflection(t *testing.T) {
 //
 // The inventory is taken from AllTopicsWithDeadLetters rather than hardcoded, so this test and
 // event_topics.go work from ONE list and a new category cannot leave a topic without a writer.
-// The ten names — five category topics and their five `.dlt` siblings — are then required
+// The eight names — four category topics and their four `.dlt` siblings — are then required
 // individually, because deriving the whole expectation from the implementation would let a
 // silently-dropped category pass.
 func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
@@ -2181,14 +2181,13 @@ func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
 		"exactly one writer per owned topic: a missing one forces lazy creation onto the publish "+
 			"path, an extra one holds connections for a destination nothing publishes to")
 
-	// The three category topics requirement R-6 names, the internal system category
-	// ledger.created made necessary, the one internal category system-error and
-	// unrecognised events made necessary, and the five `.dlt` siblings requirement R-5
-	// names. Written out as literals so a renamed topic or a dropped dead-letter sibling
-	// fails here.
+	// The three category topics requirement R-6 names, the one internal category
+	// ledger.created, system.error and unrecognised events made necessary, and the four
+	// `.dlt` siblings requirement R-5 names. Written out as literals so a renamed topic or
+	// a dropped dead-letter sibling fails here.
 	for _, topic := range []string{
-		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system",
-		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.ledgers.dlt", "blnk.system.dlt",
+		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
+		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
 	} {
 		writer, present := writers[topic]
 		require.True(t, present, "topic %q must have its own writer", topic)

@@ -41,9 +41,9 @@ import (
 //
 // # The access model, stated once
 //
-// THERE ARE NO PER-TENANT TOPICS. Blnk owns five category topics and a `.dlt` sibling for each
-// (event_topics.go). FOUR of those categories — transactions, balances, identities and
-// ledgers — may be granted to any subscriber. `<prefix>.system` may be granted ONLY where the
+// THERE ARE NO PER-TENANT TOPICS. Blnk owns four category topics and a `.dlt` sibling for each
+// (event_topics.go). THREE of those categories — transactions, balances and identities — may be
+// granted to any subscriber. `<prefix>.system` may be granted ONLY where the
 // deployment has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, and no dead-letter topic may
 // ever be granted, whatever its category: the system topic carries system.error's frozen body,
 // which renders verbatim internal error text, and it is the catalogue's catch-all, so it is an
@@ -5372,15 +5372,15 @@ func (s *EventSubscriberService) provisioningFailure(
 		)
 
 		return apierror.NewAPIError(
-			// SLA-01: THE TIMEOUT CODE, not EVENT_KAFKA_UNAVAILABLE. This branch answered 503
-			// while the registry half of the SAME issuance answered
-			// SUBSCRIBER_PROVISIONING_TIMEOUT (504) for the identical condition — one wall clock
-			// running out — so a client had to know which internal dependency was slow in order
-			// to recognise a timeout. A 503 additionally asserts that a dependency is DOWN,
-			// which is a different fact and invites a different retry policy. What the broker
-			// was left holding stays in the DETAIL, which is the only place it can be: a status
-			// code cannot say whether a credential the caller does not hold may already exist.
-			apierror.ErrSubscriberProvisioningTimeout,
+			// SUBSCRIBER_PROVISIONING_FAILED, not EVENT_KAFKA_UNAVAILABLE, and the same code the
+			// registry half of this issuance reports for the identical condition — one wall clock
+			// running out — so a client does not have to know which internal dependency was slow
+			// in order to recognise the outcome. Its 503 is the approved retryable answer for a
+			// spent budget; the error taxonomy carries no separate timeout code, deliberately, so
+			// what the broker was left holding stays in the DETAIL. That is the only place it can
+			// be anyway: no status code can say whether a credential the caller does not hold may
+			// already exist.
+			apierror.ErrSubscriberProvisioningFailed,
 			fmt.Sprintf(
 				"Provisioning Kafka credentials did not complete within %s",
 				s.budget(),
@@ -5405,7 +5405,7 @@ func (s *EventSubscriberService) provisioningFailure(
 		return apierror.NewAPIError(
 			// The same code as the deadline branch above, for the same reason: one wall clock
 			// ran out, and the caller should not have to know which dependency noticed first.
-			apierror.ErrSubscriberProvisioningTimeout,
+			apierror.ErrSubscriberProvisioningFailed,
 			"Provisioning Kafka credentials was cancelled before it completed",
 			s.provisioningDetail(
 				"Provisioning the Kafka credential was cancelled before it completed",
@@ -5730,8 +5730,12 @@ func (s *EventSubscriberService) classifyIssuanceTimeout(
 			"the same boundary idempotently",
 	)
 
+	// SUBSCRIBER_PROVISIONING_FAILED, which resolves to a retryable 503, and the same code the
+	// broker half of this issuance reports for a spent budget. The taxonomy carries no separate
+	// timeout code; the spent budget is named in verdict.Message and in the log line above, and
+	// the detail's retryable flag is what a client branches on.
 	return apierror.NewAPIError(
-		apierror.ErrSubscriberProvisioningTimeout,
+		apierror.ErrSubscriberProvisioningFailed,
 		verdict.Message,
 		NewSubscriberErrorDetail(verdict.Reason, subscriberID, true),
 	)
@@ -5834,8 +5838,8 @@ func (s *EventSubscriberService) issuanceTimeoutFor(
 //   - residue SubscriberProvisioningResult: what the broker is left holding.
 //
 // Returns:
-//   - error: a typed SUBSCRIBER_PROVISIONING_TIMEOUT carrying the residue, or cause unchanged when
-//     this was not a timeout.
+//   - error: a typed SUBSCRIBER_PROVISIONING_FAILED carrying the residue and naming the spent
+//     budget in its message, or cause unchanged when this was not a timeout.
 func (s *EventSubscriberService) classifyPostProvisioningTimeout(
 	ctx context.Context,
 	subscriber *model.EventSubscriber,
@@ -5883,8 +5887,10 @@ func (s *EventSubscriberService) classifyPostProvisioningTimeout(
 			"a principal is unaccounted for and needs manual revocation if no retry follows",
 	)
 
+	// The same retryable SUBSCRIBER_PROVISIONING_FAILED as every other expiry in the issuance
+	// path, with the broker residue carried in the detail rather than in the status.
 	return apierror.NewAPIError(
-		apierror.ErrSubscriberProvisioningTimeout,
+		apierror.ErrSubscriberProvisioningFailed,
 		verdict.Message,
 		s.provisioningDetail(reason, subscriber, residue, true),
 	)

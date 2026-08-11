@@ -1009,9 +1009,9 @@ func (g *collectorRecordedInt64Gauge) Record(_ context.Context, value int64, opt
 
 	attributes := map[string]string{}
 	for _, keyValue := range recorded.ToSlice() {
-		// Value.String rather than the deprecated Value.Emit; the two agree exactly for the
-		// string, int64 and bool attributes these instruments record.
-		attributes[string(keyValue.Key)] = keyValue.Value.String()
+		// Value.Emit renders the string, int64 and bool attributes these instruments
+		// record exactly as they were recorded.
+		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
 	}
 
 	g.mu.Lock()
@@ -3325,12 +3325,10 @@ func (c *collectorRecordedInt64Counter) Add(_ context.Context, value int64, opti
 
 	attributes := map[string]string{}
 	for _, keyValue := range recorded.ToSlice() {
-		// String rather than the deprecated Emit. Every attribute this fake ever receives is an
-		// attribute.String, and for the STRING kind both return the raw value unchanged, so the
-		// swap is behaviour-preserving here — it exists because the OpenTelemetry bump that
-		// carried the baggage-parsing fix also deprecated Emit, and a deprecation warning in a
-		// touched file is a NEW lint finding on a repository whose gate reports only new ones.
-		attributes[string(keyValue.Key)] = keyValue.Value.String()
+		// Emit is the attribute package's rendering accessor at the version this module pins.
+		// Every attribute this fake ever receives is an attribute.String, and for the STRING
+		// kind it returns the raw value unchanged.
+		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
 	}
 
 	c.mu.Lock()

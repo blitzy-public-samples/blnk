@@ -144,7 +144,6 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
-		"blnk.ledgers",
 		"blnk.system",
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
@@ -169,7 +168,8 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		// somebody created under our prefix is still not a topic we own, and treating it as ours
 		// would let a stray name reach a writer and a dead-letter composition.
 		"blnk.unknown":            "the namespace is right but there is no such category",
-		"blnk.quarantine":         "the catalogue is five categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
+		"blnk.quarantine":         "the catalogue is four categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
+		"blnk.ledgers":            "a withdrawn fifth category: it is not in the catalogue, so it is not a topic Blnk owns, creates or writes to",
 		"blnk.transaction":        "the singular is not the category name",
 		"blnk.orders":             "a category this deployment does not have",
 		"blnk.transactions.other": "a deeper name is not a category topic",
@@ -540,9 +540,8 @@ func TestIsCanonicalUUID_AcceptsOnlyTheCanonicalForm(t *testing.T) {
 // contract from both directions: exactly what it admits, and everything of Blnk's that it does
 // not.
 //
-// The set is exactly the FOUR TENANT categories — the three the requirement names plus
-// `blnk.ledgers`. The topic catalogue has a fifth, `blnk.system`, and it is deliberately NOT in
-// this list.
+// The set is exactly the THREE TENANT categories the requirement names. The topic catalogue has a
+// fourth, `blnk.system`, and it is deliberately NOT in this list.
 //
 // TWO CLASSES OF NAME ARE WITHHELD, and both are operator surfaces read under the master key:
 //
@@ -558,9 +557,9 @@ func TestIsCanonicalUUID_AcceptsOnlyTheCanonicalForm(t *testing.T) {
 //     and reachable only through SubscriberPrivilegedTopics, which takes a deployment-level
 //     acknowledgement rather than an operator rule one PUT can violate.
 //
-// `ledger.created` is on `blnk.ledgers` precisely so that the ordinary tenant event no longer
-// depends on that acknowledgement: while it shared the internal topic it was either disclosed
-// alongside Blnk's error text or unreachable, and R-12 makes the second a defect.
+// `ledger.created` shares that topic, so it depends on that acknowledgement too. That is the
+// published four-category contract, and the cost is documented for subscribers rather than
+// removed by adding a category: a fifth `blnk.ledgers` existed here once and was withdrawn.
 //
 // Grantable is not the same as granted: this list is what MAY be granted, and any given
 // subscriber holds only the subset recorded on it.
@@ -573,9 +572,8 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
-		"blnk.ledgers",
 	}, grantable,
-		"a subscriber may be granted exactly the four TENANT category topics by default; every "+
+		"a subscriber may be granted exactly the three TENANT category topics by default; every "+
 			"over-grant finding in this area reduces to this one enumerated boundary, and blnk.system "+
 			"is absent from it because it carries system.error's verbatim body and every uncatalogued "+
 			"event")

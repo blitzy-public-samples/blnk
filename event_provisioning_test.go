@@ -1158,10 +1158,10 @@ func topicSummaryStub(t *testing.T, failAfter int, listed []string) string {
 const readinessListings = 1
 
 // allProvisionedTopics is the topic catalogue the script assures, in the order it assures them:
-// the five category topics, then their dead-letter siblings.
+// the four category topics, then their dead-letter siblings.
 var allProvisionedTopics = []string{
-	"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system",
-	"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.ledgers.dlt", "blnk.system.dlt",
+	"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
+	"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
 }
 
 // TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions is finding F-10, executed.

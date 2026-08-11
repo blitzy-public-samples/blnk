@@ -3105,50 +3105,49 @@ func IsCanonicalUUID(s string) bool {
 //	transactions → blnk.transactions → blnk.transactions.dlt
 //	balances     → blnk.balances     → blnk.balances.dlt
 //	identities   → blnk.identities   → blnk.identities.dlt
-//	ledgers      → blnk.ledgers      → blnk.ledgers.dlt
 //	system       → blnk.system       → blnk.system.dlt         (internal)
 //
-// FIVE CATEGORIES, TEN TOPICS, AND THE LIST IS CLOSED. It is the published topic
-// contract: subscribers, the provisioning script, the Kubernetes configuration and
-// the local stack all enumerate exactly these names, so adding a sixth category here
-// silently obliges every one of them to be changed too. A new category is a
-// deliberate contract change, never an implementation detail, and
+// FOUR CATEGORIES, EIGHT TOPICS, AND THE LIST IS CLOSED. It is the published topic
+// contract fixed by the agreed plan: subscribers, the provisioning script, the
+// Kubernetes configuration and the local stack all enumerate exactly these names, so
+// adding a fifth category here silently obliges every one of them to be changed too —
+// and obliges every subscriber that has already built against the published catalogue
+// to change with them. A new category is a deliberate contract change requiring its own
+// approval, never an implementation detail, and
 // TestEventCatalogue_CategorySetIsClosed fails the build if one appears without that
-// change being made deliberately.
+// change being made deliberately. A fifth `ledgers` category was added here once,
+// carrying `ledger.created`, and was withdrawn for exactly that reason.
 //
 // Nothing in this file knows the prefix, builds a topic name, or appends the
 // `.dlt` suffix. Treating a value returned from here as a topic is a bug.
 //
-// # Why there are two categories beyond the three the requirements name
+// # Why there is a fourth category beyond the three the requirements name
 //
 // Two event types that really are emitted belong to none of the three categories
 // the requirements name: "ledger.created", raised by the post-ledger-creation
 // actions, and "system.error", raised through the registered webhook-sender
 // indirection when an internal error is notified. At the same time the coverage
 // requirement is absolute — every event type that reaches the legacy webhook
-// sender must be published, with zero exceptions — and requirements R-7 and R-12
-// together mean coverage is not enough on its own: after the legacy transport is
-// retired, a subscriber that received an event over HTTP must be able to receive it
-// through a credential this service issues, or the cutover loses that audience.
+// sender must be published, with zero exceptions.
 //
-// THEY GET A CATEGORY EACH, and the split is by AUDIENCE rather than by convenience.
-// `ledgers` is ordinary tenant data — a ledger's name, its id, its creation instant
-// and the caller's own metadata — so it is a subscriber-grantable category exactly
-// like the three named ones, and `ledger.created` routes there. `system` carries
-// `system.error` and is the catalogue's catch-all, so it is an OPERATOR category and
-// is not part of the default grantable set. Both follow the identical naming
-// convention, so nothing about the scheme is special-cased.
-//
-// That is AMBIGUITY-2's resolution refined by the one thing it could not foresee.
-// The agreed plan placed both event types on `blnk.system` and §0.6.3 asks execution
-// to proceed on that recommendation "unless directed otherwise"; code review then
-// directed otherwise, because collapsing the two onto one topic makes the choice
-// between disclosing Blnk's internal error text and stranding an ordinary ledger
-// event unavoidable. Splitting them removes the choice: `ledger.created` reaches its
-// audience with no privilege, and the sensitive topic keeps its own decision. The
-// alternatives are still worse — forcing ledger events onto, say, the transactions
-// topic corrupts that topic's semantics for every subscriber that filters on it, and
+// BOTH GET THE ONE CATEGORY, `system`, which is the agreed plan's own resolution of
+// AMBIGUITY-2 and the published contract. It follows the identical naming convention,
+// so nothing about the scheme is special-cased, and it is also the catalogue's
+// catch-all, so no event type — present or future — is ever silently dropped. The
+// alternatives are worse: forcing ledger events onto, say, the transactions topic
+// corrupts that topic's semantics for every subscriber that filters on it, and
 // dropping them violates the coverage requirement outright.
+//
+// THE COST IS REAL AND IS NOT HIDDEN. `system` is not in the default grantable set —
+// see EventCategorySystem for why it cannot be — so a subscriber that wants
+// `ledger.created` has to be granted the privileged category, which also carries
+// `system.error`'s verbatim internal error text and every uncatalogued event type. A
+// revision that gave `ledger.created` its own grantable `ledgers` category to avoid
+// that trade-off was withdrawn: the topic catalogue is a published contract, and
+// changing it is not something an implementation may decide for itself. Publishing
+// the cost is the honest alternative — docs/event-streaming.md states it where a
+// subscriber reads, and an operator granting the category makes the disclosure
+// decision deliberately.
 //
 // `system` IS NOT IN THE DEFAULT GRANTABLE SET, and that is an authorization
 // decision rather than an omission. The category carries `system.error`, whose
@@ -3191,42 +3190,22 @@ const (
 	// EventCategoryIdentities covers identity events.
 	EventCategoryIdentities = "identities"
 
-	// EventCategoryLedgers covers `ledger.created`, and it is a TENANT category: a
-	// subscriber may be granted `<prefix>.ledgers` exactly as it may be granted the
-	// three categories the requirements name.
+	// EventCategorySystem covers `ledger.created` and internal-error events, and it is
+	// also the CATCH-ALL for an event type EventCategory does not recognise.
 	//
-	// # Why it is its own category
+	// It is the fourth category, the one beyond the requirement's three named ones.
+	// Neither `ledger.created` nor `system.error` belongs to transactions, balances or
+	// identities — a ledger is the container the other three live in rather than one of
+	// them, and an internal error notification describes nothing in the ledger at all —
+	// and the coverage requirement admits no exceptions, so the two need a category
+	// rather than being forced into an unrelated one, which would corrupt that topic's
+	// meaning for the subscribers filtering it, or dropped, which would breach coverage
+	// outright.
 	//
-	// Its payload is a *model.Ledger — a name, an id, a creation instant and the
-	// caller's own metadata — so on its own merits it is ordinary ledger data with an
-	// ordinary subscriber audience. It has no home among transactions, balances or
-	// identities: a ledger is the container those live in rather than one of them, and
-	// filing it under any of them would corrupt that topic's meaning for every
-	// subscriber filtering on it.
-	//
-	// It used to share `system` with `system.error`, which is where the agreed plan's
-	// topic table put it, and that pairing forced an unacceptable choice. `system` must
-	// not be an ordinary grant — see EventCategorySystem — so a subscriber that wanted
-	// ledger-creation events could only get them by also being handed Blnk's verbatim
-	// internal error text, and withholding the category instead left `ledger.created`
-	// with no subscriber route at all once the legacy HTTP transport retires. Requirement
-	// R-12 makes that a defect rather than a trade-off: a subscriber receiving this event
-	// over webhooks today must have a credential-reachable replacement. Separating the
-	// two categories removes the choice entirely.
-	//
-	// Its key dimension is the LEDGER (see eventKeyDimensions), so a ledger's creation
-	// event and every later event about that ledger's contents share a partition key and
-	// therefore an order.
-	EventCategoryLedgers = "ledgers"
-
-	// EventCategorySystem covers internal-error events, and it is also the CATCH-ALL for
-	// an event type EventCategory does not recognise.
-	//
-	// Together with `ledgers` it is the second category beyond the requirement's three
-	// named ones. `system.error` belongs to none of transactions, balances or identities,
-	// and the coverage requirement admits no exceptions, so it needs a category rather
-	// than being forced into an unrelated one — which would corrupt that topic's meaning
-	// for the subscribers filtering it — or dropped, which would breach coverage outright.
+	// `ledger.created`'s key dimension is the LEDGER (see eventKeyDimensions), so a
+	// ledger's creation event and every later event about that ledger's contents share a
+	// partition key and therefore an order — the category a message is on does not decide
+	// its key.
 	//
 	// # THIS CATEGORY IS NOT IN THE DEFAULT GRANTABLE SET. It is an OPERATOR topic
 	//
@@ -3283,20 +3262,25 @@ const (
 // both check against, so that "which topics may a subscriber be granted?" has one
 // answer rather than one per caller.
 //
-// THE FOUR TENANT CATEGORIES ARE GRANTABLE — transactions, balances, identities and
-// ledgers. EventCategorySystem IS NOT, and that exclusion is the point of this
-// function existing at all: `<prefix>.system` carries system.error's frozen
-// verbatim-error body and is the catalogue's catch-all, so it is an OPERATOR topic in
-// the same class as every `<topic>.dlt`. It has a subscriber route, and reaching it
-// takes a deployment-level acknowledgement on top of the per-subscriber grant — see
+// THE THREE TENANT CATEGORIES ARE GRANTABLE — transactions, balances and identities.
+// EventCategorySystem IS NOT, and that exclusion is the point of this function existing
+// at all: `<prefix>.system` carries system.error's frozen verbatim-error body and is the
+// catalogue's catch-all, so it is an OPERATOR topic in the same class as every
+// `<topic>.dlt`. It has a subscriber route, and reaching it takes a deployment-level
+// acknowledgement on top of the per-subscriber grant — see
 // SubscriberPrivilegedEventCategories, which owns that list, and EventCategorySystem
 // for the full reasoning.
 //
-// EVERY MIGRATED EVENT TYPE HAS A ROUTE THROUGH ONE OF THE TWO LISTS. `ledger.created`
-// is on `ledgers` and therefore in this one, which is the whole reason that category
-// exists: before it, the only event on `<prefix>.system` that was ordinary tenant data
-// was unreachable by any credential, and a subscriber consuming it over the legacy
-// webhook transport had no replacement after the cutover.
+// EVERY MIGRATED EVENT TYPE HAS A ROUTE THROUGH ONE OF THE TWO LISTS, and for two of
+// them that route is the privileged one. `ledger.created` shares `<prefix>.system` with
+// `system.error` because the published topic catalogue puts it there, so a subscriber
+// that consumed it over the legacy webhook transport needs the deployment-level
+// acknowledgement and an explicit grant to keep receiving it after the cutover — with
+// the disclosure that comes attached. That is a documented cost of the four-category
+// contract, published in docs/event-streaming.md and in the migration guide, and not
+// something this function may quietly widen: a `ledgers` category added here to avoid
+// it was withdrawn, because the catalogue is a contract rather than an implementation
+// choice.
 //
 // The function is deliberately NOT AllEventCategories, because the two answer
 // different questions — "what categories exist" and "what may be granted by default" —
@@ -3334,18 +3318,20 @@ func SubscriberGrantableEventCategories() []string {
 //
 // A category on this list has a real subscriber audience and a disclosure that audience
 // must be accepted on purpose. Requirement R-12 supplies the audience: `system.error`
-// reached webhook subscribers, so retiring the HTTP transport without a
-// credential-reachable equivalent would drop it. EventCategorySystem supplies the
-// disclosure: the payload is frozen by R-8 and renders Blnk's own error text verbatim,
-// and the category is the catalogue's catch-all, so the grant also stands over every
-// event type nobody has catalogued yet.
+// and `ledger.created` both reached webhook subscribers, so retiring the HTTP transport
+// without a credential-reachable equivalent would drop them. EventCategorySystem
+// supplies the disclosure: system.error's payload is frozen by R-8 and renders Blnk's
+// own error text verbatim, and the category is the catalogue's catch-all, so the grant
+// also stands over every event type nobody has catalogued yet.
 //
 // Folding it into SubscriberGrantableEventCategories would make that disclosure an
 // ordinary grant, which is the state a previous revision shipped and code review
-// rejected. Withholding it entirely — the state after that revision was reverted — left
-// the event with no subscriber route at all. Two lists is what lets both answers be
-// "no by default, yes when somebody says so", with the saying-so recorded at deployment
-// level in KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS rather than inferred from a request.
+// rejected. Withholding it entirely would leave both event types with no subscriber
+// route at all. Two lists is what lets both answers be "no by default, yes when
+// somebody says so", with the saying-so recorded at deployment level in
+// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS rather than inferred from a request — and it
+// is what keeps `ledger.created` reachable under the four-category contract, at the
+// price of a decision an operator takes with the disclosure in front of them.
 //
 // THE MEMBERSHIP IS NOT A POLICY DECISION THIS FUNCTION MAKES. It reports which
 // categories are privileged; whether a given deployment has authorised them is
@@ -3401,10 +3387,11 @@ func isSubscriberPrivilegedEventCategory(category string) bool {
 // SubscriberPrivilegedTopics composes it, and SubscriberAuthorizableTopics adds it for a
 // deployment that has acknowledged what holding it means.
 //
-// So the list is exactly the FOUR TENANT category topics: `<prefix>.transactions`,
-// `<prefix>.balances`, `<prefix>.identities` and `<prefix>.ledgers`. Twelve of the thirteen
-// migrated event types have an authorized subscriber path through it, and the thirteenth,
-// `system.error`, has one through the privileged list — so every event type that ever
+// So the list is exactly the THREE TENANT category topics: `<prefix>.transactions`,
+// `<prefix>.balances` and `<prefix>.identities`. Eleven of the thirteen migrated event
+// types have an authorized subscriber path through it, and the remaining two —
+// `ledger.created` and `system.error`, which the published catalogue places together on
+// `<prefix>.system` — have one through the privileged list, so every event type that ever
 // reached a webhook subscriber has a credential-reachable route after the cutover.
 //
 // Parameters:
@@ -3574,17 +3561,16 @@ func IsSubscriberAuthorizableTopicName(topic, prefix string, includePrivileged b
 // It lives here rather than in the topic-naming layer because this file owns the
 // category vocabulary; the naming layer composes topic names from it.
 // The three categories the requirement names come first, in the order it names them,
-// then `ledgers`, then `system` LAST. That tail order is deliberate: the tenant
-// categories are contiguous, so SubscriberGrantableEventCategories is a prefix of this
-// list and the privileged category is what the resolved allowlist appends. A reader of
-// any inventory — a topic listing, a reconciliation report, a log line — sees the
-// requirement's own order first, the tenant addition next, and the operator category
-// where operator surfaces belong: at the end.
+// then `system` LAST. That tail order is deliberate: the tenant categories are
+// contiguous, so SubscriberGrantableEventCategories is a prefix of this list and the
+// privileged category is what the resolved allowlist appends. A reader of any
+// inventory — a topic listing, a reconciliation report, a log line — sees the
+// requirement's own order first and the operator category where operator surfaces
+// belong: at the end.
 var eventCategoryOrder = [...]string{
 	EventCategoryTransactions,
 	EventCategoryBalances,
 	EventCategoryIdentities,
-	EventCategoryLedgers,
 	EventCategorySystem,
 }
 
@@ -3631,19 +3617,16 @@ var eventTypeCategories = map[string]string{
 	"balance.created":       EventCategoryBalances,
 	"balance.monitor":       EventCategoryBalances,
 	"identity.created":      EventCategoryIdentities,
-	// ledger.created routes to its OWN tenant category, so it is subscriber-grantable
-	// like the three the requirement names. It used to share the system category — where
-	// the agreed plan's topic table placed it — and that left the one ordinary tenant
-	// event on an operator topic: reachable by a subscriber credential only if the
-	// deployment also disclosed system.error's verbatim internal error text, and
-	// unreachable otherwise. Requirement R-12 makes a credential-reachable route
-	// mandatory for every event type the legacy webhook transport delivered, so the two
-	// were separated. See EventCategoryLedgers.
-	"ledger.created": EventCategoryLedgers,
-	// system.error stays on the internal category: its payload is frozen by R-8 and
-	// renders Blnk's error text verbatim, and this category is the catalogue's catch-all.
-	// It is reachable by a subscriber only through the privileged grant — see
-	// SubscriberPrivilegedEventCategories.
+	// ledger.created and system.error share the fourth category, which is what the agreed
+	// plan's topic table specifies. A subscriber therefore reaches ledger.created only
+	// through the PRIVILEGED grant of `<prefix>.system` — the same grant that discloses
+	// system.error's verbatim internal error text — and that cost is published in
+	// docs/event-streaming.md rather than worked around by adding a category to the
+	// contract. See EventCategorySystem and SubscriberPrivilegedEventCategories.
+	"ledger.created": EventCategorySystem,
+	// system.error's payload is frozen by R-8 and renders Blnk's error text verbatim, and
+	// this category is the catalogue's catch-all, which together are why the category is
+	// privileged rather than ordinary.
 	"system.error": EventCategorySystem,
 }
 

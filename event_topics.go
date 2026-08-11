@@ -85,29 +85,30 @@ type eventTopicBacklogStore interface {
 // adds that each of them must still be reachable by a subscriber credential once the
 // legacy transport retires.
 //
-// TWO further categories resolve that, both following the identical naming convention,
-// so nothing about the scheme is special-cased and each dead-letter sibling is derived
-// by the same rule as every other. The split between them is by AUDIENCE:
+// ONE further category resolves that, following the identical naming convention, so
+// nothing about the scheme is special-cased and its dead-letter sibling is derived by the
+// same rule as every other:
 //
-//	"<prefix>.ledgers"  ledger.created. A TENANT topic, grantable exactly like the three
-//	                    the requirements name, because a ledger's name, id, creation
-//	                    instant and metadata are ordinary tenant data.
-//	"<prefix>.system"   system.error, and anything this catalogue does not recognise.
-//	                    INTERNAL, because the frozen system.error body carries verbatim
-//	                    error text — PostgreSQL schema, table and routine names; broker
-//	                    addresses — and because an internal catch-all is what stops a
-//	                    routing omission delivering a domain payload to an audience that
-//	                    never asked for it. Grantable only where the deployment has
-//	                    declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS.
+//	"<prefix>.system"   ledger.created, system.error, and anything this catalogue does
+//	                    not recognise. INTERNAL, because the frozen system.error body
+//	                    carries verbatim error text — PostgreSQL schema, table and
+//	                    routine names; broker addresses — and because an internal
+//	                    catch-all is what stops a routing omission delivering a domain
+//	                    payload to an audience that never asked for it. Grantable only
+//	                    where the deployment has declared
+//	                    KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, and that grant is
+//	                    therefore also how a subscriber reaches ledger.created.
 //
-// The two used to be one category, and separating them is what gives every migrated
-// event type a credential-reachable route without making the internal one an ordinary
-// grant. While they shared a topic there were only two possible answers and both were
-// defects: grant the topic and disclose Blnk's own error text to whoever wanted ledger
-// events, or withhold it and leave `ledger.created` with no subscriber route at all
-// after the cutover. model.EventCategoryLedgers records that reasoning.
+// That pairing is the published catalogue and it has a cost worth stating plainly: a
+// subscriber wanting ledger-creation events must hold the privileged grant, which
+// discloses Blnk's own error text as well. A revision that split `ledger.created` onto a
+// fifth grantable `ledgers` category to avoid the trade-off was withdrawn — the topic
+// catalogue is a contract subscribers build against, not an implementation choice — so
+// the cost is documented where subscribers and operators read it
+// (docs/event-streaming.md, docs/webhook-to-kafka-migration.md) instead.
+// model.EventCategorySystem records the reasoning in full.
 //
-// Do NOT "tidy" either away. Folding these events into, say, the transactions topic
+// Do NOT "tidy" it away. Folding these events into, say, the transactions topic
 // corrupts that topic's semantics for every subscriber filtering on it, and dropping
 // them violates the coverage requirement outright. The local stack, the production
 // provisioning path and the operator documentation all provision the whole inventory on
@@ -249,7 +250,7 @@ func eventCategoryOrder() []string {
 }
 
 // EventCategories returns the event category tokens in canonical order:
-// "transactions", "balances", "identities", "ledgers", "system".
+// "transactions", "balances", "identities", "system".
 //
 // These are bare tokens, not topic names. Compose a topic from one with
 // TopicForCategory; treating a returned value as a topic is a bug.
@@ -483,9 +484,9 @@ func TopicPrefix() string {
 
 // TopicForCategory composes the fully-qualified topic name for a category token.
 //
-// The composition is "<prefix>.<category>", so with the default prefix the five
-// category tokens yield blnk.transactions, blnk.balances, blnk.identities,
-// blnk.ledgers and blnk.system.
+// The composition is "<prefix>.<category>", so with the default prefix the four
+// category tokens yield blnk.transactions, blnk.balances, blnk.identities and
+// blnk.system.
 //
 // An empty or blank category resolves to the system category rather than composing
 // "<prefix>." — a name with a trailing separator and an empty final segment, which
@@ -539,9 +540,8 @@ func TopicForCategory(category string) string {
 //	                   transaction.unknown, and any bulk_transaction.<status>
 //	blnk.balances      balance.created, balance.monitor
 //	blnk.identities    identity.created
-//	blnk.ledgers       ledger.created
-//	blnk.system        system.error, and anything this catalogue does not
-//	                   recognise                                   (internal)
+//	blnk.system        ledger.created, system.error, and anything this
+//	                   catalogue does not recognise                 (internal)
 //
 // Two properties of that resolution are easy to get wrong and are worth stating
 // explicitly, because both live in the delegated mapping rather than here:
@@ -591,7 +591,7 @@ func TopicForEvent(eventType string) string {
 //
 // The idempotency rule implies one invariant: NO CATEGORY MAY BE NAMED "dlt". A
 // blnk.dlt category topic would be indistinguishable from an already-derived name and
-// could never get a dead-letter sibling of its own. None of the five categories is, and
+// could never get a dead-letter sibling of its own. None of the four categories is, and
 // a test pins it.
 //
 // An empty or blank topic returns the empty string rather than a bare ".dlt". There is
@@ -658,8 +658,8 @@ func IsDeadLetterTopic(topic string) bool {
 }
 
 // AllTopics returns every category topic in canonical order, with the configured
-// prefix applied: blnk.transactions, blnk.balances, blnk.identities and
-// blnk.system.
+// prefix applied — four names with the default prefix: blnk.transactions,
+// blnk.balances, blnk.identities and blnk.system.
 //
 // These are the topics events are published to, and all of them must be provisioned.
 // Which of them a given subscriber HOLDS is a different question — the subset recorded
@@ -837,8 +837,8 @@ func IsOwnedTopicUnderAnyConfiguredPrefix(topic string) bool {
 }
 
 // AllDeadLetterTopics returns every dead-letter topic in canonical order, with the
-// configured prefix applied: blnk.transactions.dlt, blnk.balances.dlt,
-// blnk.identities.dlt and blnk.system.dlt.
+// configured prefix applied — four names with the default prefix:
+// blnk.transactions.dlt, blnk.balances.dlt, blnk.identities.dlt and blnk.system.dlt.
 //
 // Each is the DLTFor sibling of the AllTopics entry at the same index, so the two
 // slices can be zipped safely.
@@ -856,7 +856,7 @@ func AllDeadLetterTopics() []string {
 }
 
 // AllTopicsWithDeadLetters returns every topic Blnk owns: every category topic
-// followed by every dead-letter sibling — ten names with the five categories the
+// followed by every dead-letter sibling — eight names with the four categories the
 // topic contract declares.
 //
 // THIS IS THE SINGLE SOURCE OF TRUTH FOR THE TOPIC INVENTORY. The admin client's topic

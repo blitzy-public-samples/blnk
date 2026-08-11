@@ -8829,9 +8829,11 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		"a dead-letter topic":       "blnk.transactions.dlt",
 		"the internal system topic": "blnk.system",
 		"the system dead-letter":    "blnk.system.dlt",
-		// The singular form of a real category. ledger.created is published to
-		// blnk.ledgers, so blnk.ledger is the plausible typo and a name nothing creates.
-		"the singular form of a real category": "blnk.ledger",
+		// The singular form of a real category: the category is `balances`, so `blnk.balance`
+		// is the plausible typo and a name nothing creates. `blnk.ledgers` is the same shape
+		// of mistake — a fifth category the published catalogue does not have.
+		"the singular form of a real category":              "blnk.balance",
+		"a category withdrawn from the published catalogue": "blnk.ledgers",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -8856,8 +8858,9 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 	// — subscriberInternalTopicAccessDeclared reads the deployment's own configuration rather
 	// than taking an argument — so the acknowledgement is the deployment's and not the caller's.
 	//
-	// `ledger.created` is unaffected: it is on `blnk.ledgers`, a tenant category granted like
-	// any other, so nothing about withholding this topic costs a subscriber a ledger event.
+	// `ledger.created` shares this topic, so withholding it does cost a subscriber that event
+	// unless the deployment declares the acknowledgement — the documented cost of the
+	// four-category catalogue, stated in docs/event-streaming.md rather than worked around.
 	t.Run("refuses the internal system category by default", func(t *testing.T) {
 		requireAPIError(t, requireGrantableTopics([]string{"blnk.system"}), apierror.ErrInvalidInput)
 	})

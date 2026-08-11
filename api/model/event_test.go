@@ -96,8 +96,9 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		"a topic under another prefix":  "acme.transactions",
 		"an untrimmed grantable name":   " blnk.transactions ",
 		"an uppercased category":        "blnk.TRANSACTIONS",
-		"a singular category name":      "blnk.ledger",
-		"the ledger dead-letter topic":  "blnk.ledgers.dlt",
+		"a singular category name":      "blnk.balance",
+		"a withdrawn category":          "blnk.ledgers",
+		"a withdrawn category's dlt":    "blnk.ledgers.dlt",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -125,12 +126,10 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 	// authorized_topics — and this validator refuses the name whenever the first is missing,
 	// naming it in the message so the refusal is actionable.
 	//
-	// `ledger.created` DOES NOT DEPEND ON ANY OF THIS. It is on `blnk.ledgers`, a tenant
-	// category in the default set, which is what the fifth category exists for: while it shared
-	// `blnk.system` the only options were disclosing Blnk's internal error text to whoever
-	// wanted ledger events or leaving the event unreachable by any credential, and R-12 makes
-	// the second a defect rather than a cost. docs/event-streaming.md states the resulting
-	// contract for subscribers.
+	// `ledger.created` DEPENDS ON IT TOO. The published catalogue places it on `blnk.system`
+	// with `system.error`, so a subscriber that consumed it over webhooks needs the same two
+	// declarations to keep receiving it — and accepts the disclosure that comes with them.
+	// docs/event-streaming.md states that cost for subscribers rather than leaving it implied.
 	t.Run("refuses the system category without the deployment acknowledgement", func(t *testing.T) {
 		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
 		require.Error(t, err,
@@ -152,17 +151,17 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 				"sibling stays operator-only whatever is declared")
 	})
 
-	t.Run("the default grantable set is exactly the four tenant category topics", func(t *testing.T) {
+	t.Run("the default grantable set is exactly the three tenant category topics", func(t *testing.T) {
 		// Stated as an EXACT set rather than as a series of accept/refuse cases, because
 		// every over-grant finding in this area reduces to the same question — which topics
 		// may a credential ever name — and a boundary is only checkable if it is enumerated
-		// in one place. A FIFTH entry appearing here would fail, which is the point, and so
+		// in one place. A FOURTH entry appearing here would fail, which is the point, and so
 		// would a tenant category quietly dropped from the set.
 		assert.ElementsMatch(t,
-			[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers"},
+			[]string{"blnk.transactions", "blnk.balances", "blnk.identities"},
 			model.SubscriberGrantableTopics(testTopicPrefix),
-			"the four tenant category topics are grantable by default; neither blnk.system nor any "+
-				"dead-letter topic is, and which of the four a PARTICULAR subscriber holds is "+
+			"the three tenant category topics are grantable by default; neither blnk.system nor any "+
+				"dead-letter topic is, and which of the three a PARTICULAR subscriber holds is "+
 				"decided per subscriber by authorized_topics rather than by this allowlist")
 	})
 
@@ -176,7 +175,6 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 			"blnk.transactions.dlt",
 			"blnk.balances.dlt",
 			"blnk.identities.dlt",
-			"blnk.ledgers.dlt",
 			"blnk.system.dlt",
 		} {
 			assert.Errorf(t, validateGrantableTopics([]string{topic}, testTopicPrefix),
@@ -188,11 +186,11 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 	})
 
 	t.Run("refuses a category this contract does not have", func(t *testing.T) {
-		// The plausible mistake: the category is `ledgers`, so the singular names a topic
+		// The plausible mistake: the category is `balances`, so the singular names a topic
 		// nothing creates and nobody may be granted.
-		err := validateGrantableTopics([]string{"blnk.ledger"}, testTopicPrefix)
+		err := validateGrantableTopics([]string{"blnk.balance"}, testTopicPrefix)
 		require.Error(t, err,
-			"the ledger category topic is blnk.ledgers, so the singular is not grantable")
+			"the balance category topic is blnk.balances, so the singular is not grantable")
 		assert.Contains(t, err.Error(), "not grantable")
 	})
 

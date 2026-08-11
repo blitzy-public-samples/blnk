@@ -57,30 +57,30 @@ both matter operationally:
 
 ## Topic Catalogue
 
-Events are grouped into five **category topics**, each with a **dead-letter sibling** named by appending `.dlt`. Ten names in total, and they are the complete inventory — Blnk writes to no other topic.
+Events are grouped into four **category topics**, each with a **dead-letter sibling** named by appending `.dlt`. Eight names in total, and they are the complete inventory — Blnk writes to no other topic.
 
 | Category topic | Dead-letter topic | Audience | Carries |
 |---------------|-------------------|----------|---------|
 | `blnk.transactions` | `blnk.transactions.dlt` | Subscribers may be granted it | Transaction lifecycle, including bulk batch progress |
 | `blnk.balances` | `blnk.balances.dlt` | Subscribers may be granted it | Balance creation and balance monitor alerts |
 | `blnk.identities` | `blnk.identities.dlt` | Subscribers may be granted it | Identity creation |
-| `blnk.ledgers` | `blnk.ledgers.dlt` | Subscribers may be granted it | Ledger creation |
-| `blnk.system` | `blnk.system.dlt` | **Operators by default.** Grantable only on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` | Blnk's own error notifications, and any event type the catalogue does not recognise |
+| `blnk.system` | `blnk.system.dlt` | **Operators by default.** Grantable only on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` | Ledger creation, Blnk's own error notifications, and any event type the catalogue does not recognise |
 
-**Four of the five categories are grantable by default: transactions, balances, identities and
-ledgers.** Those four carry your own records, and which of them you hold is decided by the grant
-you were issued.
+**Three of the four categories are grantable by default: transactions, balances and identities.**
+Those three carry your own records, and which of them you hold is decided by the grant you were
+issued.
 
 `blnk.system` is an internal topic. It is withheld unless **two** independent declarations are in
 place: the deployment sets `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`, and your subscriber's own
 grant then names the topic. Absent either one, a registration or credential request that names it
 is refused with a message saying which declaration is missing. No `.dlt` sibling is grantable under
-any configuration. Read [why five categories, and what `blnk.system`
-costs](#why-five-categories-and-what-blnksystem-costs) before asking for it.
+any configuration. **`ledger.created` is on this topic**, so a subscriber that needs ledger events
+needs the privileged grant — read [why there is a fourth category, and what `blnk.system`
+costs](#why-there-is-a-fourth-category-and-what-blnksystem-costs) before asking for it.
 
 ### The topic prefix
 
-Every one of those ten names is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. A deployment that sets `KAFKA_TOPIC_PREFIX=acme` therefore consumes `acme.transactions`, `acme.transactions.dlt`, `acme.balances`, and so on down the table. The category tokens themselves — `transactions`, `balances`, `identities`, `ledgers`, `system` — never change.
+Every one of those eight names is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. A deployment that sets `KAFKA_TOPIC_PREFIX=acme` therefore consumes `acme.transactions`, `acme.transactions.dlt`, `acme.balances`, and so on down the table. The category tokens themselves — `transactions`, `balances`, `identities`, `system` — never change.
 
 Nothing Blnk writes to production routes on a literal topic name. `model.EventCategory` resolves an event type to its category token and `event_topics.go` composes the topic name from that token and the configured prefix, so the whole namespace moves together when the prefix changes. Literal names do appear where a name is being *described* rather than resolved — in this document, in the provisioning scripts, in operator commands and in test fixtures — so treat those as illustrations of the default prefix, not as the routing rule.
 
@@ -109,13 +109,11 @@ It is an explicit allowlist rather than "accept any prefix with a known category
 
 As a subscriber you are unaffected either way: you are granted topics under the **current** prefix, and a historical namespace is never granted. What you notice is that events captured before the rename arrive on the old topic you were already reading, rather than stopping.
 
-### Why five categories, and what `blnk.system` costs
+### Why there is a fourth category, and what `blnk.system` costs
 
-The three category topics the requirement names — transactions, balances, identities — do not cover everything Blnk emits. `ledger.created` and `system.error` belong to none of them, while the coverage rule admits no exceptions: every event type that reached the legacy webhook sender is published to Kafka. Two further categories close that gap, both following the identical naming convention, so nothing about the scheme is special-cased and each dead-letter sibling is derived by the same rule as every other.
+The three category topics the requirement names — transactions, balances, identities — do not cover everything Blnk emits. `ledger.created` and `system.error` belong to none of them, while the coverage rule admits no exceptions: every event type that reached the legacy webhook sender is published to Kafka. **One further category, `blnk.system`, closes that gap and carries both.** It follows the identical naming convention, so nothing about the scheme is special-cased and its dead-letter sibling is derived by the same rule as every other, and it is the catalogue's catch-all, so no event type — present or future — is silently dropped.
 
-**They are two categories rather than one because the two event types have different audiences, and a shared topic can only have one.**
-
-`blnk.ledgers` carries `ledger.created` and nothing else. A ledger is one of *your* records — you created it through the API, you can read it back through the API, and its event body is the same object the ledger endpoint returns. There is nothing in it an operator needs to withhold, so it is grantable exactly as transactions, balances and identities are, and a subscriber that wants complete coverage of its own records asks for all four. That is also why it is not folded into the transactions topic: a consumer filtering the transaction stream should not have to skip ledger records, and a consumer that wants only ledger records should not have to read the transaction stream to find them.
+The alternatives are worse. Folding ledger events into the transactions topic corrupts that topic's meaning for every subscriber filtering on it, and dropping them breaches coverage outright.
 
 `blnk.system` carries `system.error`, and two properties make it an operator topic rather than a subscriber one:
 
@@ -124,11 +122,13 @@ The three category topics the requirement names — transactions, balances, iden
 
 So it is withheld by default, and widening it takes **two declarations that are hard to make by accident**. The deployment must set `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`, which is a change to the deployment's own configuration rather than to a subscriber record; and the subscriber's grant must then name `<prefix>.system`. Either one alone refuses. The provisioning script never grants it whatever the variable says, because a bring-up script has made no entitlement decision. A dead-letter sibling is not grantable under any configuration at all — those are operator surfaces read under the master key, triaged and replayed through the internal events API.
 
-**If you consume `ledger.created` over webhooks today, it has a Kafka route and nothing about your migration is unusual.** Ask for `<prefix>.ledgers` in your grant alongside the other categories you need, and the event arrives on a subscriber credential like any other. What has no subscriber route by default is `system.error`, and it never had one: it is Blnk telling its own operator that Blnk failed.
+**`ledger.created` shares that topic, and the cost of that is real and is stated here rather than hidden.** A subscriber consuming `ledger.created` over webhooks today has a Kafka route, but reaching it means holding the privileged category — which also carries `system.error`'s verbatim internal error text and every event type the catalogue does not yet recognise. So a deployment that wants to keep serving ledger events to a subscriber must declare `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` and name `<prefix>.system` in that subscriber's grant, making the disclosure a decision an operator took deliberately. A subscriber that only needs its own transaction, balance and identity records needs none of this.
 
-Coverage is unaffected by any of this: every event type, `ledger.created` and `system.error` included, is captured in the same transaction as the ledger mutation, published, observable in metrics and replayable from its dead-letter topic. What the grant model decides is the **audience**, not whether the event exists.
+An earlier revision gave `ledger.created` a grantable `blnk.ledgers` category of its own to avoid that trade-off, and it was withdrawn. The topic catalogue is a published contract that subscribers, provisioning scripts, ACL grants and dashboards all build against, so adding a category to it is a contract change to be agreed rather than one an implementation may decide for itself. Publishing the cost is the honest alternative.
 
-Neither extra category is a placeholder. Folding their events into an unrelated topic would corrupt that topic's meaning for everyone filtering on it, and dropping them would breach coverage outright.
+Coverage is unaffected by any of this: every event type, `ledger.created` and `system.error` included, is captured in the same transaction as the mutation that produced it, published, observable in metrics and replayable from its dead-letter topic. What the grant model decides is the **audience**, not whether the event exists.
+
+The fourth category is not a placeholder, and it is not a bucket for anything inconvenient. It exists because two real event types have no home among the three named ones, and because a catch-all is what guarantees a future event type reaches a topic rather than nothing.
 
 ## The `LedgerEvent` Envelope
 
@@ -235,8 +235,8 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 | `balance.created` | `blnk.balances` | A balance is created. |
 | `balance.monitor` | `blnk.balances` | A balance monitor's condition is met. Fires on every occurrence, so the same monitor produces many of these. |
 | `identity.created` | `blnk.identities` | An identity is created. |
-| `ledger.created` | `blnk.ledgers` | A ledger is created. Grantable like the three categories above — ask for `<prefix>.ledgers` in your grant. |
-| `system.error` | `blnk.system` | Blnk raises an internal error notification. **Not consumable by a subscriber by default**, and the reason the category is withheld: this body carries Blnk's own error text verbatim. See [why five categories, and what `blnk.system` costs](#why-five-categories-and-what-blnksystem-costs). |
+| `ledger.created` | `blnk.system` | A ledger is created. Belongs to none of the three named categories, so it routes to the catch-all — which means it is **not consumable by a subscriber by default**. See [why there is a fourth category, and what `blnk.system` costs](#why-there-is-a-fourth-category-and-what-blnksystem-costs). |
+| `system.error` | `blnk.system` | Blnk raises an internal error notification. **Not consumable by a subscriber by default**, and the reason the category is withheld: this body carries Blnk's own error text verbatim. See [why there is a fourth category, and what `blnk.system` costs](#why-there-is-a-fourth-category-and-what-blnksystem-costs). |
 
 The seven `transaction.*` names are derived from the transaction's status by a single mapping, which is why a transaction's whole lifecycle appears under this one prefix.
 
@@ -534,12 +534,11 @@ This section publishes a naming convention. Read it before you name a dead-lette
 
 ### `<topic>.dlt` names are Blnk-owned
 
-The dead-letter sibling of a Blnk topic is that topic's name with `.dlt` appended. Blnk **creates, writes to and manages** all five:
+The dead-letter sibling of a Blnk topic is that topic's name with `.dlt` appended. Blnk **creates, writes to and manages** all four:
 
 - `blnk.transactions.dlt`
 - `blnk.balances.dlt`
 - `blnk.identities.dlt`
-- `blnk.ledgers.dlt`
 - `blnk.system.dlt`
 
 The rule generalises: for any topic Blnk owns, Blnk also owns `<topic>.dlt`. If your deployment sets a different `KAFKA_TOPIC_PREFIX`, the owned set moves with it — `acme.transactions.dlt` and so on. The suffix is applied once and only once, so a name is never derived twice into `blnk.transactions.dlt.dlt`.
@@ -753,7 +752,7 @@ have Kafka running before it passes. If you are not migrating, leave the sunset 
 
 Each subscriber is a Kafka principal with its own SASL/SCRAM credentials and ACLs scoped to the topics it is authorised for and to its own consumer-group namespace. Credentials are issued once, through `POST /subscribers/{subscriber_id}/kafka-credentials`, which returns the broker endpoint, your topic list, your consumer group id and the credentials themselves. Provisioning, the ACL model and the exact request and response are documented in [kafka-operations.md](kafka-operations.md).
 
-Four categories can be granted by default: transactions, balances, identities and ledgers. `blnk.system` is withheld unless the deployment has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` **and** your grant names it — it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catalogue's catch-all, so it is an operator topic by default. No dead-letter topic is grantable under any configuration. See [why five categories, and what `blnk.system` costs](#why-five-categories-and-what-blnksystem-costs).
+Three categories can be granted by default: transactions, balances and identities. `blnk.system` is withheld unless the deployment has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` **and** your grant names it — it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catalogue's catch-all, so it is an operator topic by default. It also carries `ledger.created`, so a subscriber that needs ledger events needs that privileged grant. No dead-letter topic is grantable under any configuration. See [why there is a fourth category, and what `blnk.system` costs](#why-there-is-a-fourth-category-and-what-blnksystem-costs).
 
 ### The topic grant is the isolation boundary
 
@@ -768,7 +767,7 @@ The four tenant categories can be granted, and which of them you hold is decided
 
 This is the one property of the access model that surprises people, so it is stated before the field that invites the wrong reading.
 
-**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances`, `blnk.identities` and `blnk.ledgers`.
+**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances` and `blnk.identities`.
 
 The topic grant is therefore not merely *a* boundary, it is **the** boundary. If two parties must not see each other's events, they must not be granted the same topic — and because the category topics are fixed, that means separating them at the deployment boundary rather than at the grant. There is no third option, and no field on a subscriber changes this.
 

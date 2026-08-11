@@ -188,8 +188,9 @@ services:
       # catalogue does not yet recognise — that topic being the catch-all as well as
       # system.error's home. False, the default here, makes the request DTO, the persistence
       # boundary and the ACL provisioner all refuse that topic in a grant and name this
-      # variable as the remedy. ledger.created needs none of it: it is on <prefix>.ledgers,
-      # an ordinary tenant topic every subscriber may be granted.
+      # variable as the remedy. ledger.created shares that topic in the published
+      # four-category catalogue, so this declaration plus an explicit grant is also how a
+      # subscriber receives ledger-creation events — with the disclosure attached.
       KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS: ${KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS:-false}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
       # The namespaces this deployment USED TO own, so a KAFKA_TOPIC_PREFIX rename does
@@ -967,25 +968,23 @@ services:
   # then exits.
   #
   # It creates one topic per event category and a dead-letter sibling for each —
-  # blnk.transactions, blnk.balances, blnk.identities, blnk.ledgers and blnk.system,
-  # plus blnk.transactions.dlt and so on, TEN names in total — then the sample
+  # blnk.transactions, blnk.balances, blnk.identities and blnk.system,
+  # plus blnk.transactions.dlt and so on, EIGHT names in total — then the sample
   # subscriber principal and its ACLs. The category list is pinned to
   # model.EventCategory rather than restated, and each .dlt name is derived by
   # appending the suffix, which is what keeps a topic the relay publishes to from
   # ever being a topic nobody created.
   #
-  # There are TWO categories beyond the three the requirement names, because two event
+  # There is ONE category beyond the three the requirement names, because two event
   # types — ledger.created and system.error — belong to none of transactions, balances
   # or identities while every event formerly delivered by webhook still has to be
-  # published. They get a category each rather than sharing one, because their audiences
-  # differ and a topic has only one: ledger.created is a tenant record and goes to
-  # blnk.ledgers, while system.error goes to blnk.system, which also catches an event
-  # type no mapping recognises, keeping it durable and replayable.
+  # published. Both go to blnk.system, which is the published catalogue and also catches
+  # an event type no mapping recognises, keeping it durable and replayable.
   #
   # blnk.system is NOT GRANTED BY DEFAULT, and it is created all the same. Those are two
   # different questions and scripts/kafka-provision.sh keeps two lists for them:
-  # EVENT_CATEGORIES is all five, because the relay publishes to all five, while
-  # SUBSCRIBER_GRANTABLE_CATEGORIES is the four tenant categories any explicit
+  # EVENT_CATEGORIES is all four, because the relay publishes to all four, while
+  # SUBSCRIBER_GRANTABLE_CATEGORIES is the three tenant categories any explicit
   # KAFKA_SAMPLE_SUBSCRIBER_TOPICS is checked against. The provisioning summary reports
   # blnk.system as "created, never granted" for exactly that reason.
   #

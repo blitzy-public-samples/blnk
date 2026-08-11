@@ -57,11 +57,11 @@ var eventStreamingCodeCases = []struct {
 	// that asymmetry is deliberate. So is the 503: an unreachable broker is a
 	// retryable upstream condition, not a defect here, so it must not resolve to 500.
 	{ErrKafkaUnavailable, http.StatusServiceUnavailable, "EVENT_KAFKA_UNAVAILABLE"},
-	// TAXONOMY-01. 504, and neither of its neighbours: a replay abandoned by a cancelled
-	// caller or a spent deadline is not the broker being unavailable (503, which would
-	// send an operator to a healthy Kafka) and not a defect in this service (500). The
-	// event stays dead-lettered, so the request is safe to repeat.
-	{ErrEventReplayTimeout, http.StatusGatewayTimeout, "EVENT_REPLAY_TIMEOUT"},
+	// NO TIMEOUT CODE FOLLOWS IT, and that is the contract rather than a gap in this table.
+	// A replay abandoned by a cancelled caller or a spent deadline answers
+	// EVENT_REPLAY_FAILED and says so in its message; an EVENT_REPLAY_TIMEOUT mapped to 504
+	// was added here once and withdrawn, because widening this family's public surface is a
+	// contract change and not an implementation detail.
 	{ErrSubscriberNotFound, http.StatusNotFound, "SUBSCRIBER_NOT_FOUND"},
 	{ErrSubscriberProvisioningFailed, http.StatusServiceUnavailable, "SUBSCRIBER_PROVISIONING_FAILED"},
 	// A dependency of issuance being unconfigured is not a malformed request, so 503
@@ -103,9 +103,10 @@ var eventStreamingCodeCases = []struct {
 	// secret on a transport it cannot establish as confidential. A retry over the same transport
 	// cannot succeed, which is why it is not a 503.
 	{ErrSubscriberInsecureTransport, http.StatusForbidden, "SUBSCRIBER_INSECURE_TRANSPORT"},
-	// 504, not 503 and emphatically not the 500 a missing entry would produce: the
-	// dependency answered too slowly, or the caller went away.
-	{ErrSubscriberProvisioningTimeout, http.StatusGatewayTimeout, "SUBSCRIBER_PROVISIONING_TIMEOUT"},
+	// AND NO TIMEOUT CODE HERE EITHER, for the same reason as in the EVENT_ family above: a
+	// spent issuance budget or a caller that went away answers the retryable
+	// SUBSCRIBER_PROVISIONING_FAILED (503) inventoried above, at every layer of the issuance
+	// path, with the spent budget named in the message and the broker residue in the detail.
 	// THERE ARE NO DATA-PLANE CODES IN THIS FAMILY, and their absence is the access model
 	// rather than an omission. Every code above is provoked by an OPERATOR calling a
 	// management route with the master key. Blnk serves no subscriber records — there is no
@@ -142,6 +143,11 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	//   +1 — EVENT_REPLAY_TIMEOUT added, because a replay abandoned by a cancelled caller or a
 	//        spent deadline was resolving to EVENT_KAFKA_UNAVAILABLE and telling an operator to
 	//        wait for a broker that had never stopped answering.
+	//   −1 — EVENT_REPLAY_TIMEOUT WITHDRAWN AGAIN. The distinction it drew is real and is kept,
+	//        but it is drawn in the MESSAGE and the log line rather than in a public code and a
+	//        504 that a client's retry logic branches on: this family's approved public surface
+	//        is the codes the plan froze, and widening it is a contract change that belongs to
+	//        its own approved plan. An abandoned replay answers EVENT_REPLAY_FAILED.
 	//   +2 — SUBSCRIBER_CREDENTIAL_INVALID and SUBSCRIBER_TOPIC_NOT_GRANTED added for a
 	//        Blnk-hosted subscriber record read, then BOTH REMOVED with it. Blnk serves no
 	//        records, so no request a subscriber makes reaches this catalogue and neither code
@@ -170,12 +176,20 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	//        one, because the three remedies are three different edits: the ROW, the
 	//        DEPLOYMENT'S DECLARATION, and the COMPONENT.
 	//
-	//   = 19.
+	//   +1 — SUBSCRIBER_PROVISIONING_TIMEOUT added alongside the replay timeout, then
+	//   −1 — WITHDRAWN with it and for the identical reason. Every deadline expiry in the
+	//        issuance path — the broker half and the registry half alike — answers the
+	//        retryable SUBSCRIBER_PROVISIONING_FAILED (503) it already had, so one code still
+	//        covers the condition at every layer and no client has to know which dependency
+	//        consumed the budget. Recorded rather than netted out, because a reader finding
+	//        either name in git history should find the reason here.
+	//
+	//   = 17.
 	//
 	// One of those edits caught a genuine omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_
 	// AUTHORIZATION had no statusByCode entry at all, so a deliberate 409 was resolving to 500.
-	if len(eventStreamingCodeCases) != 19 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 19 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
+	if len(eventStreamingCodeCases) != 17 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 17 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {

@@ -66,16 +66,25 @@ limitations under the License.
 // ordinary registry edit, and there is one place to look when asking when a
 // credential was minted.
 //
-// # webhook_url and migrated_at are dual-run-only
+// # webhook_url is dual-run-only; migrated_at is permanent
 //
-// Both columns exist solely for the 30-day window in which Kafka publishing and
+// Both columns exist because of the 30-day window in which Kafka publishing and
 // legacy HTTP webhook delivery run side by side. They are here because the
 // requirement to migrate existing subscribers off the webhook subscription REST
 // API meets a repository in which no such API exists: the whole subscription
 // surface today is one global WebhookConfig{Url, Headers} value. Recording a legacy
 // URL per subscriber is what gives an existing subscriber somewhere to be migrated
-// FROM, and what makes the post-sunset 410 Gone behaviour observable at all. Their
-// use ENDS AT SUNSET, when they and the index over migrated_at are dropped.
+// FROM, and what makes the post-sunset 410 Gone behaviour observable at all.
+//
+// THAT SHARED ORIGIN IS NOT A SHARED FATE. webhook_url is a third party's endpoint
+// with no remaining purpose once its subscriber has migrated: it is nulled by
+// PurgeMigratedSubscriberWebhookURLs during the window, and dropped — together with
+// the index over migrated_at — by a post-sunset migration authored at that point.
+// migrated_at itself is PERMANENT and is never dropped: it is an audit fact about
+// Blnk, recording when this subscriber's cutover completed, and it is what
+// migration-progress reporting counts. sql/1781248900.sql carries the retention
+// contract and the exact post-sunset DDL; this comment and that one are one
+// statement.
 //
 // # The 5-second provisioning budget shapes every query below
 //

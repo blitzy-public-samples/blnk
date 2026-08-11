@@ -163,26 +163,28 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 			// re-provisions the same boundary idempotently, so the detail has to say the
 			// same thing or the caller cannot act on it.
 			//
-			// SLA-01: THE TIMEOUT CODE, not EVENT_KAFKA_UNAVAILABLE. This branch used to
-			// answer 503 while the registry half of the SAME issuance answered
-			// SUBSCRIBER_PROVISIONING_TIMEOUT (504) for the identical condition — one wall
-			// clock running out — so a client had to know which internal dependency was slow
-			// in order to recognise a timeout. A 503 additionally asserts that a dependency is
-			// DOWN, which is a different fact and invites a different retry policy.
+			// SUBSCRIBER_PROVISIONING_FAILED, not EVENT_KAFKA_UNAVAILABLE: a spent budget is
+			// not the broker being unreachable, and answering with the broker's code would
+			// send an operator to a Kafka that never stopped responding. It is the SAME code
+			// the registry half of this issuance reports for the identical condition — one
+			// wall clock running out — so a client does not have to know which internal
+			// dependency was slow. The published taxonomy carries no separate timeout code,
+			// so the spent budget is named in the message and the reason fragment below.
 			cause:              fmt.Errorf("provisioning: %w", context.DeadlineExceeded),
 			result:             SubscriberProvisioningResult{CredentialWritten: true},
-			wantCode:           apierror.ErrSubscriberProvisioningTimeout,
+			wantCode:           apierror.ErrSubscriberProvisioningFailed,
 			wantRetryable:      true,
 			wantCredential:     true,
 			wantReasonFragment: "did not complete within the budget",
 		},
 		{
 			name: "caller cancelled",
-			// Also the timeout code. The partial broker state stays in the DETAIL, which is
-			// where it always was and the only place it could be — a status code cannot say
-			// whether a credential the caller does not hold may already exist.
+			// Also the provisioning-failure code, and retryable for the same reason. The
+			// partial broker state stays in the DETAIL, which is where it always was and the
+			// only place it could be — a status code cannot say whether a credential the
+			// caller does not hold may already exist.
 			cause:              fmt.Errorf("provisioning: %w", context.Canceled),
-			wantCode:           apierror.ErrSubscriberProvisioningTimeout,
+			wantCode:           apierror.ErrSubscriberProvisioningFailed,
 			wantRetryable:      true,
 			wantReasonFragment: "cancelled",
 		},

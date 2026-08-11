@@ -489,15 +489,15 @@ func outboxEventFixtures() []outboxEventFixture {
 
 		// The two events that belong to none of the three categories the requirement
 		// names, and that the coverage requirement forbids dropping. They do NOT share
-		// a category: ledger.created is a tenant-owned record and carries its own
-		// grantable category so a subscriber can be granted it, while system.error is
-		// operator diagnostics and stays in the internal one — see
-		// model.EventCategoryLedgers and model.EventCategorySystem.
+		// the one category beyond the three the requirements name: the published catalogue
+		// puts ledger.created and system.error together on blnk.system, so a subscriber
+		// reaches ledger.created only through the privileged grant of that topic — see
+		// model.EventCategorySystem.
 		{
 			name:         "ledger.created",
 			eventType:    "ledger.created",
 			payload:      outboxSampleLedger(),
-			topic:        "blnk.ledgers",
+			topic:        "blnk.system",
 			aggregateID:  outboxLedgerID,
 			partitionKey: outboxLedgerID,
 		},
@@ -1271,10 +1271,9 @@ func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 
 		for _, set := range attributeSets {
 			for _, kv := range set {
-				// Value.String rather than the deprecated Value.Emit: it renders every
-				// attribute type this span can carry, which is what the leak assertions
-				// below need to inspect.
-				rendered := kv.Value.String()
+				// Value.Emit renders every attribute type this span can carry, which is
+				// what the leak assertions below need to inspect.
+				rendered := kv.Value.Emit()
 				assert.NotContains(t, rendered, ledgerID,
 					"attribute %q exports the ledger id in the clear", kv.Key)
 				assert.NotContains(t, rendered, balanceID,
@@ -1561,7 +1560,7 @@ func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *te
 	require.NotNil(t, row)
 
 	assert.Equal(t, "ledger.created", row.EventType, "event_type must be trimmed")
-	assert.Equal(t, "blnk.ledgers", row.Topic, "the trimmed name must be what routing sees")
+	assert.Equal(t, "blnk.system", row.Topic, "the trimmed name must be what routing sees")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(row.Payload),
 		"the payload must remain the legacy body byte for byte, untrimmed")
 	assert.Contains(t, string(row.Payload), `"event":"  ledger.created\t"`,
@@ -2778,7 +2777,7 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	standalone := datasource.standalone()
 	require.Len(t, standalone, 1, "exactly one standalone insert must have been issued")
 	assert.Equal(t, "ledger.created", standalone[0].EventType)
-	assert.Equal(t, "blnk.ledgers", standalone[0].Topic)
+	assert.Equal(t, "blnk.system", standalone[0].Topic)
 	assert.Equal(t, outboxLedgerID, standalone[0].PartitionKey)
 	assert.Equal(t, outboxLedgerID, standalone[0].LedgerID,
 		"a balance payload DOES carry a ledger, so the ledger column is populated as well as the key")

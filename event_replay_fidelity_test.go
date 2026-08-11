@@ -130,11 +130,11 @@ const replayFidelityBalancePayload = `{"data": {"condition": {"field": "debit_ba
 // identities category.
 const replayFidelityIdentityPayload = `{"data": {"dob": "1815-12-10T00:00:00.000000+00:00", "last_name": "Lovelace", "first_name": "Ada", "identity_id": "idt_replay_fidelity_003", "risk_weight": 0.70000000000000006661, "credit_score": 9007199254740993, "email_address": "ada@example.test", "scaled_income": 123456789012345678901234, "unmodelled_extension": {"vendor_flag": true}}, "event": "identity.created"}`
 
-// replayFidelityLedgerPayload is a ledger.created body. It routes to the ledgers
-// category — one of the two that exist because ledger.created and system.error belong to
-// none of the three categories the requirements name, and coverage is absolute. It is a
-// category of its own rather than sharing the internal one because ledger.created must
-// stay reachable by a subscriber and system.error must not.
+// replayFidelityLedgerPayload is a ledger.created body. It routes to the system
+// category — the fourth one, which exists because ledger.created and system.error belong to
+// none of the three categories the requirements name and coverage is absolute. The two share
+// it in the published catalogue, so a subscriber reaches ledger.created only through the
+// privileged grant of that topic.
 const replayFidelityLedgerPayload = `{"data": {"name": "Replay Fidelity Ledger", "ledger_id": "ldg_replay_fidelity_004", "meta_data": {"region": "eu-west-1", "sequence": 9007199254740993, "utilisation": 0.90000000000000002220, "scaled_capacity": 123456789012345678901234}, "created_at": "2024-07-03T22:11:00.250000+00:00", "unmodelled_extension": {"vendor_flag": true}}, "event": "ledger.created"}`
 
 // replayFidelityFixture is one event, its stored bytes and the destinations it must
@@ -222,15 +222,15 @@ func replayFidelityFixtures() []replayFidelityFixture {
 			aggregateID: "ldg_replay_fidelity_004",
 			// ledger.created is one of the two shapes that genuinely DO carry a
 			// ledger, so both columns hold it — which is how requirement R-6's
-			// "partitioned by ledger ID" is honoured wherever a ledger exists. It
-			// routes to the ledgers category, its own grantable category, so a
-			// subscriber can be granted ledger records without being granted the
-			// internal system stream.
+			// "partitioned by ledger ID" is honoured wherever a ledger exists. The
+			// category a message lands on does not decide its key: it routes to the
+			// system category, which it shares with system.error, and is still keyed
+			// on its ledger.
 			partitionKey:    "ldg_replay_fidelity_004",
 			ledgerID:        "ldg_replay_fidelity_004",
 			payload:         replayFidelityLedgerPayload,
-			topic:           "blnk.ledgers",
-			deadLetterTopic: "blnk.ledgers.dlt",
+			topic:           "blnk.system",
+			deadLetterTopic: "blnk.system.dlt",
 		},
 	}
 }

@@ -272,9 +272,9 @@ selects a label value, so accepting arbitrary strings would reopen the domain it
 close. `original` is the only purpose the relay publishes under and therefore the only one that
 can appear in `blnk_events_published_total`.
 
-**`topic` values**: the five category topics `blnk.transactions`, `blnk.balances`,
-`blnk.identities`, `blnk.ledgers`, `blnk.system`, and their five dead-letter siblings
-`blnk.transactions.dlt`, `blnk.balances.dlt`, `blnk.identities.dlt`, `blnk.ledgers.dlt`,
+**`topic` values**: the four category topics `blnk.transactions`, `blnk.balances`,
+`blnk.identities`, `blnk.system`, and their four dead-letter siblings
+`blnk.transactions.dlt`, `blnk.balances.dlt`, `blnk.identities.dlt`,
 `blnk.system.dlt`
 
 Every one of those names derives from `KAFKA_TOPIC_PREFIX`, whose default is `blnk`; both the
@@ -743,7 +743,7 @@ blnk_transaction_batch_total{result="success"} / blnk_transaction_batch_total
 # Event publish throughput (per second, 5 minute window)
 #
 # sum(rate(...)), NOT rate(...). This counter carries `topic` and `event_type`, so a bare
-# rate() returns ONE SERIES PER LABEL COMBINATION — five category topics against thirteen
+# rate() returns ONE SERIES PER LABEL COMBINATION — four category topics against thirteen
 # event types. Every one of those lines is a fraction of the pipeline's output, none of them is
 # the throughput figure, and reading the largest as "the rate" understates the total by most of
 # an order of magnitude. The 500 events/sec target is a statement about the pipeline's total

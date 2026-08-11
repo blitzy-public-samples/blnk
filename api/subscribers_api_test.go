@@ -3722,11 +3722,12 @@ func TestSubscribersAPI_BlankIdentifierIsAMissingParameterOnEveryRoute(t *testin
 //
 // # The code it answers with
 //
-// SUBSCRIBER_PROVISIONING_TIMEOUT (504), which is the implemented contract and is asserted
-// as such deliberately. Every deadline expiry in the issuance path reports this one code, so
-// a client's retry policy does not depend on which layer noticed the expiry first; answering
-// SUBSCRIBER_PROVISIONING_FAILED (503) here would additionally assert that a dependency is
-// unavailable, which is a different fact from "we ran out of time".
+// SUBSCRIBER_PROVISIONING_FAILED (503), which is the published contract for the condition and
+// is asserted as such deliberately. Every deadline expiry in the issuance path reports this one
+// code, so a client's retry policy does not depend on which layer noticed the expiry first, and
+// its 503 is the retryable answer a spent budget wants. The taxonomy carries no separate
+// timeout code — adding a status a retry policy branches on is a public contract change — so
+// the fact that the ceiling fired is carried in the message, which this test also pins.
 //
 // The block is bounded and released with defer, so this test cannot hang the suite even if
 // every assertion in it fails.
@@ -3775,7 +3776,7 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 	elapsed := time.Since(started)
 
 	assertErrorCode(t, recorder,
-		http.StatusGatewayTimeout, apierror.ErrSubscriberProvisioningTimeout)
+		http.StatusServiceUnavailable, apierror.ErrSubscriberProvisioningFailed)
 
 	assert.GreaterOrEqual(t, elapsed, blnk.SubscriberCredentialIssuanceBudget,
 		"answering EARLIER than the budget means something other than the ceiling produced "+
@@ -4953,7 +4954,6 @@ func TestSubscribersAPI_TypedCodesResolveToIntendedStatuses(t *testing.T) {
 		apierror.ErrKafkaUnavailable:             http.StatusServiceUnavailable,
 		apierror.ErrAuthMasterKeyRequired:        http.StatusForbidden,
 		// The rest of the codes this surface can answer, mapped for the same reason.
-		apierror.ErrSubscriberProvisioningTimeout:  http.StatusGatewayTimeout,
 		apierror.ErrSubscriberInsecureTransport:    http.StatusForbidden,
 		apierror.ErrSubscriberBrokersNotConfigured: http.StatusServiceUnavailable,
 		apierror.ErrSubscriberGrantEmpty:           http.StatusConflict,

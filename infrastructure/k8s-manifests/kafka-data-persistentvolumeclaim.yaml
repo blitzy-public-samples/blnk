@@ -63,8 +63,8 @@
 #      NOT reconcile a pre-existing claim against the template — it adopts what
 #      it finds — so a claim smaller than the template is adopted at the
 #      smaller size, silently, and the broker's retention arithmetic no longer
-#      fits its disk. See the template for the derivation: 60 partitions x 2 GiB
-#      of log.retention.bytes = 120 GiB, which is 60% of 200Gi.
+#      fits its disk. See the template for the derivation: 48 partitions x 2 GiB
+#      of log.retention.bytes = 96 GiB, which is 48% of 200Gi.
 #      TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate asserts this
 #      correspondence so it cannot drift.
 #   4. THE ACCESS MODE. ReadWriteOnce, matching the template. A claim the

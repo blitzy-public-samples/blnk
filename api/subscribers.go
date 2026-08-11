@@ -739,11 +739,10 @@ func isTypedAPIError(err error) bool {
 // row authorised for nothing and therefore not provisionable as it stands,
 // SUBSCRIBER_KEY_SCOPE_UNENFORCED for a row recording a partition-key prefix on a
 // deployment that has declared no component to apply it — no ACL can express a
-// message-key boundary, and Blnk ships nothing that would,
-// SUBSCRIBER_PROVISIONING_TIMEOUT when the registry itself ran out of
-// budget, and a typed conflict when a concurrent issuance superseded this one.
-// Downgrading any of those to a single generic code would take information away
-// from the operator who has to act on it.
+// message-key boundary, and Blnk ships nothing that would, and a typed conflict
+// when a concurrent issuance superseded this one. Downgrading any of those to a
+// single generic code would take information away from the operator who has to act
+// on it.
 //
 // Only when the failure carries NO code of its own is the context consulted, and
 // then an expired or cancelled issuance is answered with
@@ -753,16 +752,15 @@ func isTypedAPIError(err error) bool {
 // It does not promise that every response is written within five seconds — see the
 // handler's own budget section for the failure paths that legitimately take longer.
 //
-// SLA-01: THE TIMEOUT CODE, NOT THE FAILURE CODE. This branch used to answer
-// SUBSCRIBER_PROVISIONING_FAILED (503) while the service answered
-// SUBSCRIBER_PROVISIONING_TIMEOUT (504) for the same condition, so whether a
-// client saw a timeout depended on which layer happened to notice the expiry
-// first. A 503 additionally asserts that a dependency is unavailable, which is a
-// different fact from "we ran out of time" and invites a different retry policy.
-// Every deadline expiry in the issuance path now reports the same code, and the
-// partial broker state — whether a credential may exist that the caller does not
-// hold — is reported in the error DETAIL rather than through the status code,
-// which could never have carried it.
+// ONE CODE FOR EVERY EXPIRY, and it is the approved failure code. This branch and
+// the service layer both answer SUBSCRIBER_PROVISIONING_FAILED (503) for a spent
+// budget or a caller that went away, so whether a client recognises the outcome
+// does not depend on which layer happened to notice the expiry first. The error
+// taxonomy this API publishes carries no separate timeout code — adding a status a
+// retry policy branches on is a public contract change — so the fact that time ran
+// out is carried in the MESSAGE, and the partial broker state (whether a credential
+// may exist that the caller does not hold) in the error DETAIL, which is the only
+// place a status code could ever have carried it.
 //
 // Anything else unclassified defaults to SUBSCRIBER_PROVISIONING_FAILED for the
 // same reason: at this point the request has already passed the gate, the
@@ -780,13 +778,13 @@ func respondCredentialIssuanceError(c *gin.Context, issuance context.Context, er
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(issuance.Err(), context.DeadlineExceeded) {
-		respondCode(c, apierror.ErrSubscriberProvisioningTimeout, credentialIssuanceTimedOutMessage, nil)
+		respondCode(c, apierror.ErrSubscriberProvisioningFailed, credentialIssuanceTimedOutMessage, nil)
 
 		return
 	}
 
 	if errors.Is(err, context.Canceled) || errors.Is(issuance.Err(), context.Canceled) {
-		respondCode(c, apierror.ErrSubscriberProvisioningTimeout, credentialIssuanceCancelledMessage, nil)
+		respondCode(c, apierror.ErrSubscriberProvisioningFailed, credentialIssuanceCancelledMessage, nil)
 
 		return
 	}
@@ -1629,11 +1627,12 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 //	503 EVENT_KAFKA_UNAVAILABLE when no broker is configured or reachable,
 //	    SUBSCRIBER_BROKERS_NOT_CONFIGURED when no subscriber-facing endpoint is
 //	    published, SUBSCRIBER_PROVISIONING_FAILED when the broker REFUSED the
-//	    credential or its bindings
-//	504 SUBSCRIBER_PROVISIONING_TIMEOUT for EVERY deadline expiry or cancellation,
+//	    credential or its bindings AND for EVERY deadline expiry or cancellation,
 //	    whichever dependency consumed the budget — the broker, the registry, or the
-//	    caller going away. Whether a credential may already exist at the broker that
-//	    the caller does not hold is reported in the error detail, not the code.
+//	    caller going away. One code covers both because both are retryable and the
+//	    published taxonomy carries no separate timeout code; the message says which
+//	    happened, and whether a credential may already exist at the broker that the
+//	    caller does not hold is reported in the error detail.
 //
 // Parameters:
 //   - c *gin.Context: the request and response.
@@ -1701,7 +1700,7 @@ func (a *Api) IssueKafkaCredentials(c *gin.Context) {
 				"written is revoked rather than left live; re-issuing is safe either way",
 		)
 
-		respondCode(c, apierror.ErrSubscriberProvisioningTimeout, credentialIssuanceAbandonedMessage, nil)
+		respondCode(c, apierror.ErrSubscriberProvisioningFailed, credentialIssuanceAbandonedMessage, nil)
 
 		return
 	}

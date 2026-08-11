@@ -2069,21 +2069,25 @@ func TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing(t *tes
 	assert.Equal(t, []string{"blnk.transactions"}, granted.AuthorizedTopics)
 }
 
-// TestIssueSubscriberCredential_ReportsASpentBudgetAsATimeoutRatherThanAServerFault covers the
+// TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServerFault covers the
 // error SEMANTICS of a deadline, which decide whether a client retries.
 //
 // Issuance shares one deadline across the fence claim, the row read, the broker round trips and
-// the issuance record. The broker half already distinguished a timeout from a failure. The
-// registry half did not: both reads report through the repository's generic internal-server
-// code, so a budget spent waiting on a slow database arrived as HTTP 500 — indistinguishable
-// from a defect in Blnk, and the correct reaction to the two is opposite. A defect must not be
-// retried into a loop; this must be retried, and safely can be, because nothing has been
-// written when it happens here.
+// the issuance record. The broker half already reported a spent deadline as the retryable
+// provisioning failure. The registry half did not: both reads report through the repository's
+// generic internal-server code, so a budget spent waiting on a slow database arrived as HTTP
+// 500 — indistinguishable from a defect in Blnk, and the correct reaction to the two is
+// opposite. A defect must not be retried into a loop; this must be retried, and safely can be,
+// because nothing has been written when it happens here.
+//
+// The answer is SUBSCRIBER_PROVISIONING_FAILED and its 503 at every layer, which is the
+// approved retryable code for the condition; the published taxonomy carries no separate
+// timeout code, so the spent budget is named in the message and in the detail's retryable flag.
 //
 // The context is what is consulted, not the error, and that is forced rather than chosen:
 // loggedDatabaseError deliberately does not carry the driver's error, so
 // errors.Is(err, context.DeadlineExceeded) cannot answer at this layer.
-func TestIssueSubscriberCredential_ReportsASpentBudgetAsATimeoutRatherThanAServerFault(t *testing.T) {
+func TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServerFault(t *testing.T) {
 	// The two registry steps that run before the broker is touched, each failing the way the
 	// real repository fails when its query runs on a dead context.
 	for _, tt := range []struct {
@@ -2112,10 +2116,11 @@ func TestIssueSubscriberCredential_ReportsASpentBudgetAsATimeoutRatherThanAServe
 
 			var apiErr apierror.APIError
 			require.ErrorAs(t, err, &apiErr)
-			assert.Equal(t, apierror.ErrSubscriberProvisioningTimeout, apiErr.Code,
-				"a spent deadline is not a server fault, and a client cannot discriminate on 500")
-			assert.Equal(t, http.StatusGatewayTimeout, apierror.StatusForCode(apiErr.Code),
-				"504: the dependency was reached and did not answer in the time allowed")
+			assert.Equal(t, apierror.ErrSubscriberProvisioningFailed, apiErr.Code,
+				"a spent deadline is not a server fault, and a client cannot discriminate on 500; "+
+					"it answers the retryable provisioning-failure code every layer of issuance uses")
+			assert.Equal(t, http.StatusServiceUnavailable, apierror.StatusForCode(apiErr.Code),
+				"503: the approved retryable answer for a spent issuance budget")
 			assert.NotEqual(t, http.StatusInternalServerError, apierror.StatusForCode(apiErr.Code))
 
 			detail, ok := apiErr.Details.(SubscriberErrorDetail)
@@ -2159,7 +2164,7 @@ func TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired(t 
 	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
 		"the fence conflict must survive an expired budget: it is the accurate answer, and the "+
 			"remedy for it is to wait rather than to retry at once")
-	assert.NotEqual(t, apierror.ErrSubscriberProvisioningTimeout, apiErr.Code)
+	assert.NotEqual(t, apierror.ErrSubscriberProvisioningFailed, apiErr.Code)
 }
 
 // TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers is the guard on the one
@@ -7807,9 +7812,9 @@ func TestIssueSubscriberCredential_ReportsBrokerResidueWhenTheIssuanceRecordTime
 
 			var apiErr apierror.APIError
 			require.ErrorAs(t, err, &apiErr)
-			assert.Equal(t, apierror.ErrSubscriberProvisioningTimeout, apiErr.Code,
-				"a spent budget is still a timeout after the broker was touched")
-			assert.Equal(t, http.StatusGatewayTimeout, apierror.StatusForCode(apiErr.Code))
+			assert.Equal(t, apierror.ErrSubscriberProvisioningFailed, apiErr.Code,
+				"a spent budget is still a retryable provisioning failure after the broker was touched")
+			assert.Equal(t, http.StatusServiceUnavailable, apierror.StatusForCode(apiErr.Code))
 
 			detail, ok := apiErr.Details.(SubscriberErrorDetail)
 			require.True(t, ok, "the detail must be the bounded struct, never the cause")
@@ -7878,7 +7883,7 @@ func TestIssueSubscriberCredential_KeepsATypedRecordOutcomeAfterTheBrokerWasWrit
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
 		"the superseded-issuance conflict must survive an expired budget")
-	assert.NotEqual(t, apierror.ErrSubscriberProvisioningTimeout, apiErr.Code)
+	assert.NotEqual(t, apierror.ErrSubscriberProvisioningFailed, apiErr.Code)
 
 	assert.Zero(t, run.log.count("RevokeSubscriber"),
 		"and revoking would still destroy the credential the OTHER issuance handed out")

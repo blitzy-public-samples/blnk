@@ -141,17 +141,15 @@ type dltCategoryRoute struct {
 	deadLetterTopic string
 }
 
-// dltCategoryRoutes is the dead-letter routing expectation for all five categories, with
+// dltCategoryRoutes is the dead-letter routing expectation for all four categories, with
 // every topic name SPELLED OUT AS A LITERAL.
 //
 // Deriving these from DLTFor would make the test agree with the implementation by
-// construction and prove nothing. Three of the five dead-letter names —
+// construction and prove nothing. Three of the four dead-letter names —
 // blnk.transactions.dlt, blnk.balances.dlt and blnk.identities.dlt — are verbatim
 // user-supplied examples from the requirement and must match byte for byte. The fourth,
-// blnk.ledgers.dlt, carries ledger.created, which is a tenant-owned record a subscriber
-// may be granted like any other. The fifth, blnk.system.dlt, carries system.error and
-// every event whose type the catalogue does not recognise. Both follow the identical
-// convention.
+// blnk.system.dlt, carries ledger.created, system.error and every event whose type the
+// catalogue does not recognise, and follows the identical convention.
 var dltCategoryRoutes = []dltCategoryRoute{
 	{
 		eventType:       "transaction.applied",
@@ -180,8 +178,8 @@ var dltCategoryRoutes = []dltCategoryRoute{
 	},
 	{
 		eventType:       "ledger.created",
-		originalTopic:   "blnk.ledgers",
-		deadLetterTopic: "blnk.ledgers.dlt",
+		originalTopic:   "blnk.system",
+		deadLetterTopic: "blnk.system.dlt",
 	},
 	{
 		eventType:       "system.error",
@@ -197,11 +195,7 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	// The ledgers category's sibling. ledger.created is a tenant-owned record, so its
-	// dead-letter topic is covered by the age gauge for the same reason the other
-	// tenant categories' siblings are.
-	"blnk.ledgers.dlt",
-	// The system category's sibling. That category holds system.error and every event
+	// The system category's sibling. That category holds ledger.created, system.error and every event
 	// whose type the catalogue does not recognise, and those last are exactly the events
 	// most likely to fail to publish, so its dead-letter topic must be covered by the age
 	// gauge like any other — a stalled entry there being invisible would hide the failure
@@ -1195,13 +1189,13 @@ func (g *dltRecordedFloatGauge) count() int {
 
 // dltAttributeMap flattens recorded attributes to a comparable map.
 //
-// Value.String rather than the deprecated Value.Emit. The two agree exactly for the
-// string, int64 and bool attributes this pipeline records, and String is the accessor
-// the attribute package documents from v1.44.0 onwards.
+// Value.Emit is the rendering accessor of the attribute package version this module
+// pins, and it renders the string, int64 and bool attributes this pipeline records
+// exactly as the value was recorded.
 func dltAttributeMap(pairs []attribute.KeyValue) map[string]string {
 	attributes := make(map[string]string, len(pairs))
 	for _, pair := range pairs {
-		attributes[string(pair.Key)] = pair.Value.String()
+		attributes[string(pair.Key)] = pair.Value.Emit()
 	}
 
 	return attributes
@@ -3502,7 +3496,6 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.Equal(t, 20*time.Minute, report.OldestByTopic["blnk.balances.dlt"],
 		"a failed row must be attributed to the dead-letter topic it is bound for")
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.identities.dlt"])
-	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.ledgers.dlt"])
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.system.dlt"])
 	assert.Equal(t, 45*time.Minute, report.OldestAge(),
 		"OldestAge is the single number the 15-minute alert is expressed against")
@@ -3514,7 +3507,6 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.InDelta(t, (45 * time.Minute).Seconds(), values["blnk.transactions.dlt"], 0.0001)
 	assert.InDelta(t, (20 * time.Minute).Seconds(), values["blnk.balances.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.identities.dlt"], 0.0001)
-	assert.InDelta(t, 0.0, values["blnk.ledgers.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.system.dlt"], 0.0001)
 	assert.Greater(t, values["blnk.transactions.dlt"], 900.0,
 		"45 minutes must exceed the 900-second alert threshold, which is what makes the rule fire")
@@ -5635,14 +5627,19 @@ func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit
 	assert.NotEqual(t, unavailableMessage, failedMessage,
 		"the two outcomes must be distinguishable by message as well as by code")
 
-	// TAXONOMY-01: the third arm. An abandoned replay is neither of the two above, and it used
-	// to be reported as the first — a 503 whose message named a healthy broker as the culprit.
+	// The third arm. An abandoned replay is neither of the two above, and it used to be reported
+	// as the first — a 503 whose message named a healthy broker as the culprit. It answers the
+	// approved EVENT_REPLAY_FAILED code and is told apart from a genuine Blnk-owned failure by
+	// its message, because the published taxonomy has no separate timeout code to answer with.
 	abandonedCode, abandonedMessage := replayFailureOutcome(
 		fmt.Errorf("waiting for acknowledgement: %w", context.Canceled))
-	assert.Equal(t, apierror.ErrEventReplayTimeout, abandonedCode)
-	assert.Equal(t, http.StatusGatewayTimeout, apierror.StatusForCode(abandonedCode),
-		"the abandonment code must resolve to 504 through an explicit statusByCode entry; without "+
-			"one it silently becomes the unknown-code 500 and reads as a defect in this service")
+	assert.Equal(t, apierror.ErrEventReplayFailed, abandonedCode)
+	assert.Equal(t, http.StatusInternalServerError, apierror.StatusForCode(abandonedCode),
+		"the abandonment answer must resolve through an explicit statusByCode entry rather than "+
+			"the unknown-code default")
+	assert.NotEqual(t, unavailableCode, abandonedCode,
+		"and it must NOT be the availability code, whose message would send an operator to a "+
+			"broker that never stopped answering")
 	assert.NotContains(t, strings.ToLower(abandonedMessage), "broker is unavailable",
 		"an abandoned replay must not accuse the broker of being unavailable")
 	assert.Contains(t, strings.ToLower(abandonedMessage), "dead-lettered",
@@ -5854,7 +5851,7 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 		},
 		// The broker's OWN acknowledgement timeout, which arrives as a protocol code rather than
 		// as a context error. A bare context expiry no longer resolves here — see
-		// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout — because it means this
+		// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker — because it means this
 		// process stopped waiting, not that the broker failed to answer.
 		"the broker did not acknowledge in time": kafka.RequestTimedOut,
 		"the transport is closed":                fmt.Errorf("resolving a writer: %w", ErrEventPublisherClosed),
@@ -5896,8 +5893,8 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 	}
 }
 
-// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout is TAXONOMY-01 at the endpoint,
-// and it is the third arm of the split.
+// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker is the third arm
+// of the split, at the endpoint.
 //
 // # What was wrong
 //
@@ -5910,11 +5907,12 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 //
 // # What is asserted
 //
-// The code, the 504 it must resolve to through an explicit statusByCode entry, and the message —
-// which must not accuse the broker and must say the event is still dead-lettered, because that is
-// what makes repeating the request obviously safe. The row's terminal state is asserted for the
-// same reason it is on the other two arms: an abandoned replay must leave the event replayable.
-func TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout(t *testing.T) {
+// The code — the approved EVENT_REPLAY_FAILED rather than the availability code — the status it
+// must resolve to through an explicit statusByCode entry, and the message, which must not accuse
+// the broker and must say the event is still dead-lettered, because that is what makes repeating
+// the request obviously safe. The row's terminal state is asserted for the same reason it is on
+// the other two arms: an abandoned replay must leave the event replayable.
+func TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker(t *testing.T) {
 	dltPinTopicPrefix(t)
 
 	cases := map[string]error{
@@ -5937,7 +5935,10 @@ func TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout(t *testing.T
 			fixture.publisher.err = cause
 
 			outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
-			dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayTimeout, http.StatusGatewayTimeout)
+			dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayFailed, http.StatusInternalServerError)
+
+			assert.NotEqual(t, apierror.ErrKafkaUnavailable, dltAPIError(t, err).Code,
+				"an abandoned request must not be reported as the broker being unavailable")
 
 			assert.NotContains(t, strings.ToLower(dltAPIError(t, err).Message), "broker is unavailable",
 				"an abandoned request must not report the broker as unavailable")

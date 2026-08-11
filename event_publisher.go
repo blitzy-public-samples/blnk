@@ -259,7 +259,7 @@ const (
 // disclosure channel, publishing whatever string was stored to anyone who can read
 // /metrics.
 //
-// A Blnk-owned name is a member of a small, enumerable set — prefix times the five categories,
+// A Blnk-owned name is a member of a small, enumerable set — prefix times the four categories,
 // times the optional `.dlt` suffix — so it is safe to report verbatim, and reporting it is
 // what makes the dead-letter-rate and per-topic queries in docs/metrics.md work. Anything
 // else collapses to one fixed label: the series count stays bounded, and the anomaly is
@@ -277,7 +277,7 @@ func boundedTopicLabel(topic string) string {
 	// name to the "unowned" label would report a legitimate delivery as an anomaly — and
 	// would hide, behind one shared series, exactly the traffic an operator draining that
 	// generation needs to watch. The set stays bounded because the allowlist is bounded by
-	// config.MaxHistoricalTopicPrefixes: at most (1 + 4) prefixes times the five categories
+	// config.MaxHistoricalTopicPrefixes: at most (1 + 4) prefixes times the four categories
 	// times the optional `.dlt` suffix.
 	if IsOwnedTopicUnderAnyConfiguredPrefix(topic) {
 		return topic
@@ -1425,8 +1425,8 @@ var (
 // instance with nothing but a Redis DSN configured, and this must not turn that into a
 // network call, a delay, or an error.
 //
-// The returned publisher owns writers for every topic Blnk owns — the five category topics
-// and their five dead-letter siblings, ten in all — enumerated from AllTopicsWithDeadLetters
+// The returned publisher owns writers for every topic Blnk owns — the four category topics
+// and their four dead-letter siblings, eight in all — enumerated from AllTopicsWithDeadLetters
 // so that this file and the provisioning path work from one list.
 //
 // # WHAT IT CAN FAIL ON, and it is the whole transport rather than one credential

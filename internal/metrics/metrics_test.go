@@ -72,7 +72,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/expfmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -2021,8 +2020,8 @@ func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
 		resetEventMetricsCollectionHealth(t)
 		RecordEventMetricsCollection(time.Now().Add(-10*time.Minute), false)
 
-		text := scrapeRegistry(t, registry)
-		assert.True(t, expositionHasSeries(text, "blnk_event_metrics_last_success_age_seconds"),
+		exported := scrapeRegistry(t, registry)
+		assert.True(t, expositionHasSeries(exported, "blnk_event_metrics_last_success_age_seconds"),
 			"a collector that has never completed a clean collection must still report a success age, "+
 				"measured from when it started; reporting nothing makes the most degraded state the one "+
 				"state a threshold rule cannot detect")
@@ -2061,47 +2060,61 @@ func resetEventMetricsCollectionHealth(t *testing.T) {
 	eventMetricsCollectionHealth.lastSuccess = time.Time{}
 }
 
-// scrapeRegistry gathers a Prometheus registry and renders it as exposition text.
+// scrapeRegistry gathers a Prometheus registry and returns the set of SERIES NAMES the
+// exposition format would carry for it.
+//
+// It derives the names from the gathered metric families rather than rendering the exposition
+// body, because the property under test is naming and nothing else: which series a rule or a
+// documented query can match on. A family contributes its own name for a counter or a gauge,
+// and the `_bucket`/`_sum`/`_count` triple for a histogram (`_sum`/`_count` plus the bare
+// quantile series for a summary) — which is exactly the suffix set the text format emits, and
+// the reason a histogram is asserted on its `_bucket` series rather than on its bare name.
+//
+// The family kind is read through the generated accessors (GetHistogram, GetSummary,
+// GetCounter, GetGauge) instead of the type enum, so this helper needs no protobuf import of
+// its own and the package's dependency surface stays exactly what production code needs.
 //
 // Returns:
-//   - string: the exposition body, one sample per line.
-func scrapeRegistry(t *testing.T, registry *prometheus.Registry) string {
+//   - map[string]bool: every series name the registry would export, ready for lookup.
+func scrapeRegistry(t *testing.T, registry *prometheus.Registry) map[string]bool {
 	t.Helper()
 
 	families, err := registry.Gather()
 	require.NoError(t, err, "gathering the Prometheus registry")
 	require.NotEmpty(t, families, "the registry produced no metric families")
 
-	var rendered strings.Builder
-	encoder := expfmt.NewEncoder(&rendered, expfmt.NewFormat(expfmt.TypeTextPlain))
+	series := map[string]bool{}
 	for _, family := range families {
-		require.NoError(t, encoder.Encode(family), "encoding %s", family.GetName())
+		name := family.GetName()
+		require.NotEmpty(t, name, "the registry produced a metric family with no name")
+
+		for _, sample := range family.GetMetric() {
+			switch {
+			case sample.GetHistogram() != nil:
+				series[name+"_bucket"] = true
+				series[name+"_sum"] = true
+				series[name+"_count"] = true
+			case sample.GetSummary() != nil:
+				series[name] = true
+				series[name+"_sum"] = true
+				series[name+"_count"] = true
+			default:
+				// Counters, gauges and untyped samples export under the family name itself.
+				series[name] = true
+			}
+		}
 	}
 
-	return rendered.String()
+	return series
 }
 
-// expositionHasSeries reports whether exposition text carries a sample with the given name.
+// expositionHasSeries reports whether an exported series set carries the given name.
 //
-// Matched on the sample line's leading token so that a name which is a PREFIX of another cannot
-// satisfy the assertion — which is the whole failure mode being guarded, since the suffix the
-// exporter appends is what moves a series.
-func expositionHasSeries(exposition, series string) bool {
-	for _, line := range strings.Split(exposition, "\n") {
-		if strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		name := line
-		if index := strings.IndexAny(line, "{ "); index >= 0 {
-			name = line[:index]
-		}
-		if name == series {
-			return true
-		}
-	}
-
-	return false
+// The match is on the WHOLE name, so a name which is a PREFIX of another cannot satisfy the
+// assertion — which is the whole failure mode being guarded, since the suffix the exporter
+// appends is what moves a series.
+func expositionHasSeries(exposition map[string]bool, series string) bool {
+	return exposition[series]
 }
 
 // declaredInstrumentNames parses metrics.go and returns the name of every EXPORTED

@@ -149,23 +149,17 @@ const (
 	ErrEventReplayFailed    ErrorCode = "EVENT_REPLAY_FAILED"
 	ErrKafkaUnavailable     ErrorCode = "EVENT_KAFKA_UNAVAILABLE"
 
-	// ErrEventReplayTimeout is a replay that was ABANDONED rather than one that failed:
-	// the caller went away, or the request's deadline expired, before the re-publish
-	// could be acknowledged.
+	// THERE IS NO SEPARATE TIMEOUT CODE IN THIS FAMILY, and the absence is the contract
+	// rather than an oversight. A replay abandoned before the broker acknowledged it — the
+	// caller went away, or the request's deadline expired — is answered with
+	// EVENT_REPLAY_FAILED, and the accompanying message is what says the event is still
+	// dead-lettered and the request may simply be repeated. An EVENT_REPLAY_TIMEOUT value
+	// mapped to 504 was added here once and withdrawn: this family's public surface is the
+	// approved set of codes above, and widening it is a public API change that belongs to a
+	// separately approved plan, not to the implementation of one. The distinction it drew
+	// survives where it belongs — in the message and in the log line, both of which name
+	// the abandonment rather than the broker, so no operator is sent to a healthy Kafka.
 	//
-	// TAXONOMY-01: it exists because the other two answers are both wrong for that
-	// case, and one of them was being given. A cancelled or expired publish used to
-	// resolve to EVENT_KAFKA_UNAVAILABLE, whose 503 and whose message assert that the
-	// BROKER is unavailable and that the request should be repeated once it recovers —
-	// sending an operator to look at a healthy Kafka for a deadline that expired on this
-	// side of the connection. EVENT_REPLAY_FAILED and its 500 would be the opposite
-	// error: nothing in Blnk is broken either, and the event is intact.
-	//
-	// 504 rather than 503, for the same reason ErrSubscriberProvisioningTimeout is: 503
-	// says a dependency is unreachable or unconfigured, 504 says the work did not
-	// complete inside the time allowed. The event stays dead-lettered, so the request is
-	// safe to repeat.
-	ErrEventReplayTimeout ErrorCode = "EVENT_REPLAY_TIMEOUT"
 	// ErrEventKeyUnresolvable is the refusal to capture an event that can be assigned no
 	// Kafka message key.
 	//
@@ -389,26 +383,19 @@ const (
 	// which is not what a deployment behind an ingress needs to do about this.
 	ErrSubscriberInsecureTransport ErrorCode = "SUBSCRIBER_INSECURE_TRANSPORT"
 
-	// ErrSubscriberProvisioningTimeout is a credential issuance that ran out of time
-	// rather than one that failed.
+	// THERE IS NO SEPARATE TIMEOUT CODE IN THIS FAMILY EITHER, for the same reason there is
+	// none in the EVENT_ family. A credential issuance that runs out of requirement R-7's
+	// five-second budget — or whose caller goes away — is answered with
+	// SUBSCRIBER_PROVISIONING_FAILED and its 503, which is the retryable answer this
+	// contract approves for the condition. Every layer of the issuance path reports that one
+	// code, so a client's retry policy does not depend on which dependency noticed the
+	// expiry first, and what the broker may be left holding is carried in the error DETAIL,
+	// which is the only place a status code could never carry it.
 	//
-	// Issuance runs under a single deadline (requirement R-7's five-second budget), and
-	// the registry reads it makes before the broker is touched — claiming the
-	// provisioning fence, then reading the row — share it. Those reads used to report a
-	// spent budget or a cancelled caller through the repository's generic internal-server
-	// code, so a pure timeout arrived as HTTP 500: a client cannot tell that from a
-	// defect in this service, and the correct reaction to the two is opposite. A defect
-	// must not be retried into a loop; a timeout should be retried, and safely can be,
-	// because nothing has been written when it happens on these paths.
-	//
-	// 504 rather than 503, and the distinction is the dependency: 503 (as used by
-	// ErrKafkaUnavailable and ErrSubscriberProvisioningFailed) says a dependency is
-	// unreachable or unconfigured, while 504 says one was reached and did not answer
-	// inside the time allowed. A caller cancelling its own request resolves here too —
-	// it is not a server fault either, and the status a caller that has gone away never
-	// reads matters far less than the typed code its retry logic and this deployment's
-	// logs discriminate on.
-	ErrSubscriberProvisioningTimeout ErrorCode = "SUBSCRIBER_PROVISIONING_TIMEOUT"
+	// A SUBSCRIBER_PROVISIONING_TIMEOUT value mapped to 504 was added here once and
+	// withdrawn: the subscriber family's public surface is the approved set of codes above,
+	// and adding a status a client's retry logic branches on is a public API change that
+	// belongs to a separately approved plan rather than to the implementation of one.
 )
 
 // statusByCode is the single source of truth for the default HTTP status of
@@ -511,10 +498,6 @@ var statusByCode = map[ErrorCode]int{
 	ErrEventNotDeadLettered: http.StatusConflict,
 	ErrEventReplayFailed:    http.StatusInternalServerError,
 	ErrKafkaUnavailable:     http.StatusServiceUnavailable,
-	// 504: the replay was abandoned by a cancelled caller or a spent deadline. Neither
-	// the broker (503) nor this service (500) is the culprit, and without this entry the
-	// distinction would resolve to the unknown-code 500 default and read as a defect.
-	ErrEventReplayTimeout: http.StatusGatewayTimeout,
 	// 500: an unkeyable event is a producer defect inside this service, not a caller error.
 	ErrEventKeyUnresolvable: http.StatusInternalServerError,
 
@@ -559,10 +542,6 @@ var statusByCode = map[ErrorCode]int{
 	// confidential. Without this entry the refusal would resolve to the unknown-code
 	// 500 default and read as a defect in this service.
 	ErrSubscriberInsecureTransport: http.StatusForbidden,
-	// 504 rather than 503: the dependency answered too slowly, or the caller went
-	// away, and neither is a defect in this service. Without this entry a spent
-	// issuance budget resolves to the unknown-code 500 default.
-	ErrSubscriberProvisioningTimeout: http.StatusGatewayTimeout,
 
 	// Legacy codes — same statuses MapErrorToHTTPStatus implied, with the
 	// BAD_REQUEST omission fixed (it previously fell through to 500).

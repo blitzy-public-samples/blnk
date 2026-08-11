@@ -7,7 +7,7 @@ This directory supports two kinds of measurement:
 
 For the four queue-topology cases, use both. A fast `summary.json` only tells you the API accepted work quickly; the queue summary tells you how long workers took to finish it.
 
-The `event-streaming` case is the exception, and the instruction above does not apply to it: it runs no queue benchmark and writes no `queue-summary` file at all, because the event pipeline has no asynq queue to drain. Its equivalent measurement is the outbox backlog and the publish-duration histogram, which it reads from the server's `/metrics` endpoint itself.
+The `event-streaming` case is the exception, and the instruction above does not apply to it: it runs no queue benchmark and writes no `queue-summary` file at all, because the event pipeline has no asynq queue to drain. Its equivalent measurement is the outbox backlog and the capture-to-dispatch histogram, which it reads from the server's `/metrics` endpoint itself.
 
 ## Open the dashboard
 
