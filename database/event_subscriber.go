@@ -503,10 +503,13 @@ func grantableTopicPrefixes() map[string]struct{} {
 //   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into somebody
 //     else's data on a broker Blnk may share.
 //   - DEAD-LETTER topics, because every DLT carries other subscribers' failed events
-//     together with Blnk's own failure metadata, so it has no subscriber audience. This is
-//     the only owned-name class excluded: all four categories are grantable, and the
+//     together with Blnk's own failure metadata, so it has no subscriber audience. That
 //     exclusion is structural, since the grantable set is composed of
 //     "<prefix>.<category>" names and a ".dlt" name can never be one.
+//   - THE INTERNAL CATEGORY TOPIC "<prefix>.system", because system.error's frozen payload
+//     renders Blnk's error text verbatim and the category is the catalogue's catch-all, so
+//     it is an operator surface. The grantable set is the three tenant categories, and
+//     model.SubscriberGrantableEventCategories owns that decision.
 //
 // An EMPTY list is accepted: a subscriber authorised for nothing is the fail-closed default of
 // a fresh registration, and refusing it would make registration and authorisation one

@@ -103,13 +103,13 @@ Four category topics and their four dead-letter siblings — **eight topics, and
 | `blnk.transactions` | `blnk.transactions.dlt` | Yes |
 | `blnk.balances` | `blnk.balances.dlt` | Yes |
 | `blnk.identities` | `blnk.identities.dlt` | Yes |
-| `blnk.system` | `blnk.system.dlt` | Yes — but read the disclosure note first |
+| `blnk.system` | `blnk.system.dlt` | **No — operator-only, like every `.dlt`** |
 
 Every name is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, where the prefix is `KAFKA_TOPIC_PREFIX` and defaults to `blnk`. Set `KAFKA_TOPIC_PREFIX=acme` and the whole inventory moves to `acme.transactions` and so on; the category tokens never change. What each topic carries, and why there are four categories rather than the three the requirement names, is in [event-streaming.md](event-streaming.md#topic-catalogue).
 
-**No dead-letter topic is ever granted to a subscriber**, so the four `.dlt` names are operator-only. All four **category** topics are grantable, which leaves exactly four grantable names.
+**No dead-letter topic is ever granted to a subscriber**, so the four `.dlt` names are operator-only. **Neither is `blnk.system`**: it carries `system.error`, whose frozen payload renders verbatim error text naming internal detail, and it is the catalogue's catch-all, so a grant of it would also stand over every event type nobody has catalogued yet. That leaves exactly **three grantable names** — the three tenant category topics.
 
-`blnk.system` carries `ledger.created` alongside `system.error`, and `system.error` includes verbatim error text that can name internal detail. Grant it to a subscriber that needs `ledger.created`; withhold it from one that should not read operational error text — see [what granting `blnk.system` discloses](event-streaming.md#why-four-categories-and-what-blnksystem-costs-you).
+The consequence to plan around: `ledger.created` shares `blnk.system`, so it has no subscriber Kafka route. It is still created, published, retained and replayable, and you read it as an operator. See [why `blnk.system` is not grantable](event-streaming.md#why-four-categories-and-why-blnksystem-is-not-grantable), which is the page a subscriber reads.
 
 > Do not "tidy" the inventory to a different count. `model.EventCategory` routes events into exactly these four categories and `event_topics.go` composes exactly these eight names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment.
 
@@ -222,7 +222,7 @@ Run `scripts/kafka-provision.sh` against a **running** broker. It creates, in th
 2. The **producer** principal (`KAFKA_SASL_USER`, falling back to `KAFKA_PRODUCER_USER`, default `blnk-producer`) with `Write` and `Describe` on the Blnk-owned topics and nothing else.
 3. One **sample subscriber** principal (`KAFKA_SAMPLE_SUBSCRIBER_USER`, default `blnk-sample-subscriber`) with `Read` and `Describe` on **three** category topics — `<prefix>.transactions`, `<prefix>.balances` and `<prefix>.identities` — and `Read` on its own prefixed consumer-group namespace.
 
-   **All four category topics are grantable; the sample's default is a least-privilege subset of them.** `<prefix>.system` is withheld from the default for two reasons, and neither is that it cannot be granted: it carries `system.error`, whose payload is an internal error message a walkthrough credential has no business reading, and a principal granted every category has no *outside*, which would make the subscriber-isolation check vacuous. Name it in `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` to grant it — that override may name any topic on the grantable allowlist, including the system topic, and refuses anything off it: a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it, so it narrows as readily as it widens.
+   **Those three are the whole grantable allowlist.** `<prefix>.system` is not on it — it carries `system.error`, whose payload is an internal error message, and it is the catch-all for any uncatalogued event type — so the script will not grant it and neither will `POST /subscribers/{id}/kafka-credentials`. `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` narrows the sample's grant to a subset and refuses anything off the allowlist: the system topic, a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it. Use it when you want a **grantable** topic outside the sample's grant to prove a denial on; a `.dlt` name and `<prefix>.system` are always outside it.
 
 **Both principals' ACLs are RECONCILED, not merely added to.** Each run computes the grant the configuration asks for, then makes the broker hold exactly that: bindings the configuration no longer asks for are **revoked**, missing ones are created, and the end state is read back and compared. This matters because `kafka-acls --add` is idempotent without being convergent — it can only widen. Three ordinary changes therefore used to take no effect at all, each leaving the broker serving more than the configuration described while the run reported success:
 
@@ -404,7 +404,7 @@ The **group binding is `PREFIXED` on purpose**. Granting the group *id* literall
 
 Kafka's own implication rules make `Read` imply `Describe` on the same resource, and the group `Read` binding already implies the group `Describe` that `FindCoordinator` and `OffsetFetch` require. The topic `Describe` binding is therefore technically redundant and is requested anyway, so the grant is auditable from the binding list alone without the reader having to know the implication table. It costs one binding per topic.
 
-All **four categories** may appear in a grant, `blnk.system` included — it carries `ledger.created`, and withholding the category would make that event unreachable to every subscriber. Grant it only to subscribers that consume ledger events: it also carries `system.error`, whose body carries Blnk's own error text verbatim. Every `<topic>.dlt` remains ungrantable, so no dead-letter name can ever appear in a subscriber's topic list.
+The **three tenant categories** may appear in a grant. `blnk.system` may not: it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catch-all for any event type the catalogue does not yet recognise. Every `<topic>.dlt` is ungrantable for the same class of reason, so neither a dead-letter name nor the internal category name can ever appear in a subscriber's topic list — the DTO, the persistence boundary and the ACL provisioner all read one allowlist, `model.SubscriberGrantableEventCategories`.
 
 ### Foreign ACL bindings, and why issuance refuses on them
 
@@ -497,9 +497,9 @@ Expect exactly `authorizer.class.name=org.apache.kafka.metadata.authorizer.Stand
 ```bash
 # 2. The behavioural proof: a principal reading OUTSIDE its grant must be refused.
 #    A DEAD-LETTER topic is the right probe: no subscriber is ever granted one, so an
-#    authorization failure is the correct and expected outcome. Do NOT probe
-#    blnk.system — all four category topics are grantable and the sample principal
-#    holds them, so that read SUCCEEDS and proves nothing. Use a SUBSCRIBER's own
+#    authorization failure is the correct and expected outcome. blnk.system is an
+#    equally valid probe now that no subscriber may hold it, but a .dlt name is the
+#    one that stays valid whatever a deployment grants. Use a SUBSCRIBER's own
 #    client properties file —
 #    never the admin one, which is in super.users and is allowed everything by
 #    design, so it would prove nothing. The path must be visible INSIDE the
@@ -561,7 +561,7 @@ The corresponding functions are `SubscriberKafkaPrincipal`, `SubscriberConsumerG
 ### There are no per-tenant topics
 
 There is no topic per tenant, per subscriber or per ledger — looking for one is looking for something
-that does not exist. Every subscriber reads from the **same four grantable category topics**, and each
+that does not exist. Every subscriber reads from the **same three grantable category topics**, and each
 one is granted **only the subset it was authorised for**: its `authorized_topics`. Two subscribers can
 therefore hold entirely different grants over one shared inventory, and no subscriber is ever granted a
 `.dlt` topic.
@@ -576,7 +576,7 @@ Isolation is delivered by three things and three things only:
 
 This follows directly from the two facts above and is the sentence to have in mind when you approve a grant.
 
-A category topic carries **every** event of its category for the whole deployment. `blnk.transactions` holds every ledger's transaction events; `blnk.balances`, `blnk.identities` and `blnk.system` do the same for theirs. So granting `blnk.transactions` to a subscriber grants it read access to **every ledger's** transaction events and to the events of **every other subscriber** of that topic. The consumer group does not narrow it, and neither does the number of subscribers sharing the topic. A `partition_key_prefix` **does** narrow it — but not at the broker, and not by Blnk: it is applied by a component the deployment declares in front of the brokers, and where none is declared such a subscriber is refused a credential rather than issued a wider one. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker).
+A category topic carries **every** event of its category for the whole deployment. `blnk.transactions` holds every ledger's transaction events, and `blnk.balances` and `blnk.identities` do the same for theirs. So granting `blnk.transactions` to a subscriber grants it read access to **every ledger's** transaction events and to the events of **every other subscriber** of that topic. The consumer group does not narrow it, and neither does the number of subscribers sharing the topic. A `partition_key_prefix` **does** narrow it — but not at the broker, and not by Blnk: it is applied by a component the deployment declares in front of the brokers, and where none is declared such a subscriber is refused a credential rather than issued a wider one. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker).
 
 Approve a topic grant on that basis. The question to ask is not "which slice of this topic does the subscriber need?" — there is no mechanism that answers it — but **"is this subscriber trusted with the whole category?"** If the answer is no, the grant is the wrong instrument:
 
@@ -603,13 +603,83 @@ A subscriber row may carry a `partition_key_prefix`. It is the third dimension o
 
 ##### So the shipped default REFUSES a key-scoped issuance
 
-| `KAFKA_KEY_SCOPE_ENFORCEMENT` | `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` | `POST /subscribers/{id}/kafka-credentials` for a key-scoped row |
-|---|---|---|
-| `none` (default) | ignored | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** No SCRAM credential is created and nothing is recorded. |
-| `broker_gateway` | unset, or identical to `KAFKA_BROKERS` | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** A declaration with no distinct endpoint enforces nothing; startup also logs a warning naming this. |
-| `broker_gateway` | a distinct address list | `200`. `broker_endpoint` carries **that component's** address, and `partition_key_prefix_enforced_by` reads `broker_gateway`. |
+| `KAFKA_KEY_SCOPE_ENFORCEMENT` | `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` | Attestation endpoint | `POST /subscribers/{id}/kafka-credentials` for a key-scoped row |
+|---|---|---|---|
+| `none` (default) | ignored | ignored | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** No SCRAM credential is created and nothing is recorded. |
+| `broker_gateway` | unset, or identical to `KAFKA_BROKERS` | any | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** A declaration with no distinct endpoint enforces nothing; startup also logs a warning naming this. |
+| `broker_gateway` | a distinct address list | unset, or missing its token | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** An unverifiable declaration is read as *no* declaration; startup logs a warning naming the two variables. |
+| `broker_gateway` | a distinct address list | set, but the component does not attest the exact binding | **`409 SUBSCRIBER_KEY_SCOPE_UNATTESTED`.** Nothing is minted and nothing is recorded. |
+| `broker_gateway` | a distinct address list | set, and the component attests | `200`. `broker_endpoint` carries **that component's** address, and `partition_key_prefix_enforced_by` reads `broker_gateway`. |
 
-The refusal names the two remedies, and they are the only two: declare a component and its endpoint, or clear the prefix and narrow `authorized_topics` to what the broker enforces. **A subscriber with no prefix is never affected** — it keeps the advertised broker list even where a component is declared, because it has no key scope to route through one.
+The refusal names the two remedies, and they are the only two: declare a component and its endpoint, or clear the prefix and narrow `authorized_topics` to what the broker enforces. **A subscriber with no prefix is never affected by *this* refusal** — it keeps the advertised broker list even where a component is declared, because it has no key scope to route through one. It is affected by a different one, immediately below.
+
+##### The control endpoint: what Blnk verifies, and the contract your component implements
+
+A mode and a bootstrap address are assertions a deployment makes about itself, and any address satisfies them. Blnk therefore requires a **control endpoint** it can call, and a declaration without one is treated as no declaration at all — which is why the third row of the table above refuses rather than issuing something unverified.
+
+Set both:
+
+```bash
+KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL=https://keyscope-gateway.internal/key-scopes
+KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN=<bearer credential>   # a SECRET
+KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS=2000             # optional; clamped to 5000
+```
+
+Plain `http` is accepted **only** for a loopback host. Anything else must be `https`: that token registers key-scope bindings, so whoever holds it decides which records a subscriber sees. Redirects are refused rather than followed, because following one forwards the token to wherever the redirect points.
+
+The wire contract is three calls on that one URL. Implement all three; a component that answers only the first cannot be revoked from and reports no health.
+
+| When | Call | Blnk sends | Your component must answer |
+|---|---|---|---|
+| Credential issuance, **before any secret exists** and before the broker is touched | `POST <url>` | `{"principal", "subscriber_id", "partition_key_prefix", "authorized_topics", "consumer_group_prefix"}` | `200` with `{"key_scope_enforced": true, "principal": <the same principal>, "partition_key_prefix": <the same prefix, byte for byte>}` |
+| Deregistration, **after** the broker credential is revoked | `DELETE <url>?principal=<p>` | nothing | `200`, `204`, or `404`. A binding you never held is the state being asked for, so `404` counts as success. |
+| Server start-up, once | `GET <url>` | nothing | `200` with `{"key_scope_enforced": true}` |
+
+Every call carries `Authorization: Bearer <token>`.
+
+**The comparison is exact and it is deliberate.** A component that echoes a *trimmed*, lower-cased or truncated prefix is enforcing a **wider** boundary than the registry records, and that is the dangerous direction: the subscriber is told it is isolated while receiving a superset. So a prefix differing by one byte, a different principal, `key_scope_enforced: false`, a non-`200`, or no answer inside the timeout all produce `409 SUBSCRIBER_KEY_SCOPE_UNATTESTED` with nothing minted. The error carries `retryable`: `true` where the component was unreachable or answered `5xx` — repeating the request can succeed — and `false` where it answered and answered wrongly, which no retry changes.
+
+The start-up probe is **logged and never fatal**: a component that is briefly down must not stop the server, and issuance refuses on its own while it stays down. Look for one of these two lines at boot:
+
+```
+level=info  msg="cmd: the declared key-scope enforcement gateway answered the start-up health probe ..."
+level=warning msg="cmd: the declared key-scope enforcement gateway did not answer the start-up health probe ..."
+```
+
+##### Under a declared key-scoped model, EVERY subscriber must carry a key scope
+
+Withholding record `Read` from key-scoped principals protects *those* subscribers. It says nothing about a subscriber registered **without** a prefix — which is granted literal topic `Read` on every topic it is authorised for, meaning every ledger's records on a shared category topic, in a deployment whose declared model is that a subscriber sees only its own.
+
+So while enforcement is active, all three of these are refused with **`409 SUBSCRIBER_KEY_SCOPE_REQUIRED`**:
+
+- issuing a credential to a subscriber that records no `partition_key_prefix`;
+- recording a subscriber with no prefix and then issuing (the same thing, reached in the other order);
+- **clearing** a prefix on a subscriber that already holds one — the path that would otherwise widen a live principal back to whole-topic `Read` with issuance never running again.
+
+The refusal names three remedies, and there is deliberately **no per-subscriber opt-out** — that would be the same gap with a field name:
+
+1. Record the prefix that subscriber is entitled to.
+2. Provision a genuine whole-topic consumer as an **operator-managed principal outside the subscriber registry**, which is what `scripts/kafka-provision.sh` does for the producer and the sample subscriber. Such a principal has no registry row, so no Blnk endpoint mints or revokes it, and it is yours to manage.
+3. Stop declaring the key-scoped model, and acknowledge whole-topic access explicitly — the next section.
+
+##### In secure mode, a deployment must declare which access model it is
+
+Whole-topic subscriber access is **not a defect**. It is the mandated model: category topics, no per-tenant topics, an authorizer with no message-key dimension. For a single-tenant ledger, or a trusted internal consumer, a credential that reads every record on `blnk.transactions` is exactly right.
+
+What was wrong is that it was the model a deployment arrived at by configuring **nothing**. So with `BLNK_SERVER_SECURE=true`, a deployment must declare one of the two models or issuance refuses with **`409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED`**:
+
+```bash
+# Either: acknowledge that subscriber credentials read every record on each granted topic.
+KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS=true
+
+# Or: declare the key-scoped model, and record a prefix on each subscriber.
+KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway
+KAFKA_KEY_SCOPE_GATEWAY_BROKERS=keyscope-gateway.internal:9095
+KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL=https://keyscope-gateway.internal/key-scopes
+KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN=<bearer credential>
+```
+
+**Outside secure mode nothing changes.** The local stack, both Compose files and the test suite issue credentials exactly as before; the declaration exists to make a production decision explicit, not to break `make run`.
 
 `Describe` is retained deliberately in the key-scoped shape: without it a key-scoped consumer could not read its own topics' partition counts or offsets, and so could not measure its own lag.
 
@@ -661,7 +731,8 @@ An update that crosses between "has a prefix" and "has none" **reconciles the br
 ##### What the prefix still does not do
 
 - **It does not narrow the topic dimension.** Within a granted topic the prefix is the only additional narrowing. A subscriber that must not see a whole *category* needs that topic omitted from `authorized_topics`.
-- **It depends on the declared component being in the path, and on nothing widening the grant.** An operator who hands a subscriber a credential minted outside Blnk, or grants an extra `ALLOW` binding by hand, has widened it — which is why issuance reads the principal's complete grant and refuses when it finds one. Blnk cannot verify what the declared component does with a record once it has one; what Blnk verifies is that the broker will not serve that principal a record at all.
+- **It depends on the declared component being in the path, and on nothing widening the grant.** An operator who hands a subscriber a credential minted outside Blnk, or grants an extra `ALLOW` binding by hand, has widened it — which is why issuance reads the principal's complete grant and refuses when it finds one.
+- **Blnk verifies the control plane, not the data plane, and this is the residual obligation that remains yours.** What Blnk establishes is that the broker will not serve that principal a record at all, that a component answered an authenticated call, and that it attested *this* principal against *this* exact prefix. What it cannot establish is that the component then **filters records accordingly** — that is data-plane behaviour in a process Blnk does not run. A component that attests correctly and forwards everything would satisfy every check here. Instrument and test that component on its own: the attestation is a binding contract, not a proof of enforcement.
 - **Records outside the scope still exist on the shared topic.** They are unreachable by that subscriber, not absent. Where records must not be *present* in a shared namespace at all, separate the deployments.
 
 > **This has been three different behaviours, and only the current one is a boundary.** First, `POST /subscribers/:subscriber_id/kafka-credentials` refused any row recording a prefix with a code of its own, and a `CHECK` constraint made the combination unrepresentable — which withheld the only credential such a subscriber could ever have and offered no remedy but clearing the prefix. Then the credential was issued with whole-topic `Read` and the response *declared* that applying the prefix was the consumer's own obligation — accurate prose about an absent boundary, since a subscriber that ignored it, or used any other Kafka client, read every record on the shared topic. Now the grant itself is narrower, the prefix is applied by a component the operator declares, and issuance refuses — with `SUBSCRIBER_KEY_SCOPE_UNENFORCED`, naming both remedies — while no component is declared. `sql/1781249138.sql` drops `event_subscribers_key_scope_chk`; the retired `SUBSCRIBER_ISOLATION_UNENFORCEABLE` code is gone, and `SUBSCRIBER_KEY_SCOPE_UNENFORCED` is the one code for this judgement in both orders (issuance, and recording a prefix on a row that already holds a credential).
@@ -716,7 +787,7 @@ The `200` response carries everything the subscriber needs to start consuming, a
 |-------|---------|
 | `brokers` | The subscriber-facing bootstrap list, from `KAFKA_SUBSCRIBER_BROKERS`. |
 | `broker_endpoint` | The same list as one connection string, for convenience. |
-| `authorized_topics` | The topics the credential may `Read` and `Describe` — the authorised subset of the four grantable category topics. **Never a `.dlt` name.** |
+| `authorized_topics` | The topics the credential may `Read` and `Describe` — the authorised subset of the three grantable category topics. **Never a `.dlt` name, and never `<prefix>.system`.** |
 | `consumer_group_id` | The derived default group, `blnk-sub-<subscriber_id>.default`. |
 | `enforced_access` | Each dimension of the access model and the component that enforces it: topic and consumer group at the broker's authorizer, the recorded `partition_key_prefix` at the key-authorising component the deployment declared. Assembled by the model, never by the handler, and it carries `gateway_delivery_required` so a client knows which endpoint to dial. |
 | `username` | The derived principal, `blnk-sub-<subscriber_id>`. |
@@ -785,7 +856,7 @@ So the endpoint refuses unless the request arrived over a channel this deploymen
 | Channel | How the process establishes it | What you configure |
 |---|---|---|
 | **TLS terminated in-process** | The request carries a completed TLS handshake *this process* performed. Proven, not asserted. | `BLNK_SERVER_SSL` |
-| **A declared proxy boundary** | The deployment declares that a proxy in front of Blnk terminates TLS and sets `X-Forwarded-Proto`; the header is then believed, and only a value of `https` qualifies. | `BLNK_SERVER_TRUST_FORWARDED_PROTO=true` |
+| **A declared proxy boundary, entered through a declared proxy** | The deployment declares that a proxy in front of Blnk terminates TLS and sets `X-Forwarded-Proto`, **and** the request arrived from a socket peer that proxy list names; the header is then believed, and only a value of `https` qualifies. | `BLNK_SERVER_TRUST_FORWARDED_PROTO=true` **with** `BLNK_SERVER_TRUSTED_PROXIES` |
 | **A declared local-development host with a loopback peer** | The far end of the accepted socket is in `127.0.0.0/8` or is `::1` **and** the deployment has declared that no proxy sits in front of it. Read from the socket, never from `X-Forwarded-For`. | `BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE=true` — **local development only** |
 
 Anything else is refused. That is deny-by-default: a deployment that has declared nothing gets no secret on the wire — **including a loopback caller**, which is the one people are surprised by.
@@ -808,7 +879,18 @@ There is no configuration under which a loopback peer is believed while a proxy 
 `X-Forwarded-Proto` is a request header. **Any client can send it**, and no process can tell a proxy's value from a caller's — which is why Blnk believes it only when you declare the topology, once and explicitly, instead of letting every request assert its own. Declaring it moves the trust to your network, so your network has to hold it:
 
 - **The proxy must SET the header, overwriting whatever the client sent — never append to it.** A proxy that appends leaves the client's value in place, and a caller can then supply `https` itself over a plaintext hop. Most ingress controllers do the right thing by default; confirm yours does rather than assuming, because the failure is silent and the consequence is a disclosed password.
-- **No request path may reach the process or the pod directly.** Once the declaration is in force, a request that bypasses the proxy is believed on the strength of a header it wrote itself. Enforce this in the network — a `NetworkPolicy` admitting only the ingress, a security group, a listener bound to the proxy's interface — not by convention. The loopback branch above is deliberately narrow for the same reason: it reads the peer from the accepted **socket**, never from `X-Forwarded-For`, so a remote caller cannot present itself as local.
+- **No request path may reach the process or the pod directly.** Once the declaration is in force, a request that bypasses the proxy would be believed on the strength of a header it wrote itself. Enforce this in the network — a `NetworkPolicy` admitting only the ingress, a security group, a listener bound to the proxy's interface — not by convention. The loopback branch above is deliberately narrow for the same reason: it reads the peer from the accepted **socket**, never from `X-Forwarded-For`, so a remote caller cannot present itself as local.
+- **And `BLNK_SERVER_TRUSTED_PROXIES` must name that proxy, because it is the half of the obligation above that Blnk itself checks.** The header is believed only on a request whose socket peer falls inside one of those ranges, so a caller arriving by any other route — a pod IP, a `kubectl port-forward`, a second Service, an ingress rule passing the client's header through — is refused however it sets the header. It is the same list that makes a forwarded *client address* trustworthy, deliberately: one proxy, one answer.
+
+  ```bash
+  # The production shape. Both, or the channel establishes nothing.
+  BLNK_SERVER_TRUST_FORWARDED_PROTO=true
+  BLNK_SERVER_TRUSTED_PROXIES=10.0.0.0/8          # the ranges your ingress dials from
+  ```
+
+  A **universal range** (`0.0.0.0/0`, `::/0`) is not an allowlist — it matches every peer, which is exactly the state the declaration replaces — so it is skipped, and a list of nothing else counts as empty. A malformed entry matches nothing.
+
+  **With `BLNK_SERVER_SECURE=true`, the flag with no usable allowlist is refused at configuration load**, naming the variable to set. Outside secure mode it is a warning and the channel simply establishes nothing, which is what keeps the Compose stack and the test suite working. Blnk still cannot see the hop in front of the proxy, so the two obligations above remain yours; what this closes is the request that never went through the proxy at all.
 
 A declaration plus a header reading anything other than `https` does not qualify: the proxy is reporting a plaintext client hop, and the request falls through to the loopback test — which, unless this host has also been declared local-development, refuses it.
 

@@ -64,12 +64,15 @@ Events are grouped into four **category topics**, each with a **dead-letter sibl
 | `blnk.transactions` | `blnk.transactions.dlt` | Subscribers may be granted it | Transaction lifecycle, including bulk batch progress |
 | `blnk.balances` | `blnk.balances.dlt` | Subscribers may be granted it | Balance creation and balance monitor alerts |
 | `blnk.identities` | `blnk.identities.dlt` | Subscribers may be granted it | Identity creation |
-| `blnk.system` | `blnk.system.dlt` | Subscribers may be granted it | Ledger creation, Blnk's own error notifications, and any event type the catalogue does not recognise |
+| `blnk.system` | `blnk.system.dlt` | **Operators only — never granted to a subscriber** | Ledger creation, Blnk's own error notifications, and any event type the catalogue does not recognise |
 
-All four categories are grantable. There is no internal-only topic in this inventory, so what a
-given subscriber can read is decided entirely by the grant it was issued rather than by any
-category being withheld from everyone. Read [what granting `blnk.system` discloses](#why-four-categories-and-what-blnksystem-costs-you)
-before granting it.
+**Three of the four categories are grantable: transactions, balances and identities.**
+`blnk.system` is an internal topic — no subscriber principal is ever given an ACL over it, and a
+registration or credential request that names it is refused. Neither is any `.dlt` sibling. So the
+topics you can be granted are exactly the three tenant categories, and which of those you hold is
+decided by the grant you were issued. Read [why `blnk.system` is not grantable, and what that
+costs you](#why-four-categories-and-why-blnksystem-is-not-grantable) — particularly if you consume
+`ledger.created` today.
 
 ### The topic prefix
 
@@ -102,13 +105,20 @@ It is an explicit allowlist rather than "accept any prefix with a known category
 
 As a subscriber you are unaffected either way: you are granted topics under the **current** prefix, and a historical namespace is never granted. What you notice is that events captured before the rename arrive on the old topic you were already reading, rather than stopping.
 
-### Why four categories, and what `blnk.system` costs you
+### Why four categories, and why `blnk.system` is not grantable
 
 The three category topics the requirement names — transactions, balances, identities — do not cover everything Blnk emits. `ledger.created` and `system.error` belong to none of them, while the coverage rule admits no exceptions: every event type that reached the legacy webhook sender is published to Kafka. One further category closes that gap, following the identical naming convention, so nothing about the scheme is special-cased and each dead-letter sibling is derived by the same rule as every other.
 
-**`blnk.system` carries both of those event types, and that is what makes it the one category to grant deliberately.** `system.error`'s payload is a frozen legacy contract that carries verbatim error text, and error text names internal detail: database schemas, tables and routines, broker addresses. That body cannot be narrowed without breaking the payload guarantee below, so the disclosure is contained by AUDIENCE — by which subscribers are granted the topic — rather than by redaction. It is also the catalogue's catch-all: an event type Blnk adds later without extending the table lands somewhere durable, observable and replayable, and on the topic the fewest subscribers hold.
+**`blnk.system` carries both of those event types, and two properties of it make it an operator topic rather than a subscriber one.**
 
-> **Read this if you consume `ledger.created` over webhooks today.** It shares `blnk.system` with `system.error`, so ask your operator to include `blnk.system` in your `authorized_topics` and you will receive it over Kafka exactly as you receive it over webhooks now. The grant is a deliberate decision rather than a default, because it also gives you `system.error` and any event type Blnk has not yet catalogued — so if you do not consume ledger creations, do not ask for it. A fifth, subscriber-facing `blnk.ledgers` topic was implemented to close the gap and then removed, because the topic catalogue is a published contract and adding to it obliges every subscriber that wants universal coverage to hold a grant it was never told about. Withholding the category instead was tried too, and it was worse: it turned a disclosure question into a lost event.
+- `system.error`'s payload is a frozen legacy contract that carries **verbatim error text**, and error text names internal detail: database schemas, tables and routines, broker addresses, sometimes a record or tenant identifier. That body cannot be narrowed without breaking the payload guarantee below, so the disclosure cannot be redacted away.
+- It is the catalogue's **catch-all**. An event type Blnk adds later without extending the table lands here, so a grant of this topic would be a standing grant over payloads nobody has reviewed — access widened by a future routing omission rather than by a decision.
+
+Containing that by audience — grantable, but "grant it deliberately" — was the previous rule, and a rule an operator can undo with one request is not a boundary: a single mis-grant, or a grant retained on a subscriber whose purpose changed, hands one subscriber Blnk's internal error text for the whole deployment. **The name is therefore withheld from every subscriber**, exactly as every `.dlt` name is, and for the same reason: these are surfaces for whoever runs Blnk, read under the master key.
+
+> **Read this if you consume `ledger.created` over webhooks today.** It shares `blnk.system` with `system.error`, and that topic cannot be granted to you, so **`ledger.created` has no Kafka route for subscribers.** You keep receiving it over webhooks for the remainder of the dual-delivery window; after the sunset it is published, retained and replayable but readable only by your operator. Plan for that now: if `ledger.created` drives something on your side, ask your operator how they intend to relay it to you, because Blnk will not be delivering it to a subscriber credential. A fifth, subscriber-facing `blnk.ledgers` topic was implemented to close the gap and then removed, because the topic catalogue is a published contract and adding to it obliges every subscriber that wants universal coverage to hold a grant it was never told about. Making the event consumable again means revising that catalogue — a deliberate change, not an implementation detail.
+
+Coverage is unaffected by any of this: every event type, `ledger.created` and `system.error` included, is captured in the same transaction as the ledger mutation, published, observable in metrics and replayable from its dead-letter topic. What the exclusion decides is the **audience**, not whether the event exists.
 
 The system category is not a placeholder. Folding its events into an unrelated topic would corrupt that topic's meaning for everyone filtering on it, and dropping them would breach coverage outright.
 
@@ -217,8 +227,8 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 | `balance.created` | `blnk.balances` | A balance is created. |
 | `balance.monitor` | `blnk.balances` | A balance monitor's condition is met. Fires on every occurrence, so the same monitor produces many of these. |
 | `identity.created` | `blnk.identities` | An identity is created. |
-| `ledger.created` | `blnk.system` | A ledger is created. Ask your operator for `blnk.system` in your `authorized_topics` — it is granted deliberately rather than by default, because it shares the category with `system.error`. See [what granting `blnk.system` discloses](#why-four-categories-and-what-blnksystem-costs-you). |
-| `system.error` | `blnk.system` | Blnk raises an internal error notification. Grantable on the same terms, and the reason the grant is a deliberate one: this body carries Blnk's own error text verbatim. |
+| `ledger.created` | `blnk.system` | A ledger is created. **Not consumable by a subscriber**: `blnk.system` is an operator topic and cannot appear in your `authorized_topics`. See [why `blnk.system` is not grantable](#why-four-categories-and-why-blnksystem-is-not-grantable). |
+| `system.error` | `blnk.system` | Blnk raises an internal error notification. **Not consumable by a subscriber**, and the reason the whole category is withheld: this body carries Blnk's own error text verbatim. |
 
 The seven `transaction.*` names are derived from the transaction's status by a single mapping, which is why a transaction's whole lifecycle appears under this one prefix.
 
@@ -258,7 +268,7 @@ The statuses emitted today are `applied`, `inflight` and `failed`, giving `bulk_
 
 ### An unrecognised event type is published, not dropped
 
-If Blnk ever emits an event type absent from the table above, it is routed to `blnk.system` rather than refused or discarded. The outbox row is already committed by the time routing happens, so dropping it would lose a durable event, and `blnk.system` is the narrowest destination in the catalogue — it is granted deliberately, per subscriber, and only to subscribers that need ledger events — so a routing omission cannot reach every subscriber at once. Blnk logs a warning when this happens; the resolution is always to catalogue the event type, never to rely on the fallback.
+If Blnk ever emits an event type absent from the table above, it is routed to `blnk.system` rather than refused or discarded. The outbox row is already committed by the time routing happens, so dropping it would lose a durable event, and `blnk.system` is grantable to nobody — so a routing omission reaches an operator and no subscriber at all, which is the other half of why that category is withheld. Blnk logs a warning when this happens; the resolution is always to catalogue the event type, never to rely on the fallback.
 
 ## The Payload
 
@@ -734,7 +744,7 @@ have Kafka running before it passes. If you are not migrating, leave the sunset 
 
 Each subscriber is a Kafka principal with its own SASL/SCRAM credentials and ACLs scoped to the topics it is authorised for and to its own consumer-group namespace. Credentials are issued once, through `POST /subscribers/{subscriber_id}/kafka-credentials`, which returns the broker endpoint, your topic list, your consumer group id and the credentials themselves. Provisioning, the ACL model and the exact request and response are documented in [kafka-operations.md](kafka-operations.md).
 
-All four categories can be granted: transactions, balances, identities and system. `blnk.system` is the one to grant deliberately rather than by default — it carries `ledger.created`, which is why it is grantable at all, and `system.error`, whose body carries Blnk's own error text verbatim — so ask for it only if you consume ledger events. No dead-letter topic is grantable to a subscriber.
+Three categories can be granted: transactions, balances and identities. `blnk.system` cannot — it carries `system.error`, whose body renders Blnk's own error text verbatim, and it is the catalogue's catch-all, so it is an operator topic. No dead-letter topic is grantable either. `ledger.created` shares `blnk.system` and therefore has no subscriber route; see [why `blnk.system` is not grantable](#why-four-categories-and-why-blnksystem-is-not-grantable).
 
 ### The topic grant is the isolation boundary
 
@@ -743,13 +753,13 @@ Two dimensions of a subscriber's access are enforced at the broker, and they are
 - **`topic`** — literal `Read` and `Describe` on exactly the topics you were granted. Every other topic, including every `.dlt` topic, is refused by the broker rather than filtered by your client.
 - **`consumer_group`** — a prefixed `Read` grant reserving your own consumer-group namespace. Joining a group outside it is refused.
 
-All four categories can be granted, `blnk.system` included — it carries `ledger.created` as well as `system.error`, so withholding it would make a currently-delivered event unreachable. It is granted per subscriber rather than by default. No dead-letter topic is grantable to a subscriber.
+The three tenant categories can be granted, and which of them you hold is decided per subscriber. `blnk.system` is granted to nobody, and neither is any dead-letter topic: both are operator surfaces, and asking for either is refused rather than quietly dropped.
 
 ### A topic you are granted, you read whole — including other subscribers' records
 
 This is the one property of the access model that surprises people, so it is stated before the field that invites the wrong reading.
 
-**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances`, `blnk.identities` and `blnk.system`.
+**Blnk does not create a topic per subscriber.** Every subscriber of a category consumes the same category topic: all transaction events, for every ledger in the deployment, are on `blnk.transactions`. So a credential granted `blnk.transactions` can read **every** transaction event Blnk publishes — including events belonging to other ledgers and to other subscribers of the same topic. The same holds for `blnk.balances` and `blnk.identities`.
 
 The topic grant is therefore not merely *a* boundary, it is **the** boundary. If two parties must not see each other's events, they must not be granted the same topic — and because the four category topics are fixed, that means separating them at the deployment boundary rather than at the grant. There is no third option, and no field on a subscriber changes this.
 
@@ -764,9 +774,28 @@ Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topi
 | `KAFKA_KEY_SCOPE_ENFORCEMENT` on the deployment | `POST /subscribers/{id}/kafka-credentials` for a key-scoped subscriber |
 |---|---|
 | `none` (the shipped default) | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** No credential is minted, because nothing would apply the prefix and a credential granted whole-topic `Read` beside it would read every other ledger's records. |
-| `broker_gateway`, with `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` naming that component's own addresses | `200`. The response's `broker_endpoint` is **that component's** address, not the Kafka brokers', and `partition_key_prefix_enforced_by` reads `broker_gateway`. |
+| `broker_gateway`, but with no verifiable control endpoint for that component | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** A declaration Blnk cannot check is read as no declaration; see below. |
+| `broker_gateway`, and the component does not confirm your exact key scope | **`409 SUBSCRIBER_KEY_SCOPE_UNATTESTED`.** The component answered, and answered with something other than your recorded prefix. |
+| `broker_gateway`, with `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` naming that component's own addresses **and** a control endpoint that confirms your key scope | `200`. The response's `broker_endpoint` is **that component's** address, not the Kafka brokers', and `partition_key_prefix_enforced_by` reads `broker_gateway`. |
 
 The two remedies travel with the refusal, and they are the only two: have your operator declare a key-authorising component and its endpoint, or drop the prefix and narrow `authorized_topics` instead — the topic dimension is enforced at the broker in full.
+
+#### A `200` for a key-scoped subscriber means the component confirmed *your* boundary
+
+Blnk does not take the declaration on trust. Before your secret exists — and before your principal is created at the broker — issuance calls the component's control endpoint over an authenticated request, registers `{principal, subscriber_id, partition_key_prefix, authorized_topics, consumer_group_prefix}`, and requires the component to confirm **that principal** and **that prefix, byte for byte**. Anything else is `409 SUBSCRIBER_KEY_SCOPE_UNATTESTED` and nothing is minted.
+
+Two consequences for you as an integrator:
+
+- **`partition_key_prefix_enforced: true` is backed by a confirmation, not by a configuration value.** A deployment cannot produce that field by naming a component that is not there.
+- **The confirmation is a control-plane fact, so per-record filtering is still that component's behaviour.** Blnk establishes that the broker will not serve your principal a record directly and that the component accepted your boundary; it cannot observe what the component forwards. If you need evidence of the filter itself, ask your operator for the component's own instrumentation.
+
+When your subscriber is deregistered, Blnk withdraws that binding from the component after revoking your broker credential — so a principal that no longer exists does not keep an entry a later subscriber with the same identifier could inherit.
+
+#### Where the deployment is key-scoped, a subscriber with no prefix is refused
+
+Two refusals share this endpoint, and they point in opposite directions. If your deployment declares the key-scoped model, then **every** subscriber must carry a prefix: a subscriber registered without one would hold whole-topic `Read` on a shared category topic in a deployment whose whole point is that it should not. That request is `409 SUBSCRIBER_KEY_SCOPE_REQUIRED`, and clearing a prefix that is already recorded is refused the same way.
+
+Separately, a deployment running with `BLNK_SERVER_SECURE=true` must have declared **which** model it is. If it has declared neither, credential issuance answers `409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED`. Both are operator-side configuration decisions rather than anything about your request: retrying is pointless, and the message names exactly what an operator must set.
 
 A credential response for a key-scoped subscriber therefore always describes a live enforcement point:
 

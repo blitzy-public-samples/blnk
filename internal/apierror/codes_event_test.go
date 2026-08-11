@@ -77,6 +77,21 @@ var eventStreamingCodeCases = []struct {
 	// for one judgement (SUBSCRIBER_ISOLATION_UNENFORCEABLE) existed and is gone, because two
 	// codes for one refusal is how a client comes to handle one and not the other.
 	{ErrSubscriberKeyScopeUnenforced, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_UNENFORCED"},
+	// Its MIRROR, and a separate code because the remedy is the opposite edit. UNENFORCED means
+	// "this row records a key scope and nothing keeps it"; REQUIRED means "this deployment
+	// declared a key-scoped model and this row records no scope", which is the one credential
+	// that would escape the model with whole-topic Read. One code for both would tell an
+	// operator to change a prefix without saying in which direction.
+	{ErrSubscriberKeyScopeRequired, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_REQUIRED"},
+	// The declaration refusal: a secure-mode deployment that has said nothing about whether its
+	// subscribers read whole topics. 409 because the CONFIGURATION is the state that changes,
+	// and not 403, which would blame the caller holding the master key.
+	{ErrSubscriberSharedTopicAccessUnacknowledged, http.StatusConflict, "SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED"},
+	// The verification refusal. 409 even when the attestation call timed out, because the
+	// declared enforcement point is the deployment's state rather than a Blnk dependency: a 503
+	// would send an operator to a Kafka that never stopped answering. The detail's retryable
+	// flag is what separates "unreachable, try again" from "it attested a different prefix".
+	{ErrSubscriberKeyScopeUnattested, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_UNATTESTED"},
 	{ErrSubscriberDeprovisioning, http.StatusConflict, "SUBSCRIBER_DEPROVISIONING"},
 	{ErrSubscriberGrantEmpty, http.StatusConflict, "SUBSCRIBER_GRANT_EMPTY"},
 	// A fourth state refusal, and the one whose state lives at the BROKER rather than in the
@@ -146,12 +161,21 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	//        declared and mapped in codes.go. That is the omission this guard exists to catch,
 	//        and it was caught by the same recount that removed the three above.
 	//
-	//   = 16.
+	//   +3 — SUBSCRIBER_KEY_SCOPE_REQUIRED, SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED and
+	//        SUBSCRIBER_KEY_SCOPE_UNATTESTED added with the enforceable key-scope model. The
+	//        first two make the deployment state its subscriber access model — key-scoped, or
+	//        whole-topic and acknowledged — instead of defaulting silently to the widest one;
+	//        the third refuses a key-scoped credential whose declared enforcement point did not
+	//        attest the exact recorded prefix over an authenticated channel. Three codes and not
+	//        one, because the three remedies are three different edits: the ROW, the
+	//        DEPLOYMENT'S DECLARATION, and the COMPONENT.
+	//
+	//   = 19.
 	//
 	// One of those edits caught a genuine omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_
 	// AUTHORIZATION had no statusByCode entry at all, so a deliberate 409 was resolving to 500.
-	if len(eventStreamingCodeCases) != 16 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 16 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
+	if len(eventStreamingCodeCases) != 19 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 19 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {

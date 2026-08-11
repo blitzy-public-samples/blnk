@@ -272,6 +272,14 @@ var credentialConfigurationFields = map[string]bool{
 	".Kafka.SASLSecret":          true,
 	".Kafka.SASLAdminSecret":     true,
 
+	// THE BEARER CREDENTIAL Blnk presents to the declared key-scope enforcement component
+	// (SEC-01). It authenticates the bind-and-attest call, so anything holding it can register
+	// key-scope bindings at that component — which is to say it can decide which records a
+	// subscriber sees. It is a secret on exactly the same footing as the SASL credentials above,
+	// and the call that carries it is the one most likely to fail with an authentication error
+	// quoting its own settings.
+	".Kafka.KeyScopeGatewayAttestationToken": true,
+
 	// A BOOLEAN DECLARATION, not a secret. It states whether this host has anything in front
 	// of it, which decides whether a loopback caller may be issued a Kafka credential over
 	// plaintext — so its NAME reads as a credential while its value is "true" or "false" and

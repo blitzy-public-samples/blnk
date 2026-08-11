@@ -42,13 +42,14 @@ import (
 // # The access model, stated once
 //
 // THERE ARE NO PER-TENANT TOPICS. Blnk owns four category topics and a `.dlt` sibling for each
-// (event_topics.go). All FOUR categories — transactions, balances, identities and system — may
-// be granted to a subscriber, because each carries event types the legacy webhook transport
-// delivered; NO dead-letter topic may ever be granted, whatever its category. Granting
-// `<prefix>.system` does disclose system.error's frozen body, which carries verbatim internal
-// error text, so it is an audience decision the operator makes per subscriber rather than one
-// this layer makes for them. A subscriber is granted a SUBSET of the grantable set, whatever
-// its registry row authorises, and isolation comes from four things:
+// (event_topics.go). THREE of those categories — transactions, balances and identities — may be
+// granted to a subscriber. `<prefix>.system` may NOT, and no dead-letter topic may ever be,
+// whatever its category: the system topic carries system.error's frozen body, which renders
+// verbatim internal error text, and it is the catalogue's catch-all, so it is an operator
+// surface rather than a subscriber one. That decision lives in
+// model.SubscriberGrantableEventCategories and is enforced identically by the request DTO, the
+// persistence boundary and the ACL provisioner. A subscriber is granted a SUBSET of the
+// grantable set, whatever its registry row authorises, and isolation comes from four things:
 //
 //  1. The KAFKA PRINCIPAL. Each subscriber is a distinct SASL/SCRAM identity derived
 //     from its immutable subscriber id, so one subscriber's credential can never
@@ -943,6 +944,18 @@ type EventSubscriberService struct {
 	// scheduler, so the five-second issuance budget bounds the RESPONSE rather than the
 	// response plus every cleanup that followed it.
 	deferWork func(func())
+
+	// keyScopeGateway is the control-plane client for the declared key-authorising component.
+	//
+	// Nil is the normal state, and it does NOT mean "no gateway": the client is built from
+	// live configuration on demand by keyScopeGatewayClient, for the same reason
+	// keyScopeEnforcement reads configuration rather than a captured copy — a value captured
+	// when the service was constructed would describe the deployment as it stood then, and the
+	// enforcement fact and the client that verifies it must come from one read.
+	//
+	// Assigning it is for TESTS, through WithKeyScopeGateway: it is what lets a conformance
+	// double stand in for a component this repository does not ship.
+	keyScopeGateway KeyScopeGatewayClient
 }
 
 // NewEventSubscriberService builds the subscriber registry service.
@@ -1013,6 +1026,170 @@ func (s *EventSubscriberService) WithKafkaAdmin(admin subscriberPrincipalProvisi
 	s.ownsAdmin = false
 
 	return s
+}
+
+// WithKeyScopeGateway injects the control-plane client for the declared key-authorising
+// component.
+//
+// It exists for TESTS, and it is the seam that makes SEC-01's enforcement point exercisable end
+// to end: Blnk does not ship a record-filtering gateway, so the only way to prove that issuance
+// binds, attests, refuses a mismatch and revokes is to stand a conformance double in its place.
+//
+// Passing nil clears an injected client and returns the service to building one from live
+// configuration, which is what production does.
+//
+// Parameters:
+//   - gateway KeyScopeGatewayClient: the client to use, or nil to resolve from configuration.
+//
+// Returns:
+//   - *EventSubscriberService: the service, for chaining.
+func (s *EventSubscriberService) WithKeyScopeGateway(gateway KeyScopeGatewayClient) *EventSubscriberService {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.keyScopeGateway = gateway
+
+	return s
+}
+
+// keyScopeGatewayClient resolves the control-plane client for the declared component.
+//
+// # Why it is resolved per call rather than held
+//
+// The same reason keyScopeEnforcement re-reads configuration: the enforcement FACT and the
+// client that verifies it must come from one read of one configuration. A client captured at
+// construction would keep attesting against an endpoint the deployment had since changed, and —
+// worse — could exist while enforcement was reported inactive, which is the combination that
+// mints a credential nothing was asked about.
+//
+// It is cheap. The client is a struct with an http.Client whose transport pools four idle
+// connections; issuance is not a hot path, and building one per credential costs less than the
+// TLS handshake the call itself performs.
+//
+// Returns:
+//   - KeyScopeGatewayClient: the injected client when a test installed one, otherwise a client
+//     built from live configuration.
+//   - error: ErrKeyScopeGatewayNotConfigured when no usable endpoint is declared. The caller
+//     turns that into the state refusal an operator can act on; it is deliberately NOT wrapped
+//     here, so a caller can compare against the sentinel.
+func (s *EventSubscriberService) keyScopeGatewayClient() (KeyScopeGatewayClient, error) {
+	s.mu.Lock()
+	injected := s.keyScopeGateway
+	s.mu.Unlock()
+
+	if injected != nil {
+		return injected, nil
+	}
+
+	cnf, err := fetchConfiguration()
+	if err != nil || cnf == nil {
+		// A configuration that cannot be read declares nothing, which is the same fail-closed
+		// answer keyScopeEnforcement gives: no gateway, so no key-scoped credential.
+		return nil, ErrKeyScopeGatewayNotConfigured
+	}
+
+	return NewKeyScopeGatewayClient(cnf)
+}
+
+// attestKeyScope requires the declared component to confirm a subscriber's recorded key scope
+// before anything is minted.
+//
+// # Where this sits, and why
+//
+// It runs after the row is read and the enforcement fact is resolved, and BEFORE a password
+// exists or the broker is touched — the same position subscriberFacingBrokers occupies, and for
+// the same reason: a refusal there leaves no residue anywhere. There is no credential to revoke,
+// no ACL to prune, no registry write to undo, and no secret that has to be treated as
+// compromised because it was generated and then abandoned.
+//
+// # Why a missing client is a refusal rather than a skip
+//
+// The caller only reaches this when enforcement is ACTIVE, and enforcement is active only when
+// config.KafkaConfig.KeyScopeAttestation reports a usable endpoint — so the client cannot be
+// missing here unless configuration changed between the two reads. Treating that as a skip would
+// mint exactly the credential this whole path exists to prevent, so it is a refusal.
+//
+// Parameters:
+//   - ctx context.Context: the forward-path context, already bounded by the issuance budget.
+//   - subscriber *model.EventSubscriber: the row about to be provisioned.
+//
+// Returns:
+//   - error: nil when the component attested the exact recorded prefix for this exact
+//     principal; otherwise a typed ErrSubscriberKeyScopeUnattested.
+func (s *EventSubscriberService) attestKeyScope(
+	ctx context.Context, subscriber *model.EventSubscriber,
+) error {
+	binding := keyScopeBindingFor(subscriber)
+
+	gateway, err := s.keyScopeGatewayClient()
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"subscriber_id_hash": subscriberLogLabel(binding.SubscriberID),
+			"error_class":        kafkaErrorClassField("key_scope_gateway_resolution", err),
+		}).Error(
+			"event subscriber: this subscriber records a partition key prefix and enforcement was " +
+				"reported active, but no key-scope gateway control endpoint could be resolved, so no " +
+				"credential was minted",
+		)
+
+		return apierror.NewAPIError(
+			apierror.ErrSubscriberKeyScopeUnattested,
+			"No key-scope enforcement gateway control endpoint is configured, so the partition key "+
+				"prefix recorded on this subscriber cannot be confirmed with the component that would "+
+				"apply it. No credential was issued. Set KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL and "+
+				"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN, or clear the partition key prefix and "+
+				"narrow authorized_topics, which the broker enforces in full",
+			// Not retryable: the identical request cannot succeed until the deployment's
+			// configuration changes.
+			NewSubscriberErrorDetail(
+				"No key-scope enforcement gateway control endpoint is configured",
+				binding.SubscriberID, false,
+			),
+		)
+	}
+
+	return gateway.AttestBinding(ctx, binding)
+}
+
+// revokeKeyScopeBinding withdraws a subscriber's binding at the declared component.
+//
+// # Best effort, and deliberately so
+//
+// The authoritative revocation is the BROKER's: deleting the SCRAM credential ends the
+// principal's ability to authenticate anywhere the credential was accepted, gateway included,
+// because the gateway terminates the same SASL exchange. This call exists so the component does
+// not accumulate bindings for principals that no longer exist, which is hygiene and audit
+// rather than access.
+//
+// So a failure is LOGGED AND RETURNED to the caller as information, never allowed to fail a
+// deregistration whose broker half has already succeeded. Failing it would leave an operator
+// unable to remove a subscriber while a component is down, in order to complete a cleanup for
+// access that is already gone.
+//
+// A deployment with no gateway declared has nothing to revoke and this is a no-op.
+//
+// Parameters:
+//   - ctx context.Context: a bounded cleanup context.
+//   - subscriber *model.EventSubscriber: the row being deregistered. May be nil.
+//
+// Returns:
+//   - error: the component's failure, for the caller to log. Nil when there was nothing to do
+//     or the binding was withdrawn.
+func (s *EventSubscriberService) revokeKeyScopeBinding(
+	ctx context.Context, subscriber *model.EventSubscriber,
+) error {
+	if subscriber == nil || strings.TrimSpace(subscriber.KafkaPrincipal) == "" {
+		return nil
+	}
+
+	gateway, err := s.keyScopeGatewayClient()
+	if err != nil {
+		// Nothing declared, nothing to withdraw. This is the shipped default and must not be
+		// reported as a cleanup failure.
+		return nil
+	}
+
+	return gateway.RevokeBinding(ctx, subscriber.KafkaPrincipal)
 }
 
 // provisioner returns the administrative client, building one on first use when none was
@@ -1810,6 +1987,154 @@ func requireProvisionableKeyScope(subscriber *model.EventSubscriber, enforced bo
 				"no message-key dimension, so any credential issued would grant every record on every "+
 				"authorised topic and the registry would describe a narrower boundary than exists",
 			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+		),
+	)
+}
+
+// requireKeyScopeWhenEnforced is the MIRROR of requireProvisionableKeyScope: it refuses to mint
+// a credential for a subscriber that records NO key scope, in a deployment that has declared its
+// subscriber access to be key-scoped.
+//
+// # The hole this closes (SEC-01)
+//
+// Withholding topic Read from key-scoped principals made those subscribers safe. It said nothing
+// about the subscriber registered WITHOUT a prefix, and that one is granted literal topic Read on
+// every topic it is authorised for — which means every ledger's records on a shared category
+// topic, in a deployment whose whole point was that subscribers see only their own.
+//
+// So in a tenant-scoped deployment, one prefix-less registration is the single credential that
+// escapes the model, and nothing refused it. "An administrator registers or retains a subscriber
+// without a prefix and issues credentials" is not an exotic attack: it is the default shape of
+// the DTO, where partition_key_prefix is optional, and it leaves no trace that anything unusual
+// happened.
+//
+// # Why the deployment's declaration is the right trigger
+//
+// Blnk cannot tell a tenant apart from an internal analytics consumer by looking at a row. What
+// it can read is what the OPERATOR declared: KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway, with a
+// verified control endpoint, is the deployment stating that subscriber access is scoped by record
+// key. Under that statement every credential must carry a key scope, or the statement is false
+// for at least one principal.
+//
+// A deployment that needs one whole-topic consumer alongside key-scoped ones has two honest
+// routes, both named in the refusal: provision that consumer as an operator-managed principal
+// outside the subscriber registry — which is what scripts/kafka-provision.sh does for the
+// producer and the sample subscriber — or stop declaring the key-scoped model and acknowledge
+// whole-topic access explicitly. Neither is a per-subscriber opt-out, because a per-subscriber
+// opt-out is the hole again with a field name.
+//
+// # Why 409
+//
+// The request has no body, so nothing about it is malformed, and no dependency is unavailable.
+// What is wrong is the row's state relative to the deployment's declared model, and after either
+// remedy the identical request succeeds — which is what 409 means.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row about to be provisioned.
+//   - enforced bool: whether key-scope enforcement is active AND attestable.
+//
+// Returns:
+//   - error: a typed conflict when a key-scoped deployment would mint a whole-topic credential,
+//     otherwise nil.
+func requireKeyScopeWhenEnforced(subscriber *model.EventSubscriber, enforced bool) error {
+	if subscriber == nil || !enforced || subscriber.DeclaresKeyScope() {
+		return nil
+	}
+
+	return apierror.NewAPIError(
+		apierror.ErrSubscriberKeyScopeRequired,
+		"This deployment has declared that subscriber access is scoped by record key "+
+			"(KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway), and this subscriber records no partition "+
+			"key prefix. A credential issued for it would be granted whole-topic Read and would read "+
+			"every ledger's records on every authorized topic, including other subscribers' — the one "+
+			"principal the declared model does not cover. Record the partition key prefix this "+
+			"subscriber is entitled to, provision a whole-topic consumer as an operator-managed "+
+			"principal outside the subscriber registry, or stop declaring the key-scoped model and "+
+			"acknowledge whole-topic access with KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS",
+		fmt.Errorf(
+			"event subscriber: subscriber %q records no partition key prefix while key-scope "+
+				"enforcement is active; issuing would grant whole-topic Read in a deployment that "+
+				"declares key-scoped subscriber access",
+			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+		),
+	)
+}
+
+// requireAcknowledgedSharedTopicAccess refuses to mint a whole-topic credential in a PRODUCTION
+// deployment that has declared nothing about its subscriber access model.
+//
+// # What it is not
+//
+// It is not a claim that whole-topic access is a defect. It is the access model the requirement
+// mandates: category topics, no per-tenant topics, and an authorizer with no message-key
+// dimension. A credential granted `<prefix>.transactions` reads every transaction event in the
+// deployment, and for a single-tenant ledger or a trusted internal consumer that is exactly
+// right.
+//
+// What was wrong is that it was the DEFAULT, reached by configuring nothing. A deployment that
+// had never thought about tenancy got the widest credential Blnk can issue, and every artefact
+// described that correctly — the row, the response, the runbook — while no human had decided it.
+// "Documented" is not "decided".
+//
+// # The declaration, and why it is cheap
+//
+// One variable, set once: KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS=true. The alternative is to
+// declare the key-scoped model instead. Either way an operator has said which deployment this is,
+// and the answer is then visible in configuration to everybody who reads it afterwards.
+//
+// # Why only in secure mode
+//
+// Server.Secure is this repository's production signal — the same flag whose falsity already
+// announces that API authentication is disabled, and the same one resolveSearchCredential reads
+// before refusing a public default credential. Outside it, the local stack, both compose files
+// and the whole test suite issue credentials exactly as before: the declaration exists to make a
+// production decision explicit, not to break `make run`.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row about to be provisioned, named in the refusal.
+//   - enforced bool: whether key-scope enforcement is active. Under it this check does not
+//     apply, because the key scope IS the declaration and requireKeyScopeWhenEnforced has
+//     already established that one is recorded.
+//
+// Returns:
+//   - error: a typed conflict when a secure deployment has declared neither model, otherwise
+//     nil.
+func requireAcknowledgedSharedTopicAccess(subscriber *model.EventSubscriber, enforced bool) error {
+	if enforced {
+		return nil
+	}
+
+	cnf, err := fetchConfiguration()
+	if err != nil || cnf == nil {
+		// A configuration that cannot be read is not a production posture anybody declared, and
+		// it is not this check's business to invent one: every other reader of the configuration
+		// on this path has already failed by now, with a message about the configuration rather
+		// than about the access model.
+		return nil
+	}
+
+	if !cnf.Server.Secure || cnf.Kafka.SubscriberSharedTopicAccess {
+		return nil
+	}
+
+	subscriberID := ""
+	if subscriber != nil {
+		subscriberID = subscriber.SubscriberID
+	}
+
+	return apierror.NewAPIError(
+		apierror.ErrSubscriberSharedTopicAccessUnacknowledged,
+		"This deployment has not declared how subscriber access is scoped, and the credential "+
+			"requested would read every record on each topic it is granted — every ledger's, and "+
+			"every other subscriber's — because Kafka authorizes topics and consumer groups and has "+
+			"no message-key dimension. Declare the model once: set "+
+			"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS=true to acknowledge whole-topic subscriber reads, "+
+			"or set KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with its gateway addresses and "+
+			"attestation endpoint and record a partition key prefix on each subscriber",
+		fmt.Errorf(
+			"event subscriber: subscriber %q would be issued a whole-topic credential in secure mode "+
+				"with no declared subscriber access model",
+			sanitizeLogValue(subscriberID, maxLoggedFilterLength),
 		),
 	)
 }
@@ -2938,6 +3263,22 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		return nil, err
 	}
 
+	// AND CLEARING A PREFIX IS REFUSED WHERE THE DEPLOYMENT DECLARES A KEY-SCOPED MODEL (SEC-01).
+	//
+	// This is the third order the unscoped-credential state is reachable from, and the only one
+	// the issuance guard cannot see. Record a prefix, get a credential, then clear the prefix:
+	// requireKeyScopeWhenEnforced never runs again, and clearBrokerAccess below dutifully WIDENS
+	// the live principal to whole-topic Read — a subscriber in a tenant-scoped deployment reading
+	// every ledger, reached by an ordinary sequence of API calls with nothing refusing it.
+	//
+	// Judged on the row as it would be written, like every guard around it, so an update that
+	// merely renames a key-scoped subscriber or replaces one prefix with another passes through.
+	// What is refused is arriving at "no key scope" while the deployment says every subscriber
+	// has one, and the refusal names the same remedies issuance names.
+	if err := requireKeyScopeWhenEnforced(subscriber, keyScopeEnforced); err != nil {
+		return nil, err
+	}
+
 	// DOES THE BROKER HAVE TO BE TOUCHED AT ALL? ADMIN-02 and PERF-P15 are the same finding
 	// reached from two directions, and this one decision answers both.
 	//
@@ -4054,6 +4395,35 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 		)
 	}
 
+	// STEP 3b — WITHDRAW THE KEY-SCOPE BINDING at the declared component (SEC-01), now that the
+	// broker credential is gone.
+	//
+	// ORDER MATTERS AND THIS IS THE SAFE END OF IT. The broker's revocation is the authoritative
+	// one: the principal can no longer authenticate anywhere the credential was accepted,
+	// gateway included, because the gateway terminates the same SASL exchange. So by the time
+	// this runs there is no access left for a failure here to leave behind — only a stale entry
+	// in the component's binding table.
+	//
+	// It is therefore NOT allowed to fail the deregistration. Doing so would leave an operator
+	// unable to remove a subscriber while a component is unreachable, in order to finish a
+	// cleanup for access that is already gone. The failure is logged at WARNING with the
+	// principal's pseudonym and the remedy, which is the honest description of a hygiene
+	// obligation the operator can discharge at the component.
+	//
+	// A deployment that declares no component does nothing here.
+	if err := s.revokeKeyScopeBinding(ctx, pending); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"subscriber_id_hash": subscriberLogLabel(pending.SubscriberID),
+			"principal_hash":     subscriberLogLabel(pending.KafkaPrincipal),
+			"error_class":        kafkaErrorClassField("key_scope_gateway_revoke", err),
+		}).Warn(
+			"event subscriber: this subscriber's Kafka credential was revoked, but withdrawing its " +
+				"key-scope binding at the declared enforcement gateway failed; the principal can no " +
+				"longer authenticate, so no access remains — remove the stale binding at the gateway " +
+				"when it is reachable again",
+		)
+	}
+
 	// STEP 4 — DELETE, now that the broker-side cleanup is confirmed, and under the claim. A
 	// miss means the claim was lost while the revocation was in flight; the row then stays
 	// tombstoned, which is the recoverable direction, and the conflict tells the caller so.
@@ -4360,6 +4730,24 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 		return SubscriberCredential{}, err
 	}
 
+	// AND FAIL CLOSED IN THE OTHER DIRECTION (SEC-01). The refusal above covers a key scope
+	// nothing enforces; this one covers the credential that ESCAPES a declared key-scoped model —
+	// a subscriber with no prefix, issued literal topic Read, reading every ledger on a shared
+	// topic while every other subscriber in the deployment is confined. One prefix-less
+	// registration was all it took, and the DTO makes the field optional, so nothing marked the
+	// occasion.
+	if err := requireKeyScopeWhenEnforced(subscriber, keyScopeEnforced); err != nil {
+		return SubscriberCredential{}, err
+	}
+
+	// AND MAKE THE WHOLE-TOPIC MODEL A DECISION RATHER THAN A DEFAULT. Where no key-scoped model
+	// is declared, a granted topic is read in full — which is the mandated access model and is
+	// correct for a single-tenant deployment. In secure mode Blnk asks the operator to have said
+	// so, once, instead of reaching the widest credential it can issue by configuring nothing.
+	if err := requireAcknowledgedSharedTopicAccess(subscriber, keyScopeEnforced); err != nil {
+		return SubscriberCredential{}, err
+	}
+
 	// And refuse a subscriber authorised for nothing, so a live principal that can read
 	// nothing is never handed out looking like one that can. Checked in the same place and for
 	// the same reason as the three above: before a secret exists and before the broker is
@@ -4401,6 +4789,24 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	// component would add a hop which authorises nothing.
 	if subscriber.DeclaresKeyScope() && len(keyScopeGateway) > 0 {
 		subscriberBrokers = keyScopeGateway
+	}
+
+	// THE DECLARED COMPONENT IS ASKED TO CONFIRM THE BOUNDARY, before a secret exists and before
+	// the broker is touched (SEC-01).
+	//
+	// Everything above this line has established that the row records a key scope and that the
+	// deployment declares a component to keep it. Neither of those is evidence that the component
+	// exists: they are two configuration values and a column. This call is the evidence — an
+	// authenticated request the component must answer with "yes, for this principal, with this
+	// exact prefix" — and it is what stops Blnk minting a credential whose response declares an
+	// enforced key boundary nobody was ever asked about.
+	//
+	// POSITIONED HERE for the reason every other refusal on this path is: no password has been
+	// generated, no ACL created, no registry row written, so a refusal leaves nothing behind.
+	if subscriber.DeclaresKeyScope() && keyScopeEnforced {
+		if err := s.attestKeyScope(ctx, subscriber); err != nil {
+			return SubscriberCredential{}, err
+		}
 	}
 
 	// The reference OBSERVED before provisioning. It is what makes the issuance record

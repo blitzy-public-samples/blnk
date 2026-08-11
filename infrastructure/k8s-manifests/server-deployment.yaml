@@ -412,6 +412,47 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_KEY_SCOPE_GATEWAY_BROKERS
+            # AND THE CONTROL ENDPOINT OF THAT COMPONENT, which is the part of
+            # the declaration Blnk verifies instead of trusting: issuance binds
+            # the recorded prefix there and requires the component to attest
+            # that exact binding before a secret exists, and deregistration
+            # withdraws it. A mode and an address with no reachable endpoint are
+            # read as NO declaration, so key-scoped issuance refuses.
+            #
+            # ITS BEARER TOKEN IS NOT PROJECTED HERE, deliberately: it is a
+            # credential, so it belongs in a Secret rather than in the
+            # ConfigMap. Add it in the same change that fills in the URL —
+            #
+            #   - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN
+            #     valueFrom:
+            #       secretKeyRef:
+            #         name: kafka-key-scope-gateway
+            #         key: attestation-token
+            #
+            # — because a URL without a token is an incomplete declaration and
+            # is treated as none.
+            - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL
+            - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS
+            # THE DEPLOYMENT'S DECLARATION ABOUT WHOLE-TOPIC SUBSCRIBER READS.
+            # With BLNK_SERVER_SECURE=true one of the two declarations is
+            # mandatory: either the key-scoped model above, or this
+            # acknowledgement that a subscriber credential reads every record on
+            # each topic it is granted. Neither, and issuance refuses with 409
+            # SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED. Projected here
+            # only, for the same reason as the keys above.
+            - name: KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS
             - name: KAFKA_TOPIC_PREFIX
               valueFrom:
                 configMapKeyRef:

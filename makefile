@@ -464,8 +464,9 @@ build_test_run:
 #
 # EIGHT owned topics, from FOUR categories. The fourth exists because two real event types —
 # ledger.created and system.error — belong to none of the three the requirement names, while the
-# coverage rule admits no exceptions; blnk.system takes both, and it is grantable like every
-# other category — it is only withheld from the SAMPLE subscriber's default grant.
+# coverage rule admits no exceptions; blnk.system takes both. It is CREATED AND NEVER GRANTED to
+# a subscriber: system.error's frozen payload renders internal error text verbatim and the
+# category is the catch-all, so it is an operator topic like every .dlt sibling.
 # There is deliberately no fifth blnk.ledgers category: one was implemented and reverted, and
 # model/event.go's catalogue is frozen at four.
 #
@@ -492,10 +493,10 @@ build_test_run:
 #
 # There is no fifth blnk.ledgers category. One was implemented, on the reasoning that
 # ledger.created is ordinary ledger data a webhook subscriber receives today and therefore needs
-# a GRANTABLE home; it was reverted because the catalogue is frozen at four and blnk.system is
-# itself grantable. A subscriber that needs ledger.created is authorized for blnk.system rather
-# than given a topic of its own — which is why withholding that name would have made ordinary
-# ledger data unreachable to every subscriber.
+# a GRANTABLE home; it was reverted because the catalogue is frozen at four. The consequence is
+# recorded rather than hidden: ledger.created shares the ungrantable blnk.system topic, so it has
+# no subscriber Kafka route — it stays published, observable and replayable for an operator, and
+# giving it a subscriber route means revising the frozen catalogue. See docs/event-streaming.md.
 #
 # REPLICATION FACTOR IS 1 LOCALLY AND 3 IN PRODUCTION, which is the whole reason it is a
 # variable. A single-broker KRaft cluster cannot satisfy 3 — topic creation fails outright — so

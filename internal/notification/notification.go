@@ -571,10 +571,11 @@ func newCorrelationID() string {
 //
 // What the concern DOES justify, and what is done instead:
 //
-//   - system.error routes to the blnk.system category, the narrowest in the catalogue: it is
-//     granted per subscriber and only to one that needs ledger events, so the audience for this
-//     body is the operator plus whoever was deliberately granted that topic. What such a grant
-//     discloses is stated on model.EventCategorySystem.
+//   - system.error routes to the blnk.system category, which NO SUBSCRIBER CAN BE GRANTED —
+//     model.SubscriberGrantableEventCategories withholds it, for this payload's sake among
+//     others — so the audience for this body is the operator and nobody else. That is the
+//     containment: an audience nothing can widen, rather than a rule an operator is asked to
+//     follow. See model.EventCategorySystem.
 //   - The bounded classification — classifySystemError and systemErrorCode, both fixed
 //     vocabularies — is logged at the dispatch site alongside a correlation id, so an
 //     operator gets the diagnosis without the raw text being repeated across log sinks.

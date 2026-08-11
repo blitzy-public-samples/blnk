@@ -2704,10 +2704,13 @@ func (r SubscriberProvisioningRequest) validateKeyScope() error {
 //   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into
 //     somebody else's data on a broker Blnk shares.
 //   - DEAD-LETTER topics, because every DLT carries other subscribers' failed events
-//     together with Blnk's own failure metadata, so it has no subscriber audience. This is
-//     the only owned-name class excluded: all four categories are grantable, and the
+//     together with Blnk's own failure metadata, so it has no subscriber audience. That
 //     exclusion is structural rather than listed, since SubscriberGrantableTopics composes
 //     only "<prefix>.<category>" names and a ".dlt" name can never be one.
+//   - THE INTERNAL CATEGORY TOPIC "<prefix>.system", because system.error's frozen payload
+//     renders Blnk's error text verbatim and the category is the catalogue's catch-all. The
+//     grantable set is the three tenant categories; model.SubscriberGrantableEventCategories
+//     owns that decision.
 //
 // IsSubscriberGrantableTopic is the single test for all three, so the API layer, this path
 // and the provisioning script cannot disagree about what is grantable.
@@ -2900,6 +2903,26 @@ func (r SubscriberProvisioningRequest) normalizedTopics() []string {
 // the declared component the only path, and the declaration is what stops the withholding from
 // being a dead end — which is why issuance refuses a key-scoped row when nothing is declared,
 // rather than provisioning a principal that can fetch nothing at all.
+//
+// THE DECLARATION IS VERIFIED BEFORE THIS FUNCTION EVER RUNS (SEC-01). Issuance binds the
+// recorded prefix at that component's control endpoint over an authenticated call and requires
+// it to confirm this exact principal against this exact prefix; a component that cannot be
+// reached, or that confirms a wider prefix, refuses the issuance with
+// SUBSCRIBER_KEY_SCOPE_UNATTESTED. So the omission below is never taken on the strength of two
+// configuration values alone — see (*EventSubscriberService).attestKeyScope.
+//
+// # AND THE WHOLE-TOPIC SHAPE IS A DECLARED DECISION, not the shape reached by configuring
+// nothing
+//
+// The Read-bearing shape above grants every record on each listed topic — every ledger's, and
+// every other subscriber's. That is the mandated access model, correct for a single-tenant
+// ledger or a trusted internal consumer, and it is the only shape Kafka can enforce for a
+// subscriber that records no prefix. What it is no longer is a default: under a declared
+// key-scoped model, issuance refuses a prefix-less subscriber outright with
+// SUBSCRIBER_KEY_SCOPE_REQUIRED, and in secure mode with NO model declared it refuses with
+// SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED until an operator has said which deployment
+// this is. Both refusals are ordered ahead of provisioning, so this function only ever builds
+// bindings for a shape somebody chose.
 //
 // The group binding is retained for such a subscriber even though it cannot consume from the
 // broker, and deliberately: the namespace is RESERVED by that binding, so no other principal

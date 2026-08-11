@@ -1128,6 +1128,25 @@ type CreateSubscriber struct {
 	// the broker enforces in full. A subscriber that must not see another's records and
 	// has no declared component must not share a topic with it.
 	//
+	// AND A DECLARED COMPONENT IS VERIFIED, NOT TAKEN ON TRUST (SEC-01). Where one is
+	// declared, issuance calls its control endpoint over an authenticated channel before
+	// a secret exists and requires it to confirm that it enforces key scopes, for this
+	// exact principal, with THIS EXACT PREFIX byte-for-byte. An unreachable, refusing or
+	// disagreeing component answers 409 SUBSCRIBER_KEY_SCOPE_UNATTESTED. So the value
+	// recorded here is not merely stored: it is the value a peer has to hold before any
+	// credential describing it is minted, which is why it is compared without trimming or
+	// normalisation anywhere on that path.
+	//
+	// OMITTING IT IS ALSO A DECISION, and in a key-scoped deployment it is refused. A row
+	// with no prefix is issued literal topic Read, so it reads every ledger's records on
+	// each granted topic; where the deployment declares the key-scoped model that is the
+	// one principal the boundary does not cover, and issuance answers 409
+	// SUBSCRIBER_KEY_SCOPE_REQUIRED. In a deployment that declares no model at all,
+	// secure-mode issuance answers 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED
+	// until KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS records that whole-topic reads are
+	// intended. Both refusals are about the DEPLOYMENT's declared model rather than about
+	// this field's syntax, which is why neither is raised by Validate.
+	//
 	// It is ACCEPTED HERE rather than refused at registration because refusing the field
 	// would make the boundary unrecordable — an operator could not describe the intent
 	// ahead of standing the component up — and because the refusal belongs where the
@@ -1137,7 +1156,8 @@ type CreateSubscriber struct {
 	// surrounding whitespace, an over-long value, or a control character — with
 	// GEN_VALIDATION_ERROR, because those are malformed rather than unenforceable.
 	//
-	// Omit it, or send an empty string, to register normally.
+	// Omit it, or send an empty string, to register normally — subject to the two
+	// deployment-model refusals above, which apply at issuance rather than here.
 	PartitionKeyPrefix string `json:"partition_key_prefix,omitempty"`
 
 	// NO webhook_url FIELD, and its absence is the sunset being enforceable.
@@ -1518,10 +1538,13 @@ func validateSubscriberName(name string, required bool) error {
 //     somebody else's data on a broker Blnk may share.
 //   - A DEAD-LETTER topic. Every DLT carries other subscribers' failed events
 //     together with Blnk's own failure metadata, so it has no subscriber
-//     audience. This is the ONLY owned-name class that is refused: all four
-//     category topics — including blnk.system — are grantable, because
-//     model.SubscriberGrantableTopics composes only "<prefix>.<category>" names
-//     and a ".dlt" name can therefore never be a member.
+//     audience. The exclusion is structural: model.SubscriberGrantableTopics
+//     composes only "<prefix>.<category>" names, so a ".dlt" name can never be a
+//     member.
+//   - THE INTERNAL CATEGORY TOPIC, "<prefix>.system". It carries system.error's
+//     frozen verbatim-error body and is the catalogue's catch-all, so it is an
+//     operator surface: the grantable set is the three TENANT category topics.
+//     model.SubscriberGrantableEventCategories owns that decision.
 //
 // An EMPTY list is accepted, because a subscriber authorised for nothing is the
 // fail-closed default of a fresh registration. An empty or whitespace-only ENTRY
@@ -2056,6 +2079,16 @@ type SubscriberEnforcedAccess struct {
 	// and the requirement all described one that was kept, and the gap was a real exposure
 	// rather than a documentation defect. With no prefix recorded there is nothing to narrow,
 	// the topic grant is the whole boundary, and this is false.
+	//
+	// A TRUE HERE IS NOW BACKED BY AN ATTESTATION rather than by configuration (SEC-01). It was
+	// derived from two configuration values — a mode and a distinct bootstrap list — and those
+	// are assertions a deployment makes about itself: any address satisfied them, so a true here
+	// could describe a component that did not exist. It is now only ever true on a credential
+	// whose binding the declared component CONFIRMED, over an authenticated control channel,
+	// naming this principal and this prefix byte-for-byte, before the secret was generated. A
+	// component that could not be reached or disagreed produces no credential at all —
+	// SUBSCRIBER_KEY_SCOPE_UNATTESTED — rather than a response reporting an enforcement nobody
+	// was asked about.
 	PartitionKeyPrefixEnforced bool `json:"partition_key_prefix_enforced"`
 
 	// PartitionKeyPrefix echoes the routing hint recorded on the subscriber, or is empty when

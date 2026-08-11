@@ -155,6 +155,33 @@ services:
       # place of KAFKA_SUBSCRIBER_BROKERS so the credential names the endpoint that
       # enforces its scope. Ignored unless the mode above is broker_gateway.
       KAFKA_KEY_SCOPE_GATEWAY_BROKERS: ${KAFKA_KEY_SCOPE_GATEWAY_BROKERS:-}
+      # THE CONTROL ENDPOINT OF THAT COMPONENT, and the part of the declaration Blnk can
+      # actually VERIFY. The mode and the addresses above are assertions this deployment
+      # makes about itself, and any address satisfies them — so without this endpoint the
+      # declaration is treated as NO declaration and a key-scoped subscriber is refused
+      # rather than issued a credential whose boundary nothing was asked to keep.
+      #
+      # Issuance POSTs the exact recorded prefix here, authenticated with the token below,
+      # and requires the component to attest that exact binding back before any secret
+      # exists. Deregistration DELETEs it. Plain http is accepted only for a loopback
+      # host; anything else must be https, because the token registers key-scope bindings
+      # and therefore decides which records a subscriber sees.
+      KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL: ${KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL:-}
+      # The bearer credential presented on that call. A SECRET, on the same footing as the
+      # SASL credentials below.
+      KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN: ${KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN:-}
+      # How long that component has to answer, in milliseconds. Bounded to 5000 by the
+      # application, because credential issuance itself is answered inside five seconds.
+      KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS: ${KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS:-2000}
+      # THE OTHER DECLARATION A DEPLOYMENT CAN MAKE, and in secure mode it must make one
+      # of the two. "true" acknowledges that subscriber credentials read EVERY record on
+      # each topic they are granted — every ledger's and every other subscriber's —
+      # because Kafka authorizes topics and groups and has no message-key dimension. That
+      # is the correct model for a single-tenant ledger or a trusted internal consumer;
+      # what it must not be is the model a deployment arrives at by configuring nothing.
+      # With BLNK_SERVER_SECURE=true and neither this nor the key-scoped model declared,
+      # issuance refuses with 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED.
+      KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: ${KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS:-false}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
       # The namespaces this deployment USED TO own, so a KAFKA_TOPIC_PREFIX rename does
       # not strand the events captured before it. Empty in every stack that has never
@@ -334,6 +361,10 @@ services:
       BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES:
       BLNK_KAFKA_KEY_SCOPE_ENFORCEMENT:
       BLNK_KAFKA_KEY_SCOPE_GATEWAY_BROKERS:
+      BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL:
+      BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN:
+      BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS:
+      BLNK_KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS:
       BLNK_KAFKA_SASL_USER:
       BLNK_KAFKA_SASL_SECRET:
       BLNK_KAFKA_SASL_ADMIN_USER:
@@ -930,20 +961,19 @@ services:
   # to be published. Both go to blnk.system, which also catches an event type no
   # mapping recognises, keeping it durable and replayable.
   #
-  # blnk.system is GRANTABLE, like the other three — and it is NOT in the sample
-  # principal's default grant. Those are two different lists in
-  # scripts/kafka-provision.sh and the distinction is the point:
-  # SUBSCRIBER_GRANTABLE_CATEGORIES is all four, the allowlist any explicit
-  # KAFKA_SAMPLE_SUBSCRIBER_TOPICS is checked against, while
-  # SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES is the three the sample actually receives when no
-  # list is supplied. The provisioning summary reports blnk.system as "grantable,
-  # withheld" for exactly that reason.
+  # blnk.system is NOT GRANTABLE to any subscriber, and it is created all the same. Those
+  # are two different questions and scripts/kafka-provision.sh keeps two lists for them:
+  # EVENT_CATEGORIES is all four, because the relay publishes to all four, while
+  # SUBSCRIBER_GRANTABLE_CATEGORIES is the three tenant categories any explicit
+  # KAFKA_SAMPLE_SUBSCRIBER_TOPICS is checked against. The provisioning summary reports
+  # blnk.system as "created, never granted" for exactly that reason.
   #
-  # Granting it is therefore a deliberate per-subscriber decision, because it also carries
-  # system.error's verbatim internal error text; withholding the category outright was
-  # tried and was worse, since it made ledger.created unreachable to everyone. Name it in
-  # KAFKA_SAMPLE_SUBSCRIBER_TOPICS to include it. See docs/event-streaming.md for what the
-  # grant discloses.
+  # It is withheld because it carries system.error's verbatim internal error text under a
+  # payload requirement R-8 freezes, and because it is the catch-all, so a grant of it would
+  # also stand over every event type nobody has catalogued yet. Making it grantable "but
+  # deliberately" was the previous contract and one grant is all it took to undo. The cost is
+  # that ledger.created, which shares the topic, has no subscriber Kafka route — it stays
+  # published, observable and replayable for an operator. See docs/event-streaming.md.
   kafka-init:
     # The SAME profile as the kafka service above, and it has to be the same one: provisioning
     # a broker that is not running cannot succeed, and a broker with no topics is one the relay
@@ -1074,8 +1104,9 @@ services:
       # script against it, so the empty default is asserted rather than merely intended.
       KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-}
       # Narrows the sample grant to a subset of the grantable topics. It CANNOT widen it:
-      # every entry is checked against the same allowlist, so a dead-letter topic or a name
-      # outside the four-category catalogue cannot be granted through it.
+      # every entry is checked against the same allowlist, so a dead-letter topic, the
+      # internal blnk.system topic, or a name outside the four-category catalogue cannot be
+      # granted through it.
       KAFKA_SAMPLE_SUBSCRIBER_TOPICS: ${KAFKA_SAMPLE_SUBSCRIBER_TOPICS:-}
 
       # ---------------------------------------------------------------------------------

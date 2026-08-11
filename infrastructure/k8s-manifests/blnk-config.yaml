@@ -102,11 +102,12 @@ data:
   # the documented exception, and the BLNK_-prefixed alias of each name below
   # resolves as well, winning when both forms are set.
   #
-  # NEITHER SASL SECRET IS HERE, AND NEITHER MAY EVER BE ADDED.
-  # KAFKA_SASL_SECRET and KAFKA_SASL_ADMIN_SECRET are the two event-streaming
+  # NO CREDENTIAL IS HERE, AND NONE MAY EVER BE ADDED.
+  # KAFKA_SASL_SECRET, KAFKA_SASL_ADMIN_SECRET and
+  # KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN are the three event-streaming
   # variables that are credentials, and a ConfigMap is readable by anything
-  # holding get on this namespace, so both reach the pods as env entries with a
-  # valueFrom.secretKeyRef against a Secret the operator provisions out of band.
+  # holding get on this namespace, so all three reach the pods as env entries with
+  # a valueFrom.secretKeyRef against a Secret the operator provisions out of band.
   # No Secret manifest is committed to this folder.
 
   # Empty is a supported steady state: initializeEventPublisher returns the no-op
@@ -212,13 +213,69 @@ data:
   # Empty ships here, because the mode above ships as "none".
   KAFKA_KEY_SCOPE_GATEWAY_BROKERS: ""
 
+  # The CONTROL ENDPOINT of that component, and the only part of the declaration
+  # above Blnk can VERIFY rather than take on trust. Without it the declaration is
+  # read as no declaration, and a key-scoped subscriber is refused rather than
+  # issued a credential whose announced boundary nothing was asked to keep.
+  #
+  # Issuance POSTs {"principal","subscriber_id","partition_key_prefix",
+  # "authorized_topics","consumer_group_prefix"} here and requires 200 with the
+  # same principal and the same prefix echoed back, before any secret exists and
+  # before the broker is touched. Deregistration DELETEs ?principal=<p>; a failure
+  # there is logged, never fatal. A GET is probed once at start-up.
+  #
+  # https unless the host is loopback, and redirects are refused rather than
+  # followed, because following one forwards the bearer token below.
+  #
+  # THE WORKER DOES NOT RECEIVE THIS KEY, nor the two beneath it: they serve
+  # credential issuance and deregistration, which are API-server operations.
+  KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL: ""
+
+  # KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN IS DELIBERATELY ABSENT FROM THIS
+  # ConfigMap AND MUST STAY ABSENT. It is the bearer credential for the calls
+  # above, so whatever holds it can register key-scope bindings — which is to say
+  # it can decide which records a subscriber sees. Project it into
+  # server-deployment.yaml from a Secret, in the same change that fills in the URL
+  # above:
+  #
+  #   - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: kafka-key-scope-gateway
+  #         key: attestation-token
+  #
+  # A declared URL with no token is an incomplete declaration, and Blnk reads it
+  # as none — so key-scoped issuance refuses until both are present.
+
+  # How long that component has to answer, in milliseconds. The application clamps
+  # anything above 5000 to 5000, because credential issuance itself answers inside
+  # five seconds; a larger budget could only convert a refusal into a timeout.
+  KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS: "2000"
+
+  # THE OTHER DECLARATION, and with BLNK_SERVER_SECURE=true a deployment must make
+  # one of the two. "true" acknowledges that a subscriber credential reads EVERY
+  # record on each topic it is granted — every ledger's and every other
+  # subscriber's — because Kafka authorizes topics and consumer groups and has no
+  # message-key dimension.
+  #
+  # That is the mandated access model and it is right for a single-tenant ledger or
+  # a trusted internal consumer. What it must not be is the model a cluster reaches
+  # by configuring nothing: in secure mode with neither declaration, issuance
+  # refuses with 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED.
+  #
+  # "false" ships, so a cluster that turns on BLNK_SERVER_SECURE has to choose.
+  KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: "false"
+
   # The prefix every topic name derives from: the category topics
   # blnk.transactions, blnk.balances, blnk.identities and blnk.system, and their
-  # blnk.<category>.dlt dead-letter siblings — eight owned topics. All four
-  # category topics are grantable to a subscriber, per subscriber. Grant
-  # blnk.system deliberately: it carries ledger.created alongside system.error,
-  # whose frozen payload includes verbatim internal error text. No dead-letter
-  # topic is ever grantable.
+  # blnk.<category>.dlt dead-letter siblings — eight owned topics. THREE of those
+  # category topics are grantable to a subscriber, per subscriber: transactions,
+  # balances and identities. blnk.system is NOT grantable — it carries
+  # system.error's verbatim internal error text and is the catch-all for any
+  # uncatalogued event type, so it is an operator topic. No dead-letter topic is
+  # ever grantable either. ledger.created shares blnk.system and therefore has no
+  # subscriber Kafka route; it stays published, observable and replayable for an
+  # operator. See docs/event-streaming.md.
   KAFKA_TOPIC_PREFIX: "blnk"
 
   # The topic namespaces this deployment USED TO own and must still be able to publish
@@ -691,6 +748,19 @@ data:
   #      through — it must overwrite, not append.
   #   3. Nothing can reach the pod's port bypassing that proxy. A NetworkPolicy
   #      admitting only the ingress namespace is how this is normally enforced.
+  #
+  # AND BLNK_SERVER_TRUSTED_PROXIES MUST NAME THAT PROXY. It is the half of this
+  # declaration the process can check: the header is believed only on a request
+  # whose SOCKET PEER falls inside one of those ranges, so a caller that reaches
+  # the pod directly — a pod IP, a `kubectl port-forward`, a second Service — is
+  # refused whatever header it sets. That turns condition 3 above from an
+  # operational promise into an enforced one; keep the NetworkPolicy as well,
+  # because this check governs one endpoint and the policy governs the port.
+  #
+  # WITH SECURE MODE ON, "true" HERE AND AN EMPTY OR UNIVERSAL PROXY LIST IS FATAL
+  # at configuration load. That is deliberate: a per-request refusal alone would
+  # leave the cluster running with a flag that reads as effective in this ConfigMap
+  # and a 403 as the only symptom, on somebody's credential request, later.
   #
   # Nothing else in Blnk's behaviour depends on it.
   BLNK_SERVER_TRUST_FORWARDED_PROTO: "false"

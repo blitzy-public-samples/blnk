@@ -36,7 +36,6 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -3143,19 +3142,31 @@ func IsCanonicalUUID(s string) bool {
 // subscriber wanting universal coverage to hold an extra grant it was never told
 // about. And the catalogue is frozen at four in the agreed plan, so widening it is a
 // contract change that belongs to a deliberate revision of that plan rather than to
-// this implementation. Making `ledger.created` consumable is therefore an
-// ACCESS-MODEL question, and it is answered by granting the system category to the
-// subscriber that needs ledger events rather than by minting a topic the plan does not
-// name.
+// this implementation.
 //
-// `system` IS grantable, and granting it is a deliberate per-subscriber decision
-// rather than a category-wide one. That matters most for `system.error`, whose payload
-// is the frozen legacy body and therefore still carries the error text as it renders:
-// narrowing it would break the payload-preservation guarantee, so the disclosure is
-// contained by AUDIENCE — by which subscribers are granted the topic — instead of by
-// redaction. See EventCategorySystem, which states what such a grant discloses. Coverage and reachability are different questions, and only the
-// first is absolute — every event, `ledger.created` included, is durably captured,
-// published, observable and replayable.
+// `system` IS NOT GRANTABLE, and that is an authorization decision rather than an
+// omission. The category carries `system.error`, whose payload is the frozen legacy
+// body and therefore renders the error text verbatim — a PostgreSQL error names
+// schema, table, column and routine; a broker error names internal addresses — and
+// R-8 forbids narrowing that body, so the disclosure cannot be contained by
+// redaction. It is also the catalogue's CATCH-ALL, so an event type nobody has
+// catalogued yet would reach a subscriber audience without any authorization review
+// having happened. Containing the disclosure by AUDIENCE was tried in the form
+// "grantable, but grant it deliberately", and a rule an operator can violate in one
+// PUT is not a boundary: one mis-grant hands a subscriber Blnk's own error text for
+// the whole deployment. So the name is withheld at the allowlist, which is the same
+// class of decision as withholding every `<topic>.dlt`, and for the same reason —
+// these are OPERATOR surfaces, read under the master key.
+//
+// THE COST IS STATED RATHER THAN HIDDEN: `ledger.created` has no subscriber Kafka
+// route. Coverage and reachability are different questions and only the first is
+// absolute — every event, `ledger.created` included, is durably captured, published,
+// observable and replayable, and an operator reads this topic directly or through the
+// master-key-gated event API. A subscriber that consumed `ledger.created` over the
+// legacy webhook transport keeps receiving it there for the remainder of the
+// dual-delivery window and has no Kafka equivalent afterwards; that is recorded in
+// docs/event-streaming.md and docs/webhook-to-kafka-migration.md so it is planned for
+// rather than discovered.
 //
 // # Where an event type this table does not recognise goes
 //
@@ -3163,7 +3174,8 @@ func IsCanonicalUUID(s string) bool {
 // system.error and ledger.created. An uncatalogued event is therefore published —
 // the coverage guarantee is absolute and the row is already committed by the time
 // routing happens, so it can be neither dropped nor refused — and it is published to
-// the one topic whose audience is already the narrowest an operator grants.
+// a topic NO subscriber can be granted, so a routing omission cannot become a
+// disclosure to an audience that never asked for it.
 //
 // Anything arriving there under an unrecognised name is a defect to fix by
 // extending EventCategory, not a state to design around, which is why the publisher
@@ -3195,21 +3207,6 @@ const (
 	// universal coverage to hold an additional grant, and widening a frozen contract
 	// is a revision of the plan rather than an implementation detail.
 	//
-	// The ACCESS-MODEL question that follows — does the system category become
-	// grantable? — is answered below, and the answer is yes: it is grantable, and
-	// granting it is a deliberate per-subscriber decision. `ledger.created` is therefore
-	// reachable, and what a grant of it also discloses is stated in full further down and
-	// in docs/event-streaming.md, where a subscriber reads it.
-	//
-	// They share ONE category rather than getting one each. A separate `ledgers` category
-	// was tried and removed: it added a fifth category and two more topics to a public
-	// contract the provisioning script, the Kubernetes configuration, the local stack and
-	// the subscriber documentation all enumerate. The reachability argument that motivated
-	// it is answered by making this category grantable instead, which costs the catalogue
-	// nothing.
-	//
-	// # `ledger.created` lives here, and that is the frozen contract
-	//
 	// Its payload is a *model.Ledger — a name, an id, a creation instant and the
 	// caller's own metadata — and on its own merits it is ordinary ledger data. It
 	// shares this category with `system.error` because the agreed catalogue is four
@@ -3218,47 +3215,49 @@ const (
 	// script, both compose stacks, the Kubernetes configuration and the operator
 	// documentation all enumerate.
 	//
-	// The consequence is stated plainly rather than left to be discovered: a subscriber
-	// that needs `ledger.created` is granted this category, and the same grant hands it
-	// the verbatim internal error text `system.error` carries, which cannot be narrowed
-	// without breaking the payload-preservation guarantee. That trade is why the grant is
-	// a per-subscriber decision rather than a default, and why what it discloses is
-	// enumerated below rather than left to be inferred.
+	// # THIS CATEGORY IS NOT SUBSCRIBER-GRANTABLE. It is an OPERATOR topic
 	//
-	// # It is GRANTABLE, and granting it is a DELIBERATE operator decision
+	// SubscriberGrantableEventCategories excludes it, so no subscriber can hold an ACL
+	// binding over `<prefix>.system` — the same treatment every `<topic>.dlt` gets, and
+	// for the same reason: what is on it is Blnk's own operational detail rather than a
+	// tenant's data.
 	//
-	// This category is not withheld at the allowlist, because withholding it would
-	// withhold `ledger.created` — an event the legacy webhook transport delivers
-	// today — from every subscriber, and the four-category layout is what put that
-	// event here. A migration whose stated promise is that no event is lost cannot
-	// make one of them unreachable as a side effect of a topic assignment. See
-	// SubscriberGrantableEventCategories.
-	//
-	// What a grant of this category discloses is stated here so the decision is made
-	// with the facts:
+	// Two properties of the topic force that, and neither can be fixed on the topic:
 	//
 	//   - system.error's payload is the FROZEN LEGACY BODY, {"error": <text>,
 	//     "time": <now>}, and the <text> is the error as it renders. A PostgreSQL
 	//     error names schema, table, column and routine; a broker error names
-	//     internal addresses. That body cannot be narrowed without breaking the
-	//     payload-preservation guarantee the whole migration rests on. So a
-	//     subscriber granted this topic reads Blnk's own error text.
-	//   - It is also the catalogue's CATCH-ALL. An uncatalogued event type is routed
-	//     here, so a routing omission places a payload of unknown provenance on this
-	//     topic. The publisher logs at warning level when it does, which is what
-	//     makes the omission visible rather than silent.
+	//     internal addresses; either can carry a record or tenant identifier. R-8
+	//     freezes that body field-for-field, so the disclosure cannot be narrowed by
+	//     redaction — an earlier revision that classified the text was reverted for
+	//     exactly that reason (see internal/notification.systemErrorPayload).
+	//   - It is the catalogue's CATCH-ALL. An event type nobody has catalogued yet is
+	//     routed here, so a grant of this topic is a standing grant over payloads of
+	//     unknown provenance — access widened by a future routing omission rather than
+	//     by an authorization decision.
 	//
-	// The consequence for an operator is a rule, not a prohibition: grant this
-	// category only to a subscriber that needs `ledger.created`, and treat what else
-	// arrives on it as operator-visible detail. Because authorized_topics is chosen
-	// per subscriber, the narrow default is available to every deployment without the
-	// allowlist having to deny the category outright — and denying it there would take
-	// the choice away from the operator while quietly dropping an event.
+	// CONTAINING IT BY AUDIENCE WAS TRIED, AND AN OPERATOR RULE IS NOT A BOUNDARY. The
+	// previous revision made the category grantable and documented "grant it only to a
+	// subscriber that needs ledger.created". Every word of that was true and it left the
+	// disclosure one PUT away: a single mis-grant, or a retained grant on a subscriber
+	// whose purpose changed, hands one subscriber Blnk's verbatim error text for the
+	// whole deployment, and nothing in the system refuses it. Withholding the name at
+	// the allowlist is what makes the exposure unreachable rather than discouraged.
 	//
-	// Coverage and reachability are both absolute here: every event, including this
-	// one, is durably captured, published, observable and replayable, and every
-	// category can be granted. docs/event-streaming.md states what this topic carries
-	// so a subscriber planning its migration reads it rather than discovers it.
+	// # The cost, stated rather than hidden: `ledger.created` has no subscriber route
+	//
+	// Withholding the category withholds the one ordinary event on it. That cost is real
+	// and it is the smaller one: coverage is absolute and unaffected — the event is
+	// durably captured, published to `<prefix>.system`, observable, replayable and
+	// readable by an operator directly or through the master-key-gated event API — while
+	// reachability by a subscriber credential is not something the frozen four-category
+	// contract can offer without also offering `system.error`. A subscriber that consumes
+	// `ledger.created` over webhooks today keeps receiving it there for the remainder of
+	// the dual-delivery window; docs/event-streaming.md and
+	// docs/webhook-to-kafka-migration.md say so plainly so it is planned for rather than
+	// discovered. Making it consumable is a deliberate revision of the topic catalogue —
+	// a fifth grantable category, or a versioned subscriber-safe event — and belongs to a
+	// plan revision, not to this implementation.
 	//
 	EventCategorySystem = "system"
 )
@@ -3270,24 +3269,37 @@ const (
 // both check against, so that "which topics may a subscriber be granted?" has one
 // answer rather than one per caller.
 //
-// EVERY CATEGORY IS GRANTABLE. There is no internal category and no category-level
-// exclusion: each of the four carries event types the legacy webhook transport
-// already delivered, so withholding one would lose a migrating subscriber an event
-// it receives today. What a grant of the system category discloses, and why the
-// choice belongs to the operator rather than to this list, is documented on
-// EventCategorySystem.
+// THE THREE TENANT CATEGORIES ARE GRANTABLE. EventCategorySystem IS NOT, and that
+// exclusion is the point of this function existing at all: `<prefix>.system` carries
+// system.error's frozen verbatim-error body and is the catalogue's catch-all, so it is
+// an OPERATOR topic in the same class as every `<topic>.dlt` — read under the master
+// key, never handed to a subscriber principal. The full reasoning, and the cost
+// (`ledger.created` has no subscriber Kafka route), is on EventCategorySystem.
 //
-// The function remains distinct from AllEventCategories rather than being replaced by
-// it, because the two answer different questions — "what categories exist" and "what
-// may be granted" — and only one of them may ever narrow. A caller that means the
-// second and asks the first would keep working today and silently over-grant the day
-// an internal category is introduced.
+// The function is deliberately NOT AllEventCategories, because the two answer
+// different questions — "what categories exist" and "what may be granted" — and only
+// the second may narrow. A caller that means the second and asks the first
+// over-grants: that is exactly how the system category became grantable once, and the
+// resulting one-PUT-away disclosure of Blnk's internal error text is why both a
+// separate function and this comment exist. Do not re-derive this list from the
+// catalogue.
 //
 // Returns:
 //   - []string: a fresh slice of bare category tokens, in canonical order.
 func SubscriberGrantableEventCategories() []string {
 	grantable := make([]string, 0, len(eventCategoryOrder))
-	grantable = append(grantable, eventCategoryOrder[:]...)
+	for _, category := range eventCategoryOrder {
+		// The ONE exclusion, expressed as a filter over the canonical order rather than
+		// as a second hand-written list. A second list would drift the day a category is
+		// added: the addition would appear in the catalogue and silently not here, or
+		// here and not in the catalogue. Filtering keeps the order and the membership
+		// single-sourced and makes the exclusion the only local decision.
+		if category == EventCategorySystem {
+			continue
+		}
+
+		grantable = append(grantable, category)
+	}
 
 	return grantable
 }
@@ -3304,26 +3316,25 @@ func SubscriberGrantableEventCategories() []string {
 // list is therefore composed HERE, once, and the answer is identical everywhere by
 // construction rather than by review.
 //
-// What the list EXCLUDES is the security-relevant part: DEAD-LETTER topics. A
-// `<topic>.dlt` holds events that already failed, together with failure metadata naming
-// broker addresses and internal error reasons. It is Blnk's operational surface, read under
-// the master key through GET /events/dead-letter, and granting one to a subscriber would
-// hand it every other subscriber's failed events. The list composes main topics only, so no
-// `.dlt` name can appear on it.
+// What the list EXCLUDES is the security-relevant part, and there are TWO exclusions.
 //
-// So the list is exactly the FOUR category topics of the closed catalogue:
-// `<prefix>.transactions`, `<prefix>.balances`, `<prefix>.identities` and
-// `<prefix>.system`. Every category is grantable, and `<prefix>.system` is included
-// deliberately rather than by omission: under the frozen four-category contract it carries
-// `ledger.created` as well as `system.error`, so withholding the name would make ordinary
-// ledger data unreachable to every subscriber. All thirteen migrated event types therefore
-// have an authorized subscriber path.
+// DEAD-LETTER topics. A `<topic>.dlt` holds events that already failed, together with
+// failure metadata naming broker addresses and internal error reasons. It is Blnk's
+// operational surface, read under the master key through GET /events/dead-letter, and
+// granting one to a subscriber would hand it every other subscriber's failed events. The
+// list composes main topics only, so no `.dlt` name can appear on it.
 //
-// Granting `<prefix>.system` does disclose more than a tenant category does — `system.error`
-// carries raw error text describing the deployment, and this category is the catalogue's
-// catch-all, so an unmapped event type lands here — which is why what it discloses is
-// documented and the decision stays PER SUBSCRIBER through authorized_topics rather than
-// being made once for everyone here.
+// `<prefix>.system`. It is an OPERATOR topic for the same reason: `system.error`'s payload is
+// frozen by R-8 and renders Blnk's error text verbatim — schema, table, routine, broker
+// address — and the category is the catalogue's catch-all, so a grant would also stand over
+// every event type nobody has catalogued yet. The exclusion comes from
+// SubscriberGrantableEventCategories, which is where the full reasoning lives, including the
+// cost: `ledger.created` shares that topic and therefore has no subscriber Kafka route.
+//
+// So the list is exactly the THREE TENANT category topics: `<prefix>.transactions`,
+// `<prefix>.balances` and `<prefix>.identities` — the three the requirement names. Twelve of
+// the thirteen migrated event types have an authorized subscriber path; the thirteenth,
+// `ledger.created`, is published and replayable but reachable only by an operator.
 //
 // Parameters:
 //   - prefix string: the namespace this deployment owns. Trimmed; a blank prefix falls back
@@ -3442,12 +3453,12 @@ var eventTypeCategories = map[string]string{
 	"balance.monitor":       EventCategoryBalances,
 	"identity.created":      EventCategoryIdentities,
 	// ledger.created routes to the SYSTEM category, which is where the agreed plan's
-	// topic table places it. That category IS grantable — see
-	// SubscriberGrantableEventCategories, which returns all four — and ledger.created is
-	// the reason it has to be: withholding the category would make a currently-delivered
-	// event unreachable to every subscriber, turning a disclosure question into a lost
-	// event. EventCategorySystem states what the grant discloses, and why the fifth
-	// `ledgers` category that used to appear here was removed instead.
+	// topic table places it. That category is NOT subscriber-grantable — see
+	// SubscriberGrantableEventCategories — because it also carries system.error's frozen
+	// verbatim-error body and is the catalogue's catch-all. The consequence for this row
+	// is that ledger.created is published, replayable and readable by an OPERATOR and has
+	// no subscriber Kafka route; EventCategorySystem states why that cost is the smaller
+	// one and why the fifth `ledgers` category that used to appear here was removed.
 	"ledger.created": EventCategorySystem,
 	"system.error":   EventCategorySystem,
 }
@@ -3790,63 +3801,28 @@ func DeriveCredentialReference(principal, secret string) (string, error) {
 		hex.EncodeToString(mac.Sum(nil)), nil
 }
 
-// CredentialReferenceMatches reports whether a PRESENTED secret is the one a stored credential
-// reference was derived from.
+// CredentialReferenceMatches HAS BEEN REMOVED. It verified a PRESENTED subscriber secret against
+// the stored reference in constant time, and nothing in Blnk ever called it.
 //
-// # Why the registry can answer this at all
+// The rationale it carried named credential rotation as its caller: re-issuance, it said, must
+// establish that the row it is about to overwrite is the one whose secret was presented. That is
+// not how re-issuance works here and never was. `POST /subscribers/{id}/kafka-credentials` is
+// authorised by the MASTER KEY and fenced by a provisioning claim plus a conditional write
+// against the previously observed reference; the caller presents no subscriber secret, because an
+// operator rotating a credential is precisely the party that does not have one — the password is
+// returned once and never stored.
 //
-// DeriveCredentialReference is a keyed digest — HMAC-SHA256 over the secret, keyed by the
-// principal — so it is deterministic: the same principal and secret always produce the same
-// reference. That is what lets the reference serve as a verifier as well as a correlation
-// value, and it is why nothing here needs the plaintext. The stored column is not reversible and
-// this function does not try to reverse it; it re-derives and compares.
+// A verifier with no caller is worse than absent: it reads as though the registry authenticates
+// subscribers somewhere, and Blnk serves no subscriber records at all. A key-scoped principal
+// holds no topic Read at the broker, and the component that authorises record keys — declared
+// through KAFKA_KEY_SCOPE_ENFORCEMENT and not shipped by Blnk — authenticates the subscriber on
+// the path its records actually take, with its own credentials.
 //
-// # What it is for
-//
-// It VERIFIES a presented subscriber secret against the reference the registry stored, without
-// the plaintext and without a reversible column. Credential rotation is the caller that needs
-// it: re-issuing for a subscriber must establish that the row it is about to overwrite is the
-// one whose secret was presented, and the reference is the only stored value that can answer.
-//
-// Blnk serves no subscriber records itself, so nothing here authenticates a data-plane read.
-// A key-scoped principal is granted no topic Read at the broker, and the component that
-// authorises record keys — declared by the operator through KAFKA_KEY_SCOPE_ENFORCEMENT, never
-// shipped by Blnk — is what authenticates the subscriber on the path its records take.
-//
-// # Constant time, and why the short-circuits are safe
-//
-// The comparison is subtle.ConstantTimeCompare, so a caller cannot learn the reference by
-// timing repeated attempts. The two early returns leak nothing a caller does not already know:
-// an empty argument is the caller's own omission, and a reference that is not well formed is a
-// property of the stored row rather than of the presented secret. A row holding no reference —
-// a subscriber that has never been issued a credential — is refused here rather than at the
-// call site, so no caller can forget the case.
-//
-// Parameters:
-//   - reference string: the value stored in credential_reference. An empty or malformed value
-//     is refused.
-//   - principal string: the subscriber's Kafka principal, which is the HMAC key.
-//   - secret string: the presented password. Never logged by this function, which does not log.
-//
-// Returns:
-//   - bool: true only when re-deriving the reference from principal and secret reproduces the
-//     stored value exactly.
-func CredentialReferenceMatches(reference, principal, secret string) bool {
-	if reference == "" || principal == "" || secret == "" {
-		return false
-	}
-
-	if err := ValidateCredentialReference(reference); err != nil {
-		return false
-	}
-
-	candidate, err := DeriveCredentialReference(principal, secret)
-	if err != nil {
-		return false
-	}
-
-	return subtle.ConstantTimeCompare([]byte(candidate), []byte(reference)) == 1
-}
+// What remains is what is used: DeriveCredentialReference, which produces the non-reversible
+// value stored in credential_reference, and ValidateCredentialReference below, which refuses
+// anything that is not one. If a future caller genuinely needs to verify a presented secret, the
+// comparison must be constant time — subtle.ConstantTimeCompare over a freshly derived
+// candidate — and it should arrive with that caller rather than ahead of it.
 
 // ValidateCredentialReference reports whether a value has the exact shape
 // DeriveCredentialReference produces.
@@ -6180,17 +6156,17 @@ func (s *EventSubscriber) DeclaresKeyScope() bool {
 }
 
 // There is no internalEventCategories set and no IsInternalEventCategory predicate, and the
-// absence is a decision rather than an omission.
+// absence is deliberate now that the exclusion has ONE holder.
 //
-// A category-level exclusion was introduced to keep system.error away from subscribers, and it
-// would also have withheld `ledger.created`, because the four-category layout puts that event on
-// the same topic. That trades a disclosure for a lost event: `ledger.created` is delivered by the
-// legacy webhook transport today, so a subscriber migrating to Kafka would simply stop receiving
-// it, with an allowlist saying nothing was wrong.
+// EventCategorySystem is the internal category, and SubscriberGrantableEventCategories is the
+// single place that says so — one filter, consulted by the request DTO, the persistence
+// boundary and the ACL provisioner alike. A parallel set plus a predicate would be a second
+// spelling of the same fact, and the failure mode of two spellings is a category that one of
+// them excludes and the other does not: a topic the DTO refuses and the provisioner grants, or
+// the reverse.
 //
-// The concern it was reaching for is real and is answered where the decision belongs — per
-// subscriber, in authorized_topics, with what a grant of the system category discloses documented
-// on EventCategorySystem. Every category is grantable; see SubscriberGrantableEventCategories.
+// Reintroduce a set only if a SECOND internal category ever exists, and then let
+// SubscriberGrantableEventCategories be its only reader.
 
 // KeyScopeEnforcementStatus names WHERE a subscriber's key scope is enforced.
 //

@@ -726,6 +726,7 @@ func startEventRelay(
 
 	stopAssurance := assureEventTopics(ctx, instance, cfg)
 	reportStrandedTopicPrefixes(ctx, instance)
+	probeKeyScopeGateway(ctx, cfg)
 
 	// THE CLAIM GATE. Assurance above is allowed to fail and be stepped past, because the
 	// usual cause is a broker that is not listening yet and refusing to start the relay would
@@ -778,6 +779,69 @@ func startEventRelay(
 // Parameters:
 //   - ctx context.Context: cancels the query.
 //   - instance *blnk.Blnk: the service the audit reads its outbox through.
+//
+// probeKeyScopeGateway reports, at start-up, whether the declared key-scope enforcement
+// component answers and claims to be enforcing (SEC-01).
+//
+// # Why a probe exists at all when issuance already verifies
+//
+// Credential issuance attests every key-scoped binding against this component and refuses when it
+// cannot, so the boundary is safe without this function. What the probe buys is WHEN an operator
+// finds out. Without it, the first evidence that a declared component is unreachable — a
+// certificate expired, a token rotated on one side, a sidecar that did not come up — is a 409 on
+// somebody's credential request, possibly weeks later, and the operator learns it from the
+// subscriber.
+//
+// # It is DELIBERATELY NON-FATAL, and reported at WARNING
+//
+// A failing probe means key-scoped issuance will refuse; it does not mean the ledger, the relay
+// or any publishing path is impaired, and nothing about event delivery depends on this component.
+// Refusing to start the server over it would convert a subscriber-management degradation into a
+// total outage, which is the same trade assureEventTopics already declines for the same reason.
+//
+// Nothing is probed when no component is declared: that is the shipped default and every
+// key-scoped subscriber is refused a credential under it, which config validation has already
+// announced.
+//
+// Parameters:
+//   - ctx context.Context: the server's context. The probe is bounded by the configured
+//     attestation timeout on top of it, so a hanging component cannot delay start-up.
+//   - cfg *config.Configuration: read for the declared endpoint and its credential.
+func probeKeyScopeGateway(ctx context.Context, cfg *config.Configuration) {
+	gateway, err := blnk.NewKeyScopeGatewayClient(cfg)
+	if err != nil {
+		// Nothing declared. Silence here is correct: config validation warns when the mode is
+		// declared without a usable endpoint, and a deployment that declares neither has nothing
+		// to be told.
+		return
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, cfg.Kafka.KeyScopeAttestationTimeout())
+	defer cancel()
+
+	if err := gateway.Health(probeCtx); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"gateway_endpoint": gateway.Endpoint(),
+			"error_class":      blnk.KafkaErrorClass(err),
+		}).Warn(
+			"the declared key-scope enforcement gateway did not pass its start-up health probe, so " +
+				"credential issuance for every subscriber recording a partition_key_prefix will be " +
+				"REFUSED with SUBSCRIBER_KEY_SCOPE_UNATTESTED until it does. Event publishing and the " +
+				"relay are unaffected. Check the component is running, that " +
+				"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL names its control endpoint, and that " +
+				"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN is the credential it expects",
+		)
+
+		return
+	}
+
+	logrus.WithField("gateway_endpoint", gateway.Endpoint()).Info(
+		"the declared key-scope enforcement gateway answered its start-up health probe and reports " +
+			"that it enforces record-key scopes; key-scoped subscriber credentials will be attested " +
+			"against it at issuance",
+	)
+}
+
 func reportStrandedTopicPrefixes(ctx context.Context, instance *blnk.Blnk) {
 	if instance == nil {
 		return

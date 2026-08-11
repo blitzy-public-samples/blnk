@@ -2022,6 +2022,12 @@ type subscribersHarness struct {
 	// The addresses must be DISTINCT from brokers: config.KafkaConfig.KeyScopeGateway reads a
 	// gateway list equal to the broker list as no declaration at all, on the grounds that a
 	// component which IS the brokers cannot be evaluating keys.
+	//
+	// SETTING THIS ALSO STARTS AN ATTESTING STUB and declares its control endpoint, because a
+	// mode and an address are no longer a complete declaration: issuance binds the recorded
+	// prefix at the component and requires it to attest that binding back (SEC-01). A harness
+	// that declared addresses alone would refuse every key-scoped issuance with
+	// SUBSCRIBER_KEY_SCOPE_UNATTESTED — a refusal, just not the one under test.
 	keyScopeGateway []string
 
 	// allowLoopbackIssuance declares the deployment a LOCAL-DEVELOPMENT host, which is the only
@@ -2039,6 +2045,17 @@ type subscribersHarness struct {
 	// the hop to the pod is plaintext, so the process never sees a handshake. Without the
 	// declaration the header is a claim any caller can make and is not believed.
 	trustForwardedProto bool
+
+	// trustedProxies names the peers that declaration applies to
+	// (BLNK_SERVER_TRUSTED_PROXIES), and it is the SECOND HALF of the forwarded-HTTPS channel
+	// rather than a refinement of it (SEC-03).
+	//
+	// The declaration alone is a statement about the intended path, and a request arriving by
+	// any other route — a pod IP, a port-forward, a second Service — is not on it while still
+	// being able to send the same header. So trustForwardedProto with this left empty is a
+	// deployment in which the forwarded channel establishes NOTHING, and that combination is
+	// exercised deliberately below rather than avoided.
+	trustedProxies string
 }
 
 // setupSubscribersRouter builds a router over a mock datasource and returns both.
@@ -2085,6 +2102,7 @@ func setupSubscribersRouter(
 			SecretKey:                       subscribersAPITestMasterKey,
 			AllowLoopbackCredentialIssuance: harness.allowLoopbackIssuance,
 			TrustForwardedProto:             harness.trustForwardedProto,
+			TrustedProxies:                  harness.trustedProxies,
 		},
 	}
 
@@ -2105,6 +2123,12 @@ func setupSubscribersRouter(
 			configuration.Kafka.KeyScopeGatewayBrokers = append(
 				[]string(nil), harness.keyScopeGateway...,
 			)
+
+			// AND THE CONTROL ENDPOINT, without which the declaration is incomplete and every
+			// key-scoped issuance is refused before it reaches the broker.
+			endpoint, token := startKeyScopeGatewayStub(t)
+			configuration.Kafka.KeyScopeGatewayAttestationURL = endpoint
+			configuration.Kafka.KeyScopeGatewayAttestationToken = token
 		}
 
 		configuration.WebhookDeprecationSunsetDate = time.Now().
@@ -3862,10 +3886,31 @@ func TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHos
 // TLS terminates at the ingress and the hop to the pod is plaintext, so the process never sees a
 // handshake. X-Forwarded-Proto is a request header any client can set, so it is believed only
 // where BLNK_SERVER_TRUST_FORWARDED_PROTO declares that a proxy sets it and overwrites what the
-// client sent. Both halves are asserted: the header alone is refused, and the header under the
-// declaration is admitted.
+// client sent — AND only on a request that arrived from a proxy BLNK_SERVER_TRUSTED_PROXIES names.
+//
+// # Why the peer is a condition rather than a refinement (SEC-03)
+//
+// The declaration is a statement about the intended path: "requests reach this process through our
+// ingress, which owns this header". It is true of that path and says nothing about a request that
+// arrived by another one — a pod IP inside the cluster, a `kubectl port-forward`, a second Service,
+// an ingress rule that passes the client's header straight through. Each of those can set
+// `X-Forwarded-Proto: https` itself, and the response to this endpoint is a one-time SASL password,
+// so being believed is the entire exploit. Requiring the socket peer to be a named proxy is what
+// makes the declaration true of the request in hand rather than of the topology diagram.
+//
+// Every combination is exercised below because each one fails differently, and three of them used
+// to be admitted: the header alone, the declaration with no allowlist, the declaration with a
+// universal range, and a peer outside the allowlist.
 func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) {
 	subscriberID := uniqueSubscriberID()
+
+	// The proxy range the declaration applies to, and a peer inside it. Documentation ranges
+	// (RFC 5737) so nothing here could resolve to a real host.
+	const (
+		proxyRange  = "192.0.2.0/24"
+		proxyPeer   = "192.0.2.1:1234"
+		outsidePeer = "198.51.100.7:1234"
+	)
 
 	t.Run("the header alone establishes nothing", func(t *testing.T) {
 		router, datasource := setupSubscribersRouter(t, subscribersHarness{
@@ -3876,7 +3921,7 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 		recorder := subscribersServe(t, router, subscribersCall{
 			method:         http.MethodPost,
 			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
-			peer:           "192.0.2.1:1234",
+			peer:           proxyPeer,
 			plaintext:      true,
 			forwardedProto: "https",
 		})
@@ -3886,11 +3931,88 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 			"a caller must not be able to assert its own confidentiality with a header")
 	})
 
+	t.Run("the declaration with no named proxy establishes nothing either", func(t *testing.T) {
+		// THE SEC-03 CASE. This combination was admitted, and it is the one a deployment reaches
+		// by setting the flag and nothing else — so the refusal has to hold here or the peer
+		// condition is decorative.
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey:           true,
+			brokers:             []string{"127.0.0.1:9092"},
+			trustForwardedProto: true,
+			// trustedProxies deliberately empty.
+		})
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           proxyPeer,
+			plaintext:      true,
+			forwardedProto: "https",
+		})
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+		assert.Empty(t, datasource.Calls,
+			"with no proxy named, the header is believed from every peer — which is the state the "+
+				"declaration was supposed to replace")
+		assert.Contains(t, recorder.Body.String(), "BLNK_SERVER_TRUSTED_PROXIES",
+			"and the refusal must name the missing half, or an operator who set the flag has no "+
+				"way to learn why it did not take effect")
+	})
+
+	t.Run("a universal range is not an allowlist", func(t *testing.T) {
+		// 0.0.0.0/0 matches every peer, so honouring it would restore the forgeable behaviour
+		// while reading as though a decision had been made. In secure mode configuration
+		// validation refuses this outright; here — secure off, as the whole harness runs — the
+		// channel simply establishes nothing.
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey:           true,
+			brokers:             []string{"127.0.0.1:9092"},
+			trustForwardedProto: true,
+			trustedProxies:      "0.0.0.0/0, ::/0",
+		})
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           proxyPeer,
+			plaintext:      true,
+			forwardedProto: "https",
+		})
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+		assert.Empty(t, datasource.Calls)
+	})
+
+	t.Run("a peer outside the named proxies is refused", func(t *testing.T) {
+		// The direct caller: the declaration is complete and correct, and this request simply did
+		// not come through the proxy it describes.
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey:           true,
+			brokers:             []string{"127.0.0.1:9092"},
+			trustForwardedProto: true,
+			trustedProxies:      proxyRange,
+		})
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           outsidePeer,
+			plaintext:      true,
+			forwardedProto: "https",
+		})
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+		assert.Empty(t, datasource.Calls,
+			"a caller that did not arrive through the declared proxy must not be handed the "+
+				"one-time password on the strength of that proxy's declaration")
+	})
+
 	t.Run("the declared proxy is believed", func(t *testing.T) {
 		router, datasource := setupSubscribersRouter(t, subscribersHarness{
 			masterKey:           true,
 			brokers:             []string{"127.0.0.1:9092"},
 			trustForwardedProto: true,
+			trustedProxies:      proxyRange,
 		})
 
 		datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
@@ -3899,13 +4021,42 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 		recorder := subscribersServe(t, router, subscribersCall{
 			method:         http.MethodPost,
 			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
-			peer:           "192.0.2.1:1234",
+			peer:           proxyPeer,
 			plaintext:      true,
 			forwardedProto: "https",
 		})
 
 		assert.NotContains(t, recorder.Body.String(), string(apierror.ErrSubscriberInsecureTransport),
-			"the declared proxy reporting https is a confidential channel")
+			"the declared proxy, reporting https, from a peer inside the declared range IS a "+
+				"confidential channel — the production deployment must keep working")
+		datasource.AssertCalled(t, "ClaimSubscriberForProvisioning",
+			mock.Anything, subscriberID, mock.Anything)
+	})
+
+	t.Run("a bare IP names one proxy", func(t *testing.T) {
+		// The single-instance shape. A bare literal is one of the two forms
+		// BLNK_SERVER_TRUSTED_PROXIES documents, so it must work here without the operator
+		// having to write /32.
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey:           true,
+			brokers:             []string{"127.0.0.1:9092"},
+			trustForwardedProto: true,
+			trustedProxies:      "192.0.2.1",
+		})
+
+		datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
+			Return("", apierror.NewAPIError(apierror.ErrSubscriberNotFound, "no such subscriber", nil))
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           proxyPeer,
+			plaintext:      true,
+			forwardedProto: "https",
+		})
+
+		assert.NotContains(t, recorder.Body.String(), string(apierror.ErrSubscriberInsecureTransport),
+			"a bare IP literal must be honoured as a single-address range: %s", recorder.Body.String())
 		datasource.AssertCalled(t, "ClaimSubscriberForProvisioning",
 			mock.Anything, subscriberID, mock.Anything)
 	})
@@ -3915,12 +4066,13 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 			masterKey:           true,
 			brokers:             []string{"127.0.0.1:9092"},
 			trustForwardedProto: true,
+			trustedProxies:      proxyRange,
 		})
 
 		recorder := subscribersServe(t, router, subscribersCall{
 			method:         http.MethodPost,
 			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
-			peer:           "192.0.2.1:1234",
+			peer:           proxyPeer,
 			plaintext:      true,
 			forwardedProto: "http",
 		})
@@ -4810,4 +4962,71 @@ func TestSubscribersAPI_DoesNotReadASubscriberSecretHeader(t *testing.T) {
 	datasource.AssertNotCalled(t, "GetEventSubscriberByID", mock.Anything, mock.Anything)
 	datasource.AssertNotCalled(t, "ClaimSubscriberForProvisioning",
 		mock.Anything, mock.Anything, mock.Anything)
+}
+
+// startKeyScopeGatewayStub starts a stub for the key-authorising component a deployment declares
+// in front of its brokers, and returns its control endpoint and bearer token.
+//
+// # Why the HTTP layer needs one at all
+//
+// Issuance for a key-scoped subscriber now BINDS the recorded prefix at that component and
+// requires it to attest the binding back before a secret exists (SEC-01). A declaration Blnk
+// cannot verify is treated as no declaration, so without a reachable endpoint every key-scoped
+// request through this router answers SUBSCRIBER_KEY_SCOPE_UNATTESTED — and the tests whose
+// subject is the request contract, the five-second ceiling or the broker step would all be
+// asserting that one refusal instead.
+//
+// It is deliberately MINIMAL. The conformance cases — a component that trims the prefix, answers
+// for the wrong principal, enforces nothing, or rejects Blnk's token — belong to the client and
+// the service, and are covered in the root package's event_keyscope_gateway_test.go against a
+// double that implements the contract in full. What this stub has to be is CORRECT, so that a
+// request under test is not refused by its stand-in.
+//
+// Parameters:
+//   - t *testing.T: for the helper marker and to close the server when the test ends.
+//
+// Returns:
+//   - string: the control endpoint to declare in KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL.
+//   - string: the bearer token to declare alongside it.
+func startKeyScopeGatewayStub(t *testing.T) (endpoint string, token string) {
+	t.Helper()
+
+	const stubToken = "api-harness-gateway-token"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// AUTHENTICATED, like the real contract: a stub that answered unauthenticated requests
+		// would let a build that forgot to present the token pass every test here.
+		if r.Header.Get("Authorization") != "Bearer "+stubToken {
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		answer := map[string]any{"key_scope_enforced": true, "detail": "api harness stub"}
+
+		if r.Method == http.MethodPost {
+			// Answered FROM THE REQUEST, which is the one liberty this stub takes over the root
+			// package's double: it holds no state, so it echoes the binding it was given. That is
+			// enough to attest, and the mismatch cases that require stored state are asserted
+			// where the state is.
+			var binding struct {
+				Principal          string `json:"principal"`
+				PartitionKeyPrefix string `json:"partition_key_prefix"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&binding); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+
+				return
+			}
+
+			answer["principal"] = binding.Principal
+			answer["partition_key_prefix"] = binding.PartitionKeyPrefix
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(answer)
+	}))
+	t.Cleanup(server.Close)
+
+	return server.URL, stubToken
 }

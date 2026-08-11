@@ -251,9 +251,12 @@ const (
 	credentialInsecureTransportMessage = "Kafka credentials are not issued over a transport this " +
 		"deployment has not established as confidential, because the response carries a one-time " +
 		"password. Terminate TLS in Blnk (BLNK_SERVER_SSL), or declare the proxy that terminates it " +
-		"and sets X-Forwarded-Proto (BLNK_SERVER_TRUST_FORWARDED_PROTO). For local development only, " +
-		"a loopback caller can be permitted with BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE, " +
-		"which is unsafe on any host running a reverse proxy"
+		"and sets X-Forwarded-Proto (BLNK_SERVER_TRUST_FORWARDED_PROTO) TOGETHER WITH the proxy " +
+		"addresses that declaration applies to (BLNK_SERVER_TRUSTED_PROXIES) — the header is " +
+		"believed only on a request whose socket peer is one of them, because any other caller can " +
+		"send the same header. For local development only, a loopback caller can be permitted with " +
+		"BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE, which is unsafe on any host running a " +
+		"reverse proxy"
 
 	// credentialIssuanceAbandonedMessage answers a request the handler stopped waiting for
 	// because the wall-clock ceiling elapsed while the service was still working.
@@ -316,13 +319,27 @@ func ensureSubscriberManagementAuthorized(c *gin.Context) bool {
 //
 //  1. TLS IN-PROCESS. c.Request.TLS is non-nil only when this process completed the
 //     handshake. Proven, not asserted.
-//  2. A DECLARED PROXY BOUNDARY. X-Forwarded-Proto is a request header, so any client can
-//     send it and no process can tell a proxy's value from a caller's. It is therefore
-//     believed only when BLNK_SERVER_TRUST_FORWARDED_PROTO declares that a proxy in front
-//     of Blnk sets it and overwrites what the client sent — the operator asserting the
-//     topology once, explicitly, instead of every request asserting it for itself. A
-//     declaration plus a header reading anything other than https is a REFUSAL: the proxy
-//     is reporting a plaintext client hop.
+//
+//  2. A DECLARED PROXY BOUNDARY, FROM A DECLARED PROXY. X-Forwarded-Proto is a request
+//     header, so any client can send it and no process can tell a proxy's value from a
+//     caller's. It is therefore believed only when BLNK_SERVER_TRUST_FORWARDED_PROTO
+//     declares that a proxy in front of Blnk sets it and overwrites what the client sent
+//     AND the request arrived from a socket peer that BLNK_SERVER_TRUSTED_PROXIES names.
+//     A declaration plus a header reading anything other than https is a REFUSAL: the
+//     proxy is reporting a plaintext client hop.
+//
+//     THE PEER IS THE HALF THAT MAKES THE DECLARATION TRUE OF THIS REQUEST (SEC-03). The
+//     declaration is a statement about the intended path, and a request that arrives by
+//     any other route is not on it: a pod IP inside the cluster, a port-forward, a second
+//     Service, an ingress that passes the client's header through. Each of those sends its
+//     own X-Forwarded-Proto, and believing it hands that caller the one-time password.
+//     Requiring the peer costs nothing a real proxy deployment does not already have,
+//     because BLNK_SERVER_TRUSTED_PROXIES is the list that deployment already sets for the
+//     client address to be trustworthy — the same question about the same proxy, so a
+//     second variable would only let the two answers disagree. A universal range
+//     (0.0.0.0/0, ::/0) is not an allowlist and is rejected; config.validateForwardedProtoTrust
+//     refuses that combination outright in secure mode.
+//
 //  3. A DECLARED LOCAL-DEVELOPMENT HOST WITH A LOOPBACK PEER. Bytes to 127.0.0.0/8 or ::1
 //     never reach a network on their LAST hop, which is not the same as never reaching one
 //     at all: a reverse proxy on this host can accept a plaintext request from the
@@ -390,9 +407,15 @@ func (a *Api) credentialTransportConfidential(c *gin.Context) bool {
 		return false
 	}
 
-	// 2. The deployment declared the proxy that terminated TLS, and that proxy says the
-	// client hop was https.
-	if configuration.Server.TrustForwardedProto {
+	// 2. The deployment declared the proxy that terminated TLS, THIS REQUEST CAME FROM ONE OF
+	// THE PROXIES IT NAMED, and that proxy says the client hop was https.
+	//
+	// The peer is read from Request.RemoteAddr inside TrustsForwardedProtoFrom — the socket,
+	// never c.ClientIP(), which honours X-Forwarded-For and would let a caller nominate the
+	// very peer that authorises it. Both conditions are evaluated for every request rather
+	// than resolved once at start-up, because the configuration store is live and the peer is
+	// per-request.
+	if configuration.TrustsForwardedProtoFrom(c.Request.RemoteAddr) {
 		if strings.EqualFold(strings.TrimSpace(c.GetHeader(headerForwardedProto)), forwardedProtoHTTPS) {
 			return true
 		}
@@ -1228,15 +1251,45 @@ func (a *Api) GetSubscriber(c *gin.Context) {
 //	    instruction, so the response was 200 with the row unchanged
 //	403 AUTH_MASTER_KEY_REQUIRED for a non-master caller
 //	404 SUBSCRIBER_NOT_FOUND when no such subscriber exists
-//	409 SUBSCRIBER_ISOLATION_UNENFORCEABLE when the update would record a
-//	    partition-key prefix on a subscriber that already holds a credential. Kafka
-//	    has no message-key dimension, so the live credential reads whole topics and
-//	    the row would describe something narrower — and re-issuance would be refused
-//	    for the same reason, leaving the row unable to rotate its secret. Revoke the
-//	    credential first, or narrow authorized_topics
-//	409 GEN_CONFLICT when a concurrent issuance holds the provisioning fence
+//	409 SUBSCRIBER_KEY_SCOPE_UNENFORCED when the update would record a partition-key
+//	    prefix and this deployment declares no component that authorises record keys.
+//	    Kafka's authorizer has no message-key dimension, so the prefix would describe
+//	    a boundary nothing keeps. Declare the component (KAFKA_KEY_SCOPE_ENFORCEMENT
+//	    with its gateway addresses and attestation endpoint), or narrow
+//	    authorized_topics to what the broker does enforce
+//	409 SUBSCRIBER_KEY_SCOPE_REQUIRED when the update would CLEAR a partition-key
+//	    prefix while this deployment declares the key-scoped model. Clearing is the
+//	    one path that widens a live principal back to whole-topic Read without
+//	    issuance running again, so it is refused for as long as the declaration
+//	    stands: record the prefix this subscriber is entitled to instead, or stop
+//	    declaring the model and acknowledge whole-topic access with
+//	    KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS
+//	409 GEN_CONFLICT when a concurrent issuance holds the provisioning fence, or when
+//	    the row carries a revocation tombstone — complete or reverse its
+//	    deregistration first
 //	503 SUBSCRIBER_PROVISIONING_FAILED when the broker-side reconciliation did not
-//	    complete
+//	    complete. The registry row may already have been written: the row and the
+//	    broker are reconciled in that order, and a failure is reported rather than
+//	    swallowed. Retry the identical request — naming authorized_topics is always
+//	    a re-apply instruction, so a retry repairs a half-applied grant
+//
+// It does NOT answer 410 GEN_GONE. The service refuses to record a legacy webhook_url
+// after the retirement instant, but this route passes none — a body naming webhook_url
+// is a 400 GEN_VALIDATION_ERROR from the strict decoder before the service is reached,
+// and PUT /subscribers/:subscriber_id/webhook-subscription is the write path that owns
+// that refusal.
+//
+// # RECORDING a prefix on a subscriber that holds a credential is ACCEPTED
+//
+// It used to answer 409 SUBSCRIBER_ISOLATION_UNENFORCEABLE, on the reading that a live
+// credential reading whole topics beneath a narrower row was a state to forbid. The
+// diagnosis was right about the grant and wrong about the remedy: refusing left the wide
+// access in place and removed the operator's only way to record that it should go. The
+// update is what NARROWS it — every authorised topic moves from Read+Describe to Describe
+// alone, so the existing credential's next direct fetch is refused by the broker — and a
+// WARNING is logged naming the withdrawal, because the response that credential was
+// delivered with declared direct broker access and cannot be recalled. That code no longer
+// exists.
 func (a *Api) UpdateSubscriber(c *gin.Context) {
 	if !ensureSubscriberManagementAuthorized(c) {
 		return
@@ -1424,6 +1477,21 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 // message-key dimension, so such a subscriber reads every record on a topic it is
 // granted — including records written for other ledgers on that topic.
 //
+// THAT SHAPE NOW REQUIRES A DECLARATION IN PRODUCTION, and it is refused without one
+// (SEC-01). Whole-topic reads are the mandated access model rather than a defect, and
+// they are right for a single-tenant ledger; what was wrong is that they were the
+// DEFAULT, reached by configuring nothing, so the widest credential Blnk can issue was
+// the one a deployment got before anybody had decided. In secure mode this route now
+// answers 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED until the deployment sets
+// KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS=true or declares the key-scoped model instead.
+// Outside secure mode nothing changes, so the local stack and the test suite are
+// unaffected.
+//
+// AND IN A DEPLOYMENT THAT DECLARES THE KEY-SCOPED MODEL, this shape is refused
+// outright with 409 SUBSCRIBER_KEY_SCOPE_REQUIRED: a prefix-less subscriber there is
+// the single principal the declared boundary does not cover, and it would be granted
+// literal topic Read while every other subscriber is confined to its own ledgers.
+//
 // For a subscriber that RECORDS a prefix the credential grants Describe but NOT
 // Read on those topics, so the broker refuses every record fetch it attempts, and
 // the records have to reach it through the key-authorising component the deployment
@@ -1440,6 +1508,17 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 // GET under /subscribers that returns records. The two remedies travel with the
 // refusal — declare a component and its endpoint, or clear the prefix and narrow
 // authorized_topics to what the broker can keep.
+//
+// A DECLARATION IS NOT ENOUGH EITHER, and that is the other half of SEC-01. Before a
+// secret exists and before the broker is touched, Blnk calls the declared component's
+// control endpoint over an authenticated channel and requires it to confirm that it
+// enforces key scopes, for THIS principal, with the recorded prefix byte-for-byte. An
+// unreachable, unauthenticated, refusing or disagreeing component answers 409
+// SUBSCRIBER_KEY_SCOPE_UNATTESTED and no credential is minted. Two configuration
+// values used to be the whole basis for the response's enforced-access declaration;
+// they are assertions a deployment makes about itself, and an authenticated
+// attestation is evidence. Deregistration withdraws the binding at the same endpoint.
+// The wire contract is in docs/kafka-operations.md.
 //
 // The order matters and it is the whole of the correction. Issuing whole-topic Read
 // beside a prefix nothing applies is the exposure that was closed: cooperation is not
@@ -1466,6 +1545,20 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 //	    SUBSCRIBER_KEY_SCOPE_UNENFORCED for a subscriber recording a partition-key
 //	    prefix while no key-authorising component is declared, which Kafka's
 //	    authorizer has no dimension for,
+//	    SUBSCRIBER_KEY_SCOPE_REQUIRED for a subscriber recording NO prefix while the
+//	    deployment DOES declare a key-scoped model — the one credential that would
+//	    escape it, since it would be granted whole-topic Read,
+//	    SUBSCRIBER_KEY_SCOPE_UNATTESTED when the declared enforcement component did
+//	    not confirm this principal's exact recorded prefix over its authenticated
+//	    control endpoint, whether because it was unreachable, refused, or answered
+//	    with a different prefix. The error detail's `retryable` flag distinguishes a
+//	    transport failure from a mismatch,
+//	    SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED in secure mode when the
+//	    deployment has declared neither model and the credential would therefore read
+//	    every record on each granted topic,
+//	    SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION when the broker would grant the
+//	    principal more than the registry records, the credential having been revoked
+//	    again,
 //	    GEN_CONFLICT when a concurrent issuance superseded this one
 //	503 EVENT_KAFKA_UNAVAILABLE when no broker is configured or reachable,
 //	    SUBSCRIBER_BROKERS_NOT_CONFIGURED when no subscriber-facing endpoint is

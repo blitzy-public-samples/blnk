@@ -281,11 +281,12 @@ func EventCategories() []string {
 //     match would accept "blnk.transactions.something-else" and, with a
 //     caller-supplied prefix, very nearly anything.
 //
-// All FOUR category topics are on the list, the system one included: every category
-// carries event types the legacy webhook delivered, so withholding one would cost a
-// migrating subscriber an event it receives today. Which of the four a given subscriber
-// actually holds is the subset recorded on that subscriber, and granting the system
-// topic discloses system.error's verbatim body — see model.EventCategorySystem.
+// The list is the THREE TENANT category topics. `<prefix>.system` is on neither this list
+// nor the catalogue of names any subscriber may hold: it carries system.error's frozen
+// verbatim-error body and is the catalogue's catch-all, which makes it an operator topic
+// in the same class as a `.dlt` — see model.EventCategorySystem and
+// model.SubscriberGrantableEventCategories, which owns that decision. Which of the three
+// a given subscriber actually holds is the subset recorded on that subscriber.
 //
 // Returns:
 //   - []string: a fresh slice of fully-qualified topic names, in canonical category

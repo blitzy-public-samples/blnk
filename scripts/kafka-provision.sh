@@ -69,15 +69,15 @@
 # convention and doubles as the catch-all for an event type the catalogue does not
 # recognise, so no event type is silently dropped.
 #
-# <prefix>.system is GRANTABLE BUT NOT IN THE SAMPLE DEFAULT, and the distinction is the one
-# SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES exists to express. It is on the allowlist —
-# model.SubscriberGrantableEventCategories includes it and KAFKA_SAMPLE_SUBSCRIBER_TOPICS may
-# name it — so ledger.created IS consumable by a subscriber whose grant asks for it. It is
-# withheld from the sample principal by default because the same topic carries system.error,
-# whose payload is an internal error message. This comment previously said the topic was
-# created and never granted, which contradicted both the allowlist below and the Go policy it
-# mirrors. A fifth
-# <prefix>.ledgers topic was implemented to close it and then removed: the catalogue is a
+# <prefix>.system IS CREATED AND IS NEVER GRANTED TO A SUBSCRIBER. It is an operator topic: the
+# events on it reach an operator, not a subscriber principal. It is absent from
+# SUBSCRIBER_GRANTABLE_CATEGORIES below — mirroring model.SubscriberGrantableEventCategories —
+# because system.error's payload is frozen by R-8 and renders Blnk's own error text verbatim,
+# and because the category is the catch-all, so a grant of it would stand over every event type
+# nobody has catalogued yet. The consequence, recorded rather than hidden, is that
+# ledger.created has no subscriber Kafka route: it is still created here, still published, still
+# observable and replayable. A fifth
+# <prefix>.ledgers topic was implemented to close that gap and then removed: the catalogue is a
 # published contract, so an extra topic obliges every subscriber wanting universal coverage
 # to hold a grant it was never told about, and widening a frozen contract belongs to a
 # revision of the agreed plan rather than to this script.
@@ -927,26 +927,29 @@ readonly EVENT_CATEGORIES=(transactions balances identities system)
 #            master key. The dead-letter names are excluded by not being category names at
 #            all, so no entry here can ever produce one.
 #
-# ALL FOUR CATEGORIES ARE GRANTABLE, including 'system', and that is a deliberate decision
-# rather than an oversight. Under the frozen four-category catalogue blnk.system carries
-# ledger.created as well as system.error, so withholding the category would make ledger.created
-# unreachable to every subscriber — a regression against the transport being replaced, which
-# delivered ledger.created and system.error alike to the single configured webhook URL.
+# THE THREE TENANT CATEGORIES ARE GRANTABLE. 'system' IS NOT, and that exclusion is a
+# deliberate authorization decision rather than an oversight.
 #
-# What granting it discloses is documented in docs/event-streaming.md, and the decision stays
-# PER SUBSCRIBER: authorized_topics is an explicit list, so an operator grants the system topic
-# to the subscribers that should have it and not to the others. This list is the set of names
-# that MAY appear there, not a set every subscriber receives. The sample principal below takes
-# the whole list because a local consumer has nobody to be isolated from — a real deployment
-# narrows it.
+# <prefix>.system carries system.error, whose payload is frozen by requirement R-8 and therefore
+# renders Blnk's error text verbatim — a PostgreSQL error names schema, table, column and
+# routine; a broker error names internal addresses — and it is the catalogue's CATCH-ALL, so a
+# grant of it would also stand over every event type nobody has catalogued yet. It is an
+# OPERATOR topic, in the same class as every .dlt sibling, and no subscriber principal is given
+# an ACL over it.
+#
+# The category was grantable-but-deliberate before this, and an operator rule that one grant can
+# violate is not a boundary. The cost is recorded rather than hidden: ledger.created shares that
+# topic, so it has no subscriber Kafka route — it is still created, published, observable and
+# replayable, and an operator reads it. See model.SubscriberGrantableEventCategories and
+# docs/event-streaming.md.
 #
 # Kept as a separate list rather than derived by filtering EVENT_CATEGORIES because the
 # distinction is a POLICY, not a naming rule, and because provisioning every category while
 # granting a subset must remain expressible: conflating the two is how a topic that events are
 # routed to goes uncreated. model.SubscriberGrantableEventCategories states the same policy on
-# the Go side, and TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows asserts the two
+# the Go side, and TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns asserts the two
 # agree name for name and in the same order.
-readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities system)
+readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities)
 
 # What the SAMPLE principal is granted when KAFKA_SAMPLE_SUBSCRIBER_TOPICS is unset.
 #
@@ -957,13 +960,15 @@ readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities syste
 # therefore reported a provisioned sample subscriber that could read nothing, and the first
 # symptom was a demo consumer receiving no records with every ACL apparently in place.
 #
-# IT IS A STRICT SUBSET OF SUBSCRIBER_GRANTABLE_CATEGORIES, and the two are separate for the
-# reason stated above: what a subscriber MAY be granted is a policy, what the sample IS
-# granted is a least-privilege default. `system` is grantable — model.EventCategorySystem is
-# in SubscriberGrantableEventCategories, and an operator may name the system topic through
-# KAFKA_SAMPLE_SUBSCRIBER_TOPICS — but it is deliberately not in the default: it carries
-# system.error, whose payload is an internal error message, and a sample credential handed
-# out for a walkthrough should not read operational failures by default.
+# IT IS A SUBSET OF SUBSCRIBER_GRANTABLE_CATEGORIES, and the two stay separate for the reason
+# stated above: what a subscriber MAY be granted is a policy, what the sample IS granted is a
+# default. It currently equals the allowlist, because every remaining category is tenant data
+# and a local walkthrough consumer has nobody on this stack to be isolated from; the one
+# category that used to make the two differ — `system` — is no longer grantable to any
+# subscriber, so the narrowing that mattered now lives in the allowlist itself.
+#
+# `system` must never appear here. The allowlist check would refuse it anyway, and stating it
+# again costs one assertion and catches the edit that adds it to both lists at once.
 #
 # Ordered as a subset of the allowlist so the two lists read against each other.
 readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=(transactions balances identities)
@@ -1042,10 +1047,14 @@ GENERATED_SECRET_FILES=()
 # credential itself is never printed (Q4-20).
 SUBSCRIBER_SECRET_ARTIFACT=""
 CATEGORY_TOPICS=()
-# The topics a subscriber MAY be granted: every category topic, and never a dead-letter
-# sibling. It is the shell's copy of model.SubscriberGrantableTopics and it is the allowlist
-# any override is checked against.
+# The topics a subscriber MAY be granted: every TENANT category topic, and never the internal
+# system topic or a dead-letter sibling. It is the shell's copy of
+# model.SubscriberGrantableTopics and it is the allowlist any override is checked against.
 GRANTABLE_TOPICS=()
+# The category topics that are created and published to but never granted to a subscriber.
+# DERIVED as CATEGORY_TOPICS minus GRANTABLE_TOPICS, so it cannot disagree with the allowlist,
+# and reported in the summary so "created" and "grantable" are visibly different questions.
+INTERNAL_TOPICS=()
 # What the sample principal is granted when no override is supplied: a least-privilege subset
 # of the allowlist. See SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES.
 SAMPLE_DEFAULT_TOPICS=()
@@ -1732,6 +1741,16 @@ resolve_topics() {
     GRANTABLE_TOPICS=()
     for category in "${SUBSCRIBER_GRANTABLE_CATEGORIES[@]}"; do
         GRANTABLE_TOPICS+=("${prefix}.${category}")
+    done
+
+    # The category topics no subscriber may be granted, derived rather than listed: a category
+    # that is published to and not on the allowlist is internal by definition, so this stays
+    # correct without a second policy list to keep in step.
+    INTERNAL_TOPICS=()
+    for topic in "${CATEGORY_TOPICS[@]}"; do
+        if ! is_grantable_topic "$topic"; then
+            INTERNAL_TOPICS+=("$topic")
+        fi
     done
 
     # What the SAMPLE principal is granted by default: a subset of the allowlist, for the
@@ -5339,15 +5358,21 @@ print_summary() {
             printf '%s\n' "  granted operations   Read, Describe on those topics; Read on that group namespace"
             printf '%s\n' "  NOT granted          Write anywhere, and no .dlt topic - those are Blnk's"
             printf '%s\n' "                       own internals, triaged through the events API"
-            # WITHHELD IS COMPUTED, not written out. The summary used to assert that
-            # <prefix>.system is never granted, which contradicted the allowlist and the Go
-            # policy both. Deriving it from the two arrays means this line describes the grant
-            # that was actually made, and keeps describing it if the default set changes.
+            if ((${#INTERNAL_TOPICS[@]} > 0)); then
+                printf '%s\n' "  created, never       $(join_commas "${INTERNAL_TOPICS[@]}")"
+                printf '%s\n' "  granted              published to, and grantable to nobody: the system topic"
+                printf '%s\n' "                       carries system.error's verbatim error text and every"
+                printf '%s\n' "                       uncatalogued event type. ledger.created shares it and is"
+                printf '%s\n' "                       therefore operator-only over Kafka"
+            fi
+            # WITHHELD IS COMPUTED, not written out, so this line describes the grant that was
+            # actually made and keeps describing it if the default set changes. It reports only
+            # GRANTABLE topics the sample did not receive; the internal topic is reported above,
+            # because it is withheld from every subscriber rather than from this one.
             if ((${#withheld_topics[@]} > 0)); then
                 printf '%s\n' "  grantable, withheld  $(join_commas "${withheld_topics[@]}")"
-                printf '%s\n' "                       on the allowlist but not in the sample default -"
-                printf '%s\n' "                       the system topic carries system.error. Name it in"
-                printf '%s\n' "                       KAFKA_SAMPLE_SUBSCRIBER_TOPICS to include it"
+                printf '%s\n' "                       on the allowlist and not in this run's grant - name"
+                printf '%s\n' "                       it in KAFKA_SAMPLE_SUBSCRIBER_TOPICS to include it"
             fi
             case "$SUBSCRIBER_SECRET_DISPOSITION" in
                 preserved)

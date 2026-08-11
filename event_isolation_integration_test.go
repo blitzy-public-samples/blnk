@@ -142,6 +142,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -467,9 +468,47 @@ var eventIsolationKeyScopeGatewayBrokers = []string{"keyscope-gateway.invalid:90
 func eventIsolationDeclareKeyScopeGateway(t *testing.T, fixture *eventIsolationFixture) []string {
 	t.Helper()
 
+	gateway, _ := eventIsolationDeclareKeyScopeGatewayWithDouble(t, fixture)
+
+	return gateway
+}
+
+// eventIsolationDeclareKeyScopeGatewayWithDouble is the same declaration, returning the CONTROL
+// double as well so a test can assert what Blnk registered at it.
+//
+// # Why the declaration now includes a control endpoint
+//
+// A mode and a distinct bootstrap list are assertions a deployment makes about itself, and any
+// address satisfies them. Issuance therefore BINDS the recorded prefix at the component's control
+// endpoint over an authenticated call and requires it to attest that exact binding before a secret
+// exists; a declaration with no usable endpoint is read as no declaration, and a key-scoped
+// subscriber is refused (SEC-01).
+//
+// So this helper starts the conformance double from event_keyscope_gateway_test.go and declares
+// its endpoint. The double is a CONTROL plane only, which is why the declared BROKER address stays
+// unroutable: no probe in this file dials it, because Blnk ships nothing to run there, and the
+// record-filtering half belongs to whatever a deployment really operates.
+//
+// Parameters:
+//   - t *testing.T: for the helper marker, the double's lifetime and the configuration restore.
+//   - fixture *eventIsolationFixture: supplies the environment's Kafka configuration.
+//
+// Returns:
+//   - []string: the declared gateway bootstrap list.
+//   - *keyScopeGatewayDouble: the control component, for assertions about the binding it holds.
+func eventIsolationDeclareKeyScopeGatewayWithDouble(
+	t *testing.T,
+	fixture *eventIsolationFixture,
+) ([]string, *keyScopeGatewayDouble) {
+	t.Helper()
+
+	double, endpoint := newKeyScopeGatewayDouble(t)
+
 	declared := fixture.env.kafka
 	declared.KeyScopeEnforcement = config.KeyScopeEnforcementBrokerGateway
 	declared.KeyScopeGatewayBrokers = append([]string(nil), eventIsolationKeyScopeGatewayBrokers...)
+	declared.KeyScopeGatewayAttestationURL = endpoint
+	declared.KeyScopeGatewayAttestationToken = double.token
 
 	require.NotEqual(t, declared.Brokers, declared.KeyScopeGatewayBrokers,
 		"the declared gateway must be DISTINCT from the broker list, or KeyScopeGateway reads it as "+
@@ -482,7 +521,7 @@ func eventIsolationDeclareKeyScopeGateway(t *testing.T, fixture *eventIsolationF
 		"the republished configuration must report an ACTIVE enforcement point, or every key-scoped "+
 			"issuance below refuses and the tests assert the wrong thing")
 
-	return gateway
+	return gateway, double
 }
 
 // eventIsolationRequireBroker skips the test when no broker answers a TCP dial.
@@ -3948,13 +3987,46 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 		// same claim as point 3 read backwards. If clearing did NOT restore the fetch, the
 		// narrowing would be indistinguishable from a broken grant — a subscriber that could
 		// never read anything would satisfy every refusal above while proving nothing.
+		//
+		// WHILE THE KEY-SCOPED MODEL IS DECLARED, CLEARING IS REFUSED (SEC-01). It is the one path
+		// that turns a live key-scoped principal into a whole-topic reader with issuance never
+		// running again, so the deployment's own declaration is what stands in the way — and the
+		// refusal is asserted here rather than assumed, because the widening below would otherwise
+		// look like proof that clearing is always available.
 		cleared := ""
+		refusedUpdate, refusedErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
+			PartitionKeyPrefix: &cleared,
+		})
+		require.Error(t, refusedErr,
+			"a deployment declaring key-scoped subscriber access must not let a subscriber be "+
+				"widened out of that model by an ordinary update")
+		assert.Nil(t, refusedUpdate)
+
+		var refusal apierror.APIError
+		require.ErrorAs(t, refusedErr, &refusal)
+		assert.Equal(t, apierror.ErrSubscriberKeyScopeRequired, refusal.Code)
+
+		stillScoped, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
+		require.NoError(t, readErr)
+		require.NotNil(t, stillScoped.PartitionKeyPrefix,
+			"and the refusal applied nothing: a half-applied clearing would leave the registry "+
+				"describing whole-topic access it had just declined to grant")
+
+		// THE REMEDY THE REFUSAL NAMES, exercised: the deployment stops declaring the key-scoped
+		// model. That is a deployment-level decision rather than a per-subscriber opt-out, which
+		// is the whole point — the model holds for every subscriber or for none.
+		eventIsolationPublishConfiguration(t, &config.Configuration{Kafka: fixture.env.kafka})
+		_, stillDeclared := fixture.env.kafka.KeyScopeGateway()
+		require.False(t, stillDeclared,
+			"the republished configuration must declare nothing, or the clearing below is refused "+
+				"again and this subtest proves neither half")
+
 		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
 			PartitionKeyPrefix: &cleared,
 		})
 		require.NoError(t, updateErr,
-			"clearing the prefix must never be refused; it is the documented way to return a "+
-				"subscriber to direct consumption")
+			"and with the model no longer declared, clearing is an ordinary authorization update: "+
+				"it is how a subscriber returns to direct consumption")
 		require.Nil(t, updated.PartitionKeyPrefix,
 			"a present empty string CLEARS the column rather than storing an empty prefix")
 		assert.False(t, updated.RequiresGatewayDelivery())
@@ -4084,6 +4156,135 @@ func TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared(t 
 	assert.Equal(t, fixture.env.kafka.SubscriberBrokers, issued.Brokers,
 		"and a prefix-less subscriber gets the subscriber-facing broker list, never a gateway "+
 			"this deployment never declared")
+}
+
+// TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists is SEC-01's
+// end-to-end half, against a REAL broker and a REAL control endpoint.
+//
+// # What only this combination can prove
+//
+// event_keyscope_gateway_test.go proves the client speaks the contract. event_subscriber_test.go
+// proves the service refuses when the contract is not satisfied. Neither can answer the question
+// an operator actually has: when Blnk declares a subscriber key-scoped, IS THERE A COMPONENT
+// HOLDING THAT BINDING, and is the broker-side state consistent with it? That needs a live
+// authorizer on one side and a live control endpoint on the other, which is this fixture plus the
+// conformance double.
+//
+// # The two directions, and why both are here
+//
+//  1. ATTESTED. The binding the component holds is the principal and the exact stored prefix, it
+//     was registered before any secret existed, and the credential that came back authenticates
+//     against the broker while naming the component rather than a broker address. A credential
+//     naming a bootstrap address would hand the subscriber a route around the thing enforcing its
+//     scope.
+//  2. UNATTESTED. A component that answers for a WIDER prefix than the row records — the
+//     truncating proxy, which is the dangerous misbehaviour because the subscriber is told it is
+//     isolated — must produce a refusal that leaves NOTHING at the broker. That is the assertion
+//     no in-process test can make: a refusal that minted a SCRAM credential and failed to unwind
+//     it would satisfy every unit assertion and leave a principal in the metadata log that
+//     authenticates.
+func TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists(t *testing.T) {
+	t.Run("attested: the component holds the exact binding and the credential names it", func(t *testing.T) {
+		fixture, ctx := eventIsolationSetup(t)
+
+		granted, _ := eventIsolationGrantSplit(fixture)
+		subscriberID := eventIsolationSubscriberID("keyscope-attested")
+		keyPrefix := "ldg_" + uuid.NewString()
+
+		gateway, double := eventIsolationDeclareKeyScopeGatewayWithDouble(t, fixture)
+
+		subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
+			SubscriberID:       subscriberID,
+			Name:               "event isolation probe (key scope attested)",
+			AuthorizedTopics:   []string{granted},
+			PartitionKeyPrefix: &keyPrefix,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, subscriber)
+		t.Cleanup(func() { eventIsolationTeardown(t, fixture, subscriber) })
+
+		require.Zero(t, double.requestCount(http.MethodPost),
+			"the precondition: nothing has been bound by registration alone, so the assertion below "+
+				"is about what ISSUANCE did")
+
+		credential, err := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
+		require.NoError(t, err,
+			"an attesting component must not block issuance: the declaration is satisfied")
+		require.NotEmpty(t, credential.Password())
+
+		held, bound := double.heldPrefix(subscriber.KafkaPrincipal)
+		require.True(t, bound,
+			"THE COMPONENT MUST HOLD A BINDING FOR THIS PRINCIPAL. Without one the credential's "+
+				"declared key boundary rests on nothing, which is the state SEC-01 named")
+		assert.Equal(t, keyPrefix, held,
+			"and it must hold the EXACT stored prefix, byte for byte: a trimmed or normalised prefix "+
+				"selects a different set of records than the registry describes")
+		assert.Equal(t, "Bearer "+double.token, double.authorizationHeader(),
+			"the call must be authenticated, or anything on the network can register bindings and "+
+				"thereby decide what a subscriber sees")
+
+		assert.Equal(t, gateway, credential.Brokers,
+			"the credential names the component, never a broker address that would route around it")
+		assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement)
+
+		// AND THE BROKER AGREES THE PRINCIPAL EXISTS, which is what makes this an end-to-end
+		// assertion rather than two independent ones.
+		exists, existsErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, existsErr, "describing the SCRAM credential of %q", subscriber.KafkaPrincipal)
+		assert.True(t, exists,
+			"principal %q must hold a credential at the broker: the attestation permitted the "+
+				"issuance, so the issuance must have completed", subscriber.KafkaPrincipal)
+	})
+
+	t.Run("unattested: a wider prefix is refused and leaves nothing at the broker", func(t *testing.T) {
+		fixture, ctx := eventIsolationSetup(t)
+
+		granted, _ := eventIsolationGrantSplit(fixture)
+		subscriberID := eventIsolationSubscriberID("keyscope-unattested")
+		keyPrefix := "ldg_" + uuid.NewString()
+
+		_, double := eventIsolationDeclareKeyScopeGatewayWithDouble(t, fixture)
+		// THE TRUNCATING PROXY. It answers 200, for the right principal, with a prefix that
+		// matches more keys than the row records.
+		double.prefixOverride = "ldg_"
+
+		subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
+			SubscriberID:       subscriberID,
+			Name:               "event isolation probe (key scope unattested)",
+			AuthorizedTopics:   []string{granted},
+			PartitionKeyPrefix: &keyPrefix,
+		})
+		require.NoError(t, err,
+			"registration is never the refusal: an operator records the intended boundary before "+
+				"the component that keeps it is correct")
+		require.NotNil(t, subscriber)
+		t.Cleanup(func() { eventIsolationTeardown(t, fixture, subscriber) })
+
+		credential, err := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
+		require.Error(t, err,
+			"a component enforcing a WIDER boundary than the registry records must not be accepted: "+
+				"the subscriber would be told it is isolated while reading a superset")
+		assert.Zero(t, credential.PasswordLength())
+
+		var apiErr apierror.APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, apierror.ErrSubscriberKeyScopeUnattested, apiErr.Code,
+			"the typed refusal, distinct from the no-component one so an operator knows the "+
+				"component answered and answered wrongly")
+
+		// THE PROPERTY ONLY THE BROKER CAN ANSWER.
+		exists, existsErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, existsErr, "describing the SCRAM credential of %q", subscriber.KafkaPrincipal)
+		assert.False(t, exists,
+			"principal %q HOLDS A CREDENTIAL AT THE BROKER after an unattested issuance: the "+
+				"attestation is ordered before the mint precisely so that this cannot happen",
+			subscriber.KafkaPrincipal)
+
+		stored, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
+		require.NoError(t, readErr)
+		assert.Nil(t, stored.CredentialReference,
+			"and no issuance may be recorded for a credential that does not exist")
+	})
 }
 
 // There is no test of a Blnk-hosted read path for a key-scoped subscriber, because there is no

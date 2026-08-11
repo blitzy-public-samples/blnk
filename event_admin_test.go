@@ -1117,14 +1117,17 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 	require.Len(t, categories, categoryCount,
 		"four categories are what give every emitted event type a home — including the system category an unrecognised type routes to; a fifth would need a topic here and a change to the published topic contract")
 
-	// EVERY CATEGORY TOPIC IS PROVISIONED AND GRANTABLE, and NO dead-letter sibling is.
+	// EVERY CATEGORY TOPIC IS PROVISIONED. GRANTABILITY IS A SEPARATE QUESTION, and the two are
+	// asserted separately here because conflating them is how a topic events route to goes
+	// uncreated — or how an operator topic acquires a subscriber audience.
 	//
 	// Provisioned, because Blnk writes to all of them. A topic nobody created is a topic the
 	// relay cannot publish to, so its events would strand in the outbox.
 	//
-	// Grantable, because each carries event types the legacy webhook transport delivers today —
-	// the system topic included, which is why ledger.created keeps an authorized route after
-	// the sunset. Which of them a PARTICULAR subscriber holds is decided per subscriber by its
+	// Grantable for the three TENANT categories only. The system category is provisioned and NOT
+	// grantable: it carries system.error's frozen verbatim-error body and is the catalogue's
+	// catch-all, so it is an operator topic in the same class as a dead-letter sibling. Which of
+	// the tenant topics a PARTICULAR subscriber holds is decided per subscriber by its
 	// authorized_topics, not here.
 	//
 	// Never the dead-letter siblings: they carry failure metadata and every subscriber's failed
@@ -1133,8 +1136,16 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 		topic := TopicForCategory(category)
 		assert.Contains(t, expectedEventTopics, topic,
 			"category topic %q must be provisioned: Blnk publishes to it", topic)
-		assert.True(t, IsSubscriberGrantableTopic(topic),
-			"category topic %q must be grantable, or an event type the legacy transport delivers has no authorized Kafka route", topic)
+
+		if category == model.EventCategorySystem {
+			assert.False(t, IsSubscriberGrantableTopic(topic),
+				"the system topic %q must NOT be grantable: it carries system.error's verbatim error "+
+					"body and every uncatalogued event", topic)
+		} else {
+			assert.True(t, IsSubscriberGrantableTopic(topic),
+				"tenant category topic %q must be grantable, or an event type the legacy transport delivers has no authorized Kafka route", topic)
+		}
+
 		assert.False(t, IsSubscriberGrantableTopic(DLTFor(topic)),
 			"dead-letter topic %q must never be grantable: it carries failure metadata and every subscriber's failed events", DLTFor(topic))
 	}
@@ -2214,8 +2225,9 @@ func TestProvisionSubscriberPrincipal_NeverGrantsWriteOrAWildcardPattern(t *test
 
 	subscriber := testSubscriber()
 	// The widest LEGITIMATE grant, which is the grantable allowlist rather than the whole
-	// inventory: all four category topics are grantable and no dead-letter topic is, so asking
-	// for a DLT is refused before any binding is built (see
+	// inventory: the three tenant category topics are grantable, while the internal system
+	// topic and every dead-letter topic are not, so asking for either is refused before any
+	// binding is built (see
 	// TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist).
 	subscriber.AuthorizedTopics = SubscriberGrantableTopics()
 

@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -353,6 +354,24 @@ const (
 // whose per-row max_attempts was raised directly in the database.
 const MaxRelayRetryAttempts = 5
 
+// DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS bounds one call to the key-authorising component's
+// control endpoint when KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS is unset.
+//
+// Two seconds, chosen against the budget it lives inside rather than against a network: credential
+// issuance answers within five seconds (requirement R-7) and the attestation is one of several
+// steps in it, so the call must fail fast enough to leave the broker round trips and the registry
+// write their share. A component that cannot answer a single authenticated POST in two seconds is
+// not one a five-second issuance can depend on, and the refusal names it.
+const DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS = 2000
+
+// MaxKeyScopeAttestationTimeout caps a configured attestation timeout.
+//
+// It is the issuance budget itself: a timeout at or beyond it can never fire, because the request's
+// own deadline expires first and the caller gets a 504 in place of the deterministic 409 the
+// refusal is supposed to be. Configured values above it are capped rather than rejected — see
+// KafkaConfig.KeyScopeAttestationTimeout.
+const MaxKeyScopeAttestationTimeout = 5 * time.Second
+
 // EventRetentionUnboundedSweep is the value of RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
 // that removes the per-sweep batch ceiling entirely. PERF-P23.
 //
@@ -413,9 +432,25 @@ type ServerConfig struct {
 	// SUBSCRIBER_INSECURE_TRANSPORT rather than putting a password on a channel
 	// nobody has established as confidential.
 	//
-	// SETTING THIS WITHOUT SUCH A PROXY IS UNSAFE: it re-enables exactly the
-	// disclosure the default prevents, and it does so silently. Nothing else in
-	// Blnk's behaviour depends on it.
+	// # IT IS ONLY HALF THE DECLARATION. TrustedProxies below is the other half
+	//
+	// This flag is a statement about the intended PATH — "requests reach this
+	// process through our ingress, which owns that header" — and it is silent about
+	// a request that arrived by a different one. A caller reaching the process
+	// directly (a pod IP, a port-forward, a second Service, an ingress rule that
+	// passes the client's header through) sends its own X-Forwarded-Proto, so
+	// believing the flag alone hands that caller the one-time password.
+	//
+	// The header is therefore believed only from a socket peer TrustedProxies names
+	// — see TrustsForwardedProtoFrom, which requires both — and a declaration with
+	// no usable allowlist establishes nothing. In secure mode that combination is
+	// refused at configuration load by validateForwardedProtoTrust rather than
+	// running as a per-request refusal nobody notices until a 403.
+	//
+	// SETTING THIS WITHOUT SUCH A PROXY STILL BUYS NOTHING SAFE: two obligations
+	// remain the operator's, because no process can verify them — the proxy must
+	// OVERWRITE the header rather than append to it, and the hop in front of the
+	// proxy must be the TLS one. Nothing else in Blnk's behaviour depends on it.
 	TrustForwardedProto bool `json:"trust_forwarded_proto" envconfig:"BLNK_SERVER_TRUST_FORWARDED_PROTO"`
 
 	// AllowLoopbackCredentialIssuance permits POST /subscribers/{id}/kafka-credentials
@@ -466,6 +501,18 @@ type ServerConfig struct {
 	//
 	// Set it ONLY to the addresses of proxies you operate. Listing 0.0.0.0/0 restores the
 	// forgeable behaviour and defeats the point.
+	//
+	// # IT ALSO SCOPES TrustForwardedProto, and that is the higher-stakes of its two uses
+	//
+	// A forgeable client address costs the truthfulness of an access log. A forgeable
+	// X-Forwarded-Proto costs a one-time SASL password, because it is what establishes the
+	// channel POST /subscribers/{id}/kafka-credentials will disclose one over. This list
+	// answers both questions, deliberately: they are the same question about the same proxy,
+	// and two lists could only let a deployment give them different answers.
+	//
+	// So a universal range is rejected for the forwarded-proto decision rather than merely
+	// discouraged — see ForwardedProtoTrustedPeers — and an empty list makes that channel
+	// establish nothing at all.
 	TrustedProxies string `json:"trusted_proxies" envconfig:"BLNK_SERVER_TRUSTED_PROXIES"`
 }
 
@@ -772,6 +819,83 @@ type KafkaConfig struct {
 	// Brokers: a gateway list pointing at the brokers means nothing evaluates record keys,
 	// which is the state the declaration would be lying about. See KeyScopeGateway.
 	KeyScopeGatewayBrokers []string `json:"key_scope_gateway_brokers" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
+
+	// KeyScopeGatewayAttestationURL is the CONTROL endpoint of the key-authorising component,
+	// and it is what turns the declaration above from a claim into a verified fact.
+	//
+	// # Why an address and a mode were not enough
+	//
+	// KeyScopeEnforcement plus KeyScopeGatewayBrokers say "a component in front of the brokers
+	// applies each principal's recorded prefix". Nothing checked it. A deployment could set both
+	// to any distinct address and Blnk would mint a credential carrying no topic Read, tell the
+	// subscriber its key scope was enforced at the gateway, and be wrong — the same false
+	// assurance as the client-side-filter reading it replaced, moved one layer out.
+	//
+	// So issuance now BINDS AND ATTESTS before a secret exists: it posts the principal, the
+	// recorded prefix, the authorised topics and the consumer-group prefix to this endpoint over
+	// an authenticated channel, and requires the component to answer that it enforces key scopes,
+	// for that principal, with that prefix byte-for-byte. Deregistration deletes the binding at
+	// the same endpoint. See blnk.KeyScopeGatewayClient for the wire contract, which
+	// docs/kafka-operations.md publishes so a component can implement it.
+	//
+	// # It is REQUIRED for enforcement to be active
+	//
+	// KeyScopeGateway reports enforcement active only when this URL and its token are both
+	// usable, so a deployment that declares the mode and the bootstrap list but no control
+	// endpoint is treated exactly as an undeclared one: key-scoped subscribers are refused a
+	// credential rather than issued an unverified one. That is the fail-closed direction, and it
+	// is deliberate that the stricter behaviour is what an incomplete configuration gets.
+	//
+	// Must be an absolute http or https URL. https is required unless the host is a loopback
+	// literal, because the request carries a bearer token; see KeyScopeAttestation, which owns
+	// the whole predicate.
+	KeyScopeGatewayAttestationURL string `json:"key_scope_gateway_attestation_url" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL"`
+
+	// KeyScopeGatewayAttestationToken is the bearer credential Blnk presents to the control
+	// endpoint above.
+	//
+	// It authenticates BLNK TO THE GATEWAY, which is the direction that matters: without it any
+	// party that could reach the endpoint could register or delete key-scope bindings, and the
+	// component would be a boundary anybody could rewrite. It is required for the same reason
+	// the URL is — enforcement is not active without both — and it is never logged, never
+	// echoed in an API response and never included in an error message.
+	KeyScopeGatewayAttestationToken string `json:"key_scope_gateway_attestation_token" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN"`
+
+	// KeyScopeGatewayAttestationTimeoutMS bounds a single attestation or revocation call.
+	//
+	// It is bounded because the call sits inside credential issuance, which has a five-second
+	// wall-clock contract (requirement R-7). A gateway that hangs must cost the request a
+	// bounded slice of that budget and then refuse, rather than consuming it and turning a
+	// deterministic 409 into a 504.
+	//
+	// Defaults to DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS. A non-positive value takes the
+	// default; a value above the issuance budget is capped, because a timeout longer than the
+	// budget it lives inside is not a timeout.
+	KeyScopeGatewayAttestationTimeoutMS int `json:"key_scope_gateway_attestation_timeout_ms" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS"`
+
+	// SubscriberSharedTopicAccess is the deployment ACKNOWLEDGING that a subscriber granted a
+	// category topic reads every record on it — every ledger's, every other subscriber's.
+	//
+	// # Why an acknowledgement exists at all
+	//
+	// It is not a feature toggle and it changes no behaviour beyond one refusal. The access
+	// model is fixed by the requirement: category topics, no per-tenant topics, and an
+	// authorizer with no message-key dimension. Whole-topic reads are therefore what a grant
+	// MEANS, and that is fine for a single-tenant deployment or a trusted internal consumer and
+	// unacceptable for a multi-tenant one. Only the operator knows which they are running.
+	//
+	// Before this existed, the widest reading was the DEFAULT: a deployment that had declared
+	// nothing got whole-topic credentials, and the registry, the response and the runbook all
+	// described that correctly while nobody had decided it. This variable is the decision. In
+	// secure mode (Server.Secure — the same production signal the search-credential refusal
+	// reads), credential issuance for a subscriber with NO key scope refuses with
+	// SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED until either this is true or
+	// KeyScopeEnforcement declares — and proves — a key-authorising component.
+	//
+	// Default false. It is NOT read outside secure mode, so the local stack, the compose files
+	// and the test suite are unaffected: the declaration exists to make a production decision
+	// explicit, not to break a walkthrough.
+	SubscriberSharedTopicAccess bool `json:"subscriber_shared_topic_access" envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
 
 	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
 	// PRODUCER principal: the identity the event publisher authenticates as. It needs
@@ -1226,11 +1350,25 @@ type eventStreamingEnvOverride struct {
 	// which KeyScopeGateway reads as "not declared" and refuses issuance on.
 	KafkaKeyScopeGatewayBrokers *[]string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
 	KafkaKeyScopeEnforcement    *string   `envconfig:"KAFKA_KEY_SCOPE_ENFORCEMENT"`
-	KafkaTopicPrefix            *string   `envconfig:"KAFKA_TOPIC_PREFIX"`
-	KafkaSASLAdminUser          *string   `envconfig:"KAFKA_SASL_ADMIN_USER"`
-	KafkaSASLAdminSecret        *string   `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
-	KafkaMinPartitions          *int      `envconfig:"KAFKA_MIN_PARTITIONS"`
-	KafkaReplicationFactor      *int      `envconfig:"KAFKA_REPLICATION_FACTOR"`
+	// The attestation trio belongs here with the mode and the gateway list, and for the same
+	// reason: enforcement is active only when the mode, the addresses AND the control endpoint
+	// all resolve, so resolving one of them by a different mechanism from the others is how a
+	// deployment ends up declaring an enforcement point it cannot reach — which fails closed and
+	// refuses every key-scoped subscriber, on a configuration the operator believes is complete.
+	KafkaKeyScopeGatewayAttestationURL       *string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL"`
+	KafkaKeyScopeGatewayAttestationToken     *string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN"`
+	KafkaKeyScopeGatewayAttestationTimeoutMS *int    `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS"`
+	// KafkaSubscriberSharedTopicAccess is the whole-topic ACKNOWLEDGEMENT, and it is a bool, so
+	// applyPrefixedEnvAliases could carry it. It is here instead so that every variable
+	// governing the subscriber access model resolves through one mechanism: a deployment that
+	// declared the acknowledgement by a name this struct honoured and the mode by one it did not
+	// would get the widest behaviour from the narrowest-looking configuration.
+	KafkaSubscriberSharedTopicAccess *bool   `envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
+	KafkaTopicPrefix                 *string `envconfig:"KAFKA_TOPIC_PREFIX"`
+	KafkaSASLAdminUser               *string `envconfig:"KAFKA_SASL_ADMIN_USER"`
+	KafkaSASLAdminSecret             *string `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
+	KafkaMinPartitions               *int    `envconfig:"KAFKA_MIN_PARTITIONS"`
+	KafkaReplicationFactor           *int    `envconfig:"KAFKA_REPLICATION_FACTOR"`
 
 	RelayMaxRetryAttempts                 *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RelayRetryBaseBackoffMS               *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
@@ -1287,6 +1425,18 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	}
 	if override.KafkaKeyScopeEnforcement != nil {
 		cnf.Kafka.KeyScopeEnforcement = *override.KafkaKeyScopeEnforcement
+	}
+	if override.KafkaKeyScopeGatewayAttestationURL != nil {
+		cnf.Kafka.KeyScopeGatewayAttestationURL = *override.KafkaKeyScopeGatewayAttestationURL
+	}
+	if override.KafkaKeyScopeGatewayAttestationToken != nil {
+		cnf.Kafka.KeyScopeGatewayAttestationToken = *override.KafkaKeyScopeGatewayAttestationToken
+	}
+	if override.KafkaKeyScopeGatewayAttestationTimeoutMS != nil {
+		cnf.Kafka.KeyScopeGatewayAttestationTimeoutMS = *override.KafkaKeyScopeGatewayAttestationTimeoutMS
+	}
+	if override.KafkaSubscriberSharedTopicAccess != nil {
+		cnf.Kafka.SubscriberSharedTopicAccess = *override.KafkaSubscriberSharedTopicAccess
 	}
 	if override.KafkaTopicPrefix != nil {
 		cnf.Kafka.TopicPrefix = *override.KafkaTopicPrefix
@@ -1822,6 +1972,16 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 	// deployment that would authenticate to its search index with a publicly known key is
 	// refused rather than warned about among other warnings.
 	if err := cnf.resolveSearchCredential(); err != nil {
+		return err
+	}
+
+	// IMMEDIATELY AFTER, and for the same reason: it is the other check whose failure would
+	// leave a secret readable. resolveSearchCredential refuses a publicly known search key;
+	// this refuses a forwarded-HTTPS declaration that would put a one-time SASL password on a
+	// channel established by a header any caller can send. Both are ahead of the secure-mode
+	// warning below so a production deployment is refused rather than warned about among
+	// other warnings.
+	if err := cnf.validateForwardedProtoTrust(); err != nil {
 		return err
 	}
 
@@ -2598,16 +2758,43 @@ func (cnf *Configuration) setKafkaDefaults() {
 	// 409 on a request they believe they configured for.
 	if cnf.Kafka.KeyScopeEnforcement == KeyScopeEnforcementBrokerGateway {
 		if _, active := cnf.Kafka.KeyScopeGateway(); !active {
-			logrus.WithFields(logrus.Fields{
-				"gateway_broker_count": len(cnf.Kafka.KeyScopeGatewayBrokers),
-				"variable":             "KAFKA_KEY_SCOPE_GATEWAY_BROKERS",
-			}).Warn(
-				"KAFKA_KEY_SCOPE_ENFORCEMENT is broker_gateway but no distinct gateway bootstrap " +
-					"list is configured, so key-scope enforcement is NOT active and issuance will " +
-					"refuse every subscriber that records a partition_key_prefix; set " +
-					"KAFKA_KEY_SCOPE_GATEWAY_BROKERS to the enforcing endpoint, which must differ " +
-					"from KAFKA_BROKERS",
-			)
+			// WHICH HALF IS MISSING IS NAMED, because the two remedies are different variables
+			// and a single "not active" line sends an operator to check the one that is already
+			// correct. The bootstrap list is reported first: it is the older requirement, and a
+			// deployment upgrading into the attestation requirement will usually have it.
+			if _, _, attestable := cnf.Kafka.KeyScopeAttestation(); !attestable {
+				logrus.WithFields(logrus.Fields{
+					"attestation_url_set":   strings.TrimSpace(cnf.Kafka.KeyScopeGatewayAttestationURL) != "",
+					"attestation_token_set": strings.TrimSpace(cnf.Kafka.KeyScopeGatewayAttestationToken) != "",
+					"variables": []string{
+						"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL",
+						"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN",
+					},
+				}).Warn(
+					"KAFKA_KEY_SCOPE_ENFORCEMENT is broker_gateway but no usable attestation " +
+						"endpoint is configured, so key-scope enforcement is NOT active and issuance " +
+						"will refuse every subscriber that records a partition_key_prefix. Blnk will " +
+						"not mint a credential declaring a key boundary it could not ask the " +
+						"component to confirm: set KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL to the " +
+						"component's control endpoint — https, or http only for a loopback host — " +
+						"and KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN to the bearer credential it " +
+						"authenticates Blnk with. The wire contract is in docs/kafka-operations.md",
+				)
+			}
+
+			if len(cnf.Kafka.KeyScopeGatewayBrokers) == 0 ||
+				brokerListsEqual(cnf.Kafka.KeyScopeGatewayBrokers, cnf.Kafka.Brokers) {
+				logrus.WithFields(logrus.Fields{
+					"gateway_broker_count": len(cnf.Kafka.KeyScopeGatewayBrokers),
+					"variable":             "KAFKA_KEY_SCOPE_GATEWAY_BROKERS",
+				}).Warn(
+					"KAFKA_KEY_SCOPE_ENFORCEMENT is broker_gateway but no distinct gateway bootstrap " +
+						"list is configured, so key-scope enforcement is NOT active and issuance will " +
+						"refuse every subscriber that records a partition_key_prefix; set " +
+						"KAFKA_KEY_SCOPE_GATEWAY_BROKERS to the enforcing endpoint, which must differ " +
+						"from KAFKA_BROKERS",
+				)
+			}
 		}
 	}
 
@@ -3212,26 +3399,178 @@ func (k KafkaConfig) KeyScopeGateway() (brokers []string, active bool) {
 		return nil, false
 	}
 
-	internal := normalizeBrokers(k.Brokers)
-	if len(gateway) == len(internal) {
-		identical := true
-		for index := range gateway {
-			if gateway[index] != internal[index] {
-				identical = false
+	if brokerListsEqual(gateway, k.Brokers) {
+		return nil, false
+	}
 
-				break
-			}
-		}
-
-		if identical {
-			return nil, false
-		}
+	// THE CONTROL ENDPOINT IS PART OF THE DECLARATION, not an optional extra. Enforcement is
+	// "active" here only when Blnk can ASK the component to confirm the boundary, because
+	// everything active-ness unlocks is downstream of that confirmation: issuance stops
+	// refusing key-scoped rows, and the credential response declares the scope enforced. A mode
+	// and a bootstrap address are assertions a deployment makes about itself; an authenticated
+	// attestation is evidence. Treating an unattestable configuration as inactive means a
+	// deployment that has declared a gateway it cannot reach gets the same refusal as one that
+	// declared nothing — which is the fail-closed direction, and the only one that cannot mint a
+	// credential claiming an enforcement point nothing was asked about.
+	if _, _, attestable := k.KeyScopeAttestation(); !attestable {
+		return nil, false
 	}
 
 	brokers = make([]string, len(gateway))
 	copy(brokers, gateway)
 
 	return brokers, true
+}
+
+// KeyScopeAttestation resolves the key-authorising component's CONTROL endpoint and the
+// credential Blnk presents to it.
+//
+// It answers one question — can Blnk ask the declared component to confirm a principal's key
+// scope? — and it is deliberately independent of the bootstrap list: the addresses a SUBSCRIBER
+// dials and the endpoint BLNK calls are different interfaces on the same component, and a
+// deployment may well expose them on different hosts and schemes.
+//
+// # What makes an endpoint usable
+//
+//  1. The mode is broker_gateway. Nothing else declares a component at all.
+//  2. The URL parses as an ABSOLUTE http or https URL with a host. A relative or schemeless
+//     value cannot be dialled, and treating it as usable would defer the failure to the middle
+//     of an issuance.
+//  3. The scheme is https, UNLESS the host is a loopback literal. The request carries the
+//     bearer token below, so plaintext to a remote host would put a long-lived credential on
+//     the wire; a loopback host is permitted because that is how a sidecar or a test double is
+//     reached, and its last hop never touches a network.
+//  4. The token is non-blank. An unauthenticated control endpoint is one any party that can
+//     reach it may rewrite bindings on, which would make the "boundary" writable by whoever
+//     found the URL.
+//
+// Anything else answers false, which KeyScopeGateway reads as "not enforcing" and issuance
+// reads as "refuse key-scoped subscribers". No warning is emitted here — this is a pure
+// accessor read on every issuance — validateKafkaKeyScopeGateway announces the misconfiguration
+// once at start-up instead.
+//
+// Returns:
+//   - endpoint string: the trimmed URL, empty unless attestable.
+//   - token string: the bearer credential, empty unless attestable. Never logged.
+//   - attestable bool: true only when all four conditions above hold.
+func (k KafkaConfig) KeyScopeAttestation() (endpoint string, token string, attestable bool) {
+	if !strings.EqualFold(strings.TrimSpace(k.KeyScopeEnforcement), KeyScopeEnforcementBrokerGateway) {
+		return "", "", false
+	}
+
+	endpoint = strings.TrimSpace(k.KeyScopeGatewayAttestationURL)
+	token = strings.TrimSpace(k.KeyScopeGatewayAttestationToken)
+
+	if endpoint == "" || token == "" {
+		return "", "", false
+	}
+
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
+		return "", "", false
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+	case "http":
+		if !isLoopbackHostname(parsed.Hostname()) {
+			return "", "", false
+		}
+	default:
+		return "", "", false
+	}
+
+	return endpoint, token, true
+}
+
+// KeyScopeAttestationTimeout is how long a single attestation or revocation call may take.
+//
+// It is bounded on BOTH sides. A non-positive configured value takes the default, because "no
+// timeout" inside a five-second issuance contract is not a configuration anybody means. A value
+// above MaxKeyScopeAttestationTimeout is capped rather than rejected: the call lives inside the
+// issuance budget, so a timeout longer than that budget cannot expire before the budget does,
+// and refusing to start over it would be worse than correcting it.
+//
+// Returns:
+//   - time.Duration: always positive, never above MaxKeyScopeAttestationTimeout.
+func (k KafkaConfig) KeyScopeAttestationTimeout() time.Duration {
+	if k.KeyScopeGatewayAttestationTimeoutMS <= 0 {
+		return DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS * time.Millisecond
+	}
+
+	timeout := time.Duration(k.KeyScopeGatewayAttestationTimeoutMS) * time.Millisecond
+	if timeout > MaxKeyScopeAttestationTimeout {
+		return MaxKeyScopeAttestationTimeout
+	}
+
+	return timeout
+}
+
+// brokerListsEqual reports whether two bootstrap lists name the same endpoints in the same order.
+//
+// Both sides are normalised first, so a list differing only in whitespace, blank entries or
+// duplication is recognised as the same list. That matters because the ONE caller that compares
+// lists is asking a security question — is the declared gateway actually the brokers? — and a
+// deployment writing "kafka:9092, kafka:9092" for one and "kafka:9092" for the other must not
+// thereby be treated as having declared a distinct enforcement point.
+//
+// The comparison is ORDER-SENSITIVE after normalisation, which is the conservative direction for
+// its caller: two lists holding the same endpoints in a different order are reported as
+// DIFFERENT, so the caller treats them as a declared gateway and the attestation call then has
+// the final say. A false "identical" would be the dangerous answer, and cannot arise.
+//
+// Parameters:
+//   - left, right []string: bootstrap lists, normalised internally.
+//
+// Returns:
+//   - bool: true when both normalise to the same non-empty or empty sequence.
+func brokerListsEqual(left, right []string) bool {
+	first := normalizeBrokers(left)
+	second := normalizeBrokers(right)
+
+	if len(first) != len(second) {
+		return false
+	}
+
+	for index := range first {
+		if first[index] != second[index] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isLoopbackHostname reports whether a URL host is a loopback address or the loopback name.
+//
+// The literal check is net.IP.IsLoopback, which covers 127.0.0.0/8 and ::1 without a string
+// comparison per form; "localhost" is accepted by name because that is what a compose file, a
+// sidecar annotation or an httptest URL writes, and it resolves to a loopback address on every
+// platform this runs on.
+//
+// A name that merely CONTAINS "localhost" — "localhost.evil.example" — is not loopback and is
+// refused, which is why the comparison is an equality and not a suffix test.
+//
+// Parameters:
+//   - hostname string: the host component of a URL, already stripped of any port.
+//
+// Returns:
+//   - bool: true for a loopback literal or the exact name "localhost".
+func isLoopbackHostname(hostname string) bool {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return false
+	}
+
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+
+	if ip := net.ParseIP(hostname); ip != nil {
+		return ip.IsLoopback()
+	}
+
+	return false
 }
 
 // ValidateSASLAdminCredentials reports a half-configured administrative credential.
@@ -3717,6 +4056,238 @@ func (cnf *Configuration) TrustedProxyCIDRs() []string {
 	}
 
 	return proxies
+}
+
+// ForwardedProtoTrustedPeers parses Server.TrustedProxies into the socket-peer matchers the
+// forwarded-HTTPS channel is believed on, and reports whether what remains is usable.
+//
+// # Why the forwarded-proto decision needs a peer at all (SEC-03)
+//
+// X-Forwarded-Proto is a request header. BLNK_SERVER_TRUST_FORWARDED_PROTO declares that a proxy
+// in front of Blnk sets it and overwrites whatever a client sent, which is a true statement about
+// the intended path and says nothing about the request in hand: a caller that reaches the process
+// by any other route — a pod IP inside the cluster, a port-forward, a second Service, a
+// misconfigured ingress that passes the header through — sends its own value and is believed.
+// That endpoint returns a one-time SASL password, so being believed is the whole of the exploit.
+//
+// The header is therefore believed only from a PEER the operator has named. This is not a new
+// list: BLNK_SERVER_TRUSTED_PROXIES already names the proxies whose forwarded headers may be
+// believed, which is exactly this question, and a second list would let a deployment trust a
+// proxy for the client address and not for the protocol, or the reverse.
+//
+// # What is rejected, and why silently rather than fatally
+//
+// A UNIVERSAL RANGE matches every peer, so it re-creates the behaviour this check exists to
+// remove: 0.0.0.0/0 and ::/0 — and any entry whose prefix length is zero — are skipped rather
+// than honoured. Skipped rather than fatal because the same list also configures gin's client-IP
+// resolution, where the operator's intent is a separate decision that this accessor has no
+// business failing; a list that consisted only of universal ranges reports usable=false, which
+// refuses. validateForwardedProtoTrust announces both cases at start-up.
+//
+// A malformed entry is skipped for the same reason and by the same rule as TrustedProxyCIDRs:
+// this accessor only ever grants confidence, so anything it cannot parse grants none.
+//
+// Returns:
+//   - peers []*net.IPNet: the parsed matchers, bare IP literals widened to a single-address
+//     network. Nil when nothing usable was declared.
+//   - usable bool: whether at least one non-universal matcher was declared. False means the
+//     forwarded-HTTPS channel establishes nothing, whatever the header says.
+func (cnf *Configuration) ForwardedProtoTrustedPeers() (peers []*net.IPNet, usable bool) {
+	declared := cnf.TrustedProxyCIDRs()
+	if len(declared) == 0 {
+		return nil, false
+	}
+
+	peers = make([]*net.IPNet, 0, len(declared))
+
+	for _, entry := range declared {
+		if network := parseTrustedPeerEntry(entry); network != nil {
+			peers = append(peers, network)
+		}
+	}
+
+	if len(peers) == 0 {
+		return nil, false
+	}
+
+	return peers, true
+}
+
+// parseTrustedPeerEntry parses one trusted-proxy entry into a network matcher.
+//
+// It accepts a CIDR block or a bare IP literal, which are the two forms
+// BLNK_SERVER_TRUSTED_PROXIES documents, and rejects a universal range because a matcher that
+// matches everything is not an allowlist.
+//
+// Parameters:
+//   - entry string: one already-trimmed entry from the declared list.
+//
+// Returns:
+//   - *net.IPNet: the matcher, or nil when the entry is malformed or universal.
+func parseTrustedPeerEntry(entry string) *net.IPNet {
+	if _, network, err := net.ParseCIDR(entry); err == nil {
+		if ones, _ := network.Mask.Size(); ones == 0 {
+			// 0.0.0.0/0 and ::/0. Matching every peer is indistinguishable from having declared
+			// no allowlist, except that it reads as though a decision was made.
+			return nil
+		}
+
+		return network
+	}
+
+	address := net.ParseIP(entry)
+	if address == nil {
+		return nil
+	}
+
+	// A BARE IP IS A SINGLE-ADDRESS NETWORK, widened here rather than special-cased at the
+	// comparison, so the matcher list has one shape and the caller has one loop.
+	bits := net.IPv6len * 8
+	if address.To4() != nil {
+		bits = net.IPv4len * 8
+	}
+
+	return &net.IPNet{IP: address, Mask: net.CIDRMask(bits, bits)}
+}
+
+// TrustsForwardedProtoFrom reports whether X-Forwarded-Proto may be believed on a request whose
+// socket peer is remoteAddr.
+//
+// BOTH halves are required: the deployment must have declared that a proxy owns the header, and
+// the request must have arrived FROM one of the peers it named. Either alone is the defect —
+// the declaration alone believes any caller that reaches the process by another route, and a
+// peer match alone would believe a proxy the operator never said terminates TLS.
+//
+// Parameters:
+//   - remoteAddr string: the peer as http.Request.RemoteAddr gives it, "host:port" or a bare
+//     host. It must be the SOCKET peer: a value derived from X-Forwarded-For would let a caller
+//     nominate the peer that authorises it.
+//
+// Returns:
+//   - bool: true only when the declaration, a usable allowlist and a matching peer all hold.
+func (cnf *Configuration) TrustsForwardedProtoFrom(remoteAddr string) bool {
+	if !cnf.Server.TrustForwardedProto {
+		return false
+	}
+
+	peers, usable := cnf.ForwardedProtoTrustedPeers()
+	if !usable {
+		return false
+	}
+
+	address := peerAddressOf(remoteAddr)
+	if address == nil {
+		return false
+	}
+
+	for _, network := range peers {
+		if network.Contains(address) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// peerAddressOf extracts the IP from a socket peer address.
+//
+// http.Request.RemoteAddr is "host:port" for TCP, and a bare host for the transports that have
+// no port, so both are accepted. An IPv6 zone is dropped: it identifies the interface a
+// link-local address was reached on and is not part of the address a CIDR describes.
+//
+// Parameters:
+//   - remoteAddr string: the peer address.
+//
+// Returns:
+//   - net.IP: the parsed address, or nil when there is nothing parseable — which every caller
+//     must read as "not trusted", since an unparseable peer establishes nothing.
+func peerAddressOf(remoteAddr string) net.IP {
+	candidate := strings.TrimSpace(remoteAddr)
+	if candidate == "" {
+		return nil
+	}
+
+	if host, _, err := net.SplitHostPort(candidate); err == nil {
+		candidate = host
+	}
+
+	if zone := strings.IndexByte(candidate, '%'); zone >= 0 {
+		candidate = candidate[:zone]
+	}
+
+	return net.ParseIP(strings.Trim(candidate, "[]"))
+}
+
+// validateForwardedProtoTrust refuses, in secure mode, a deployment that has declared the
+// forwarded-HTTPS channel without naming the proxies it may be believed from.
+//
+// # Why this is fatal in secure mode rather than a warning
+//
+// The declaration's only effect is to permit a one-time SASL password onto a channel the process
+// cannot see, and without an allowlist it permits that for EVERY caller — including one that
+// reached the pod directly and set the header itself. A warning would leave that deployment
+// running in exactly the state the flag was introduced to avoid, and the remedy is one variable.
+//
+// Outside secure mode it is a warning, and that boundary is the same one resolveSearchCredential
+// draws: Server.Secure is this repository's production signal, the local stack and the test
+// suite run with it false, and a fatal check there would refuse configurations whose whole
+// purpose is to be permissive on a developer's machine.
+//
+// A deployment that terminates TLS in-process needs none of this: that channel is proven rather
+// than declared, so the flag is simply unnecessary and this check does not fire on it.
+//
+// Returns:
+//   - error: non-nil only for a secure deployment that declared the flag with no usable
+//     allowlist.
+func (cnf *Configuration) validateForwardedProtoTrust() error {
+	if !cnf.Server.TrustForwardedProto {
+		return nil
+	}
+
+	if _, usable := cnf.ForwardedProtoTrustedPeers(); usable {
+		return nil
+	}
+
+	declared := strings.TrimSpace(cnf.Server.TrustedProxies)
+
+	if !cnf.Server.Secure {
+		logrus.WithField("trusted_proxies_declared", declared != "").Warn(
+			"SECURITY: BLNK_SERVER_TRUST_FORWARDED_PROTO is set but BLNK_SERVER_TRUSTED_PROXIES " +
+				"names no usable proxy, so X-Forwarded-Proto would be believed from ANY peer. " +
+				"Credential issuance therefore refuses the forwarded-HTTPS channel and answers " +
+				"SUBSCRIBER_INSECURE_TRANSPORT. Set BLNK_SERVER_TRUSTED_PROXIES to the CIDR ranges " +
+				"of the proxies that terminate TLS in front of this process. This is a warning " +
+				"rather than a refusal only because secure mode is off.",
+		)
+
+		return nil
+	}
+
+	if declared == "" {
+		return errors.New(
+			"BLNK_SERVER_TRUST_FORWARDED_PROTO is set with secure mode enabled, but " +
+				"BLNK_SERVER_TRUSTED_PROXIES is empty. The flag declares that a proxy in front of " +
+				"this process owns X-Forwarded-Proto, and that declaration is what allows the " +
+				"one-time SASL password from POST /subscribers/{id}/kafka-credentials onto a " +
+				"channel this process cannot see for itself. With no allowlist the header is " +
+				"believed from any peer, so a caller that reaches this process directly — a pod " +
+				"IP, a port-forward, a second Service — can set it and be handed that password. " +
+				"Set BLNK_SERVER_TRUSTED_PROXIES to the CIDR ranges of the proxies that terminate " +
+				"TLS, or unset BLNK_SERVER_TRUST_FORWARDED_PROTO and terminate TLS in this process " +
+				"with BLNK_SERVER_SSL",
+		)
+	}
+
+	return fmt.Errorf(
+		"BLNK_SERVER_TRUST_FORWARDED_PROTO is set with secure mode enabled, but "+
+			"BLNK_SERVER_TRUSTED_PROXIES declares no usable proxy range. A universal range "+
+			"(0.0.0.0/0 or ::/0) matches every peer, which is the same as declaring no allowlist "+
+			"at all, and a malformed entry matches none. Blnk would then believe "+
+			"X-Forwarded-Proto from any caller and hand a one-time SASL password to whoever "+
+			"reached this process directly. Replace the value with the CIDR ranges of the "+
+			"proxies you operate: %q",
+		declared,
+	)
 }
 
 func (cnf *Configuration) setupRateLimiting() {

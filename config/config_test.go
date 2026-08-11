@@ -2160,6 +2160,100 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
+			// THE CONTROL ENDPOINT, whose absence turns the whole declaration above off.
+			// Both spellings are exercised for the same reason the mode's are: an operator
+			// who set the form that resolved to nothing would find every key-scoped
+			// issuance refused with SUBSCRIBER_KEY_SCOPE_UNATTESTED on a deployment that
+			// believed it had declared a component.
+			name:   "the mandated bare KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL resolves",
+			envKey: "KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL",
+			value:  "https://gateway.example.com/key-scopes",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeGatewayAttestationURL != "https://gateway.example.com/key-scopes" {
+					t.Errorf("Expected Kafka.KeyScopeGatewayAttestationURL to resolve, got %q",
+						loaded.Kafka.KeyScopeGatewayAttestationURL)
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL alias resolves",
+			envKey: "BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL",
+			value:  "https://gateway.internal/key-scopes",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeGatewayAttestationURL != "https://gateway.internal/key-scopes" {
+					t.Errorf("Expected Kafka.KeyScopeGatewayAttestationURL to resolve, got %q",
+						loaded.Kafka.KeyScopeGatewayAttestationURL)
+				}
+			},
+		},
+		{
+			name:   "the mandated bare KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN resolves",
+			envKey: "KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN",
+			value:  "gateway-token",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeGatewayAttestationToken != "gateway-token" {
+					t.Errorf("Expected Kafka.KeyScopeGatewayAttestationToken to resolve, got %q",
+						loaded.Kafka.KeyScopeGatewayAttestationToken)
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN alias resolves",
+			envKey: "BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN",
+			value:  "prefixed-gateway-token",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeGatewayAttestationToken != "prefixed-gateway-token" {
+					t.Errorf("Expected Kafka.KeyScopeGatewayAttestationToken to resolve, got %q",
+						loaded.Kafka.KeyScopeGatewayAttestationToken)
+				}
+			},
+		},
+		{
+			name:   "the mandated bare KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS resolves",
+			envKey: "KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS",
+			value:  "1500",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeGatewayAttestationTimeoutMS != 1500 {
+					t.Errorf("Expected Kafka.KeyScopeGatewayAttestationTimeoutMS to be 1500, got %d",
+						loaded.Kafka.KeyScopeGatewayAttestationTimeoutMS)
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS alias resolves",
+			envKey: "BLNK_KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS",
+			value:  "2500",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeGatewayAttestationTimeoutMS != 2500 {
+					t.Errorf("Expected Kafka.KeyScopeGatewayAttestationTimeoutMS to be 2500, got %d",
+						loaded.Kafka.KeyScopeGatewayAttestationTimeoutMS)
+				}
+			},
+		},
+		{
+			// THE OTHER DECLARATION. In secure mode a deployment must make one of the two,
+			// so a spelling that resolved to nothing would refuse every issuance on a
+			// cluster whose operator had acknowledged the model.
+			name:   "the mandated bare KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS resolves",
+			envKey: "KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS",
+			value:  "true",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if !loaded.Kafka.SubscriberSharedTopicAccess {
+					t.Error("Expected Kafka.SubscriberSharedTopicAccess to resolve true")
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS alias resolves",
+			envKey: "BLNK_KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS",
+			value:  "true",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if !loaded.Kafka.SubscriberSharedTopicAccess {
+					t.Error("Expected Kafka.SubscriberSharedTopicAccess to resolve true")
+				}
+			},
+		},
+		{
 			name:   "the ordinary BLNK_KAFKA_TOPIC_PREFIX alias resolves",
 			envKey: "BLNK_KAFKA_TOPIC_PREFIX",
 			value:  "acme",
@@ -5259,5 +5353,249 @@ func TestRelayConfig_RepairCapacityDefaultsAndResolves(t *testing.T) {
 				}
 			})
 		}
+	})
+}
+
+// TestTrustsForwardedProtoFrom_RequiresBothTheDeclarationAndANamedPeer is the SEC-03 contract at
+// the configuration layer.
+//
+// # What was wrong
+//
+// The forwarded-HTTPS channel — the one that permits a one-time SASL password onto a connection
+// this process cannot see — was decided by BLNK_SERVER_TRUST_FORWARDED_PROTO alone. That flag is a
+// true statement about the intended path and says nothing about the request in hand: a caller that
+// reaches the process by any other route sends its own X-Forwarded-Proto and was believed.
+//
+// # Why the existing list rather than a new variable
+//
+// BLNK_SERVER_TRUSTED_PROXIES already names the proxies whose forwarded headers may be believed,
+// which is the same question about the same proxy. A second list could only let the two answers
+// disagree — a deployment trusting a proxy for the client address and not for the protocol, or the
+// reverse — and neither disagreement means anything an operator would have chosen.
+//
+// The table is exhaustive over the ways this can be answered wrongly, because every row of it
+// except the last two used to answer "trusted".
+func TestTrustsForwardedProtoFrom_RequiresBothTheDeclarationAndANamedPeer(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		declared bool
+		proxies  string
+		peer     string
+		trusted  bool
+		why      string
+	}{
+		{
+			name:    "no declaration, no trust",
+			proxies: "192.0.2.0/24",
+			peer:    "192.0.2.1:1234",
+			why: "the allowlist alone must establish nothing: it names proxies whose headers may " +
+				"be believed WHEN the deployment has said a proxy owns the protocol header, and a " +
+				"deployment that has not said so terminates TLS itself or refuses",
+		},
+		{
+			name:     "declaration with no allowlist",
+			declared: true,
+			peer:     "192.0.2.1:1234",
+			why: "THE SEC-03 CASE. With no proxy named the header is believed from every peer, " +
+				"which is the state the declaration was introduced to replace",
+		},
+		{
+			name:     "declaration with a universal IPv4 range",
+			declared: true,
+			proxies:  "0.0.0.0/0",
+			peer:     "192.0.2.1:1234",
+			why:      "a matcher that matches every peer is not an allowlist",
+		},
+		{
+			name:     "declaration with a universal IPv6 range",
+			declared: true,
+			proxies:  "::/0",
+			peer:     "[2001:db8::1]:1234",
+			why:      "the same, in the other family",
+		},
+		{
+			name:     "declaration with a malformed allowlist",
+			declared: true,
+			proxies:  "not-an-address, 300.1.2.3, 10.0.0.0/99",
+			peer:     "10.0.0.1:1234",
+			why: "an entry that cannot be parsed matches nothing, and a list of nothing but such " +
+				"entries establishes nothing rather than everything",
+		},
+		{
+			name:     "a peer outside the named range",
+			declared: true,
+			proxies:  "192.0.2.0/24",
+			peer:     "198.51.100.7:1234",
+			why:      "the direct caller: the declaration is complete and this request is not on the path it describes",
+		},
+		{
+			name:     "an unparseable peer",
+			declared: true,
+			proxies:  "192.0.2.0/24",
+			peer:     "not-a-peer",
+			why:      "an unparseable peer establishes nothing; this predicate only ever grants confidence",
+		},
+		{
+			name:     "an empty peer",
+			declared: true,
+			proxies:  "192.0.2.0/24",
+			why:      "and an absent one likewise",
+		},
+		{
+			name:     "a peer inside the named range",
+			declared: true,
+			proxies:  "192.0.2.0/24",
+			peer:     "192.0.2.1:1234",
+			trusted:  true,
+			why:      "the production deployment: TLS at the ingress, the pod hop plaintext, the ingress named",
+		},
+		{
+			name:     "a bare IP literal names one proxy",
+			declared: true,
+			proxies:  "192.0.2.1",
+			peer:     "192.0.2.1:1234",
+			trusted:  true,
+			why:      "a bare literal is one of the two documented forms and must not require /32",
+		},
+		{
+			name:     "a usable range beside an unusable one",
+			declared: true,
+			proxies:  "0.0.0.0/0, 192.0.2.0/24",
+			peer:     "192.0.2.1:1234",
+			trusted:  true,
+			why: "the universal entry is skipped rather than poisoning the list, so an operator who " +
+				"left one behind still gets the narrowing the other entry describes",
+		},
+		{
+			name:     "an IPv6 peer inside an IPv6 range",
+			declared: true,
+			proxies:  "2001:db8::/32",
+			peer:     "[2001:db8::1]:1234",
+			trusted:  true,
+			why:      "both families are supported, because a service mesh sidecar may be either",
+		},
+		{
+			name:     "a zone-qualified IPv6 peer",
+			declared: true,
+			proxies:  "fe80::/10",
+			peer:     "[fe80::1%eth0]:1234",
+			trusted:  true,
+			why:      "the zone identifies the interface, not the address, so it must not defeat the match",
+		},
+		{
+			name:     "a peer with no port",
+			declared: true,
+			proxies:  "192.0.2.0/24",
+			peer:     "192.0.2.1",
+			trusted:  true,
+			why:      "RemoteAddr carries no port on the transports that have none",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			cnf := Configuration{
+				Server: ServerConfig{
+					TrustForwardedProto: testCase.declared,
+					TrustedProxies:      testCase.proxies,
+				},
+			}
+
+			assert.Equal(t, testCase.trusted, cnf.TrustsForwardedProtoFrom(testCase.peer), testCase.why)
+		})
+	}
+}
+
+// TestValidateForwardedProtoTrust_RefusesADeclarationNothingScopes pins the start-up half.
+//
+// A per-request refusal on its own is fail-closed and silent: the deployment runs, the flag reads
+// as effective in the ConfigMap, and the symptom is a 403 on somebody's credential request. So a
+// SECURE deployment that declares the channel without naming a proxy is refused at configuration
+// load, where the message can name the variable to set, and an insecure one is warned — the same
+// boundary resolveSearchCredential draws, and the reason the local stack and this suite are
+// unaffected.
+func TestValidateForwardedProtoTrust_RefusesADeclarationNothingScopes(t *testing.T) {
+	base := func() Configuration {
+		return Configuration{
+			ProjectName:  "Test Project",
+			DataSource:   DataSourceConfig{Dns: "some-dns"},
+			Redis:        RedisConfig{Dns: "localhost:6379"},
+			TypeSenseKey: "a-configured-search-key",
+		}
+	}
+
+	t.Run("secure with no allowlist is fatal", func(t *testing.T) {
+		cnf := base()
+		cnf.Server.Secure = true
+		cnf.Server.TrustForwardedProto = true
+
+		err := cnf.validateAndAddDefaults()
+		require.Error(t, err,
+			"a production deployment must not run with a forwarded-HTTPS channel every caller "+
+				"can satisfy")
+		assert.Contains(t, err.Error(), "BLNK_SERVER_TRUSTED_PROXIES",
+			"the message must name the variable to set")
+		assert.Contains(t, err.Error(), "BLNK_SERVER_SSL",
+			"and the alternative, because an operator with no proxy needs the other remedy")
+	})
+
+	t.Run("secure with a universal range is fatal and quotes the value", func(t *testing.T) {
+		cnf := base()
+		cnf.Server.Secure = true
+		cnf.Server.TrustForwardedProto = true
+		cnf.Server.TrustedProxies = "0.0.0.0/0"
+
+		err := cnf.validateAndAddDefaults()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "0.0.0.0/0",
+			"quoting the value is what tells an operator that the list they set is the problem "+
+				"rather than a missing one")
+	})
+
+	t.Run("secure with a real range is accepted", func(t *testing.T) {
+		cnf := base()
+		cnf.Server.Secure = true
+		cnf.Server.TrustForwardedProto = true
+		cnf.Server.TrustedProxies = "10.0.0.0/8"
+
+		require.NoError(t, cnf.validateAndAddDefaults(),
+			"the correct production shape must load: refusing it would withdraw the only channel a "+
+				"TLS-terminating ingress deployment has")
+	})
+
+	t.Run("secure without the declaration is accepted", func(t *testing.T) {
+		cnf := base()
+		cnf.Server.Secure = true
+
+		require.NoError(t, cnf.validateAndAddDefaults(),
+			"a deployment that terminates TLS in-process declares none of this and must be "+
+				"unaffected")
+	})
+
+	t.Run("insecure warns rather than refusing", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := base()
+		cnf.Server.TrustForwardedProto = true
+
+		require.NoError(t, cnf.validateAndAddDefaults(),
+			"outside secure mode this must not be fatal: the local stack and this whole suite run "+
+				"there, and a fatal check would refuse configurations whose purpose is to be permissive")
+
+		var warned bool
+		for _, entry := range hook.AllEntries() {
+			if entry.Level == logrus.WarnLevel &&
+				strings.Contains(entry.Message, "BLNK_SERVER_TRUSTED_PROXIES") {
+				warned = true
+			}
+		}
+		assert.True(t, warned,
+			"but it must WARN, naming the variable: a silent no-op leaves the operator to "+
+				"discover it as a 403 on a credential request")
 	})
 }

@@ -65,11 +65,11 @@ func derivedReference(t *testing.T) string {
 // the resource name "*" as matching every resource, so a single such entry converts
 // a per-topic grant into a cluster-wide one.
 //
-// All FOUR category topics are accepted, blnk.system included, for the reason set out
-// at the system subtest below. What is refused is every DEAD-LETTER name — those carry
-// failure metadata and other subscribers' failed events, and are read under the master
-// key instead — along with foreign names, wildcards, and names whose category does not
-// exist in the closed four-category catalogue.
+// The THREE TENANT category topics are accepted. What is refused is `blnk.system` — the
+// internal category, for the reason set out at its subtest below — plus every DEAD-LETTER
+// name, since those carry failure metadata and other subscribers' failed events and are
+// read under the master key instead, along with foreign names, wildcards, and names whose
+// category does not exist in the closed four-category catalogue.
 func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *testing.T) {
 	grantable := model.SubscriberGrantableTopics(testTopicPrefix)
 	require.NotEmpty(t, grantable, "there must be at least one grantable topic to test against")
@@ -90,6 +90,7 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		"a prefixed wildcard":           "blnk.transactions*",
 		"a foreign topic of same shape": "attacker.transactions",
 		"a dead-letter topic":           "blnk.transactions.dlt",
+		"the internal system topic":     "blnk.system",
 		"the system dead-letter topic":  "blnk.system.dlt",
 		"a topic under another prefix":  "acme.transactions",
 		"an untrimmed grantable name":   " blnk.transactions ",
@@ -105,55 +106,62 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS GRANTABLE, and it is the one member of the set that has to
-	// argue for itself, because blnk.system carries system.error, whose payload is the
-	// frozen legacy body and therefore carries raw error text verbatim.
+	// THE SYSTEM CATEGORY IS NOT GRANTABLE, and it is the one refusal in the set that has to
+	// argue for itself, because `blnk.system` also carries `ledger.created` — an ordinary
+	// ledger event the legacy webhook transport delivers today.
 	//
-	// It is grantable because that is EXACT PARITY with the transport being replaced.
-	// internal/notification.NotifyError already delivers system.error, with that same
-	// verbatim error text, to the single configured webhook URL — so an event carrying
-	// deployment detail to a subscriber-supplied endpoint is what Blnk does today, not
-	// something this change introduces. Refusing the category would have made the Kafka
-	// pipeline deliver strictly LESS than the webhook it replaces, which R-1 forbids: the
-	// requirement is 100% of the event types SendWebhook routes, and an event published to
-	// a topic no credential may name is not delivered to anybody.
+	// It is refused because of the OTHER two things on that topic, neither of which a
+	// per-subscriber decision can remove. `system.error`'s payload is the frozen legacy body,
+	// so it renders Blnk's error text verbatim — schema, table, column, routine, broker
+	// address — and R-8 forbids narrowing it. And the category is the catalogue's CATCH-ALL, so
+	// a grant of it stands over every event type nobody has catalogued yet, which means access
+	// widened by a future routing omission rather than by an authorization decision.
 	//
-	// THE COST IS REAL AND IS RECORDED RATHER THAN GLOSSED. Because ledger.created shares
-	// blnk.system under the frozen four-category catalogue, a subscriber that wants ledger
-	// events is granted a topic that also carries system.error. That is a decision to take per
-	// subscriber, which is why the grant lives in authorized_topics and this allowlist only
-	// says what MAY be named. A fifth grantable `ledgers` category was implemented to separate
-	// them and removed: the catalogue is enumerated
-	// identically by the provisioning script, both Compose files, the Kubernetes manifests and
-	// every subscriber's topic list, so it is four everywhere or it is a deliberate contract
-	// change made in all of them at once. docs/event-streaming.md states the consequence for
-	// subscribers plainly.
-	t.Run("accepts the system category", func(t *testing.T) {
-		assert.NoError(t, validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix),
-			"blnk.system must be grantable, or ledger.created — which routes to it under the "+
-				"four-category catalogue — is published to a topic no credential may name, and "+
-				"the Kafka pipeline delivers strictly less than the webhook it replaces")
+	// CONTAINING IT PER SUBSCRIBER WAS THE PREVIOUS CONTRACT: the category was grantable, and
+	// the documented rule was to grant it only to a subscriber that needed ledger events. A
+	// rule an operator can violate in one PUT is not a boundary — one mis-grant, or one
+	// retained grant on a subscriber whose purpose changed, hands that subscriber Blnk's
+	// internal error text for the whole deployment. Refusing the name here is what makes the
+	// disclosure unreachable rather than discouraged.
+	//
+	// THE COST IS REAL AND IS RECORDED RATHER THAN GLOSSED: `ledger.created` has no subscriber
+	// Kafka route. R-1 is unaffected — it requires every event type to be PUBLISHED, and this
+	// one is captured, published to `blnk.system`, observable and replayable, readable by an
+	// operator directly or through the master-key-gated event API. A subscriber consuming it
+	// over webhooks keeps receiving it there for the remainder of the dual-delivery window. A
+	// fifth grantable `ledgers` category was implemented to close the gap and removed: the
+	// catalogue is enumerated identically by the provisioning script, both Compose files, the
+	// Kubernetes manifests and every subscriber's topic list, so it is four everywhere or it is
+	// a deliberate contract change made in all of them at once. docs/event-streaming.md states
+	// the consequence for subscribers plainly.
+	t.Run("refuses the system category", func(t *testing.T) {
+		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
+		require.Error(t, err,
+			"blnk.system carries system.error's verbatim error body and every uncatalogued event, "+
+				"so no subscriber may be granted it")
+		assert.Contains(t, err.Error(), "not grantable")
 	})
 
-	t.Run("the grantable set is exactly the four category topics", func(t *testing.T) {
+	t.Run("the grantable set is exactly the three tenant category topics", func(t *testing.T) {
 		// Stated as an EXACT set rather than as a series of accept/refuse cases, because
 		// every over-grant finding in this area reduces to the same question — which topics
 		// may a credential ever name — and a boundary is only checkable if it is enumerated
-		// in one place. A FIFTH category appearing here would fail, which is the point, and so
-		// would a category quietly dropped from the set.
+		// in one place. A FOURTH entry appearing here would fail, which is the point, and so
+		// would a tenant category quietly dropped from the set.
 		assert.ElementsMatch(t,
-			[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system"},
+			[]string{"blnk.transactions", "blnk.balances", "blnk.identities"},
 			model.SubscriberGrantableTopics(testTopicPrefix),
-			"all four category topics are grantable and no dead-letter topic is; which of them a "+
-				"PARTICULAR subscriber holds is decided per subscriber by authorized_topics, not "+
-				"by this allowlist")
+			"the three tenant category topics are grantable; neither blnk.system nor any "+
+				"dead-letter topic is, and which of the three a PARTICULAR subscriber holds is "+
+				"decided per subscriber by authorized_topics rather than by this allowlist")
 	})
 
 	t.Run("refuses every dead-letter sibling, grantable category or not", func(t *testing.T) {
 		// A `<topic>.dlt` holds Blnk's failure metadata alongside the full payload of every
 		// event that failed, for every subscriber, so it is operator-facing whatever the
-		// category it belongs to. Asserting it for a TENANT category as well as the internal
-		// one is what stops "the category is grantable" being read as "so is its sibling".
+		// category it belongs to. Asserting it for every TENANT category as well as the
+		// internal one is what stops "the category is grantable" being read as "so is its
+		// sibling".
 		for _, topic := range []string{
 			"blnk.transactions.dlt",
 			"blnk.balances.dlt",

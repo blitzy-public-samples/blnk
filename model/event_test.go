@@ -239,13 +239,13 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 			name:      "ledger created",
 			eventType: "ledger.created",
 			want:      EventCategorySystem,
-			reason:    "ledger.created belongs to none of the three named categories, and the agreed topic contract is FOUR categories, so it routes to blnk.system. That category IS grantable - see SubscriberGrantableEventCategories - because withholding it would withhold ledger.created, which the legacy webhook transport delivers today, from every subscriber. What it is not is granted by default: it is chosen per subscriber, and the documented rule is to grant it only to one that needs ledger.created, because the same topic carries system.error's verbatim body. A fifth grantable 'ledgers' category was implemented to separate them and removed again: the catalogue is a published contract and widening it obliges every subscriber to hold a grant it was never told about",
+			reason:    "ledger.created belongs to none of the three named categories, and the agreed topic contract is FOUR categories, so it routes to blnk.system. That category is NOT subscriber-grantable - see SubscriberGrantableEventCategories - because it also carries system.error's frozen verbatim-error body and is the catalogue's catch-all, and an operator rule one PUT can violate is not a boundary. The cost is that ledger.created is published, observable and replayable but reachable only by an operator; a fifth grantable 'ledgers' category was implemented to separate them and removed again, because the catalogue is a published contract and widening it belongs to a plan revision",
 		},
 		{
 			name:      "system error",
 			eventType: "system.error",
 			want:      EventCategorySystem,
-			reason:    "system.error carries Blnk's internal diagnostic detail, so it routes to the system category, which is the narrowest in the catalogue rather than an unreachable one: a grant is possible and is a deliberate per-subscriber decision made against what EventCategorySystem documents it discloses",
+			reason:    "system.error carries Blnk's internal diagnostic detail verbatim under a payload R-8 freezes, so it routes to the system category - the one category no subscriber can be granted, which is what keeps that text an operator surface rather than a subscriber-visible one",
 		},
 	}
 
@@ -265,56 +265,77 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 }
 
 // The catch-all arm's own test is not here. It used to be, in a duplicate whose prose
-// described blnk.system as internal and ungrantable — a property the code does not have and
-// that TestSubscriberGrantableEventCategories_IsEveryCategoryInTheCatalogue asserts the
-// opposite of, in this same file. The surviving
+// disagreed with the code it asserted against. The surviving
 // TestEventCategory_UnknownEventFallsBackToTheSystemCategory below states the contract
 // correctly and asserts a superset: the same two fallback answers plus IsCataloguedEventType,
 // which is what makes a routing omission observable rather than silent.
 
-// TestSubscriberGrantableEventCategories_CoversEveryCategory pins the allowlist the
-// subscriber authorization path and the ACL provisioning both consult.
+// TestSubscriberGrantableEventCategories_IsEveryTenantCategoryAndNotTheInternalOne pins the
+// allowlist the subscriber authorization path and the Kafka ACL provisioning both consult.
 //
-// It asserts the membership by NAME rather than by count, because a count-only
-// assertion passes just as happily when a category is swapped for another as when the
-// list is correct.
-func TestSubscriberGrantableEventCategories_CoversEveryCategory(t *testing.T) {
+// It asserts membership by NAME in both directions, because a count-only assertion passes just
+// as happily when one category is swapped for another as when the list is correct.
+//
+// # The three tenant categories are grantable; the system category is NOT
+//
+// AAP §0.5.2 and AMBIGUITY-2 fix the catalogue at four category topics and route BOTH
+// ledger.created and system.error to `<prefix>.system`. That topic is therefore withheld from
+// every subscriber, for two properties of it that no per-subscriber decision can remove:
+//
+//   - system.error's payload is the frozen legacy body, so it renders Blnk's error text as it
+//     comes — a PostgreSQL error names schema, table, column and routine; a broker error names
+//     internal addresses. R-8 freezes that body, so the disclosure cannot be redacted away.
+//   - The category is the catalogue's CATCH-ALL, so a grant of it also stands over every event
+//     type nobody has catalogued yet: access widened by a future routing omission rather than by
+//     an authorization decision.
+//
+// THE PREVIOUS CONTRACT WAS "grantable, but grant it deliberately", asserted by four
+// near-identical tests in this package. It was true prose and not a boundary: one PUT, or one
+// retained grant on a subscriber whose purpose changed, hands a subscriber Blnk's verbatim error
+// text for the whole deployment. Withholding the name is what makes that unreachable.
+//
+// The cost is real and is asserted rather than hidden — `ledger.created` shares the topic, so it
+// has no subscriber Kafka route. Coverage is unaffected: it is captured, published, observable and
+// replayable, and an operator reads it. Making it consumable means revising the frozen topic
+// catalogue, which belongs to a plan revision.
+func TestSubscriberGrantableEventCategories_IsEveryTenantCategoryAndNotTheInternalOne(t *testing.T) {
 	grantable := SubscriberGrantableEventCategories()
 
 	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
 
-	// GRANTABLE, and this is the assertion that matters most here, because it is the one
-	// a reader is most likely to expect the opposite of.
-	//
-	// blnk.system carries ledger.created and system.error, and BOTH were delivered by the
-	// legacy HTTP transport. Withholding the category would leave those two event types
-	// published and unreachable: captured, relayed and observable, with no credential Blnk
-	// can issue able to read them. That is coverage satisfied on the publishing side and
-	// broken on the consuming side, in the one direction the webhook-to-Kafka migration
-	// promises not to regress.
-	//
-	// What a grant of it discloses is real and is not glossed over: system.error's payload
-	// is the frozen legacy body, so it carries the error text as it renders — a PostgreSQL
-	// error names schema, table, column and routine; a broker error names internal
-	// addresses. The containment is therefore an AUDIENCE decision, made per subscriber by
-	// whoever chooses authorized_topics, which is the same decision an operator already
-	// made when they pointed one webhook URL at the same text. This list says what MAY be
-	// granted; it never says what any subscriber IS granted.
-	assert.Contains(t, grantable, EventCategorySystem,
-		"blnk.system carries ledger.created and system.error, both of which the legacy transport "+
-			"delivered, so the category must be grantable or those two event types are published "+
-			"and unreachable — a consuming-side regression the migration promises not to cause")
+	// THE ASSERTION THAT MATTERS MOST HERE, and the one a reader of the previous contract is
+	// most likely to expect the opposite of.
+	assert.NotContains(t, grantable, EventCategorySystem,
+		"the system category carries system.error's frozen verbatim-error body and is the "+
+			"catalogue's catch-all, so no subscriber may be granted it: it is an operator topic, in "+
+			"the same class as every <topic>.dlt")
 
-	assert.Len(t, grantable, 4,
-		"all four categories of the agreed topic contract are grantable; a fifth entry means a category was added without the contract being changed")
+	assert.Equal(t,
+		[]string{EventCategoryTransactions, EventCategoryBalances, EventCategoryIdentities},
+		grantable,
+		"the grantable list is the three tenant categories in catalogue order: a missing one makes a "+
+			"tenant category unreachable, and a fourth means the internal category reached the allowlist")
 
-	// Every category is grantable. The equality is asserted in BOTH directions, so neither
-	// a category that exists without being grantable nor a grantable token that is not a
-	// category can slip through.
-	assert.ElementsMatch(t, AllEventCategories(), grantable,
-		"the grantable list and the category list must contain exactly the same tokens: a category missing from the grantable list is unreachable for subscribers with nothing to say so, and a grantable token that is not a category would compose a topic nothing publishes to")
+	// The catalogue is unchanged and still holds four categories. Asserting BOTH halves is what
+	// keeps this a deliberate exclusion rather than a category that quietly disappeared: an event
+	// type still routes to the system category, and the topic is still created and published to.
+	assert.Len(t, AllEventCategories(), 4,
+		"the topic catalogue is frozen at four categories by AAP §0.5.2; a fifth means the contract "+
+			"was widened without the provisioning script, both compose stacks, the Kubernetes "+
+			"configuration and the subscriber documentation being changed with it")
+	assert.Contains(t, AllEventCategories(), EventCategorySystem,
+		"the system category must still EXIST — it is the catch-all every uncatalogued event routes "+
+			"to and the home of ledger.created; it is ungrantable, not absent")
+	assert.Len(t, grantable, len(AllEventCategories())-1,
+		"exactly one category is internal, so the allowlist is the catalogue minus one")
+
+	// No dead-letter token can appear, whatever the category list becomes.
+	for _, category := range grantable {
+		assert.NotContains(t, category, ".dlt",
+			"category %q must be a bare token: a dead-letter name reaching the grantable list would hand a subscriber every other subscriber's failed events", category)
+	}
 
 	// The accessors must hand back copies, or one caller's sort reorders every other
 	// caller's view.
@@ -1817,150 +1838,4 @@ func TestEventCategory_UnknownEventFallsBackToTheSystemCategory(t *testing.T) {
 		"a named member of the catalogue must be reported as catalogued")
 	assert.True(t, IsCataloguedEventType("bulk_transaction.applied"),
 		"a runtime-composed bulk transaction name must be reported as catalogued, because it is matched by prefix rather than enumerated")
-}
-
-// TestSubscriberGrantableEventCategories_IsEveryCategoryInTheCatalogue pins the grant surface at
-// ALL FOUR categories, and the "all" is the assertion rather than an incidental count.
-//
-// # Why every category is grantable
-//
-// AAP §0.5.2 and AMBIGUITY-2 fix the catalogue at four category topics and route BOTH
-// ledger.created and system.error to blnk.system. An ungrantable system category therefore does
-// not merely withhold Blnk's internal error detail — it makes ledger.created unreachable to every
-// subscriber, which is a regression against the transport being replaced: the legacy webhook
-// delivered ledger.created and system.error to the single configured URL alongside everything
-// else. Withholding a category the frozen contract routes ordinary ledger data through is a
-// larger fault than the disclosure it avoids, and the disclosure has its own remedy: a subscriber
-// is granted a SUBSET, and what granting blnk.system exposes is documented in
-// docs/event-streaming.md so the decision is made deliberately per subscriber.
-//
-// Nothing here says every subscriber SHOULD be granted the system topic. authorized_topics is an
-// explicit per-subscriber list; this test pins only which names may appear in it.
-func TestSubscriberGrantableEventCategories_IsEveryCategoryInTheCatalogue(t *testing.T) {
-	grantable := SubscriberGrantableEventCategories()
-
-	assert.Equal(t, AllEventCategories(), grantable,
-		"the grantable set IS the catalogue, in catalogue order: a category the contract routes "+
-			"events to but no subscriber may be granted is a topic nothing can consume")
-	assert.Contains(t, grantable, EventCategorySystem,
-		"blnk.system CARRIES ledger.created under the frozen four-category contract, so excluding "+
-			"it would withhold ordinary ledger data every webhook subscriber receives today")
-	assert.Len(t, grantable, 4,
-		"four categories, four grantable names; a fifth here means the catalogue grew a category "+
-			"AAP §0.5.2 does not have")
-
-	// The accessors must hand back copies, or one caller's sort reorders every other caller's view.
-	grantable[0] = "mutated"
-	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
-		"SubscriberGrantableEventCategories must return a fresh slice")
-}
-
-// TestSubscriberGrantableEventCategories_CoversEveryCategoryTopic pins the allowlist the
-// subscriber authorization path and the ACL provisioning both consult.
-//
-// It asserts the members by NAME rather than by count alone, because a count-only
-// assertion passes just as happily when a category is swapped for another as when the
-// list is correct.
-//
-// # Every category topic is grantable, and which ones a subscriber holds is per subscriber
-//
-// The topic design is four category topics, and this list is all four of them. It is an
-// allowlist of what MAY be granted, not a description of what any particular subscriber
-// has: a subscriber's authorized_topics names the subset it is entitled to, and its ACL
-// covers nothing else. Dead-letter topics are outside the list entirely, which
-// SubscriberGrantableTopics enforces structurally by composing only `<prefix>.<category>`
-// names.
-//
-// The system topic is on the list for a reason worth recording, because it replaced an
-// arrangement in which it was not. Both of its catalogued event types — ledger.created and
-// system.error — are delivered by the legacy HTTP transport today, so withholding them
-// here made two of the thirteen migrated event types PUBLISHED AND UNREACHABLE: captured,
-// relayed and observable, with no subscriber credential Blnk can issue able to read them.
-// That is a consuming-side regression in the one direction the migration promises not to
-// regress. Granting the topic is a deliberate operator decision per subscriber, and the
-// documentation states at the point of the grant that system.error carries verbatim
-// internal error text.
-func TestSubscriberGrantableEventCategories_CoversEveryCategoryTopic(t *testing.T) {
-	grantable := SubscriberGrantableEventCategories()
-
-	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
-	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
-	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
-	assert.Contains(t, grantable, EventCategorySystem,
-		"the system category carries ledger.created and system.error, both delivered by the legacy "+
-			"transport today, so it must be grantable: a published-but-unreachable event type is a "+
-			"consuming-side regression the migration promises not to cause")
-
-	assert.Len(t, grantable, 4,
-		"the topic design is four category topics and every one of them is grantable; a fifth entry here means a category was added without the provisioning script, the Kubernetes configuration and the subscriber documentation being changed with it")
-
-	assert.Equal(t, AllEventCategories(), grantable,
-		"the grantable list must be the whole category list in canonical order, so no layer has to reconstruct a subset")
-
-	// No dead-letter token can appear, whatever the category list becomes.
-	for _, category := range grantable {
-		assert.NotContains(t, category, ".dlt",
-			"category %q must be a bare token: a dead-letter name reaching the grantable list would hand a subscriber every other subscriber's failed events", category)
-	}
-
-	// The accessors must hand back copies, or one caller's sort reorders every other
-	// caller's view.
-	grantable[0] = "mutated"
-	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
-		"SubscriberGrantableEventCategories must return a fresh slice")
-
-	all := AllEventCategories()
-	all[0] = "mutated"
-	assert.NotContains(t, AllEventCategories(), "mutated",
-		"AllEventCategories must return a fresh slice")
-}
-
-// TestSubscriberGrantableEventCategories_OffersEveryCategoryByName pins the allowlist the
-// subscriber authorization path and the ACL provisioning both consult.
-//
-// It asserts membership by NAME rather than by count, because a count-only assertion passes just
-// as happily when one category is swapped for another as when the list is correct.
-//
-// # Why the system category is IN the list
-//
-// An exclusion was written here, to keep system.error's verbatim error text away from
-// subscribers, and the concern behind it is real: that payload is the frozen legacy body and the
-// text inside it describes the inside of the deployment.
-//
-// It is nevertheless not the right place to act on it, because `ledger.created` rides the same
-// topic under the agreed four-category catalogue. Excluding the category would therefore have
-// withheld an event the legacy webhook transport delivers TODAY from every subscriber, and the
-// allowlist would have reported nothing wrong — a lost event traded for a disclosure.
-//
-// The decision belongs one level down, in each subscriber's authorized_topics, where an operator
-// grants the system category only to a subscriber that needs ledger events. What such a grant
-// discloses is documented on EventCategorySystem, so the operator making it has the facts. This
-// test therefore pins the WIDEST set that may be granted, not what any particular subscriber is
-// granted.
-func TestSubscriberGrantableEventCategories_OffersEveryCategoryByName(t *testing.T) {
-	grantable := SubscriberGrantableEventCategories()
-
-	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
-	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
-	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
-	assert.Contains(t, grantable, EventCategorySystem,
-		"the system category carries ledger.created, which the legacy transport delivers today, so "+
-			"it must be grantable to the subscriber that needs it")
-
-	assert.Len(t, grantable, 4,
-		"all four categories are grantable; a shorter list means a category became unreachable for "+
-			"every subscriber, which loses whichever catalogued events it carries")
-
-	// No category may be missing from the allowlist. Every category that exists must be
-	// offerable, or an event is captured, published and reachable by nobody.
-	for _, category := range AllEventCategories() {
-		assert.Contains(t, grantable, category,
-			"category %q exists, so it must be grantable; a category that is neither granted nor "+
-				"documented as internal is unreachable for subscribers with nothing to say so", category)
-	}
-
-	// The accessors must hand back copies, or one caller's sort reorders every other caller's view.
-	grantable[0] = "mutated"
-	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
-		"SubscriberGrantableEventCategories must return a fresh slice")
 }

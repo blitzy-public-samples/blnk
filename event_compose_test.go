@@ -2245,6 +2245,13 @@ var workerExemptEventStreamingEnv = map[string]string{
 	"KAFKA_SUBSCRIBER_BROKERS":        "only credential issuance reports it, and only the server serves that endpoint",
 	"KAFKA_KEY_SCOPE_ENFORCEMENT":     "the same: it gates issuance, which this role does not serve",
 	"KAFKA_KEY_SCOPE_GATEWAY_BROKERS": "the addresses issuance reports under that declaration",
+	"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL": "the control endpoint issuance binds a key scope at, and " +
+		"deregistration withdraws it from; both endpoints are served by the server alone",
+	"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN": "the credential for that call, and this role never " +
+		"makes it — forwarding it would widen what a compromise of the worker is worth for no capability",
+	"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS": "it bounds a call this role does not make",
+	"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS": "the deployment's declaration about what a SUBSCRIBER " +
+		"credential may read, consulted only where credentials are issued",
 	"KAFKA_HISTORICAL_TOPIC_PREFIXES": "a new row's topic is composed from the CONFIGURED prefix alone, so the " +
 		"historical list can never decide whether an insert is accepted; only the publisher, the " +
 		"dead-letter write and replay read stored topics, and all three run in the server",

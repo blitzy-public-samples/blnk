@@ -213,6 +213,84 @@ const (
 	// refusal, one code, named after the configuration key an operator changes to lift it.
 	ErrSubscriberKeyScopeUnenforced ErrorCode = "SUBSCRIBER_KEY_SCOPE_UNENFORCED"
 
+	// ErrSubscriberKeyScopeRequired is the MIRROR of the code above: the refusal to issue a
+	// credential to a subscriber that records NO partition_key_prefix, in a deployment that has
+	// declared its subscriber access to be key-scoped.
+	//
+	// # Why the absence of a prefix can be the fault
+	//
+	// A category topic is shared by every ledger in the deployment, so a credential holding
+	// topic Read reads all of them. Where the deployment has declared a key-authorising
+	// component (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway) it has said that subscriber access
+	// is scoped by record key — and a subscriber registered without a prefix in that deployment
+	// is the one credential that escapes the model entirely: it is granted literal topic Read
+	// and reads every tenant on every topic it holds, while every other subscriber is confined.
+	// Issuing it silently is how a tenant-scoped deployment acquires one unscoped principal
+	// nobody remembers granting.
+	//
+	// So under a declared key-scoped model, a key scope is MANDATORY, and this is the refusal.
+	// The remedies are both real and both named in the message: record the ledger-id prefix the
+	// subscriber is entitled to, or stop declaring the key-scoped model and acknowledge
+	// whole-topic access explicitly (KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS), which is a decision
+	// somebody has then made rather than one the system made for them.
+	//
+	// 409 rather than 400: the request has no body, so nothing about it is malformed; what is
+	// wrong is the row's state relative to the deployment's declared model, and after either
+	// remedy the identical request succeeds.
+	ErrSubscriberKeyScopeRequired ErrorCode = "SUBSCRIBER_KEY_SCOPE_REQUIRED"
+
+	// ErrSubscriberSharedTopicAccessUnacknowledged is the refusal to mint a whole-topic
+	// credential in a production deployment that has declared nothing about its access model.
+	//
+	// # What the caller is being told
+	//
+	// Kafka authorises topics and consumer groups. It has no message-key dimension, so a
+	// credential granted a category topic reads EVERY record on it — every ledger's, every
+	// other subscriber's. That is not a defect being reported; it is the access model the
+	// requirement mandates, since per-tenant topics are excluded. What is missing is somebody
+	// having said so.
+	//
+	// Blnk therefore asks a secure-mode deployment to declare its model once, explicitly:
+	// either KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with a verified key-authorising
+	// component in front of the brokers, or KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS=true, which
+	// records that whole-topic reads are understood and intended. Until one of them is set,
+	// issuance refuses with this code rather than handing out a credential whose breadth nobody
+	// has acknowledged.
+	//
+	// It fires ONLY in secure mode (BLNK_SERVER_SECURE=true), the same production signal the
+	// search-credential refusal reads. A local stack, the compose files and the whole test
+	// suite run outside it and are unaffected — which is deliberate: the declaration exists to
+	// make a production decision explicit, not to break `make run`.
+	//
+	// 409, with the other state refusals: the request is well formed, the deployment's
+	// configuration is what has to change, and after it the identical request succeeds.
+	ErrSubscriberSharedTopicAccessUnacknowledged ErrorCode = "SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED"
+
+	// ErrSubscriberKeyScopeUnattested is the refusal to mint a key-scoped credential when the
+	// declared key-authorising component did not ATTEST the boundary it is supposed to keep.
+	//
+	// # Why a declaration is not enough
+	//
+	// A key-scoped credential is issued with NO topic Read: the broker refuses every fetch, and
+	// the subscriber's records reach it through the component the deployment declared in front
+	// of the brokers. Two configuration values used to be the whole basis for believing that
+	// component exists — a mode and a bootstrap list — and neither is evidence. A deployment
+	// could name any address, and Blnk would mint a credential declaring an enforced key
+	// boundary that nothing was applying, which is the same false assurance the pre-refusal
+	// behaviour had.
+	//
+	// So before the secret exists and before the broker is touched, Blnk asks the declared
+	// component, over an authenticated channel, to confirm three things: that it enforces key
+	// scopes at all, that it will do so for THIS principal, and that the prefix it holds is
+	// byte-for-byte the prefix the registry recorded. Anything else — unreachable, unauthorised,
+	// a mismatched prefix, a malformed answer, a refusal — is this code.
+	//
+	// 409 rather than 503, even when the cause was a timeout: the deployment's enforcement point
+	// is state, not a Blnk dependency being briefly unavailable, and answering 503 would send an
+	// operator to look at Kafka. The `retryable` flag in the error detail is what distinguishes a
+	// transport failure (worth repeating) from a prefix mismatch (not).
+	ErrSubscriberKeyScopeUnattested ErrorCode = "SUBSCRIBER_KEY_SCOPE_UNATTESTED"
+
 	// ErrSubscriberAccessExceedsAuthorization is the refusal to issue a credential to a
 	// principal the broker would grant MORE access than the registry records.
 	//
@@ -455,6 +533,20 @@ var statusByCode = map[ErrorCode]int{
 	// authorizer has no message-key dimension, so no retry narrows what a credential would
 	// carry.
 	ErrSubscriberKeyScopeUnenforced: http.StatusConflict,
+	// Also 409, and the mirror of the entry above: the deployment declared a key-scoped access
+	// model and this row records no key scope, so the remedy is a state change — record the
+	// prefix, or acknowledge whole-topic access — and never a retry.
+	ErrSubscriberKeyScopeRequired: http.StatusConflict,
+	// Also 409: the deployment has declared nothing about its subscriber access model and this
+	// is a production posture, so the configuration is what changes. Not 403, which would say
+	// the CALLER is not permitted; the caller holds the master key and the deployment is what
+	// has not decided.
+	ErrSubscriberSharedTopicAccessUnacknowledged: http.StatusConflict,
+	// Also 409, and NOT 503 even when the attestation timed out: the declared enforcement point
+	// is part of the deployment's state, so a 503 would send an operator to a Kafka that never
+	// stopped answering. The detail's `retryable` flag separates a transport failure from a
+	// prefix mismatch.
+	ErrSubscriberKeyScopeUnattested: http.StatusConflict,
 	// Also 409, and NOT the 503 of SUBSCRIBER_PROVISIONING_FAILED: the broker answered and
 	// the boundary it would enforce is wider than the row records, which a retry cannot
 	// change. Without this entry the refusal would resolve to the unknown-code 500 — which is

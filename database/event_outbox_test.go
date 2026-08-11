@@ -8783,6 +8783,7 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		"a wildcarded category":                  "blnk.*",
 		"a foreign topic":                        "attacker.transactions",
 		"a dead-letter topic":                    "blnk.transactions.dlt",
+		"the internal system topic":              "blnk.system",
 		"the system dead-letter":                 "blnk.system.dlt",
 		"a category this contract does not have": "blnk.ledgers",
 	}
@@ -8792,23 +8793,24 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS ACCEPTED, and it is worth saying so here because the opposite
-	// reading is tempting. `blnk.system` carries `ledger.created` and `system.error`, two of
-	// the thirteen event types the legacy webhook transport delivered, so refusing a grant on
-	// it would leave a migrating subscriber with no authorized path to either — coverage on
-	// the publishing side and a regression on the consuming side.
+	// THE SYSTEM CATEGORY IS REFUSED AT THIS LAYER TOO, and it is worth saying so here rather
+	// than leaving it as one entry in the table above.
 	//
-	// What a grant of it discloses is real: `system.error`'s payload is the FROZEN legacy
-	// body, so it still carries the error text as it renders — a PostgreSQL error names
-	// schema, table, column and routine; a broker error names internal addresses. That body
-	// cannot be narrowed without breaking the payload-preservation guarantee the whole
-	// migration rests on. So the containment is an AUDIENCE decision recorded per subscriber
-	// in authorized_topics, exactly the decision an operator already made when they pointed
-	// one webhook URL at the same text — not a decision this layer makes for them. This layer
-	// enforces only that a stored topic is one that MAY be granted.
-	t.Run("accepts the system category", func(t *testing.T) {
-		assert.NoError(t, requireGrantableTopics([]string{"blnk.system"}),
-			"blnk.system carries ledger.created and system.error, so a subscriber must be able to hold it")
+	// `blnk.system` carries `system.error`, whose payload is the FROZEN legacy body and
+	// therefore renders the error text as it comes — a PostgreSQL error names schema, table,
+	// column and routine; a broker error names internal addresses — and R-8 forbids narrowing
+	// that body. It is also the catalogue's catch-all. So it is an OPERATOR topic, and the
+	// refusal lives in one place, model.SubscriberGrantableEventCategories, which the DTO, this
+	// persistence boundary and the ACL provisioner all read.
+	//
+	// This layer matters because it is the door a caller reaches WITHOUT the DTO: a service, CLI
+	// or migration caller writing a row directly. A row seeded past both would still be refused
+	// at issuance, but it would already describe a grant the deployment does not permit.
+	//
+	// The cost is that `ledger.created` — which shares the topic — has no subscriber Kafka
+	// route. It is still captured, published, observable and replayable for an operator.
+	t.Run("refuses the internal system category", func(t *testing.T) {
+		requireAPIError(t, requireGrantableTopics([]string{"blnk.system"}), apierror.ErrInvalidInput)
 	})
 
 	t.Run("refuses an offending topic in any position", func(t *testing.T) {
