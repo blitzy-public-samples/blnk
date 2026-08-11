@@ -1662,13 +1662,16 @@ var subscriberLifecycleKeyScopeGatewayBrokers = []string{"keyscope-gateway.examp
 // enforceKeyScopeGateway republishes the lifecycle configuration with key-scope enforcement
 // ACTIVE, and returns the gateway list it declared.
 //
-// What declaring it CHANGES is the endpoint a key-scoped credential names, and only that. The
-// in-binary subscriber stream gateway enforces the prefix in every build — see
-// streamGatewayEnforcesKeyScope — so issuance does not depend on this call; a test that omits it
-// still gets a credential, and gets the SUBSCRIBER-FACING broker list rather than this gateway.
-// A test asserting that the enforcing endpoint is what a key-scoped credential reports therefore
-// has to declare one here, and a test asserting the ordinary deployment's endpoint must not call
-// this at all.
+// IT IS A PRECONDITION OF EVERY KEY-SCOPED ISSUANCE, not a variation on one. Blnk ships no
+// component that authorises record keys and serves no records itself, so without this call the
+// shipped default applies and issuance for a prefix-recording row REFUSES with
+// SUBSCRIBER_KEY_SCOPE_UNENFORCED — see
+// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway, which is the
+// test that asserts exactly that and is therefore the one test that must NOT call this.
+//
+// Declaring it also changes the endpoint a key-scoped credential names: the gateway list rather
+// than the subscriber-facing broker list, because that subscriber's connection is terminated by
+// the declared component.
 //
 // Parameters:
 //   - t *testing.T: for the helper marker and the configuration restore.
@@ -2133,11 +2136,6 @@ func TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers(t *testing.
 		"the addresses Blnk dials must never appear in a subscriber's credential: they do not "+
 			"resolve for it, and publishing them discloses internal topology")
 }
-
-// TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList HAS BEEN REMOVED, for
-// the reason set out at length further down under "THE SUBSCRIBER-FACING BROKER LIST IS A WARNED
-// FALLBACK, NOT A NINTH REQUIRED VARIABLE": it asserted the opposite answer, for the same input,
-// to the two tests that replaced it.
 
 // TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll is the fail-closed
 // remainder: with neither list set there is no Kafka, so no endpoint could be reported and no
@@ -4430,6 +4428,12 @@ func TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNo
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
+
 	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err,
 		"a recorded key prefix must not withdraw the mandatory credential capability: there is no "+
@@ -4492,6 +4496,12 @@ func TestIssueSubscriberCredential_StillWorksOnceTheKeyScopeIsCleared(t *testing
 	run := newSubscriberLifecycle(t).seeded(row)
 	admin, service := run.admin, run.service
 
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
+
 	scoped, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err, "issuance works before the prefix is cleared")
 	require.Equal(t, "ldg_9f1c8a72", scoped.PartitionKeyPrefix)
@@ -4541,6 +4551,12 @@ func TestIssueSubscriberCredential_StillWorksOnceTheKeyScopeIsCleared(t *testing
 func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	store, service := run.store, run.service
+
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
 
 	prefix := "ldg_k_83f61ccabf29"
 	updated, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
@@ -4628,6 +4644,10 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 	t.Run("a key scope on a subscriber with no credential is accepted", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
 
+		// A DECLARED ENFORCEMENT POINT: without one this row fails closed with
+		// SUBSCRIBER_KEY_SCOPE_UNENFORCED, which is asserted on its own elsewhere.
+		enforceKeyScopeGateway(t)
+
 		prefix := "ldg_9f1c8a72"
 		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
 			PartitionKeyPrefix: &prefix,
@@ -4636,10 +4656,11 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 		require.NotNil(t, updated.PartitionKeyPrefix)
 		assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
 
-		// And the state it produces IS ISSUABLE. This is the half a blanket refusal got wrong: it
-		// withheld the credential instead of narrowing it, so the third dimension of requirement
-		// R-7's access model had no working path at all. What makes issuance safe here is that the
-		// credential is not topic-wide — record-level Read is withheld and the gateway delivers.
+		// And the state it produces IS ISSUABLE, because a component is declared above. This is the
+		// half a blanket refusal got wrong: it withheld the credential unconditionally, so the third
+		// dimension of requirement R-7's access model had no working path even where an operator had
+		// stood up something to keep it. What makes issuance safe here is that the credential is not
+		// topic-wide — record-level Read is withheld, and the declared component is the only path.
 		credential, issueErr := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 		require.NoError(t, issueErr,
 			"a key-scoped row must be issuable: the credential is narrowed rather than withheld")
@@ -4659,6 +4680,10 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 
 	t.Run("a key scope on a provisioned subscriber is accepted and narrows the grant", func(t *testing.T) {
 		run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
+
+		// A DECLARED ENFORCEMENT POINT: without one this row fails closed with
+		// SUBSCRIBER_KEY_SCOPE_UNENFORCED, which is asserted on its own elsewhere.
+		enforceKeyScopeGateway(t)
 
 		prefix := "ldg_9f1c8a72"
 		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
@@ -4720,28 +4745,33 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 	})
 }
 
-// THE SUBSCRIBER-FACING BROKER LIST IS A WARNED FALLBACK, NOT A NINTH REQUIRED VARIABLE.
+// THE SUBSCRIBER-FACING BROKER LIST IS REQUIRED FOR ISSUANCE, AND IT HAS BEEN BOTH THINGS.
 //
-// TestIssueSubscriberCredential_RefusesWhenNoSubscriberFacingBrokersAreConfigured used to sit
-// here, asserting that issuance answered 503 whenever KAFKA_SUBSCRIBER_BROKERS was unset. That
-// contract was withdrawn deliberately: requirement R-10 describes EIGHT configuration variables,
-// and making the advertised list a hard prerequisite added a ninth mandatory one — a deployment
-// configured exactly as the contract says could publish every event and still be refused every
-// credential, for a setting no requirement mentions.
+// A test asserting the 503 sat here, was replaced by one asserting a warned FALLBACK to
+// KAFKA_BROKERS, and the refusal has now been restored. The reasoning that produced each turn is
+// worth keeping, because both objections are real:
 //
-// What replaced it is two tests rather than one, because the behaviour splits in two:
+//   - AGAINST REQUIRING IT: requirement R-10 describes EIGHT configuration variables, so a ninth
+//     prerequisite means a deployment configured exactly as documented can publish every event and
+//     still be refused every credential.
+//   - AGAINST THE FALLBACK: KAFKA_BROKERS holds the addresses BLNK dials, which inside a deployment
+//     do not resolve for a subscriber outside it. The warning landed in Blnk's log while the
+//     consequence landed on the subscriber, and because the secret is shown once, diagnosing it
+//     costs a reissue.
 //
-//   - TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList, above, pins that the
-//     eight documented variables are enough, and that the internal list is reported with a
-//     warning naming the variable and the fix.
-//   - TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll, above, pins the
-//     fail-closed remainder: with NEITHER list set there is no Kafka at all, so no endpoint
-//     could be reported and no credential could work.
+// What resolves both: the refusal, plus a documented one-line remedy for the in-cluster case — set
+// KAFKA_SUBSCRIBER_BROKERS to the same value as KAFKA_BROKERS, which makes the claim explicit
+// rather than implicit in a substitution nobody reads. R-10's eight variables remain sufficient to
+// PUBLISH; only the endpoint whose entire output is a third-party address needs the ninth.
 //
-// Both of the old test's real properties survive in the second of those — the 503, the code, the
-// variable named in the message, and no secret, no broker call and no registry write before the
-// refusal. Keeping the old test alongside its successor left two tests asserting opposite
-// answers for one input.
+// The behaviour now lives in three tests, none of them contradicting another:
+//
+//   - TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList, below, for the
+//     refusal, the variable named in the message, the absence of residue, and the remedy working.
+//   - TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll, above, for the case
+//     where NEITHER list is set, meaning no Kafka at all.
+//   - TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers, above, for the success case
+//     and for the two lists being held apart.
 
 // TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent pins the two functions that decide, together,
 // what a credential response says about the key boundary.
@@ -7081,6 +7111,12 @@ func TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope(t *testi
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
+
 	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err,
 		"A KEY SCOPE MUST NOT REFUSE ISSUANCE: refusing withheld the credential instead of "+
@@ -7811,7 +7847,7 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 //
 // What replaced it is a NARROWER GRANT plus an enforcement point. A key-scoped subscriber is
 // provisioned with Describe and no Read on its topics, so the broker itself refuses its direct
-// fetches, and its records are delivered by Blnk's subscriber stream gateway, which applies the
+// fetches, and its records are delivered by the declared key-authorising component, which applies the
 // prefix per record before anything leaves the process. The prefix is therefore enforced by a
 // component in the path, not requested of the subscriber.
 //
@@ -7827,12 +7863,18 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 //     what the refusal used to stand in for: the grant a key-scoped row is actually given
 //
 // requireEnforceableKeyScope was retired with them. requireProvisionableKeyScope,
-// requireRecordableKeyScope and apierror.ErrSubscriberIsolationUnenforceable were NOT: they take
-// the enforcement fact as a parameter now, so each refuses only in a build that links no
-// enforcement point, and streamGatewayEnforcesKeyScope is what makes that condition false here.
-// The refusals therefore remain reachable and tested — see
-// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope — while no request to
-// this binary can reach one.
+// requireRecordableKeyScope and apierror.ErrSubscriberKeyScopeUnenforced were NOT: they take the
+// enforcement fact as a parameter, read once from config.KafkaConfig.KeyScopeGateway, so each
+// refuses whenever the deployment has declared no component that authorises record keys — which
+// is the SHIPPED DEFAULT. The refusals are therefore reachable by an ordinary request, not merely
+// by a hand-passed boolean: see
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope for the guard and
+// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway for the endpoint.
+//
+// What changed since this note was first written is the premise, not the guards: an in-binary
+// enforcement point was introduced and then REMOVED, because a Blnk-hosted read path is a second
+// data plane holding Blnk's own wide credential, authenticated by a header the authorization layer
+// does not know about and unaffected by revoking the subscriber's SCRAM credential.
 
 // TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed pins what a successful
 // credential says about its own reach.
@@ -7840,8 +7882,9 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 // It began life as TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope,
 // asserting that a recorded partition-key prefix was no reason to withhold a credential. That
 // premise holds on the key-scoped path too, and that is why the fixture here records a prefix: a
-// key-scoped row IS issuable — its credential holds no record-level Read and the stream gateway
-// delivers, key-filtered — so the narrowed grant has to be reported as faithfully as the ordinary
+// key-scoped row IS issuable where a component is declared — its credential holds no record-level
+// Read and the declared component delivers, key-filtered — so the narrowed grant has to be
+// reported as faithfully as the ordinary
 // one. The secret exists once, the broker was really asked, the issuance is really recorded, the
 // scope is delivered to the party that applies it together with the component that enforces it,
 // and the reported grant is the BROKER-CONFIRMED one.
@@ -7942,7 +7985,7 @@ func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t 
 // stores one credential per principal, unable ever to rotate its secret. The diagnosis was right
 // about the old grant and wrong about the remedy: refusing removed the operator's only way to
 // record the decision, and the enforcement it was standing in for does not come from withholding
-// anything. Recording the prefix NARROWS the live grant instead, and the subscriber stream gateway
+// anything. Recording the prefix NARROWS the live grant instead, and the declared component
 // becomes the only path that subscriber's records can take.
 //
 // So what is asserted here is that the decision is recordable, that it is persisted, that the row
@@ -7954,6 +7997,12 @@ func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t 
 func TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	store, service := run.store, run.service
+
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
 
 	prefix := "ldg_k_83f61ccabf29"
 	updated, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
@@ -8030,6 +8079,10 @@ func TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal(t *testing.
 
 		run := newSubscriberLifecycle(t).seeded(row)
 
+		// A DECLARED ENFORCEMENT POINT: without one this row fails closed with
+		// SUBSCRIBER_KEY_SCOPE_UNENFORCED, which is asserted on its own elsewhere.
+		enforceKeyScopeGateway(t)
+
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
 
@@ -8054,9 +8107,10 @@ func TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal(t *testing.
 		assert.Equal(t, issuedAt, entry.Data["credential_issued_at"],
 			"the instant separates 'I provisioned this a moment ago' from 'a principal minted an "+
 				"hour ago is now described as key-scoped'")
-		assert.Contains(t, entry.Message, "gateway",
-			"and the message must name the component that applies the prefix, because that is "+
-				"where the holder's records now come from")
+		assert.Contains(t, entry.Message, "KAFKA_KEY_SCOPE_ENFORCEMENT",
+			"and the message must name the component that applies the prefix — by naming the variable "+
+				"that declares it, because that is where the holder's records now come from and Blnk "+
+				"ships nothing that would serve them itself")
 		assert.Contains(t, entry.Message, "WITHDRAWN",
 			"and must state that record-level Read was taken away, since a fetch beginning to "+
 				"fail is the symptom an operator will be searching for")
@@ -8203,6 +8257,12 @@ func TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared(t *testing.T
 	run := newSubscriberLifecycle(t).seeded(row)
 	admin, service := run.admin, run.service
 
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
+
 	scoped, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err,
 		"a recorded key scope is issued to, and the response declares that the broker does not "+
@@ -8228,63 +8288,119 @@ func TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared(t *testing.T
 			"an endpoint that does not resolve for it")
 }
 
-// TestIssueSubscriberCredential_StillNamesAnEndpointForAKeyScopedSubscriberWithoutAGateway is the
-// ordinary deployment: a key scope enforced by the in-binary stream gateway, with no EXTERNAL
-// gateway declared.
+// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the SHIPPED
+// DEPLOYMENT: a row recording a partition-key prefix, and nothing declared that authorises record
+// keys.
 //
-// # The substitution this guards, and why it needs its own test
+// # Why a refusal rather than a credential
 //
-// Where an external enforcing endpoint is declared, a key-scoped credential must name IT rather
-// than the brokers: that subscriber's connection is terminated by the gateway, and reporting a
-// bootstrap address would hand out a credential declaring gateway-enforced isolation together
-// with an endpoint that bypasses the gateway. TestIssueSubscriberCredential_ReportsTheGrant
-// ProvisioningConfirmed covers that case, and it declares a gateway to reach it.
+// Kafka's authorizer has no message-key dimension, and Blnk ships no component that supplies one.
+// So there are exactly two credentials this service could mint for such a row, and both are wrong:
+// one carrying whole-topic Read, which reads every other ledger's records beside a prefix nothing
+// applies; or one carrying Describe and no Read, which can fetch nothing at all and whose response
+// would name an endpoint that refuses it. The refusal is the third option, and it is the only one
+// that neither over-grants nor hands out a credential that cannot work.
 //
-// The substitution must not key on WHETHER the scope is enforced, because the answer to that is
-// always yes — streamGatewayEnforcesKeyScope — while the gateway ADDRESS is populated only by an
-// external declaration. Keying on the fact replaces the broker list with an empty one in every
-// ordinary deployment, and the subscriber is handed a credential naming nowhere to connect: a 200
-// whose failure surfaces as an unexplained connection error in somebody else's logs. Nothing else
-// in the suite would notice, because every other key-scoped issuance test declares a gateway
-// first and therefore takes the substituted path.
+// A Blnk-hosted read path was the fourth option and was removed. It made Blnk a second data plane
+// holding Blnk's own wide producer credential, authenticated by a bespoke header the platform's
+// authorization layer knows nothing about, and unaffected by revoking the subscriber's SCRAM
+// credential at the broker — so revocation stopped the direct path and left the served one open.
 //
-// The in-binary gateway needs no substitution: it is not a bootstrap endpoint but a route on
-// Blnk's own API. The broker list stays truthful for this subscriber precisely because its grant
-// is narrowed — Describe and no topic Read — so those addresses admit it to describe its topics
-// and refuse its every fetch, which is the boundary the response also declares.
-func TestIssueSubscriberCredential_StillNamesAnEndpointForAKeyScopedSubscriberWithoutAGateway(
+// # What the refusal has to be, to be usable
+//
+// TYPED, so a client can tell it from an outage; 409 rather than 503, because no retry helps; and
+// carrying BOTH remedies, because a refusal naming none is a dead end. Nothing may be minted or
+// recorded on the way out: the assertions below check the broker was never asked and no issuance
+// was written, which is what makes the refusal free of residue.
+func TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(
 	t *testing.T,
 ) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
 
-	// DELIBERATELY NOT enforceKeyScopeGateway: this is the deployment in which the only
-	// enforcement point is the one linked into the binary.
+	// DELIBERATELY NOT enforceKeyScopeGateway: this is the shipped deployment, in which nothing
+	// authorises record keys. Every other key-scoped issuance test declares one, so this is the
+	// single test standing between the default and an unasserted refusal.
+	run := newSubscriberLifecycle(t).seeded(row)
+	service := run.service
+
+	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.Error(t, err,
+		"a key-scoped row must NOT be issued a credential where nothing applies its prefix")
+	assert.Zero(t, credential.PasswordLength(),
+		"and no secret may exist: a refusal that generated one has already created the thing it "+
+			"declined to hand over")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrSubscriberKeyScopeUnenforced, apiErr.Code,
+		"the TYPED code, so a client tells this apart from a broker outage")
+	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+		"409 and never the 500 an unmapped code resolves to: the request is well formed, nothing "+
+			"is unavailable, and no retry changes the answer")
+	assert.Contains(t, err.Error(), "Clear the partition key prefix",
+		"the first remedy, or the endpoint is a dead end for this row")
+	assert.Contains(t, err.Error(), "narrow the subscriber's authorized topics",
+		"and the enforceable alternative an operator wanting isolation needs")
+
+	// NOTHING REACHED THE BROKER AND NOTHING WAS RECORDED. The refusal is ordered ahead of both,
+	// so there is no credential to revoke and no registry row to repair.
+	assert.Zero(t, run.log.count("UpsertScramCredential"),
+		"no SCRAM credential may be created for a row that is being refused")
+	assert.Zero(t, run.log.count("ProvisionSubscriberPrincipal"),
+		"and the broker must not be asked at all")
+	assert.Zero(t, run.log.count("RecordSubscriberCredentialIssued"),
+		"nor may an issuance be recorded for a credential that does not exist")
+}
+
+// TestIssueSubscriberCredential_NamesTheDeclaredGatewayForAKeyScopedSubscriber is the other side of
+// the same decision: with a component declared, the credential is issued AND names that component.
+//
+// # The substitution this guards, and why it needs its own test
+//
+// A key-scoped credential must name the declared component rather than the brokers: that
+// subscriber's connection is terminated by it, and reporting a bootstrap address would hand out a
+// credential declaring key-scoped isolation together with an endpoint that bypasses the thing
+// enforcing it. The subscriber-facing broker list is what a PREFIX-LESS subscriber gets, and the
+// assertions below hold the two apart so neither can be reported for the other.
+//
+// The substitution keys on the declared ADDRESS rather than on the enforcement boolean, and the
+// two are separable on purpose: the boolean decides whether issuance happens at all, the address
+// decides which endpoint is named. They agree by construction because both come from one
+// configuration read — but a substitution written against the boolean would hand out a credential
+// naming NOWHERE if that ever stopped being true.
+func TestIssueSubscriberCredential_NamesTheDeclaredGatewayForAKeyScopedSubscriber(
+	t *testing.T,
+) {
+	row := subscriberFixtureRow(t)
+	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+
 	run := newSubscriberLifecycle(t).seeded(row)
 	admin, service := run.admin, run.service
+	gateway := enforceKeyScopeGateway(t)
 
 	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err,
-		"a key-scoped row is issuable without an external gateway: the stream gateway in this "+
-			"binary is the enforcement point")
+		"a key-scoped row IS issuable once a component is declared to apply its prefix")
 
 	require.NotEmpty(t, credential.Brokers,
 		"AND THE CREDENTIAL MUST NAME SOMEWHERE TO CONNECT. An empty list here is the defect this "+
 			"test exists for: the subscriber cannot dial it, and it reads as an outage rather than "+
 			"as a misconfiguration")
-	assert.Equal(t, subscriberLifecycleSubscriberBrokers, credential.Brokers,
-		"and the endpoint is the subscriber-facing broker list, because no external gateway was "+
-			"declared to replace it")
-	assert.Equal(t, strings.Join(subscriberLifecycleSubscriberBrokers, ","), credential.BrokerEndpoint,
+	assert.Equal(t, gateway, credential.Brokers,
+		"and the endpoint is the DECLARED component, which is what terminates this subscriber's "+
+			"connection")
+	assert.Equal(t, strings.Join(gateway, ","), credential.BrokerEndpoint,
 		"the joined form travels in the same response and must agree with the list")
 	assert.NotEqual(t, admin.Brokers(), credential.Brokers,
 		"never the addresses Blnk dials, which do not resolve outside the deployment")
-	assert.NotEqual(t, subscriberLifecycleKeyScopeGatewayBrokers, credential.Brokers,
-		"and never a gateway this deployment never declared")
+	assert.NotEqual(t, subscriberLifecycleSubscriberBrokers, credential.Brokers,
+		"and never the subscriber-facing broker list, which would bypass the component enforcing "+
+			"the prefix")
 
 	assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement,
-		"the scope IS enforced — by the stream gateway on Blnk's own API — so the credential says "+
-			"so even though the endpoint it names is a broker list")
+		"the scope IS enforced, by the declared component, so the credential names it — and the "+
+			"value is the same word the deployment declared in KAFKA_KEY_SCOPE_ENFORCEMENT")
 	assert.Equal(t, "ldg_9f1c8a72", credential.PartitionKeyPrefix,
 		"and the subscriber is told the prefix its records are filtered by")
 }
@@ -8303,6 +8419,12 @@ func TestIssueSubscriberCredential_StillNamesAnEndpointForAKeyScopedSubscriberWi
 // what the NEXT issuance delivers.
 func TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
+
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
 
 	const scope = "ldg_9f1c8a72"
 
@@ -8344,6 +8466,12 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
+	// without one, issuance and a prefix-recording update both fail closed with
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
+	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
+	enforceKeyScopeGateway(t)
+
 	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err,
 		"a recorded key scope must not withhold the credential: a subscriber with no credential "+
@@ -8382,21 +8510,42 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 		"and no dead-letter sibling is ever carried along with a category grant")
 }
 
-// TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList is the R-10 half.
+// TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList is the R-10 half, and
+// the behaviour it pins reversed once: a fallback to KAFKA_BROKERS was tried, warned about, and
+// withdrawn.
 //
-// KAFKA_SUBSCRIBER_BROKERS used to be a prerequisite, and issuance answered 503 without it.
-// That made a ninth variable mandatory for an endpoint the configuration contract describes
-// with eight: a deployment configured exactly as documented could publish every event and
-// still be refused every credential. So the internal list is now the REQUIRED FALLBACK — the
-// endpoint works — and the fact that it was used is warned about instead, because reporting an
-// internal address is right for an in-cluster subscriber and wrong for an external one, and
-// only an operator knows which.
-func TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList(t *testing.T) {
+// # Why the fallback was not acceptable, even warned
+//
+// KAFKA_BROKERS is what BLNK dials. Inside a deployment that is "kafka:9092", a ClusterIP or a
+// headless Service, and none of those resolve for a subscriber outside it — and Kafka compounds it,
+// because a broker answers every client with the ADVERTISED address of the listener the connection
+// arrived on, so even a reachable bootstrap hands back internal names for the partition leaders.
+//
+// The fallback logged a warning, and the warning was not a control: it landed in Blnk's log while
+// the consequence landed on the subscriber, as an unexplained connection timeout days later. And
+// because the SASL secret is shown exactly once, diagnosing it costs a reissue — which invalidates
+// the credential the subscriber is already holding. A 200 that cannot be used is the worst of the
+// three available answers.
+//
+// The R-10 objection to requiring it — that the configuration contract names eight variables and a
+// ninth prerequisite makes a documented deployment unable to issue — is answered without a
+// fallback: a deployment whose subscribers really are in-cluster sets KAFKA_SUBSCRIBER_BROKERS to
+// the same value as KAFKA_BROKERS. One line, and the claim is explicit rather than implicit in a
+// substitution nobody reads.
+//
+// # What is asserted
+//
+// The refusal is typed, it is 503 rather than a 400-class answer because only an operator can
+// supply the list, it NAMES the variable, and it leaves no residue: no secret generated, no broker
+// call made, no issuance recorded. The complementary case — the whole list absent, meaning no Kafka
+// at all — is TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll, and the
+// success case is TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers.
+func TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
 	// Republished WITHOUT the subscriber-facing list, and with Kafka still configured: this is
 	// a deployment that publishes events perfectly well and has simply never been told what to
-	// tell a subscriber.
+	// tell a subscriber. It is the exact input the fallback used to accept.
 	outboxStoreConfiguration(t, &config.Configuration{
 		Kafka: config.KafkaConfig{
 			Brokers:     []string{"broker-1:9092"},
@@ -8404,61 +8553,81 @@ func TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList(t *testing
 		},
 	})
 
-	hook := logtest.NewGlobal()
-
 	credential, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.Error(t, err,
+		"issuance must REFUSE rather than publish the addresses Blnk dials: a subscriber outside the "+
+			"deployment cannot resolve them, and the secret it was handed is not reissuable")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrSubscriberBrokersNotConfigured, apiErr.Code,
+		"the typed code, so a client tells a missing configuration from a broker outage")
+	assert.Equal(t, http.StatusServiceUnavailable, apierror.StatusForCode(apiErr.Code),
+		"503: a dependency of issuance is unconfigured. Nothing about the request is wrong, and the "+
+			"identical call succeeds once an operator supplies the list")
+	assert.Contains(t, err.Error(), "KAFKA_SUBSCRIBER_BROKERS",
+		"and it must NAME the variable, or an operator reading the refusal cannot act on it")
+
+	// NO INTERNAL ADDRESS ANYWHERE IN THE ANSWER. This is the disclosure the fallback made on every
+	// issuance, and the reason the refusal is a security improvement rather than only a usability one.
+	assert.NotContains(t, err.Error(), "broker-1:9092",
+		"the refusal must not disclose the internal bootstrap address it declined to publish")
+	assert.Empty(t, credential.Brokers,
+		"and no endpoint is reported at all")
+
+	// AND NO RESIDUE. The check is ordered before the secret exists and before the broker is
+	// touched, so there is nothing to revoke and nothing to repair.
+	assert.Zero(t, credential.PasswordLength(),
+		"NO SECRET MAY EXIST: a refusal that generated one created the thing it declined to return")
+	assert.Zero(t, run.log.count("ProvisionSubscriberPrincipal"),
+		"the broker must not be asked to mint a credential whose response cannot be returned")
+	assert.Zero(t, run.log.count("RecordSubscriberCredentialIfUnchanged"),
+		"and the registry must not record a credential nobody received")
+
+	stored, ok := run.store.row(subscriberFixtureID)
+	require.True(t, ok)
+	assert.Nil(t, stored.CredentialReference, "a refused issuance leaves no credential record")
+
+	// THE REMEDY WORKS, which is what separates a refusal from a dead end — including the
+	// in-cluster deployment's remedy of pointing both variables at the same list.
+	outboxStoreConfiguration(t, &config.Configuration{
+		Kafka: config.KafkaConfig{
+			Brokers:           []string{"broker-1:9092"},
+			SubscriberBrokers: []string{"broker-1:9092"},
+			TopicPrefix:       "blnk",
+		},
+	})
+
+	issued, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err,
-		"the eight required variables must be enough to make the credential endpoint work")
-
-	assert.Equal(t, []string{"broker-1:9092"}, credential.Brokers,
-		"with no advertised list configured the internal bootstrap list is reported")
-	assert.Equal(t, "broker-1:9092", credential.BrokerEndpoint)
-	assert.NotEmpty(t, credential.Password(), "a working credential is returned, not a refusal")
-	assert.Equal(t, 1, run.log.count("RecordSubscriberCredentialIfUnchanged"),
-		"and the issuance is recorded exactly once")
-
-	// AND THE SUBSTITUTION IS NOT SILENT, which is the whole reason a fallback is acceptable
-	// where a silent one would not be. The secret is shown exactly once, so a subscriber handed
-	// an address it cannot reach discovers that as a connection timeout days later, nowhere near
-	// the request that produced it; this line is what lets an operator connect the two without
-	// reissuing — which would invalidate the credential the subscriber is holding.
-	warned := false
-	for _, entry := range hook.AllEntries() {
-		if entry.Level == logrus.WarnLevel &&
-			strings.Contains(entry.Message, "KAFKA_SUBSCRIBER_BROKERS") {
-			warned = true
-		}
-	}
-	assert.True(t, warned,
-		"the fallback must WARN and name KAFKA_SUBSCRIBER_BROKERS: reporting the addresses Blnk "+
-			"dials is correct only for a subscriber inside this deployment, and an unreported "+
-			"substitution reaches the holder as an unexplained connection timeout")
-
-	// The internal addresses are still never presented as an advertised list: the response
-	// reports them because they are all there is, and the log says so.
-	assert.NotContains(t, credential.Brokers, "",
-		"no blank entry may reach the reported list; a subscriber would try to dial it")
+		"declaring the same list explicitly is the documented remedy for an in-cluster deployment, "+
+			"and it must make the identical call succeed")
+	assert.Equal(t, []string{"broker-1:9092"}, issued.Brokers,
+		"and the endpoint reported is the one an operator deliberately published")
+	assert.NotEmpty(t, issued.Password())
 }
 
-// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope is the guard on the
-// fail-closed floor beneath the subscriber stream gateway.
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope is the guard that
+// makes a key scope unprovisionable unless something is DECLARED to enforce it.
 //
-// # Why the floor still exists once the gateway does
+// # The refusal is the shipped behaviour, not a floor beneath one
 //
 // A row recording a partition_key_prefix describes a boundary Kafka's authorizer has no dimension
-// for. In THIS binary that boundary is real — aclEntries withholds topic Read from a key-scoped
-// principal, verifyKeyScopeBoundary proves the withholding before the password becomes
-// returnable, and the stream gateway filters every record by key — so issuance proceeds and
-// streamGatewayEnforcesKeyScope records why.
+// for. Blnk narrows what it can — aclEntries withholds topic Read from a key-scoped principal and
+// verifyKeyScopeBoundary proves the withholding before the password becomes returnable — but
+// nothing in Blnk applies the prefix to a record, because BLNK SERVES NO RECORDS. On the shipped
+// default (KAFKA_KEY_SCOPE_ENFORCEMENT=none) the only credential this service could mint would
+// either read every record on every authorised topic, other ledgers' and other subscribers'
+// included, or be able to fetch nothing at all. So issuance REFUSES.
 //
-// Strip the enforcement point and the ONLY credential this service could mint reads every record
-// on every authorised topic, other ledgers' and other subscribers' included. Disclosing that in
-// the response was tried and is not a boundary: the party asked to apply the filter is the party
-// holding the credential. So the guard refuses, and the refusal has to be actionable — a caller
-// must be able to tell it from an outage and know what to change.
+// Disclosing the gap in the response was tried and is not a boundary: the party asked to apply
+// the filter is the party holding the credential. So the refusal has to be actionable — a caller
+// must be able to tell it from an outage and know what to change — which is why it is typed and
+// names both remedies.
 //
-// The guard therefore takes the enforcement fact as a PARAMETER rather than reading the constant,
-// which is what keeps this refusal reachable and asserted rather than dead by construction.
+// The guard takes the enforcement fact as a PARAMETER, read once by its caller from
+// config.KafkaConfig.KeyScopeGateway, so the refusal and the credential's reported enforcement
+// point cannot disagree and NEITHER branch is dead by construction.
 func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t *testing.T) {
 	scoped := subscriberFixtureRow(t)
 	scoped.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -8474,7 +8643,7 @@ func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t 
 
 		var apiErr apierror.APIError
 		require.ErrorAs(t, err, &apiErr)
-		assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, apiErr.Code,
+		assert.Equal(t, apierror.ErrSubscriberKeyScopeUnenforced, apiErr.Code,
 			"the TYPED code, not a generic conflict: this refusal has a remedy CONFLICT cannot express")
 		assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
 			"409, and never the 500 an unmapped code would resolve to: the request carries no body, "+
@@ -8485,10 +8654,35 @@ func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t 
 			"and the enforceable alternative, which is what an operator wanting isolation needs")
 	})
 
-	t.Run("permitted where the stream gateway enforces it", func(t *testing.T) {
-		require.True(t, streamGatewayEnforcesKeyScope,
-			"this binary links the enforcement point in; the premise of the assertion below")
-		assert.NoError(t, requireProvisionableKeyScope(&scoped, streamGatewayEnforcesKeyScope),
+	t.Run("refused on the SHIPPED default, read from configuration", func(t *testing.T) {
+		// THE DEFAULT ITSELF, resolved the way issuance resolves it, so this asserts the shipped
+		// behaviour rather than a hand-passed boolean. A build that grew an in-binary enforcement
+		// point would make this true and this assertion would fail — which is the point.
+		_, active := config.KafkaConfig{}.KeyScopeGateway()
+		require.False(t, active,
+			"the zero configuration must not report an active enforcement point: Blnk ships no "+
+				"component that authorises record keys")
+
+		require.Error(t, requireProvisionableKeyScope(&scoped, active),
+			"so a key-scoped row is refused a credential out of the box")
+	})
+
+	t.Run("permitted where a component is declared", func(t *testing.T) {
+		declared := config.KafkaConfig{
+			Brokers:             []string{"kafka-internal:9092"},
+			KeyScopeEnforcement: config.KeyScopeEnforcementBrokerGateway,
+			KeyScopeGatewayBrokers: []string{
+				"gateway.example.com:9094",
+			},
+		}
+		gateway, active := declared.KeyScopeGateway()
+		require.True(t, active,
+			"a broker_gateway declaration with a distinct endpoint is what an active enforcement "+
+				"point looks like")
+		require.NotEmpty(t, gateway,
+			"and it carries the address the credential must name in place of the brokers")
+
+		assert.NoError(t, requireProvisionableKeyScope(&scoped, active),
 			"a key-scoped row must be provisionable where its scope is actually enforced — "+
 				"withholding the credential entirely is an absent boundary, not a narrower one")
 	})
@@ -8524,12 +8718,14 @@ func TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard(t *testing.T) {
 
 	var apiErr apierror.APIError
 	require.ErrorAs(t, err, &apiErr)
-	assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, apiErr.Code,
-		"one state, one code: the same refusal the credential endpoint answers with")
+	assert.Equal(t, apierror.ErrSubscriberKeyScopeUnenforced, apiErr.Code,
+		"one state, one code: the same refusal the credential endpoint answers with. A second code "+
+			"for this judgement existed and was retired, because two codes for one refusal is how a "+
+			"client comes to handle one and not the other")
 
-	assert.NoError(t, requireRecordableKeyScope(&provisioned, streamGatewayEnforcesKeyScope),
-		"and under enforcement the update passes through: it NARROWS the grant rather than "+
-			"describing a boundary nobody keeps")
+	assert.NoError(t, requireRecordableKeyScope(&provisioned, true),
+		"and where a component is declared the update passes through: it NARROWS the grant rather "+
+			"than describing a boundary nobody keeps")
 
 	unprovisioned := subscriberFixtureRow(t)
 	unprovisioned.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")

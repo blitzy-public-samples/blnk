@@ -1412,7 +1412,9 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 
 	// THE BALANCE-MONITOR HANDOFF DRAINER, and it is NOT optional maintenance. Every ledger
 	// transaction that moves a monitored balance records a handoff row inside its own
-	// transaction — an intent saying "these monitors have not been judged yet" — and the
+	// transaction — an intent saying "these monitors have not been judged yet", carrying both
+	// inputs the judgement depends on: the balance as written and the monitor definitions in
+	// force when it was written, so draining late cannot change the verdict — and the
 	// post-commit evaluation stands down whenever the handoff is in play. This processor is
 	// therefore the SOLE owner of `balance.monitor`: without it the rows accumulate
 	// unevaluated, no monitor alert is ever published, and the only symptom is silence.

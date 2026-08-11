@@ -44,7 +44,10 @@ type IDataSource interface {
 	// the last two event families under requirement R-2. Neither event could be captured
 	// inside the mutation that produced it — a monitor alert does not exist until its
 	// balance is committed, and a bulk summary belongs to no single transaction — so each
-	// gets a durable INTENT that IS written atomically, plus an atomic completion.
+	// captures atomically what CAN be: for a monitor alert, every input the alert is a
+	// function of (the post-mutation balance AND the monitor definitions in force), so the
+	// events that will exist are already decided at commit; for a bulk summary, the
+	// outcome itself. Each then pairs that with an atomic completion.
 	balanceMonitorHandoff // Interface for balance monitor handoff operations
 	bulkTransactionBatch  // Interface for bulk transaction batch coordinator operations
 }
@@ -1262,24 +1265,35 @@ type chain interface {
 	CountUnchainedTransactions(ctx context.Context, cutoff time.Time) (int64, error)                                // Counts the chainer backlog
 }
 
-// balanceMonitorHandoff defines persistence for blnk.balance_monitor_handoff, the
-// durable intent that a balance moved and its monitors have not been evaluated yet.
+// balanceMonitorHandoff defines persistence for blnk.balance_monitor_handoff, the row
+// that carries a committed movement's monitor evaluation — and every input that
+// evaluation depends on — until it has been performed.
 //
 // # Why this exists as its own contract
 //
-// `balance.monitor` was the one event type that could not honour requirement R-2. A
-// monitor fires because a CONDITION was met on a balance a transaction has ALREADY
-// committed, so at the instant the alert exists there is no open transaction to enrol
-// it in. Retrying the capture narrowed the window; it could not close it, because a
-// process that dies between the commit and the insert loses the alert outright and
-// leaves nothing to replay.
+// `balance.monitor` is the one event type whose row cannot be inserted by the mutation
+// that causes it. A monitor fires because a CONDITION was met on a balance a transaction
+// has ALREADY committed, so at the instant the alert exists there is no open transaction
+// to enrol it in. Retrying the capture narrowed the window; it could not close it,
+// because a process that dies between the commit and the insert loses the alert outright
+// and leaves nothing to replay.
 //
-// The handoff splits the problem in two. The INTENT to evaluate is written inside the
-// balance's own transaction — see recordBalanceMonitorHandoffs, called by the atomic
-// writers — so a committed movement always carries its pending evaluation. The RESULT of
-// that evaluation, zero or more event rows, is then written in one transaction with the
-// handoff's transition to completed. Nothing in the sequence can lose an alert: a crash
-// leaves a claimable handoff, not a missing event.
+// The handoff splits the problem in two, and the split is chosen so that only the WRITE
+// is deferred, never the DECISION. What the balance's own transaction commits — see
+// recordBalanceMonitorHandoffs, called by the atomic writers — is both decision inputs:
+// the balance exactly as that transaction wrote it, and the monitor definitions in force
+// at that moment (BalanceSnapshot and MonitorSnapshot on model.BalanceMonitorHandoff).
+// Which alerts will exist, and what each will say, is therefore already fixed when the
+// movement commits; draining the row cannot change it, because the evaluation is a pure
+// function of two frozen values. The RESULT, zero or more event rows, is then written in
+// one transaction with the handoff's transition to completed. Nothing in the sequence
+// can lose or alter an alert: a crash leaves a claimable handoff, not a missing event,
+// and a later edit to blnk.balance_monitors cannot reach a movement already committed.
+//
+// The narrower guarantee this still is, stated plainly: the event ROW appears after the
+// mutation's commit rather than within it, so a subscriber sees `balance.monitor` a
+// poll interval behind the movement. What the row CONTAINS, and whether it exists at
+// all, is determined by the mutation transaction itself.
 //
 // # There is no in-transaction insert method here, and that is deliberate
 //

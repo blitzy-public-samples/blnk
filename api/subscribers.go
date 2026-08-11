@@ -26,7 +26,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/api/model"
@@ -110,9 +109,10 @@ import (
 // also the only place in this package where the CHANNEL is part of the contract:
 // ensureCredentialTransportConfidential refuses issuance unless the deployment has
 // established the channel as confidential — TLS in-process, a declared proxy
-// boundary reporting https, or a loopback peer. An authenticated request over
-// plaintext is a correctly authorised leak, and no amount of care about where the
-// password is not written protects against carrying it in clear.
+// boundary reporting https, or a loopback peer on a host the deployment has declared
+// to be local-development. An authenticated request over plaintext is a correctly
+// authorised leak, and no amount of care about where the password is not written
+// protects against carrying it in clear.
 //
 // # NO SUNSET LOGIC LIVES HERE
 //
@@ -160,40 +160,7 @@ const (
 	subscriberQueryParamIncludeCount = "include_count"
 	subscriberQueryParamSortBy       = "sort_by"
 	subscriberQueryParamSortOrder    = "sort_order"
-
-	// The event-stream parameters. topic and partition address the log, offset is the
-	// caller's cursor, limit bounds the page (shared with the listing above, since it means
-	// the same thing) and max_wait_ms is how long the broker may hold the read.
-	subscriberQueryParamTopic     = "topic"
-	subscriberQueryParamPartition = "partition"
-	subscriberQueryParamOffset    = "offset"
-	subscriberQueryParamMaxWait   = "max_wait_ms"
-
-	// headerSubscriberSecret and headerSubscriberPrincipal carry the subscriber's OWN SASL
-	// credential to the event-stream endpoint.
-	//
-	// A header rather than a query parameter, and the distinction is not cosmetic: query
-	// strings are written to access logs, proxy logs and browser history by default, and this
-	// value is a live password. The principal is optional — the registry already knows which
-	// one belongs to the subscriber — and is checked when sent, because a caller naming a
-	// different principal is asking about a different identity.
-	headerSubscriberSecret    = "X-Blnk-Subscriber-Secret"
-	headerSubscriberPrincipal = "X-Blnk-Subscriber-Principal"
 )
-
-// subscriberStreamQueryParameters is every query parameter GET /subscribers/:id/events
-// accepts, in the order its refusal lists them.
-//
-// Closed for the same reason the listing's set is: a misspelled `?offsett=100` accepted in
-// silence would serve the default offset, and a client reading the answer as its own cursor
-// would either re-read records it had already processed or skip past ones it had not.
-var subscriberStreamQueryParameters = []string{
-	subscriberQueryParamTopic,
-	subscriberQueryParamPartition,
-	subscriberQueryParamOffset,
-	subscriberQueryParamLimit,
-	subscriberQueryParamMaxWait,
-}
 
 // subscriberListQueryParameters is every query parameter GET /subscribers accepts,
 // in the order the refusal lists them.
@@ -284,8 +251,9 @@ const (
 	credentialInsecureTransportMessage = "Kafka credentials are not issued over a transport this " +
 		"deployment has not established as confidential, because the response carries a one-time " +
 		"password. Terminate TLS in Blnk (BLNK_SERVER_SSL), or declare the proxy that terminates it " +
-		"and sets X-Forwarded-Proto (BLNK_SERVER_TRUST_FORWARDED_PROTO), or call this endpoint over " +
-		"loopback"
+		"and sets X-Forwarded-Proto (BLNK_SERVER_TRUST_FORWARDED_PROTO). For local development only, " +
+		"a loopback caller can be permitted with BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE, " +
+		"which is unsafe on any host running a reverse proxy"
 
 	// credentialIssuanceAbandonedMessage answers a request the handler stopped waiting for
 	// because the wall-clock ceiling elapsed while the service was still working.
@@ -355,14 +323,20 @@ func ensureSubscriberManagementAuthorized(c *gin.Context) bool {
 //     topology once, explicitly, instead of every request asserting it for itself. A
 //     declaration plus a header reading anything other than https is a REFUSAL: the proxy
 //     is reporting a plaintext client hop.
-//  3. A LOOPBACK PEER. Bytes to 127.0.0.0/8 or ::1 never reach a network, so a local
-//     operator or a shell inside the container can issue a credential with no TLS at all.
-//     The peer is read from Request.RemoteAddr — THE SOCKET — and never from
-//     c.ClientIP(), which honours X-Forwarded-For and would let a remote caller claim to
-//     be local. That distinction is the whole value of this branch.
+//  3. A DECLARED LOCAL-DEVELOPMENT HOST WITH A LOOPBACK PEER. Bytes to 127.0.0.0/8 or ::1
+//     never reach a network on their LAST hop, which is not the same as never reaching one
+//     at all: a reverse proxy on this host can accept a plaintext request from the
+//     internet and forward it over 127.0.0.1, so the peer is loopback while the client's
+//     hop was public and readable. The process cannot tell that apart from an operator
+//     running curl inside the container, so the loopback peer alone establishes nothing
+//     and this branch requires BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE — the
+//     deployment stating that there is no such proxy. The peer is then read from
+//     Request.RemoteAddr — THE SOCKET — and never from c.ClientIP(), which honours
+//     X-Forwarded-For and would let a remote caller claim to be local.
 //
 // Anything else is refused, which is deny-by-default: a deployment that has stated
-// nothing gets no secret on the wire.
+// nothing gets no secret on the wire. A loopback caller on an undeclared host is
+// refused too, which is the whole point of channel 3 being a declaration.
 //
 // SecurityHeaders in api/middleware takes the header at face value for the same question,
 // and that difference is deliberate rather than an inconsistency: believing it there
@@ -407,18 +381,31 @@ func (a *Api) credentialTransportConfidential(c *gin.Context) bool {
 		return true
 	}
 
-	// 2. The deployment declared the proxy that did, and that proxy says the client hop
-	// was https. Read live from the configuration store for the same reason
-	// subscriberTopicPrefix is: a value captured when the router was built would describe
-	// the deployment as it stood then.
-	if configuration := a.blnk.Config(); configuration != nil && configuration.Server.TrustForwardedProto {
+	// Both remaining channels are DECLARATIONS by the deployment, so both read the live
+	// configuration store — for the same reason subscriberTopicPrefix does: a value captured
+	// when the router was built would describe the deployment as it stood then. A store that
+	// cannot be read declares nothing, which refuses.
+	configuration := a.blnk.Config()
+	if configuration == nil {
+		return false
+	}
+
+	// 2. The deployment declared the proxy that terminated TLS, and that proxy says the
+	// client hop was https.
+	if configuration.Server.TrustForwardedProto {
 		if strings.EqualFold(strings.TrimSpace(c.GetHeader(headerForwardedProto)), forwardedProtoHTTPS) {
 			return true
 		}
 	}
 
-	// 3. The peer is on this host, so the bytes never reach a network.
-	return requestPeerIsLoopback(c.Request)
+	// 3. The deployment declared itself a local-development host AND the peer is on it. The
+	// declaration is required because a loopback peer is only ever evidence about the LAST
+	// hop; see the channel list above for the same-host proxy shape it cannot distinguish.
+	if configuration.Server.AllowLoopbackCredentialIssuance {
+		return requestPeerIsLoopback(c.Request)
+	}
+
+	return false
 }
 
 // requestPeerIsLoopback reports whether the request's PEER — the far end of the accepted
@@ -697,8 +684,9 @@ func isTypedAPIError(err error) bool {
 // subscriber-facing endpoint is published, SUBSCRIBER_PROVISIONING_FAILED when
 // the broker refused the credential or its bindings, SUBSCRIBER_GRANT_EMPTY for a
 // row authorised for nothing and therefore not provisionable as it stands,
-// SUBSCRIBER_ISOLATION_UNENFORCEABLE for a row recording a partition-key prefix,
-// which no ACL can express,
+// SUBSCRIBER_KEY_SCOPE_UNENFORCED for a row recording a partition-key prefix on a
+// deployment that has declared no component to apply it — no ACL can express a
+// message-key boundary, and Blnk ships nothing that would,
 // SUBSCRIBER_PROVISIONING_TIMEOUT when the registry itself ran out of
 // budget, and a typed conflict when a concurrent issuance superseded this one.
 // Downgrading any of those to a single generic code would take information away
@@ -1377,9 +1365,13 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 //     checks.
 //   - A CONFIDENTIAL CHANNEL, which is what ensureCredentialTransportConfidential
 //     checks: TLS terminated in-process, or a declared proxy boundary reporting
-//     https, or a loopback peer. Authentication says who is asking; it says nothing
-//     about who else can read the answer, and this response is the one place in
-//     Blnk where the answer is a secret.
+//     https, or — on a host declared local-development with
+//     BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE — a loopback peer.
+//     Authentication says who is asking; it says nothing about who else can read the
+//     answer, and this response is the one place in Blnk where the answer is a
+//     secret. A loopback peer is NOT self-establishing: a same-host reverse proxy
+//     makes a public plaintext hop look loopback from here, which is why the third
+//     channel is a declaration rather than an observation.
 //
 // The last is enforced in code precisely because the first two can be satisfied by
 // a deployment that still carries the password over a plaintext hop — which is the
@@ -1434,20 +1426,27 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 //
 // For a subscriber that RECORDS a prefix the credential grants Describe but NOT
 // Read on those topics, so the broker refuses every record fetch it attempts, and
-// its records are delivered by GET /subscribers/{subscriber_id}/events, which
-// applies the prefix to each record's key before returning it. The
-// enforced-access declaration — assembled by model.NewSubscriberEnforcedAccess,
-// never here — reports that as gateway_delivery_required, broker_record_access
-// false and partition_key_prefix_enforced_by "blnk_stream_gateway", so a client
-// learns where to consume from in the same body that carries the secret.
+// the records have to reach it through the key-authorising component the deployment
+// DECLARED in front of the brokers — whose address the response carries in
+// broker_endpoint in place of KAFKA_SUBSCRIBER_BROKERS. The enforced-access
+// declaration — assembled by model.NewSubscriberEnforcedAccessUnder, never here —
+// reports that as gateway_delivery_required, broker_record_access false and
+// partition_key_prefix_enforced_by "broker_gateway", so a client learns where to
+// consume from in the same body that carries the secret.
 //
-// A SUBSCRIBER RECORDING A PREFIX IS STILL PROVISIONED. This endpoint used to
-// refuse it with 409, which handed back no credential at all — not a narrower
-// boundary but an absent one, and a subscriber that consumes nothing is not
-// isolated. It then issued whole-topic Read and declared the prefix the client's
-// own filter, which is the exposure the isolation correction closed: cooperation
-// is not an authorization boundary. Dead-letter topics are never grantable, so no
-// "<topic>.dlt" can appear in the list.
+// AND WHERE NO COMPONENT IS DECLARED — the shipped default — THIS ROUTE REFUSES
+// SUCH A SUBSCRIBER with 409 SUBSCRIBER_KEY_SCOPE_UNENFORCED. Blnk ships no
+// key-authorising component and exposes no data-plane route of its own: there is no
+// GET under /subscribers that returns records. The two remedies travel with the
+// refusal — declare a component and its endpoint, or clear the prefix and narrow
+// authorized_topics to what the broker can keep.
+//
+// The order matters and it is the whole of the correction. Issuing whole-topic Read
+// beside a prefix nothing applies is the exposure that was closed: cooperation is not
+// an authorization boundary. Refusing outright, rather than minting a principal that
+// can fetch nothing, is what keeps the response from ever claiming a boundary no
+// component keeps. Dead-letter topics are never grantable, so no "<topic>.dlt" can
+// appear in the list.
 //
 // Provisioning VERIFIES the narrower shape before the secret becomes returnable —
 // no topic Read among the reconciled bindings, ACL enforcement confirmed, no
@@ -1464,8 +1463,9 @@ func (a *Api) DeleteSubscriber(c *gin.Context) {
 //	    confidential
 //	404 SUBSCRIBER_NOT_FOUND when no such subscriber exists
 //	409 SUBSCRIBER_GRANT_EMPTY for a subscriber authorised for no topics,
-//	    SUBSCRIBER_ISOLATION_UNENFORCEABLE for a subscriber recording a
-//	    partition-key prefix, which Kafka cannot enforce,
+//	    SUBSCRIBER_KEY_SCOPE_UNENFORCED for a subscriber recording a partition-key
+//	    prefix while no key-authorising component is declared, which Kafka's
+//	    authorizer has no dimension for,
 //	    GEN_CONFLICT when a concurrent issuance superseded this one
 //	503 EVENT_KAFKA_UNAVAILABLE when no broker is configured or reachable,
 //	    SUBSCRIBER_BROKERS_NOT_CONFIGURED when no subscriber-facing endpoint is
@@ -1578,9 +1578,10 @@ func (a *Api) IssueKafkaCredentials(c *gin.Context) {
 		// round trip.
 		// THE ENFORCEMENT POINT COMES FROM THE ISSUANCE, not from the prefix. The service read
 		// the deployment's key-scope enforcement mode to decide whether to mint this credential
-		// at all — a recorded prefix with nothing enforcing it is refused — so the value it
-		// recorded is the only one that can describe what was actually issued. Deriving it here
-		// from the prefix would report consumer_side for a credential minted under a gateway.
+		// at all — a recorded prefix with no declared component enforcing it is refused — so the
+		// value it recorded is the only one that can describe what was actually issued. Deriving
+		// it here from the prefix would report an enforcement point for a credential that may
+		// have been minted under none.
 		EnforcedAccess: model.NewVerifiedSubscriberEnforcedAccessUnder(
 			credential.SubscriberID, authorizedTopics, credential.PartitionKeyPrefix,
 			credential.KeyScopeEnforcement,
@@ -1602,256 +1603,6 @@ func (a *Api) IssueKafkaCredentials(c *gin.Context) {
 		CredentialFingerprint: credential.Fingerprint,
 		Replaced:              credential.Replaced,
 	})
-}
-
-// StreamSubscriberEvents serves one page of a subscriber's own event stream, applying its
-// partition-key scope.
-//
-// GET /subscribers/:subscriber_id/events
-//
-// # Why this endpoint exists, and why it is the only non-management route in this file
-//
-// It is the ENFORCEMENT POINT for requirement R-7's partition-key dimension. Kafka's
-// authorizer has no message-key resource, so a subscriber confined to a key prefix cannot be
-// given a broker grant that expresses it; Blnk grants such a subscriber Describe and NO Read —
-// closing the broker path outright — and serves its records here, filtered per record.
-//
-// Every other route in this file is an OPERATOR action gated on the master key. This one is a
-// SUBSCRIBER action, so it is authenticated differently: the caller presents the subscriber's
-// own SASL secret in X-Blnk-Subscriber-Secret and the gateway compares it, in constant time,
-// against the credential reference the registry recorded. The deployment's own API
-// authentication still applies on top through the standard middleware — this is an additional
-// factor, not a replacement for one — which is why an operator cannot read a subscriber's
-// stream without holding that subscriber's secret.
-//
-// # Responses
-//
-//	200 with the page, `records: []` when the subscriber is caught up
-//	400 GEN_VALIDATION for a malformed identifier, partition, offset or wait,
-//	    GEN_MISSING_PARAMETER when no topic is named
-//	401 SUBSCRIBER_CREDENTIAL_INVALID for every authentication failure, indistinguishably:
-//	    no such subscriber, no credential issued, the wrong principal, the wrong secret, or a
-//	    credential pending revocation. Distinguishing them would let an unauthenticated caller
-//	    enumerate the registry
-//	403 SUBSCRIBER_TOPIC_NOT_GRANTED when the topic is outside the subscriber's grant or is
-//	    one no subscriber may be granted, SUBSCRIBER_INSECURE_TRANSPORT when the channel is
-//	    not one this deployment has established as confidential
-//	503 EVENT_KAFKA_UNAVAILABLE when no broker is configured or the read failed
-//
-// Parameters:
-//   - c *gin.Context: the request and response.
-func (a *Api) StreamSubscriberEvents(c *gin.Context) {
-	// NO MASTER-KEY GATE, and its absence is deliberate rather than an omission: this is the
-	// data plane, and the credential that authorises it is the SUBSCRIBER's. The middleware
-	// chain has already required the deployment's own API authentication.
-	subscriberID, ok := subscriberIDFromRoute(c)
-	if !ok {
-		return
-	}
-
-	if !rejectUnsupportedQueryParameters(c, subscriberStreamQueryParameters) {
-		return
-	}
-
-	// THE TRANSPORT, before the secret is read. The caller is sending a live password in a
-	// request header, so a channel nobody has established as confidential discloses it on the
-	// way IN — the mirror of the issuance endpoint's concern, and the same gate answers it.
-	if !a.ensureStreamTransportConfidential(c) {
-		return
-	}
-
-	request, ok := subscriberStreamRequestFrom(c, subscriberID)
-	if !ok {
-		return
-	}
-
-	// THE BUDGET. It bounds the registry read, the SASL handshake on a cold transport and the
-	// fetch — including the full max_wait a caller may have asked the broker to hold for.
-	ctx, cancel := context.WithTimeout(c.Request.Context(), blnk.SubscriberStreamBudget)
-	defer cancel()
-
-	page, err := a.blnk.ReadSubscriberEventStream(ctx, request)
-	if err != nil {
-		respondError(c, err)
-
-		return
-	}
-
-	// NO-STORE, ALWAYS. The body carries ledger event payloads belonging to one subscriber,
-	// and a shared cache or a browser history holding them would disclose them to whoever
-	// reads that cache next. It is set on the success path only because the error paths carry
-	// no records — and respondError's own headers are its business.
-	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, private")
-	c.Header("Pragma", "no-cache")
-
-	c.JSON(http.StatusOK, subscriberEventStreamResponse(page))
-}
-
-// subscriberEventStreamResponse projects a gateway page onto the wire shape.
-//
-// The record slice is allocated rather than left nil, so a caught-up subscriber receives `[]`
-// and not `null`: an empty page is the ordinary steady state of a healthy consumer, and every
-// client would otherwise have to special-case it.
-//
-// Parameters:
-//   - page blnk.SubscriberStreamPage: the gateway's answer.
-//
-// Returns:
-//   - model.SubscriberEventStreamResponse: the response body.
-func subscriberEventStreamResponse(page blnk.SubscriberStreamPage) model.SubscriberEventStreamResponse {
-	records := make([]model.SubscriberEventStreamRecord, 0, len(page.Records))
-	for _, record := range page.Records {
-		records = append(records, model.SubscriberEventStreamRecord{
-			Offset:    record.Offset,
-			Partition: record.Partition,
-			Key:       record.Key,
-			Timestamp: record.Timestamp,
-			// THE BYTES AS THEY SIT ON THE TOPIC. json.RawMessage, so the envelope is
-			// embedded rather than re-encoded — a re-marshal would reorder keys and rewrite
-			// numbers, and a subscriber comparing this against a record read directly from
-			// the topic would find two different payloads for one event.
-			Event: record.Value,
-		})
-	}
-
-	return model.SubscriberEventStreamResponse{
-		SubscriberID:     page.SubscriberID,
-		Topic:            page.Topic,
-		Partition:        page.Partition,
-		Records:          records,
-		NextOffset:       page.NextOffset,
-		HighWatermark:    page.HighWatermark,
-		LogStartOffset:   page.LogStartOffset,
-		RecordsScanned:   page.RecordsScanned,
-		RecordsWithheld:  page.RecordsWithheld,
-		Truncated:        page.Truncated,
-		KeyScope:         page.KeyScope,
-		KeyScopeEnforced: page.KeyScopeEnforced,
-	}
-}
-
-// subscriberStreamRequestFrom reads the stream request out of the route, query and headers,
-// writing the refusal itself when any of it is malformed.
-//
-// # Why the numeric parameters are refused rather than defaulted
-//
-// A page size or a wait that is out of range is CLAMPED by the gateway, because a caller
-// asking for more than the ceiling is expressing a throughput preference and the response
-// reports what was actually read. A value that is not a number at all is different: it is a
-// client defect, and serving the default for `offset=abc` would silently re-read from
-// wherever the default happens to point — which for a cursor is either duplicate processing
-// or skipped events.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//   - subscriberID string: the canonical identifier from the route.
-//
-// Returns:
-//   - blnk.SubscriberStreamRequest: the request to hand the gateway.
-//   - bool: false when the refusal has been written.
-func subscriberStreamRequestFrom(
-	c *gin.Context,
-	subscriberID string,
-) (blnk.SubscriberStreamRequest, bool) {
-	request := blnk.SubscriberStreamRequest{
-		SubscriberID: subscriberID,
-		Topic:        strings.TrimSpace(c.Query(subscriberQueryParamTopic)),
-		// THE SECRET, read from the header and passed straight through. It is not logged, not
-		// echoed and not stored anywhere in this package.
-		Secret:    strings.TrimSpace(c.GetHeader(headerSubscriberSecret)),
-		Principal: strings.TrimSpace(c.GetHeader(headerSubscriberPrincipal)),
-	}
-
-	partition, ok := subscriberStreamIntFromQuery(c, subscriberQueryParamPartition, 0)
-	if !ok {
-		return request, false
-	}
-	request.Partition = int(partition)
-
-	// ZERO BY DEFAULT — the earliest ABSOLUTE offset, not the latest. A client that omits its
-	// cursor is served from the beginning of the retained log, which at worst re-delivers
-	// events it can suppress by event_id; defaulting to the end would silently skip everything
-	// currently on the partition, and a skipped event is not recoverable by idempotency.
-	offset, ok := subscriberStreamIntFromQuery(c, subscriberQueryParamOffset, 0)
-	if !ok {
-		return request, false
-	}
-	request.Offset = offset
-
-	limit, ok := subscriberStreamIntFromQuery(c, subscriberQueryParamLimit, 0)
-	if !ok {
-		return request, false
-	}
-	request.Limit = int(limit)
-
-	maxWait, ok := subscriberStreamIntFromQuery(c, subscriberQueryParamMaxWait, 0)
-	if !ok {
-		return request, false
-	}
-	if maxWait > 0 {
-		request.MaxWait = time.Duration(maxWait) * time.Millisecond
-	}
-
-	return request, true
-}
-
-// subscriberStreamIntFromQuery reads one integer query parameter, or its default when absent.
-//
-// It parses as int64 so that a partition or a page size beyond int range is refused as a
-// malformed number rather than wrapping into a plausible small value on a 32-bit build.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written.
-//   - name string: the parameter to read.
-//   - fallback int64: the value an absent parameter takes.
-//
-// Returns:
-//   - int64: the parsed value, or the fallback.
-//   - bool: false when the refusal has been written.
-func subscriberStreamIntFromQuery(c *gin.Context, name string, fallback int64) (int64, bool) {
-	raw := strings.TrimSpace(c.Query(name))
-	if raw == "" {
-		return fallback, true
-	}
-
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
-			"%q must be an integer, got %q", name, raw,
-		), nil)
-
-		return 0, false
-	}
-
-	return value, true
-}
-
-// ensureStreamTransportConfidential refuses a stream read whose channel this deployment has
-// not established as confidential.
-//
-// It shares credentialTransportConfidential with the issuance endpoint — one predicate over
-// the request and the live configuration, so the two routes cannot disagree about which
-// channels are confidential — and differs only in the message, because the DIRECTION of the
-// exposure differs. Issuance is refused because the RESPONSE carries a one-time password; this
-// is refused because the REQUEST does, in a header, on every poll for as long as the
-// subscriber runs. A stream read over plaintext therefore discloses a live credential
-// repeatedly rather than once.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - bool: true when the channel is confidential and the read may proceed.
-func (a *Api) ensureStreamTransportConfidential(c *gin.Context) bool {
-	if a.credentialTransportConfidential(c) {
-		return true
-	}
-
-	respondCode(c, apierror.ErrSubscriberInsecureTransport, streamInsecureTransportMessage, nil)
-
-	return false
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2621,16 +2372,4 @@ const (
 	subscriberRevocationScanIncompleteMessage = "The subscriber registry is larger than the " +
 		"revocation scan's bound, so the set of subscribers awaiting revocation could not be " +
 		"established; read blnk.event_subscribers directly, filtering on revocation_pending_at"
-
-	// streamInsecureTransportMessage answers a stream read whose channel is not confidential.
-	//
-	// It names the SASL secret in the request rather than a password in the response, because
-	// that is what is exposed here and the difference changes how urgent it is: the header is
-	// sent on every poll, so a plaintext consumer leaks a live credential continuously rather
-	// than once.
-	streamInsecureTransportMessage = "The subscriber event stream is not served over a transport " +
-		"this deployment has not established as confidential, because the request carries the " +
-		"subscriber's SASL secret in a header on every poll. Terminate TLS in Blnk " +
-		"(BLNK_SERVER_SSL), or declare the proxy that terminates it and sets X-Forwarded-Proto " +
-		"(BLNK_SERVER_TRUST_FORWARDED_PROTO), or call this endpoint over loopback"
 )

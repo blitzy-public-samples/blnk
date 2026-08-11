@@ -204,18 +204,21 @@ func (a Api) Router() *gin.Engine {
 	router.DELETE("/subscribers/:subscriber_id", a.DeleteSubscriber)
 	router.POST("/subscribers/:subscriber_id/kafka-credentials", a.IssueKafkaCredentials)
 
-	// THE DATA-PLANE ROUTE, and the only one under /subscribers that is not an operator
-	// action. It is the enforcement point for a subscriber's partition-key prefix: Kafka's
-	// authorizer has no message-key dimension, so a key-scoped subscriber is granted Describe
-	// and NO Read and the broker refuses its every fetch — this is the path its records take,
-	// filtered per record by the subscriber's own prefix.
+	// THERE IS NO DATA-PLANE ROUTE UNDER /subscribers, and its absence is the design rather
+	// than an omission. Requirement R-7 has subscribers consume Kafka DIRECTLY with the
+	// per-subscriber SASL/SCRAM credential the endpoint above issues; every route registered
+	// here is an OPERATOR action gated on the master key.
 	//
-	// It is registered beside the management routes rather than under a separate prefix so that
-	// api/middleware's pathToResource entry for "subscribers" covers it; a new first path
-	// segment would resolve to no resource and the auth middleware would abort every request to
-	// it, master key included. The handler authenticates the SUBSCRIBER separately, with the
-	// SASL secret it was issued, so reaching this route is not the same as being served by it.
-	router.GET("/subscribers/:subscriber_id/events", a.StreamSubscriberEvents)
+	// An HTTP polling route was tried and removed. It read the shared topics with Blnk's own
+	// broker credential and returned the records a subscriber's partition-key prefix admitted,
+	// which made Blnk a second, unauthorised data plane: it sat behind the deployment's own API
+	// authentication while the credential response contains no API key, and it answered from
+	// the registry's credential reference alone — so a principal already revoked at the broker,
+	// or one whose grant had not settled, kept being served. Kafka's authorizer has no
+	// message-key dimension, so a subscriber that records a partition_key_prefix is REFUSED a
+	// credential unless an operator has declared a component in front of the brokers that
+	// authorises record keys (KAFKA_KEY_SCOPE_ENFORCEMENT). Blnk does not ship that component.
+	// See event_subscriber.go's requireProvisionableKeyScope and docs/event-streaming.md.
 
 	// Deprecated webhook-subscription management routes.
 	//
@@ -248,10 +251,19 @@ func (a Api) Router() *gin.Engine {
 	// path, so a global installation would be correct — it would simply do the pre-auth guard's
 	// job a second time, after authentication, for every request in the API.
 	//
-	// Removing these routes and their handlers is a LATER, SEPARATE RELEASE. Passing the
-	// retirement instant changes behaviour, not code: the handlers, the legacy sender and its
-	// configuration block all remain, which is what makes the retirement reversible by moving
-	// the date and what means somebody still has to perform the removal.
+	// THESE FOUR ROUTES ARE NOT DELETED BY THE TERMINAL RELEASE, and that is a decision rather
+	// than an omission. The requirement is that this surface answer 410 Gone on EVERY request
+	// after the sunset, and a route that has been removed answers 404 instead — so the
+	// registrations are what there is to answer with, and the guard is what answers. They also
+	// have to be here for a deployment whose own window has not closed yet, since the retirement
+	// is a per-deployment configuration instant rather than a property of this binary.
+	//
+	// Passing the instant changes behaviour, not code: the handlers remain and the retirement is
+	// reversible by moving the date. What the terminal release removes is the DELIVERY mechanism
+	// — webhooks.go, the ProcessWebhook queue mapping and the relay's dual-delivery branch — and
+	// docs/webhook-to-kafka-migration.md carries that as a checklist whose preserve half names
+	// these four registrations and both guards. TestWebhookTerminalRelease_ChecklistMatchesTheSurface
+	// fails if a release deletes them anyway.
 	//
 	// The path is middleware.DeprecatedWebhookSubscriptionRoute rather than four literals,
 	// so the routes registered here and the paths the pre-auth guard recognises are one

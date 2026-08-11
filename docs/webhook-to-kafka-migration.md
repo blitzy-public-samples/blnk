@@ -98,7 +98,7 @@ Only the keys this document names. The complete set is documented with commentar
 |---|---|
 | `WEBHOOK_DEPRECATION_SUNSET_DATE` | The RFC3339 instant the legacy HTTP transport retires. Required once `KAFKA_BROKERS` is set. The window opens 30 days earlier. |
 | `KAFKA_BROKERS` | The brokers Blnk itself publishes to. Empty disables publishing. |
-| `KAFKA_SUBSCRIBER_BROKERS` | The externally advertised brokers reported to a subscriber when credentials are issued. An **optional override**: set it when the address subscribers reach differs from the one Blnk publishes through. Left unset, issuance falls back to `KAFKA_BROKERS` and warns that it is handing out an internal address. Issuance is refused only when **neither** list is set. |
+| `KAFKA_SUBSCRIBER_BROKERS` | The externally advertised brokers reported to a subscriber when credentials are issued. **Required for issuance, with no fallback**: left unset, `POST /subscribers/{id}/kafka-credentials` answers `503 SUBSCRIBER_BROKERS_NOT_CONFIGURED` and mints nothing, rather than publishing the internal `KAFKA_BROKERS` addresses. Set it to the same value as `KAFKA_BROKERS` if your subscribers really do run inside the deployment. |
 | `BLNK_WEBHOOK_URL` | The single global legacy webhook destination — see [What Never Existed](#what-never-existed). |
 
 #### Which names resolve, exactly
@@ -158,7 +158,7 @@ response near 6.25 seconds as a symptom to chase.
 
 Subscriber management follows the same privileged-endpoint pattern as hook management: the master key is checked **before any work is done**, and a caller who does not hold it receives `AUTH_MASTER_KEY_REQUIRED`. An ordinary scoped API key will not do. In practice this means credential issuance is an operator action, not something a subscriber performs for itself — so if you are the subscriber, this is the request you ask your Blnk operator to make on your behalf.
 
-It is also the only endpoint in Blnk whose response contains a secret, so the **channel** is part of its contract. A request over a channel the deployment has not established as confidential is refused with `403` and `error_detail.code` of `SUBSCRIBER_INSECURE_TRANSPORT`, because a correct master key over plaintext HTTP is an authorised credential leak. The operator's side of that is one of: TLS terminated in Blnk (`BLNK_SERVER_SSL`), a declared TLS-terminating proxy (`BLNK_SERVER_TRUST_FORWARDED_PROTO`, with an ingress that sets `X-Forwarded-Proto`), or a loopback call from inside the container — note that only the first is *proven* by this process, the second is *declared* by the operator, and the third is read from the socket rather than from any header. See [The transport contract this endpoint requires](kafka-operations.md#the-transport-contract-this-endpoint-requires) in the operations runbook for the full contract, including why enabling the proxy boundary obliges you to make that proxy the only route to the process.
+It is also the only endpoint in Blnk whose response contains a secret, so the **channel** is part of its contract. A request over a channel the deployment has not established as confidential is refused with `403` and `error_detail.code` of `SUBSCRIBER_INSECURE_TRANSPORT`, because a correct master key over plaintext HTTP is an authorised credential leak. The operator's side of that is one of: TLS terminated in Blnk (`BLNK_SERVER_SSL`), a declared TLS-terminating proxy (`BLNK_SERVER_TRUST_FORWARDED_PROTO`, with an ingress that sets `X-Forwarded-Proto`), or — on a host declared local-development with `BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE` — a loopback call from inside the container. Only the first is *proven* by this process; the other two are *declared* by the operator, and the loopback one needs a declaration because a same-host reverse proxy makes a public plaintext hop look like loopback from inside the process. See [The transport contract this endpoint requires](kafka-operations.md#the-transport-contract-this-endpoint-requires) in the operations runbook for the full contract, including why enabling the proxy boundary obliges you to make that proxy the only route to the process.
 
 ### The secret is shown once
 
@@ -286,6 +286,7 @@ The response carries everything a consumer needs *from Blnk* — where the broke
     "topics": ["blnk.transactions", "blnk.balances"],
     "consumer_group_namespace": "blnk-sub-sub_9f8d3c214b7a5e6f8a120c4d.",
     "partition_key_prefix_enforced": false,
+    "partition_key_prefix_enforced_by": "none",
     "gateway_delivery_required": false,
     "broker_record_access": true,
     "exclusive_grant_verified": true
@@ -301,28 +302,38 @@ The response carries everything a consumer needs *from Blnk* — where the broke
 
 Every member above is present in every response, with one exception: `partition_key_prefix` is omitted
 when no prefix is recorded for the subscriber, which is the case shown here — hence
-`partition_key_prefix_enforced_by: "none"` and `client_side_key_filtering_required: false`. In
-particular `not_enforced_by` carries `partition_key` for **every** subscriber, because Kafka has no
-message-key authorisation dimension for Blnk to use; `credential_fingerprint` is a non-reversible
+`partition_key_prefix_enforced_by: "none"` and `gateway_delivery_required: false`. In particular
+`not_enforced_by` is **empty for every subscriber**: every dimension the response names is enforced
+somewhere, and a subscriber whose prefix nothing would enforce is refused a credential rather than
+issued one with an unenforced dimension listed. `credential_fingerprint` is a non-reversible
 reference you can compare against the registry to confirm which credential is live without ever
 handling the secret; and `replaced` tells you whether this call superseded an existing credential —
 `true` means any consumer still using the previous password is now failing authentication.
 
+There is no `client_side_key_filtering_required` member. It existed while a key-scoped subscriber was
+granted whole-topic `Read` and asked to discard what was not its own, and it was removed with that
+design — cooperation by the party holding the credential is not an access boundary. Nothing replaced
+it, because nothing now asks you to filter.
+
 > The `password` above is a placeholder. **The real response carries the generated secret, once.** Everything else in the response is reproducible by re-reading the subscriber; the password is not — which is why the request above writes it to a private file instead of printing it, and why the only field a reviewer or a support ticket should ever see is the redacted projection.
 
 **3. Note which brokers you were given, and check they are reachable from where you are.** `brokers` is
-the *subscriber-facing* list. When your operator has set `KAFKA_SUBSCRIBER_BROKERS`, it is the
-externally advertised list and differs from the addresses Blnk dials internally. When they have not,
-issuance **falls back to `KAFKA_BROKERS`** — Blnk logs a warning that it is advertising an internal
-address, but the response is still a success, so a successful response is not by itself proof that the
-endpoint is routable from your network. Issuance is refused, with `503`
-`SUBSCRIBER_BROKERS_NOT_CONFIGURED`, only when **neither** list is configured. If the addresses you
-receive do not resolve or connect from your side, that is the fallback to raise with your operator, not
-a fault in your consumer.
+the *subscriber-facing* list, and it comes from **`KAFKA_SUBSCRIBER_BROKERS` alone**. There is no
+fallback to `KAFKA_BROKERS`: those are the addresses Blnk dials from inside the deployment, they are
+routinely unroutable from outside it, and advertising them would both hand you an endpoint that
+cannot connect and publish the internal topology. When your operator has not set a subscriber-facing
+list, issuance is **refused** with `503 SUBSCRIBER_BROKERS_NOT_CONFIGURED` before any credential is
+minted — so a `200` from this endpoint means an operator deliberately published the address you were
+given.
+
+For a subscriber carrying a `partition_key_prefix` the address is different again: it is the
+key-authorising component your operator declared (`KAFKA_KEY_SCOPE_GATEWAY_BROKERS`), not a Kafka
+broker. Read `broker_endpoint` rather than assuming which of the two you have — see the
+`gateway_delivery_required` bullet below.
 
 **4. Configure your consumer.** The example above shows a subscriber with **no** `partition_key_prefix`, which is the ordinary case and the one this step describes: connect with **`security.protocol=SASL_SSL`**, authenticate with `sasl.mechanism=SCRAM-SHA-512` using `username` and the captured password, **validate the broker certificate** against the CA your operator supplied separately (leave hostname verification enabled), then join `consumer_group_id` and subscribe to `authorized_topics`. Anything outside your grant is refused at the broker, not filtered by your client.
 
-**If `gateway_delivery_required` is `true`, stop and read the bullet below instead.** Your principal holds `Describe` and no `Read`, so a consumer configured as above will authenticate and then have every fetch refused with `TOPIC_AUTHORIZATION_FAILED`. Your records come from `GET /subscribers/{id}/events`.
+**If `gateway_delivery_required` is `true`, stop and read the bullet below instead.** Your principal holds `Describe` and no `Read` on the Kafka brokers, so a consumer pointed at a broker will authenticate and then have every fetch refused with `TOPIC_AUTHORIZATION_FAILED`. Point it at the `broker_endpoint` in your response instead: that is the key-authorising component your operator declared, and it takes the same SASL/SCRAM credential.
 
 `SASL_PLAINTEXT` appears only in Blnk's local development stack. Over plaintext the SCRAM exchange is
 observable to anyone on the network path and nothing authenticates the broker to you, so a
@@ -339,8 +350,8 @@ Two limits are worth stating outright, because the narrower one is the natural a
 
 - The credential grants **Read and Describe on your authorised topics** and **Read on your consumer-group namespace**, and nothing further. No dead-letter topic is ever granted to a subscriber, so no `<topic>.dlt` appears in `authorized_topics`.
 - **`ledger.created` needs an explicit grant, and it is the one event you can lose at the cutover by not asking for it.** The topic catalogue has four categories, and `ledger.created` shares `blnk.system` with `system.error` — whose payload is a frozen legacy body carrying verbatim internal error text. `blnk.system` is grantable, precisely so this event stays reachable, but it is not granted by default. So a webhook subscriber that consumes `ledger.created` today must have `blnk.system` in its `authorized_topics` **before** the sunset. Raise it with your operator: the grant also delivers `system.error` and any event type Blnk has not yet catalogued, so if you do not consume ledger creations, reading them from the REST API remains the narrower answer.
-- **Within an authorised topic the BROKER applies no further restriction.** Kafka authorises at topic and consumer-group granularity and has no message-key dimension, so per-key filtering cannot be enforced by the broker and is not claimed anywhere. `enforced_access.partition_key_prefix_enforced` is always `false`, and it is reported explicitly rather than left to be inferred.
-- **`enforced_access.gateway_delivery_required` decides how you consume.** If the subscriber records a `partition_key_prefix`, Blnk enforces it — Kafka's authorizer has no message-key dimension, so such a subscriber is granted `Describe` but **not** `Read` on its topics and the broker refuses every direct fetch. Its records arrive from `GET /subscribers/{id}/events`, which returns only the records whose key carries the prefix, and `gateway_delivery_required` is `true` on every response about it. When no prefix is recorded that field is `false`, `broker_record_access` is `true`, and the subscriber consumes directly from the broker confined by its `authorized_topics` alone — which means a granted topic is readable in full, including other ledgers' records on it. **Check this field before you point a consumer at a bootstrap address**: it is the difference between a working migration and a consumer whose every fetch is refused. See [event-streaming.md](event-streaming.md#your-partition_key_prefix-is-enforced-by-blnk-and-it-decides-how-you-consume) for the endpoint's contract and [kafka-operations.md](kafka-operations.md#the-partition-key-prefix-is-enforced-by-blnk-not-by-the-broker) for the grant it implies.
+- **Within an authorised topic the BROKER applies no further restriction.** Kafka authorises at topic and consumer-group granularity and has no message-key dimension, so per-key filtering cannot be enforced by the broker and is never claimed to be. That is why a key scope, when one is recorded, is kept *outside* the broker and why the broker-side grant for such a subscriber is narrowed to `Describe`.
+- **`enforced_access.gateway_delivery_required` decides which endpoint you dial.** If the subscriber records a `partition_key_prefix`, its principal is granted `Describe` but **not** `Read` on its topics and the Kafka brokers refuse every fetch it attempts; its records arrive from the key-authorising component the deployment declared, whose address `broker_endpoint` carries, and `gateway_delivery_required` is `true` on every response about it. **Blnk does not ship that component and serves no records itself** — there is no read path under `/subscribers` — so where no component is declared such a subscriber is refused a credential with `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED` rather than issued one it could not use. When no prefix is recorded the field is `false`, `broker_record_access` is `true`, and the subscriber consumes directly from the brokers confined by its `authorized_topics` alone — which means a granted topic is readable in full, including other ledgers' records on it. **Check this field before you point a consumer at a bootstrap address**: it is the difference between a working migration and a consumer whose every fetch is refused. See [event-streaming.md](event-streaming.md#your-partition_key_prefix-is-enforced-outside-the-broker-and-it-decides-whether-you-get-a-credential-at-all) for the contract and [kafka-operations.md](kafka-operations.md#the-partition-key-prefix-is-enforced-outside-the-broker) for the grant it implies.
 - **To narrow what the BROKER enforces, narrow the topic grant** — that is the dimension the broker can actually check.
 
 > **One of the three specified scopes is not an ACL, and cannot be.** The specification asks for ACLs
@@ -349,23 +360,28 @@ Two limits are worth stating outright, because the narrower one is the natural a
 > topic, group, transactional id, delegation token and user resources, and a message key is none of
 > them.
 >
-> Blnk previously refused issuance in this case, and that refusal has been **removed** along with its
-> `409 SUBSCRIBER_ISOLATION_UNENFORCEABLE` code and the database constraint behind it. Refusing looked
-> like the safe direction and was not: a subscriber that is refused a credential consumes *nothing*,
-> which is the absence of a boundary rather than a narrower one, and it left operators unable to
-> onboard a subscriber whose only fault was recording a prefix. Disclosure achieves what the refusal
-> was reaching for — nobody is told the key is enforced — without withholding the data. **Do not read
-> `partition_key_prefix_enforced: false` as "this deployment chose not to use key scoping."** Read it
-> as "key scoping cannot be enforced here, and any subscriber needing it must be isolated by another
-> means." The two options that actually work are a narrower topic grant, or separate deployments for
-> data that must not be co-readable. Choosing between those is an architectural decision for the
-> people who own the requirement, not something this document can settle.
+> So the third scope is kept **outside** the broker, by a component the deployment declares in
+> `KAFKA_KEY_SCOPE_ENFORCEMENT` and addresses in `KAFKA_KEY_SCOPE_GATEWAY_BROKERS`. Blnk narrows the
+> broker-side grant to `Describe` so that component is the only path such a subscriber's records can
+> take, and it **refuses to mint a credential at all** — `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED` — while
+> no component is declared. **Blnk does not ship one, and Blnk serves no records itself.**
 >
-> The refusal was briefly replaced by issuing the credential with the limitation disclosed in the
-> body, and then restored. Disclosure was accurate and narrowed nothing, because the party asked to
-> apply a client-side filter is the party holding the credential. What the intervening period was
-> right about is that a permanent dead end is unacceptable, which is why the refusal names two
-> working remedies and why clearing the prefix is never itself refused.
+> Two earlier behaviours are worth naming, because each looks like this one and neither was a
+> boundary. First, issuance was refused unconditionally and a database `CHECK` constraint made the
+> combination unrepresentable, so a subscriber recording a prefix could never obtain a credential and
+> clearing the prefix was the only escape; `sql/1781248930.sql` drops that constraint. Then the
+> credential was issued with whole-topic `Read` and the response declared applying the prefix to be
+> the consumer's own obligation — accurate prose about an absent boundary, since the party asked to
+> filter was the party holding the credential.
+>
+> What the current behaviour keeps from each: the refusal, because a boundary that nothing enforces
+> must not be reported as enforced; and two named remedies, because a permanent dead end is
+> unacceptable. **Do not read `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED` as "this deployment chose not to
+> use key scoping."** Read it as "nothing here evaluates message keys yet", and take one of the two
+> remedies: have a key-authorising component declared, or clear the prefix and narrow the topic grant
+> instead. Separate deployments for data that must not be co-readable remain the third answer.
+> Choosing between them is an architectural decision for the people who own the requirement, not
+> something this document can settle. Clearing a prefix is never itself refused.
 
 The ACL model, the SCRAM parameters and the provisioning procedure are the operator's side of this and are documented in [kafka-operations.md](kafka-operations.md); they are not restated here.
 
@@ -471,7 +487,7 @@ codebase changed itself. **Automatic** entries happen at the instant, by configu
 | Recording a legacy URL | **Automatic** | `POST` and `PUT /subscribers/{subscriber_id}/webhook-subscription` are the only write paths for it, and both answer `410 Gone`. Clearing one is `DELETE` on the same route, so it stops at the instant too |
 | Reporting a legacy URL | **Automatic** | `GET /subscribers/{subscriber_id}/webhook-subscription` is the only read path, and it answers `410 Gone` |
 | HTTP delivery | **Automatic** | No delivery is enqueued or attempted; a delivery still owed when the instant passes is dropped rather than left pending |
-| `webhooks.go` and its functions | **Manual** | `processHTTP`, `SendWebhook` and `ProcessWebhook` are deleted in a later release. The source carries an explicit operator checklist for it; the date does not do it. Its first step is **already complete** — the two payload-contract symbols have been relocated out, so what remains is a pure deletion |
+| `webhooks.go` and its functions | **Manual** | `processHTTP`, `SendWebhook` and `ProcessWebhook` are deleted in a later release — the one enumerated in [The terminal release](#the-terminal-release-the-deletion-checklist) below. The date does not do it. Its first step is **already complete**: the two payload-contract symbols have been relocated out, so what remains is a pure deletion |
 | The delivery handler registration | **Manual** | The `WebhookQueue → ProcessWebhook` mapping is unregistered in that same release — **the mapping only**, never the queue, see [What Never Existed](#what-never-existed) |
 | The `webhook_url` column | **Manual, not yet scheduled** | Recorded URLs can be purged (nulled) once subscribers have migrated. **No migration drops the column.** The statements to drop it and `migrated_at` sit **commented out** in `sql/1781248900.sql` as a documented future step, to be run by hand only after the sunset has passed and every subscriber shows migrated |
 
@@ -494,6 +510,58 @@ subscriber on `/subscribers`, then record its URL on
 only through the guarded `GET`, so the two reads cannot disagree about whether the legacy surface
 still exists. `migrated_at` does stay on the subscriber body, before and after the sunset, because it
 is migration *progress* rather than legacy webhook state and discloses no endpoint.
+
+### The terminal release: the deletion checklist
+
+The rows marked **Manual** above are not a promise to tidy up eventually. They are one release, and
+this is its checklist. It is here rather than only in the source because it is the artifact the
+deferral is answerable to: while the transport is still compiled in, every row below names something
+that exists, and `TestWebhookTerminalRelease_ChecklistMatchesTheSurface` in `event_sunset_test.go`
+asserts exactly that. So the release cannot be performed without editing this table, and this table
+cannot be left describing a release that already happened.
+
+**Trigger.** Do none of it until the deployed window has fully closed — `WebhookSunsetPassed` true,
+`WebhookDualDeliveryActive` false, and 30 days elapsed since the window opened. Before then the
+delivery code must stay compiled and reachable: the dual-delivery payload-equivalence check needs a
+live second transport to compare against, and the `410` is a runtime decision, not a consequence of
+deleted source. This ordering is the schedule the project's plan fixes, which places these deletions
+as the feature's terminal step rather than as part of the release that introduced Kafka.
+
+**Delete, in this order.** Order matters only for the first row, which is already discharged.
+
+| Artifact | Where it lives today | Terminal action |
+|---|---|---|
+| `NewWebhook`, `getEventFromStatus` | `event_outbox.go`, `event_topics.go` | **ALREADY RELOCATED — do nothing.** They are the payload object and the event-string vocabulary, so they outlive the transport. Verify they are not in `webhooks.go` before deleting it |
+| `processHTTP`, `processHTTPRaw`, `SendWebhook`, `EnqueueLegacyWebhookDelivery`, `ProcessWebhook`, `legacyWebhookTaskID`, `LegacyWebhookRetention`, `LegacyWebhookEventIDHeader` | `webhooks.go` | **DELETE the whole file.** Nothing else in it outlives the transport; confirm that with a build rather than by reading |
+| The transport's own tests | `webhooks_test.go`, `webhooks_process_test.go`, `webhooks_destination_test.go`, `webhooks_logging_test.go` | **DELETE.** Their subject is the HTTP transport; the payload and vocabulary behaviours they also touch are covered where those two symbols now live |
+| `mux.HandleFunc(cfg.Queue.WebhookQueue, b.blnk.ProcessWebhook)` | `cmd/workers.go` | **UNREGISTER THIS ONE LINE**, and nothing else on that mux. See the preserve table below — this is the row most likely to be over-applied |
+| The dual-delivery branch and its state: `eventRelayLegacyTransport`, `dualDeliveryActive`, `MarkEventWebhookPending`, the `webhook_pending` status, `kafka_dispatched_at`, `webhook_attempts` | `event_relay.go` | **DELETE.** All of it exists to keep a failed legacy enqueue recoverable *during* the window. Deleting `webhooks.go` breaks the build at the enqueue call site, which is the intended reminder that the two go together |
+| The delivery use of the webhook configuration block — `WebhookConfig`, reached as the `Webhook` member of the notification config | `config/config.go`, `webhooks.go` | **STOP READING IT for delivery.** The struct may stay so existing `blnk.json` files keep loading; nothing may deliver from it |
+| The dual-delivery test | `event_dual_delivery_test.go` | **DELETE**, with the branch it tests — not with `webhooks.go`, since its subject is the branch |
+
+**Preserve. Every row here is shared infrastructure that predates or outlives this transport, and
+deleting any of it produces no compile error.**
+
+| Artifact | Where it lives | Why it must survive |
+|---|---|---|
+| `cfg.Queue.WebhookQueue`, `initializeWebhookQueues`, `initializeWebhookWorkerServer` | `cmd/workers.go`, `config/config.go` | The queue is shared. `initializeWebhookQueues` returns the webhook queue **and** the index queue, and `internal/hooks/manager.go` enqueues `PRE_TRANSACTION`/`POST_TRANSACTION` work onto the webhook queue **by name**. Removing it silently disables transaction hooks and search indexing |
+| `new:hook_execution`, `cfg.Queue.IndexQueue`, `new:index:batch` handlers | `cmd/workers.go` | Three of the four handlers on that mux belong to other features. Only the `ProcessWebhook` mapping is this transport's |
+| `DeprecatedWebhookSubscriptionRoute` and its four registrations — `RegisterWebhookSubscription`, `GetWebhookSubscription`, `UpdateWebhookSubscription`, `DeleteWebhookSubscription` | `api/api.go`, `api/subscribers.go` | **The `410 Gone` is required *on every request* after the sunset, and a deleted route answers `404`.** The routes are what there is to answer with; the guard is what answers. Deleting them would replace the required refusal with "no such endpoint" and would leave a deployment still inside its own window with no management surface at all |
+| `WebhookSunsetGuard`, `WebhookSunsetPreAuthGuard`, `IsDeprecatedWebhookSubscriptionPath` | `api/middleware/sunset.go` | The runtime retirement itself. It is a configuration decision that every deployment reaches on its own date |
+| `ErrGenGone` and its `statusByCode` entry | `internal/apierror/codes.go` | Without the mapping the guard would emit `500`; an unmapped code defaults to it |
+| `WebhookSunsetPassed`, `WebhookSunsetSnapshotAt`, `WebhookDeprecationWindow` | `event_sunset.go` | The single sunset decision point, still consulted by the guards |
+| Every queueing dependency — `hibiken/asynq`, `hibiken/asynqmon`, `redis/go-redis` | `go.mod` | **Nothing leaves `go.mod`.** Deleting `ProcessWebhook` removes a handler registration, not a module: all three remain required by the transaction queue, the hooks subsystem and the index queue |
+
+> This is the one place the checklist departs from a narrower reading of "delete the webhook REST
+> API". The four routes and the guard are preserved *because* the requirement is that the API answer
+> `410 Gone` on every request after the sunset, and only a registered route can. What is deleted is
+> the delivery mechanism.
+
+**Verify, after performing it.** `go build ./...` with zero errors is the check that nothing in
+`webhooks.go` was still needed. Then: the four deprecated routes still answer `410 GEN_GONE` on every
+method, transaction hooks still execute, and search indexing still runs — the three things the
+preserve table exists to protect. `sql/1781248900.sql`'s commented-out column drops stay commented
+out; they are a separate, hand-run step.
 
 ### The `410 Gone` is a typed error code, not a bare status
 

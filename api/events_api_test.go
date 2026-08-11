@@ -60,11 +60,15 @@ limitations under the License.
 // Neither harness sets configuration by any route other than config.MockConfig, and
 // no test in this file imports a Kafka client: the pipeline's transport is exercised
 // in the root package, and what is under test here is HTTP.
+//
+// The one assertion in this surface that DOES need a broker — that a 200 from the
+// replay route put the record back on its original topic — lives in
+// events_replay_integration_test.go for exactly that reason, so this file's
+// no-broker contract holds by construction rather than by intention.
 package api
 
 import (
 	"context"
-	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -76,9 +80,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/segmentio/kafka-go"
-	"github.com/segmentio/kafka-go/sasl/scram"
 
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/api/model"
@@ -3368,246 +3369,16 @@ func TestReplayDeadLetterEvent_RequiresAnEventIDInTheRoute(t *testing.T) {
 	})
 }
 
-// eventsReplayKafkaClient builds an authenticated Kafka client for reading a replayed record
-// back off its topic.
-//
-// The local stack speaks SASL/SCRAM-SHA-512, so an unauthenticated client cannot read anything
-// and a test built on one would report every assertion as a broker problem.
-//
-// THE ADMINISTRATIVE PRINCIPAL IS USED, NOT THE PRODUCER, and the reason is a property worth
-// stating: Blnk's producer principal is granted Write and NOT Read, so it cannot read back what
-// it publishes — least privilege applied to the publisher itself. A read-back verifier therefore
-// needs a different identity, and the administrator is the one this environment already supplies
-// for administrative reads. It is a verification identity belonging to the test, never a
-// production consumer.
-//
-// Parameters:
-//   - t *testing.T: the test, failed when the mechanism cannot be built.
-//   - kafkaConfig config.KafkaConfig: the resolved broker environment.
-//
-// Returns:
-//   - *kafka.Client: a client addressed at the first broker, with its transport closed on cleanup.
-func eventsReplayKafkaClient(t *testing.T, kafkaConfig config.KafkaConfig) *kafka.Client {
-	t.Helper()
-
-	mechanism, err := scram.Mechanism(scram.SHA512,
-		kafkaConfig.SASLAdminUser, kafkaConfig.SASLAdminSecret)
-	require.NoError(t, err,
-		"building the SCRAM-SHA-512 mechanism for the administrative principal")
-
-	transport := &kafka.Transport{SASL: mechanism}
-	if kafkaConfig.TLS.Enabled {
-		transport.TLS = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: kafkaConfig.TLS.ServerName,
-		}
-	}
-	t.Cleanup(transport.CloseIdleConnections)
-
-	return &kafka.Client{
-		Addr:      kafka.TCP(kafkaConfig.Brokers[0]),
-		Timeout:   eventsReplayBrokerTimeout,
-		Transport: transport,
-	}
-}
-
-// eventsReplayBrokerTimeout bounds every broker round trip this test makes. Generous enough for
-// a cold connection and a SASL handshake, short enough that an unreachable broker fails the test
-// rather than hanging it.
-const eventsReplayBrokerTimeout = 15 * time.Second
-
-// TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic is the SUCCESS path of
-// POST /events/dead-letter/:event_id/replay, executed rather than described.
-//
-// # What was untested
-//
-// Every other test of this route asserts a refusal — no broker, not dead-lettered, not found,
-// unauthorised — and the success body was covered only by a test that MARSHALLED
-// model.ReplayEventResponse itself and inspected the JSON. That pins the DTO's tags and can pin
-// nothing about the handler: which outcome fields it copies into which response fields, that it
-// answers 200 rather than 201 or 204, that it reports the ORIGINAL topic rather than the
-// dead-letter topic it was listed from, and that the event id it returns is the one that was
-// replayed. Every one of those is a line of handler code that a self-marshalled DTO never
-// executes. A handler that returned the dlt topic, or an empty event id, or someone else's
-// timestamp would have passed the whole file.
-//
-// # Why it is broker-backed and what that costs
-//
-// A 200 cannot be forged from this package. The handler calls blnk.ReplayDeadLetteredEvent on
-// the concrete service, which resolves the real publisher and refuses with
-// EVENT_KAFKA_UNAVAILABLE when it is the no-op — so a success requires a real publish to a real
-// broker. It therefore SKIPS with a reason when none is configured, exactly as the credential
-// issuance test in the sibling file does, and its name puts it inside the ^TestEventsAPI_ family
-// the Kafka acceptance job runs with a fail-on-skip gate: absent locally, required in CI.
-//
-// The registry stays a MOCK, which is what makes the assertions exact. The claim returns a known
-// dead-lettered row, so the event id, the topic and the payload bytes on the wire are all
-// fixture values the response can be compared against — and the coordinate the broker assigned
-// is captured from the MarkEventDispatched argument, which is the same value the service read
-// out of the publish acknowledgement.
-//
-// # The record is read back at the coordinate the broker named
-//
-// Not scanned for. The acknowledged partition and offset are used to fetch exactly one record,
-// so a value that arrived at a different coordinate, or not at all, fails rather than being
-// missed by a search that gave up. Its key and its bytes are then compared with the stored row:
-// a replay must republish the ORIGINAL bytes, which is the property the byte-fidelity criterion
-// rests on and the reason PublishRequestFromOutbox reads EventRaw instead of re-marshalling.
-func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *testing.T) {
-	kafkaConfig, reason, configured := subscribersKafkaEnvironment(t)
-	if !configured {
-		t.Skip(reason)
-	}
-
-	eventID := uuid.NewString()
-	row := eventsReplayableRow(eventID)
-
-	apiInstance, datasource := newEventsAPIOverMockDatasource(t, func(cfg *config.Configuration) {
-		cfg.Kafka = kafkaConfig
-		// Brokers without a sunset date are refused by configuration validation, because a
-		// publishing deployment with no usable dual-delivery window is treated as already
-		// retired. A future instant keeps the sunset guard transparent.
-		cfg.WebhookDeprecationSunsetDate = time.Now().Add(20 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	})
-	router := apiInstance.Router()
-
-	// RESOLVED THROUGH PRODUCTION, and only after the configuration is published: TopicForEvent
-	// reads the prefix from the store, and the topic the fixture names must be one Blnk OWNS
-	// under that prefix or the publisher refuses the request for a reason that has nothing to do
-	// with this test. Spelling it out here instead would hard-code a prefix the environment is
-	// free to change.
-	row.Topic = blnk.TopicForEvent(row.EventType)
-	row.DLTTopic = blnk.DLTFor(row.Topic)
-	require.NotEmpty(t, row.Topic, "the fixture's event type must route to a topic")
-
-	datasource.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).Return(row, nil)
-
-	// The acknowledged coordinate is CAPTURED rather than matched, because it is what the
-	// broker chose and the test cannot know it in advance. It is also the only place the
-	// service's view of the publish is observable from this package.
-	var acknowledged coremodel.BrokerRecord
-	datasource.On("MarkEventDispatched", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
-		Return(nil).
-		Run(func(args mock.Arguments) {
-			record, isRecord := args.Get(3).(coremodel.BrokerRecord)
-			require.True(t, isRecord, "the dispatch transition must be given a broker record")
-			acknowledged = record
-		})
-	// Not expected to be reached: a successful replay marks the row dispatched and releases
-	// nothing. Programmed so that a release would be RECORDED rather than panicking the mock,
-	// which is what lets the assertion below name it.
-	datasource.On("ReleaseEventReplay", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
-		Return(nil).Maybe()
-
-	before := time.Now().UTC()
-	recorder := eventsKeyedRequest(t, router,
-		http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
-	after := time.Now().UTC()
-
-	// 1. THE EXACT STATUS. 200 and nothing else: a replay returns a body, so 204 would be
-	// wrong, and it creates no addressable resource, so 201 would be too.
-	require.Equalf(t, http.StatusOK, recorder.Code,
-		"a successful replay answers 200. body: %s", recorder.Body.String())
-
-	// 2. THE EXACT BODY, decoded into the declared DTO and then read again as raw keys, so a
-	// field renamed in the response but not in the model cannot pass.
-	var response model.ReplayEventResponse
-	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response),
-		"the success body must decode as the declared response: %s", recorder.Body.String())
-
-	assert.Equal(t, eventID, response.EventID,
-		"THE EVENT ID IS UNCHANGED BY A REPLAY. That is what lets a subscriber deduplicating on "+
-			"event_id absorb the copy, and a handler returning a fresh id would break exactly that")
-	assert.Equal(t, row.Topic, response.Topic,
-		"the ORIGINAL category topic the event went back to, never the dead-letter topic it was "+
-			"listed from")
-	assert.NotContains(t, response.Topic, blnk.DeadLetterTopicSuffix,
-		"a client told to reason about the .dlt topic would consume from the wrong place")
-	assert.Equal(t, string(coremodel.PublishStatusDispatched), response.Status,
-		"the broker acknowledged the record, so the reported status is dispatched rather than "+
-			"retrying or dead-lettered")
-
-	require.False(t, response.ReplayedAt.IsZero(),
-		"the acknowledgement instant must be reported: it is what an operator correlates the "+
-			"replay against")
-	assert.Falsef(t, response.ReplayedAt.Before(before.Add(-time.Second)) ||
-		response.ReplayedAt.After(after.Add(time.Second)),
-		"replayed_at must be the instant of THIS replay, not a stored one: got %s, request ran "+
-			"between %s and %s", response.ReplayedAt, before, after)
-
-	var rawBody map[string]interface{}
-	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &rawBody))
-	assert.Equal(t, eventID, rawBody["event_id"], "the wire key is event_id")
-	assert.Equal(t, row.Topic, rawBody["topic"], "the wire key is topic")
-	assert.NotContains(t, recorder.Body.String(), "failure",
-		"failure metadata has no place on a success")
-
-	// 3. THE BOOKKEEPING RAN, and the coordinate it recorded is a real one.
-	datasource.AssertCalled(t, "MarkEventDispatched",
-		mock.Anything, row.ID, row.ClaimToken, mock.Anything)
-	datasource.AssertNotCalled(t, "ReleaseEventReplay",
-		mock.Anything, row.ID, row.ClaimToken, mock.Anything)
-
-	require.True(t, acknowledged.Confirmed(),
-		"the broker must have acknowledged the record with a coordinate; an unconfirmed record "+
-			"would leave the row claiming a publication it cannot name")
-	require.Equal(t, row.Topic, acknowledged.Topic,
-		"the acknowledged coordinate must name the original topic")
-	require.GreaterOrEqual(t, acknowledged.Offset, int64(0),
-		"a published record occupies a non-negative offset")
-
-	// 4. THE RECORD IS ON THE TOPIC, read at exactly the coordinate the broker named.
-	client := eventsReplayKafkaClient(t, kafkaConfig)
-
-	ctx, cancel := context.WithTimeout(context.Background(), eventsReplayBrokerTimeout)
-	defer cancel()
-
-	fetched, err := client.Fetch(ctx, &kafka.FetchRequest{
-		Topic:     acknowledged.Topic,
-		Partition: acknowledged.Partition,
-		Offset:    acknowledged.Offset,
-		MinBytes:  1,
-		MaxBytes:  1 << 20,
-		MaxWait:   eventsReplayBrokerTimeout / 3,
-	})
-	require.NoError(t, err, "fetching %s/%d at offset %d",
-		acknowledged.Topic, acknowledged.Partition, acknowledged.Offset)
-	require.NoError(t, fetched.Error, "the broker refused the fetch")
-	require.NotNil(t, fetched.Records)
-
-	record, err := fetched.Records.ReadRecord()
-	require.NoErrorf(t, err,
-		"NO RECORD AT %s/%d OFFSET %d. The response reported a successful replay and the "+
-			"bookkeeping recorded that coordinate, so a record has to be there",
-		acknowledged.Topic, acknowledged.Partition, acknowledged.Offset)
-	require.Equal(t, acknowledged.Offset, record.Offset,
-		"the record read must be the one at the acknowledged offset")
-
-	key, err := kafka.ReadAll(record.Key)
-	require.NoError(t, err, "reading the replayed record's key")
-	assert.Equal(t, row.EffectiveKey(), string(key),
-		"the replay must be keyed as the original was, or it lands on a different partition and "+
-			"the aggregate's ordering is broken by the very act of repairing it")
-
-	value, err := kafka.ReadAll(record.Value)
-	require.NoError(t, err, "reading the replayed record's value")
-	assert.Equal(t, string(row.EventRaw), string(value),
-		"A REPLAY REPUBLISHES THE STORED BYTES. Re-marshalling from a struct would produce a "+
-			"value that differs from the original in field order or in a zero value, and the "+
-			"byte-fidelity criterion is what a subscriber's deduplication depends on")
-
-	datasource.AssertExpectations(t)
-}
-
 // TestReplayEventResponse_IsTheShapeASuccessfulReplayReturns pins the success DTO at the
 // type level.
 //
 // A 200 from this endpoint cannot be produced without a broker, and a broker is
 // deliberately absent from every test in this file — the listing and the statistics must
 // work without one, and the replay's own no-broker refusal is asserted above. The success
-// path is exercised end to end in the root package against a real broker; what belongs
-// here is the CONTRACT of the body that path returns, because that contract is declared in
-// api/model and a client is written against it.
+// path is executed against a real broker in events_replay_integration_test.go, which is
+// where the Kafka client dependency belongs; what belongs here is the CONTRACT of the body
+// that path returns, because that contract is declared in api/model and a client is
+// written against it.
 //
 // Status is omitempty and the other three are not, which is the shape a client must handle:
 // the event id, the ORIGINAL topic and the acknowledgement instant are always present.

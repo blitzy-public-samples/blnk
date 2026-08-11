@@ -90,6 +90,21 @@ services:
       # configured at all, are open, and /metrics discloses ledger throughput, balance
       # counts and error rates.
       BLNK_METRICS_BEARER_TOKEN: ${BLNK_METRICS_BEARER_TOKEN:-}
+      # CREDENTIAL ISSUANCE OVER PLAINTEXT LOOPBACK, which is a LOCAL-DEVELOPMENT
+      # exception and is why this file sets it while the Kubernetes manifests do not.
+      #
+      # POST /subscribers/{id}/kafka-credentials answers with a one-time SASL password, so
+      # it refuses any channel the deployment has not established as confidential. This
+      # stack has no TLS and no proxy, so without this declaration every issuance here
+      # answers 403 SUBSCRIBER_INSECURE_TRANSPORT and the endpoint cannot be exercised
+      # locally at all.
+      #
+      # IT IS A DECLARATION, NOT AN OBSERVATION. A loopback peer proves only that the last
+      # hop stayed on the host: a reverse proxy on the same host forwards a public plaintext
+      # request over 127.0.0.1, and from inside the process that is indistinguishable from
+      # curl in the container. Do not carry this value into a deployment that has anything in
+      # front of Blnk — use BLNK_SERVER_SSL or BLNK_SERVER_TRUST_FORWARDED_PROTO there.
+      BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE: ${BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE:-true}
       # ---------------------------------------------------------------------
       # Kafka event publishing and the outbox relay. Every name below is the bare,
       # un-prefixed form .env.example declares, which is the mandated contract.
@@ -118,11 +133,14 @@ services:
       # "kafka:9092" — reachable on this compose network and nowhere else — so
       # reporting it to a subscriber would return an endpoint it cannot dial. The
       # broker advertises its EXTERNAL listener as localhost:9092, published on the
-      # host below, and that is what a subscriber connects to. It is an OPTIONAL OVERRIDE:
-      # left empty, issuance falls back to KAFKA_BROKERS and warns that it is handing out
-      # an internal address, so a 200 is not by itself proof the endpoint is dialable.
-      # Issuance is refused with 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED only when NEITHER
-      # list is set.
+      # host below, and that is what a subscriber connects to.
+      #
+      # IT IS REQUIRED FOR CREDENTIAL ISSUANCE AND THERE IS NO FALLBACK. Left empty,
+      # POST /subscribers/{id}/kafka-credentials answers 503
+      # SUBSCRIBER_BROKERS_NOT_CONFIGURED naming this variable and mints nothing —
+      # rather than publishing an internal address whose failure lands in the
+      # subscriber's logs days later, after the one-time secret is gone. Every other
+      # endpoint runs without it.
       KAFKA_SUBSCRIBER_BROKERS: ${KAFKA_SUBSCRIBER_BROKERS:-localhost:9092}
       # WHETHER ANYTHING IN FRONT OF THE BROKERS AUTHORISES RECORD KEYS. "none", the
       # shipped value, means nothing does — and because Kafka's authorizer has no

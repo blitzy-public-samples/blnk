@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -71,38 +72,171 @@ import (
 // balanceMonitorHandoffColumns is the projection every read of the handoff table
 // uses, declared once so the column order and the Scan order cannot drift apart.
 const balanceMonitorHandoffColumns = `id, handoff_id, balance_id, ledger_id, balance_snapshot, ` +
-	`status, attempts, max_attempts, last_error, events_captured, created_at, processed_at, locked_until`
+	`monitor_snapshot, status, attempts, max_attempts, last_error, events_captured, created_at, ` +
+	`processed_at, locked_until`
 
-// insertBalanceMonitorHandoffsInTx records, inside the caller's transaction, the
-// intent to evaluate the monitors of every supplied balance.
+// selectBalanceMonitorsInTx reads the monitor definitions of the supplied balances
+// INSIDE the caller's transaction, keyed by balance id.
+//
+// # This read is the other half of R-2, and the transaction is why
+//
+// A `balance.monitor` alert is decided by two inputs: the balance's post-mutation state and
+// the monitor definitions in force at that moment. The balance was already snapshotted in
+// this transaction. Reading the definitions here puts BOTH inside the same commit, so the
+// evaluation the handoff processor performs later is a pure function of the row it claimed.
+//
+// Reading them afterwards — which is what the handoff processor used to do — left one input
+// live. blnk.balance_monitors is operator-editable through PUT and DELETE
+// /balance-monitors, so a monitor deleted between the commit and the drain suppressed an
+// alert for a movement that had already crossed its threshold; one created in that window
+// produced an alert for a movement it was never registered to watch; an edited threshold
+// produced an alert for a condition that was not the condition in force. None of it was
+// visible from the outbox, because the row looked identical either way.
+//
+// It also makes a RETRY deterministic. The claim lease can lapse and a row can be evaluated
+// twice; model.BalanceMonitorEventIdentity makes the second attempt collide with the first
+// on purpose so it is a no-op — which only holds if the second reaches the same verdict.
+//
+// # One statement, one index lookup per balance
+//
+// The read is a single `balance_id = ANY($1)` served by idx_balance_monitors_balance_id, the
+// index the handoff table's own migration added for exactly this access pattern. It REPLACES
+// the per-balance correlated EXISTS the insert used to carry, so a deployment with no
+// monitors configured now pays one indexed probe for the whole statement rather than one per
+// balance, and still writes nothing.
+//
+// # The scan tolerates NULL where GetBalanceMonitors does not, deliberately
+//
+// blnk.balance_monitors.precision and precise_value are nullable columns.
+// Datasource.GetBalanceMonitors scans them into a bare float64 and int64, so a NULL there is
+// a scan error on that path. Here it must not be: this statement runs inside a MONEY
+// TRANSACTION, and a monitor row with an unset precision must never roll back a ledger
+// movement. The nullable columns are read through sql.Null* and flattened to the same zero
+// values the non-null case produces, so a row readable by both paths decodes identically —
+// which is what keeps the event payload bytes identical to the pre-snapshot behaviour — and
+// a row readable by only one is still evaluated rather than dropped.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statement.
+//   - tx *sql.Tx: the caller's open transaction. Required.
+//   - balanceIDs []string: the balances to read monitors for. Empty yields no read.
+//
+// Returns:
+//   - map[string][]model.BalanceMonitor: the definitions, keyed by balance id. A balance
+//     with no monitor is absent from the map rather than present with an empty slice.
+//   - error: the wrapped statement or scan error, which correctly rolls the caller back.
+func selectBalanceMonitorsInTx(
+	ctx context.Context, tx *sql.Tx, balanceIDs []string,
+) (map[string][]model.BalanceMonitor, error) {
+	if len(balanceIDs) == 0 {
+		return nil, nil
+	}
+
+	if tx == nil {
+		return nil, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to read balance monitors",
+			errors.New("balance monitors must be snapshotted inside the balance's own transaction"),
+		)
+	}
+
+	// The column list and its order mirror Datasource.GetBalanceMonitors exactly, so the two
+	// reads of this table cannot decode the same row into different values.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT monitor_id, balance_id, field, operator, value, description, call_back_url,
+		       created_at, precision, precise_value
+		FROM blnk.balance_monitors
+		WHERE balance_id = ANY($1)
+	`, pq.Array(balanceIDs))
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read balance monitors", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	monitors := make(map[string][]model.BalanceMonitor, len(balanceIDs))
+	for rows.Next() {
+		monitor := model.BalanceMonitor{}
+		condition := model.AlertCondition{}
+
+		var description, callBackURL sql.NullString
+		var precision sql.NullFloat64
+		var preciseValue sql.NullInt64
+
+		if err := rows.Scan(
+			&monitor.MonitorID,
+			&monitor.BalanceID,
+			&condition.Field,
+			&condition.Operator,
+			&condition.Value,
+			&description,
+			&callBackURL,
+			&monitor.CreatedAt,
+			&precision,
+			&preciseValue,
+		); err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan a balance monitor", err)
+		}
+
+		monitor.Description = description.String
+		monitor.CallBackURL = callBackURL.String
+		condition.Precision = precision.Float64
+		// ALWAYS NON-NIL, matching GetBalanceMonitors, which assigns big.NewInt
+		// unconditionally. A nil pointer here would marshal as JSON null and CheckCondition
+		// would have to guard it, so the zero is carried explicitly.
+		condition.PreciseValue = big.NewInt(preciseValue.Int64)
+		monitor.Condition = condition
+
+		monitors[monitor.BalanceID] = append(monitors[monitor.BalanceID], monitor)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read balance monitors", err)
+	}
+
+	return monitors, nil
+}
+
+// insertBalanceMonitorHandoffsInTx records, inside the caller's transaction, the pending
+// evaluation of every supplied balance's monitors — together with both inputs that
+// evaluation depends on.
 //
 // # This is the atomicity, and it is why the function takes a *sql.Tx
 //
 // The transaction belongs to the atomic writer that is updating these balances. Writing
-// the intent here — after the balance UPDATEs and before the COMMIT — is what makes a
+// the row here — after the balance UPDATEs and before the COMMIT — is what makes a
 // committed movement inseparable from its pending evaluation. Move this after the
 // commit and the guarantee is gone while every happy-path test still passes, which is
 // precisely the failure the handoff exists to remove.
 //
+// # BOTH DECISION INPUTS ARE CAPTURED, and that is what R-2 requires
+//
+// selectBalanceMonitorsInTx reads the monitor definitions in this same transaction, and
+// model.PrepareBalanceMonitorHandoffs stores them beside the balance snapshot. So a
+// committed movement carries the complete decision: the balance as written, and the
+// definitions in force when it was. The evaluator is then a pure function of the row —
+// see the note on selectBalanceMonitorsInTx for the three ways a live read diverged.
+//
 // # A row is written only for a balance that HAS a monitor
 //
-// The insert is one statement whose VALUES list is filtered by an EXISTS against
-// blnk.balance_monitors. That is deliberate and it is what makes this affordable on the
-// money path: the overwhelming majority of balances carry no monitor, and a row per
-// balance per transaction would be pure write amplification — two rows per transaction
-// at the system's throughput target, every one destined to be evaluated to "nothing
-// fired" and deleted. With the guard, a deployment with no monitors configured writes
-// nothing and pays one indexed probe per balance.
+// That guard used to be a per-balance correlated EXISTS in the insert's WHERE clause, and
+// it is now a consequence of the read: a balance absent from the monitor map produces no
+// handoff in model.PrepareBalanceMonitorHandoffs, so no row is built. One statement
+// replaces one probe per balance, and the economics that motivated the guard are unchanged
+// — the overwhelming majority of balances carry no monitor, and a row per balance per
+// transaction would be pure write amplification at the system's throughput target, every
+// one destined to be evaluated to "nothing fired" and deleted. A deployment with no
+// monitors configured still writes nothing.
 //
 // The guard is sound because a monitor cannot fire retroactively. A monitor registered
 // AFTER a movement was never intended to alert on it, which is exactly the behaviour of
 // the post-commit evaluation this replaces, so deciding at write time changes nothing an
-// operator can observe.
+// operator can observe. Deciding it from a snapshot rather than at drain time is what makes
+// that statement TRUE rather than merely intended.
 //
 // idx_balance_monitors_balance_id, added by the same migration as this table, is what
-// keeps the probe an index lookup. blnk.balance_monitors has a foreign key on
+// keeps the read an index lookup. blnk.balance_monitors has a foreign key on
 // balance_id but PostgreSQL does not index a foreign-key column automatically, so
-// before that index this probe would have been a sequential scan holding the balance
+// before that index this read would have been a sequential scan holding the balance
 // locks for its duration.
 //
 // # Nothing here fails the caller for a reason of its own
@@ -136,7 +270,32 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 		)
 	}
 
-	handoffs, err := model.PrepareBalanceMonitorHandoffs(balances)
+	// THE MONITOR DEFINITIONS, READ IN THIS TRANSACTION. This is the R-2 half that was
+	// missing: without it the row carries only the balance and the evaluator has to read
+	// the definitions live, after the commit, from a table an operator can edit.
+	balanceIDs := make([]string, 0, len(balances))
+	for _, balance := range balances {
+		if balance == nil {
+			continue
+		}
+		if trimmed := strings.TrimSpace(balance.BalanceID); trimmed != "" {
+			balanceIDs = append(balanceIDs, trimmed)
+		}
+	}
+
+	monitors, err := selectBalanceMonitorsInTx(ctx, tx, balanceIDs)
+	if err != nil {
+		return err
+	}
+
+	// NOTHING MONITORED, NOTHING WRITTEN, and the read is the whole guard: this is the
+	// common case for a deployment with no monitors configured, and it costs one indexed
+	// statement rather than a row per balance.
+	if len(monitors) == 0 {
+		return nil
+	}
+
+	handoffs, err := model.PrepareBalanceMonitorHandoffs(balances, monitors)
 	if err != nil {
 		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to prepare balance monitor handoffs", err)
 	}
@@ -148,39 +307,34 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 	var query strings.Builder
 	query.WriteString(`
 		INSERT INTO blnk.balance_monitor_handoff
-		(handoff_id, balance_id, ledger_id, balance_snapshot)
-		SELECT v.handoff_id, v.balance_id, v.ledger_id, v.balance_snapshot
-		FROM (VALUES
+		(handoff_id, balance_id, ledger_id, balance_snapshot, monitor_snapshot)
+		VALUES
 	`)
 
-	args := make([]interface{}, 0, len(handoffs)*4)
+	args := make([]interface{}, 0, len(handoffs)*5)
 	for index, handoff := range handoffs {
 		if index > 0 {
 			query.WriteString(",")
 		}
 		base := len(args) + 1
-		// The FIRST tuple carries the casts. PostgreSQL infers a VALUES list's column
-		// types from its first row, and a bare placeholder there is untyped, so without
-		// these the planner cannot resolve v.balance_snapshot against a jsonb column.
-		if index == 0 {
-			fmt.Fprintf(&query, "($%d::text, $%d::text, $%d::text, $%d::jsonb)", base, base+1, base+2, base+3)
-		} else {
-			fmt.Fprintf(&query, "($%d, $%d, $%d, $%d)", base, base+1, base+2, base+3)
-		}
+		// The casts stay on every tuple now that this is a plain VALUES list on the INSERT
+		// rather than a joined subquery: they cost nothing, and they keep the two jsonb
+		// placeholders unambiguous whichever tuple the planner types the list from.
+		fmt.Fprintf(&query, "($%d::text, $%d::text, $%d::text, $%d::jsonb, $%d::jsonb)",
+			base, base+1, base+2, base+3, base+4)
 
 		ledgerID := interface{}(nil)
 		if handoff.LedgerID != "" {
 			ledgerID = handoff.LedgerID
 		}
-		args = append(args, handoff.HandoffID, handoff.BalanceID, ledgerID, []byte(handoff.BalanceSnapshot))
-	}
-
-	query.WriteString(`
-		) AS v(handoff_id, balance_id, ledger_id, balance_snapshot)
-		WHERE EXISTS (
-			SELECT 1 FROM blnk.balance_monitors m WHERE m.balance_id = v.balance_id
+		args = append(args,
+			handoff.HandoffID,
+			handoff.BalanceID,
+			ledgerID,
+			[]byte(handoff.BalanceSnapshot),
+			[]byte(handoff.MonitorSnapshot),
 		)
-	`)
+	}
 
 	if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
 		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to record balance monitor handoffs", err)
@@ -201,10 +355,11 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 //     monitors before the write and hands the resulting `balance.monitor` rows to the
 //     writer, so the alert is inserted in the very transaction that moved the balance.
 //     It runs on the single-transaction path only.
-//   - the WRITER-SIDE handoff — recordBalanceMonitorHandoffs below — records the INTENT
-//     to evaluate, which BalanceMonitorHandoffProcessor later drains, evaluating the
-//     conditions and committing the alerts with the handoff's completion. It runs on
-//     every atomic writer, including the coalescing path the plan freezes.
+//   - the WRITER-SIDE handoff — recordBalanceMonitorHandoffs below — commits the
+//     evaluation's two INPUTS (the balance as written and the monitor definitions in force)
+//     and leaves the evaluation itself to BalanceMonitorHandoffProcessor, which drains the
+//     row and commits the alerts with the handoff's completion. It runs on every atomic
+//     writer, including the coalescing path the plan freezes.
 //
 // Both are correct in isolation. Run together on one balance they publish the SAME
 // crossing twice, under two different event ids — and a `balance.monitor` id is a fresh
@@ -214,13 +369,15 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 //
 // # Why the two compose rather than one replacing the other
 //
-// The caller-side pass gives the alert itself — not merely the intent — the mutation's
-// transaction, which is what requirement R-2 asks for literally, and it delivers with no
-// added latency. The writer-side handoff reaches paths the caller cannot: the coalesced
-// batch, whose argument list is frozen, and any balance whose monitors could not be read
-// before the write. Keeping both, with the handoff suppressed exactly where the caller
-// already evaluated, is strictly better than either alone: every path is covered, nothing
-// is published twice, and the hot path keeps the stronger guarantee.
+// The caller-side pass gives the ALERT ROW itself the mutation's transaction, which is what
+// requirement R-2 asks for literally, and it delivers with no added latency. The writer-side
+// handoff gives that transaction the alert's DECISION instead — both inputs, frozen — and
+// reaches paths the caller cannot: the coalesced batch, whose argument list is frozen, and any
+// balance whose monitors could not be read before the write. So the two differ in when the row
+// is inserted and never in what the row says: a movement's verdict is settled by its own
+// transaction either way. Keeping both, with the handoff suppressed exactly where the caller
+// already evaluated, is strictly better than either alone: every path is covered, nothing is
+// published twice, and the hot path keeps the lower latency.
 //
 // # Reading the coverage from the rows rather than from a new parameter
 //
@@ -806,7 +963,7 @@ func (d Datasource) CountBalanceMonitorHandoffByStatus(ctx context.Context) (map
 func scanBalanceMonitorHandoff(rows *sql.Rows) (*model.BalanceMonitorHandoff, error) {
 	handoff := &model.BalanceMonitorHandoff{}
 	var ledgerID, lastError sql.NullString
-	var snapshot []byte
+	var snapshot, monitorSnapshot []byte
 	var processedAt, lockedUntil sql.NullTime
 
 	if err := rows.Scan(
@@ -815,6 +972,9 @@ func scanBalanceMonitorHandoff(rows *sql.Rows) (*model.BalanceMonitorHandoff, er
 		&handoff.BalanceID,
 		&ledgerID,
 		&snapshot,
+		// NULL on a row written before sql/1781252100.sql, which scans into a nil slice and
+		// is what model.BalanceMonitorHandoff.Monitors reports as "no snapshot carried".
+		&monitorSnapshot,
 		&handoff.Status,
 		&handoff.Attempts,
 		&handoff.MaxAttempts,
@@ -830,6 +990,12 @@ func scanBalanceMonitorHandoff(rows *sql.Rows) (*model.BalanceMonitorHandoff, er
 	handoff.LedgerID = ledgerID.String
 	handoff.LastError = lastError.String
 	handoff.BalanceSnapshot = append([]byte(nil), snapshot...)
+	// Left NIL when the column was NULL, rather than an empty non-nil slice: Monitors
+	// distinguishes "no snapshot carried" from "a snapshot that decoded to nothing", and a
+	// zero-length non-nil slice would make a legacy row indistinguishable from a new one.
+	if monitorSnapshot != nil {
+		handoff.MonitorSnapshot = append([]byte(nil), monitorSnapshot...)
+	}
 	if processedAt.Valid {
 		at := processedAt.Time
 		handoff.ProcessedAt = &at

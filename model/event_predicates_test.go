@@ -348,12 +348,13 @@ func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 	})
 
 	t.Run("RequiresGatewayDelivery states which path this subscriber's records take", func(t *testing.T) {
-		// The predicate decides the SHAPE OF THE GRANT and what the credential contract says, not
-		// whether a credential may be minted. Kafka has no key-level ACL resource, so a recorded
-		// prefix is a boundary Blnk keeps itself: such a subscriber is provisioned without topic
-		// Read and its records are delivered, key-filtered, by the stream gateway. Its edges are
-		// therefore the difference between withholding record access from a subscriber that asked
-		// for a narrowing and granting a whole shared topic to one that did.
+		// The predicate decides the SHAPE OF THE GRANT and what the credential contract says. Kafka
+		// has no key-level ACL resource, so a recorded prefix is a boundary kept OUTSIDE the broker:
+		// such a subscriber is provisioned without topic Read, and its records are delivered
+		// key-filtered by the component the deployment declared — or, where none is declared, it is
+		// refused a credential entirely rather than issued a wider one. Its edges are therefore the
+		// difference between withholding record access from a subscriber that asked for a narrowing
+		// and granting a whole shared topic to one that did.
 		none := &EventSubscriber{}
 		assert.False(t, none.RequiresGatewayDelivery(),
 			"no recorded prefix means the topic grant is the boundary, so the broker delivers")

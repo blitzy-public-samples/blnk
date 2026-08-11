@@ -393,6 +393,25 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_SUBSCRIBER_BROKERS
+            # WHETHER ANYTHING AUTHORISES RECORD KEYS, and the endpoint of
+            # whatever does. "none" — the shipped value — makes credential
+            # issuance REFUSE a subscriber that records a
+            # partition_key_prefix, with 409
+            # SUBSCRIBER_KEY_SCOPE_UNENFORCED: Kafka's authorizer has no
+            # message-key dimension, Blnk ships no component that supplies
+            # one, and Blnk serves no records itself. Both keys are projected
+            # HERE and not onto the worker, because issuance is an API-server
+            # operation. See blnk-config.yaml.
+            - name: KAFKA_KEY_SCOPE_ENFORCEMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_ENFORCEMENT
+            - name: KAFKA_KEY_SCOPE_GATEWAY_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_GATEWAY_BROKERS
             - name: KAFKA_TOPIC_PREFIX
               valueFrom:
                 configMapKeyRef:
@@ -789,6 +808,16 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: BLNK_SERVER_TRUST_FORWARDED_PROTO
+            # The loopback exception for credential issuance, projected on the SERVER
+            # role only because that is the role serving the endpoint. It ships "false"
+            # in the ConfigMap: in a cluster a loopback peer is a sidecar hop rather
+            # than evidence of confidentiality, so believing it would put a one-time
+            # SASL password on whatever the hop before it was.
+            - name: BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE
             - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
               value: http://jaeger:4318/v1/traces
             - name: TZ

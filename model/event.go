@@ -3803,11 +3803,15 @@ func DeriveCredentialReference(principal, secret string) (string, error) {
 //
 // # What it is for
 //
-// The subscriber stream gateway — the component that enforces a key-scoped subscriber's
-// partition-key boundary — has to establish that the caller asking for a subscriber's records
-// is the holder of the credential Blnk issued for it. A key-scoped principal is deliberately
-// granted no topic Read at the broker, so the gateway is the only path its records take, and an
-// unauthenticated gateway would be a way around the very boundary it exists to keep.
+// It VERIFIES a presented subscriber secret against the reference the registry stored, without
+// the plaintext and without a reversible column. Credential rotation is the caller that needs
+// it: re-issuing for a subscriber must establish that the row it is about to overwrite is the
+// one whose secret was presented, and the reference is the only stored value that can answer.
+//
+// Blnk serves no subscriber records itself, so nothing here authenticates a data-plane read.
+// A key-scoped principal is granted no topic Read at the broker, and the component that
+// authorises record keys — declared by the operator through KAFKA_KEY_SCOPE_ENFORCEMENT, never
+// shipped by Blnk — is what authenticates the subscriber on the path its records take.
 //
 // # Constant time, and why the short-circuits are safe
 //
@@ -3971,18 +3975,18 @@ func HashIdentifier(value string) string {
 //	  Topic  <each entry of AuthorizedTopics>  LITERAL   Read + Describe   BROKER
 //	  Group  <ConsumerGroupID>                 PREFIXED  Read              BROKER
 //
-//	KEY SCOPE RECORDED — record access is withheld at the broker and delivered,
-//	filtered, by Blnk:
+//	KEY SCOPE RECORDED — record access is withheld at the broker, and the key
+//	boundary is kept by the component the deployment DECLARED:
 //	  Topic  <each entry of AuthorizedTopics>  LITERAL   Describe only     BROKER
 //	  Group  <ConsumerGroupID>                 PREFIXED  Read              BROKER
-//	  Key    <PartitionKeyPrefix>              prefix    consume           BLNK GATEWAY
+//	  Key    <PartitionKeyPrefix>              prefix    consume           DECLARED GATEWAY
 //
 // KafkaPrincipal, ConsumerGroupID and AuthorizedTopics are the BROKER-CHECKED
 // scopes, and a provisioning call translates them into one SCRAM credential plus
 // that set of ACL bindings. KafkaPrincipal is the join key between a registry row
 // and the broker's own authorization state, because every binding names it.
 //
-// # The key scope is ENFORCED BY BLNK, because the broker cannot express it
+// # The key scope is ENFORCED OUTSIDE THE BROKER, because the broker cannot express it
 //
 // Kafka's authorizer has no message-key dimension. Its resource types are Topic,
 // Group, Cluster, TransactionalId and DelegationToken — there is no
@@ -3997,7 +4001,7 @@ func HashIdentifier(value string) string {
 // key scope — is ruled out, because the whole point of the shared category topics
 // is that a new subscriber costs no new topics.
 //
-// # So the enforcement point is Blnk, and the grant is narrowed to make it the only path
+// # So the enforcement point is a declared component, and the grant is narrowed to make it the only path
 //
 // A subscriber that records a key scope is provisioned WITHOUT Read on any topic. It
 // keeps Describe, so it can still see its topics and their offsets, and it keeps Read
@@ -4005,13 +4009,22 @@ func HashIdentifier(value string) string {
 // by the broker's authorizer, with any client, from any host. There is nothing for the
 // subscriber to cooperate with and nothing for it to ignore.
 //
-// Its records are delivered instead by the SUBSCRIBER STREAM GATEWAY: an authenticated
-// Blnk read path that consumes the shared topic with Blnk's own identity, applies
-// HasKeyAccess to each record's key, and returns only the records the row entitles the
-// subscriber to. The caller proves it holds the credential Blnk issued — see
-// CredentialReferenceMatches — so the gateway is not a way around the credential either.
-// HasKeyAccess is the one authoritative predicate the prefix means, and the gateway is
-// its production caller, so the rule the registry recorded is the rule enforced.
+// Its records are delivered instead by the KEY-AUTHORISING COMPONENT THE OPERATOR DECLARES
+// in front of the brokers — KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway together with that
+// component's own bootstrap addresses. HasKeyAccess is the one authoritative statement of what
+// the recorded prefix means, and a declared component applies exactly that rule to each
+// record's key.
+//
+// BLNK DOES NOT SHIP THAT COMPONENT, and it serves no subscriber records itself: there is no
+// data-plane route under /subscribers and no Blnk read path that consumes on a subscriber's
+// behalf. That is deliberate. A Blnk-hosted read path would be a second data plane holding
+// Blnk's own wide credential, authenticated by a header the platform's authorization layer does
+// not know about, and unaffected by revoking the subscriber's SCRAM credential at the broker.
+//
+// So where NO component is declared — the shipped default — a key-scoped row is not provisioned
+// at all. Issuance answers SUBSCRIBER_KEY_SCOPE_UNENFORCED (409) rather than minting a principal
+// that can fetch nothing, and clearing the prefix or narrowing authorized_topics to what the
+// broker can keep are the two remedies. The boundary is never claimed and left unkept.
 //
 // # Why "the consumer applies it" was not good enough
 //
@@ -4074,9 +4087,10 @@ func HashIdentifier(value string) string {
 //
 //   - PartitionKeyPrefix nil means NO key constraint was recorded, as opposed to a
 //     constraint on the empty prefix — which would invert the intent. Non-nil is the
-//     third scope, enforced by the stream gateway, and it also DECIDES THE BROKER
-//     GRANT: a row carrying it is provisioned without topic Read. See the access-model
-//     note above.
+//     third scope, enforced by the key-authorising component an operator declares in
+//     front of the brokers, and it also DECIDES THE BROKER GRANT: a row carrying it is
+//     provisioned without topic Read, and is refused a credential entirely while no such
+//     component is declared. See the access-model note above.
 //   - CredentialReference nil is the reliable test for "no credential has ever
 //     been issued", the real "registered, not yet provisioned" state.
 //   - CredentialIssuedAt nil accompanies it; the two are set and overwritten
@@ -4328,12 +4342,13 @@ func (s *EventSubscriber) RequestedKeyScope() string {
 // trimming and no normalisation is applied — a caller whose key differs from the
 // recorded scope by whitespace is asking about a different key.
 //
-// IT IS NOT WHAT THE BROKER CHECKS, and that is why it has an enforcement point of its
-// own. Kafka's authorizer has no message-key dimension, so a key-scoped subscriber is
-// granted Describe and NO Read on its topics — the broker refuses its every fetch — and
-// its records are served by Blnk's subscriber stream gateway, which calls THIS predicate
-// on every record before returning one. The gateway is the rule's primary caller; a
-// replay or an administrative export that reads keys answers to the same rule.
+// IT IS NOT WHAT THE BROKER CHECKS, and that is why a key scope needs an enforcement point
+// of its own. Kafka's authorizer has no message-key dimension, so a key-scoped subscriber is
+// granted Describe and NO Read on its topics — the broker refuses its every fetch — and the
+// component an operator declares in front of the brokers is what applies this rule to each
+// record before returning it. This function is the rule stated ONCE, in the layer that owns
+// the registry row, so that a declared component, a replay and an administrative export that
+// reads keys cannot disagree about what a recorded prefix means.
 //
 // Keeping the rule here rather than at those call sites is what stops two of them
 // disagreeing about what a recorded prefix means — and it is why the previous
@@ -4576,7 +4591,8 @@ func (s *EventSubscriber) IsRevocationPending() bool {
 }
 
 // RequiresGatewayDelivery reports whether the subscriber records a partition key prefix, and
-// therefore that its records may only be delivered through Blnk's subscriber stream gateway.
+// therefore that its records may only be delivered through the key-authorising component an
+// operator has declared in front of the brokers.
 //
 // # It states where records come from, not what the subscriber ought to do
 //
@@ -4598,12 +4614,19 @@ func (s *EventSubscriber) IsRevocationPending() bool {
 //
 // A subscriber this reports true for is granted Describe on its authorised topics and Read on
 // its consumer-group namespace, and NO topic Read at all — so the broker refuses every fetch it
-// attempts, whatever client it uses. Its records reach it through the subscriber stream gateway,
-// which authenticates its issued credential and applies HasKeyAccess to every record's key
-// before returning it. The prefix is enforced before delivery, by Blnk, on the shared topics.
+// attempts, whatever client it uses. Its records reach it through the component the deployment
+// declared (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway plus that component's own bootstrap
+// addresses), which authenticates the issued credential and applies HasKeyAccess's rule to
+// every record's key before returning it.
+//
+// BLNK DOES NOT SHIP THAT COMPONENT and serves no records itself. So where none is declared —
+// the shipped default — a row this reports true for is not provisioned at all: issuance fails
+// closed with SUBSCRIBER_KEY_SCOPE_UNENFORCED rather than minting a principal that can fetch
+// nothing, and clearing the prefix or narrowing authorized_topics are the two remedies.
 //
 // So this is not a disclosure of a gap. It is the routing fact a client needs — consume through
-// the gateway, not from the broker — and the provisioning fact that makes the boundary real.
+// the declared component, not from the broker — and the provisioning fact that makes the
+// boundary real.
 //
 // The empty string is treated as absent for the same reason the column is nullable: "a
 // constraint on the empty prefix" is not an intent anybody has.
@@ -4628,7 +4651,8 @@ func (s *EventSubscriber) RequiresGatewayDelivery() bool {
 // True is the ordinary case: a subscriber with no key scope is confined by its topic grant
 // alone, the broker enforces that grant completely, and direct consumption is exactly the
 // access model requirement R-7 describes. False means the only boundary the row asks for is one
-// the broker cannot evaluate, so record access is withheld and the stream gateway delivers.
+// the broker cannot evaluate, so record access is withheld and the declared key-authorising
+// component is the only path records can take.
 //
 // A nil receiver answers true, matching RequiresGatewayDelivery's false: neither predicate
 // invents a narrowing for a row that does not exist. Nothing is granted on the strength of it —
@@ -5574,8 +5598,9 @@ func OperatorOwnableInternalIP(address net.IP) bool {
 	return address.IsLoopback() || address.IsPrivate()
 }
 
-// BalanceMonitorHandoff is one row of blnk.balance_monitor_handoff: the durable
-// intent that a balance moved and its monitors have not been evaluated yet.
+// BalanceMonitorHandoff is one row of blnk.balance_monitor_handoff: the durable,
+// self-contained record that a balance moved and its monitors have not been evaluated
+// yet, carrying both inputs that evaluation depends on.
 //
 // # What it is for
 //
@@ -5583,28 +5608,43 @@ func OperatorOwnableInternalIP(address net.IP) bool {
 // fires because a CONDITION was met on a balance a transaction already committed, so
 // the alert cannot be captured inside the mutation that caused it — by the time the
 // alert exists, that transaction is gone. What CAN be captured inside the mutation is
-// the intent to evaluate, and that is this row. It is written by the same database
-// transaction that writes the balance, so a committed movement always carries its
-// pending evaluation and a rolled-back movement carries none.
+// EVERY INPUT THE ALERT IS A FUNCTION OF, and that is this row. It is written by the
+// same database transaction that writes the balance, so a committed movement always
+// carries its pending evaluation and a rolled-back movement carries none.
 //
 // The evaluation's RESULT is then captured transactionally too: the event rows it
 // produces and this row's transition to a terminal status commit together. So the
 // sequence is at-least-once evaluation feeding an atomic capture, and the only way to
 // lose an alert is for the condition never to have been met.
 //
-// # Why the balance is carried as a snapshot
+// # BOTH INPUTS ARE SNAPSHOTTED, and that is what makes the evaluation a pure function
 //
-// BalanceSnapshot holds the balance exactly as the transaction wrote it. The
-// evaluation must judge THAT state: re-reading the balance later would judge whatever
-// subsequent transactions had done to it, so a threshold crossed by this movement and
-// uncrossed by the next would produce no alert, and two attempts at the same handoff
-// could reach different verdicts. Snapshotting makes the evaluation deterministic,
-// makes a retry idempotent in outcome, and lets the evaluator run in a different
-// process from the writer.
+// A `balance.monitor` alert is decided by exactly two things: the balance's post-mutation
+// state, and the monitor definitions in force at that moment. Snapshotting one and
+// re-reading the other would leave the outcome dependent on when the row happened to be
+// drained, so both are captured inside the mutation's transaction.
 //
-// The field is json.RawMessage rather than a *Balance so the row can be carried,
+// BalanceSnapshot holds the balance exactly as the transaction wrote it. The evaluation
+// must judge THAT state: re-reading the balance later would judge whatever subsequent
+// transactions had done to it, so a threshold crossed by this movement and uncrossed by
+// the next would produce no alert.
+//
+// MonitorSnapshot holds the monitor definitions read inside the same transaction. The
+// evaluation must judge THOSE definitions: blnk.balance_monitors is operator-editable
+// through PUT and DELETE /balance-monitors, so a live read let a monitor deleted after
+// the commit suppress an alert for a movement that had already crossed its threshold, a
+// monitor created after the commit produce an alert for a movement it was never
+// registered to watch, and an edited threshold produce an alert for a condition that was
+// not the condition in force.
+//
+// TOGETHER THEY ALSO MAKE A RETRY IDEMPOTENT IN OUTCOME. The claim lease can lapse and a
+// row can be evaluated twice; BalanceMonitorEventIdentity makes those attempts collide on
+// purpose so the second is a no-op — but only if the second reaches the same verdict, and
+// it can only do that if neither input has moved underneath it.
+//
+// Both fields are json.RawMessage rather than decoded values so the row can be carried,
 // claimed and requeued without paying an unmarshal that only the evaluator needs. Use
-// Balance to decode it.
+// Balance and Monitors to decode them.
 //
 // The field names correspond one-to-one with the table's columns; the repository scans
 // rows directly into this struct, so the two must stay aligned.
@@ -5626,6 +5666,15 @@ type BalanceMonitorHandoff struct {
 	LedgerID string `json:"ledger_id,omitempty"`
 	// BalanceSnapshot is the balance as the transaction wrote it, marshalled.
 	BalanceSnapshot json.RawMessage `json:"balance_snapshot"`
+	// MonitorSnapshot is the monitor definitions in force when that transaction
+	// committed, read inside it and marshalled as a JSON array.
+	//
+	// EMPTY MEANS LEGACY, NOT "NO MONITORS". A handoff is written only for a balance
+	// that has at least one monitor, so a row this release produces always carries a
+	// non-empty array. Empty therefore identifies a row written before the column
+	// existed, which the evaluator drains by falling back to a live read — see
+	// Monitors, which reports the distinction rather than hiding it behind a nil slice.
+	MonitorSnapshot json.RawMessage `json:"monitor_snapshot,omitempty"`
 	// Status is the relay state machine: pending, processing, completed or failed.
 	// The values are the OutboxStatus* constants, shared with the two existing
 	// outboxes rather than duplicated, so one vocabulary describes all three.
@@ -5675,59 +5724,151 @@ func (h *BalanceMonitorHandoff) Balance() (*Balance, error) {
 	return balance, nil
 }
 
+// Monitors decodes the monitor definitions this handoff carries.
+//
+// # What the two return values mean together
+//
+// The monitors are the definitions in force when the balance's transaction committed —
+// see the note on MonitorSnapshot for why the evaluation must judge those and not
+// whatever blnk.balance_monitors holds now.
+//
+// The BOOLEAN is the part a caller must not ignore. It reports whether a snapshot was
+// carried at all, which is a different question from whether it decoded to anything:
+//
+//   - true with a populated slice is the ordinary case, and the slice is the whole
+//     population to evaluate.
+//   - FALSE means the row predates the monitor_snapshot column (sql/1781252100.sql).
+//     Such a row is still evaluable, but only by reading the monitors live, which is the
+//     behaviour this snapshot replaced — so a caller taking that path is accepting the
+//     older guarantee for a finite, shrinking population and should say so in a log line.
+//
+// The two are returned as a pair rather than collapsed into "empty means fall back"
+// because a snapshot that legitimately decoded to zero monitors and a snapshot that was
+// never written demand opposite handling: the first means "evaluate nothing, complete the
+// row", the second means "the inputs are not here". Collapsing them would make an
+// upgraded deployment silently re-read live monitors forever if the write side ever
+// regressed to omitting the column.
+//
+// Returns:
+//   - []BalanceMonitor: the snapshotted definitions, nil when none was carried.
+//   - bool: true when this row carries a snapshot at all.
+//   - error: a decode failure, which means the row is not evaluable and should be failed
+//     rather than retried; re-reading the same bytes cannot succeed later.
+func (h *BalanceMonitorHandoff) Monitors() ([]BalanceMonitor, bool, error) {
+	if h == nil || len(h.MonitorSnapshot) == 0 {
+		return nil, false, nil
+	}
+
+	// A JSON `null` is a carried snapshot that decodes to nothing, and it is distinguished
+	// here because json.Unmarshal into a slice leaves it nil without error — which would
+	// otherwise be indistinguishable from a decode that produced an empty array.
+	if string(bytes.TrimSpace(h.MonitorSnapshot)) == "null" {
+		return nil, true, nil
+	}
+
+	monitors := []BalanceMonitor{}
+	if err := json.Unmarshal(h.MonitorSnapshot, &monitors); err != nil {
+		return nil, true, fmt.Errorf("failed to decode the balance monitor snapshot: %w", err)
+	}
+
+	return monitors, true, nil
+}
+
 // balanceMonitorHandoffPrefix is the identifier prefix for a handoff, following the
 // repository's `<module>_<uuid>` convention so an id is self-describing in a log line.
 const balanceMonitorHandoffPrefix = "bmh"
 
-// PrepareBalanceMonitorHandoffs builds one handoff per supplied balance.
+// PrepareBalanceMonitorHandoffs builds one handoff per supplied balance that HAS a monitor.
 //
 // It is the model-layer half of the atomic capture: the repository writes what this
 // returns inside the balance's own transaction. It lives here rather than in the
-// repository because the snapshot IS the balance's serialised form, and the model owns
-// what a balance serialises to.
+// repository because both snapshots ARE serialised model values, and the model owns what
+// a balance and a monitor serialise to.
+//
+// # BOTH INPUTS ARE SNAPSHOTTED HERE, in the caller's transaction
+//
+// The writers hand over balances in their post-mutation state, and the monitors as read
+// inside the same transaction that is performing the mutation. Marshalling both here —
+// before the COMMIT — captures the complete decision, so the evaluation later judges the
+// movement that produced the handoff against the definitions that were in force when it
+// did, rather than whatever either has become since.
+//
+// The monitors are keyed BY BALANCE ID rather than passed as one flat slice, because a
+// handoff is per balance and a flat slice would make every evaluator re-derive the split.
+//
+// # A BALANCE WITH NO MONITOR PRODUCES NO HANDOFF, and that replaces a SQL guard
+//
+// The insert used to filter its VALUES list with an EXISTS against blnk.balance_monitors,
+// so that the overwhelming majority of balances — which carry no monitor — cost no row.
+// Reading the definitions in the same transaction supplies the same answer earlier and
+// more cheaply: an absent or empty entry in the map means no monitor, so no row is built
+// at all, and one read replaces a per-balance correlated probe.
+//
+// The economics that motivated the guard are unchanged and still matter: a row per balance
+// per transaction would be pure write amplification at the throughput target, every one
+// destined to evaluate to "nothing fired" and be deleted.
 //
 // # What is skipped, and why nothing is rejected
 //
-// A nil balance and a balance with a blank id are skipped. The writers call this
-// unconditionally for every balance they update, and a ledger movement must never be
-// refused because an alerting side effect could not be described. A marshal failure IS
-// returned, because it means the balance itself does not serialise — a fact the caller
-// needs, and one that cannot be worked around by omitting the handoff.
-//
-// # The snapshot is the balance AS PASSED
-//
-// The writers hand over balances in their post-mutation state, which is the state the
-// monitor conditions must be judged against. Marshalling here — before the transaction
-// commits — captures exactly that state, so the evaluation later judges the movement
-// that produced the handoff rather than whatever the balance has become since.
+// A nil balance, a balance with a blank id, and a balance with no monitors are skipped.
+// The writers call this unconditionally for every balance they update, and a ledger
+// movement must never be refused because an alerting side effect could not be described. A
+// marshal failure IS returned, because it means the balance or a monitor does not
+// serialise — a fact the caller needs, and one that cannot be worked around by omitting
+// the handoff, since the row would then claim an evaluation it has no inputs for.
 //
 // Parameters:
-//   - balances []*model.Balance: the balances being updated, in post-mutation state.
+//   - balances []*Balance: the balances being updated, in post-mutation state.
+//   - monitors map[string][]BalanceMonitor: the monitor definitions read inside the
+//     caller's transaction, keyed by balance id. A nil map yields no handoffs at all,
+//     which is the correct answer for a deployment with no monitors configured.
 //
 // Returns:
-//   - []*BalanceMonitorHandoff: one handoff per usable balance, in input order.
-//   - error: a marshal failure on any balance.
-func PrepareBalanceMonitorHandoffs(balances []*Balance) ([]*BalanceMonitorHandoff, error) {
-	if len(balances) == 0 {
+//   - []*BalanceMonitorHandoff: one handoff per monitored balance, in input order.
+//   - error: a marshal failure on any balance or monitor set.
+func PrepareBalanceMonitorHandoffs(
+	balances []*Balance,
+	monitors map[string][]BalanceMonitor,
+) ([]*BalanceMonitorHandoff, error) {
+	if len(balances) == 0 || len(monitors) == 0 {
 		return nil, nil
 	}
 
 	handoffs := make([]*BalanceMonitorHandoff, 0, len(balances))
 	for _, balance := range balances {
-		if balance == nil || strings.TrimSpace(balance.BalanceID) == "" {
+		if balance == nil {
+			continue
+		}
+
+		balanceID := strings.TrimSpace(balance.BalanceID)
+		if balanceID == "" {
+			continue
+		}
+
+		// NO MONITOR, NO ROW. This is the write-amplification guard, and it is also what
+		// makes an empty MonitorSnapshot on a stored row mean "written before the column
+		// existed" rather than "no monitors": a row is never written for an empty set.
+		balanceMonitors := monitors[balanceID]
+		if len(balanceMonitors) == 0 {
 			continue
 		}
 
 		snapshot, err := json.Marshal(balance)
 		if err != nil {
-			return nil, fmt.Errorf("failed to snapshot balance %s for monitor evaluation: %w", balance.BalanceID, err)
+			return nil, fmt.Errorf("failed to snapshot balance %s for monitor evaluation: %w", balanceID, err)
+		}
+
+		monitorSnapshot, err := json.Marshal(balanceMonitors)
+		if err != nil {
+			return nil, fmt.Errorf("failed to snapshot the monitors of balance %s: %w", balanceID, err)
 		}
 
 		handoffs = append(handoffs, &BalanceMonitorHandoff{
 			HandoffID:       GenerateUUIDWithSuffix(balanceMonitorHandoffPrefix),
-			BalanceID:       strings.TrimSpace(balance.BalanceID),
+			BalanceID:       balanceID,
 			LedgerID:        strings.TrimSpace(balance.LedgerID),
 			BalanceSnapshot: snapshot,
+			MonitorSnapshot: monitorSnapshot,
 			Status:          OutboxStatusPending,
 		})
 	}
@@ -5994,11 +6135,12 @@ func (a EventOutboxAudit) FullyConfirmed() bool {
 // It was the predicate credential issuance failed closed on: a subscriber recording a
 // partition-key prefix could never obtain a credential, because the prefix named a boundary
 // "nothing in the system can enforce". That premise is no longer true. Kafka still has no
-// message-key authorization dimension — it never will — but Blnk now enforces the boundary
-// itself, at the subscriber stream gateway, and withholds record-level Read from a key-scoped
-// principal so the gateway is the only path records can take. DeclaresKeyScope, immediately
-// below, is the surviving presence predicate; RequiresGatewayDelivery is the one that says
-// what follows from it.
+// message-key authorization dimension — it never will — but the boundary is now expressible:
+// record-level Read is withheld from a key-scoped principal so that the key-authorising
+// component an operator declares in front of the brokers is the only path records can take, and
+// issuance fails closed while no such component is declared. DeclaresKeyScope, immediately
+// below, is the surviving presence predicate; RequiresGatewayDelivery is the one that says what
+// follows from it.
 //
 // It had no callers when it was removed, which is worse rather than better: it was documented
 // prose asserting that a stored value could not be honoured, sitting one grep away from
@@ -6065,9 +6207,11 @@ const (
 	// boundary and there is nothing left for a consumer to filter.
 	KeyScopeEnforcementNone KeyScopeEnforcementStatus = "none"
 
-	// KeyScopeEnforcementGateway is reported when a key scope IS recorded: the scope is
-	// enforced by BLNK, at the subscriber stream gateway, which applies HasKeyAccess to
-	// every record's key before the record leaves the process.
+	// KeyScopeEnforcementGateway is reported when a key scope IS recorded AND the deployment
+	// has declared a key-authorising component in front of the brokers: that component applies
+	// the recorded prefix to every record's key before returning it. Blnk does not ship it, and
+	// where none is declared no credential exists to report a status for, because issuance
+	// fails closed.
 	//
 	// It replaced a value of "consumer_side", and the replacement is the whole of the
 	// isolation correction. Kafka's authorizer has no message-key dimension, so the broker
@@ -6076,11 +6220,15 @@ const (
 	// was not entitled to. Cooperation is not an access boundary: a subscriber that ignored
 	// the prefix, or read the topic with any other client, saw every other ledger's records.
 	//
-	// So a key-scoped subscriber is no longer granted Read on any topic at all. Its
-	// credential authenticates at the gateway, the gateway filters by this scope, and the
+	// So a key-scoped subscriber is no longer granted Read on any topic at all. Its credential
+	// authenticates at the declared component, that component filters by this scope, and the
 	// broker refuses every direct fetch — which is what makes this value a statement about
 	// where enforcement HAPPENS rather than a request that somebody perform it.
-	KeyScopeEnforcementGateway KeyScopeEnforcementStatus = "blnk_stream_gateway"
+	//
+	// The value is the SAME WORD the deployment declares in KAFKA_KEY_SCOPE_ENFORCEMENT, so a
+	// credential response and the configuration that made it issuable cannot be read as naming
+	// two different components.
+	KeyScopeEnforcementGateway KeyScopeEnforcementStatus = "broker_gateway"
 )
 
 // KeyScopeEnforcement reports where this subscriber's key scope is enforced.
@@ -6096,6 +6244,12 @@ const (
 // A nil receiver answers KeyScopeEnforcementNone, because a subscriber that does not
 // exist has recorded nothing — and because this is read on rows loaded from a repository
 // whose not-found representation is a nil pointer.
+//
+// IT READS THE ROW AND NOTHING ELSE. A registry row cannot know whether the deployment has
+// declared an enforcing component, so this answers where a recorded prefix WOULD be enforced.
+// Whether such a credential may be issued at all is config.KafkaConfig.KeyScopeGateway's
+// question, asked once at issuance; issuedKeyScopeEnforcement is the caller that combines the
+// two so a credential never reports an enforcement point that is not actually running.
 //
 // Returns:
 //   - KeyScopeEnforcementStatus: Gateway when a non-blank prefix is recorded, otherwise

@@ -294,10 +294,18 @@ func formatDeprecationDate(instant time.Time) string {
 // shapes in api/model/event.go already publish, so a subscriber reading the type
 // documentation and a subscriber reading a refusal are told the same thing.
 //
-// It says "retired", not "removed". The routes and their handlers are still registered
-// and still compiled after the sunset — the date withdraws the behaviour, and deleting
-// the surface is a separate, later release — so a body claiming the endpoint no longer
-// exists would describe a state the deployment is not in.
+// It says "retired", not "removed", and that is precise rather than euphemistic. The routes
+// and their handlers stay registered after the sunset PERMANENTLY, because the requirement is
+// that this surface answer 410 Gone on every request once the window closes — and only a
+// registered route can answer anything. A deleted route answers 404, which says "no such
+// endpoint" rather than "this endpoint is gone", and would fail the very criterion the guard
+// exists to satisfy. So a body claiming the endpoint no longer exists would describe a state
+// the deployment is not in and is not going to be in.
+//
+// What a later release DOES delete is the delivery mechanism behind the transport — webhooks.go,
+// the queue handler mapping and the relay's dual-delivery branch — enumerated as a checklist in
+// docs/webhook-to-kafka-migration.md, whose preserve half names this guard and these routes
+// explicitly. This file is not on the deletion side of that release.
 const webhookSunsetGoneMessage = "Webhook subscription management has been retired and is no " +
 	"longer available. Use the Kafka event stream and the subscriber credential endpoint " +
 	"instead; see the webhook-to-Kafka migration guide under docs/."
@@ -346,11 +354,11 @@ func IsDeprecatedWebhookSubscriptionPath(path string) bool {
 //     should answer 404 after it too. Matching case-insensitively would invent a Gone
 //     resource that never existed.
 //   - Exactly one trailing slash is tolerated. Gin redirects "/a/b/" to "/a/b" before
-//     any handler runs when the latter is registered, so the tolerance is not what
-//     handles the common case; it is here so that after the routes are deleted — when
-//     there is no registered path left to redirect to and the redirect therefore stops
-//     happening — the slashed form is still recognised as the retired surface rather
-//     than decaying into a 404.
+//     any handler runs when the latter is registered FOR THAT METHOD, so the tolerance is
+//     not what handles the common case. It is here for the requests this pre-auth guard
+//     exists to reach in the first place: a method the four registrations do not cover has
+//     no route to be redirected to, so the slashed form of an unsupported verb would decay
+//     into a 404 and report the retired surface as one that never existed.
 //
 // Parameters:
 //   - path: the request path, already percent-decoded, as Gin itself routes on.

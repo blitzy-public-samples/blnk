@@ -4412,6 +4412,62 @@ func TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing(t *testing.T) {
 	})
 }
 
+// TestServerConfig_LoopbackCredentialIssuanceDefaultsToRefusing pins the default on the flag
+// that decides whether a plaintext loopback caller may be handed a one-time SASL password.
+//
+// # Why the default is the whole point
+//
+// A loopback peer establishes only that the LAST hop stayed on the host. A reverse proxy on the
+// same host — nginx, Caddy, an Envoy or mesh sidecar — accepts a request from the internet,
+// possibly over plain http, and forwards it over 127.0.0.1, so from inside the process that
+// request cannot be told apart from an operator running curl in the container. Believing the peer
+// unconditionally therefore disclosed the password on whatever the earlier hop was, and it did so
+// on the deployment shape that is most common rather than on an exotic one.
+//
+// Only the deployment knows which shape it is, so this is a declaration with a deny-by-default
+// value — the same posture as TrustForwardedProto, which exists for the same reason on the same
+// endpoint. A default of true would re-enable the disclosure silently for every deployment that
+// never thought about it.
+//
+// The second sub-test is the other half: a default setter must not undo the local stack's
+// explicit opt-in, or `docker compose up` plus curl could never issue a credential.
+func TestServerConfig_LoopbackCredentialIssuanceDefaultsToRefusing(t *testing.T) {
+	cnf := Configuration{
+		ProjectName: "Test Project",
+		DataSource:  DataSourceConfig{Dns: "some-dns"},
+		Redis:       RedisConfig{Dns: "localhost:6379"},
+	}
+
+	if err := cnf.validateAndAddDefaults(); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if cnf.Server.AllowLoopbackCredentialIssuance {
+		t.Error("server.allow_loopback_credential_issuance must default to false: a loopback peer " +
+			"is evidence about one hop, and a deployment that has not declared itself free of a " +
+			"fronting proxy must not have credential issuance opened over plaintext on its behalf")
+	}
+
+	if cnf.Server.TrustForwardedProto {
+		t.Error("and the other transport declaration must stay deny-by-default too, so the two " +
+			"cannot drift into different postures for one endpoint")
+	}
+
+	t.Run("an explicit local-development declaration survives the default setters", func(t *testing.T) {
+		declared := cnf
+		declared.Server.AllowLoopbackCredentialIssuance = true
+
+		if err := declared.validateAndAddDefaults(); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if !declared.Server.AllowLoopbackCredentialIssuance {
+			t.Error("a default setter must not overwrite the declaration the local stack makes: " +
+				"without it the credential endpoint cannot be exercised locally at all")
+		}
+	})
+}
+
 // TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable is the test for the defect that
 // the event pipeline's designed diagnostics could not be switched on in a deployed binary.
 //

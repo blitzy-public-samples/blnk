@@ -236,11 +236,17 @@ func NotifyError(systemError error) {
 			return
 		}
 
-		// If Slack is configured, send the error notification to Slack
-		if conf.Notification.Slack.WebhookUrl != "" {
-			SlackNotification(systemError)
-		}
-
+		// THE DURABLE RECORD IS ATTEMPTED FIRST, and the optional side channel second.
+		//
+		// The order is load-bearing rather than stylistic. SlackNotification is a synchronous
+		// HTTP POST to a third party whose client allows 30 seconds per call, and it is exactly
+		// the call most likely to be slow during the incident this goroutine is reporting. With
+		// Slack first, every system.error spent that budget BEFORE its outbox row was attempted:
+		// a burst of errors accumulated goroutines each holding an uncaptured event, and a
+		// process that went down inside that window lost the events entirely, because the row
+		// that would have made them replayable had not been written. Nothing about the Slack
+		// message needs to precede it.
+		//
 		// Dispatch system.error whenever EITHER event transport is configured: Kafka
 		// brokers or the legacy webhook URL. This sender is system.error's only route
 		// into the event pipeline — it is the one event type with no direct producer
@@ -275,6 +281,13 @@ func NotifyError(systemError error) {
 						"went unreported to subscribers",
 				)
 			}
+		}
+
+		// Slack LAST, and unconditionally reached: it is an operator convenience, so its
+		// outcome cannot affect the event above and its latency can no longer delay it. A
+		// failure inside it is logged by SlackNotification itself.
+		if conf.Notification.Slack.WebhookUrl != "" {
+			SlackNotification(systemError)
 		}
 	}(systemError)
 }

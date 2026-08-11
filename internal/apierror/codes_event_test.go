@@ -19,6 +19,7 @@ package apierror
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -66,18 +67,16 @@ var eventStreamingCodeCases = []struct {
 	// A dependency of issuance being unconfigured is not a malformed request, so 503
 	// and never 400: only an operator can supply the externally advertised list.
 	{ErrSubscriberBrokersNotConfigured, http.StatusServiceUnavailable, "SUBSCRIBER_BROKERS_NOT_CONFIGURED"},
-	// The two STATE refusals. Both 409, because the request is well formed and it is
-	// the registry row that has to change before the identical request can succeed.
+	// The THREE STATE refusals. All 409, because the request is well formed and it is
+	// the registry row — or the deployment's configuration — that has to change before the
+	// identical request can succeed.
 	//
-	// SUBSCRIBER_ISOLATION_UNENFORCEABLE is a third, and its meaning NARROWED rather than
-	// disappeared. It once named a blanket refusal to issue any credential to a subscriber
-	// recording a partition-key prefix; such a subscriber is no longer refused outright —
-	// it is granted Describe without Read and its records are delivered key-filtered by the
-	// subscriber stream gateway. What the code names now is the fail-closed floor beneath
-	// that: a declared isolation that cannot be established at all. It is inventoried here
-	// because it is still declared in codes.go, and a code present without a statusByCode
-	// row resolves to the unknown-code 500 — which is exactly what this table forbids.
-	{ErrSubscriberIsolationUnenforceable, http.StatusConflict, "SUBSCRIBER_ISOLATION_UNENFORCEABLE"},
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED is the fail-closed one, and it is the ONLY code for its
+	// judgement in either order: issuing for a row that already records a partition-key
+	// prefix, and recording a prefix on a row that already holds a credential. A second code
+	// for one judgement (SUBSCRIBER_ISOLATION_UNENFORCEABLE) existed and is gone, because two
+	// codes for one refusal is how a client comes to handle one and not the other.
+	{ErrSubscriberKeyScopeUnenforced, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_UNENFORCED"},
 	{ErrSubscriberDeprovisioning, http.StatusConflict, "SUBSCRIBER_DEPROVISIONING"},
 	{ErrSubscriberGrantEmpty, http.StatusConflict, "SUBSCRIBER_GRANT_EMPTY"},
 	// A fourth state refusal, and the one whose state lives at the BROKER rather than in the
@@ -92,18 +91,16 @@ var eventStreamingCodeCases = []struct {
 	// 504, not 503 and emphatically not the 500 a missing entry would produce: the
 	// dependency answered too slowly, or the caller went away.
 	{ErrSubscriberProvisioningTimeout, http.StatusGatewayTimeout, "SUBSCRIBER_PROVISIONING_TIMEOUT"},
-	// SEC-KEY-01. The two DATA-PLANE codes, and the only ones in this family a subscriber
-	// rather than an operator can provoke: the subscriber stream gateway is authenticated by
-	// the subscriber's own SASL credential, so it answers the same two questions the broker
-	// would have answered had the subscriber held record access — who are you, and may you
-	// read this topic.
+	// THERE ARE NO DATA-PLANE CODES IN THIS FAMILY, and their absence is the access model
+	// rather than an omission. Every code above is provoked by an OPERATOR calling a
+	// management route with the master key. Blnk serves no subscriber records — there is no
+	// read path under /subscribers — so no request a subscriber makes reaches this catalogue
+	// at all: a subscriber authenticates to the broker with SASL/SCRAM and is refused by the
+	// broker's own authorizer, in Kafka's protocol, with Kafka's error codes.
 	//
-	// 401 and 403 respectively, and keeping them apart is the point. A rejected secret is
-	// recoverable by presenting the right one or re-issuing; a topic outside the grant is not
-	// recoverable by any credential, and answering it with 401 would send a client into a
-	// re-authentication loop against a boundary only an operator can move.
-	{ErrSubscriberCredentialInvalid, http.StatusUnauthorized, "SUBSCRIBER_CREDENTIAL_INVALID"},
-	{ErrSubscriberTopicNotGranted, http.StatusForbidden, "SUBSCRIBER_TOPIC_NOT_GRANTED"},
+	// SUBSCRIBER_CREDENTIAL_INVALID (401) and SUBSCRIBER_TOPIC_NOT_GRANTED (403) were declared
+	// for a Blnk-hosted record read and are removed with it. Reintroducing either would mean
+	// Blnk had grown a second data plane, which is the thing the access model exists to avoid.
 }
 
 // TestStatusForCode_EventStreamingCodes states the mapping positively;
@@ -130,21 +127,31 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	//   +1 — EVENT_REPLAY_TIMEOUT added, because a replay abandoned by a cancelled caller or a
 	//        spent deadline was resolving to EVENT_KAFKA_UNAVAILABLE and telling an operator to
 	//        wait for a broker that had never stopped answering.
-	//   +2 — SUBSCRIBER_CREDENTIAL_INVALID and SUBSCRIBER_TOPIC_NOT_GRANTED added with the
-	//        subscriber stream gateway, which is the component that enforces a key-scoped
-	//        subscriber's partition-key prefix. They are the first codes in this family a
-	//        subscriber can provoke, so they are the first that carry a 401 and a 403.
+	//   +2 — SUBSCRIBER_CREDENTIAL_INVALID and SUBSCRIBER_TOPIC_NOT_GRANTED added for a
+	//        Blnk-hosted subscriber record read, then BOTH REMOVED with it. Blnk serves no
+	//        records, so no request a subscriber makes reaches this catalogue and neither code
+	//        can be provoked. Net zero, and recorded rather than netted out because a future
+	//        reader finding the names in git history should find the reason here.
 	//
 	//   +1 — EVENT_KEY_UNRESOLVABLE added with the producer-side capture guard: an event that
 	//        can be assigned no Kafka message key cannot preserve per-aggregate ordering, so it
 	//        is refused at capture rather than published unordered.
 	//
-	//   = 18.
+	//   −1 — SUBSCRIBER_ISOLATION_UNENFORCEABLE retired. It and SUBSCRIBER_KEY_SCOPE_UNENFORCED
+	//        were two codes for ONE judgement — a declared key boundary nothing enforces — and
+	//        two codes for one judgement is how a client comes to handle one and not the other.
+	//        The surviving code answers both orders it can arise in.
+	//
+	//   +1 — SUBSCRIBER_KEY_SCOPE_UNENFORCED itself, which had NO ROW HERE while it was
+	//        declared and mapped in codes.go. That is the omission this guard exists to catch,
+	//        and it was caught by the same recount that removed the three above.
+	//
+	//   = 16.
 	//
 	// One of those edits caught a genuine omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_
 	// AUTHORIZATION had no statusByCode entry at all, so a deliberate 409 was resolving to 500.
-	if len(eventStreamingCodeCases) != 18 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 18 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
+	if len(eventStreamingCodeCases) != 16 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 16 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {
@@ -152,6 +159,63 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 				t.Errorf("StatusForCode(%s) = %d, want %d", tt.code, got, tt.status)
 			}
 		})
+	}
+}
+
+// TestStatusForCode_EventStreamingInventoryIsComplete makes the literal count above
+// FALSIFIABLE rather than a number a reader has to trust.
+//
+// The count guard one function up catches a row being deleted. It cannot catch the
+// opposite and more dangerous drift: a code declared and mapped in codes.go that never
+// acquired a row here. SUBSCRIBER_KEY_SCOPE_UNENFORCED was exactly that — declared,
+// mapped to 409, and absent from the inventory — and the literal count was satisfied the
+// whole time, because deleting a stale row and never adding the new one nets to zero.
+//
+// So this derives the population from statusByCode instead of restating it: every mapped
+// code whose string carries the EVENT_ or SUBSCRIBER_ prefix must appear above. It reads
+// the same map production resolves against, so a code cannot be mapped-but-uninventoried
+// in any build where this passes.
+//
+// GEN_GONE is deliberately outside the derived set. It is a GEN_ code that this family
+// merely depends on, so it is asserted by name in the two tests around this one rather
+// than swept in by a prefix match that would then also sweep in every other GEN_ code.
+func TestStatusForCode_EventStreamingInventoryIsComplete(t *testing.T) {
+	inventoried := make(map[ErrorCode]bool, len(eventStreamingCodeCases))
+	for _, tt := range eventStreamingCodeCases {
+		if inventoried[tt.code] {
+			t.Errorf("%s appears twice in eventStreamingCodeCases: a duplicate row satisfies the count guard while masking a missing code", tt.code)
+		}
+
+		inventoried[tt.code] = true
+	}
+
+	for code, status := range statusByCode {
+		name := string(code)
+		if !strings.HasPrefix(name, "EVENT_") && !strings.HasPrefix(name, "SUBSCRIBER_") {
+			continue
+		}
+
+		if !inventoried[code] {
+			t.Errorf(
+				"%s is mapped to %d in statusByCode but has no row in eventStreamingCodeCases: "+
+					"add one, and correct the literal count in TestStatusForCode_EventStreamingCodes",
+				code, status,
+			)
+		}
+	}
+
+	// AND THE REVERSE DIRECTION, which is what keeps a retired code from lingering as an
+	// assertion about a symbol nothing produces. A row for an unmapped code would resolve to
+	// the 500 default and the status assertion would fail — but only if the row's expected
+	// status happened to differ from 500, and EVENT_REPLAY_FAILED legitimately expects 500.
+	for _, tt := range eventStreamingCodeCases {
+		if _, mapped := statusByCode[tt.code]; !mapped {
+			t.Errorf(
+				"%s has a row in eventStreamingCodeCases but no statusByCode entry: it resolves to the "+
+					"unknown-code 500 default in production",
+				tt.code,
+			)
+		}
 	}
 }
 

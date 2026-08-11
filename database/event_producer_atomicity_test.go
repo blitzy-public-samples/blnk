@@ -257,9 +257,13 @@ func countHandoffsForBalance(t *testing.T, ds Datasource, balanceID string) int 
 //
 // The overwhelming majority of balances carry no monitor. A row per balance per transaction
 // would be pure write amplification at the system's throughput target, every row destined to be
-// evaluated to "nothing fired". The EXISTS guard is what avoids that, and it has to be part of
-// the same statement — a Go-side check would need its own query and its own round trip inside
-// the ledger transaction.
+// evaluated to "nothing fired". The guard is what avoids that.
+//
+// It USED to be a correlated EXISTS in the insert's own WHERE clause. It is now a consequence of
+// the monitor read this statement performs for the snapshot: a balance the read returns nothing
+// for produces no handoff. That is strictly cheaper — one indexed statement for the batch rather
+// than one probe per balance — and it is what gives an absent monitor_snapshot on a stored row a
+// single meaning, since a row is never written for an empty monitor set.
 func TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance(t *testing.T) {
 	ds := openRealTestDB(t)
 
@@ -277,10 +281,14 @@ func TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance(t *test
 		"an unmonitored balance must write nothing at all, or the money path pays for every transaction")
 }
 
-// TestInsertBalanceMonitorHandoffsInTx_StoresTheSnapshotAndTheLedger asserts the row carries
+// TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger asserts the row carries
 // everything the evaluation needs, so the evaluator can run in another process and judge the
-// state the transaction actually wrote.
-func TestInsertBalanceMonitorHandoffsInTx_StoresTheSnapshotAndTheLedger(t *testing.T) {
+// state the transaction actually wrote — against the definitions that were in force when it did.
+//
+// BOTH snapshots are the assertion, and the monitor one is the R-2 half that was missing. Without
+// it the evaluator re-read blnk.balance_monitors after the commit, from a table operators edit, so
+// which events existed depended on when the row was drained.
+func TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger(t *testing.T) {
 	ds := openRealTestDB(t)
 
 	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
@@ -291,13 +299,13 @@ func TestInsertBalanceMonitorHandoffsInTx_StoresTheSnapshotAndTheLedger(t *testi
 	insertHandoffsInOwnTx(t, ds, []*model.Balance{written})
 
 	var storedLedger sql.NullString
-	var snapshot []byte
+	var snapshot, monitorSnapshot []byte
 	var status string
 	var attempts, maxAttempts, captured int
 	require.NoError(t, ds.Conn.QueryRow(`
-		SELECT ledger_id, balance_snapshot, status, attempts, max_attempts, events_captured
+		SELECT ledger_id, balance_snapshot, monitor_snapshot, status, attempts, max_attempts, events_captured
 		FROM blnk.balance_monitor_handoff WHERE balance_id = $1
-	`, balanceID).Scan(&storedLedger, &snapshot, &status, &attempts, &maxAttempts, &captured))
+	`, balanceID).Scan(&storedLedger, &snapshot, &monitorSnapshot, &status, &attempts, &maxAttempts, &captured))
 
 	assert.Equal(t, ledgerID, storedLedger.String,
 		"the ledger travels on the row so the alert is attributable without a second read")
@@ -311,6 +319,111 @@ func TestInsertBalanceMonitorHandoffsInTx_StoresTheSnapshotAndTheLedger(t *testi
 	require.NotNil(t, decoded.Balance)
 	assert.Equal(t, 0, decoded.Balance.Cmp(big.NewInt(4242)),
 		"the snapshot must be the value the transaction wrote, not the value read back later")
+
+	// THE MONITOR DEFINITIONS, read inside the same transaction and stored beside the balance.
+	require.NotEmpty(t, monitorSnapshot,
+		"a row written without the monitor snapshot leaves the evaluator to re-read a mutable "+
+			"table, which is the divergence this column closes")
+
+	handoff := &model.BalanceMonitorHandoff{MonitorSnapshot: monitorSnapshot}
+	monitors, snapshotted, err := handoff.Monitors()
+	require.NoError(t, err)
+	require.True(t, snapshotted)
+	require.Len(t, monitors, 1, "the fixture registers exactly one monitor on this balance")
+	assert.Equal(t, balanceID, monitors[0].BalanceID)
+	assert.Equal(t, ">=", monitors[0].Condition.Operator,
+		"the CONDITION is what the evaluation judges, so it has to survive the round trip")
+	assert.InDelta(t, float64(100), monitors[0].Condition.Precision, 0,
+		"and so does the precision, which scales the value the condition is compared against")
+	require.NotNil(t, monitors[0].Condition.PreciseValue,
+		"the precise value must never decode to nil: CheckCondition dereferences it")
+	assert.Equal(t, 0, monitors[0].Condition.PreciseValue.Cmp(big.NewInt(100)))
+}
+
+// TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead is what keeps the event payload
+// bytes unchanged by the snapshot.
+//
+// The `balance.monitor` payload is the marshalled monitor object, and AAP §0.7.1 V-8 requires the
+// Kafka payload and the legacy webhook body to be byte-identical during the dual-delivery window.
+// The snapshot therefore has to decode a row to the SAME values Datasource.GetBalanceMonitors
+// decodes it to — otherwise the bytes differ for a reason no requirement asked for.
+//
+// The one deliberate divergence is NULL tolerance: precision and precise_value are nullable
+// columns, GetBalanceMonitors scans them into bare numeric types and errors on a NULL, and this
+// read must not, because it runs inside a money transaction. Both halves are asserted.
+func TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	balanceID, _ := monitoredTestBalance(t, ds, true)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	snapshotted, err := selectBalanceMonitorsInTx(context.Background(), tx, []string{balanceID})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	live, err := ds.GetBalanceMonitors(balanceID)
+	require.NoError(t, err)
+
+	require.Len(t, snapshotted[balanceID], len(live),
+		"the two reads must see the same population, or the snapshot evaluates a different set")
+	require.Len(t, live, 1)
+	assert.Equal(t, live, snapshotted[balanceID],
+		"EVERY DECODED FIELD must match the live read, or the balance.monitor payload bytes change "+
+			"and the dual-delivery equivalence guarantee breaks for a reason nothing asked for")
+
+	// AND THE NULL TOLERANCE, which is the one place the two deliberately differ. A monitor row
+	// with an unset precision must never roll back a ledger movement.
+	_, err = ds.Conn.Exec(
+		`UPDATE blnk.balance_monitors SET precision = NULL, precise_value = NULL WHERE balance_id = $1`,
+		balanceID,
+	)
+	require.NoError(t, err)
+
+	nullTx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = nullTx.Rollback() }()
+
+	tolerant, err := selectBalanceMonitorsInTx(context.Background(), nullTx, []string{balanceID})
+	require.NoError(t, err,
+		"a NULL precision must not fail this read: it runs inside the balance's own transaction, "+
+			"and refusing would roll back a money movement over an alerting side effect")
+	require.NoError(t, nullTx.Commit())
+
+	require.Len(t, tolerant[balanceID], 1)
+	assert.Zero(t, tolerant[balanceID][0].Condition.Precision,
+		"a NULL precision flattens to the zero the non-null case would have produced")
+	require.NotNil(t, tolerant[balanceID][0].Condition.PreciseValue,
+		"and the precise value is still non-nil, because CheckCondition dereferences it")
+	assert.Equal(t, 0, tolerant[balanceID][0].Condition.PreciseValue.Cmp(big.NewInt(0)))
+}
+
+// TestSelectBalanceMonitorsInTx_ReturnsNothingForAnUnmonitoredBalance pins the answer the
+// write-amplification guard is built on.
+func TestSelectBalanceMonitorsInTx_ReturnsNothingForAnUnmonitoredBalance(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	unmonitored, _ := monitoredTestBalance(t, ds, false)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	monitors, err := selectBalanceMonitorsInTx(context.Background(), tx, []string{unmonitored})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	assert.Empty(t, monitors[unmonitored],
+		"an unmonitored balance must be absent from the map, which is what stops a handoff row "+
+			"being written for it")
+
+	// An empty id list is a no-op rather than a statement, so the common no-balances path pays
+	// nothing at all.
+	none, err := selectBalanceMonitorsInTx(context.Background(), nil, nil)
+	require.NoError(t, err, "an empty list must not require a transaction, because it makes no read")
+	assert.Empty(t, none)
 }
 
 // TestInsertBalanceMonitorHandoffsInTx_RollsBackWithItsTransaction is the atomicity assertion.

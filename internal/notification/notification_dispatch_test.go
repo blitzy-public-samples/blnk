@@ -364,33 +364,81 @@ func TestNotifyError_SenderErrorIsSwallowed(t *testing.T) {
 	}
 }
 
+// TestNotifyError_DispatchesToBothSlackAndWebhook asserts both channels are reached AND the
+// order they are reached in.
+//
+// # The order is the assertion, not an implementation detail
+//
+// The durable event is attempted FIRST and Slack second. Slack is a synchronous POST to a third
+// party whose client allows 30 seconds, and it is the call most likely to hang during the very
+// incident being reported — so with Slack first, every system.error waited on it before its
+// outbox row existed, a burst accumulated goroutines each holding an uncaptured event, and a
+// process that died in that window lost them with no row to replay from. Reversing the order
+// again would restore that, silently and with both channels still working, which is why the
+// sequence is pinned here rather than left to the reading of the code.
+//
+// The wait is the completion seam rather than a receive on the sender's channel. Waiting only
+// for the sender would return while the notifier was still inside the Slack POST, so the
+// deferred server close would race it and the Slack assertion would fail for a reason that has
+// nothing to do with the behaviour.
 func TestNotifyError_DispatchesToBothSlackAndWebhook(t *testing.T) {
 	original := webhookSender
 	defer RegisterWebhookSender(original)
 
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	record := func(channel string) {
+		mu.Lock()
+		order = append(order, channel)
+		mu.Unlock()
+	}
+
 	server, captured := newSlackCaptureServer(http.StatusOK, `{}`)
 	defer server.Close()
 
-	storeNotificationConfig(t, server.URL, "http://example.invalid/webhook-target")
+	// Wrapped so the Slack hit is recorded in the same ordered log as the event capture. The
+	// capture server records the request itself; this only records WHEN, relative to the sender.
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		record("slack")
+		server.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer slack.Close()
+
+	storeNotificationConfig(t, slack.URL, "http://example.invalid/webhook-target")
 
 	senderCalled := make(chan string, 1)
 	RegisterWebhookSender(func(event string, payload interface{}) error {
+		record("event")
 		senderCalled <- event
+
 		return nil
 	})
 
+	awaitCompletion := awaitNotifyError(t)
+
 	NotifyError(errors.New("dual channel failure"))
+
+	awaitCompletion()
 
 	select {
 	case event := <-senderCalled:
 		assert.Equal(t, "system.error", event)
-	case <-time.After(3 * time.Second):
+	default:
 		t.Fatal("webhook sender was never invoked")
 	}
 
-	// Slack is called synchronously before the webhook sender inside the
-	// NotifyError goroutine, so by now it must have been hit.
 	reqs := captured()
 	require.Len(t, reqs, 1, "Slack should have received the error notification")
 	assert.Contains(t, string(reqs[0].body), "dual channel failure")
+
+	mu.Lock()
+	sequence := append([]string(nil), order...)
+	mu.Unlock()
+
+	assert.Equal(t, []string{"event", "slack"}, sequence,
+		"the durable event must be attempted BEFORE the optional Slack delivery: Slack is a "+
+			"third-party POST with a 30-second budget, and letting it run first delays every "+
+			"system.error's outbox row by that budget during the outage that produced it")
 }

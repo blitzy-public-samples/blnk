@@ -7,7 +7,7 @@ This directory supports two kinds of measurement:
 
 For the four queue-topology cases, use both. A fast `summary.json` only tells you the API accepted work quickly; the queue summary tells you how long workers took to finish it.
 
-The `events` case is the exception, and the instruction above does not apply to it: it runs no queue benchmark and writes no `queue-summary` file at all, because the event pipeline has no asynq queue to drain. Its equivalent measurement is the outbox backlog and the publish-duration histogram, which it reads from the server's `/metrics` endpoint itself.
+The `event-streaming` case is the exception, and the instruction above does not apply to it: it runs no queue benchmark and writes no `queue-summary` file at all, because the event pipeline has no asynq queue to drain. Its equivalent measurement is the outbox backlog and the publish-duration histogram, which it reads from the server's `/metrics` endpoint itself.
 
 ## Open the dashboard
 
@@ -47,14 +47,18 @@ These are the main flow tests to compare:
   - same as above, but the hot source is split into source buckets first
 - `cold-to-hot-shard`
   - same as above, but the hot destination is split into destination buckets first
-- `events`
+- `event-streaming`
   - offers event publication at 550 events/sec for 30 minutes, judged against V-1's 500/s,
     and measures throughput, p99
     capture-to-dispatch latency and dead-letter rate from the server's own instruments — the
     `/metrics` exposition, plus the `GET /events/stats` census where the dead-letter counter is
-    not exported. `event-streaming` is accepted as a second name for it. Not a queue-topology
+    not exported. Not a queue-topology
     comparison, so read it against the acceptance criteria rather than against the four above —
     see the event-streaming acceptance run below.
+  - **`event-streaming` is the case name this guide uses throughout, and it is the name the two
+    artifacts are called after.** `events` is accepted as a shorthand for the same case: the
+    runner normalises it onto `event-streaming` and prints both the name you typed and the one it
+    resolved to, so one run cannot produce a second pair of filenames.
   - It has two prerequisites the other four do not, and both are REFUSED rather than warned
     about: a Blnk instance **dedicated to the run** (`ISOLATED_INSTANCE=1`), because every figure
     it produces is a delta of process-global counters, and a **fixture decision**
@@ -74,7 +78,7 @@ And supports optional sharding with:
 - `SOURCE_BUCKETS`
 - `DESTINATION_BUCKETS`
 
-### The four queue cases execute third-party code; the events case does not
+### The four queue cases execute third-party code; the event-streaming case does not
 
 `script.js` imports two modules from `https://jslib.k6.io` at run time — `k6-utils` and
 `k6-summary`. That code is fetched over the network on every run and executed inside the VU
@@ -91,7 +95,7 @@ runner forwards no credential to `script.js` at all.
 module, which is why the acceptance run is the one case that may legitimately be given the master
 key and the metrics bearer token.
 
-The `events` case does not run that script. It runs `tests/loadtest/events.js`, which recognises
+The `event-streaming` case does not run that script. It runs `tests/loadtest/events.js`, which recognises
 exactly one scenario, `event_publish`, and reads **53** distinct environment variables. The ones
 that change what a run measures or whether it is allowed to start are grouped below with their
 defaults; the rest are documented in the file itself, beside the constant each one feeds.
@@ -173,7 +177,7 @@ The output files are:
 - `run-<case>.ndjson`
 - `queue-summary-<case>.json`
 
-That is the artifact set for the four queue cases. The `events` case writes only
+That is the artifact set for the four queue cases. The `event-streaming` case writes only
 `summary-event-streaming.json` by default, because it has no asynq queue to drain and so runs no queue
 benchmark and needs no Redis DSN, and because its raw `run-event-streaming.ndjson` stream is opt-in — see
 `RAW_OUTPUT` below. There is deliberately no `queue-summary-event-streaming.json`.
@@ -192,7 +196,7 @@ bash tests/loadtest/run_case.sh hot-to-cold-shard
 bash tests/loadtest/run_case.sh cold-to-hot-shard
 ```
 
-And the event-streaming case, under either of its two names. **A dedicated instance and a fixture
+And the event-streaming case. **A dedicated instance and a fixture
 decision are both required** — the run refuses to start without either, for the reasons in the
 acceptance section — so every command below carries `ISOLATED_INSTANCE=1` plus one of
 `ALLOW_FIXTURE_CREATION=1` and `LEDGER_PAIRS`:
@@ -209,16 +213,14 @@ ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 \
 # to match it, and a narrowed spread measures less concurrency than V-1 is stated over.
 ISOLATED_INSTANCE=1 LEDGER_SPREAD=2 \
   LEDGER_PAIRS='[{"source":"bln_a1","destination":"bln_b1"},{"source":"bln_a2","destination":"bln_b2"}]' \
-  bash tests/loadtest/run_case.sh events
+  bash tests/loadtest/run_case.sh event-streaming
 ```
 
-Both names dispatch the same case and write the same two files. `event-streaming` is the
-canonical name and the one the artifacts are named after; both spellings dispatch the same case,
-and the run prints which name you used alongside the one it resolved to. Its defaults are the
-acceptance criteria's own figures — 550/s offered for 30 minutes, judged against V-1's 500/s — so
-override the load shape for a first attempt. The runner forwards `RATE`, `DURATION`, `VUS` and `MAX_VUS` only when you set them, and
-prints which of the two shapes it used. Override the ceilings too, or a ten-second run at rate 5
-is judged against a target stated over thirty minutes at 500:
+The case's defaults are the acceptance criteria's own figures — 550/s offered for 30 minutes,
+judged against V-1's 500/s — so override the load shape for a first attempt. The runner forwards
+`RATE`, `DURATION`, `VUS` and `MAX_VUS` only when you set them, and prints which of the two shapes
+it used. Override the ceilings too, or a ten-second run at rate 5 is judged against a target
+stated over thirty minutes at 500:
 
 ```bash
 RATE=5 DURATION=10s VUS=5 MAX_VUS=10 \
@@ -263,7 +265,7 @@ prefer a `.gz` destination, which k6 compresses directly:
 ```bash
 NDJSON_OUT=tests/loadtest/run-event-streaming.ndjson.gz \
   RATE=5 DURATION=10s VUS=5 MAX_VUS=10 TARGET_EVENTS_PER_SEC=1 SMOKE=1 \
-  bash tests/loadtest/run_case.sh events
+  bash tests/loadtest/run_case.sh event-streaming
 ```
 
 `RAW_OUTPUT=1` does the same at the default path. Naming `NDJSON_OUT` implies it.
@@ -332,7 +334,7 @@ against a database you are willing to grow. Run it with:
 set -a; . ./.env; set +a                  # master key (BLNK_SERVER_SECRET_KEY) + metrics bearer token
 export API_KEY="$BLNK_SERVER_SECRET_KEY"  # REQUIRED: ./.env ships no API key of its own
 ISOLATED_INSTANCE=1 LEDGER_SPREAD=64 SERVER_REPLICAS=1 \
-  ALLOW_FIXTURE_CREATION=1 bash tests/loadtest/run_case.sh events
+  ALLOW_FIXTURE_CREATION=1 bash tests/loadtest/run_case.sh event-streaming
 ```
 
 `API_KEY` is not optional and sourcing `./.env` does not provide it — that file ships the master
@@ -365,7 +367,7 @@ ISOLATED_INSTANCE=1 \
   LEDGER_PAIRS="$(echo W3siZGVzdGluYXRpb24iOiJibG5f… | base64 -d)" \
   LEDGER_SPREAD=64 \
   SERVER_REPLICAS=1 \
-  bash tests/loadtest/run_case.sh events
+  bash tests/loadtest/run_case.sh event-streaming
 ```
 
 `LEDGER_SPREAD` must match the number of pairs you supply. Acceptance mode requires that many
@@ -408,7 +410,7 @@ Run it against a **dedicated** Blnk instance, with a fixture decision:
 set -a; . ./.env; set +a          # the master key and the metrics bearer token
 
 ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 \
-  bash tests/loadtest/run_case.sh events
+  bash tests/loadtest/run_case.sh event-streaming
 ```
 
 or, to reuse fixtures from an earlier run instead of adding more:
@@ -418,7 +420,7 @@ set -a; . ./.env; set +a
 
 ISOLATED_INSTANCE=1 \
   LEDGER_PAIRS="$(cat tests/loadtest/ledger-pairs.json)" \
-  bash tests/loadtest/run_case.sh events
+  bash tests/loadtest/run_case.sh event-streaming
 ```
 
 where `ledger-pairs.json` is a file you keep containing
@@ -451,7 +453,7 @@ set -a; . ./.env; set +a
 
 ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 \
   RATE=50 DURATION=2m \
-  bash tests/loadtest/run_case.sh events
+  bash tests/loadtest/run_case.sh event-streaming
 ```
 
 A shorter run's verdicts are real for the load it offered, which is not the load the criteria are
@@ -770,10 +772,13 @@ The most useful comparison fields are:
 
 If the server numbers are good but queue duration is still high, the bottleneck is in worker drain, not API acceptance.
 
-### For the events case
+### For the event-streaming case
 
-There is only one artifact to read, `summary-event-streaming.json`, plus `run-event-streaming.ndjson` for the raw
-series. **There is deliberately no `queue-summary-event-streaming.json`** — the event pipeline has no asynq
+There is one artifact to read, `summary-event-streaming.json`. A second file,
+`run-event-streaming.ndjson`, holds the raw k6 series and exists **only when the run was asked for
+it** — `RAW_OUTPUT=1`, or `NDJSON_OUT=PATH`, which implies it; see the `RAW_OUTPUT` note above. Its
+absence after a default run is the documented outcome, not a truncated run.
+**There is deliberately no `queue-summary-event-streaming.json`** — the event pipeline has no asynq
 queue, so nothing runs the queue benchmark and there is no drain time to compare against. Looking
 for one is the most likely way to conclude a healthy run was incomplete.
 

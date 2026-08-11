@@ -23,7 +23,6 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
-	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -280,17 +279,6 @@ type kafkaAdminAPI interface {
 	Metadata(ctx context.Context, req *kafka.MetadataRequest) (*kafka.MetadataResponse, error)
 	OffsetFetch(ctx context.Context, req *kafka.OffsetFetchRequest) (*kafka.OffsetFetchResponse, error)
 	ListOffsets(ctx context.Context, req *kafka.ListOffsetsRequest) (*kafka.ListOffsetsResponse, error)
-
-	// Fetch reads records from one partition. It is the only READ of message payloads in
-	// this seam, and it exists for the subscriber stream gateway: a key-scoped subscriber
-	// holds Describe and no Read at the broker, so Blnk reads on its behalf and returns
-	// only the records its partition-key prefix admits.
-	//
-	// It is deliberately on this seam and NOT on KafkaAdmin. KafkaAdmin is what the
-	// subscriber service depends on and what a dozen test doubles implement; widening it
-	// would make every one of them implement a record read they have no use for. The
-	// gateway takes its own one-method seam instead.
-	Fetch(ctx context.Context, req *kafka.FetchRequest) (*kafka.FetchResponse, error)
 }
 
 // Compile-time proof that the seam is a faithful subset of the real client. If a
@@ -2036,9 +2024,11 @@ type SubscriberProvisioningRequest struct {
 	//
 	// True produces topic Describe and consumer-group Read and NO topic Read, so every
 	// fetch such a principal attempts is refused by the broker with any client from any
-	// host. Its records are delivered by the subscriber stream gateway, which applies the
-	// prefix before a record leaves the process. False produces the ordinary grant, in
-	// which the topic list IS the boundary and the broker keeps all of it.
+	// host. Its records reach it through the key-authorising component the deployment has
+	// DECLARED in front of the brokers (KAFKA_KEY_SCOPE_ENFORCEMENT), which applies the prefix
+	// before returning anything; Blnk ships no such component and serves no records itself, so
+	// with none declared issuance refuses such a row outright. False produces the ordinary
+	// grant, in which the topic list IS the boundary and the broker keeps all of it.
 	//
 	// It is set by NewSubscriberProvisioningRequest from the row, never by a caller
 	// choosing a boundary: a request that could ask for record access on a key-scoped
@@ -2108,8 +2098,10 @@ type SubscriberProvisioningRequest struct {
 // Its PRESENCE, however, is mapped, onto KeyScoped, and that is what makes the boundary
 // real. A row declaring a key scope is provisioned WITHOUT topic Read: it keeps Describe and
 // its consumer-group namespace, and the broker refuses every record fetch it attempts. The
-// records it is entitled to are delivered by the subscriber stream gateway, which applies
-// model.EventSubscriber.HasKeyAccess to each record's key before returning it.
+// records it is entitled to reach it through the key-authorising component the deployment has
+// declared in front of the brokers, which applies model.EventSubscriber.HasKeyAccess's rule —
+// a byte-exact prefix test on the record key — before returning anything. Blnk does not ship
+// that component: with none declared, issuance for such a row is refused rather than narrowed.
 //
 // The two readings this replaced were both wrong, in opposite directions. Issuance once
 // REFUSED any row carrying a prefix, which withheld the only credential that can exist for a
@@ -2246,8 +2238,8 @@ type SubscriberProvisioningResult struct {
 	//
 	// False for a key-scoped subscriber, always, and that is the isolation boundary rather
 	// than a detail: such a principal is granted Describe and its consumer-group namespace
-	// and nothing else, so the broker refuses every fetch it attempts. Its records are
-	// delivered by the subscriber stream gateway.
+	// and nothing else, so the broker refuses every fetch it attempts. Its records reach it
+	// through the declared key-authorising component instead.
 	//
 	// It is reported rather than inferred so a caller's log line and the credential response
 	// state what was actually written, and so a test can assert the grant shape from the
@@ -2659,10 +2651,10 @@ func (r SubscriberProvisioningRequest) validate() error {
 // credential.
 //
 // What closes it is KeyScoped: record-level Read is withheld, every fetch such a principal
-// attempts is refused by the broker from any client on any host, and the subscriber's records are
-// delivered by the stream gateway with the prefix applied first. So the request that must be
-// refused is not the key-scoped one — it is the one that names a scope while asking for the
-// unnarrowed grant.
+// attempts is refused by the broker from any client on any host, and the subscriber's records
+// reach it through the declared key-authorising component with the prefix applied first. So the
+// request that must be refused is not the key-scoped one — it is the one that names a scope
+// while asking for the unnarrowed grant.
 //
 // # Why the check is here as well as in the service
 //
@@ -2902,11 +2894,12 @@ func (r SubscriberProvisioningRequest) normalizedTopics() []string {
 // what this omission ends: such a principal can list its topics and their offsets, can join
 // its own consumer group, and CANNOT FETCH A SINGLE RECORD, with any client, from any host.
 //
-// Its records are delivered by the subscriber stream gateway, which reads the shared topic
-// with Blnk's own identity and applies the recorded prefix before returning anything. The
-// grant here and that filter are the two halves of one boundary: withholding Read is what
-// makes the gateway the only path, and the gateway is what stops the withholding from being a
-// dead end.
+// Its records reach it through the key-authorising component the deployment has declared in
+// front of the brokers, which applies the recorded prefix before returning anything. The grant
+// here and that component are the two halves of one boundary: withholding Read is what makes
+// the declared component the only path, and the declaration is what stops the withholding from
+// being a dead end — which is why issuance refuses a key-scoped row when nothing is declared,
+// rather than provisioning a principal that can fetch nothing at all.
 //
 // The group binding is retained for such a subscriber even though it cannot consume from the
 // broker, and deliberately: the namespace is RESERVED by that binding, so no other principal
@@ -4298,8 +4291,8 @@ var ErrForeignACLGrantsAccess = errors.New(
 // That combination is exactly the disclosure this release closes: whole-topic Read handed to a
 // key-scoped subscriber lets it consume every other ledger's records on the shared category
 // topic, whatever the response says about the prefix. A key-scoped subscriber is therefore
-// granted Describe and its consumer-group namespace and no topic Read, and its records are
-// delivered by the subscriber stream gateway, which applies the prefix before returning
+// granted Describe and its consumer-group namespace and no topic Read, and its records reach it
+// through the declared key-authorising component, which applies the prefix before returning
 // anything. If for any reason that shape cannot be established — the grant still carries Read,
 // or the broker's enforcement is unconfirmed — issuance FAILS rather than returning a password
 // whose isolation nobody verified.
@@ -4308,8 +4301,8 @@ var ErrForeignACLGrantsAccess = errors.New(
 // and a test all recognise the refusal without matching message text.
 var ErrSubscriberKeyScopeUnenforced = errors.New(
 	"kafka admin: a subscriber recording a partition-key prefix must be granted no record-level " +
-		"Read, so that Blnk's subscriber stream gateway is the only path its records can take; the " +
-		"boundary could not be established, so no subscriber credential may be issued",
+		"Read, so that the declared key-authorising component is the only path its records can " +
+		"take; the boundary could not be established, so no subscriber credential may be issued",
 )
 
 // bindingsGrantTopicRead reports whether a desired binding set includes Read on a TOPIC.
@@ -8314,326 +8307,5 @@ func applyWindowToPartition(
 
 	if written := bound.end - start; written > 0 {
 		snapshot.WindowRecordCount += written
-	}
-}
-
-// ---------------------------------------------------------------------------------------
-// The record read — the one place Blnk reads message payloads back out of Kafka
-//
-// # Why an administrative client reads records at all
-//
-// A key-scoped subscriber is provisioned with Describe and NO Read on its topics, so the
-// broker refuses its every fetch. That refusal IS the isolation boundary — Kafka's
-// authorizer has no message-key dimension, so a grant narrow enough to express the
-// subscriber's prefix does not exist — and it leaves Blnk owing such a subscriber a way to
-// consume. The subscriber stream gateway is that way: it reads with Blnk's own credential
-// and returns only the records the subscriber's prefix admits.
-//
-// The read therefore lives here, beside the ACL grants it is the counterpart to, rather
-// than in a second Kafka client with its own transport and its own SASL handshake.
-// ---------------------------------------------------------------------------------------
-
-// TopicRecordFetch is one bounded read of one partition.
-//
-// Every bound is explicit and required. An unbounded read of a shared category topic is a
-// request whose cost is decided by however many records happen to be on the partition, which
-// is not a property any caller of this can know, so the type has no "read everything" shape
-// to reach for.
-type TopicRecordFetch struct {
-	// Topic is the fully-qualified topic to read. The gateway has already established that
-	// the requesting subscriber is authorised for it; this type performs no authorization.
-	Topic string
-
-	// Partition is the partition to read. Partitions are addressed one at a time because a
-	// subscriber's cursor is per partition — a page spanning partitions could not report a
-	// single resumable next offset.
-	Partition int
-
-	// Offset is where to start. Values at or above zero are absolute; the two Kafka
-	// sentinels are honoured, so kafka.FirstOffset reads from the earliest retained record
-	// and kafka.LastOffset from the end of the log.
-	Offset int64
-
-	// MaxRecords bounds how many records are returned. It is applied AFTER the broker
-	// answers, because Kafka bounds a fetch by bytes rather than by count.
-	MaxRecords int
-
-	// MaxBytes bounds the response the broker is asked to build. It is the bound that
-	// actually protects this process's memory, since a single oversized record can exceed
-	// any record count.
-	MaxBytes int64
-
-	// MaxWait is how long the broker may hold the request waiting for MinBytes to
-	// accumulate. It is what makes an empty partition answer promptly rather than at the
-	// broker's default.
-	MaxWait time.Duration
-}
-
-// FetchedRecord is one record as it came off the partition.
-//
-// Key and Value are COPIES of the bytes the reader produced, not views onto it. The reader
-// and its underlying connection buffer are released before this returns, so a view would
-// alias memory the client is free to reuse.
-type FetchedRecord struct {
-	// Offset is the record's position in the partition, which is what makes a page
-	// resumable.
-	Offset int64
-
-	// Key is the message key, verbatim. For Blnk's own events it is the partition key —
-	// the ledger id for a ledger-scoped event — which is exactly what a subscriber's
-	// partition-key prefix is matched against.
-	Key []byte
-
-	// Value is the message body, verbatim: the marshalled LedgerEvent envelope.
-	Value []byte
-
-	// Time is the record's timestamp as the broker reports it.
-	Time time.Time
-}
-
-// TopicRecordBatch is what one bounded read produced.
-type TopicRecordBatch struct {
-	// Topic and Partition echo what was read, so a batch is self-describing.
-	Topic     string
-	Partition int
-
-	// Records are in offset order, at most MaxRecords of them.
-	Records []FetchedRecord
-
-	// HighWatermark is the offset the next record produced will occupy, so a caller can
-	// tell "caught up" from "more to read" without a second round trip.
-	HighWatermark int64
-
-	// LogStartOffset is the earliest offset still retained, which is what tells a caller
-	// its cursor has fallen off the back of the log rather than merely being behind.
-	LogStartOffset int64
-
-	// Truncated reports that MaxRecords cut the batch short, so a caller knows more
-	// records are immediately available at NextOffset rather than inferring it from a full
-	// page.
-	Truncated bool
-}
-
-// NextOffset is the offset a caller should resume from.
-//
-// It is derived from what was SCANNED rather than from what a caller chose to keep, which is
-// the property the gateway depends on: a page in which every record was withheld by a key
-// scope still advances, so a subscriber cannot be stalled forever by records it is not
-// entitled to.
-//
-// Returns:
-//   - int64: one past the last record read; the requested offset when nothing was read and
-//     the request named an absolute one; the high watermark when nothing was read and the
-//     request named a sentinel.
-func (b TopicRecordBatch) NextOffset(requested int64) int64 {
-	if len(b.Records) > 0 {
-		return b.Records[len(b.Records)-1].Offset + 1
-	}
-
-	if requested >= 0 {
-		return requested
-	}
-
-	return b.HighWatermark
-}
-
-// FetchTopicRecords reads a bounded page of records from one partition.
-//
-// # What it does not do
-//
-// It does not authorise. The credential it reads with is Blnk's own and is wide enough to
-// read every category topic, so a caller that skipped the subscriber's topic and key checks
-// would be handed records the subscriber is not entitled to. Authorization belongs to the
-// gateway, which is the only caller.
-//
-// # Why the reader is drained and closed here
-//
-// kafka-go returns records through a RecordReader backed by the connection's read buffer.
-// Holding one past this call would hold that buffer, and reading a Bytes value after the
-// reader advances is undefined — so every key and value is copied out eagerly and the reader
-// is closed before returning, error or not.
-//
-// Parameters:
-//   - ctx context.Context: bounds the read. A cancelled or expired context is reported
-//     before the broker is touched.
-//   - req TopicRecordFetch: the topic, partition, offset and bounds to read within.
-//
-// Returns:
-//   - TopicRecordBatch: the records read and the partition's watermarks.
-//   - error: ErrKafkaAdminNotConfigured when no broker is configured, the broker's own
-//     error when it refused the read, or a wrapped transport failure.
-func (a *KafkaAdminClient) FetchTopicRecords(
-	ctx context.Context,
-	req TopicRecordFetch,
-) (_ TopicRecordBatch, err error) {
-	ctx, span := startKafkaAdminSpan(ctx, "fetch_topic_records")
-	defer span.End()
-	defer func() { failKafkaAdminSpan(span, err) }()
-
-	batch := TopicRecordBatch{Topic: req.Topic, Partition: req.Partition}
-	if err := a.ready(ctx); err != nil {
-		return batch, err
-	}
-
-	topic := strings.TrimSpace(req.Topic)
-	if topic == "" {
-		return batch, errors.New("kafka admin: a record read names no topic")
-	}
-
-	if req.MaxRecords <= 0 || req.MaxBytes <= 0 || req.MaxWait <= 0 {
-		return batch, fmt.Errorf(
-			"kafka admin: a record read of %q partition %d must be bounded: "+
-				"max_records=%d max_bytes=%d max_wait=%s",
-			topic, req.Partition, req.MaxRecords, req.MaxBytes, req.MaxWait,
-		)
-	}
-
-	response, err := a.client.Fetch(ctx, &kafka.FetchRequest{
-		Topic:     topic,
-		Partition: req.Partition,
-		Offset:    req.Offset,
-		// ONE BYTE, so the broker answers as soon as anything is available and MaxWait is a
-		// ceiling rather than a floor. A larger MinBytes would make a quiet partition hold
-		// the subscriber's request open for the full wait for no reason.
-		MinBytes: 1,
-		MaxBytes: req.MaxBytes,
-		MaxWait:  req.MaxWait,
-		// READ_COMMITTED. Blnk's producer is not transactional, so every record it writes is
-		// committed and the two isolation levels agree for its own topics — but a topic is a
-		// shared namespace and this is a subscriber-facing read, so the stricter level is the
-		// correct default: it can never disclose an aborted record, and it costs nothing here.
-		IsolationLevel: kafka.ReadCommitted,
-	})
-	if err != nil {
-		return batch, fmt.Errorf("kafka admin: fetching %q partition %d: %w", topic, req.Partition, err)
-	}
-
-	if response == nil {
-		return batch, fmt.Errorf(
-			"kafka admin: fetching %q partition %d returned no response and no error",
-			topic, req.Partition,
-		)
-	}
-
-	batch.HighWatermark = response.HighWatermark
-	batch.LogStartOffset = response.LogStartOffset
-
-	// THE READER IS RELEASED WHATEVER HAPPENS, including on the broker-error path below,
-	// because a refused fetch still returns a reader on some client versions.
-	defer closeRecordReader(response.Records)
-
-	// The broker's own verdict arrives INSIDE the response — this is where
-	// TOPIC_AUTHORIZATION_FAILED appears — so it is returned as an error rather than read
-	// past. A caller that ignored it would report an empty page for a refused read, which
-	// reads as "caught up".
-	if response.Error != nil {
-		return batch, fmt.Errorf(
-			"kafka admin: the broker refused a read of %q partition %d: %w",
-			topic, req.Partition, response.Error,
-		)
-	}
-
-	records, truncated, err := readFetchedRecords(response.Records, req.MaxRecords)
-	if err != nil {
-		return batch, fmt.Errorf("kafka admin: reading %q partition %d: %w", topic, req.Partition, err)
-	}
-
-	batch.Records = records
-	batch.Truncated = truncated
-
-	return batch, nil
-}
-
-// readFetchedRecords drains at most limit records out of a reader, copying every key and
-// value.
-//
-// io.EOF is the reader's normal end and is not an error. Anything else is: a partial read
-// would otherwise be indistinguishable from the end of the partition, and a caller would
-// advance its cursor past records it never saw.
-//
-// Parameters:
-//   - reader kafka.RecordReader: the reader the response carried. A nil reader yields no
-//     records, which is what an empty partition produces.
-//   - limit int: the maximum number of records to read.
-//
-// Returns:
-//   - []FetchedRecord: the records read, in the order the reader produced them.
-//   - bool: true when the limit stopped the read with records still available.
-//   - error: a read failure that is not the reader's end.
-func readFetchedRecords(reader kafka.RecordReader, limit int) ([]FetchedRecord, bool, error) {
-	if reader == nil {
-		return nil, false, nil
-	}
-
-	records := make([]FetchedRecord, 0, limit)
-	for {
-		record, err := reader.ReadRecord()
-		if errors.Is(err, io.EOF) {
-			return records, false, nil
-		}
-		if err != nil {
-			return records, false, err
-		}
-		if record == nil {
-			return records, false, nil
-		}
-
-		if len(records) == limit {
-			// THE LIMIT, reported rather than silently applied. There is at least one more
-			// record on the partition at NextOffset, and a caller told otherwise would wait
-			// for a poll interval it does not need to wait for.
-			return records, true, nil
-		}
-
-		key, err := readRecordBytes(record.Key)
-		if err != nil {
-			return records, false, fmt.Errorf("reading the key of offset %d: %w", record.Offset, err)
-		}
-
-		value, err := readRecordBytes(record.Value)
-		if err != nil {
-			return records, false, fmt.Errorf("reading the value of offset %d: %w", record.Offset, err)
-		}
-
-		records = append(records, FetchedRecord{
-			Offset: record.Offset,
-			Key:    key,
-			Value:  value,
-			Time:   record.Time,
-		})
-	}
-}
-
-// readRecordBytes materialises one kafka.Bytes value, tolerating a nil.
-//
-// A nil key is ordinary — Blnk always sets one, but a shared topic may carry records from
-// elsewhere — and it is NOT the same as an empty key for a key-scoped subscriber: an empty
-// key carries no prefix, so such a record is withheld rather than delivered. Returning nil
-// bytes rather than an error is what lets that decision be made by the authorization rule
-// instead of failing the whole page.
-func readRecordBytes(value kafka.Bytes) ([]byte, error) {
-	if value == nil {
-		return nil, nil
-	}
-
-	return kafka.ReadAll(value)
-}
-
-// closeRecordReader releases a reader that holds a connection buffer.
-//
-// Closability is discovered rather than assumed: kafka-go's readers implement io.Closer, but
-// the empty reader a refused fetch returns does not have to, and the interface the response
-// declares does not include Close.
-func closeRecordReader(reader kafka.RecordReader) {
-	closer, ok := reader.(io.Closer)
-	if !ok || closer == nil {
-		return
-	}
-
-	if err := closer.Close(); err != nil {
-		kafkaErrorEntry("fetch_record_reader_close", err).Debug(
-			"kafka admin: a record reader did not close cleanly, so its connection buffer is " +
-				"returned to the pool by the transport instead",
-		)
 	}
 }

@@ -79,7 +79,7 @@ import (
 // one: it multiplies the partition count and the ordering guarantee by the number of
 // subscribers, and it makes adding a subscriber a topic-provisioning event rather than a
 // credential one. It is, however, the answer if per-key isolation is genuinely required —
-// see model.EventSubscriber's documentation, which names it and the filtering-gateway
+// see model.EventSubscriber's documentation, which names it and the declared-gateway
 // alternative.
 //
 // # SECRET HANDLING IS THE POINT OF THIS FILE
@@ -693,11 +693,15 @@ type SubscriberCredential struct {
 	Replaced bool
 
 	// KeyScopeEnforcement says WHICH COMPONENT enforces the recorded scope, and it travels with
-	// the prefix rather than being derivable from it. blnk_stream_gateway means the subscriber
-	// was granted Describe but NOT Read on its topics, so the broker refuses every direct fetch
-	// and its records are delivered — key-filtered — by the subscriber stream gateway; none
-	// means no scope was recorded and the topic and group ACLs are the entire boundary, which
-	// the broker keeps in full.
+	// the prefix rather than being derivable from it. broker_gateway — the same word the
+	// deployment declares in KAFKA_KEY_SCOPE_ENFORCEMENT — means the subscriber was granted
+	// Describe but NOT Read on its topics, so the broker refuses every direct fetch and its
+	// records are delivered, key-filtered, by that declared component; none means no scope was
+	// recorded and the topic and group ACLs are the entire boundary, which the broker keeps in
+	// full.
+	//
+	// It is never reported for a key-scoped row while no component is declared, because no
+	// credential exists to report it on: issuance answers SUBSCRIBER_KEY_SCOPE_UNENFORCED.
 	//
 	// Its value was "consumer_side" until the isolation correction, and the pair was what
 	// replaced refusing to issue at all. Both of those were answers to the same question and
@@ -753,9 +757,9 @@ func (c SubscriberCredential) PasswordLength() int {
 // A recorded prefix is returned verbatim with enforcedByBroker FALSE, and the false is precise
 // rather than discouraging: Kafka's authorizer has no message-key dimension, so the broker
 // cannot evaluate this scope — which is exactly why such a credential is granted no topic Read
-// and its records are delivered, key-filtered, by the subscriber stream gateway. The boundary IS
-// enforced; the broker is not what enforces it, and KeyScopeEnforcement on this credential names
-// the component that does.
+// and its records are delivered, key-filtered, by the declared key-authorising component. The
+// boundary IS enforced; the broker is not what enforces it, and KeyScopeEnforcement on this
+// credential names the component that does.
 //
 // No recorded prefix is reported as model.SubscriberKeyScopeAllKeys with enforcedByBroker TRUE,
 // because in that case the topic grant IS the whole boundary and the broker does keep all of it.
@@ -767,7 +771,7 @@ func (c SubscriberCredential) PasswordLength() int {
 // Returns:
 //   - scope string: the recorded prefix, or model.SubscriberKeyScopeAllKeys when none is recorded.
 //   - enforcedByBroker bool: false exactly when a narrowing prefix is recorded, which is when the
-//     gateway enforces it instead.
+//     declared component enforces it instead.
 func (c SubscriberCredential) KeyScope() (scope string, enforcedByBroker bool) {
 	trimmed := strings.TrimSpace(c.PartitionKeyPrefix)
 	if trimmed == "" {
@@ -777,8 +781,8 @@ func (c SubscriberCredential) KeyScope() (scope string, enforcedByBroker bool) {
 	// FALSE, and the boolean means what it is named: the BROKER does not enforce this. Kafka's
 	// authorizer has no message-key dimension, so no ACL evaluates the prefix — which is why such
 	// a credential holds no topic Read at all and its records are delivered, key-filtered, by the
-	// stream gateway. The boundary IS enforced, and KeyScopeEnforcement on this credential names
-	// the component that enforces it. Reporting true here because SOMETHING enforces the scope
+	// declared component. The boundary IS enforced, and KeyScopeEnforcement on this credential
+	// names the component that enforces it. Reporting true here because SOMETHING enforces the scope
 	// would state a broker boundary Kafka does not keep, which is the disclosure this pair of
 	// return values exists to prevent.
 	return trimmed, false
@@ -788,10 +792,10 @@ func (c SubscriberCredential) KeyScope() (scope string, enforcedByBroker bool) {
 //
 // It differs from EventSubscriber.KeyScopeEnforcement in exactly one way, and the difference is
 // the reason it exists: that method reads a registry row, which knows nothing about whether the
-// deployment runs an enforcing gateway, so it answers consumer_side for any recorded prefix. A
-// credential, by contrast, only exists where issuance permitted it, and issuance refuses a
-// recorded prefix while enforcement is inactive — so on a credential a recorded prefix implies
-// the gateway.
+// deployment has declared an enforcing component, so it answers where a recorded prefix WOULD be
+// enforced. A credential, by contrast, only exists where issuance permitted it, and issuance
+// refuses a recorded prefix while no component is declared — so on a credential a recorded prefix
+// implies a running one.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the row being issued for. May be nil, which reports
@@ -832,12 +836,12 @@ func (c SubscriberCredential) LogFields() logrus.Fields {
 		"issued_at":               c.IssuedAt.UTC().Format(time.RFC3339Nano),
 		// Where the key scope is enforced, on EVERY issuance line rather than only the
 		// key-scope line, so a search over issuance records can separate the subscribers whose
-		// records are delivered through the stream gateway from the ones whose whole boundary
-		// is broker-enforced. The prefix VALUE is not repeated here — it is caller-supplied
-		// text, and the line logKeyScopeDisclosure emits alongside this one carries it
-		// sanitized, once. On an ISSUED credential this reads "gateway" for a row recording a
-		// prefix and "none" otherwise; it never reads consumer_side, because a credential is
-		// minted only where an enforcement point exists.
+		// records are delivered through the declared component from the ones whose whole
+		// boundary is broker-enforced. The prefix VALUE is not repeated here — it is
+		// caller-supplied text, and the line logKeyScopeDisclosure emits alongside this one
+		// carries it sanitized, once. On an ISSUED credential this reads "broker_gateway" for a
+		// row recording a prefix and "none" otherwise; it never reads consumer_side, because a
+		// credential is minted only where an enforcement point is declared.
 		"key_scope_enforcement": string(c.KeyScopeEnforcement),
 	}
 }
@@ -1295,21 +1299,21 @@ func SubscriberConsumerGroupNamespace(subscriberID string) (string, error) {
 // stream. The prefix is a statement about which LEDGERS a subscriber is authorised for, which
 // only the caller registering it can make.
 //
-// # A NON-EMPTY RESULT IS A FILTERING OBLIGATION, NOT A REFUSAL
+// # A NON-EMPTY RESULT NAMES A BOUNDARY THE BROKER CANNOT KEEP
 //
 // Kafka's authorizer has no message-key dimension: there is no ACL that restricts a consumer
-// to a slice of a topic by key. A subscriber granted a topic can read every record on it
-// regardless of this value.
+// to a slice of a topic by key. A subscriber granted Read on a topic can read every record on
+// it regardless of this value.
 //
-// Issuance nonetheless SUCCEEDS for such a row, and an earlier revision of this comment said
-// it did not. Refusing withdrew a mandatory capability — a subscriber registered with a
-// prefix could never obtain credentials at all — and refusing is only fail-closed when a
-// narrower grant exists to insist upon. A narrower grant DOES exist, and it is what issuance
-// provisions now: Describe without Read on the authorised topics, so the broker refuses every
-// record fetch, plus delivery through the subscriber stream gateway, which applies this
-// constraint to each record's key. The credential response and every subscriber read carry an
-// enforced-access object naming the component that keeps each dimension. See
-// model.EventSubscriber.RequiresGatewayDelivery and api/model.SubscriberEnforcedAccess.
+// So a recorded prefix is provisioned as Describe WITHOUT Read on the authorised topics — the
+// broker refuses every record fetch — and the records are delivered, key-filtered, by the
+// key-authorising component the deployment DECLARED in front of the brokers
+// (KAFKA_KEY_SCOPE_ENFORCEMENT). Where no component is declared, which is the shipped default,
+// issuance REFUSES with SUBSCRIBER_KEY_SCOPE_UNENFORCED rather than minting a credential that
+// can fetch nothing or, worse, one granted whole-topic Read beside a prefix nothing applies.
+// The credential response and every subscriber read carry an enforced-access object naming the
+// component that keeps each dimension. See model.EventSubscriber.RequiresGatewayDelivery and
+// api/model.SubscriberEnforcedAccess.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the registry row. Nil yields "".
@@ -1606,8 +1610,8 @@ func normalizeSubscriberKeyScope(prefix *string) (*string, error) {
 // partition-key prefix Kafka's authorizer has no dimension for — is now reported by
 // logKeyScopeDisclosure, on the issuance path, so there is ONE key-scope diagnostic per issuance
 // rather than two that can drift, and it fires where the credential's shape is decided. It says
-// what that shape is: Describe and no topic Read, with delivery through the subscriber stream
-// gateway.
+// what that shape is: Describe and no topic Read, with delivery through the key-authorising
+// component the deployment declared — or a refusal to issue at all where none is declared.
 
 // subscriberKeyPrefix reads a subscriber's recorded partition-key prefix, trimmed, or "" when
 // none is recorded.
@@ -1730,26 +1734,6 @@ func subscriberCredentialIssuedAt(subscriber *model.EventSubscriber) string {
 	return subscriber.CredentialIssuedAt.UTC().Format(time.RFC3339)
 }
 
-// streamGatewayEnforcesKeyScope records that this binary CONTAINS an enforcement point for a
-// subscriber's partition-key prefix, so a recorded prefix is never a boundary nobody keeps.
-//
-// The component is SubscriberStreamGateway in event_stream_gateway.go, reached over
-// GET /subscribers/{subscriber_id}/events. A key-scoped subscriber is provisioned with Describe
-// and no topic Read — the broker refuses its every fetch — and its records are read with Blnk's
-// own credential and filtered per record by model.EventSubscriber.HasKeyAccess before any leaves
-// the process. That is what makes the prefix an authorization boundary rather than a request to
-// the party holding the credential.
-//
-// It is a constant rather than a configuration read because the gateway is linked into the
-// binary: a deployment cannot turn it off, only decline to use it. KafkaConfig.KeyScopeGateway
-// is the SEPARATE question of whether an EXTERNAL enforcing endpoint is declared, which changes
-// which address a key-scoped credential names, not whether the scope is enforced at all.
-//
-// The two guards below take the enforcement fact as a parameter rather than reading this
-// constant themselves, so their refusal path stays reachable — and tested — for a build in which
-// no enforcement point exists.
-const streamGatewayEnforcesKeyScope = true
-
 // requireProvisionableKeyScope refuses to mint a credential for a subscriber whose row records
 // a partition key prefix, because Kafka cannot enforce one.
 //
@@ -1813,9 +1797,9 @@ func requireProvisionableKeyScope(subscriber *model.EventSubscriber, enforced bo
 	return apierror.NewAPIError(
 		// The TYPED code, not the generic conflict. Both resolve to 409, but a client
 		// discriminates on the code, and this refusal has a specific remedy that "CONFLICT"
-		// cannot express — see apierror.ErrSubscriberIsolationUnenforceable, whose
-		// documentation describes exactly this refusal.
-		apierror.ErrSubscriberIsolationUnenforceable,
+		// cannot express — see apierror.ErrSubscriberKeyScopeUnenforced, whose documentation
+		// describes exactly this refusal and both of the orders it is reachable from.
+		apierror.ErrSubscriberKeyScopeUnenforced,
 		"This subscriber records a partition key prefix, which Kafka cannot enforce, so no "+
 			"credential will be issued for it: the credential would read every record on every "+
 			"authorized topic, including other ledgers' and other subscribers'. Clear the "+
@@ -1886,9 +1870,9 @@ func requireRecordableKeyScope(subscriber *model.EventSubscriber, enforced bool)
 
 	return apierror.NewAPIError(
 		// The same typed code issuance refuses with. One state, one code: a client that handles
-		// SUBSCRIBER_ISOLATION_UNENFORCEABLE from the credential endpoint needs no second case
-		// to handle it here, and the remedies are the same two plus revocation.
-		apierror.ErrSubscriberIsolationUnenforceable,
+		// SUBSCRIBER_KEY_SCOPE_UNENFORCED from the credential endpoint needs no second case to
+		// handle it here, and the remedies are the same two plus revocation.
+		apierror.ErrSubscriberKeyScopeUnenforced,
 		"This subscriber already holds a Kafka credential, and Kafka cannot enforce a partition "+
 			"key prefix, so recording one would describe a narrower boundary than the credential "+
 			"actually has. Revoke the credential first if the prefix is what you want, clear the "+
@@ -2932,27 +2916,25 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		}
 	}
 
-	// A partition key prefix on a row that already holds a credential used to be REFUSED here,
-	// and it is accepted now. The refusal was one half of a pair whose other half made the
-	// mandatory credential endpoint a permanent dead-end; both are gone, along with the CHECK
-	// constraint that made the combination unrepresentable. What replaced them is a NARROWER
-	// GRANT rather than a prohibition: a row carrying a prefix is provisioned with Describe and
-	// no Read on its topics, and its records are delivered key-filtered by the subscriber
-	// stream gateway. See model.EventSubscriber.RequiresGatewayDelivery.
+	// A partition key prefix recorded over a row that ALREADY HOLDS A CREDENTIAL is refused
+	// unless something in front of the brokers authorises record keys. The refusal is one half
+	// of a pair — requireProvisionableKeyScope guards the other order, prefix first and
+	// credential afterwards — and on its own either is walked around by approaching the state
+	// from the far side.
 	//
 	// Judged on the row as it would be WRITTEN, which is why it sits after every change above
 	// has been applied and before any broker work below: an update that clears the prefix, or
 	// that leaves a prefix on a row with no credential, passes through untouched. What is
 	// refused is the combination — a live principal with Read on whole topics beneath a row
-	// announcing key-scoped access — because Kafka has no message-key dimension to make the
-	// announcement true, and because a row in that state could never rotate its secret, since
-	// re-issuance is refused for the same reason. See requireRecordableKeyScope, which passes
-	// through whenever an enforcement point exists — as it does in this binary, because the
-	// subscriber stream gateway is linked into it.
-	_, externalGatewayDeclared := s.keyScopeEnforcement()
-	if err := requireRecordableKeyScope(
-		subscriber, streamGatewayEnforcesKeyScope || externalGatewayDeclared,
-	); err != nil {
+	// announcing key-scoped access — because Kafka's authorizer has no message-key dimension to
+	// make the announcement true, and because a row in that state could never rotate its
+	// secret, since re-issuance is refused for the same reason.
+	//
+	// THE ENFORCEMENT FACT IS CONFIGURATION, NOT A PROPERTY OF THIS BINARY. Blnk ships no
+	// key-authorising component and serves no records itself; KAFKA_KEY_SCOPE_ENFORCEMENT is an
+	// operator declaring that one is deployed in front of the brokers. See keyScopeEnforcement.
+	_, keyScopeEnforced := s.keyScopeEnforcement()
+	if err := requireRecordableKeyScope(subscriber, keyScopeEnforced); err != nil {
 		return nil, err
 	}
 
@@ -2981,8 +2963,8 @@ func (s *EventSubscriberService) UpdateSubscriber(
 	// dimension — so changing one prefix for another moves no binding and must not cost two
 	// DescribeACLs round trips. But RECORDING a prefix on a row that had none, or CLEARING the
 	// one it had, changes the grant itself: a key-scoped subscriber is provisioned with Describe
-	// and NO Read on its topics, so that the stream gateway is the only path its records can
-	// take. An edit across that line therefore has to reach the broker, in the correct
+	// and NO Read on its topics, so that the declared key-authorising component is the only path
+	// its records can take. An edit across that line therefore has to reach the broker, in the correct
 	// direction: recording a prefix PRUNES the Read bindings, and clearing one grants them back.
 	//
 	// Leaving it out — which is what the previous revision did, on the reasoning that a prefix
@@ -3457,8 +3439,9 @@ func (s *EventSubscriberService) settleGrantReconciliation(
 // # The transition, and why it is worth its own diagnostic
 //
 // logKeyScopeDisclosure already records every issuance made to a row carrying a prefix, so such a
-// subscriber is told at issuance that its records come from the stream gateway. This one covers
-// the reverse order: the credential was issued FIRST, against a row with no prefix, so its
+// subscriber is told at issuance that its records come from the declared key-authorising
+// component. This one covers the reverse order: the credential was issued FIRST, against a row
+// with no prefix, so its
 // response said broker_record_access = true and gateway_delivery_required = false — truthfully,
 // at the time. A later update then records a prefix, and that earlier statement, already
 // delivered and unretractable, is now wrong.
@@ -3466,16 +3449,18 @@ func (s *EventSubscriberService) settleGrantReconciliation(
 // # And the consequence is immediate, which is why this is a warning
 //
 // The broker-side grant DOES change across this transition. Recording a prefix narrows the
-// authorization: UpdateSubscriber prunes the Read bindings so that the stream gateway is the only
-// path the subscriber's records can take, exactly as issuance would have provisioned it. The
+// authorization: UpdateSubscriber prunes the Read bindings so that the declared key-authorising
+// component is the only path the subscriber's records can take, exactly as issuance would have
+// provisioned it. The
 // holder's existing credential still authenticates and can still describe its topics — and its
 // next fetch is refused by the broker with TOPIC_AUTHORIZATION_FAILED.
 //
 // That is the correct outcome, and it is not a silent one. An operator who narrows a subscriber's
 // declared boundary should expect its direct consumption to stop; a consumer whose fetches begin
 // failing needs the reason to be findable. So the line states the transport change and the
-// remedy: reissue, which delivers the corrected enforced-access declaration naming the gateway,
-// or clear the prefix to restore direct broker consumption.
+// remedy: reissue, which delivers the corrected enforced-access declaration naming the declared
+// component — and which REFUSES outright where none is declared, so the narrowing cannot be
+// reported as enforced by nothing — or clear the prefix to restore direct broker consumption.
 //
 // The previous revision of this comment said the grant could not change, "because Kafka has no
 // message-key authorization dimension to change". Kafka still has none; what changed is that Blnk
@@ -3511,10 +3496,11 @@ func warnOnKeyScopeRecordedAfterIssuance(
 	}).Warn(
 		"event subscriber: recorded a partition key prefix on a subscriber that already holds a " +
 			"Kafka credential. Record-level Read has been WITHDRAWN from the existing principal, so " +
-			"its next direct fetch is refused by the broker and its records are now delivered by " +
-			"Blnk's subscriber stream gateway. The response that credential was delivered with " +
-			"declared direct broker access, so reissue the credential to deliver the corrected " +
-			"enforced_access declaration — or clear the prefix to restore direct consumption",
+			"its next direct fetch is refused by the broker and its records must now be delivered by " +
+			"the key-authorising component declared in KAFKA_KEY_SCOPE_ENFORCEMENT. The response that " +
+			"credential was delivered with declared direct broker access, so reissue the credential " +
+			"to deliver the corrected enforced_access declaration — or clear the prefix to restore " +
+			"direct consumption",
 	)
 }
 
@@ -3769,29 +3755,6 @@ func (s *EventSubscriberService) keyScopeEnforcement() (gateway []string, enforc
 	return cnf.Kafka.KeyScopeGateway()
 }
 
-// normalizedBootstrapBrokers copies the internal bootstrap list, dropping blank entries.
-//
-// A COPY, because the configuration is shared through an atomic.Value and read concurrently:
-// handing out the backing array would let a caller that appends to its result mutate what every
-// later reader sees. Blank entries are dropped because an empty address in the reported list is
-// an endpoint a subscriber would try to dial.
-//
-// Parameters:
-//   - brokers []string: config.KafkaConfig.Brokers.
-//
-// Returns:
-//   - []string: a copy holding every non-blank entry, nil when there are none.
-func normalizedBootstrapBrokers(brokers []string) []string {
-	var out []string
-	for _, broker := range brokers {
-		if trimmed := strings.TrimSpace(broker); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-
-	return out
-}
-
 // subscriberFacingBrokers resolves the bootstrap list to report to a subscriber, or refuses.
 //
 // # Why this is not admin.Brokers()
@@ -3804,25 +3767,30 @@ func normalizedBootstrapBrokers(brokers []string) []string {
 // ones for the actual partition leaders. Only an operator knows the externally advertised
 // list, which is why it is configuration (KAFKA_SUBSCRIBER_BROKERS) and not a derivation.
 //
-// # KAFKA_SUBSCRIBER_BROKERS IS AN OPTIONAL OVERRIDE, WARNED ABOUT RATHER THAN REQUIRED
+// # IT FAILS CLOSED, AND THE POLICY LIVES IN ONE PLACE
 //
-// A revision of this function made it mandatory and answered a typed 503 without it. The cost of
-// that is larger than it looks: requirement R-10 names EIGHT configuration variables and this is
-// not one of them, so a deployment configured exactly as documented published every event
-// correctly and was refused EVERY credential — R-7's endpoint unusable on a conforming
-// deployment. A ninth mandatory variable is a change to the configuration contract, not a
-// hardening of it.
+// The decision is config.KafkaConfig.SubscriberFacingBrokers and nothing else: this function
+// asks it and refuses when it reports no advertised list. There is no fallback to
+// KAFKA_BROKERS.
 //
-// So the internal list is the fallback, and the fact that it was used is reported rather than
-// hidden: once at start-up by Configuration.warnOnUnusableSubscriberBrokers, and once per
-// issuance here. Reporting the internal addresses is CORRECT for a subscriber running inside the
-// deployment, which is the case the local stack and every in-cluster consumer are, and wrong for
-// one outside it — and only an operator knows which, which is precisely why the absence cannot be
-// resolved by refusing.
+// A fallback existed, with a warning on every issuance, and the warning was not a control. It
+// landed in Blnk's log while the consequence landed on the subscriber: an internal address
+// reported to an outside consumer surfaces as an unexplained connection timeout in THEIR logs
+// days later, and because the SASL secret is shown exactly once, diagnosing it costs a
+// reissue — a one-time secret spent on an address nothing can dial. It also published the
+// deployment's internal topology in a response body. Refusing is the cheaper failure: it is
+// immediate, it names the variable to set, it discloses no internal address, and it happens
+// BEFORE a password exists or the broker is touched, so it leaves no residue anywhere.
 //
-// The typed refusal survives for the case where it is unambiguous: NEITHER list configured. Then
-// there is no Kafka at all, no endpoint value would work, and 503 with the key named is the only
-// honest answer. ErrSubscriberBrokersNotConfigured documents exactly that boundary.
+// The refusal is not a new configuration requirement smuggled past requirement R-10's eight
+// variables so much as the one it always documented: .env.example, both Compose files and
+// infrastructure/k8s-manifests/blnk-config.yaml have all described this refusal, and the local
+// stack sets KAFKA_SUBSCRIBER_BROKERS to the broker's external listener. A deployment whose
+// subscribers really do run inside it states that in one line by setting this to the same value
+// as KAFKA_BROKERS, which is a claim an operator has made rather than one the service invented.
+//
+// Every other endpoint runs without it. Only issuance needs it, and only because only an
+// operator can know the address a subscriber outside the deployment reaches.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the subscriber being provisioned, named in the log and
@@ -3830,8 +3798,8 @@ func normalizedBootstrapBrokers(brokers []string) []string {
 //
 // Returns:
 //   - []string: the subscriber-facing bootstrap list, never empty on success.
-//   - error: ErrSubscriberBrokersNotConfigured (503) only when no broker list is configured at
-//     all.
+//   - error: ErrSubscriberBrokersNotConfigured (503) when no subscriber-facing list is
+//     configured.
 func (s *EventSubscriberService) subscriberFacingBrokers(
 	subscriber *model.EventSubscriber,
 ) ([]string, error) {
@@ -3845,46 +3813,31 @@ func (s *EventSubscriberService) subscriberFacingBrokers(
 	// consistent behaviour across every event file.
 	cnf, err := fetchConfiguration()
 	if err == nil && cnf != nil {
-		if brokers, advertised := cnf.Kafka.SubscriberFacingBrokers(); advertised && len(brokers) > 0 {
+		if brokers, advertised := cnf.Kafka.SubscriberFacingBrokers(); advertised {
 			return brokers, nil
-		}
-
-		if internal := normalizedBootstrapBrokers(cnf.Kafka.Brokers); len(internal) > 0 {
-			// WARNED ON EVERY ISSUANCE, not only at boot. The credential's secret is shown
-			// exactly once, so a subscriber handed an address it cannot reach discovers that as a
-			// connection timeout days later, nowhere near the request that produced it. The log
-			// line is what lets an operator connect the two without reissuing.
-			logrus.WithFields(logrus.Fields{
-				"subscriber_id_hash": subscriberLogLabel(identifier),
-				"broker_count":       len(internal),
-			}).Warn(
-				"event subscriber: KAFKA_SUBSCRIBER_BROKERS is not configured, so the credential " +
-					"reports the internal broker addresses Blnk dials (KAFKA_BROKERS). That is " +
-					"correct only when this subscriber runs inside the deployment; set " +
-					"KAFKA_SUBSCRIBER_BROKERS to the externally advertised addresses if it does not",
-			)
-
-			return internal, nil
 		}
 	}
 
 	logrus.WithField("subscriber_id_hash", subscriberLogLabel(identifier)).Error(
-		"event subscriber: no Kafka broker list is configured, so no credential was issued; " +
-			"neither KAFKA_SUBSCRIBER_BROKERS nor KAFKA_BROKERS names an endpoint a subscriber " +
-			"could dial, and a credential reporting none is a secret shown once for nothing",
+		"event subscriber: KAFKA_SUBSCRIBER_BROKERS is not configured, so no credential was " +
+			"issued; only an operator knows the externally advertised broker addresses a " +
+			"subscriber can dial, and a one-time secret handed out with an address that does not " +
+			"resolve for it costs a reissue to diagnose",
 	)
 
 	return nil, apierror.NewAPIError(
 		apierror.ErrSubscriberBrokersNotConfigured,
-		// THE VARIABLES ARE NAMED IN THE MESSAGE, not only in the detail and the log. This is the
+		// THE VARIABLE IS NAMED IN THE MESSAGE, not only in the detail and the log. This is the
 		// one string that reaches the operator running the request, and "no broker list is
-		// configured" without the keys is a message that cannot be acted on. A configuration key
-		// name discloses nothing: both are documented in .env.example and the manifests.
-		"no Kafka broker list is configured, so credentials cannot be issued. Set KAFKA_BROKERS, "+
-			"and set KAFKA_SUBSCRIBER_BROKERS as well when subscribers connect from outside this "+
-			"deployment, because the addresses Blnk dials internally do not resolve for them",
+		// configured" without the key is a message that cannot be acted on. A configuration key
+		// name discloses nothing: it is documented in .env.example and in the manifests.
+		"no subscriber-facing Kafka broker list is configured, so credentials cannot be issued. "+
+			"Set KAFKA_SUBSCRIBER_BROKERS to the externally advertised broker addresses "+
+			"subscribers connect to — the same value as KAFKA_BROKERS when they run inside this "+
+			"deployment. The addresses Blnk dials internally are not reported, because they do "+
+			"not resolve for a subscriber outside it",
 		NewSubscriberErrorDetail(
-			"no Kafka broker list is configured", identifier,
+			"no subscriber-facing Kafka broker list is configured", identifier,
 			// Retryable: nothing was written, and the request succeeds unchanged once the
 			// variable is set.
 			true,
@@ -4381,11 +4334,15 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 
 	// THE ENFORCEMENT FACT, READ ONCE. Both halves of the key-scope decision consult it — whether
 	// this subscriber may be issued a credential at all, and which endpoint that credential
-	// names — so the two cannot disagree. keyScopeGateway is non-empty only when an EXTERNAL
-	// enforcing endpoint is declared; the in-binary stream gateway needs no address here because
-	// it is reached over Blnk's own API.
-	keyScopeGateway, externalGatewayDeclared := s.keyScopeEnforcement()
-	keyScopeEnforced := streamGatewayEnforcesKeyScope || externalGatewayDeclared
+	// names — so the two cannot disagree.
+	//
+	// IT COMES ENTIRELY FROM CONFIGURATION. Blnk ships no component that authorises record keys
+	// and serves no records itself, so on the default KAFKA_KEY_SCOPE_ENFORCEMENT=none nothing
+	// evaluates a partition-key prefix and issuance for a prefix-recording row FAILS CLOSED
+	// below. It is true only where an operator has declared an enforcing component in front of
+	// the brokers, and keyScopeGateway is then the address of that component — which is also
+	// what the credential must name in place of the broker list.
+	keyScopeGateway, keyScopeEnforced := s.keyScopeEnforcement()
 
 	// FAIL CLOSED ON AN UNENFORCEABLE KEY SCOPE. A row recording a partition key prefix
 	// describes a boundary Kafka's authorizer has no dimension for, so a credential carrying
@@ -4393,11 +4350,12 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	// subscribers' included. Disclosure was tried in place of a boundary and is not one: the
 	// party asked to apply the filter is the party holding the credential.
 	//
-	// What makes issuance PROCEED here is that the narrowing is real: aclEntries withholds topic
-	// Read from a key-scoped principal, verifyKeyScopeBoundary proves that withholding against
-	// the bindings actually sent before the password becomes returnable, and the subscriber
-	// stream gateway is the path its records take instead. Without an enforcement point this
-	// refuses, and requireProvisionableKeyScope names both remedies.
+	// What makes issuance PROCEED here is that the narrowing is real AND something is declared to
+	// keep it: aclEntries withholds topic Read from a key-scoped principal, verifyKeyScopeBoundary
+	// proves that withholding against the bindings actually sent before the password becomes
+	// returnable, and the declared key-authorising component is the path its records take instead.
+	// Where no component is declared — the shipped default — this REFUSES, and
+	// requireProvisionableKeyScope names both remedies.
 	if err := requireProvisionableKeyScope(subscriber, keyScopeEnforced); err != nil {
 		return SubscriberCredential{}, err
 	}
@@ -4424,28 +4382,23 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 		return SubscriberCredential{}, err
 	}
 
-	// AN EXTERNAL ENFORCING ENDPOINT WINS over the advertised broker list for a key-scoped
+	// THE DECLARED ENFORCING ENDPOINT WINS over the advertised broker list for a key-scoped
 	// subscriber, and it has to: where one is declared, that subscriber's connection is
 	// terminated by it rather than by a broker. Reporting the brokers instead would hand out a
-	// credential declaring gateway-enforced key isolation together with an endpoint that
-	// bypasses the gateway.
+	// credential declaring key-scoped isolation together with an endpoint that bypasses the
+	// component enforcing it.
 	//
-	// THE CONDITION IS THE ADDRESS, NOT THE ENFORCEMENT FACT, and the difference is not
-	// cosmetic. keyScopeEnforced is true whenever ANY enforcement point exists, and the
-	// in-binary one always does — see streamGatewayEnforcesKeyScope — while keyScopeGateway is
-	// populated only by an EXTERNAL declaration. Substituting on the fact would therefore
-	// replace the broker list with an empty one in the ordinary deployment, and the subscriber
-	// would be handed a credential naming no endpoint at all.
+	// THE CONDITION IS THE ADDRESS RATHER THAN THE ENFORCEMENT FACT, so that the two stay
+	// separable: the fact decides whether issuance happens at all (requireProvisionableKeyScope
+	// above), and a non-empty address decides which endpoint the credential names. They agree by
+	// construction here, because keyScopeEnforcement derives both from one configuration read
+	// and reports enforcement only when the address list is non-empty and distinct from
+	// KAFKA_BROKERS — but a substitution written against the boolean would silently hand out a
+	// credential naming NO endpoint if that ever stopped being true.
 	//
-	// The in-binary gateway needs no substitution because it is not a bootstrap endpoint: it is
-	// reached over Blnk's own API at GET /subscribers/{subscriber_id}/events. The broker list
-	// stays truthful for such a subscriber precisely because its grant is narrowed — Describe
-	// and no topic Read — so the addresses it names admit it to describe its topics and refuse
-	// its every fetch, which is the boundary the response also declares.
-	//
-	// A subscriber with no prefix keeps the advertised broker list even where a gateway is
-	// declared: it has no key scope to enforce, so routing it through the gateway would add a
-	// hop that authorises nothing.
+	// A subscriber with no prefix keeps the advertised broker list even where an enforcing
+	// component is declared: it has no key scope to enforce, so routing it through that
+	// component would add a hop which authorises nothing.
 	if subscriber.DeclaresKeyScope() && len(keyScopeGateway) > 0 {
 		subscriberBrokers = keyScopeGateway
 	}
@@ -4652,10 +4605,10 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 		// for. Always populated — "none" when no scope is recorded — so a client branches on this
 		// rather than on whether the prefix happens to be empty.
 		// THE ENFORCEMENT POINT AS ISSUED, not as the row would read on its own.
-		// EventSubscriber.KeyScopeEnforcement answers consumer_side for any recorded prefix
-		// because a registry row knows nothing about the deployment; an ISSUED credential
-		// exists only where enforcement is active, so a key-scoped one is always
-		// broker_gateway and consumer_side is unreachable here.
+		// EventSubscriber.KeyScopeEnforcement reads only the row, which knows nothing about
+		// whether the deployment declared an enforcing component; an ISSUED credential exists
+		// only where one is declared, so a key-scoped credential always reports broker_gateway
+		// and can never report an enforcement point that is not running.
 		KeyScopeEnforcement: issuedKeyScopeEnforcement(subscriber, keyScopeEnforced),
 		Fingerprint:         model.CredentialFingerprint(reference),
 		Replaced:            result.CredentialReplaced,
@@ -4673,7 +4626,7 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	//
 	// It is emitted from the issuance path because that is the claim it makes: that THIS
 	// credential was granted Describe and not Read, and that the subscriber's records travel
-	// through the stream gateway instead. warnOnKeyScopeRecordedAfterIssuance is written against
+	// through the declared component instead. warnOnKeyScopeRecordedAfterIssuance is written against
 	// its existence — it covers only the reverse order, on the stated grounds that issuance
 	// already reports this one — so leaving the call site out would silently make that reasoning
 	// false and leave the transition undiagnosed in the order operators take most often.
@@ -4852,8 +4805,9 @@ func (s *EventSubscriberService) provisioningFailure(
 			// subscriber's row authorises. No retry changes it.
 			apierror.ErrSubscriberAccessExceedsAuthorization,
 			"This subscriber records a partition-key prefix, so its credential must be granted no "+
-				"record-level Read and its records must be delivered by Blnk's subscriber stream "+
-				"gateway; that boundary could not be established, so no credential was issued",
+				"record-level Read and its records must be delivered by the key-authorising component "+
+				"declared in KAFKA_KEY_SCOPE_ENFORCEMENT; that boundary could not be established, so "+
+				"no credential was issued",
 			// NOT retryable: either the broker's ACL enforcement is unconfirmed or a binding
 			// outside Blnk's control restores the withheld access, and both need an operator.
 			s.provisioningDetail(
@@ -6833,8 +6787,8 @@ type subscriberAuthorization struct {
 
 	// keyScoped is the PRESENCE of a partition-key prefix, not its value, and it belongs in this
 	// snapshot because it decides the SHAPE of the grant: a key-scoped row is provisioned with
-	// Describe and no Read on its topics so that the subscriber stream gateway is the only path
-	// its records can take.
+	// Describe and no Read on its topics so that the declared key-authorising component is the
+	// only path its records can take.
 	//
 	// The value is deliberately absent. Swapping one prefix for another moves no binding —
 	// Kafka's authorizer has no message-key dimension — so recording it here would make every
@@ -7713,8 +7667,11 @@ type keyScopeDisclosure struct {
 	// Prefix is the recorded partition-key prefix, or "" when none is recorded.
 	Prefix string
 
-	// Enforcement is WHICH COMPONENT enforces the scope: the Blnk stream gateway when a prefix
-	// is recorded, none when the topic and group ACLs are the whole boundary.
+	// Enforcement is WHICH COMPONENT enforces the scope: the declared key-authorising component
+	// (broker_gateway) when a prefix is recorded, none when the topic and group ACLs are the
+	// whole boundary. It describes the ROW, so it reports where a prefix WOULD be enforced even
+	// on a deployment that has declared nothing — which is exactly the state a refused issuance
+	// has to be able to describe.
 	Enforcement model.KeyScopeEnforcementStatus
 }
 
@@ -7749,10 +7706,10 @@ func describeSubscriberKeyScope(subscriber *model.EventSubscriber) keyScopeDiscl
 // It was a WARNING while the answer was "more than the row suggests". A key-scoped credential
 // then carried Read on whole shared topics and the prefix was the consumer's own filter, so every
 // issuance genuinely was something an operator needed to know about. That is no longer what
-// happens — such a credential is granted Describe and no Read, and the gateway applies the prefix
-// before a record leaves the process — so the line records a normal, fully-enforced issuance and
-// its severity says so. Leaving it at warning would have taught operators to ignore the one
-// severity that is supposed to mean something.
+// happens — such a credential is granted Describe and no Read, and issuance only succeeds where a
+// key-authorising component is declared to apply the prefix — so the line records a normal,
+// fully-enforced issuance and its severity says so. Leaving it at warning would have taught
+// operators to ignore the one severity that is supposed to mean something.
 //
 // # WHAT THIS REPLACED, twice over
 //
@@ -7791,7 +7748,7 @@ func logKeyScopeDisclosure(subscriber *model.EventSubscriber, disclosure keyScop
 		"issued a Kafka credential to a subscriber that records a partition key prefix: Kafka ACLs " +
 			"have no message-key dimension, so this credential was granted Describe but NOT Read on " +
 			"its authorised topics — the broker refuses every direct fetch — and its records are " +
-			"delivered key-filtered by Blnk's subscriber stream gateway",
+			"delivered key-filtered by the component declared in KAFKA_KEY_SCOPE_ENFORCEMENT",
 	)
 }
 
@@ -7801,8 +7758,8 @@ func logKeyScopeDisclosure(subscriber *model.EventSubscriber, disclosure keyScop
 // Both were written for one transition — a partition-key prefix recorded onto a row that already
 // holds a live credential — and both DISCLOSED it, on the reasoning that such a prefix bound
 // nobody but a cooperating consumer. That reasoning no longer holds: the update NARROWS the live
-// grant, pruning record-level Read from every authorised topic, and the subscriber stream gateway
-// becomes the only path that subscriber's records can take.
+// grant, pruning record-level Read from every authorised topic, and the declared key-authorising
+// component becomes the only path that subscriber's records can take.
 //
 // So the transition is still reachable and still worth a line; what changed is the line's content,
 // not its existence. It reports that Read was WITHDRAWN from a principal whose credential is

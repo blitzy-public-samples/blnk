@@ -1225,6 +1225,25 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 // preserves a contract that step 2 would otherwise destroy, and step 4 is a
 // prohibition that step 3 makes tempting.
 //
+// THE OBLIGATION IS PUBLISHED AND ENFORCED, not merely recorded here. This procedure has
+// two counterparts, and all three describe one release:
+//
+//   - docs/webhook-to-kafka-migration.md carries the same release as an operator-facing
+//     DELETION CHECKLIST — the artifacts, where each lives, and the preserve half — because
+//     the party who performs it reads the migration guide, not this file.
+//   - TestWebhookTerminalRelease_ChecklistMatchesTheSurface (event_sunset_test.go) holds that
+//     checklist to this tree in both directions: a row naming something that no longer exists
+//     fails, and an exported symbol declared here that the checklist does not name fails. So
+//     the release cannot be performed without editing the checklist, and the checklist cannot
+//     rot while the transport is still compiled in.
+//
+// WHY THIS IS DEFERRED RATHER THAN OVERDUE. Requirement R-12 runs in two halves in sequence:
+// both transports deliver from the same outbox rows for the fixed window, and only after the
+// window closes is the delivery source removed. The project's plan schedules these deletions
+// as the feature's TERMINAL step for that reason. Performing them earlier would remove the
+// second transport the payload-equivalence check compares against, so this file existing is a
+// requirement of the window rather than an omission from it.
+//
 // PRECONDITION. Do none of this until WebhookSunsetPassed (event_sunset.go) answers
 // true for the deployed window — that is, until the full 30-day dual-delivery window
 // has elapsed and WebhookDualDeliveryActive has answered false ever since. Until then this file must remain compiled

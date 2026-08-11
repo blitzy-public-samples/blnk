@@ -336,37 +336,6 @@ var EventCaptureToDispatchDuration metric.Float64Histogram
 // Attributes: topic, event_type
 var EventsDeadLetteredTotal metric.Int64Counter
 
-// SubscriberStreamRecordsDelivered counts records the subscriber stream gateway returned to a
-// subscriber, and SubscriberStreamRecordsWithheld counts the ones its partition-key prefix
-// excluded.
-//
-// # Why the withheld count is a first-class signal and not a debug log line
-//
-// The gateway IS the enforcement point for a key-scoped subscriber: Kafka's authorizer has no
-// message-key dimension, so such a subscriber is granted Describe and no Read and its records
-// reach it only through this path, filtered per record. That makes "is the filter working?" a
-// question an operator has to be able to answer, and it is unanswerable from the delivered
-// count alone — a feed with a working filter and a feed on a quiet topic look identical.
-//
-// A sustained delivered count with a ZERO withheld count on a shared category topic is
-// therefore the signature worth watching: it is what a filter that has stopped filtering looks
-// like, and it is indistinguishable from healthy operation without this pair.
-//
-// # Why they are counters and why the attributes stop where they do
-//
-// Counters, because they are per-record events and their RATE is the reading; a gauge would
-// lose every value between scrapes. Attributed by topic and by whether the subscriber is
-// key-scoped, and NOT by subscriber id: an id is caller-chosen and unbounded, so one series
-// per subscriber would accumulate for the lifetime of the process. SubscriberConsumerLag
-// carries subscriber identity because a lag figure means nothing without it and it has an
-// explicit cardinality budget; a delivered/withheld rate is answerable per topic.
-//
-// Attributes: topic, key_scoped
-var (
-	SubscriberStreamRecordsDelivered metric.Int64Counter
-	SubscriberStreamRecordsWithheld  metric.Int64Counter
-)
-
 // EVERY GAUGE BELOW is maintained by ONE production caller, the periodic
 // EventMetricsCollector in event_metrics.go, and by nothing else — the dead-letter age, the
 // consumer-lag pair and its coverage gauges, the outbox backlog, the registry size, and the
@@ -1515,22 +1484,6 @@ func Init() error {
 	EventsDeadLetteredTotal, err = meter.Int64Counter("blnk.events.dead_lettered.total",
 		metric.WithDescription("Total number of events dead-lettered after retry exhaustion by topic and event type"),
 		metric.WithUnit("{event}"),
-	)
-	if err != nil {
-		return err
-	}
-
-	SubscriberStreamRecordsDelivered, err = meter.Int64Counter("blnk.subscriber_stream.records.delivered",
-		metric.WithDescription("Records the subscriber stream gateway returned to a subscriber, by topic and whether the subscriber is key-scoped"),
-		metric.WithUnit("{record}"),
-	)
-	if err != nil {
-		return err
-	}
-
-	SubscriberStreamRecordsWithheld, err = meter.Int64Counter("blnk.subscriber_stream.records.withheld",
-		metric.WithDescription("Records the subscriber stream gateway excluded because the subscriber's partition-key prefix does not admit them, by topic and whether the subscriber is key-scoped"),
-		metric.WithUnit("{record}"),
 	)
 	if err != nil {
 		return err

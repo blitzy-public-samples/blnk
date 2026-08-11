@@ -7,8 +7,9 @@ if [[ $# -lt 1 ]]; then
   echo "cases: hot-to-cold-no-shard | cold-to-hot-no-shard | hot-to-cold-shard | cold-to-hot-shard"
   echo "       events | event-streaming  (the event-streaming acceptance run: V-1 throughput"
   echo "                and p99, V-3 dead-letter rate. Both names run the same case;"
-  echo "                'event-streaming' is canonical and names the artifacts)"
-  echo "queue-mode: normal | spread | hot (default: normal, transaction cases only)"
+  echo "                'event-streaming' is canonical and names the artifacts; this case"
+  echo "                does not read the queue-mode argument)"
+  echo "queue-mode: normal | spread | hot (default: normal)"
   echo
   echo "environment, event case:"
   echo "  RAW_OUTPUT=1     also write the raw k6 NDJSON stream (OFF by default: a 30-minute"
@@ -193,14 +194,6 @@ refuse_credential_bearing_url() {
   fi
 }
 
-# require_clean_url is the event-streaming branch's spelling of the same refusal, kept as a
-# one-line delegation rather than a second implementation: two independently written guards are
-# free to drift into two different notions of a "clean" URL, and the branch below depends on this
-# one running before anything is printed.
-require_clean_url() {
-  refuse_credential_bearing_url "$1" "$2"
-}
-
 # ---------------------------------------------------------------------------
 # The event-streaming case
 # ---------------------------------------------------------------------------
@@ -292,12 +285,20 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
   # token reached the terminal, the CI log and the scrollback before the scenario rejected it.
   # The check therefore happens here, first, and every print goes through redact_url.
   #
-  # The refusal, the redaction and the credential predicate are the hoisted helpers above — one
-  # implementation, so the runner cannot end up with two notions of what counts as a credential
-  # in a URL. require_clean_url is this branch's spelling of refuse_credential_bearing_url and
-  # delegates to it for exactly that reason.
-  require_clean_url URL "${URL}"
-  require_clean_url METRICS_URL "${METRICS_URL:-}"
+  # The refusal, the redaction and the credential predicate are the hoisted helpers above — ONE
+  # implementation under ONE name, so the runner cannot end up with two notions of what counts as
+  # a credential in a URL. This branch used to reach them through a second, branch-local name that
+  # did nothing but delegate; one operation with two spellings is how it acquired two call sites.
+  #
+  # THESE TWO CALLS ARE THE WHOLE REFUSAL FOR THE VALUES THE CALLER GAVE. There is no second pass
+  # over them further down: a duplicate pair used to sit below the derivation commentary, refusing
+  # the same two variables again with nothing printed in between, and a second call that can only
+  # ever agree with the first is one more place to edit and no more protection. The one value that
+  # IS guarded again is the DERIVED METRICS_URL, immediately after the substitution that builds it
+  # — that is a new string, and a transformation is where a component which was tolerable in the
+  # input can end up somewhere it is not.
+  refuse_credential_bearing_url "URL" "${URL}"
+  refuse_credential_bearing_url "METRICS_URL" "${METRICS_URL:-}"
 
   # Captured before the derivation below can fill it in, so the announcement can tell an operator
   # which of the two endpoints they actually chose.
@@ -325,12 +326,8 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
   # reported withheld verdicts rather than naming the malformed endpoint. A URL that cannot be
   # transformed is refused here instead of guessed at, because the guess is not visibly wrong.
   #
-  # A CREDENTIAL-BEARING URL IS REFUSED BEFORE IT IS PRINTED, both for the value the caller gave
-  # and for the one derived from it. The refusal is first because the diagnostics below — the
-  # derivation failure included — echo these endpoints, and events.js's own refusal happens later,
-  # inside a process this script has already logged for.
-  refuse_credential_bearing_url "URL" "${URL}"
-  refuse_credential_bearing_url "METRICS_URL" "${METRICS_URL:-}"
+  # Both endpoints were already refused above if they carried a credential, before any of these
+  # diagnostics could echo them; the derived value is refused on its own terms after it is built.
 
   # VALIDATED BEFORE IT IS REPORTED OR TRANSFORMED. A value that is not an absolute http(s) URL
   # with a host cannot yield a usable metrics sibling either, and letting it through produced the
@@ -670,10 +667,6 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
   trap 'events_cleanup_partials; trap - EXIT; exit 130' INT
   trap 'events_cleanup_partials; trap - EXIT; exit 143' TERM
 
-  # No queue benchmark. That tool measures Redis asynq depth for the transaction pipeline;
-  # the event pipeline's backlog is blnk_outbox_pending on /metrics, which the scenario reads
-  # itself. Requiring a Redis DSN here would block a run that has no use for one.
-  #
   # --include-system-env-vars IS PASSED EXPLICITLY, and it is not decoration. It defaults to
   # true, which is what lets the exported credentials above reach __ENV — but the default is
   # overridable from the environment, and K6_INCLUDE_SYSTEM_ENV_VARS=false in a caller's shell

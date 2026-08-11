@@ -484,9 +484,19 @@ func NewBlnkForRole(db database.IDataSource, role ProcessRole) (*Blnk, error) {
 	// notification.WebhookSender and NotifyError's signature are untouched, so capturing
 	// this event costs the notification package no import churn.
 	//
-	// context.Background() is deliberate: WebhookSender supplies no context and must not
-	// grow one, and NotifyError already runs this on its own goroutine detached from any
-	// request, so there is no caller context to inherit and no deadline to respect.
+	// THE CONTEXT IS CREATED HERE, BOUNDED, because there is no caller context to inherit and
+	// an unbounded one is not the safe default it looks like. WebhookSender supplies no context
+	// and must not grow one — the notification package's signature is frozen — and NotifyError
+	// runs this on its own goroutine detached from any request, so the closure has to construct
+	// its own. It used to construct context.Background(): a database that had stopped answering
+	// then pinned every notifier goroutine indefinitely, and since the errors that reach
+	// NotifyError arrive in bursts during exactly that kind of outage, the goroutines
+	// accumulated with nothing to release them. systemErrorCaptureBudget bounds the single
+	// insert instead, so a stuck capture fails, is logged by NotifyError, and the goroutine
+	// ends.
+	//
+	// The cancel is deferred inside the closure, so the context's resources are released per
+	// call rather than living as long as the process.
 	//
 	// The payload is FORWARDED VERBATIM and must stay that way. NotifyError builds the
 	// LEGACY system.error body — exactly {"error", "time"}, the two keys the HTTP push has
@@ -502,7 +512,10 @@ func NewBlnkForRole(db database.IDataSource, role ProcessRole) (*Blnk, error) {
 	// Kafka-only deployment would never emit system.error and event coverage would be
 	// incomplete with nothing failing to say so.
 	notification.RegisterWebhookSender(func(event string, payload interface{}) error {
-		return b.PublishEvent(context.Background(), NewWebhook{
+		capture, cancel := context.WithTimeout(context.Background(), systemErrorCaptureBudget)
+		defer cancel()
+
+		return b.PublishEvent(capture, NewWebhook{
 			Event:   event,
 			Payload: payload,
 		})
@@ -706,6 +719,20 @@ func (b *Blnk) waitForBackgroundWork(grace time.Duration) bool {
 // for the compensation-then-release pair a failed issuance schedules together, which is the
 // longest chain anything schedules.
 const backgroundWorkDrainGrace = 10 * time.Second
+
+// systemErrorCaptureBudget bounds the single outbox insert that captures a system.error.
+//
+// It exists because the notifier that reaches that insert has no context of its own: the
+// WebhookSender signature carries none, and NotifyError runs detached from any request. Something
+// has to supply the deadline, and the sender registered in NewBlnk is the only place that can.
+//
+// Ten seconds is generous for one small INSERT including connection acquisition under load, and
+// short enough that a database which has stopped answering does not accumulate notifier
+// goroutines: system errors arrive in bursts during precisely that failure, and each one used to
+// wait forever. The capture is a SINGLE attempt — system.error does not spend a retry budget,
+// because it describes a process fault with no ledger state behind it — so this bounds the whole
+// operation rather than one try of several.
+const systemErrorCaptureBudget = 10 * time.Second
 
 // Close properly closes all connections and resources used by the Blnk instance.
 //

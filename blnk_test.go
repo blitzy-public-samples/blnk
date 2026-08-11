@@ -100,6 +100,11 @@ type wiringSpyDatasource struct {
 	*mocks.MockDataSource
 
 	rows chan *model.EventOutbox
+
+	// deadlines records, per recorded row, whether the insert's context carried a deadline and
+	// how far away it was. The sender registered in NewBlnk constructs that context itself —
+	// nothing upstream of it has one — so this is the only place the bound can be observed.
+	deadlines chan time.Duration
 }
 
 // newWiringSpyDatasource returns a spy wired for use as the Blnk datasource.
@@ -108,18 +113,52 @@ func newWiringSpyDatasource() *wiringSpyDatasource {
 		MockDataSource: new(mocks.MockDataSource),
 		// Buffered so a row is never lost if the test is not yet waiting, and so the
 		// producing goroutine can never block on a test that has already failed.
-		rows: make(chan *model.EventOutbox, 4),
+		rows:      make(chan *model.EventOutbox, 4),
+		deadlines: make(chan time.Duration, 4),
 	}
 }
 
-// InsertEventOutbox records a standalone outbox insert.
-func (s *wiringSpyDatasource) InsertEventOutbox(_ context.Context, e *model.EventOutbox) error {
+// InsertEventOutbox records a standalone outbox insert, and how long the caller gave it.
+//
+// A zero duration means the context carried NO deadline, which is the state the notifier used to
+// be in: an insert against a database that had stopped answering pinned its goroutine forever.
+func (s *wiringSpyDatasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error {
+	remaining := time.Duration(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline)
+	}
+
+	select {
+	case s.deadlines <- remaining:
+	default:
+	}
+
 	select {
 	case s.rows <- e:
 	default:
 	}
 
 	return nil
+}
+
+// awaitDeadline returns the budget recorded alongside the next row.
+//
+// Parameters:
+//   - t *testing.T: the test to fail if nothing was recorded.
+//
+// Returns:
+//   - time.Duration: time remaining on the insert's context, or zero when it had no deadline.
+func (s *wiringSpyDatasource) awaitDeadline(t *testing.T) time.Duration {
+	t.Helper()
+
+	select {
+	case remaining := <-s.deadlines:
+		return remaining
+	case <-time.After(5 * time.Second):
+		t.Fatal("no insert was recorded, so there is no context budget to inspect")
+
+		return 0
+	}
 }
 
 // await returns the next recorded row, failing the test if none arrives.
@@ -530,6 +569,54 @@ func TestNewBlnk_RegistersTheSystemErrorSenderIntoTheEventOutbox(t *testing.T) {
 		"the row must be left for the relay to claim")
 
 	wiringAssertSystemErrorEnvelope(t, row.Payload, systemError.Error())
+}
+
+// TestNewBlnk_BoundsTheSystemErrorSendersOwnContext pins the deadline the closure constructs.
+//
+// # Why the closure has to construct one at all
+//
+// notification.WebhookSender carries no context and must not grow one — the notification
+// package's signature is frozen — and NotifyError runs the sender on a goroutine detached from
+// any request. So nothing upstream can supply a deadline, and the closure registered in NewBlnk
+// is the only place one can come from.
+//
+// It used to pass context.Background(). That reads as harmless and is not: system.error is the
+// event type raised BY failures, so it arrives in bursts during exactly the outage that makes a
+// database stop answering, and an insert with no deadline pinned each notifier goroutine
+// indefinitely. The capture is a single attempt with no retry budget, so the bound is the whole
+// operation's.
+//
+// The assertion is on the context the DATASOURCE received, which is the only observation that
+// proves the bound reached the operation rather than being created and discarded.
+func TestNewBlnk_BoundsTheSystemErrorSendersOwnContext(t *testing.T) {
+	cnf := wiringRedisConfiguration(t)
+	cnf.Kafka = config.KafkaConfig{
+		Brokers:          []string{wiringBlackholeBroker},
+		TopicPrefix:      DefaultTopicPrefix,
+		InsecureLocalDev: true,
+	}
+	wiringStoreConfiguration(t, cnf)
+
+	t.Cleanup(func() { notification.RegisterWebhookSender(nil) })
+
+	datasource := newWiringSpyDatasource()
+	instance, err := wiringNewBlnkWithin(t, datasource)
+	require.NoError(t, err)
+	require.NotNil(t, instance)
+
+	notification.NotifyError(errors.New("wiring test: the capture must not wait forever"))
+
+	require.NotNil(t, datasource.await(t), "the sender must have reached the insert")
+
+	remaining := datasource.awaitDeadline(t)
+
+	assert.Positive(t, remaining,
+		"the insert's context must carry a deadline. Zero means context.Background() came back, "+
+			"and a database that stops answering then holds a notifier goroutine forever — during "+
+			"the outage that is producing the system errors in the first place")
+	assert.LessOrEqual(t, remaining, systemErrorCaptureBudget,
+		"and the deadline must be the declared budget rather than something larger, so the bound "+
+			"stated by systemErrorCaptureBudget is the bound the operation actually gets")
 }
 
 // TestNewBlnk_RegistersTheSystemErrorSenderIntoTheLegacyTransportWhenKafkaIsAbsent is the

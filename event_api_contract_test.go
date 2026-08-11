@@ -1723,11 +1723,15 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 // disclosure and client cooperation are not an authorization boundary.
 //
 // So the boundary is ENFORCED now, and this is where the contract says so. A subscriber recording
-// a prefix is granted Describe but NOT Read on its topics — the broker refuses every direct fetch
-// — and its records are delivered by Blnk's stream gateway, which applies the prefix to each
-// record's key. The fields below are the whole of that statement, and they are asserted as a
-// group because their VALUE is in their agreement: any one of them alone is either ambiguous or
-// ignorable.
+// a prefix is granted Describe but NOT Read on its topics — the broker refuses every direct fetch —
+// and its records are delivered by the key-authorising component the DEPLOYMENT declares in
+// KAFKA_KEY_SCOPE_ENFORCEMENT, which applies the prefix to each record's key. Blnk does not ship
+// that component and serves no records itself, so where none is declared issuance refuses the row
+// with SUBSCRIBER_KEY_SCOPE_UNENFORCED rather than emitting this object at all — which is what
+// keeps every response carrying it a statement about a live enforcement point.
+//
+// The fields below are the whole of that statement, and they are asserted as a group because their
+// VALUE is in their agreement: any one of them alone is either ambiguous or ignorable.
 func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions"}
@@ -1736,7 +1740,7 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 
 		assert.Equal(t, "ldg_9f2c", declared.PartitionKeyPrefix,
-			"the prefix is echoed, because it is the boundary the gateway applies on this "+
+			"the prefix is echoed, because it is the boundary the declared component applies on this "+
 				"subscriber's behalf")
 		assert.True(t, declared.PartitionKeyPrefixEnforced,
 			"and it is stated as ENFORCED in the same object: a recorded prefix is kept by Blnk, "+

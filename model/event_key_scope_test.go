@@ -179,20 +179,31 @@ func TestEventSubscriber_IsRevocationPendingTestsOnlyThePresenceOfTheTimestamp(t
 //
 // Its VALUE changed with the isolation correction, and the change is the point of this test: it
 // used to answer "consumer_side", meaning the platform granted whole-topic Read and asked the
-// subscriber to discard what it was not entitled to. It answers "blnk_stream_gateway" now, because
-// a key-scoped subscriber is granted no topic Read at all and its records are filtered by Blnk
-// before delivery. A regression to the old value would be a regression to the old exposure.
+// subscriber to discard what it was not entitled to. It answers "broker_gateway" now — the same
+// word a deployment declares in KAFKA_KEY_SCOPE_ENFORCEMENT — because a key-scoped subscriber is
+// granted no topic Read at all and its records are filtered by the component the operator declared
+// in front of the brokers. A regression to the old value would be a regression to the old exposure.
+//
+// This method reads the ROW and nothing else, so it reports where a recorded prefix WOULD be kept.
+// Whether a credential may be issued at all is config.KafkaConfig.KeyScopeGateway's question,
+// asked once at issuance — which is why a registry read of a row on a deployment that declared
+// nothing still describes the row truthfully instead of reporting "none" and hiding the intent.
 func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.T) {
-	// A real prefix: recorded, and enforced by BLNK'S STREAM GATEWAY, because Kafka has no
-	// message-key dimension to enforce it with and the subscriber therefore holds no topic Read.
+	// A real prefix: recorded, and kept by the DECLARED KEY-AUTHORISING COMPONENT, because Kafka
+	// has no message-key dimension to enforce it with and the subscriber therefore holds no topic
+	// Read.
 	scoped := &EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}
 	assert.True(t, scoped.DeclaresKeyScope(), "a recorded prefix is a recorded scope")
 	assert.Equal(t, KeyScopeEnforcementGateway, scoped.KeyScopeEnforcement(),
-		"the broker cannot evaluate a message key, so Blnk keeps this boundary itself rather than "+
+		"the broker cannot evaluate a message key, so this boundary is kept outside it rather than "+
 			"granting the whole topic and asking the consumer to filter")
+	assert.Equal(t, KeyScopeEnforcementStatus("broker_gateway"), scoped.KeyScopeEnforcement(),
+		"AND THE WIRE VALUE IS THE CONFIGURATION'S OWN WORD. It is serialised into the credential "+
+			"response, so a value naming a component the deployment does not configure would leave a "+
+			"client unable to connect the two")
 	assert.False(t, scoped.GrantsBrokerRecordAccess(),
 		"which is only true because record access is withheld: a key-scoped subscriber that also "+
-			"held topic Read would have the gateway as one path among two")
+			"held topic Read would have the declared component as one path among two")
 
 	// No column at all: the topic and group ACLs are the entire boundary.
 	assert.False(t, (&EventSubscriber{}).DeclaresKeyScope(), "an unset prefix records no scope")

@@ -57,8 +57,15 @@ func NewBalanceTracker() *model.BalanceTracker {
 // DURABLE standalone path, because the balance movement that satisfied the condition has
 // already been committed by the time this runs and the capture is therefore the alert's
 // only chance. See the call site below, PublishEventDurably, and
-// PostCommitEventCaptureContract — which is where the three producers with no producing
-// mutation, and the at-most-once window they share, are described once for all of them.
+// PostCommitEventCaptureContract — which is where the three producers whose event row is
+// inserted after their mutation committed, and the residual window each one still has, are
+// described once for all of them.
+//
+// THIS FUNCTION IS REACHED ONLY WHERE EVENT PUBLISHING IS UNCONFIGURED. With a broker
+// configured the guard below stands the whole path down, because the alert is then decided by
+// the balance's own transaction — either evaluated before the write and committed with it, or
+// committed as a handoff carrying both of the evaluation's inputs. The standalone capture is
+// therefore the legacy transport's path, not a fallback the Kafka pipeline leans on.
 //
 // Parameters:
 //   - ctx context.Context: The context for the operation.
@@ -127,13 +134,17 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 				// transaction that moves the balance across the threshold. Those alerts arrive
 				// here already in `captured` and are skipped above.
 				//
-				// This path remains for the crossings the atomic route cannot own: a balance
+				// This path remains for ONE shape: a deployment with no broker, where there is
+				// no event pipeline to capture into and no handoff processor to drain a handoff,
+				// so the alert reaches its subscriber down the legacy transport instead. The
+				// crossings the pre-write pass cannot own on a Kafka deployment — a balance
 				// updated through a writer this feature may not thread event rows into (the
 				// coalesced batch path, whose only caller is frozen by AAP §0.6.2), a monitor
-				// that appeared between the pre-commit snapshot and this check, and a monitor
-				// whose read failed before the write. For those the mutation is ALREADY
-				// COMMITTED, so this insert is the alert's only chance and it is made durable
-				// rather than single-shot.
+				// that appeared after the pre-write read, and a monitor whose read failed before
+				// the write — are covered by the durable handoff, which the same transaction
+				// commits, not by this path. Here the mutation is ALREADY COMMITTED, so this
+				// insert is the alert's only chance and it is made durable rather than
+				// single-shot.
 				//
 				// SendWebhook became PublishEvent and nothing else changed: the event string
 				// and the payload object are the same ones the legacy transport received, so
@@ -329,7 +340,11 @@ func (c balanceMonitorCapture) holds(balanceID, monitorID string) bool {
 // The writer also records a durable monitor HANDOFF inside the same transaction, which
 // BalanceMonitorHandoffProcessor drains — see database.recordBalanceMonitorHandoffs. That is
 // what covers the paths this function is not wired into (the coalesced batch, whose argument
-// list AAP §0.6.2 freezes) and the balances whose monitors could not be read here. The writer
+// list AAP §0.6.2 freezes) and the balances whose monitors could not be read here. The two
+// mechanisms give that transaction the same guarantee by different means: this one commits the
+// alert row, the handoff commits the alert's two decision inputs — the balance as written and
+// the monitor definitions in force — so a balance that falls to the handoff is not evaluated
+// against whatever the monitors happen to say when the row is drained. The writer
 // suppresses the handoff for exactly the balances this pass covered, so a crossing is captured
 // once: by this function when it can, by the handoff otherwise. Publishing from both would
 // deliver every alert twice under two different event ids, which nothing downstream could

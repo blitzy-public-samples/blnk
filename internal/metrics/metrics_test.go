@@ -261,10 +261,19 @@ func eventStreamingInstruments() []namedInstrument {
 		{"EventMetricsCollectionFailuresTotal", EventMetricsCollectionFailuresTotal},
 		{"EventMetricsLastCollectionAgeSeconds", EventMetricsLastCollectionAgeSeconds},
 		{"EventMetricsLastSuccessAgeSeconds", EventMetricsLastSuccessAgeSeconds},
-		{"SubscriberStreamRecordsDelivered", SubscriberStreamRecordsDelivered},
-		{"SubscriberStreamRecordsWithheld", SubscriberStreamRecordsWithheld},
 	}
 }
+
+// There are no subscriber-record-delivery instruments in this inventory, and their absence
+// is the access model rather than an omission.
+//
+// SubscriberStreamRecordsDelivered and SubscriberStreamRecordsWithheld were declared for a
+// Blnk-hosted subscriber read path and are removed with it. Blnk serves no subscriber records
+// — there is no data-plane route under /subscribers — so no per-record counter it could
+// increment exists. A key-scoped subscriber's records are delivered by the key-authorising
+// component the deployment declares in front of the brokers, and per-record evidence that
+// the boundary filtered anything has to come from THAT component's own instrumentation.
+// docs/kafka-operations.md says so where the triage table used to read these two series.
 
 // preExistingInstruments returns the sixteen instruments that predate the
 // event-streaming work, each labelled with its variable name. Enumerated
@@ -489,19 +498,6 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 			"EventMetricsLastSuccessAgeSeconds",
 			EventMetricsLastSuccessAgeSeconds,
 			(*metric.Float64ObservableGauge)(nil),
-		},
-		{
-			// COUNTERS, and the kind decides whether the pair is readable at all: both are
-			// per-record events and the reading is their RATE, which a gauge would destroy by
-			// keeping only whatever value happened to be current at scrape time.
-			"SubscriberStreamRecordsDelivered",
-			SubscriberStreamRecordsDelivered,
-			(*metric.Int64Counter)(nil),
-		},
-		{
-			"SubscriberStreamRecordsWithheld",
-			SubscriberStreamRecordsWithheld,
-			(*metric.Int64Counter)(nil),
 		},
 	}
 
@@ -1182,15 +1178,6 @@ func recordEveryEventInstrument(ctx context.Context) {
 	))
 	RecordEventMetricsCollection(time.Now().Add(-30*time.Second), true)
 
-	// THE GATEWAY PAIR, recorded together and with the SAME attribute tuple, because they are
-	// read together: the whole diagnostic value of the withheld count is as a proportion of the
-	// delivered one, and two different tuples could not be divided by each other in a query.
-	streamAttributes := metric.WithAttributes(
-		attribute.String("topic", "blnk.transactions"),
-		attribute.Bool("key_scoped", true),
-	)
-	SubscriberStreamRecordsDelivered.Add(ctx, 4, streamAttributes)
-	SubscriberStreamRecordsWithheld.Add(ctx, 6, streamAttributes)
 }
 
 // collectScopeMetrics collects one snapshot and returns the metrics of the "blnk"
@@ -1464,20 +1451,9 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			unit:        "s",
 			description: "Seconds since the periodic event-metrics collector last completed a collection with no failures",
 		},
-		// THE GATEWAY PAIR. The unit is {record} on both, because the pair is only meaningful
-		// read together — a delivered rate beside a withheld rate is what says whether the
-		// partition-key boundary is filtering anything — and a unit divergence would put the
-		// two on different exported series names.
-		{
-			name:        "blnk.subscriber_stream.records.delivered",
-			unit:        "{record}",
-			description: "Records the subscriber stream gateway returned to a subscriber, by topic and whether the subscriber is key-scoped",
-		},
-		{
-			name:        "blnk.subscriber_stream.records.withheld",
-			unit:        "{record}",
-			description: "Records the subscriber stream gateway excluded because the subscriber's partition-key prefix does not admit them, by topic and whether the subscriber is key-scoped",
-		},
+		// NO blnk.subscriber_stream.* PAIR. Blnk serves no subscriber records, so it counts
+		// none — see the note on eventStreamingInstruments for where per-record evidence of a
+		// key-scope filter has to come from instead.
 	}
 
 	require.Len(t, expected, len(eventStreamingInstruments()),
@@ -1747,21 +1723,8 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// to separate a stuck pass from a busy one, and that question has no per-subject
 		// breakdown.
 		{metric: "blnk.subscribers.obligations_settled.total", keys: nil},
-		// THE GATEWAY PAIR, and the two keys are the whole contract. topic is what makes a
-		// withheld rate readable per stream; key_scoped is what separates the subscribers the
-		// filter applies to from the ones it does not, so a zero withheld count can be
-		// interpreted rather than merely observed. Subscriber identity is deliberately ABSENT:
-		// an id is caller-chosen and unbounded, and one series per subscriber would accumulate
-		// for the life of the process — the lag gauges carry it only because a lag figure is
-		// meaningless without it and they have an explicit budget.
-		{
-			metric: "blnk.subscriber_stream.records.delivered",
-			keys:   []string{"topic", "key_scoped"},
-		},
-		{
-			metric: "blnk.subscriber_stream.records.withheld",
-			keys:   []string{"topic", "key_scoped"},
-		},
+		// NO blnk.subscriber_stream.* PAIR, for the reason recorded on eventStreamingInstruments:
+		// there is no Blnk-hosted subscriber read path to count records on.
 	}
 
 	require.Len(t, cases, len(eventStreamingInstruments()),

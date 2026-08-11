@@ -675,6 +675,18 @@ var startParseWarnings = &sunsetWarnGuard{}
 // It is the one resolution both dual-delivery callers share, and it re-reads live
 // configuration on every call for the same reasons WebhookSunsetPassed does.
 //
+// # ONE READ, and it decides both ends
+//
+// The whole window comes from a single resolveWebhookWindow call. This used to resolve the
+// sunset through resolveWebhookSunset and then read the configuration store AGAIN to derive
+// the start, and config.ConfigStore is an atomic.Value replaced wholesale on reload — so the
+// two ends could be drawn from different generations. The state this decides is the relay's
+// legacy leg, while the 410 guard decides from WebhookSunsetSnapshotAt, which already reads
+// once: a mixed-generation read here is therefore exactly how "the legacy leg has stopped"
+// and "the webhook routes answer 410" could disagree across a reload. Both now derive from
+// the same single-read resolution, so the pair is consistent by construction rather than by
+// the reload being unlikely to land in between.
+//
 // Parameters:
 //   - now time.Time: the instant to place. A parameter rather than an internal clock
 //     read so callers, and the tests that pin the boundaries to the nanosecond,
@@ -683,7 +695,7 @@ var startParseWarnings = &sunsetWarnGuard{}
 // Returns:
 //   - WebhookWindowState: which of the four states applies.
 func WebhookDualDeliveryWindowState(now time.Time) WebhookWindowState {
-	sunset, resolution := resolveWebhookSunset()
+	start, sunset, resolution := resolveWebhookWindow()
 	if resolution != sunsetResolved {
 		return WebhookWindowUnavailable
 	}
@@ -703,16 +715,11 @@ func WebhookDualDeliveryWindowState(now time.Time) WebhookWindowState {
 		return WebhookWindowClosed
 	}
 
-	cnf, err := fetchConfiguration()
-	if err != nil {
-		// The sunset resolved, so configuration was readable a moment ago; this can
-		// only be a store that has since been emptied, which is not a reachable
-		// production state. Deriving the start from the sunset keeps the verdict
-		// determined rather than inventing a failure.
-		cnf = nil
-	}
-
-	if instant.Before(webhookWindowStart(cnf, sunset)) {
+	// start came from the SAME read as sunset, so the two ends cannot describe different
+	// configurations and the PENDING boundary cannot contradict the CLOSED one. A resolved
+	// resolution always carries a start — resolveWebhookWindow derives it from the sunset
+	// when none is configured — so there is no second read to fall back to here.
+	if instant.Before(start) {
 		return WebhookWindowPending
 	}
 

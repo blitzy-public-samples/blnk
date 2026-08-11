@@ -4,12 +4,18 @@ metadata:
   name: blnk-config
   namespace: blnk
 data:
-  # Kafka event streaming and outbox relay. Blnk reads these SEVENTEEN keys from
-  # its process environment; they reproduce config.KafkaConfig, config.RelayConfig
-  # and the WEBHOOK_DEPRECATION_SUNSET_DATE field of config/config.go, and the
-  # matching block of .env.example, so the three can be diffed by eye. There is
-  # exactly ONE deprecation date: WEBHOOK_DEPRECATION_START_DATE was retired and
-  # setting it does nothing, as the note on the sunset key below records.
+  # Kafka event streaming and outbox relay. Blnk reads TWENTY-TWO of the keys in
+  # this block from its process environment; they reproduce config.KafkaConfig,
+  # config.KafkaTLSConfig, config.RelayConfig and the
+  # WEBHOOK_DEPRECATION_SUNSET_DATE field of config/config.go, and the matching
+  # block of .env.example, so the three can be diffed by eye. There is exactly ONE
+  # deprecation date: WEBHOOK_DEPRECATION_START_DATE was retired and setting it
+  # does nothing, as the note on the sunset key below records.
+  #
+  # KAFKA_CLUSTER_ID is the twenty-third KAFKA_-prefixed key here and Blnk does not
+  # read it: it is consumed by kafka-statefulset.yaml when it formats KRaft storage.
+  # It lives in this map so the broker and the application are configured from one
+  # object, not because the application has a setting of that name.
   #
   # SEVEN OF config.KafkaConfig'S KEYS ARE DELIBERATELY ABSENT, and none of them
   # should be added here. KAFKA_INSECURE_LOCAL_DEV and
@@ -29,27 +35,33 @@ data:
   # blnk.json, so the environment wins and the two sources can never disagree
   # about a value; and blnk.json is projected with subPath, so editing it needs
   # a pod rollout (see the note on that key) while these keys leave the mount
-  # untouched. Do not split the seventeen across both mechanisms.
+  # untouched. Do not split them across both mechanisms.
   #
   # server-deployment.yaml and worker-deployment.yaml surface each key they need
   # with its own env entry and a valueFrom.configMapKeyRef, AND THE TWO NEED VERY
   # DIFFERENT SUBSETS. This map is the union; neither Deployment projects all of
   # it, and the asymmetry is a decision recorded on both sides rather than drift:
   #
-  #   SERVER — all seventeen keys below, plus KAFKA_SASL_SECRET and
+  #   SERVER — every Blnk-read key below, plus KAFKA_SASL_SECRET and
   #   KAFKA_SASL_ADMIN_SECRET from Secrets. It is the only role that publishes
   #   (the outbox relay runs there and nowhere else), the only role that
   #   administers, and the only role that reads offsets.
   #
-  #   WORKER — exactly four: KAFKA_BROKERS, KAFKA_TOPIC_PREFIX,
-  #   RELAY_MAX_RETRY_ATTEMPTS and WEBHOOK_DEPRECATION_SUNSET_DATE, and NO
+  #   WORKER — exactly four, and the manifest projects exactly those four:
+  #   KAFKA_BROKERS (gates capture), KAFKA_TOPIC_PREFIX (names the topic recorded
+  #   on a captured row), RELAY_MAX_RETRY_ATTEMPTS (stamped on the row AT CAPTURE,
+  #   so it is a property of the row rather than of the relay) and
+  #   WEBHOOK_DEPRECATION_SUNSET_DATE (ProcessWebhook runs in that role). NO
   #   credential of any kind. It captures events into the outbox and publishes
   #   none, so the producer principal, the administrative principal, the TLS
-  #   material, the subscriber endpoint, the topic geometry, the relay backoff
-  #   values and the retention window are all things it cannot use.
-  #   blnk.NewBlnkForRole enforces this in code: `blnk workers` selects the no-op
-  #   publisher before the broker list is read. worker-deployment.yaml lists every
-  #   absent key with the reason it is absent.
+  #   material, the subscriber endpoint, the topic geometry, the relay BACKOFF
+  #   values and the retention window are all things it cannot use — and none of
+  #   them is projected there, because a key this role never reads can still stop
+  #   it: configuration is validated as a whole at start-up, and a worker that
+  #   will not boot stops transaction processing over a value only the relay
+  #   reads. blnk.NewBlnkForRole enforces the publishing half in code: `blnk
+  #   workers` selects the no-op publisher before the broker list is read.
+  #   worker-deployment.yaml lists every absent key with the reason it is absent.
   #
   # PROJECTING HALF A PAIR BREAKS A POD, which is why an unused key is skipped
   # rather than merely left unused: config/config.go validates the producer pair
@@ -152,6 +164,53 @@ data:
   # Empty ships here because KAFKA_BROKERS above is empty: with no broker there is
   # no issuance to refuse.
   KAFKA_SUBSCRIBER_BROKERS: ""
+
+  # WHETHER ANYTHING IN FRONT OF THE BROKERS AUTHORISES RECORD KEYS, which is what
+  # decides whether a subscriber recording a partition_key_prefix can be issued a
+  # credential at all.
+  #
+  #   none           (the shipped value) Nothing authorises record keys.
+  #                  POST /subscribers/{id}/kafka-credentials answers
+  #                  409 SUBSCRIBER_KEY_SCOPE_UNENFORCED for a prefix-recording
+  #                  subscriber, before any secret is generated and before any ACL is
+  #                  bound. A subscriber with NO prefix is unaffected.
+  #   broker_gateway A component in front of the brokers evaluates record keys.
+  #                  Key-scoped issuance is permitted, and the credential reports that
+  #                  component's addresses in place of KAFKA_SUBSCRIBER_BROKERS.
+  #
+  # WHY A REFUSAL RATHER THAN A DISCLOSURE. Kafka's authorizer evaluates cluster,
+  # topic, group, transactional id and user resources. A message key is none of them,
+  # so no ACL narrows a principal to a slice of a topic's records. Issuing anyway and
+  # reporting the limitation in the body hands out unrestricted access to a shared
+  # stream and relies on the integrator reading a flag; an unread flag is not a
+  # control. Blnk narrows what it can — a key-scoped principal is granted Describe and
+  # NO topic Read — and refuses to mint a credential that could fetch nothing.
+  #
+  # BLNK DOES NOT SHIP THAT COMPONENT and serves no records itself: there is no
+  # read path under /subscribers. Blnk validates this declaration, narrows the grant
+  # and reports the endpoint. Declaring broker_gateway without operating such a
+  # component produces credentials naming an enforcement point that enforces nothing,
+  # which is worse than the refusal.
+  #
+  # An unrecognised value is read as "none" with a warning at configuration load: the
+  # failure direction for an authorization control is closed.
+  #
+  # THE WORKER DOES NOT RECEIVE THIS KEY. Credential issuance is an API-server
+  # operation; the worker captures events and issues nothing.
+  KAFKA_KEY_SCOPE_ENFORCEMENT: "none"
+
+  # The addresses that key-authorising component listens on, comma-separated,
+  # reported to a key-scoped subscriber IN PLACE OF KAFKA_SUBSCRIBER_BROKERS so its
+  # credential names the endpoint that keeps its declared boundary.
+  #
+  # ONLY HONOURED WITH KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway, and only when this
+  # list is non-empty AND DIFFERENT from KAFKA_BROKERS. A list equal to the brokers
+  # cannot be evaluating keys — it IS the brokers — so that combination is read as no
+  # declaration at all, warned about at start-up, and issuance refuses as if the mode
+  # were "none".
+  #
+  # Empty ships here, because the mode above ships as "none".
+  KAFKA_KEY_SCOPE_GATEWAY_BROKERS: ""
 
   # The prefix every topic name derives from: the category topics
   # blnk.transactions, blnk.balances, blnk.identities and blnk.system, and their
@@ -619,10 +678,11 @@ data:
   #
   # False is therefore deny-by-default: credential issuance refuses with
   # SUBSCRIBER_INSECURE_TRANSPORT rather than putting a password on a channel
-  # nobody has established as confidential. A loopback caller is still served,
-  # because those bytes never leave the host. Shipping "true" would have been the
-  # convenient default and the wrong one — it re-enables exactly that disclosure,
-  # silently, for every deployment that has no such proxy.
+  # nobody has established as confidential — INCLUDING a loopback caller, which
+  # needs the separate declaration below and does not get it here. Shipping "true"
+  # would have been the convenient default and the wrong one — it re-enables
+  # exactly that disclosure, silently, for every deployment that has no such
+  # proxy.
   #
   # SET IT TO "true" ONLY WHEN ALL THREE HOLD:
   #   1. An ingress, load balancer or mesh sidecar terminates TLS in front of the
@@ -634,6 +694,30 @@ data:
   #
   # Nothing else in Blnk's behaviour depends on it.
   BLNK_SERVER_TRUST_FORWARDED_PROTO: "false"
+
+  # Whether a LOOPBACK PEER may receive a Kafka credential over plaintext. This is a
+  # local-development exception, and it ships "false" for a Kubernetes deployment
+  # because a Kubernetes deployment is the shape it is unsafe in.
+  #
+  # THE SERVER DOES NOT START WITHOUT THIS KEY. server-deployment.yaml reads it
+  # through a non-optional configMapKeyRef, for the same reason as the flag above:
+  # a transport decision that governs a secret should be stated by the deployment
+  # rather than inherited from an application default.
+  #
+  # WHY IT SHIPS FALSE. A loopback peer establishes only that the LAST hop stayed
+  # on the host. It says nothing about the hop before it, and a sidecar proxy — the
+  # normal mesh shape — forwards a request to 127.0.0.1 after accepting it from
+  # outside, possibly in the clear. From inside the container that request is
+  # indistinguishable from `kubectl exec` plus curl, so believing the peer would
+  # disclose a one-time SASL password on whatever the earlier hop was.
+  #
+  # Set it to "true" only on a developer machine running the Compose stack, where the
+  # plaintext listener and the loopback caller are the whole topology. In this cluster,
+  # issue credentials over TLS: either BLNK_SERVER_SSL, or terminate at the ingress and
+  # declare it with BLNK_SERVER_TRUST_FORWARDED_PROTO above.
+  #
+  # THE WORKER DOES NOT READ IT. Credential issuance is a server-role endpoint.
+  BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE: "false"
 
   # Whether the in-process metrics registry and the /metrics route exist.
   #

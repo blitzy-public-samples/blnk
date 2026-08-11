@@ -1258,6 +1258,114 @@ func TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead(t *te
 	assert.False(t, snapshot.Passed, "the probe instant is inside the first generation's window")
 }
 
+// TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead is the same
+// property for the OTHER consumer of the window, and it is the one that decides whether a
+// subscriber still receives an HTTP delivery.
+//
+// # What a second read costs here
+//
+// WebhookSunsetSnapshotAt drives the 410 guard and reads once. This predicate drives the relay's
+// legacy leg. When it resolved the sunset through one read and then re-read the store to derive
+// the start, the two ends of the window could come from different generations of
+// config.ConfigStore — which is an atomic.Value replaced WHOLESALE on reload, so any two reads
+// are two chances to see different contents. The pair that can then disagree is precisely the
+// pair requirement R-12 defines together: whether the legacy leg runs, and whether the webhook
+// routes answer 410. A reload landing between the two reads could stand the legacy leg down as
+// "pending" while the guard still answered 200, or the reverse, with nothing in either code path
+// able to report that the two had been decided from different configurations.
+//
+// # How the condition is forced rather than waited for
+//
+// The seam returns a LATER generation on every call after the first, so a second read cannot
+// help but observe it — no timing, no flakiness. The generations are chosen so the verdicts
+// differ rather than merely the dates: the probe instant is inside generation one's window
+// (ACTIVE) and a decade before generation two's start (PENDING). A two-read implementation
+// therefore answers PENDING and stops the legacy leg for a window that has not opened in any
+// configuration the process ever held.
+func TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead(t *testing.T) {
+	restoreFetchConfiguration(t)
+	sunsetParseWarnings.reset()
+	startParseWarnings.reset()
+
+	const (
+		firstSunset  = "2030-01-01T00:00:00Z"
+		firstStart   = "2029-12-02T00:00:00Z"
+		secondSunset = "2040-01-01T00:00:00Z"
+		secondStart  = "2039-12-02T00:00:00Z"
+	)
+
+	// installFlippingSeam gives ONE entry point a store that answers with the first generation
+	// once and the later generation from then on, and reports how many times it was read.
+	//
+	// A fresh seam per sub-test is required rather than tidy: the flip is keyed on the read
+	// count, so a shared counter would leave the second entry point reading generation two on
+	// its FIRST read and every assertion after the first would be measuring the fixture instead
+	// of the code.
+	installFlippingSeam := func() *int {
+		reads := 0
+		fetchConfiguration = func() (*config.Configuration, error) {
+			reads++
+
+			if reads > 1 {
+				return &config.Configuration{
+					WebhookDeprecationSunsetDate: secondSunset,
+					WebhookDeprecationStartDate:  secondStart,
+				}, nil
+			}
+
+			return &config.Configuration{
+				WebhookDeprecationSunsetDate: firstSunset,
+				WebhookDeprecationStartDate:  firstStart,
+			}, nil
+		}
+
+		return &reads
+	}
+
+	probe := mustParseSunset(t, "2029-12-15T00:00:00Z")
+
+	t.Run("the state places the instant inside the generation it read", func(t *testing.T) {
+		reads := installFlippingSeam()
+
+		state := WebhookDualDeliveryWindowState(probe)
+
+		assert.Equal(t, 1, *reads,
+			"the window state must read the configuration store EXACTLY ONCE per call. A second "+
+				"read is a second generation, and the start and the sunset are two independently "+
+				"configured fields, so two reads can place an instant in a window that never existed")
+		assert.Equal(t, WebhookWindowActive, state,
+			"the probe is inside the generation that was read, so both transports must run. PENDING "+
+				"here means the start came from a later generation than the sunset")
+	})
+
+	t.Run("the relay predicate inherits that single read", func(t *testing.T) {
+		reads := installFlippingSeam()
+
+		assert.True(t, WebhookDualDeliveryActive(probe),
+			"the relay's dual-delivery branch is this state read through one delegation, so it must "+
+				"reach the same verdict; false here means the legacy leg stops for a window that has "+
+				"not opened in any configuration the process ever held")
+		assert.Equal(t, 1, *reads,
+			"and the delegation must not add a read of its own")
+	})
+
+	t.Run("the 410 guard agrees from its own single read", func(t *testing.T) {
+		// THE PAIR R-12 DEFINES TOGETHER, asserted as itself: whether the legacy leg runs and
+		// whether the webhook routes answer 410 are one decision taken twice, so each entry point
+		// reading one whole generation is what keeps them from disagreeing across a reload.
+		reads := installFlippingSeam()
+
+		snapshot := WebhookSunsetSnapshotAt(probe)
+
+		assert.Equal(t, 1, *reads, "the guard's snapshot must also read exactly once")
+		assert.False(t, snapshot.Passed,
+			"the guard must not consider the sunset passed at an instant the relay calls active; "+
+				"that disagreement is the divergence a mixed-generation read produces")
+		assert.Equal(t, mustParseSunset(t, firstStart), snapshot.WindowStart,
+			"and both ends it renders must come from the generation it read")
+	})
+}
+
 // TestWebhookDeprecationWindow_AgreesWithTheSnapshot pins the two public readings of one window to
 // each other.
 //
@@ -1300,4 +1408,301 @@ func TestWebhookDeprecationWindow_AgreesWithTheSnapshot(t *testing.T) {
 		assert.True(t, snapshot.WindowStart.IsZero(),
 			"an unresolved window has no start to render, and a zero value is what the guards test")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// THE TERMINAL RELEASE — the deletion checklist, and what keeps it honest
+// ---------------------------------------------------------------------------
+
+// terminalReleaseHeading is the checklist's heading in the published migration guide.
+//
+// The heading is matched literally because the test derives everything else from the section
+// under it: renaming the heading without updating this constant would silently reduce the whole
+// guard to nothing, so the require below fails loudly instead.
+const terminalReleaseHeading = "### The terminal release: the deletion checklist"
+
+// terminalReleasePreserveMarker separates the checklist's two tables.
+//
+// Everything before it is what the release DELETES; everything after it is what the release must
+// leave alone. Both halves are asserted the same way — the difference is which direction a stale
+// row fails in — so one marker is all the parser needs.
+const terminalReleasePreserveMarker = "**Preserve."
+
+// terminalReleaseRow is one parsed row: the artifacts it names, and the files it says they live
+// in.
+type terminalReleaseRow struct {
+	// line is the raw row, quoted into failure messages so the reader sees the row to edit
+	// rather than being told a symbol is missing somewhere.
+	line string
+	// artifacts are the backticked tokens in the first column: symbols, statements, module
+	// paths — whatever the release acts on.
+	artifacts []string
+	// locations are the backticked tokens in the second column, every one of which must be a
+	// path in this repository.
+	locations []string
+}
+
+// backtickedTokens returns the tokens a markdown cell wraps in backticks.
+//
+// Splitting on the backtick and taking the odd indices is exact for this input and needs no
+// regexp: a cell with unbalanced backticks would yield a trailing token, and a token that is not
+// an identifier fails the assertions below rather than passing silently.
+func backtickedTokens(cell string) []string {
+	parts := strings.Split(cell, "`")
+	tokens := make([]string, 0, len(parts)/2)
+	for index := 1; index < len(parts); index += 2 {
+		token := strings.TrimSpace(parts[index])
+		if token != "" {
+			tokens = append(tokens, token)
+		}
+	}
+
+	return tokens
+}
+
+// terminalReleaseChecklist parses the published checklist into its two halves.
+//
+// Parameters:
+//   - t *testing.T: the test, for the helper marking and the requires.
+//
+// Returns:
+//   - []terminalReleaseRow: the rows the terminal release deletes or unregisters.
+//   - []terminalReleaseRow: the rows it must preserve.
+func terminalReleaseChecklist(t *testing.T) ([]terminalReleaseRow, []terminalReleaseRow) {
+	t.Helper()
+
+	doc := readRepoFile(t, filepath.Join("docs", "webhook-to-kafka-migration.md"))
+
+	start := strings.Index(doc, terminalReleaseHeading)
+	require.GreaterOrEqual(t, start, 0,
+		"docs/webhook-to-kafka-migration.md must carry the terminal-release checklist under %q. It "+
+			"is what makes the deferred deletion answerable to something rather than acknowledged in "+
+			"a comment", terminalReleaseHeading)
+
+	section := doc[start+len(terminalReleaseHeading):]
+	if next := strings.Index(section, "\n### "); next >= 0 {
+		section = section[:next]
+	}
+
+	var (
+		deletes    []terminalReleaseRow
+		preserves  []terminalReleaseRow
+		preserving bool
+	)
+
+	for _, line := range strings.Split(section, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.Contains(trimmed, terminalReleasePreserveMarker) {
+			preserving = true
+
+			continue
+		}
+
+		// Rows only. The header row and the alignment row carry no backticks in their first
+		// column, so they are skipped by the emptiness check below rather than by position.
+		if !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+
+		cells := strings.Split(strings.Trim(trimmed, "|"), "|")
+		if len(cells) < 3 {
+			continue
+		}
+
+		row := terminalReleaseRow{
+			line:      trimmed,
+			artifacts: backtickedTokens(cells[0]),
+			locations: backtickedTokens(cells[1]),
+		}
+		if len(row.artifacts) == 0 && len(row.locations) == 0 {
+			continue
+		}
+
+		if preserving {
+			preserves = append(preserves, row)
+
+			continue
+		}
+		deletes = append(deletes, row)
+	}
+
+	return deletes, preserves
+}
+
+// TestWebhookTerminalRelease_ChecklistMatchesTheSurface is what turns the deferred deletion from
+// an acknowledgement into an obligation.
+//
+// # Why the deletion is deferred at all
+//
+// Requirement R-12 has two halves that run in sequence: both transports deliver from the same
+// outbox rows for the fixed window, and only after it closes is the delivery source removed. The
+// project's plan places these deletions as the feature's TERMINAL step for that reason — during
+// the window the legacy functions must exist, because the payload-equivalence check needs a live
+// second transport to compare against and the 410 is a runtime decision rather than a consequence
+// of deleted source. Deleting them now would break the window the same requirement mandates.
+//
+// # Why a comment saying so is not enough
+//
+// A deferral recorded only in prose decays in both directions. The prose can name symbols that
+// have since been renamed or deleted, so the release is performed against a stale list; or the
+// transport can grow a new exported symbol that no list mentions, so the release leaves it behind.
+// Both failures are invisible until someone performs the release.
+//
+// This test closes both directions against the PUBLISHED checklist:
+//
+//   - every file the checklist names must exist, and every artifact must be findable in the file
+//     the checklist says holds it — so performing the release forces the table to be edited in the
+//     same change, and a rename cannot leave the table pointing at nothing;
+//   - every EXPORTED symbol the legacy transport declares must be named in the checklist — so a
+//     new one cannot escape the release;
+//   - the preserve half must still be intact — so a release that over-applies its own delete half
+//     fails here rather than silently disabling transaction hooks and search indexing.
+func TestWebhookTerminalRelease_ChecklistMatchesTheSurface(t *testing.T) {
+	root := moduleRootDir(t)
+	deletes, preserves := terminalReleaseChecklist(t)
+
+	// Lower bounds rather than exact counts: the point is that the parse found the tables, not
+	// that the tables have a fixed size. An exact count would fail on any legitimate addition.
+	require.GreaterOrEqualf(t, len(deletes), 6,
+		"the delete half of the checklist parsed as %d rows, which means the table shape changed "+
+			"and this guard stopped reading it", len(deletes))
+	require.GreaterOrEqualf(t, len(preserves), 6,
+		"the preserve half parsed as %d rows; it is the half that protects the shared queue, so an "+
+			"unparsed table is worse than a missing one", len(preserves))
+
+	assertRow := func(t *testing.T, row terminalReleaseRow, half string) {
+		t.Helper()
+
+		require.NotEmptyf(t, row.locations,
+			"every %s row must name where its artifacts live, so the release does not have to go "+
+				"looking. Row: %s", half, row.line)
+
+		contents := make([]string, 0, len(row.locations))
+		for _, location := range row.locations {
+			path := filepath.Join(root, location)
+			body, err := os.ReadFile(path)
+			require.NoErrorf(t, err,
+				"the %s checklist names %s, which must exist while the row does. If this release has "+
+					"been performed, DELETE THE ROW in docs/webhook-to-kafka-migration.md — the "+
+					"checklist and the tree are two halves of one statement. Row: %s",
+				half, location, row.line)
+			contents = append(contents, string(body))
+		}
+
+		for _, artifact := range row.artifacts {
+			found := false
+			for _, body := range contents {
+				if strings.Contains(body, artifact) {
+					found = true
+
+					break
+				}
+			}
+
+			assert.Truef(t, found,
+				"the %s checklist names %q as living in %v, and it is not there. Either the symbol "+
+					"was renamed and the row was not, or the row's location column is wrong — a "+
+					"release performed from a stale row deletes the wrong thing or misses the right "+
+					"one. Row: %s", half, artifact, row.locations, row.line)
+		}
+	}
+
+	t.Run("every artifact the release deletes exists where the checklist says", func(t *testing.T) {
+		for _, row := range deletes {
+			assertRow(t, row, "delete")
+		}
+	})
+
+	t.Run("every artifact the release must preserve is still intact", func(t *testing.T) {
+		for _, row := range preserves {
+			assertRow(t, row, "preserve")
+		}
+	})
+
+	t.Run("no exported symbol of the legacy transport escapes the checklist", func(t *testing.T) {
+		const transport = "webhooks.go"
+
+		if _, err := os.Stat(filepath.Join(root, transport)); err != nil {
+			t.Skipf("%s is gone, so the terminal release has been performed and there is no "+
+				"transport surface left to enumerate", transport)
+		}
+
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, filepath.Join(root, transport), nil, parser.SkipObjectResolution)
+		require.NoErrorf(t, err, "%s must parse to be enumerated", transport)
+
+		doc := readRepoFile(t, filepath.Join("docs", "webhook-to-kafka-migration.md"))
+		section := doc[strings.Index(doc, terminalReleaseHeading):]
+		if next := strings.Index(section, "\n### "); next >= 0 {
+			section = section[:next]
+		}
+
+		exported := exportedTopLevelNames(file)
+		require.NotEmptyf(t, exported,
+			"%s must declare at least one exported symbol, or this enumeration proves nothing", transport)
+
+		for _, name := range exported {
+			assert.Containsf(t, section, name,
+				"%s declares the exported symbol %q and the terminal-release checklist does not name "+
+					"it. Anything exported from the legacy transport is reachable from outside this "+
+					"package, so a release that does not know about it either leaves dead public API "+
+					"behind or breaks a caller it never looked for. Add it to the checklist in "+
+					"docs/webhook-to-kafka-migration.md", transport, name)
+		}
+	})
+
+	t.Run("the checklist names the trigger rather than a date", func(t *testing.T) {
+		doc := readRepoFile(t, filepath.Join("docs", "webhook-to-kafka-migration.md"))
+		section := doc[strings.Index(doc, terminalReleaseHeading):]
+
+		for _, predicate := range []string{"WebhookSunsetPassed", "WebhookDualDeliveryActive"} {
+			assert.Containsf(t, section, predicate,
+				"the checklist must state its precondition as %s, the predicate the running system "+
+					"answers with. A hard-coded date would be a second sunset decision, and the two "+
+					"could disagree", predicate)
+		}
+	})
+}
+
+// exportedTopLevelNames collects the exported top-level declarations of a parsed file:
+// functions and methods, and every name in a type, const or var declaration.
+//
+// Methods are included by their own name rather than qualified by receiver. The checklist names
+// SendWebhook and ProcessWebhook without receivers, which is how a release performing a text
+// search for them would look for them.
+//
+// Parameters:
+//   - file *ast.File: the parsed source.
+//
+// Returns:
+//   - []string: the exported names, in declaration order.
+func exportedTopLevelNames(file *ast.File) []string {
+	var names []string
+
+	for _, decl := range file.Decls {
+		switch typed := decl.(type) {
+		case *ast.FuncDecl:
+			if typed.Name != nil && typed.Name.IsExported() {
+				names = append(names, typed.Name.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				switch specified := spec.(type) {
+				case *ast.TypeSpec:
+					if specified.Name.IsExported() {
+						names = append(names, specified.Name.Name)
+					}
+				case *ast.ValueSpec:
+					for _, ident := range specified.Names {
+						if ident.IsExported() {
+							names = append(names, ident.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return names
 }

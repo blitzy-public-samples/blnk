@@ -576,7 +576,7 @@ Isolation is delivered by three things and three things only:
 
 This follows directly from the two facts above and is the sentence to have in mind when you approve a grant.
 
-A category topic carries **every** event of its category for the whole deployment. `blnk.transactions` holds every ledger's transaction events; `blnk.balances`, `blnk.identities` and `blnk.system` do the same for theirs. So granting `blnk.transactions` to a subscriber grants it read access to **every ledger's** transaction events and to the events of **every other subscriber** of that topic. The consumer group does not narrow it, and neither does the number of subscribers sharing the topic. A `partition_key_prefix` **does** narrow it — but not at the broker: it is enforced by Blnk, and a subscriber that records one no longer consumes from the broker at all. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-by-blnk-not-by-the-broker).
+A category topic carries **every** event of its category for the whole deployment. `blnk.transactions` holds every ledger's transaction events; `blnk.balances`, `blnk.identities` and `blnk.system` do the same for theirs. So granting `blnk.transactions` to a subscriber grants it read access to **every ledger's** transaction events and to the events of **every other subscriber** of that topic. The consumer group does not narrow it, and neither does the number of subscribers sharing the topic. A `partition_key_prefix` **does** narrow it — but not at the broker, and not by Blnk: it is applied by a component the deployment declares in front of the brokers, and where none is declared such a subscriber is refused a credential rather than issued a wider one. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker).
 
 Approve a topic grant on that basis. The question to ask is not "which slice of this topic does the subscriber need?" — there is no mechanism that answers it — but **"is this subscriber trusted with the whole category?"** If the answer is no, the grant is the wrong instrument:
 
@@ -584,24 +584,34 @@ Approve a topic grant on that basis. The question to ask is not "which slice of 
 |---|---|---|
 | A subscriber must not see a *category* | Omit that topic from `authorized_topics`. The broker refuses it outright. | Nothing. This is the intended mechanism. |
 | A subscriber must not see *another tenant's records within a category* | **Separate the deployments.** A distinct Blnk deployment, with its own broker or its own topic namespace via `KAFKA_TOPIC_PREFIX`, is the only boundary that holds. | A second deployment to operate. |
-| A subscriber must not see *another subscriber's or another ledger's records within a category it is granted* | Record a `partition_key_prefix`. Blnk then grants `Describe` without `Read` and serves that subscriber's records itself, filtered per record — see immediately below. | The subscriber consumes through `GET /subscribers/{id}/events` rather than directly from the broker. |
+| A subscriber must not see *another subscriber's or another ledger's records within a category it is granted* | Record a `partition_key_prefix` **and declare a key-authorising component** (`KAFKA_KEY_SCOPE_ENFORCEMENT`). Blnk then grants `Describe` without `Read` so that component is the only path — see immediately below. | A component to run, which Blnk does not ship. Without one, issuance for that subscriber is refused with `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`. |
 
-A per-subscriber topic is ruled out by design — the access model exists to avoid per-tenant topics — so the middle option is the key scope, and the section below is how it is enforced: see [the partition-key prefix](#the-partition-key-prefix-is-enforced-by-blnk-not-by-the-broker).
+A per-subscriber topic is ruled out by design — the access model exists to avoid per-tenant topics — so the middle option is the key scope, and the section below is what it costs and what it refuses: see [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker).
 
-#### The partition-key prefix is enforced by Blnk, not by the broker
+#### The partition-key prefix is enforced outside the broker
 
-A subscriber row may carry a `partition_key_prefix`. It is the third dimension of the access model, and it is the one Kafka cannot evaluate — so Blnk enforces it itself, and the way it does so changes the subscriber's grant.
+A subscriber row may carry a `partition_key_prefix`. It is the third dimension of the access model, and it is the one Kafka cannot evaluate — so it is kept outside the broker, and recording one changes both the subscriber's grant and whether it can be issued a credential at all.
 
 **Kafka's authorizer has no message-key dimension.** There is no ACL that restricts a consumer to a slice of a topic by key: a principal granted topic `Read` reads every record on that topic, whatever the keys are. So rather than issue such a credential, provisioning **withholds record-level `Read`** from a key-scoped subscriber:
 
 | The row | The ACL bindings created | How the subscriber consumes |
 |---|---|---|
-| No `partition_key_prefix` | `Read` + `Describe` on each authorised topic (`LITERAL`), `Read` on the group namespace (`PREFIXED`) | Directly from the broker. Its `authorized_topics` are its whole boundary. |
-| A `partition_key_prefix` | **`Describe` only** on each authorised topic, `Read` on the group namespace | `GET /subscribers/{id}/events`. A direct fetch is refused with `TOPIC_AUTHORIZATION_FAILED`. |
+| No `partition_key_prefix` | `Read` + `Describe` on each authorised topic (`LITERAL`), `Read` on the group namespace (`PREFIXED`) | Directly from the brokers at `KAFKA_SUBSCRIBER_BROKERS`. Its `authorized_topics` are its whole boundary. |
+| A `partition_key_prefix` | **`Describe` only** on each authorised topic, `Read` on the group namespace | Through the key-authorising component declared in `KAFKA_KEY_SCOPE_ENFORCEMENT`, at `KAFKA_KEY_SCOPE_GATEWAY_BROKERS`. A fetch against the brokers is refused with `TOPIC_AUTHORIZATION_FAILED`. |
 
-The second row is the boundary. The subscriber stream gateway reads with **Blnk's own** producer credential and applies the recorded prefix to every record before returning one, so a record outside the scope cannot reach the subscriber by any client it chooses to use.
+**BLNK DOES NOT SHIP THAT COMPONENT, AND BLNK SERVES NO RECORDS ITSELF.** There is no data-plane route under `/subscribers` and no Blnk endpoint that returns records. What Blnk owns for a key scope is exactly three things: the narrowed grant above, the per-record rule the prefix means (`HasKeyAccess` in the model package, stated once so a declared component, a replay and an administrative export cannot disagree), and the refusal below.
 
-`Describe` is retained deliberately: without it a key-scoped consumer could not read its own topics' partition counts or offsets, and so could not measure its own lag.
+##### So the shipped default REFUSES a key-scoped issuance
+
+| `KAFKA_KEY_SCOPE_ENFORCEMENT` | `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` | `POST /subscribers/{id}/kafka-credentials` for a key-scoped row |
+|---|---|---|
+| `none` (default) | ignored | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** No SCRAM credential is created and nothing is recorded. |
+| `broker_gateway` | unset, or identical to `KAFKA_BROKERS` | **`409 SUBSCRIBER_KEY_SCOPE_UNENFORCED`.** A declaration with no distinct endpoint enforces nothing; startup also logs a warning naming this. |
+| `broker_gateway` | a distinct address list | `200`. `broker_endpoint` carries **that component's** address, and `partition_key_prefix_enforced_by` reads `broker_gateway`. |
+
+The refusal names the two remedies, and they are the only two: declare a component and its endpoint, or clear the prefix and narrow `authorized_topics` to what the broker enforces. **A subscriber with no prefix is never affected** — it keeps the advertised broker list even where a component is declared, because it has no key scope to route through one.
+
+`Describe` is retained deliberately in the key-scoped shape: without it a key-scoped consumer could not read its own topics' partition counts or offsets, and so could not measure its own lag.
 
 Credential issuance states which shape was provisioned:
 
@@ -613,17 +623,16 @@ Credential issuance states which shape was provisioned:
   "consumer_group_namespace": "blnk-sub-sub_9f8d3c214b7a5e6f.",
   "partition_key_prefix_enforced": true,
   "partition_key_prefix": "ldg_9f1c8a72",
-  "partition_key_prefix_enforced_by": "blnk_stream_gateway",
+  "partition_key_prefix_enforced_by": "broker_gateway",
   "gateway_delivery_required": true,
   "broker_record_access": false,
-  "exclusive_grant_verified": true,
-  "guidance": "Kafka authorises whole topics and consumer groups and has no message-key dimension, so Blnk enforces a subscriber's partition-key prefix itself: a subscriber that records one is granted Describe but NOT Read on its topics, so the broker refuses every direct fetch, and its records are delivered by GET /subscribers/{id}/events, which returns only the records whose key carries the prefix. A subscriber with no prefix consumes directly from the broker and is confined by its authorized_topics alone, which means a granted topic is readable in full — including records written for other ledgers and other subscribers on that topic."
+  "exclusive_grant_verified": true
 }
 ```
 
-`gateway_delivery_required` is the field a subscriber's client branches on — it is `true` exactly when a prefix is recorded — and `broker_record_access` is its exact complement, stating whether a topic `Read` binding exists. `not_enforced_by` is now **empty for every subscriber**; it stays in the body because an absent key would read as "not stated" rather than as "nothing is unenforced", and because it is where a future unenforceable dimension would appear. `enforced_by` carries `partition_key` exactly when a prefix is recorded.
+`gateway_delivery_required` is the field a subscriber's client branches on — it is `true` exactly when a prefix is recorded — and `broker_record_access` is its exact complement, stating whether a topic `Read` binding exists. `not_enforced_by` is now **empty for every subscriber**; it stays in the body because an absent key would read as "not stated" rather than as "nothing is unenforced", and because it is where a future unenforceable dimension would appear. `enforced_by` carries `partition_key` exactly when a prefix is recorded. `partition_key_prefix_enforced_by` uses the **same word** the deployment declares in `KAFKA_KEY_SCOPE_ENFORCEMENT`, so a response and the configuration that made it issuable cannot name two different components.
 
-Issuance to a key-scoped subscriber logs an INFO line naming the prefix, the enforcement point and the topics, so the moment a key-scoped principal comes into existence is visible in the operator log.
+Issuance to a key-scoped subscriber logs an INFO line naming the prefix, the enforcement point and the topics, so the moment a key-scoped principal comes into existence is visible in the operator log. A **refused** issuance logs the refusal with the same identifiers, so the state is equally visible.
 
 ##### Verifying the narrowed grant
 
@@ -645,30 +654,34 @@ docker compose exec kafka /opt/kafka/bin/kafka-acls.sh \
 
 An update that crosses between "has a prefix" and "has none" **reconciles the broker**, in the direction the change implies:
 
-- **Recording** a prefix on a provisioned subscriber withdraws record-level `Read`. The existing credential still authenticates and can still `Describe`; its next direct fetch is refused. A WARNING is logged naming the prefix, the withdrawal and the two ways forward — re-issue, which delivers a response declaring gateway delivery, or clear the prefix to restore direct consumption. That warning exists because the consequence reaches *backwards*: the response that credential was delivered with said `broker_record_access: true`, truthfully at the time, and it cannot be recalled.
+- **Recording** a prefix on a provisioned subscriber withdraws record-level `Read`. The existing credential still authenticates and can still `Describe`; its next direct fetch is refused. A WARNING is logged naming the prefix, the withdrawal and the two ways forward — re-issue, which delivers a response declaring the enforcing component (and which is itself refused where none is declared), or clear the prefix to restore direct consumption. That warning exists because the consequence reaches *backwards*: the response that credential was delivered with said `broker_record_access: true`, truthfully at the time, and it cannot be recalled.
 - **Clearing** a prefix re-grants `Read` on every topic the subscriber already had. It is a **widening**, so it is fail-closed: if the broker cannot be reached, the update fails and the row keeps its prefix rather than recording access that was never granted.
 - **Replacing** one prefix with another moves no binding — Kafka has no key dimension for it to move — so it does not touch the broker at all and does not fail when Kafka is down.
 
 ##### What the prefix still does not do
 
 - **It does not narrow the topic dimension.** Within a granted topic the prefix is the only additional narrowing. A subscriber that must not see a whole *category* needs that topic omitted from `authorized_topics`.
-- **It is a Blnk-side boundary, so it depends on Blnk being in the path.** An operator who hands a subscriber a credential minted outside Blnk, or grants an extra `ALLOW` binding by hand, has widened it — which is why issuance reads the principal's complete grant and refuses when it finds one.
+- **It depends on the declared component being in the path, and on nothing widening the grant.** An operator who hands a subscriber a credential minted outside Blnk, or grants an extra `ALLOW` binding by hand, has widened it — which is why issuance reads the principal's complete grant and refuses when it finds one. Blnk cannot verify what the declared component does with a record once it has one; what Blnk verifies is that the broker will not serve that principal a record at all.
 - **Records outside the scope still exist on the shared topic.** They are unreachable by that subscriber, not absent. Where records must not be *present* in a shared namespace at all, separate the deployments.
 
-> **This has been three different behaviours, and only the current one is a boundary.** First, `POST /subscribers/:subscriber_id/kafka-credentials` answered `409 SUBSCRIBER_ISOLATION_UNENFORCEABLE` for any row recording a prefix, and a `CHECK` constraint made the combination unrepresentable — which withheld the only credential such a subscriber could ever have and left it unable to consume at all. Then the credential was issued with whole-topic `Read` and the response *declared* that applying the prefix was the consumer's own obligation — accurate prose about an absent boundary, since a subscriber that ignored it, or used any other Kafka client, read every record on the shared topic. Now the grant itself is narrower and the gateway enforces the prefix. `sql/1781249138.sql` drops `event_subscribers_key_scope_chk` and the `SUBSCRIBER_ISOLATION_UNENFORCEABLE` code is retired.
+> **This has been three different behaviours, and only the current one is a boundary.** First, `POST /subscribers/:subscriber_id/kafka-credentials` refused any row recording a prefix with a code of its own, and a `CHECK` constraint made the combination unrepresentable — which withheld the only credential such a subscriber could ever have and offered no remedy but clearing the prefix. Then the credential was issued with whole-topic `Read` and the response *declared* that applying the prefix was the consumer's own obligation — accurate prose about an absent boundary, since a subscriber that ignored it, or used any other Kafka client, read every record on the shared topic. Now the grant itself is narrower, the prefix is applied by a component the operator declares, and issuance refuses — with `SUBSCRIBER_KEY_SCOPE_UNENFORCED`, naming both remedies — while no component is declared. `sql/1781249138.sql` drops `event_subscribers_key_scope_chk`; the retired `SUBSCRIBER_ISOLATION_UNENFORCEABLE` code is gone, and `SUBSCRIBER_KEY_SCOPE_UNENFORCED` is the one code for this judgement in both orders (issuance, and recording a prefix on a row that already holds a credential).
 >
 > One caveat if you were running an earlier build: `sql/1781248920.sql` **cleared** `partition_key_prefix` on every row that held it beside a credential, and those values were not retained anywhere. Re-record them with `PUT /subscribers/{id}` — the registry has no `PATCH` route, and an unregistered verb is answered by the router rather than the handler. The `event_subscribers_key_scope_chk` CHECK constraint stays **dropped** (`sql/1781249138.sql`): the guard is in the service, so a row seeded directly into the database can still hold the combination, and every read of such a row describes it truthfully.
 
-##### Triage: reading the gateway's own metrics
+##### Triage: a key scope has no Blnk-side metrics, because Blnk serves no records
 
-`blnk_subscriber_stream_records_delivered_total` and `blnk_subscriber_stream_records_withheld_total` are attributed by `topic` and by `key_scoped`, and they are read **together**. The withheld counter is the only externally visible evidence that the boundary is filtering anything: a key-scoped subscriber's feed looks identical whether the filter is working or the topic is quiet.
+There is no delivered/withheld counter pair to read, and there cannot be: the per-record filter runs in the declared component, which is not Blnk's process. **Instrument that component** if you need per-record evidence that the boundary is filtering; Blnk's `/metrics` cannot supply it.
 
-| Reading | What it means |
+What Blnk's own signals do tell you about a key-scoped subscriber:
+
+| Signal | What it establishes |
 |---|---|
-| Delivered rising, withheld rising | Normal for a key-scoped subscriber on a shared topic. |
-| Delivered rising, withheld **flat at zero**, `key_scoped="true"` | Investigate. On a shared category topic this is the signature of a filter that has stopped filtering — nothing has failed and no error will be logged. |
-| Both flat, `key_scoped="true"` | The subscriber is not polling, or the topic is quiet. Read its lag. |
-| Delivered flat, withheld rising | Working as designed: every record in the window belonged to another ledger. The subscriber's cursor still advances. |
+| The INFO issuance line naming the prefix and enforcement point | A key-scoped principal exists, and the deployment had a component declared when it was minted. |
+| `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED` in the API log | A key-scoped subscriber was refused a credential. It holds nothing; it is not consuming. |
+| `blnk_kafka_consumer_lag` for its group | Whether records are being consumed under its group at all. Flat non-zero lag on a granted topic means it is not consuming. |
+| The `kafka-acls.sh --list` output above | `Describe` and no `Read` — the broker-side half of the boundary, which is the half Blnk owns. |
+
+The one reading to act on immediately: a key-scoped principal that holds a topic `Read` binding. That is the boundary absent, whatever any metric says, and it is what `exclusive_grant_verified` and the verification above exist to make impossible through Blnk.
 
 Note also that the prefix is **recorded rather than derived** — unlike the principal and the group. It could not be derived: a Kafka message key on Blnk's topics is the outbox row's stored partition key, which is the **ledger id** wherever the event's subject belongs to a ledger (see [event-streaming.md](event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists)), and a prefix computed from the subscriber's own identifier bears no relation to any ledger id — so it would match no record ever produced. A prefix is therefore only meaningful when the operator sets it from the ledger identifiers that subscriber is entitled to.
 
@@ -705,7 +718,7 @@ The `200` response carries everything the subscriber needs to start consuming, a
 | `broker_endpoint` | The same list as one connection string, for convenience. |
 | `authorized_topics` | The topics the credential may `Read` and `Describe` — the authorised subset of the four grantable category topics. **Never a `.dlt` name.** |
 | `consumer_group_id` | The derived default group, `blnk-sub-<subscriber_id>.default`. |
-| `enforced_access` | Each dimension of the access model and the component that enforces it: topic and consumer group at the broker's authorizer, the recorded `partition_key_prefix` at Blnk's subscriber stream gateway. Assembled by the model, never by the handler, and it carries `gateway_delivery_required` so a client knows which transport to use. |
+| `enforced_access` | Each dimension of the access model and the component that enforces it: topic and consumer group at the broker's authorizer, the recorded `partition_key_prefix` at the key-authorising component the deployment declared. Assembled by the model, never by the handler, and it carries `gateway_delivery_required` so a client knows which endpoint to dial. |
 | `username` | The derived principal, `blnk-sub-<subscriber_id>`. |
 | `password` | **The plaintext, returned only on this response and never again.** Hand it to the subscriber and keep no copy Blnk can be asked for. |
 | `mechanism` | `SCRAM-SHA-512`. |
@@ -717,22 +730,32 @@ A **successful** provisioning completes within five seconds: the ceiling is appl
 again at the HTTP boundary, so an expiry is *answered* rather than waited out and every request ends
 with a code that says whether retrying is sensible.
 
-**A failing provisioning is bounded by the same five seconds, not by a second budget of its own.** When
-provisioning fails partway, Blnk compensates synchronously before answering — revoking the credential it
-had already written at the broker — and that compensation runs inside the *same* deadline: the forward
-path is bounded by the deadline minus a 1.25-second reserve, and the reserve is what the compensation
-spends. One window per request, shared by every level of cleanup nested within it. The only case that
-overruns is a step that ignores its own context, and that is bounded to one further 1.25-second window,
-so the practical ceiling is around 6.25 seconds rather than 5 — never the sum of several fresh budgets.
-[The five-second bound covers the cleanup too](#the-five-second-bound-covers-the-cleanup-too), directly
-below, sets the arithmetic out in full and explains why the reserve is held back rather than borrowed.
+**A failing provisioning is bounded by the same five seconds, not by a second budget of its own — and its
+cleanup runs after the answer.** When provisioning fails partway, Blnk owes a compensation: revoking the
+credential it had already written at the broker, clearing the registry record, releasing the provisioning
+fence. On the server role that work is SCHEDULED rather than awaited, so the refusal reaches you inside
+the budget and the cleanup finishes moments later on the *same* absolute deadline — the forward path is
+bounded by the deadline minus a 1.25-second reserve, and the reserve is what the compensation spends. One
+window per request, shared by every level of cleanup nested within it. The only case that overruns is a
+step that ignores its own context, and that is bounded to one further 1.25-second window, so the
+practical ceiling is around 6.25 seconds rather than 5 — never the sum of several fresh budgets.
+**Read the response's `compensated` flag as the state at the moment of answering, not as a verdict on the
+cleanup.** [The cleanup runs AFTER the response](#the-cleanup-runs-after-the-response-and-the-five-second-bound-still-covers-it),
+directly below, sets the arithmetic out in full, names the durable markers to inspect before retrying,
+and explains why the reserve is held back rather than borrowed.
 Compensating at all is a deliberate trade: the alternative is leaving a live SASL credential at the
 broker for a principal the registry records no issuance for, which then has to be found and revoked by
 hand (see [SubscriberRevocationOutstanding](#subscriberrevocationoutstanding)).
 
 The endpoint reports `KAFKA_SUBSCRIBER_BROKERS`, the externally advertised list, which is normally a **different list** from `KAFKA_BROKERS`. `KAFKA_BROKERS` is what Blnk itself dials and is an address inside the deployment; a broker answers every client with the *advertised* address of the listener the connection arrived on, so handing a subscriber an internal address produces an unexplained connection timeout in the subscriber's logs days later, and publishes your internal topology for good measure. Set it.
 
-**It is an optional override with a required fallback, and the fallback is warned about rather than silent.** With `KAFKA_SUBSCRIBER_BROKERS` unset, issuance reports `KAFKA_BROKERS` and logs a WARNING saying that it did, naming the list it published — because the eight variables the configuration contract fixes must be enough to run every documented endpoint, and a ninth mandatory variable was not acceptable. So a response can hand you an internal address, and the warning in the operator log is how you find out. `SUBSCRIBER_BROKERS_NOT_CONFIGURED` is reserved for the case where **neither** list is set, which means Kafka is unconfigured and no credential could work whatever endpoint was reported. A deployment whose subscribers really are in-cluster should still set `KAFKA_SUBSCRIBER_BROKERS` to the same value as `KAFKA_BROKERS`: it is one line, it makes the claim explicit, and it silences a warning that would otherwise be indistinguishable from a real misconfiguration.
+**It is REQUIRED for this one endpoint, and there is no fallback.** With `KAFKA_SUBSCRIBER_BROKERS` unset, issuance answers `503 SUBSCRIBER_BROKERS_NOT_CONFIGURED` naming the variable, before a secret is generated and before the broker is touched — so nothing needs cleaning up.
+
+A fallback to `KAFKA_BROKERS` existed, with a WARNING on every issuance, and the warning was not a control: it landed in Blnk's log while the consequence landed on the subscriber. An internal address handed to an outside subscriber surfaces as an unexplained connection timeout in *their* logs days later, and because the SASL secret is shown exactly once, diagnosing it costs a reissue. Refusing is the cheaper failure — it is immediate, it names the variable to set, and it discloses no internal address.
+
+Every other endpoint runs without this variable; only issuance requires it, and only because only an operator knows the externally advertised list. **A deployment whose subscribers really are in-cluster sets `KAFKA_SUBSCRIBER_BROKERS` to the same value as `KAFKA_BROKERS`** — one line that makes the claim explicit rather than implicit in a fallback. Start-up logs a warning when the two lists are identical, so that choice stays visible.
+
+For a subscriber carrying a `partition_key_prefix` the reported list is different again: it is `KAFKA_KEY_SCOPE_GATEWAY_BROKERS`, the declared key-authorising component's own addresses, substituted in place of this list so the credential names the endpoint that keeps its scope. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker).
 
 The refusals worth recognising:
 
@@ -749,7 +772,7 @@ The refusals worth recognising:
 | `409` | `GEN_CONFLICT`, *"This subscriber is being deregistered, so no credential will be issued for it"* | The row carries a revocation tombstone. Minting a credential would re-arm a principal mid-removal, and the deregistration already in flight would then delete the row recording it. **Finish or reverse the deregistration first**; retrying unchanged will keep being refused. |
 | `409` | `GEN_CONFLICT`, *"No provisioning claim is held for this subscriber, so the operation was abandoned"* | A **concurrent issuance for the same subscriber superseded this one.** Another call won the race, so this request's credential is not the live one. Do not retry blindly: re-read the subscriber to see the issuance that landed, and re-issue only if you still need a credential of your own — a fresh issuance replaces whatever the other call created. |
 | `503` | `EVENT_KAFKA_UNAVAILABLE` | No broker configured, or the broker is down. |
-| `503` | `SUBSCRIBER_BROKERS_NOT_CONFIGURED` | **Neither** `KAFKA_SUBSCRIBER_BROKERS` nor `KAFKA_BROKERS` is set, so Kafka is unconfigured. Set the brokers; setting only `KAFKA_BROKERS` is enough to issue, and issuance then warns that it published the internal list. |
+| `503` | `SUBSCRIBER_BROKERS_NOT_CONFIGURED` | `KAFKA_SUBSCRIBER_BROKERS` is not set. There is no fallback to `KAFKA_BROKERS`, whose addresses are internal to the deployment. Set the externally advertised list — to the same value as `KAFKA_BROKERS` if subscribers really are in-cluster. Nothing was minted. |
 | `503` | `SUBSCRIBER_PROVISIONING_FAILED` | The broker refused the credential or its bindings. Check the admin credential and the authorizer. |
 | `504` | `SUBSCRIBER_PROVISIONING_TIMEOUT` | The registry ran out of the issuance budget. Retry. |
 
@@ -763,9 +786,20 @@ So the endpoint refuses unless the request arrived over a channel this deploymen
 |---|---|---|
 | **TLS terminated in-process** | The request carries a completed TLS handshake *this process* performed. Proven, not asserted. | `BLNK_SERVER_SSL` |
 | **A declared proxy boundary** | The deployment declares that a proxy in front of Blnk terminates TLS and sets `X-Forwarded-Proto`; the header is then believed, and only a value of `https` qualifies. | `BLNK_SERVER_TRUST_FORWARDED_PROTO=true` |
-| **A loopback peer** | The far end of the accepted socket is in `127.0.0.0/8` or is `::1`, so the bytes never reach a network. | Nothing — a local operator or a shell inside the container needs no TLS |
+| **A declared local-development host with a loopback peer** | The far end of the accepted socket is in `127.0.0.0/8` or is `::1` **and** the deployment has declared that no proxy sits in front of it. Read from the socket, never from `X-Forwarded-For`. | `BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE=true` — **local development only** |
 
-Anything else is refused. That is deny-by-default: a deployment that has declared nothing gets no secret on the wire.
+Anything else is refused. That is deny-by-default: a deployment that has declared nothing gets no secret on the wire — **including a loopback caller**, which is the one people are surprised by.
+
+#### A loopback peer is not proof of anything on its own, which is why the third channel is a declaration
+
+`RemoteAddr` is the far end of the accepted socket, so a loopback value establishes that **the last hop** stayed on this host. It establishes nothing about the hop before it, and the shape where that matters is completely ordinary: a reverse proxy on the same host — nginx, Caddy, an Envoy sidecar — accepts a request from the internet over plain `http` and forwards it to Blnk over `127.0.0.1`. From inside the process that request is **indistinguishable** from an operator running `curl` inside the container, and answering it puts a one-time SASL password on the public hop.
+
+Blnk does not guess between them. Only the deployment knows which it is, so the loopback channel is a declaration exactly like the proxy one:
+
+- **Set `BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE=true` for local development**, where the plaintext listener and the loopback caller are the whole topology. The Compose stack sets it for that reason.
+- **Leave it unset everywhere else**, including on a single-host production deployment with a proxy in front of Blnk. There, issue credentials over TLS or through the declared proxy; a loopback `curl` on that host is refused, and that refusal is correct rather than inconvenient.
+
+There is no configuration under which a loopback peer is believed while a proxy is also declared to be in front of the process: the two are separate declarations, and each is evaluated on its own.
 
 **`403` rather than `400` or `426`.** The request is well formed and the caller is authenticated and authorised; the server is declining to fulfil it, which is what `403` means. It shares that status with `AUTH_MASTER_KEY_REQUIRED`, so anything distinguishing "the transport was refused" from "the caller was refused" must read `error_detail.code` and never the status alone. `426 Upgrade Required` was considered and rejected: it mandates an `Upgrade` header describing an in-band protocol switch, which is not what a deployment behind an ingress needs to do about this.
 
@@ -776,32 +810,68 @@ Anything else is refused. That is deny-by-default: a deployment that has declare
 - **The proxy must SET the header, overwriting whatever the client sent — never append to it.** A proxy that appends leaves the client's value in place, and a caller can then supply `https` itself over a plaintext hop. Most ingress controllers do the right thing by default; confirm yours does rather than assuming, because the failure is silent and the consequence is a disclosed password.
 - **No request path may reach the process or the pod directly.** Once the declaration is in force, a request that bypasses the proxy is believed on the strength of a header it wrote itself. Enforce this in the network — a `NetworkPolicy` admitting only the ingress, a security group, a listener bound to the proxy's interface — not by convention. The loopback branch above is deliberately narrow for the same reason: it reads the peer from the accepted **socket**, never from `X-Forwarded-For`, so a remote caller cannot present itself as local.
 
-A declaration plus a header reading anything other than `https` does not qualify: the proxy is reporting a plaintext client hop, and the request falls through to the loopback test and is otherwise refused.
+A declaration plus a header reading anything other than `https` does not qualify: the proxy is reporting a plaintext client hop, and the request falls through to the loopback test — which, unless this host has also been declared local-development, refuses it.
 
 > **One deliberate asymmetry.** The security-headers middleware takes `X-Forwarded-Proto` at face value for the same question, and that is not an inconsistency. Believing it there merely adds an HSTS header that a plaintext client ignores; believing it here would disclose a password. The stricter rule is applied where the cost of being wrong is a credential.
 
 
-### The five-second bound covers the cleanup too
+### The cleanup runs AFTER the response, and the five-second bound still covers it
 
-The five seconds above is a bound on **the whole request**, not on its forward path. That distinction is worth stating because it is easy to build the other thing by accident, and the other thing is what an operator notices.
+Two facts, and the order between them is what an operator has to know:
 
-Issuance touches the broker up to four times and the registry twice, and a failure part-way through leaves a **live SASL credential with ACL bindings that no registry row records** — unfindable through the API, so unrevokable by any means short of the Kafka CLI. So a failure is compensated before the call returns: the credential is deleted at the broker, the registry's credential record is cleared, and the provisioning fence is released.
+1. **The response comes back inside the five seconds.** That is the contract.
+2. **On the server role, the cleanup a failed issuance owes runs AFTER that response has been sent** — on its own goroutine, bounded by the same absolute deadline, with the provisioning fence still held until it finishes.
 
-That compensation has to survive the caller's cancellation, because *the deadline expiring is the commonest reason it is needed at all* — a cleanup running on the spent budget returns immediately and leaves exactly the residue it exists to remove. Detaching it from cancellation is what makes it run. But detaching from cancellation also detaches from the deadline, and a cleanup left with no bound will take one of its own.
+Issuance touches the broker up to four times and the registry twice, and a failure part-way through leaves a **live SASL credential with ACL bindings that no registry row records** — unfindable through the API, so unrevokable by any means short of the Kafka CLI. Undoing that means deleting the credential at the broker, clearing the registry's credential record, and releasing the provisioning fence: two more broker round trips and up to two local writes. **None of it changes the caller's answer**, so making the caller wait for it is what turned a five-second contract into a ten-second one on success and a twenty-five-second one on failure. The work is therefore scheduled rather than awaited.
 
-So the deadline is **held onto deliberately and re-imposed on the cleanup**:
+**Scheduled is not fire-and-forget**, and the difference is what makes the endpoint's answer trustworthy:
+
+| | What happens | Why it is safe |
+|---|---|---|
+| The response | Returns as soon as the forward path is done or has failed | Its state flags describe the state **at the moment of answering**, not a prediction: a failed issuance whose cleanup has not run yet answers `credential_written: true`, `compensated: false`. |
+| The cleanup | Runs after the response, detached from the caller's cancellation, bounded by the earlier of the request's absolute deadline and the cleanup budget | Detached because *the deadline expiring is the commonest reason cleanup is needed at all*; still bounded, so it cannot extend the request's window or hang forever. |
+| The fence | Held until the cleanup finishes, then released by the same task | A retry that arrives while cleanup is in flight is answered `409` rather than being allowed to mint a fresh credential this task would then revoke. |
+| The record | A durable marker is written on the subscriber row before the task ends | The residue survives the process, so nothing depends on an operator having read a log line. |
+
+Because the deadline is shared, the forward path does not get all five seconds:
 
 | | Bounded by | Why |
 |---|---|---|
 | Forward path — lookup, fence, four broker round trips, the issuance record | The deadline **minus 1.25 s** | The 1.25 s is what the cleanup needs: two broker round trips and up to two local writes. Held back rather than borrowed, so the one failure that most needs compensating — the deadline expiring — has time left to compensate in. |
 | Compensation — revoke, clear, release fence | The **same** deadline | One window per request, shared by every level of cleanup nested inside it. A broker-side cleanup reached through a registry-side one inherits the instant rather than starting a second window. |
 
+**A shutdown waits for it.** Outstanding tasks are tracked, so a graceful stop drains them; a hard kill abandons them, which is exactly what the durable markers below are for. A panic inside one is recovered and logged rather than ending the process, because by then there is no caller to attribute it to.
+
+> On a deployment with no scheduler installed — which is every in-process caller outside the API server, and every test — the same work runs inline instead. The outcome is identical; only the timing differs, and the response then waits for it.
+
+#### What to inspect before you retry, and what to revoke by hand
+
+**Do not read the response's `compensated: false` as "the cleanup failed".** It means the cleanup had not finished when you were answered, which is the normal case. The state a few seconds later is recorded on the subscriber row, and these are the three markers to look at:
+
+| Marker | Meaning | Remedy |
+|---|---|---|
+| `credential_cleanup_pending_at` | A credential exists at the broker that the registry records no issuance for, **or** one was revoked and the registry still records it. The settlement processor owns it. | None by hand. Watch `blnk_subscribers_credential_cleanup_pending` return to zero. |
+| `credential_orphaned_at` | The registry's credential reference may not describe what actually authenticates — a claim was superseded between provisioning and recording. | Issue once more. The next issuance replaces whatever is at the broker, because Kafka holds one SCRAM credential per principal. |
+| `revocation_failed_at` | A deregistration could not remove the broker-side credential. | Settlement retries it; a marker that does not clear is the manual case below. |
+
+`GET /subscribers` projects all three, and the settlement processor — which runs in the server role beside the relay — retries what they describe until the row is clean. **Retrying issuance is safe while any of them is set**: provisioning is idempotent per principal, so a retry re-establishes the same boundary rather than adding a second one.
+
+**The manual case is narrow, and it is loud.** If the cleanup cannot even record its marker — the registry is unreachable as well as the broker — then the log line is the only record that exists, and it says so in those words, at ERROR, naming the principal. That is the one situation where nothing will reconcile the residue for you:
+
+```bash
+# Delete the orphaned SCRAM credential.
+kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --command-config "$ADMIN_PROPS" \
+  --alter --delete-config 'SCRAM-SHA-512' --entity-type users --entity-name '<principal>'
+```
+
+Then remove its bindings as [The ACL Model](#the-acl-model) describes. Treat such an ERROR line as work to do rather than as a report of something already handled; see [Reading the logs](#reading-the-logs-redacted-is-the-log-not-the-failure) for what else it will and will not tell you.
+
 Two consequences to plan around:
 
 - **A broker that needs more than 3.75 seconds for four round trips now fails where it would previously have succeeded at up to 5.** That is the deliberate cost of the reserve. It is not a tuning knob to widen; it is a broker to fix, and the `503` tells you to retry once you have.
 - **The one case that can overrun the bound is a step that ignores its own context** — a driver call that does not honour cancellation, a blocking syscall, a stop-the-world pause. No deadline arithmetic reaches a call that never looks at its deadline. When that happens the compensation still runs, bounded to one 1.25-second window and no more, because the alternative is leaving the unaccounted credential behind. If you see issuance answering at roughly 6.25 seconds, that is this case, and the thing to investigate is the step that overran — not the cleanup.
 
-If compensation itself cannot finish inside its window — a broker that is hanging rather than refusing — it is **abandoned and logged at ERROR with the principal named**. That is the manual-revocation case: find the principal in the log, delete it with `kafka-configs.sh --alter --delete-config 'SCRAM-SHA-512' --entity-type users --entity-name <principal>`, and remove its bindings as [The ACL Model](#the-acl-model) describes. The log names the principal precisely so this is possible; see [Reading the logs](#reading-the-logs-redacted-is-the-log-not-the-failure) for what else it will and will not tell you.
+If compensation itself cannot finish inside its window — a broker that is hanging rather than refusing — it is **abandoned, marked on the row, and logged at ERROR with the principal named**. The marker is what settlement then retries; the log line is what you read when even the marker could not be written. Both paths are described under [What to inspect before you retry](#what-to-inspect-before-you-retry-and-what-to-revoke-by-hand) above.
 
 #### `503` and `504` are different failures, and the one you will actually see is `503`
 
@@ -811,7 +881,7 @@ Both appear in the refusal table above and it is worth knowing which to expect, 
 
 **`504 SUBSCRIBER_PROVISIONING_TIMEOUT` is Blnk saying it ran out of time**, which needs the work to be genuinely *slow* rather than broken — a broker answering but pathologically late, a registry write blocked behind a long-running transaction, or a host under enough pressure that the process does not get scheduled. It is rare by construction: the forward path is bounded well under the ceiling and a broker that is merely unreachable fails long before the clock runs out. Treat a `504` as a latency investigation, not an authorization one, and note that the request may have taken longer than five seconds to answer — see the bound table above for why.
 
-Both are safe to retry, and for both the compensation described above is **attempted before the answer is sent** — a retry re-provisions the same boundary idempotently either way. What neither code promises is that the compensation *succeeded*. Usually it does, and the revocation is confirmed: the broker is clean, the generated secret is dead, and the outcome is logged as a warning. When the broker hangs rather than refusing, the compensation is abandoned inside its window and **a live SASL credential is left behind for a principal the registry records no issuance for** — logged at ERROR with the principal named, which is the only record of what has to be revoked by hand. So treat an ERROR line naming a principal as work to do, not as a report of something already handled; the procedure is the paragraph above. A `504` in particular does **not** mean "the forward path may have half-worked and no cleanup was tried" — that is what holding the reserve back prevents.
+Both are safe to retry, and for both the compensation described above is **owed and scheduled, not completed, by the time the answer is sent** — a retry re-provisions the same boundary idempotently either way, and the provisioning fence makes an immediate retry wait rather than race the cleanup. What neither code promises is that the compensation *succeeded*. Usually it does, and the revocation is confirmed: the broker is clean, the generated secret is dead, and the outcome is logged as a warning moments after your response. When the broker hangs rather than refusing, the compensation is abandoned inside its window and **a live SASL credential is left behind for a principal the registry records no issuance for** — recorded as `credential_cleanup_pending_at` for settlement to retry, and logged at ERROR naming the principal when even that record could not be written. So check the markers before concluding anything, and treat an ERROR line naming a principal as work to do; both procedures are above. A `504` in particular does **not** mean "the forward path may have half-worked and no cleanup was tried" — that is what holding the reserve back prevents.
 
 ### Rate limiting the credential endpoint
 
@@ -2742,8 +2812,8 @@ Consequences to expect, so that none of them is mistaken for a fault:
 | `kafka-init` restarts three times and the stack never comes up | Provisioning is refusing a configuration — a bad credential pair, an impossible replication factor, a rejected variable | Read `docker compose logs kafka-init`. The cap exists so a permanent failure is terminal: the container stays `Exited(1)`, the dependency gate fails fast, and you get one error to read instead of a log growing a fresh copy of itself every few seconds. |
 | The publisher refuses to build; the server will not start | Brokers and an administrative pair are configured but no producer pair is | Set `KAFKA_SASL_USER` and `KAFKA_SASL_SECRET`. Publishing as the administrator would make a leaked producer credential a compromise of the cluster's whole authorization state. `KAFKA_ALLOW_ADMIN_PRODUCER=true` is a documented, warned-about escape hatch for a deployment mid-upgrade, not a fix. |
 | Both Kafka clients refuse to connect, naming TLS | `KAFKA_TLS_ENABLED` is off and `KAFKA_INSECURE_LOCAL_DEV` is not set | Configure the `KAFKA_TLS_*` block. Only set `KAFKA_INSECURE_LOCAL_DEV` for the local single-broker stack; it is warned about on every configuration load. |
-| A subscriber sees records outside its `partition_key_prefix` | Working as designed: the prefix is enforced **consumer-side** and no ACL evaluates a message key | Filter on the key in the consumer, or — if the records must be unreachable rather than filtered — narrow `authorized_topics`, which is a real ACL. See [the partition-key prefix](#the-partition-key-prefix-is-a-consumer-side-filtering-contract). |
-| `PUT /subscribers/{id}` with a `partition_key_prefix` answers `500` naming a constraint | The database still carries `event_subscribers_key_scope_chk` | Apply the pending migrations; `sql/1781248930.sql` drops it. See [the partition-key prefix](#the-partition-key-prefix-is-a-consumer-side-filtering-contract). |
+| A subscriber sees records outside its `partition_key_prefix` | No ACL evaluates a message key, so the prefix is enforced by the component the deployment declares in front of the brokers — and if `KAFKA_KEY_SCOPE_ENFORCEMENT` is `none`, nothing enforces it and no credential should have been issued for that row | Declare the enforcing component, or — if the records must be unreachable rather than filtered — narrow `authorized_topics`, which is a real ACL. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker). |
+| `PUT /subscribers/{id}` with a `partition_key_prefix` answers `500` naming a constraint | The database still carries `event_subscribers_key_scope_chk` | Apply the pending migrations; `sql/1781248930.sql` drops it. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker). |
 | Replay answers `409 EVENT_NOT_DEAD_LETTERED` | The row is `failed` (its dead-letter write is still owed), already replayed, or another replay holds it | Restore broker reachability so the dead-letter write completes, then replay. See [the two states](#the-two-states-and-why-only-one-is-replayable). |
 | A subscriber cannot join its consumer group | The group is outside its `blnk-sub-<subscriber_id>.` namespace, or the binding was written without the trailing delimiter | Use a leaf inside the namespace — `blnk-sub-<id>.default` is the issued default. Check the binding is `PREFIXED` on the dot-terminated namespace. |
 | The alerts never fire, and nothing looks wrong | The rules are not loaded, or the scrape is refused | Check `http://localhost:9090/rules` — not `/targets` — and the bearer-token note in [Is the alert armed at all?](#is-the-alert-armed-at-all). |
@@ -2769,8 +2839,10 @@ recoverable from anywhere.
 | `kafka-init` restarts three times and the stack never comes up | Provisioning is refusing a configuration — a bad credential pair, an impossible replication factor, a rejected variable | Read `docker compose logs kafka-init`. The cap exists so a permanent failure is terminal: the container stays `Exited(1)`, the dependency gate fails fast, and you get one error to read instead of a log growing a fresh copy of itself every few seconds. |
 | The publisher refuses to build; the server will not start | Brokers and an administrative pair are configured but no producer pair is | Set `KAFKA_SASL_USER` and `KAFKA_SASL_SECRET`. Publishing as the administrator would make a leaked producer credential a compromise of the cluster's whole authorization state. `KAFKA_ALLOW_ADMIN_PRODUCER=true` is a documented, warned-about escape hatch for a deployment mid-upgrade, not a fix. |
 | Both Kafka clients refuse to connect, naming TLS | `KAFKA_TLS_ENABLED` is off and `KAFKA_INSECURE_LOCAL_DEV` is not set | Configure the `KAFKA_TLS_*` block. Only set `KAFKA_INSECURE_LOCAL_DEV` for the local single-broker stack; it is warned about on every configuration load. |
-| A subscriber sees records outside its `partition_key_prefix` | It is consuming **directly from the broker**, which evaluates no message key — so its row records no prefix, or its credential predates the prefix being recorded | Confirm the row carries the prefix, then re-issue: `enforced_access.gateway_delivery_required` must read `true` and the principal must hold no topic `Read` binding. The subscriber then reads `GET /subscribers/{id}/events`. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-by-blnk-not-by-the-broker). |
-| `PUT /subscribers/{id}` with a `partition_key_prefix` answers `500` naming a constraint | The database still carries `event_subscribers_key_scope_chk` | Apply the pending migrations; `sql/1781248930.sql` drops it. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-by-blnk-not-by-the-broker). |
+| A subscriber sees records outside its `partition_key_prefix` | It is consuming **directly from the broker**, which evaluates no message key — so its row records no prefix, or its credential predates the prefix being recorded | Confirm the row carries the prefix, then re-issue: `enforced_access.gateway_delivery_required` must read `true` and the principal must hold no topic `Read` binding. Point the subscriber at the `broker_endpoint` the new response carries. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker). |
+| `PUT /subscribers/{id}` with a `partition_key_prefix` answers `500` naming a constraint | The database still carries `event_subscribers_key_scope_chk` | Apply the pending migrations; `sql/1781248930.sql` drops it. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker). |
+| `POST /subscribers/{id}/kafka-credentials` answers `409 SUBSCRIBER_KEY_SCOPE_UNENFORCED` | The row records a `partition_key_prefix` and no key-authorising component is declared, or `KAFKA_KEY_SCOPE_GATEWAY_BROKERS` is unset or identical to `KAFKA_BROKERS` | Take one of the two remedies the refusal names: declare a component and a distinct endpoint, or clear the prefix with `PUT /subscribers/{id}` and narrow `authorized_topics` instead. See [the partition-key prefix](#the-partition-key-prefix-is-enforced-outside-the-broker). |
+| `POST /subscribers/{id}/kafka-credentials` answers `503 SUBSCRIBER_BROKERS_NOT_CONFIGURED` | `KAFKA_SUBSCRIBER_BROKERS` is unset. There is no fallback to `KAFKA_BROKERS`: those addresses are internal and would not resolve for the subscriber | Set the externally advertised broker list and retry. Nothing was minted, so no cleanup is needed. |
 | Replay answers `409 EVENT_NOT_DEAD_LETTERED` | The row is `failed` (its dead-letter write is still owed), already replayed, or another replay holds it | Restore broker reachability so the dead-letter write completes, then replay. See [the two states](#the-two-states-and-why-only-one-is-replayable). |
 | A subscriber cannot join its consumer group | The group is outside its `blnk-sub-<subscriber_id>.` namespace, or the binding was written without the trailing delimiter | Use a leaf inside the namespace — `blnk-sub-<id>.default` is the issued default. Check the binding is `PREFIXED` on the dot-terminated namespace. |
 | The alerts never fire, and nothing looks wrong | The rules are not loaded, or the scrape is refused | Check `http://localhost:9090/rules` — not `/targets` — and the bearer-token note in [Is the alert armed at all?](#is-the-alert-armed-at-all). |

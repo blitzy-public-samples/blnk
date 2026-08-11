@@ -34,6 +34,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1048,13 +1049,12 @@ func subscriberRequest(
 		request.Header.Set("Content-Type", "application/json")
 	}
 
-	// A LOOPBACK PEER, because the credential endpoint refuses to put a one-time secret on a
-	// channel it cannot establish as confidential. httptest.NewRequest records 192.0.2.1 — a
-	// documentation address, deliberately not loopback — so without this every issuance test
-	// would assert against SUBSCRIBER_INSECURE_TRANSPORT rather than against the handler.
-	// Loopback is the honest one of the three confidential channels to claim here: no TLS was
-	// terminated and no proxy is declared, but the bytes genuinely never reach a network.
-	request.RemoteAddr = "127.0.0.1:54321"
+	// IN-PROCESS TLS, because the credential endpoint refuses to put a one-time secret on a
+	// channel it cannot establish as confidential, and this is the channel a production
+	// deployment has. A loopback peer was presented here once; it establishes only that the LAST
+	// hop stayed on the host, so relying on it made this harness model a posture that a
+	// same-host reverse proxy silently invalidates.
+	request.TLS = &tls.ConnectionState{}
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, request)
@@ -1246,8 +1246,9 @@ func TestSubscribersAPI_CRUDThroughTheRealRouter(t *testing.T) {
 // A subscriber registered WITH a key scope must be accepted, and every response about it must
 // carry the scope beside the component that enforces it. The adjacency is the property: the scope
 // alone reads as a limit the credential itself carries, and it is not — the credential is refused
-// record access at the broker and the records arrive through Blnk's stream gateway, which is what
-// applies the prefix.
+// record access at the broker, and the records must arrive through the key-authorising component
+// the deployment declared, which is what applies the prefix. Registration accepts the intent
+// whether or not such a component is declared; ISSUANCE is where the absence of one is refused.
 func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 	router := subscribersRouter(t, true)
 	subscriberID := uniqueSubscriberID()
@@ -1297,53 +1298,46 @@ func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 		"no dimension of this subscriber's access is enforced by nobody")
 }
 
-// TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber is the F-1 contract at the HTTP
-// boundary as this build actually ships it: a key-scoped row is ISSUABLE, and the endpoint never
-// answers the refusal that a build without an enforcement point would.
+// TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the F-1 contract
+// at the HTTP boundary as this build actually ships it: on the DEFAULT configuration a key-scoped
+// row is refused a credential, with the typed conflict and both remedies.
 //
-// # Why the refusal is not the contract here
+// # Why the refusal is the contract
 //
 // Kafka's authorizer has no message-key dimension, so a credential carrying topic Read for a
 // key-scoped row would read every record on every granted topic — other ledgers' and other
-// subscribers' included. Two answers to that were tried and both failed. Disclosing the
-// limitation in a 200 body is not a boundary, because the party asked to apply the filter is the
-// party holding the credential. Refusing outright with 409 SUBSCRIBER_ISOLATION_UNENFORCEABLE is
-// not one either: it withdrew a capability the registry is explicitly designed to hold, leaving a
-// key-scoped subscriber with no credential and no delivery path at all.
+// subscribers' included. Three answers were tried and only the third holds.
 //
-// What ships instead is a NARROWER GRANT plus an enforcing delivery path. A key-scoped principal
-// is provisioned with Describe and no topic Read — the broker refuses its every direct fetch —
-// and its records are read with Blnk's own credential and filtered per record by the subscriber
-// stream gateway at GET /subscribers/{subscriber_id}/events. streamGatewayEnforcesKeyScope
-// records that this binary contains that component, so requireProvisionableKeyScope has nothing
-// to refuse; its refusal path stays reachable, and tested, for a build in which no enforcement
-// point exists.
+// Disclosing the limitation in a 200 body is not a boundary: the party asked to apply the filter is
+// the party holding the credential, and any other Kafka client ignores the request entirely.
+// Serving the records from Blnk instead — a read path under /subscribers, reading with Blnk's own
+// wide credential and filtering per record — was worse in three specific ways: it was a second data
+// plane, it authenticated with a bespoke header the platform's authorization middleware knows
+// nothing about, and revoking the subscriber's SCRAM credential at the broker left it open.
+//
+// What ships is a NARROWED GRANT plus a REFUSAL. A key-scoped principal is provisioned with
+// Describe and no topic Read, and the records must be delivered by whatever key-authorising
+// component the DEPLOYMENT declares in KAFKA_KEY_SCOPE_ENFORCEMENT. Blnk ships none — so with none
+// declared there is no credential worth minting, and the endpoint says so.
 //
 // # What this asserts, and why at this layer
 //
-// The service layer owns the enforcement semantics — that Read is withheld, that the withholding
-// is verified against the bindings actually sent, that the response declares the enforcement
-// point — and event_subscriber_test.go covers them against a live broker. What belongs HERE is
-// the boundary: that the endpoint does not answer the superseded conflict for a row the gateway
-// enforces, that it reaches the registry rather than refusing ahead of it, and that an issuance
-// which cannot complete leaves nothing behind and discloses nothing.
+// The service layer owns the semantics and event_subscriber_test.go covers them. What belongs HERE
+// is the boundary contract: the status, the typed code a client branches on, the remedies in the
+// message, and that a refusal leaves nothing written and discloses nothing.
 //
-// The registry read of the same state — the prefix reported together with the component that
-// enforces it — is TestSubscribersAPI_RecordsAndReturnsTheKeyScope.
+// The ORDER is part of it. The refusal happens after the row is read — so the fence claim and the
+// registry read are required expectations below — and before any secret exists or the broker is
+// touched, which is what makes it free of residue.
 //
-// The harness configures brokers deliberately — with none, issuance answers
-// EVENT_KAFKA_UNAVAILABLE (503) before the row is ever read, and nothing about the row would be
-// exercised. That ordering is itself covered by
-// TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured.
-//
-// It also configures NO admin SASL credentials, which is what makes the outcome here a broker-side
-// failure rather than a completed issuance: this test asserts that the row was accepted and the
-// broker round trip attempted, not that a principal was created. Completing one requires a real
-// cluster and appears in TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnce.
-func TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber(t *testing.T) {
+// The registry read of the same state — the prefix reported together with the component that would
+// enforce it — is TestSubscribersAPI_RecordsAndReturnsTheKeyScope. The declared-gateway case is
+// TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway, immediately below.
+func TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
 		brokers:   []string{"127.0.0.1:9092"},
+		// DELIBERATELY NO keyScopeGateway: this is the shipped default.
 	})
 
 	subscriberID := uniqueSubscriberID()
@@ -1358,9 +1352,10 @@ func TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber(t *testing.T) {
 
 	const claimToken = "claim-token-for-the-key-scoped-issuance"
 
-	// REQUIRED, both of them, and that is the first half of the property: the request must reach
-	// the provisioning fence and then the row. A build that refused a key-scoped subscriber ahead
-	// of the registry would leave these unmet, and AssertExpectations below is what says so.
+	// REQUIRED, both of them: the refusal is a judgement about the ROW, so the request must reach
+	// the provisioning fence and then the registry before it can be made. An implementation that
+	// refused every request carrying no gateway declaration — without reading the row — would
+	// also refuse prefix-less subscribers, and AssertExpectations below is what separates the two.
 	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
 		Return(claimToken, nil).Once()
 	datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(stored, nil).Once()
@@ -1370,9 +1365,8 @@ func TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber(t *testing.T) {
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	datasource.On("ReleaseSubscriberProvisioningFence",
 		mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-	// PERMITTED, NOT EXPECTED, and never reached here — it is registered only so that an
-	// environment in which the broker round trip somehow completed would fail on the assertion
-	// below rather than panicking inside the mock on a call it has no answer for.
+	// PERMITTED, NOT EXPECTED, and never reached — registered only so that a build which somehow
+	// completed the issuance would fail the assertion below rather than panicking inside the mock.
 	datasource.On("RecordSubscriberCredentialIfUnchanged",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(nil).Maybe()
@@ -1382,22 +1376,86 @@ func TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber(t *testing.T) {
 	})
 	body := recorder.Body.String()
 
-	// THE SUPERSEDED REFUSAL IS NOT THE ANSWER. Asserted on the code as well as the status,
-	// because a client branches on the code and because another conflict — a concurrent
-	// re-issuance, say — would be a legitimate 409 that this assertion must not read as the
-	// isolation refusal returning.
-	require.NotEqual(t, http.StatusConflict, recorder.Code,
-		"a key-scoped row is issuable in a build that contains the stream gateway: the grant is "+
-			"narrowed to Describe and the records are delivered key-filtered, so there is nothing "+
-			"here to refuse. body: %s", body)
-	assert.NotContains(t, body, string(apierror.ErrSubscriberIsolationUnenforceable),
-		"SUBSCRIBER_ISOLATION_UNENFORCEABLE says NOTHING enforces the prefix; this binary links "+
-			"the component that does, and that guard is reached only where one is absent")
+	require.Equal(t, http.StatusConflict, recorder.Code,
+		"a key-scoped row must be REFUSED where nothing is declared to apply its prefix: the only "+
+			"credentials available are one wider than the row describes and one that can fetch "+
+			"nothing. body: %s", body)
+	assert.Contains(t, body, string(apierror.ErrSubscriberKeyScopeUnenforced),
+		"and the TYPED code, because a client branches on it — a bare 409 is indistinguishable from "+
+			"a concurrent re-issuance")
+	assert.Contains(t, body, "Clear the partition key prefix",
+		"the first remedy travels in the body: a refusal naming none is a dead end")
+	assert.Contains(t, body, "narrow the subscriber's authorized topics",
+		"and the enforceable alternative for an operator who wanted isolation")
 
-	// AND THE ISSUANCE WAS ATTEMPTED AT THE BROKER, which is what proves the row was accepted
-	// rather than skipped. It fails because the harness holds no admin SASL credential, and a
-	// 503 is the honest answer to that: nothing was created, and a retry against a reachable,
-	// authenticated cluster is exactly what would succeed.
+	assert.NotContains(t, body, `"password"`,
+		"A REFUSED ISSUANCE CARRIES NO SECRET: none is generated on this path")
+	assert.NotContains(t, body, keyScope,
+		"and it does not echo the prefix into the body, which is caller-supplied text")
+
+	// NOTHING WAS WRITTEN. The refusal precedes the issuance record, so the registry cannot end up
+	// describing a credential no subscriber holds.
+	datasource.AssertNotCalled(t, "RecordSubscriberCredentialIfUnchanged",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	datasource.AssertExpectations(t)
+}
+
+// TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway is the other side
+// of the same decision, and it is what keeps the refusal above from being read as "key scopes are
+// unusable".
+//
+// With KAFKA_KEY_SCOPE_ENFORCEMENT declaring a component at a distinct endpoint, the identical
+// request is NOT refused: it proceeds past the key-scope guard to the broker. This harness holds no
+// admin SASL credential, so the broker step fails with a 503 — which is the assertion. A 503 here
+// means the row was accepted and provisioning was attempted; a 409 would mean the guard refused.
+//
+// The pair is what makes either test conclusive. A build that always refused would satisfy the test
+// above and fail this one; a build that never refused would satisfy this one and fail that.
+func TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway(t *testing.T) {
+	router, datasource := setupSubscribersRouter(t, subscribersHarness{
+		masterKey: true,
+		brokers:   []string{"127.0.0.1:9092"},
+		// DISTINCT from brokers, or KeyScopeGateway reads it as no declaration and this test
+		// would assert the refusal it exists to rule out.
+		keyScopeGateway: []string{"keyscope-gateway.invalid:9095"},
+	})
+
+	subscriberID := uniqueSubscriberID()
+
+	stored := subscribersFixtureRow(subscriberID)
+	keyScope := "ldg_9f2c"
+	stored.PartitionKeyPrefix = &keyScope
+	stored.CredentialReference = nil
+	stored.CredentialIssuedAt = nil
+
+	const claimToken = "claim-token-for-the-declared-gateway-issuance"
+
+	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
+		Return(claimToken, nil).Once()
+	datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(stored, nil).Once()
+	datasource.On("RenewSubscriberProvisioningFence",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	datasource.On("ReleaseSubscriberProvisioningFence",
+		mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	datasource.On("RecordSubscriberCredentialIfUnchanged",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Maybe()
+
+	recorder := subscribersServe(t, router, subscribersCall{
+		method: http.MethodPost, path: "/subscribers/" + subscriberID + "/kafka-credentials",
+	})
+	body := recorder.Body.String()
+
+	require.NotEqual(t, http.StatusConflict, recorder.Code,
+		"with a component declared there is nothing for the key-scope guard to refuse. body: %s", body)
+	assert.NotContains(t, body, string(apierror.ErrSubscriberKeyScopeUnenforced),
+		"SUBSCRIBER_KEY_SCOPE_UNENFORCED says nothing applies the prefix; this deployment declared "+
+			"something that does")
+
+	// AND PROVISIONING WAS ATTEMPTED AT THE BROKER, which is what proves the row was accepted
+	// rather than skipped. It fails because the harness holds no admin SASL credential, and a 503
+	// is the honest answer: nothing was created, and a retry against a reachable, authenticated
+	// cluster is what would succeed.
 	require.Equal(t, http.StatusServiceUnavailable, recorder.Code,
 		"the row was accepted, so the next step is the broker, and this harness cannot "+
 			"authenticate to one. body: %s", body)
@@ -1407,11 +1465,7 @@ func TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber(t *testing.T) {
 
 	assert.NotContains(t, body, `"password"`,
 		"A FAILED ISSUANCE CARRIES NO SECRET: the credential is never marshalled on this path")
-	assert.NotContains(t, body, keyScope,
-		"and it does not echo the prefix into the body, which is caller-supplied text")
 
-	// NOTHING WAS WRITTEN. The broker round trip precedes the issuance record, so a failure there
-	// cannot leave the registry describing a credential no subscriber holds.
 	datasource.AssertNotCalled(t, "RecordSubscriberCredentialIfUnchanged",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	datasource.AssertExpectations(t)
@@ -1959,6 +2013,32 @@ type subscribersHarness struct {
 	secure    bool
 	masterKey bool
 	brokers   []string
+
+	// keyScopeGateway declares a key-authorising component in front of the brokers, at these
+	// addresses. Empty is the SHIPPED DEFAULT, under which issuance refuses a subscriber
+	// recording a partition_key_prefix — so a test that needs a key-scoped issuance to proceed
+	// sets this, and a test asserting the refusal must not.
+	//
+	// The addresses must be DISTINCT from brokers: config.KafkaConfig.KeyScopeGateway reads a
+	// gateway list equal to the broker list as no declaration at all, on the grounds that a
+	// component which IS the brokers cannot be evaluating keys.
+	keyScopeGateway []string
+
+	// allowLoopbackIssuance declares the deployment a LOCAL-DEVELOPMENT host, which is the only
+	// state in which a loopback peer establishes a confidential channel for credential issuance.
+	//
+	// Default false, matching production: a loopback peer proves only that the last hop stayed
+	// on the host, and a same-host reverse proxy makes a public plaintext hop look loopback from
+	// inside the process. Tests here therefore present IN-PROCESS TLS instead, which is the
+	// channel a production deployment actually has; this field exists for the two tests whose
+	// subject IS the local-development exception.
+	allowLoopbackIssuance bool
+
+	// trustForwardedProto declares the proxy in front of Blnk that terminated TLS and sets
+	// X-Forwarded-Proto, which is the production Kubernetes shape: TLS ends at the ingress and
+	// the hop to the pod is plaintext, so the process never sees a handshake. Without the
+	// declaration the header is a claim any caller can make and is not believed.
+	trustForwardedProto bool
 }
 
 // setupSubscribersRouter builds a router over a mock datasource and returns both.
@@ -2001,8 +2081,10 @@ func setupSubscribersRouter(
 		Redis:      config.RedisConfig{Dns: "localhost:6379"},
 		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
 		Server: config.ServerConfig{
-			Secure:    harness.secure,
-			SecretKey: subscribersAPITestMasterKey,
+			Secure:                          harness.secure,
+			SecretKey:                       subscribersAPITestMasterKey,
+			AllowLoopbackCredentialIssuance: harness.allowLoopbackIssuance,
+			TrustForwardedProto:             harness.trustForwardedProto,
 		},
 	}
 
@@ -2017,6 +2099,14 @@ func setupSubscribersRouter(
 			// transport refuses to dial in the clear without this acknowledgement.
 			InsecureLocalDev: true,
 		}
+
+		if len(harness.keyScopeGateway) > 0 {
+			configuration.Kafka.KeyScopeEnforcement = config.KeyScopeEnforcementBrokerGateway
+			configuration.Kafka.KeyScopeGatewayBrokers = append(
+				[]string(nil), harness.keyScopeGateway...,
+			)
+		}
+
 		configuration.WebhookDeprecationSunsetDate = time.Now().
 			Add(20 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	}
@@ -2111,17 +2201,33 @@ func subscribersTestAPIKey(scopes ...string) *coremodel.APIKey {
 
 // subscribersCall is one request against the surface.
 //
-// peer is spelled out rather than defaulted silently because it decides an outcome:
-// httptest.NewRequest records 192.0.2.1, a documentation address that is deliberately not
-// loopback, and the credential route refuses to put a one-time password on a channel it
-// cannot establish as confidential. An empty peer therefore means "loopback" here, and a
-// test about the transport gate sets it explicitly.
+// # The transport this presents by default, and why it is TLS rather than loopback
+//
+// The credential route refuses to put a one-time password on a channel the deployment has not
+// established as confidential, so every call has to present one of the three. This harness
+// presents IN-PROCESS TLS — the channel a production deployment actually has — because the
+// alternative it used to present, a loopback peer, is not evidence of confidentiality on its
+// own: a reverse proxy on the same host forwards a public plaintext request over 127.0.0.1, so
+// the peer reads as loopback while the client's hop was readable. Defaulting to it made every
+// test in this file assert against a posture no production deployment should have.
+//
+// peer is left to httptest's 192.0.2.1 unless a test sets it, and plaintext drops the TLS state,
+// so the two tests whose subject IS the transport gate can compose any of the four shapes:
+// TLS, declared proxy, declared local-development host with a loopback peer, and none of those.
 type subscribersCall struct {
 	method string
 	path   string
 	body   string
 	key    string
 	peer   string
+
+	// plaintext omits the in-process TLS state, leaving the request on a channel the deployment
+	// has established nothing about unless it declared a proxy or a local-development host.
+	plaintext bool
+
+	// forwardedProto sets X-Forwarded-Proto, which is believed only where the deployment
+	// declared the proxy that sets it.
+	forwardedProto string
 }
 
 // subscribersServe performs one call and returns the recorder.
@@ -2139,9 +2245,20 @@ func subscribersServe(
 		request.Header.Set(middleware.KeyHeader, call.key)
 	}
 
-	request.RemoteAddr = call.peer
-	if request.RemoteAddr == "" {
-		request.RemoteAddr = "127.0.0.1:54321"
+	if call.peer != "" {
+		request.RemoteAddr = call.peer
+	}
+
+	if call.forwardedProto != "" {
+		request.Header.Set("X-Forwarded-Proto", call.forwardedProto)
+	}
+
+	// IN-PROCESS TLS, unless the call is deliberately plaintext. A non-nil Request.TLS is what a
+	// server that completed the handshake itself records, and it is the one confidential channel
+	// that needs no declaration by the deployment — which makes it the honest default for a
+	// harness whose subject is the handlers rather than the transport gate.
+	if !call.plaintext {
+		request.TLS = &tls.ConnectionState{}
 	}
 
 	recorder := httptest.NewRecorder()
@@ -2158,14 +2275,13 @@ func subscribersServe(
 // binds, because these tables drive tests about AUTHORIZATION: a request must fail on the
 // gate rather than on its body, or the assertion moves to a different property.
 //
-// GET /subscribers/:subscriber_id/events IS DELIBERATELY ABSENT, and it must stay absent.
-// It is the DATA PLANE — the enforcement point for a subscriber's partition-key prefix —
-// and it is authenticated by the SUBSCRIBER's own SASL secret rather than by an operator's
-// master key, so a table asserting ErrAuthMasterKeyRequired for every entry would be
-// asserting a gate that route correctly does not have. Its own authorization properties are
-// covered by TestSubscribersAPI_StreamRouteResolvesToTheSubscribersResource and
-// TestSubscribersAPI_StreamAuthenticatesWithTheSubscribersOwnSecret, which assert both
-// halves: the prefix resolves for it, and reaching it is not the same as being served by it.
+// EVERY ROUTE UNDER /subscribers IS HERE, and that is now a complete statement rather than a
+// qualified one: there is no data-plane route to leave out. A record-serving route existed and was
+// removed — it was authenticated by the subscriber's own SASL secret rather than by an operator's
+// master key, which is precisely why it could not appear in a table asserting
+// ErrAuthMasterKeyRequired for every entry. Its absence is asserted directly by
+// TestSubscribersAPI_HasNoRecordServingRoute, and the absence of the header it read by
+// TestSubscribersAPI_DoesNotReadASubscriberSecretHeader.
 func subscribersEveryRoute(subscriberID string) []subscribersCall {
 	webhookPath := webhookSubscriptionPath(subscriberID)
 
@@ -3610,9 +3726,9 @@ func TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured(
 // would already exist at the broker, unusable by the caller that never received it and still
 // requiring revocation.
 //
-// The peer below is 192.0.2.1 — the documentation address httptest records by default, and
-// deliberately not loopback. Every other test in this file sets a loopback peer for exactly
-// this reason, which makes this test the negative control for that whole convention.
+// The request below is PLAINTEXT with a remote peer: no in-process TLS, no declared proxy, and
+// no loopback. It is the negative control for the whole harness, which presents in-process TLS
+// so that every other test asserts against the handler rather than against this gate.
 func TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnything(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
@@ -3622,9 +3738,10 @@ func TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnyt
 	subscriberID := uniqueSubscriberID()
 
 	recorder := subscribersServe(t, router, subscribersCall{
-		method: http.MethodPost,
-		path:   "/subscribers/" + subscriberID + "/kafka-credentials",
-		peer:   "192.0.2.1:1234",
+		method:    http.MethodPost,
+		path:      "/subscribers/" + subscriberID + "/kafka-credentials",
+		peer:      "192.0.2.1:1234",
+		plaintext: true,
 	})
 
 	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
@@ -3634,13 +3751,185 @@ func TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnyt
 	// The refusal names all three ways to satisfy the contract, because each is a deployment
 	// change and the operator reading the message is the person who makes it.
 	body := recorder.Body.String()
-	for _, remedy := range []string{"BLNK_SERVER_SSL", "BLNK_SERVER_TRUST_FORWARDED_PROTO", "loopback"} {
+	for _, remedy := range []string{
+		"BLNK_SERVER_SSL",
+		"BLNK_SERVER_TRUST_FORWARDED_PROTO",
+		"BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE",
+	} {
 		assert.Contains(t, body, remedy,
 			"the refusal must name every way to establish a confidential channel")
 	}
+	assert.Contains(t, body, "local development only",
+		"and it must say which of the three is not a production answer, or an operator reaches for "+
+			"the easiest one on a host where it is unsafe")
 	assert.NotContains(t, body, "192.0.2.1",
 		"and it must disclose nothing about the topology back to the caller: every refused "+
 			"request gets the identical body")
+}
+
+// TestIssueKafkaCredentials_RefusesALoopbackPeerOnAnUndeclaredHost is the production half of the
+// transport gate, and the one that closes a real disclosure.
+//
+// # Why a loopback peer proves less than it appears to
+//
+// Request.RemoteAddr is the far end of the accepted socket, so a loopback value establishes that
+// the LAST hop stayed on this host. It establishes nothing about the hop before it. The shape
+// that matters is ordinary: a reverse proxy on the same host — nginx, Caddy, an Envoy sidecar —
+// accepts a request from the internet, possibly over plain http, and forwards it to Blnk over
+// 127.0.0.1. From inside the process that request is indistinguishable from an operator running
+// curl in the container, and answering it puts a one-time SASL password on the public hop.
+//
+// Blnk cannot tell those apart, so it does not try: the loopback channel is a DECLARATION the
+// deployment makes, exactly like the trusted-proxy one, and the default is to refuse. This test
+// is the default.
+func TestIssueKafkaCredentials_RefusesALoopbackPeerOnAnUndeclaredHost(t *testing.T) {
+	router, datasource := setupSubscribersRouter(t, subscribersHarness{
+		masterKey: true,
+		brokers:   []string{"127.0.0.1:9092"},
+	})
+
+	subscriberID := uniqueSubscriberID()
+
+	for name, peer := range map[string]string{
+		"IPv4 loopback":        "127.0.0.1:54321",
+		"the 127/8 block":      "127.9.9.9:54321",
+		"IPv6 loopback":        "[::1]:54321",
+		"a zone-qualified ::1": "[::1%lo0]:54321",
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := subscribersServe(t, router, subscribersCall{
+				method:    http.MethodPost,
+				path:      "/subscribers/" + subscriberID + "/kafka-credentials",
+				peer:      peer,
+				plaintext: true,
+			})
+
+			assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+			assert.NotContains(t, recorder.Body.String(), `"password"`,
+				"no secret may be disclosed to a peer whose earlier hops this process cannot see")
+		})
+	}
+
+	assert.Empty(t, datasource.Calls,
+		"and nothing may be claimed or minted: the refusal precedes the registry, so a request "+
+			"that cannot be answered safely leaves no provisioning fence behind")
+}
+
+// TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHost is the exception,
+// tested separately from the production posture on purpose.
+//
+// The local stack is a plaintext listener reached over loopback and nothing else, so without this
+// declaration `make run` plus curl could never issue a credential. What the test pins is that the
+// exception is reached ONLY through the declaration: the same request refused above is admitted
+// here, and the only difference is BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE.
+//
+// The assertion is that the transport gate PASSED, not that a credential was issued. Issuance
+// then fails against the unreachable broker in this harness, which is a different code — and
+// asserting the transport code's ABSENCE is what distinguishes "the gate admitted it" from "the
+// gate refused it" without needing a live broker.
+func TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHost(t *testing.T) {
+	router, datasource := setupSubscribersRouter(t, subscribersHarness{
+		masterKey:             true,
+		brokers:               []string{"127.0.0.1:9092"},
+		allowLoopbackIssuance: true,
+	})
+
+	subscriberID := uniqueSubscriberID()
+
+	// The registry read the gate now lets the request reach. It answers "no such subscriber", so
+	// the handler's own refusal is the 404 — which is only reachable past the transport gate.
+	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
+		Return("", apierror.NewAPIError(apierror.ErrSubscriberNotFound, "no such subscriber", nil))
+
+	recorder := subscribersServe(t, router, subscribersCall{
+		method:    http.MethodPost,
+		path:      "/subscribers/" + subscriberID + "/kafka-credentials",
+		peer:      "127.0.0.1:54321",
+		plaintext: true,
+	})
+
+	body := recorder.Body.String()
+	assert.NotContains(t, body, string(apierror.ErrSubscriberInsecureTransport),
+		"the declared local-development host must satisfy the transport gate: %s", body)
+	assert.NotEqual(t, http.StatusForbidden, recorder.Code,
+		"and the request must get past it rather than being refused for its channel")
+	datasource.AssertCalled(t, "ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything)
+}
+
+// TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS is the third channel, and the one a
+// production Kubernetes deployment actually uses.
+//
+// TLS terminates at the ingress and the hop to the pod is plaintext, so the process never sees a
+// handshake. X-Forwarded-Proto is a request header any client can set, so it is believed only
+// where BLNK_SERVER_TRUST_FORWARDED_PROTO declares that a proxy sets it and overwrites what the
+// client sent. Both halves are asserted: the header alone is refused, and the header under the
+// declaration is admitted.
+func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) {
+	subscriberID := uniqueSubscriberID()
+
+	t.Run("the header alone establishes nothing", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey: true,
+			brokers:   []string{"127.0.0.1:9092"},
+		})
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           "192.0.2.1:1234",
+			plaintext:      true,
+			forwardedProto: "https",
+		})
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+		assert.Empty(t, datasource.Calls,
+			"a caller must not be able to assert its own confidentiality with a header")
+	})
+
+	t.Run("the declared proxy is believed", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey:           true,
+			brokers:             []string{"127.0.0.1:9092"},
+			trustForwardedProto: true,
+		})
+
+		datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
+			Return("", apierror.NewAPIError(apierror.ErrSubscriberNotFound, "no such subscriber", nil))
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           "192.0.2.1:1234",
+			plaintext:      true,
+			forwardedProto: "https",
+		})
+
+		assert.NotContains(t, recorder.Body.String(), string(apierror.ErrSubscriberInsecureTransport),
+			"the declared proxy reporting https is a confidential channel")
+		datasource.AssertCalled(t, "ClaimSubscriberForProvisioning",
+			mock.Anything, subscriberID, mock.Anything)
+	})
+
+	t.Run("a declared proxy reporting http is a refusal", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{
+			masterKey:           true,
+			brokers:             []string{"127.0.0.1:9092"},
+			trustForwardedProto: true,
+		})
+
+		recorder := subscribersServe(t, router, subscribersCall{
+			method:         http.MethodPost,
+			path:           "/subscribers/" + subscriberID + "/kafka-credentials",
+			peer:           "192.0.2.1:1234",
+			plaintext:      true,
+			forwardedProto: "http",
+		})
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+		assert.Empty(t, datasource.Calls,
+			"the proxy is REPORTING a plaintext client hop, which is a refusal rather than an "+
+				"absence of information")
+	})
 }
 
 // TestIssueKafkaCredentials_RefusesAnUnknownSubscriber keeps the missing-row answer on the
@@ -4366,359 +4655,159 @@ func TestSubscribersAPI_TypedCodesResolveToIntendedStatuses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The subscriber event stream — GET /subscribers/:subscriber_id/events
+// THERE IS NO DATA-PLANE ROUTE UNDER /subscribers, and this section is what enforces that
 //
-// # What this section owns, and what it deliberately leaves to the root package
+// # What was here, and why it is gone rather than fixed
 //
-// The gateway's filtering rule is exhaustively covered by event_stream_gateway_test.go, and
-// the broker half of the boundary — that a key-scoped principal's direct fetch is REFUSED by
-// Kafka's own authorizer — by event_isolation_integration_test.go against a live broker.
+// GET /subscribers/:subscriber_id/events served a key-scoped subscriber its own records: Blnk read
+// the shared category topic with its OWN administrative credential, applied the subscriber's
+// partition-key prefix per record, and returned a page. Three properties of that design are why it
+// was removed outright rather than hardened.
 //
-// What only this package can prove is the HTTP contract of the one data-plane route in the
-// subscriber surface: that the new path resolves for the authorization middleware at all, that
-// it is authenticated by the subscriber's secret rather than by an operator's master key, that
-// the secret is refused on a channel this deployment has not established as confidential, and
-// that a malformed cursor is refused rather than substituted.
+//  1. It was a SECOND DATA PLANE holding a credential far wider than any subscriber's. Every record
+//     on the topic passed through the filter, so a defect in the filter — or a diagnostic field
+//     added to the page in good faith — disclosed other ledgers' records.
+//  2. It authenticated with a BESPOKE HEADER, X-Blnk-Subscriber-Secret, which the platform's
+//     authorization middleware knows nothing about. Two authentication systems on one router is how
+//     one of them comes to be forgotten.
+//  3. REVOCATION DID NOT REVOKE. Removing a subscriber's SCRAM credential at the broker closed the
+//     direct path and left the served one open, because the served one authenticated against a
+//     registry column rather than against the broker.
+//
+// AAP requirement R-7 authorises exactly one subscriber endpoint — POST
+// /subscribers/{id}/kafka-credentials — and §0.5.2 enumerates the four new routes this feature adds.
+// A record-serving route is not among them.
+//
+// # What replaces it
+//
+// A key-scoped subscriber's records are delivered by the key-authorising component the DEPLOYMENT
+// declares in front of the brokers (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway, addressed by
+// KAFKA_KEY_SCOPE_GATEWAY_BROKERS). Blnk does not ship it. Where none is declared, issuance refuses
+// the row — see TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway — so no
+// credential ever exists that claims an enforcement point nothing is running.
 // ---------------------------------------------------------------------------------------
 
-// streamAPITestSecret is the plaintext the fixture row's credential reference is derived from.
+// TestSubscribersAPI_HasNoRecordServingRoute is the guard that keeps the removal removed.
 //
-// The reference is DERIVED here rather than written as a literal, because that is what the
-// gateway does to authenticate: it re-derives from the presented secret and compares in
-// constant time. A hand-written reference would make every positive case below fail and every
-// negative case pass for the wrong reason.
-const streamAPITestSecret = "the-secret-this-subscriber-was-issued"
+// # Why an absence needs a test
+//
+// A deleted route leaves no compile error behind. Re-adding one is a single line in api.go, and the
+// reasoning against it lives in prose that a future change need not read. So the absence is asserted
+// the only way an absence can be: by making the requests such a route would answer and requiring
+// the ROUTER to refuse them before any handler exists to serve them.
+//
+// # Why it asserts 404 specifically, and what would break it
+//
+// gin answers an unregistered path with 404 from the router itself, ahead of the whole middleware
+// chain. That is the fingerprint of "no such route", and it is distinguishable from every answer a
+// registered route could give: 403 would mean the path resolved and authorization judged it, 401
+// that something authenticated it, 405 that the path exists under another method, 500 that a handler
+// ran. Any of those means a record-serving route is back.
+//
+// The master key is presented on purpose. A 404 while holding the most privileged credential the
+// deployment has is the strongest available statement that nothing is registered there — a refusal
+// that depended on the caller's scope would leave the route reachable by someone.
+func TestSubscribersAPI_HasNoRecordServingRoute(t *testing.T) {
+	router, _ := setupSubscribersRouter(t, subscribersHarness{secure: true, masterKey: true})
 
-// streamAPIProvisionedRow returns a fixture row whose credential reference matches
-// streamAPITestSecret, optionally confined to a partition-key prefix.
-func streamAPIProvisionedRow(t *testing.T, subscriberID, keyPrefix string) *coremodel.EventSubscriber {
-	t.Helper()
-
-	row := subscribersFixtureRow(subscriberID)
-
-	reference, err := coremodel.DeriveCredentialReference(row.KafkaPrincipal, streamAPITestSecret)
-	require.NoError(t, err, "deriving the fixture's credential reference")
-	row.CredentialReference = &reference
-
-	if keyPrefix != "" {
-		row.PartitionKeyPrefix = &keyPrefix
-	}
-
-	return row
-}
-
-// streamAPIPath builds a well-formed stream request path for the subscriber's first granted
-// topic.
-func streamAPIPath(subscriberID string, query string) string {
+	subscriberID := uniqueSubscriberID()
 	topic := coremodel.SubscriberGrantableTopics(coremodel.DefaultEventTopicPrefix)[0]
 
-	path := fmt.Sprintf("/subscribers/%s/events?topic=%s", subscriberID, topic)
-	if query != "" {
-		path += "&" + query
-	}
+	// Every shape the removed route accepted, plus the two neighbouring paths a re-introduction
+	// would most plausibly choose.
+	for name, call := range map[string]subscribersCall{
+		"the removed stream route": {
+			method: http.MethodGet,
+			path: fmt.Sprintf(
+				"/subscribers/%s/events?topic=%s&partition=0&offset=0&limit=100", subscriberID, topic,
+			),
+			key: subscribersAPITestMasterKey,
+		},
+		"the removed stream route with no query": {
+			method: http.MethodGet,
+			path:   "/subscribers/" + subscriberID + "/events",
+			key:    subscribersAPITestMasterKey,
+		},
+		"a records path": {
+			method: http.MethodGet,
+			path:   "/subscribers/" + subscriberID + "/records",
+			key:    subscribersAPITestMasterKey,
+		},
+		"a stream path": {
+			method: http.MethodGet,
+			path:   "/subscribers/" + subscriberID + "/stream",
+			key:    subscribersAPITestMasterKey,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := subscribersServe(t, router, call)
 
-	return path
+			assert.Equal(t, http.StatusNotFound, recorder.Code,
+				"%s %s must not be registered. Blnk serves no subscriber records: a route here is a "+
+					"second data plane holding Blnk's own wide credential, authenticated outside the "+
+					"authorization middleware, and unaffected by revoking the subscriber's SCRAM "+
+					"credential at the broker. A key scope is delivered by the component the deployment "+
+					"declares in KAFKA_KEY_SCOPE_ENFORCEMENT. body: %s",
+				call.method, call.path, recorder.Body.String())
+		})
+	}
 }
 
-// streamAPIServe performs one stream request, optionally presenting a subscriber secret.
+// TestSubscribersAPI_DoesNotReadASubscriberSecretHeader pins the second half of the removal: not
+// merely that the route is gone, but that no surviving route accepts the header it used.
 //
-// The secret travels in a HEADER, which is the contract: a query string is written to access
-// logs, proxy logs and browser history by default, and this value is a live password.
-func streamAPIServe(
-	t *testing.T,
-	router *gin.Engine,
-	path, secret, principal, peer string,
-) *httptest.ResponseRecorder {
-	t.Helper()
-
-	request := httptest.NewRequest(http.MethodGet, path, nil)
-
-	if secret != "" {
-		request.Header.Set("X-Blnk-Subscriber-Secret", secret)
-	}
-	if principal != "" {
-		request.Header.Set("X-Blnk-Subscriber-Principal", principal)
-	}
-
-	request.RemoteAddr = peer
-	if request.RemoteAddr == "" {
-		request.RemoteAddr = "127.0.0.1:54321"
-	}
-
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
-
-	return recorder
-}
-
-// TestSubscribersAPI_StreamRouteResolvesToTheSubscribersResource is the hard-blocker check for
-// the new path, and it is the same one every route on this surface needs.
-//
-// getResourceFromPath returns an EMPTY resource for an unmapped first path segment and the
-// middleware then aborts with ErrAuthUnknownResource — so a route whose prefix is missing from
-// pathToResource rejects every caller, master key included, and does so with a 403 that looks
-// like an ordinary permissions refusal. Registering the stream under /subscribers rather than
-// under a new prefix is what avoids that, and this asserts it rather than assuming it.
-//
-// The assertion is on the CODE and not the status, because ErrAuthUnknownResource and
-// ErrAuthInsufficientPermissions both resolve to 403 — which is precisely why the failure this
-// guards against is easy to miss.
-func TestSubscribersAPI_StreamRouteResolvesToTheSubscribersResource(t *testing.T) {
-	subscriberID := uniqueSubscriberID()
+// X-Blnk-Subscriber-Secret was a live SASL password presented on every poll, authenticated against
+// a registry column by code that sat outside the authorization middleware. If any subscriber route
+// still honoured it, the removal would have moved the second authentication system rather than
+// deleted it — so the credential endpoint is exercised with the header and WITHOUT a master key, and
+// must refuse on the master key exactly as it does when no header is present at all.
+func TestSubscribersAPI_DoesNotReadASubscriberSecretHeader(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{secure: true})
 
-	// Scoped to another feature on purpose: what is under test is that the path RESOLVES and
-	// to what, not that this key may use it.
-	key := subscribersTestAPIKey(
-		middleware.BuildScope(middleware.ResourceLedgers, middleware.ActionAll))
-	datasource.On("GetAPIKey", mock.Anything, key.Key).Return(key, nil)
+	subscriberID := uniqueSubscriberID()
 
-	request := httptest.NewRequest(http.MethodGet, streamAPIPath(subscriberID, ""), nil)
+	// A key scoped to the subscriber resource, so the request is authenticated and authorised as
+	// far as the master-key gate. Whatever refuses it below refuses it there and not earlier.
+	//
+	// Programmed through the shared helper because authentication ALSO starts a background
+	// last-used update for every non-master credential it admits; the helper is what makes that
+	// call expected and joinable rather than an unexpected-call panic on another goroutine.
+	key := subscribersTestAPIKey(
+		middleware.BuildScope(middleware.ResourceSubscribers, middleware.ActionAll))
+	touched := expectSubscribersAPIKeyLookup(datasource, key)
+
+	request := httptest.NewRequest(
+		http.MethodPost, "/subscribers/"+subscriberID+"/kafka-credentials", nil,
+	)
 	request.Header.Set(middleware.KeyHeader, key.Key)
-	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Blnk-Subscriber-Secret", "the-secret-this-subscriber-was-issued")
+	request.Header.Set("X-Blnk-Subscriber-Principal", "blnk-sub-"+subscriberID)
+	// In-process TLS, so the request cannot be refused for its transport before reaching the
+	// master-key gate this test is about.
+	request.TLS = &tls.ConnectionState{}
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
 
-	require.Equal(t, http.StatusForbidden, recorder.Code, "body: %s", recorder.Body.String())
+	require.Equal(t, http.StatusForbidden, recorder.Code,
+		"a subscriber secret must buy nothing: this route is master-key only. body: %s",
+		recorder.Body.String())
 
 	var body struct {
 		ErrorDetail apierror.APIError `json:"error_detail"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
 
-	require.NotEqual(t, apierror.ErrAuthUnknownResource, body.ErrorDetail.Code,
-		"GET /subscribers/:id/events RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware "+
-			"aborts every request to it — including one carrying a correct subscriber secret. The "+
-			"route must stay under the /subscribers prefix, or \"events\" must be mapped as well")
-	assert.Equal(t, apierror.ErrAuthInsufficientPermissions, body.ErrorDetail.Code,
-		"a key scoped to another resource must be refused on PERMISSIONS, which is what proves the "+
-			"path resolved and was then judged")
-}
+	assert.Equal(t, apierror.ErrAuthMasterKeyRequired, body.ErrorDetail.Code,
+		"the refusal must be the MASTER KEY gate, which is what says the subscriber headers were "+
+			"never consulted. A different code here would mean something read them")
 
-// TestSubscribersAPI_StreamAuthenticatesWithTheSubscribersOwnSecret is the data-plane contract.
-//
-// # Why this route is not master-key gated, and why that is safe
-//
-// Every other route under /subscribers is an OPERATOR action. This one is the path a
-// SUBSCRIBER's own records take, because a key-scoped subscriber is granted Describe and no
-// Read at the broker and cannot fetch them itself. Gating it on the master key would mean
-// handing every subscriber Blnk's master credential.
-//
-// So it is authenticated by the subscriber's SASL secret, and the four cases below are the
-// whole of that contract: reaching the route without the master key is allowed, and being
-// SERVED by it requires the credential. The last case is the one that proves authentication
-// SUCCEEDED — it gets as far as the broker read and fails there, because this harness has no
-// broker.
-func TestSubscribersAPI_StreamAuthenticatesWithTheSubscribersOwnSecret(t *testing.T) {
-	subscriberID := uniqueSubscriberID()
-	row := streamAPIProvisionedRow(t, subscriberID, "")
+	// Joined before the call log is read, so the background update cannot still be appending to it.
+	requireSubscribersLastUsedTouch(t, touched)
 
-	t.Run("no master key is required to reach it, and no secret is refused", func(t *testing.T) {
-		// masterKey FALSE, which is what every other route on this surface answers
-		// ErrAuthMasterKeyRequired to. This one must not.
-		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: false})
-		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil).Maybe()
-
-		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""), "", "", "")
-
-		assertErrorCode(t, recorder, http.StatusUnauthorized, apierror.ErrSubscriberCredentialInvalid)
-		assert.NotEqual(t, http.StatusForbidden, recorder.Code,
-			"a data-plane route must not answer ErrAuthMasterKeyRequired: a subscriber does not "+
-				"hold the master key and never should")
-	})
-
-	t.Run("the wrong secret is refused with the same answer", func(t *testing.T) {
-		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
-
-		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""), "not-the-secret", "", "")
-
-		assertErrorCode(t, recorder, http.StatusUnauthorized, apierror.ErrSubscriberCredentialInvalid)
-		assert.NotContains(t, recorder.Body.String(), streamAPITestSecret,
-			"and the refusal discloses nothing about the credential it compared against")
-	})
-
-	t.Run("a topic outside the grant is refused after authentication", func(t *testing.T) {
-		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
-
-		// A REAL grantable topic that this row is not granted. The row holds the first of the
-		// grantable topics; this is the second, so the refusal is the row's grant rather than
-		// the topic catalogue.
-		other := coremodel.SubscriberGrantableTopics(coremodel.DefaultEventTopicPrefix)[1]
-		path := fmt.Sprintf("/subscribers/%s/events?topic=%s", subscriberID, other)
-
-		recorder := streamAPIServe(t, router, path, streamAPITestSecret, "", "")
-
-		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberTopicNotGranted)
-		assert.Contains(t, recorder.Body.String(), other,
-			"the refusal names the topic, which is safe: the caller sent it and can read its own "+
-				"grant through GET /subscribers/{id}")
-	})
-
-	t.Run("the correct secret reaches the broker read", func(t *testing.T) {
-		// NO BROKERS in this harness, so a request that authenticates and authorises correctly
-		// must fail at the READ and nowhere earlier. That is what makes this the positive
-		// authentication assertion: a 503 here can only be reached past both gates.
-		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
-
-		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""), streamAPITestSecret, "", "")
-
-		assertErrorCode(t, recorder, http.StatusServiceUnavailable, apierror.ErrKafkaUnavailable)
-		assert.NotContains(t, recorder.Body.String(), "records",
-			"an unavailable stream must not be answered with an empty page: a client would read "+
-				"that as 'caught up' and advance nothing")
-
-		datasource.AssertCalled(t, "GetEventSubscriberByID", mock.Anything, subscriberID)
-	})
-
-	t.Run("a foreign principal is refused even with the right secret", func(t *testing.T) {
-		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
-
-		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""),
-			streamAPITestSecret, "blnk-sub-somebody-else", "")
-
-		assertErrorCode(t, recorder, http.StatusUnauthorized, apierror.ErrSubscriberCredentialInvalid)
-	})
-}
-
-// TestSubscribersAPI_StreamRefusesAnInsecureTransport is the mirror of the credential
-// endpoint's gate, and the exposure runs the other way.
-//
-// Issuance is refused over a non-confidential channel because the RESPONSE carries a one-time
-// password. This route is refused because the REQUEST does, in a header, on every poll for as
-// long as the subscriber runs — so a plaintext consumer discloses a live credential
-// continuously rather than once.
-//
-// The store is the witness that the gate fires FIRST: a transport refusal after the registry
-// read would have already accepted the secret off the wire.
-func TestSubscribersAPI_StreamRefusesAnInsecureTransport(t *testing.T) {
-	subscriberID := uniqueSubscriberID()
-	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-
-	// 192.0.2.1 is httptest's default and is a documentation address, deliberately NOT
-	// loopback. No TLS was terminated in this process and no proxy is declared, so none of the
-	// three confidential channels applies.
-	recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""),
-		streamAPITestSecret, "", "192.0.2.1:12345")
-
-	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
-	assert.Empty(t, datasource.Calls,
-		"the transport gate must refuse before the registry is read; a refusal afterwards has "+
-			"already taken the subscriber's live secret off a channel nobody established as "+
-			"confidential")
-}
-
-// TestSubscribersAPI_StreamRefusesAMalformedRequest draws the line between the parameters that
-// are CLAMPED and the ones that are refused.
-//
-// A page size or a wait out of range is clamped, because a caller asking for more than the
-// ceiling is expressing a throughput preference and the response reports what was actually
-// read. A value that is not a number at all is a client defect, and serving the default for
-// `offset=abc` would silently re-read from wherever the default points — duplicate processing
-// at best, skipped events at worst, with nothing in the response to say so.
-func TestSubscribersAPI_StreamRefusesAMalformedRequest(t *testing.T) {
-	subscriberID := uniqueSubscriberID()
-
-	for name, query := range map[string]string{
-		"a non-numeric offset":      "offset=abc",
-		"a non-numeric partition":   "partition=first",
-		"a non-numeric limit":       "limit=lots",
-		"a non-numeric wait":        "max_wait_ms=forever",
-		"an unrecognised parameter": "offsett=100",
-	} {
-		t.Run(name, func(t *testing.T) {
-			router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-
-			recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, query),
-				streamAPITestSecret, "", "")
-
-			require.Equal(t, http.StatusBadRequest, recorder.Code, "body: %s", recorder.Body.String())
-			assert.Empty(t, datasource.Calls,
-				"a malformed request must be refused in memory, before the registry is read")
-		})
-	}
-
-	t.Run("a request naming no topic is refused as a missing parameter", func(t *testing.T) {
-		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
-		row := streamAPIProvisionedRow(t, subscriberID, "")
-		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
-
-		recorder := streamAPIServe(t, router, "/subscribers/"+subscriberID+"/events",
-			streamAPITestSecret, "", "")
-
-		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMissingParameter)
-	})
-}
-
-// TestSubscriberEventStreamResponse_ProjectsThePageWithoutReEncodingTheEnvelope pins the wire
-// projection, which is the one piece of the stream contract that lives in this package.
-//
-// Two properties, and both are the kind that only fail in production. The envelope must be
-// EMBEDDED rather than re-encoded, or a subscriber comparing a record read here against the
-// same record read from the topic finds two different payloads. And an empty page must be `[]`
-// rather than `null`, because a caught-up subscriber is the ordinary steady state and every
-// client would otherwise have to special-case it.
-func TestSubscriberEventStreamResponse_ProjectsThePageWithoutReEncodingTheEnvelope(t *testing.T) {
-	// Keys out of alphabetical order and an integer beyond float64's exact range: both survive
-	// a byte copy and neither survives a decode-and-re-encode.
-	envelope := `{"schema_version":1,"event_id":"9f1c","payload":{"amount":9007199254740993}}`
-	stamp := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-
-	page := blnk.SubscriberStreamPage{
-		SubscriberID:     "sub_0f6e2c8a",
-		Topic:            "blnk.transactions",
-		Partition:        3,
-		Records:          []blnk.SubscriberStreamRecord{{Offset: 41, Partition: 3, Key: "ldg_acme", Timestamp: stamp, Value: []byte(envelope)}},
-		NextOffset:       42,
-		HighWatermark:    99,
-		LogStartOffset:   7,
-		RecordsScanned:   5,
-		RecordsWithheld:  4,
-		Truncated:        true,
-		KeyScope:         "ldg_acme",
-		KeyScopeEnforced: true,
-	}
-
-	body, err := json.Marshal(subscriberEventStreamResponse(page))
-	require.NoError(t, err)
-
-	assert.Contains(t, string(body), `"event":`+envelope,
-		"the envelope must be EMBEDDED byte for byte. A re-marshal would reorder the keys and "+
-			"turn 9007199254740993 into 9007199254740992, so a subscriber comparing this against "+
-			"the same record read from the topic would find two different events")
-
-	var decoded map[string]interface{}
-	require.NoError(t, json.Unmarshal(body, &decoded))
-
-	for _, key := range []string{
-		"subscriber_id", "topic", "partition", "records", "next_offset", "high_watermark",
-		"log_start_offset", "records_scanned", "records_withheld", "truncated",
-		"key_scope", "key_scope_enforced",
-	} {
-		assert.Contains(t, decoded, key, "the response must carry %q", key)
-	}
-
-	assert.Equal(t, float64(42), decoded["next_offset"])
-	assert.Equal(t, float64(4), decoded["records_withheld"],
-		"the withheld count is what makes an empty page legible as a working filter rather than "+
-			"a broken feed")
-
-	t.Run("an empty page is [] and not null", func(t *testing.T) {
-		empty, err := json.Marshal(subscriberEventStreamResponse(blnk.SubscriberStreamPage{}))
-		require.NoError(t, err)
-
-		assert.Contains(t, string(empty), `"records":[]`,
-			"a caught-up subscriber is the ordinary state; null would force every client to "+
-				"special-case it")
-		assert.NotContains(t, string(empty), `"key_scope":`,
-			"and a subscriber with no prefix omits the scope rather than reporting an empty one, "+
-				"which as a filter would match nothing")
-		assert.Contains(t, string(empty), `"key_scope_enforced":false`,
-			"while the boolean is always present, so a client can branch on it without first "+
-				"testing whether the scope string is empty")
-	})
+	// AND NOTHING REACHED THE REGISTRY, so no header-driven lookup happened on the way to the
+	// refusal.
+	datasource.AssertNotCalled(t, "GetEventSubscriberByID", mock.Anything, mock.Anything)
+	datasource.AssertNotCalled(t, "ClaimSubscriberForProvisioning",
+		mock.Anything, mock.Anything, mock.Anything)
 }

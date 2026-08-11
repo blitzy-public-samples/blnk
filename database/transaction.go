@@ -719,9 +719,15 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 	}
 
 	// The balance-monitor handoff, and it goes in HERE for the same reason the event
-	// rows do: the INTENT to judge a balance's monitors belongs in the transaction that
+	// rows do: the judgement of a balance's monitors belongs to the transaction that
 	// moved the balance, so a committed movement always carries its pending evaluation
 	// and a rolled-back one carries none.
+	//
+	// What is written is not merely a marker to go and look later. The handoff carries BOTH
+	// inputs the judgement depends on — the balance exactly as this transaction wrote it, and
+	// the monitor definitions read inside this transaction — so which alerts exist, and what
+	// each says, is decided here and cannot be changed by an edit to blnk.balance_monitors
+	// afterwards. Only the alert's INSERT is deferred, to the processor that drains the row.
 	//
 	// The event rows are passed in because they answer whether it is needed. A caller
 	// that evaluated a balance's monitors BEFORE the write hands the resulting alerts to

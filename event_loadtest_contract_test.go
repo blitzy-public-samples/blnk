@@ -549,7 +549,7 @@ func TestLoadTestRunner_KeepsCredentialsOutOfArgvAndOutOfOutput(t *testing.T) {
 
 	// ORDERING: the refusal precedes the first print of an endpoint. This is the assertion the
 	// original code would have failed while still containing a perfectly good refusal downstream.
-	refusal := strings.Index(code, `require_clean_url URL "${URL}"`)
+	refusal := strings.Index(code, `refuse_credential_bearing_url "URL" "${URL}"`)
 	require.Greaterf(t, refusal, 0,
 		"%s: the runner must refuse a credential-bearing URL itself. Leaving it to events.js's "+
 			"own init check is too late — the runner prints the endpoints first",
@@ -2274,10 +2274,16 @@ func TestLoadTestOfferedRate_IsReportedAsOfferedRatherThanAsTheTarget(t *testing
 func TestLoadTestReadmeCertifyingRun_IsRunnableAsDocumented(t *testing.T) {
 	readme := readRepoFile(t, "tests/loadtest/README.md")
 
-	// Scoped to the acceptance-run section rather than searched file-wide. `run_case.sh events`
-	// appears four times in this README — a general usage example, the certifying run, and two
-	// shortened runs — and only one of them is the command that claims to certify V-1 and V-3.
-	// A file-wide search finds the general example first and asserts about the wrong line.
+	// Scoped to the acceptance-run section rather than searched file-wide. An invocation of the
+	// runner appears many times in this README — general usage examples, the certifying run, the
+	// fixture-reuse form and two shortened runs — and only one of them is the command that claims
+	// to certify V-1 and V-3. A file-wide search finds the general example first and asserts about
+	// the wrong line.
+	//
+	// Either spelling of the case name counts, because both dispatch the one branch: the guide
+	// writes the canonical `event-streaming`, and `events` normalises onto it in the runner. This
+	// test is about the command being RUNNABLE as printed, not about which of the two names it
+	// uses — TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames owns the naming.
 	section := strings.Index(readme, "## The event-streaming acceptance run")
 	require.Greaterf(t, section, 0,
 		"tests/loadtest/README.md must carry an acceptance-run section")
@@ -2288,13 +2294,14 @@ func TestLoadTestReadmeCertifyingRun_IsRunnableAsDocumented(t *testing.T) {
 
 	certifying := ""
 	for _, line := range strings.Split(body[runItWith:], "\n") {
-		if strings.Contains(line, "run_case.sh events") {
+		if strings.Contains(line, "run_case.sh event-streaming") ||
+			strings.Contains(line, "run_case.sh events") {
 			certifying = strings.TrimSpace(line)
 			break
 		}
 	}
 	require.NotEmptyf(t, certifying,
-		"the acceptance-run section must document a `run_case.sh events` invocation")
+		"the acceptance-run section must document a `run_case.sh event-streaming` invocation")
 
 	// SMOKE=1 would satisfy the runner but explicitly forfeits the right to quote the numbers,
 	// so it cannot be what the certifying command uses.

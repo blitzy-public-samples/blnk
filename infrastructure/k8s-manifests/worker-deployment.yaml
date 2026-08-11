@@ -192,10 +192,23 @@ spec:
             # name, so it neither skips that key nor warns.
             #
             # THIS ROLE CAPTURES EVENTS AND PUBLISHES NONE, so it receives the
-            # four naming-and-capture keys below and NO BROKER CREDENTIAL OF ANY
-            # KIND. server-deployment.yaml projects fourteen; the difference is
-            # a
+            # FOUR keys below — and they are the four it actually reads — plus NO
+            # BROKER CREDENTIAL OF ANY KIND. server-deployment.yaml projects
+            # twenty-four Kafka, relay and webhook keys; the difference is a
             # decision, recorded on both sides, not drift.
+            #
+            # The four, each with the code that reads it in THIS process:
+            #
+            #   KAFKA_BROKERS                    gates capture —
+            #                                    eventPublishingConfigured
+            #   KAFKA_TOPIC_PREFIX               names the topic recorded on each
+            #                                    captured row
+            #   RELAY_MAX_RETRY_ATTEMPTS         stamped on the row AT CAPTURE by
+            #                                    event_outbox.go's eventMaxAttempts,
+            #                                    so the budget travels with the row
+            #                                    rather than being read by the relay
+            #   WEBHOOK_DEPRECATION_SUNSET_DATE  ProcessWebhook runs HERE and drops a
+            #                                    delivery once the instant has passed
             #
             # IT USED TO CARRY THE PRODUCER CREDENTIAL AND THE TLS MATERIAL, and
             # nothing in this process ever produced a Kafka message.
@@ -233,13 +246,15 @@ spec:
             # KAFKA_BROKERS is what activates capture, and blnk-config.yaml
             # lists what must be set with it.
             #
-            # THE VALUES BELOW ARE STILL PARSED AND VALIDATED, so "inactive" is
-            # not "ignored" — the same statement server-deployment.yaml makes,
-            # and for the same reason: configuration load runs in every role.
-            # A WEBHOOK_DEPRECATION_SUNSET_DATE that is not RFC3339 is FATAL, an
-            # illegal KAFKA_TOPIC_PREFIX is rejected, and a half-supplied SASL
-            # pair is refused. A malformed value here keeps this pod out of
-            # Ready even where nothing is published.
+            # THE FOUR VALUES BELOW ARE STILL PARSED AND VALIDATED, so "inactive"
+            # is not "ignored" — the same statement server-deployment.yaml makes,
+            # and for the same reason: configuration load runs in every role. A
+            # WEBHOOK_DEPRECATION_SUNSET_DATE that is not RFC3339 is FATAL and an
+            # illegal KAFKA_TOPIC_PREFIX is rejected, so a malformed value here
+            # keeps this pod out of Ready even where nothing is published. That
+            # coupling is exactly why the keys this role never reads are NOT
+            # projected: validation applies to what is present, so what is absent
+            # cannot stop this pod.
             # ---------------------------------------------------------------------
             # NOT a credential and not optional. Capture is gated on the broker
             # list rather than on the publisher: with it empty the producers in
@@ -255,49 +270,55 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_BROKERS
-            # WHAT THIS ROLE DOES NOT RECEIVE, AND WHY (F-21).
+            # WHAT THIS ROLE DOES NOT RECEIVE, AND WHY.
             #
-            # The worker PUBLISHES events — handleTransactionRejection emits
-            # transaction.rejected — so it needs brokers, a topic prefix, the
-            # producer credential and the TLS material. It does nothing else
-            # with
-            # Kafka, and eight keys that used to be projected here described
-            # work
-            # that happens only in the server role:
+            # The worker ORIGINATES one event family — handleTransactionRejection's
+            # transaction.rejected — and it CAPTURES it rather than publishing it: the
+            # row is inserted inside the ledger transaction and the relay, which only
+            # the server role runs, is what puts it on a topic. So the worker needs
+            # the two naming-and-capture keys and the two above that it genuinely
+            # reads, and nine keys describe work that happens only in the server role:
             #
-            #   KAFKA_SUBSCRIBER_BROKERS      the bootstrap list handed to
-            #                                 subscribers by the credential
-            #                                 endpoint, which is an API route
-            #   KAFKA_MIN_PARTITIONS          topic assurance: EnsureTopics is
-            #   KAFKA_REPLICATION_FACTOR      called only from cmd/server.go
-            #   KAFKA_ALLOW_PARTITION_GROWTH
-            #   RELAY_MAX_RETRY_ATTEMPTS      the relay runs only in the server
-            #   RELAY_RETRY_BASE_BACKOFF_MS   role, beside the fund-lineage
-            #   RELAY_RETRY_MAX_BACKOFF_MS    outbox processor it is modelled on
-            #   RELAY_EVENT_RETENTION_DAYS
+            #   KAFKA_SUBSCRIBER_BROKERS                     the bootstrap list the
+            #                                                credential endpoint hands
+            #                                                to a subscriber — an API
+            #                                                route
+            #   KAFKA_MIN_PARTITIONS                         topic assurance:
+            #   KAFKA_REPLICATION_FACTOR                     EnsureTopics is called
+            #   KAFKA_ALLOW_PARTITION_GROWTH                 only from cmd/server.go
+            #   RELAY_RETRY_BASE_BACKOFF_MS                  the relay's own backoff
+            #   RELAY_RETRY_MAX_BACKOFF_MS                   schedule, read where the
+            #                                                relay runs
+            #   RELAY_EVENT_RETENTION_DAYS                   the retention sweeper,
+            #   RELAY_EVENT_RETENTION_BATCH_SIZE             which runs in the server
+            #   RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP  role beside the relay
             #
-            # Removing them is not tidiness. Blnk validates its configuration as
-            # a
-            # whole at start-up, so a typo in a relay backoff or a replication
-            # factor
-            # the worker would never have read still refused to let it boot —
-            # and a
-            # worker that will not boot stops TRANSACTION PROCESSING, which has
-            # nothing to do with the value that was wrong. Narrowing what each
-            # role
-            # is given narrows what can stop it.
+            # RELAY_MAX_RETRY_ATTEMPTS IS NOT IN THAT LIST, and it is the one that
+            # looks as though it should be. It is read AT CAPTURE, not at publication:
+            # event_outbox.go stamps max_attempts on the row this role writes, so the
+            # budget is a property of the row rather than of the relay reading it. A
+            # worker without it would write rows carrying the default budget while the
+            # server's rows carried the configured one.
             #
-            # WEBHOOK_DEPRECATION_SUNSET_DATE IS DELIBERATELY KEPT. It looks
-            # relay-shaped and is not: ProcessWebhook runs in THIS role and
-            # consults
-            # the sunset predicate, and so does the outbox retention path. Both
-            # roles
-            # must resolve the same window from the same value, or one could
-            # still be
-            # delivering webhooks while the other has retired them.
+            # REMOVING THE NINE IS NOT TIDINESS. Blnk validates its configuration as a
+            # whole at start-up, so a typo in a relay backoff or a replication factor
+            # this process would never have read still refused to let it boot — and a
+            # worker that will not boot stops TRANSACTION PROCESSING, which has nothing
+            # to do with the value that was wrong. Narrowing what each role is given
+            # narrows what can stop it.
             #
-            # Every one of them has a safe default, so the configuration this role
-            # does read is unchanged by their absence.
+            # There is deliberately NO "keep both roles' views identical" projection
+            # here. That argument was made for the retention keys and it is the wrong
+            # trade: it buys a value being rejected in two places instead of one, and
+            # pays for it with the transaction pipeline stopping over a setting only
+            # the relay reads. Every removed key has a safe default, so the
+            # configuration this role DOES read is unchanged by their absence.
+            #
+            # WEBHOOK_DEPRECATION_SUNSET_DATE IS DELIBERATELY KEPT for the opposite
+            # reason: it looks relay-shaped and is not. ProcessWebhook runs in THIS
+            # role and consults the sunset predicate, so both roles must resolve the
+            # same window from the same value — or one could still be delivering
+            # webhooks while the other has retired them.
             - name: KAFKA_TOPIC_PREFIX
               valueFrom:
                 configMapKeyRef:
@@ -327,59 +348,11 @@ spec:
             # the outbox row records the topic its event is destined for, so this role
             # must resolve the same names the relay will publish to. Naming a topic is
             # not authority over it.
-            - name: KAFKA_MIN_PARTITIONS
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: KAFKA_MIN_PARTITIONS
-            - name: KAFKA_REPLICATION_FACTOR
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: KAFKA_REPLICATION_FACTOR
-            - name: KAFKA_ALLOW_PARTITION_GROWTH
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: KAFKA_ALLOW_PARTITION_GROWTH
             - name: RELAY_MAX_RETRY_ATTEMPTS
               valueFrom:
                 configMapKeyRef:
                   name: blnk-config
                   key: RELAY_MAX_RETRY_ATTEMPTS
-            - name: RELAY_RETRY_BASE_BACKOFF_MS
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: RELAY_RETRY_BASE_BACKOFF_MS
-            - name: RELAY_RETRY_MAX_BACKOFF_MS
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: RELAY_RETRY_MAX_BACKOFF_MS
-            - name: RELAY_EVENT_RETENTION_DAYS
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: RELAY_EVENT_RETENTION_DAYS
-            # Carried here for the same reason
-            # RELAY_EVENT_RETENTION_DAYS is: the sweep runs in the
-            # SERVER role, not this one, but both roles load the same
-            # configuration and validate it at start-up. Supplying the
-            # full set to both keeps the two roles' views identical,
-            # so a value that is rejected or clamped is treated the
-            # same wherever it is read, rather than being noticed on
-            # only one of them.
-            - name: RELAY_EVENT_RETENTION_BATCH_SIZE
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: RELAY_EVENT_RETENTION_BATCH_SIZE
-            - name: RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
             - name: WEBHOOK_DEPRECATION_SUNSET_DATE
               valueFrom:
                 configMapKeyRef:

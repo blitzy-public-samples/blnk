@@ -31,10 +31,17 @@
 //
 // # How the gap is closed, in two halves
 //
-// The half that CAN be atomic is the INTENT. database.recordBalanceMonitorHandoffs writes
-// one handoff row per monitored balance inside the balance's own transaction, so a
-// committed movement always carries its pending evaluation and a rolled-back movement
-// carries none.
+// The half that CAN be atomic is EVERY INPUT THE ALERT IS A FUNCTION OF.
+// database.recordBalanceMonitorHandoffs writes one handoff row per monitored balance inside
+// the balance's own transaction, carrying the balance as written AND the monitor definitions
+// read in that same transaction — so a committed movement always carries its pending
+// evaluation together with the complete decision it is pending on, and a rolled-back
+// movement carries none.
+//
+// Both snapshots are load-bearing. Re-reading the monitors at drain time left one input live
+// on a table operators edit through PUT and DELETE /balance-monitors, so which events existed
+// could change after the mutation committed and two attempts at one row could disagree. The
+// snapshot is what makes this processor a pure function of the row it claimed.
 //
 // The half that cannot be atomic with the mutation is made atomic with the intent's
 // COMPLETION. This processor claims a handoff, evaluates it, and hands the alerts and the
@@ -294,11 +301,13 @@ func (p *BalanceMonitorHandoffProcessor) processBatch(ctx context.Context) {
 //
 // # The sequence, and why each step is where it is
 //
-//  1. Decode the snapshot. The condition is judged against the balance AS THE
+//  1. Decode the BALANCE snapshot. The condition is judged against the balance AS THE
 //     TRANSACTION WROTE IT, not against the balance now: re-reading would judge whatever
 //     later transactions had done to it, so a threshold crossed by this movement and
 //     uncrossed by the next would produce no alert, and two attempts could disagree.
-//  2. Look up the monitors, through the same cached read the post-commit path used.
+//  2. Decode the MONITOR snapshot, for the same reason applied to the other input. A row
+//     written before sql/1781252100.sql carries none, and only such a row falls back to the
+//     live cached read — see monitorsForHandoff.
 //  3. Evaluate each condition with the UNCHANGED CheckCondition.
 //  4. Prepare an event row per fired monitor, with a DERIVED id.
 //  5. Write the rows and the completion in ONE transaction.
@@ -329,9 +338,9 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 		return newPermanentMonitorHandoffError(err)
 	}
 
-	monitors, err := p.blnk.getBalanceMonitorsCached(ctx, handoff.BalanceID)
+	monitors, err := p.monitorsForHandoff(ctx, handoff)
 	if err != nil {
-		return fmt.Errorf("failed to load monitors for balance %s: %w", handoff.BalanceID, err)
+		return err
 	}
 
 	events := make([]*model.EventOutbox, 0, len(monitors))
@@ -384,6 +393,79 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 	}).Debug("balance monitor handoff evaluated")
 
 	return nil
+}
+
+// monitorsForHandoff resolves the monitor definitions this handoff is to be evaluated
+// against, preferring the snapshot the mutation captured.
+//
+// # The snapshot is the answer, and the fallback is a migration artefact
+//
+// A row written by this release carries the definitions that were in force when the
+// balance's transaction committed, read inside that transaction. Using them is what makes
+// the evaluation a pure function of the row: the same row evaluated twice, or evaluated an
+// hour later, reaches the same verdict, and no edit to blnk.balance_monitors between the
+// commit and the drain can add, remove or reshape an alert for a movement that has already
+// happened.
+//
+// A row written BEFORE sql/1781252100.sql carries no snapshot. Such a row is still
+// evaluable — by reading the monitors live, which is exactly what this processor used to do
+// — and it must be, because refusing it would strand the backlog an upgrade inherits at the
+// moment that backlog is largest. So the fallback exists, it is taken only for those rows,
+// and it is logged at WARN so the older guarantee is never applied silently.
+//
+// The fallback population is finite and shrinking: every row written from this release
+// forward carries a snapshot, and a handoff is written only for a balance that HAS a
+// monitor, so an empty snapshot can only mean "predates the column" and never "no
+// monitors".
+//
+// # A DECODE FAILURE IS PERMANENT
+//
+// Stored bytes do not change, so no further attempt can decode them and spending the
+// remaining budget only delays the same conclusion. It is reported as permanent, exactly as
+// a corrupt balance snapshot is. A failure of the live fallback read is NOT permanent: a
+// database that refused this read may answer the next one.
+//
+// Parameters:
+//   - ctx context.Context: the context for the fallback read, unused on the snapshot path.
+//   - handoff model.BalanceMonitorHandoff: the claimed row.
+//
+// Returns:
+//   - []model.BalanceMonitor: the definitions to evaluate. Empty is a legitimate answer and
+//     completes the handoff with no events.
+//   - error: a permanent error for an undecodable snapshot, a retryable one for a failed
+//     fallback read.
+func (p *BalanceMonitorHandoffProcessor) monitorsForHandoff(
+	ctx context.Context, handoff model.BalanceMonitorHandoff,
+) ([]model.BalanceMonitor, error) {
+	monitors, snapshotted, err := handoff.Monitors()
+	if err != nil {
+		return nil, newPermanentMonitorHandoffError(err)
+	}
+
+	if snapshotted {
+		return monitors, nil
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"handoff_id": handoff.HandoffID,
+		"balance_id": handoff.BalanceID,
+		"created_at": handoff.CreatedAt.UTC().Format(time.RFC3339),
+	}).Warn(
+		"balance monitor handoff carries no monitor snapshot, so it predates sql/1781252100.sql: " +
+			"falling back to a LIVE read of blnk.balance_monitors for this row. Its verdict therefore " +
+			"depends on the monitor definitions as they stand now rather than as they stood when the " +
+			"balance's transaction committed. Every row written since that migration carries the " +
+			"snapshot, so this population only shrinks",
+	)
+
+	live, err := p.blnk.getBalanceMonitorsCached(ctx, handoff.BalanceID)
+	if err != nil {
+		// RETRYABLE, unlike a decode failure: the database refused this read, and the next
+		// attempt may succeed.
+		return nil, fmt.Errorf("failed to load monitors for balance %s: %w", handoff.BalanceID, err)
+	}
+
+	return live, nil
 }
 
 // recordHandoffFailure writes an evaluation failure against the row and reports it.

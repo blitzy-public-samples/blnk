@@ -411,13 +411,42 @@ type ServerConfig struct {
 	// Default false, which is deny-by-default: with no in-process TLS and no
 	// declaration, credential issuance refuses with
 	// SUBSCRIBER_INSECURE_TRANSPORT rather than putting a password on a channel
-	// nobody has established as confidential. A loopback caller is still served,
-	// because those bytes never leave the host.
+	// nobody has established as confidential.
 	//
 	// SETTING THIS WITHOUT SUCH A PROXY IS UNSAFE: it re-enables exactly the
 	// disclosure the default prevents, and it does so silently. Nothing else in
 	// Blnk's behaviour depends on it.
 	TrustForwardedProto bool `json:"trust_forwarded_proto" envconfig:"BLNK_SERVER_TRUST_FORWARDED_PROTO"`
+
+	// AllowLoopbackCredentialIssuance permits POST /subscribers/{id}/kafka-credentials
+	// to answer over a plaintext connection whose PEER is a loopback address
+	// (BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE). It is a LOCAL-DEVELOPMENT
+	// convenience and nothing else.
+	//
+	// # Why a loopback peer is not, by itself, evidence of anything
+	//
+	// A loopback peer proves only that the LAST hop never touched a network. It says
+	// nothing about the hop before it. The common deployment where that distinction
+	// matters is a reverse proxy on the same host: the proxy accepts a request from the
+	// internet — possibly over plain http — and forwards it to Blnk over 127.0.0.1, so
+	// the peer Blnk sees is loopback while the client's hop was public and readable.
+	// Treating the loopback peer as proof of end-to-end confidentiality would disclose a
+	// one-time SASL password to whoever was watching that public hop, and the process
+	// cannot tell that shape apart from an operator running curl inside the container.
+	//
+	// Only the deployment knows which it is, which is why this is a declaration rather
+	// than an inference — the same posture as TrustForwardedProto above, in the same
+	// direction: the operator states the topology once, explicitly.
+	//
+	// Default false. A loopback caller with no in-process TLS and no declared proxy is
+	// therefore REFUSED with SUBSCRIBER_INSECURE_TRANSPORT, which is the correct answer
+	// for a production host that happens to have something local in front of it. The
+	// local stack sets it, because there the plaintext listener and the loopback caller
+	// are the whole topology.
+	//
+	// DO NOT SET THIS IN PRODUCTION. Use in-process TLS (SSL above) or terminate TLS at a
+	// proxy and declare it with TrustForwardedProto.
+	AllowLoopbackCredentialIssuance bool `json:"allow_loopback_credential_issuance" envconfig:"BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE"`
 	// TrustedProxies is a comma-separated list of CIDR blocks or bare IP literals whose
 	// X-Forwarded-For and X-Real-IP headers may be BELIEVED
 	// (BLNK_SERVER_TRUSTED_PROXIES).
@@ -698,17 +727,24 @@ type KafkaConfig struct {
 	// given the addresses of the externally advertised listener, which only an operator
 	// can know.
 	//
-	// So POST /subscribers/{id}/kafka-credentials reports this list when it is set. It is an
-	// OPTIONAL OVERRIDE rather than a prerequisite: with it empty, issuance reports Brokers
-	// and logs that it did. Requirement R-10 fixes the mandatory configuration surface at
-	// eight variables, and this is not one of them — making it mandatory meant a deployment
-	// satisfying the entire documented contract could run the relay and still receive 503
-	// from every issuance request, which is a required endpoint disabled by an undocumented
-	// setting.
+	// So POST /subscribers/{id}/kafka-credentials reports this list, and REQUIRES it: with it
+	// empty, issuance answers the typed 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED naming this
+	// variable, before a password is generated and before the broker is touched. It does NOT
+	// fall back to Brokers.
 	//
-	// The warning is what the refusal used to be. An in-cluster subscriber needs no override
-	// at all; an external one needs this variable, and both the start-up log and every
-	// issuance say so while the endpoint keeps working. See SubscriberFacingBrokers.
+	// A fallback existed, warning on every issuance, and a warning is not a control: it landed
+	// in Blnk's log while the consequence landed on the subscriber, days later, as a connection
+	// timeout against an internal address — holding a secret shown exactly once, so diagnosing
+	// it costs a reissue that invalidates the credential the subscriber holds. It also published
+	// the deployment's internal topology in a response body.
+	//
+	// Requirement R-10 fixes the mandatory configuration surface for PUBLISHING at eight
+	// variables and this is not one of them; it gates one endpoint whose entire output is an
+	// address a third party will dial, and there is no value Blnk can infer, because only an
+	// operator knows its externally advertised listener. A deployment whose subscribers really
+	// do run inside it sets this to the same value as Brokers, which makes that an explicit
+	// claim in one line rather than an implicit one in a fallback. Start-up warns that issuance
+	// will refuse while it is unset. See SubscriberFacingBrokers, which owns this policy.
 	SubscriberBrokers []string `json:"subscriber_brokers" envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
 
 	// KeyScopeEnforcement names WHERE a subscriber's partition_key_prefix is enforced, and
@@ -738,9 +774,18 @@ type KafkaConfig struct {
 	KeyScopeGatewayBrokers []string `json:"key_scope_gateway_brokers" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
 
 	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
-	// PRODUCER principal: the identity
-	// the event publisher in the server and worker processes authenticates as. It
-	// needs only Write and Describe on the topics Blnk owns.
+	// PRODUCER principal: the identity the event publisher authenticates as. It needs
+	// only Write and Describe on the topics Blnk owns.
+	//
+	// ONE ROLE READS IT — the SERVER. blnk.ProcessRole.PublishesEvents names only that
+	// role, and initializeEventPublisher returns the no-op implementation for every
+	// other one WITHOUT reading the broker list, this pair or the TLS material. The
+	// worker role therefore builds no producer: the events it originates (notably
+	// transaction.rejected) are CAPTURED into the outbox inside their ledger
+	// transaction, and the relay — which runs in the server role only — is what
+	// publishes them. infrastructure/k8s-manifests/worker-deployment.yaml projects
+	// neither this pair nor the TLS material for exactly that reason, and says so
+	// beside the four keys it does project.
 	//
 	// It is deliberately separate from the administrative principal below. A producer
 	// process that authenticates as the administrator holds authority to create
@@ -2059,17 +2104,17 @@ func (cnf *Configuration) warnOnInsecureKafkaTransport() {
 	}
 }
 
-// warnOnUnusableSubscriberBrokers reports at STARTUP which broker list subscribers will be given.
+// warnOnUnusableSubscriberBrokers reports at STARTUP that credential issuance will refuse.
 //
-// KAFKA_SUBSCRIBER_BROKERS is an OPTIONAL OVERRIDE: without it credential issuance reports
-// KAFKA_BROKERS, which is right when subscribers run inside the deployment and wrong when they
-// do not. Only an operator knows which, so the absence cannot be an error and must not be
-// silence either — an unnoticed internal address reaches the subscriber as an unexplained
-// connection timeout days later, nowhere near the request that produced it.
+// KAFKA_SUBSCRIBER_BROKERS is REQUIRED for issuance and has no fallback — see
+// SubscriberFacingBrokers, which owns that policy. Only an operator knows the externally
+// advertised addresses a subscriber can dial, so the absence is not something Blnk can resolve;
+// what it must not be is a surprise discovered on the first credential request.
 //
-// It is a WARNING for the same reason the insecure-transport notices are: the setting's absence
-// changes what an endpoint reports, and that belongs in the log an operator reads at boot. It
-// says nothing when no broker is configured, because then there is no Kafka and no issuance.
+// It is a WARNING rather than a load failure because publishing is unaffected: the relay, the
+// dead-letter surface and every other endpoint work without it, and refusing to start would
+// take a working ledger offline over an endpoint the deployment may not use yet. It says
+// nothing when no broker is configured, because then there is no Kafka and no issuance.
 func (cnf *Configuration) warnOnUnusableSubscriberBrokers() {
 	if len(cnf.Kafka.Brokers) == 0 {
 		return
@@ -2081,9 +2126,9 @@ func (cnf *Configuration) warnOnUnusableSubscriberBrokers() {
 
 	logrus.Warn(
 		"KAFKA_SUBSCRIBER_BROKERS is not configured: POST /subscribers/{id}/kafka-credentials " +
-			"will report the internal broker addresses Blnk dials (KAFKA_BROKERS), which is correct " +
-			"only when subscribers run inside this deployment. Set it to the externally advertised " +
-			"broker addresses subscribers connect to if they do not.",
+			"will answer 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED and issue nothing. Set it to the " +
+			"externally advertised broker addresses subscribers connect to — the same value as " +
+			"KAFKA_BROKERS when they run inside this deployment. Publishing is unaffected.",
 	)
 }
 
@@ -3053,10 +3098,11 @@ func (k KafkaConfig) OwnedTopicPrefixes() []string {
 }
 
 // SubscriberFacingBrokers returns the bootstrap list to HAND TO A SUBSCRIBER, and reports
-// whether that list is the operator's ADVERTISED one or the internal fallback.
+// whether an operator has advertised one at all.
 //
 // It exists so that the single question "what do I tell this subscriber to connect to?" has
-// one answer in one place.
+// one answer in one place. event_subscriber.go's subscriberFacingBrokers asks it and refuses
+// issuance when it reports false; nothing else decides this.
 //
 // # KAFKA_SUBSCRIBER_BROKERS IS MANDATORY FOR ISSUANCE, and there is no fallback
 //
@@ -3105,8 +3151,13 @@ func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, advertised boo
 	return brokers, true
 }
 
-// KeyScopeEnforcementNone is the shipped default: no component evaluates record keys, so a
-// subscriber's partition_key_prefix is a routing hint it must filter on itself.
+// KeyScopeEnforcementNone is the shipped default: NOTHING evaluates record keys.
+//
+// Under it a subscriber that records a partition_key_prefix is REFUSED a credential —
+// event_subscriber.go's requireProvisionableKeyScope and requireRecordableKeyScope — rather
+// than issued one whose declared boundary nothing keeps. Client-side filtering was the earlier
+// reading of this value and is not an authorization boundary: the party asked to apply the
+// filter is the party holding the credential, and any other Kafka client reads the whole topic.
 const KeyScopeEnforcementNone = "none"
 
 // KeyScopeEnforcementBrokerGateway declares that subscriber connections are terminated by a
@@ -3140,9 +3191,11 @@ const KeyScopeEnforcementBrokerGateway = "broker_gateway"
 // brokers, where nothing evaluates keys. Accepting it would produce the exact failure this
 // whole mechanism exists to prevent — a credential declaring enforced key isolation while the
 // broker serves every record on the topic — so a configuration that cannot be enforcing is
-// treated as not enforcing, and never becomes the endpoint a credential names. Issuance itself
-// still proceeds: the in-binary subscriber stream gateway is the enforcement point in that
-// deployment, and it is reached over Blnk's own API rather than at a bootstrap address.
+// treated as not enforcing, and never becomes the endpoint a credential names. Because that is
+// the SAME decision issuance reads, such a configuration also makes issuance refuse a
+// key-scoped subscriber, exactly as the default "none" does: a declaration that cannot be true
+// is worth less than no declaration, and the failure direction for an authorization control is
+// closed.
 //
 // Returns:
 //   - brokers []string: a copy of the gateway bootstrap list, nil unless enforcement is

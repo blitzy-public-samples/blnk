@@ -1473,25 +1473,34 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // PostCommitEventCaptureContract is the SINGLE place the post-commit producers are described,
 // and it exists because the alternative was three files each claiming to hold the only one.
 //
-// # What requirement R-2 actually binds
+// # What requirement R-2 binds, and what it does NOT get redefined into
 //
 // R-2 requires an event to be written to the outbox INSIDE THE SAME DATABASE TRANSACTION AS THE
-// LEDGER MUTATION THAT PRODUCED IT. Read the antecedent: the guarantee attaches an event to the
-// transaction of its producing mutation. Every event produced BY a ledger mutation is captured
-// that way, with no exceptions — the three entity creations through their repositories'
+// LEDGER MUTATION THAT PRODUCED IT. That is the contract, stated once, and nothing in this file
+// may narrow it by reinterpreting its antecedent. Every event produced BY a ledger mutation is
+// captured that way, with no exceptions — the three entity creations through their repositories'
 // EventPreparer, and every transaction lifecycle event inside the transaction that records the
 // transaction and moves the balances.
 //
-// # The three producers that have NO producing mutation
+// # The three producers whose event comes into existence AFTER their mutation committed
 //
 // Three event types are produced by an OBSERVATION OVER STATE THAT IS ALREADY COMMITTED rather
-// than by a mutation. For them R-2's antecedent does not hold: there is no open transaction at
-// the moment the event comes into existence, so there is nothing for it to be atomic WITH.
+// than by a mutation, so at the instant the event exists there is no open transaction left to
+// insert it in. That is a fact about when the event can be WRITTEN. It is NOT a licence to say
+// the event is outside R-2, and two of the three close the gap from the other side: the
+// mutation's own transaction commits everything that DECIDES the event, so the deferred write
+// cannot change which events exist or what they say.
 //
 //	balance.monitor            A monitor's condition is met by a balance that some other
-//	                           transaction has already committed. The condition is evaluated
-//	                           after that commit, by design, and the alert exists only once it
-//	                           has been evaluated.
+//	                           transaction has already committed, so the alert exists only once
+//	                           the condition has been evaluated. BOTH INPUTS TO THAT EVALUATION
+//	                           ARE COMMITTED BY THE MUTATION: recordBalanceMonitorHandoffs writes
+//	                           a handoff row inside the balance's transaction carrying the balance
+//	                           as written AND the monitor definitions in force. The verdict is
+//	                           therefore fixed at commit, and BalanceMonitorHandoffProcessor
+//	                           writes the resulting alerts in one transaction with the handoff's
+//	                           completion. What is deferred is the insert, not the decision, and
+//	                           the handoff cannot be lost — only drained late, or recorded failed.
 //	bulk_transaction.<status>  A batch summary. Every transaction the batch describes has
 //	                           already committed under its own transaction; a bulk request is
 //	                           executed one transaction at a time, with compensating void or
@@ -1503,40 +1512,58 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 //	                           kind. It is the one of the three that does NOT retry its insert;
 //	                           see the entry-point list below for why.
 //
-// THIS IS NOT A LIST OF EXCEPTIONS TO R-2, and describing it as one was wrong in two ways at
-// once. It named the wrong number — balance.monitor and the bulk summary were each documented,
-// separately, as "the one exception", two claims that cannot both hold — and it named the wrong
-// thing, because an event with no producing transaction is outside R-2's scope rather than a
-// carve-out from it. Any wording that presents this as one lone carve-out from R-2 is stale.
+// THIS IS NOT A LIST OF EXCEPTIONS TO R-2. It is the list of producers whose event row is
+// INSERTED after their mutation committed, and for two of the three the decision behind that row
+// is committed by the mutation itself. Do not describe any member as exempt from R-2, and do not
+// describe this set as though it had a single member — there are three, and exemption is not what
+// distinguishes them.
 //
 // # What these three DO guarantee, and the window that remains
 //
-// The two that describe LEDGER STATE are captured through a bounded, retried insert of the SAME
-// prepared row — PublishEventDurably here for balance.monitor, and the equivalent loop in
-// sendBulkTransactionWebhook for the batch summary. Retrying the same prepared row is what makes
-// the retry idempotent rather than duplicating: an identical stored row is adopted as success by
-// the repository instead of being inserted again under a second id.
+// Where a standalone insert IS reached, the two that describe LEDGER STATE spend a bounded,
+// retried insert of the SAME prepared row — PublishEventDurably here for balance.monitor, and the
+// equivalent loop in sendBulkTransactionWebhook for the batch summary. Retrying the same prepared
+// row is what makes the retry idempotent rather than duplicating: an identical stored row is
+// adopted as success by the repository instead of being inserted again under a second id.
 //
 // Once captured, the event is indistinguishable from any other: the same relay, the same bounded
 // retry, the same dead-lettering, the same replay, the same metrics.
 //
-// The window that CANNOT be closed here is the one between the mutation's commit and a successful
-// insert. The mutation is durable before the first attempt, so no number of attempts closes it: a
-// process that dies inside that window loses the event, and there is nothing to replay because no
-// row was ever written. That is AT-MOST-ONCE behaviour for these three event types, stated plainly
-// rather than implied, and it is escalated rather than silent — an exhausted budget is logged at
-// error level with the event id and raised through notification.NotifyError, on both the monitor
-// and the bulk path.
+// The window a standalone insert CANNOT close is the one between the mutation's commit and a
+// successful insert. The mutation is durable before the first attempt, so no number of attempts
+// closes it: a process that dies inside that window loses the event, and there is nothing to
+// replay because no row was ever written. It is escalated rather than silent — an exhausted budget
+// is logged at error level with the event id and raised through notification.NotifyError, on both
+// the monitor and the bulk path.
 //
-// # Why the window is not closed, and what closing it would take
+// # Which members that window still applies to, exactly
 //
-// It is not a coding oversight. Closing it for balance.monitor requires evaluating monitor
-// conditions INSIDE the balance mutation's transaction, and monitor condition evaluation is
-// explicitly excluded from modification by this change's plan (AAP §0.6.2, and §0.4.1 which
-// scopes the balance.go edit to substituting the transport with "monitor condition evaluation is
-// untouched"). Closing it for the bulk summary requires a batch-spanning transaction, which means
-// restructuring the transaction-processing pipeline that the same section freezes. Both are
-// contract-level changes for whoever owns that plan, not decisions this file may take.
+// It is NOT the standing behaviour of all three, and stating it as though it were understates two
+// of them:
+//
+//   - balance.monitor reaches a standalone insert ONLY on a deployment with no broker, where there
+//     is no event pipeline to capture into at all. With one configured, the alert is captured in
+//     the balance's own transaction (evaluated before the write) or decided by it (the handoff
+//     row's two snapshots) and inserted atomically with the handoff's completion — and a handoff
+//     whose evaluation budget is spent is RECORDED as failed, so it is countable rather than
+//     absent.
+//   - bulk_transaction.<status> is inserted in the same transaction as the coordinator's terminal
+//     transition. The budget buys that transaction's transient failures; a batch that never
+//     finalises stays non-terminal and is countable as an unfinalized batch.
+//   - system.error is the one member for which at-most-once is the standing behaviour. It reports
+//     a process fault, so there is no ledger state behind it to make durable and no record of its
+//     absence to count.
+//
+// # What closing the residual would take
+//
+// For system.error it would take a durable record of a fault the process may be unable to write
+// at all, which is a contract-level change for whoever owns the plan rather than a decision this
+// file may take. For the bulk summary it would take a batch-spanning transaction, which means
+// restructuring the transaction-processing pipeline AAP §0.6.2 freezes. Note what closing
+// balance.monitor's did NOT take: monitor CONDITION EVALUATION is still frozen domain logic and
+// is untouched (AAP §0.6.2, and §0.4.1 scoping the balance.go edit to the transport with "monitor
+// condition evaluation is untouched") — what the mutation captures is the evaluation's INPUTS, not
+// the evaluation.
 //
 // docs/event-streaming.md states the same three in subscriber-facing terms. If you change this
 // set, change that section in the same commit.

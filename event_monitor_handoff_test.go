@@ -67,15 +67,31 @@ func handoffProcessorHarness(t *testing.T) (*BalanceMonitorHandoffProcessor, *mo
 	return NewBalanceMonitorHandoffProcessor(instance), datasource
 }
 
-// monitoredHandoff returns a claimed handoff carrying the snapshot of a balance that
-// satisfies crossedMonitor's condition.
+// monitoredHandoff returns a claimed handoff carrying BOTH snapshots: the balance that
+// satisfies crossedMonitor's condition, and crossedMonitor itself.
 //
-// The snapshot is built from the same fixture the post-commit tests use, so the two describe
-// one balance rather than two plausible-looking ones.
+// Both are built from the same fixtures the post-commit tests use, so the two describe one
+// balance and one monitor rather than plausible-looking copies of them. Carrying the monitor
+// snapshot is what makes these tests exercise the shipped path — a row written by the
+// producer always carries one, and only a row predating sql/1781252100.sql does not.
 func monitoredHandoff(t *testing.T, handoffID string) model.BalanceMonitorHandoff {
 	t.Helper()
 
-	handoffs, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{monitoredBalance()})
+	return monitoredHandoffWithMonitors(t, handoffID, crossedMonitor())
+}
+
+// monitoredHandoffWithMonitors is monitoredHandoff with the snapshotted definitions chosen by
+// the caller, for a test that needs a condition other than "met".
+func monitoredHandoffWithMonitors(
+	t *testing.T, handoffID string, monitors ...model.BalanceMonitor,
+) model.BalanceMonitorHandoff {
+	t.Helper()
+
+	balance := monitoredBalance()
+	handoffs, err := model.PrepareBalanceMonitorHandoffs(
+		[]*model.Balance{balance},
+		map[string][]model.BalanceMonitor{balance.BalanceID: monitors},
+	)
 	require.NoError(t, err)
 	require.Len(t, handoffs, 1)
 
@@ -88,8 +104,26 @@ func monitoredHandoff(t *testing.T, handoffID string) model.BalanceMonitorHandof
 	return handoff
 }
 
-func TestPrepareBalanceMonitorHandoffs_SnapshotsEachBalanceAsWritten(t *testing.T) {
-	handoffs, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{monitoredBalance()})
+// legacyMonitoredHandoff returns a claimed handoff written BEFORE sql/1781252100.sql: the
+// balance snapshot is present and the monitor snapshot is absent.
+//
+// It is produced by stripping the column rather than by hand-building a row, so it stays a
+// faithful copy of what the previous release wrote as the rest of the row's shape evolves.
+func legacyMonitoredHandoff(t *testing.T, handoffID string) model.BalanceMonitorHandoff {
+	t.Helper()
+
+	handoff := monitoredHandoff(t, handoffID)
+	handoff.MonitorSnapshot = nil
+
+	return handoff
+}
+
+func TestPrepareBalanceMonitorHandoffs_SnapshotsBothDecisionInputsAsWritten(t *testing.T) {
+	balance := monitoredBalance()
+	handoffs, err := model.PrepareBalanceMonitorHandoffs(
+		[]*model.Balance{balance},
+		map[string][]model.BalanceMonitor{balance.BalanceID: {crossedMonitor()}},
+	)
 
 	require.NoError(t, err)
 	require.Len(t, handoffs, 1)
@@ -107,6 +141,23 @@ func TestPrepareBalanceMonitorHandoffs_SnapshotsEachBalanceAsWritten(t *testing.
 	require.NotNil(t, snapshot.Balance)
 	assert.Equal(t, 0, snapshot.Balance.Cmp(big.NewInt(700)),
 		"the snapshotted value is what the condition is judged against")
+
+	// AND THE OTHER HALF OF THE DECISION. A row carrying only the balance leaves the monitor
+	// definitions to be re-read after the commit, from a table operators edit — which is what
+	// let a deleted monitor suppress an alert for a movement that had already crossed it.
+	monitors, snapshotted, err := handoffs[0].Monitors()
+	require.NoError(t, err)
+	require.True(t, snapshotted,
+		"every row this release writes must carry a monitor snapshot; without one the evaluator "+
+			"falls back to a live read and the guarantee is the old one")
+	require.Len(t, monitors, 1)
+	assert.Equal(t, "mon_crossed", monitors[0].MonitorID)
+	assert.Equal(t, ">=", monitors[0].Condition.Operator,
+		"the CONDITION is snapshotted too, not just the monitor's identity: an edited threshold "+
+			"must not change the verdict on a movement that already committed")
+	require.NotNil(t, monitors[0].Condition.PreciseValue)
+	assert.Equal(t, 0, monitors[0].Condition.PreciseValue.Cmp(big.NewInt(100)),
+		"and the precise value survives the JSON round trip, or the payload bytes change")
 }
 
 // TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe keeps a bookkeeping row from
@@ -116,15 +167,50 @@ func TestPrepareBalanceMonitorHandoffs_SnapshotsEachBalanceAsWritten(t *testing.
 // caller's slip, and refusing the whole batch for one would refuse money movement because an
 // alerting side effect could not be described.
 func TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe(t *testing.T) {
-	handoffs, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{
-		nil,
-		{BalanceID: "   "},
-		monitoredBalance(),
-	})
+	balance := monitoredBalance()
+	handoffs, err := model.PrepareBalanceMonitorHandoffs(
+		[]*model.Balance{
+			nil,
+			{BalanceID: "   "},
+			{BalanceID: "bln_unmonitored", LedgerID: "ldg_monitored"},
+			balance,
+		},
+		map[string][]model.BalanceMonitor{balance.BalanceID: {crossedMonitor()}},
+	)
 
 	require.NoError(t, err)
-	require.Len(t, handoffs, 1, "only the usable balance yields a handoff, and nothing is rejected")
+	require.Len(t, handoffs, 1, "only the usable MONITORED balance yields a handoff, and nothing is rejected")
 	assert.Equal(t, "bln_monitored", handoffs[0].BalanceID)
+}
+
+// TestPrepareBalanceMonitorHandoffs_WritesNothingForAnUnmonitoredBalance pins the guard that
+// replaced a SQL EXISTS clause, and it is the one that keeps this affordable on the money path.
+//
+// The overwhelming majority of balances carry no monitor. A row per balance per transaction
+// would be pure write amplification at the throughput target, every one destined to evaluate to
+// "nothing fired" and be deleted — so a balance absent from the monitor map produces no row.
+//
+// It is also what gives an EMPTY MonitorSnapshot on a stored row a single meaning. Because a row
+// is never written for an empty monitor set, an empty snapshot can only mean "written before the
+// column existed", which is what makes the evaluator's legacy fallback safe to key on.
+func TestPrepareBalanceMonitorHandoffs_WritesNothingForAnUnmonitoredBalance(t *testing.T) {
+	balance := monitoredBalance()
+
+	for name, monitors := range map[string]map[string][]model.BalanceMonitor{
+		"a nil map":         nil,
+		"an empty map":      {},
+		"another balance":   {"bln_someone_else": {crossedMonitor()}},
+		"an empty entry":    {"bln_monitored": {}},
+		"a nil slice entry": {"bln_monitored": nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			handoffs, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{balance}, monitors)
+
+			require.NoError(t, err, "an unmonitored balance is not an error; it is the common case")
+			assert.Empty(t, handoffs,
+				"no monitor means no evaluation to hand off, so no row may be written")
+		})
+	}
 }
 
 // TestPrepareBalanceMonitorHandoffs_MintsAFreshIDPerMovement is the guard on the id that makes
@@ -134,9 +220,11 @@ func TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe(t *testing.T) {
 // would collapse every movement after the first into a duplicate the unique index rejects, and
 // the alerts for exactly the balances that move most would silently stop.
 func TestPrepareBalanceMonitorHandoffs_MintsAFreshIDPerMovement(t *testing.T) {
-	first, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{monitoredBalance()})
+	monitors := map[string][]model.BalanceMonitor{"bln_monitored": {crossedMonitor()}}
+
+	first, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{monitoredBalance()}, monitors)
 	require.NoError(t, err)
-	second, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{monitoredBalance()})
+	second, err := model.PrepareBalanceMonitorHandoffs([]*model.Balance{monitoredBalance()}, monitors)
 	require.NoError(t, err)
 
 	assert.NotEqual(t, first[0].HandoffID, second[0].HandoffID,
@@ -177,8 +265,10 @@ func TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion(t *te
 
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
 		Return([]model.BalanceMonitorHandoff{handoff}, nil).Once()
-	datasource.On("GetBalanceMonitors", "bln_monitored").
-		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
+	// NO GetBalanceMonitors STUB, deliberately: the row carries its monitor snapshot, so the
+	// evaluation reads no table at all. An unstubbed call would panic inside the mock, which is
+	// how this test would report a regression to the live read — and the explicit
+	// AssertNotCalled below says so rather than leaving it to a panic.
 
 	var captured []*model.EventOutbox
 	datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_atomic", mock.Anything).
@@ -203,6 +293,182 @@ func TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion(t *te
 	datasource.AssertNotCalled(t, "InsertEventOutbox", mock.Anything, mock.Anything)
 	datasource.AssertNotCalled(t, "MarkBalanceMonitorHandoffFailed",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+
+	// AND THE MONITOR DEFINITIONS CAME FROM THE ROW, not from the table. This is the R-2 half
+	// the snapshot added: a live read here would make the alert depend on the definitions as
+	// they stand when the row is drained rather than as they stood when the balance's
+	// transaction committed.
+	datasource.AssertNotCalled(t, "GetBalanceMonitors", mock.Anything)
+}
+
+// TestBalanceMonitorHandoff_VerdictIsUnchangedByALaterEditToTheMonitors is the MAJ-05
+// property stated directly: the decision is a function of the ROW, and nothing else.
+//
+// # The three divergences a live read allowed
+//
+// blnk.balance_monitors is operator-editable through PUT and DELETE /balance-monitors, and the
+// evaluator used to read it when it drained a handoff — after the balance's transaction had
+// already committed. So which events existed depended on when the row happened to be drained:
+//
+//  1. DELETED between commit and drain: no alert, for a movement that had crossed the threshold.
+//  2. CREATED in that window: an alert, for a movement the monitor was never registered to watch.
+//  3. EDITED in that window: an alert for a condition that was not the condition in force.
+//
+// Each is asserted here by making the live table say something DIFFERENT from the snapshot and
+// requiring the verdict to follow the snapshot. The stubs are `.Maybe()` rather than absent, so a
+// regression to the live read produces a wrong VERDICT — a specific, readable failure — instead
+// of an unstubbed-call panic that says only that something was called.
+func TestBalanceMonitorHandoff_VerdictIsUnchangedByALaterEditToTheMonitors(t *testing.T) {
+	t.Run("a monitor deleted after the commit still fires", func(t *testing.T) {
+		processor, datasource := handoffProcessorHarness(t)
+
+		datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]model.BalanceMonitorHandoff{monitoredHandoff(t, "bmh_deleted")}, nil).Once()
+		// THE TABLE NOW SAYS THERE IS NO MONITOR. Under the live read this produced no alert for
+		// a movement that had already crossed the threshold.
+		datasource.On("GetBalanceMonitors", "bln_monitored").
+			Return([]model.BalanceMonitor{}, nil).Maybe()
+
+		var captured []*model.EventOutbox
+		datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_deleted", mock.Anything).
+			Run(func(args mock.Arguments) { captured, _ = args.Get(2).([]*model.EventOutbox) }).
+			Return(nil).Once()
+
+		processor.processBatch(context.Background())
+
+		require.Len(t, captured, 1,
+			"the movement crossed a threshold that WAS in force when it committed, so deleting the "+
+				"monitor afterwards must not retract the alert")
+		assert.Equal(t, "balance.monitor", captured[0].EventType)
+	})
+
+	t.Run("a monitor created after the commit does not fire", func(t *testing.T) {
+		processor, datasource := handoffProcessorHarness(t)
+
+		// A handoff whose snapshot carries a condition that is NOT met, standing in for the
+		// monitors that existed at commit time.
+		unmet := crossedMonitor()
+		unmet.Condition.Operator = "<"
+
+		datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]model.BalanceMonitorHandoff{
+				monitoredHandoffWithMonitors(t, "bmh_created", unmet),
+			}, nil).Once()
+		// THE TABLE NOW CARRIES AN EXTRA, MET MONITOR. Under the live read this produced an alert
+		// for a movement the monitor was never registered to watch.
+		datasource.On("GetBalanceMonitors", "bln_monitored").
+			Return([]model.BalanceMonitor{unmet, crossedMonitor()}, nil).Maybe()
+
+		var captured []*model.EventOutbox
+		datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_created", mock.Anything).
+			Run(func(args mock.Arguments) { captured, _ = args.Get(2).([]*model.EventOutbox) }).
+			Return(nil).Once()
+
+		processor.processBatch(context.Background())
+
+		assert.Empty(t, captured,
+			"a monitor registered after a movement was never intended to alert on it, and the "+
+				"handoff must be completed rather than left claimable")
+	})
+
+	t.Run("an edited threshold does not change the verdict", func(t *testing.T) {
+		processor, datasource := handoffProcessorHarness(t)
+
+		datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
+			Return([]model.BalanceMonitorHandoff{monitoredHandoff(t, "bmh_edited")}, nil).Once()
+		// THE SAME MONITOR ID, REVERSED CONDITION. Under the live read this suppressed the alert.
+		edited := crossedMonitor()
+		edited.Condition.Operator = "<"
+		datasource.On("GetBalanceMonitors", "bln_monitored").
+			Return([]model.BalanceMonitor{edited}, nil).Maybe()
+
+		var captured []*model.EventOutbox
+		datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_edited", mock.Anything).
+			Run(func(args mock.Arguments) { captured, _ = args.Get(2).([]*model.EventOutbox) }).
+			Return(nil).Once()
+
+		processor.processBatch(context.Background())
+
+		require.Len(t, captured, 1,
+			"the condition in force at commit time was met, so an edit afterwards must not decide "+
+				"the alert")
+
+		// AND THE PAYLOAD IS THE SNAPSHOTTED MONITOR, not the edited one. The event body is the
+		// monitor object, so a live read would also have changed what a subscriber received.
+		_, data := capturedEventPayload(t, captured[0])
+		condition, ok := data["condition"].(map[string]interface{})
+		require.True(t, ok, "the payload must carry the monitor's condition object")
+		assert.Equal(t, ">=", condition["operator"],
+			"the alert must describe the condition that actually fired, not the one an operator "+
+				"substituted afterwards")
+	})
+}
+
+// TestBalanceMonitorHandoff_FallsBackToALiveReadForALegacyRow keeps the upgrade path drainable.
+//
+// A row written before sql/1781252100.sql carries no monitor snapshot. Refusing it would strand
+// the backlog an upgrade inherits at exactly the moment that backlog is largest, so such a row is
+// still evaluated — by reading the monitors live, which is the older guarantee, applied to a
+// finite and shrinking population.
+//
+// The fallback is keyed on the snapshot being ABSENT, never on it being empty-after-decode: a row
+// is only ever written for a balance that HAS a monitor, so an absent snapshot has exactly one
+// meaning. That is what stops an upgraded deployment from silently re-reading live monitors
+// forever if the write side ever regressed to omitting the column.
+func TestBalanceMonitorHandoff_FallsBackToALiveReadForALegacyRow(t *testing.T) {
+	processor, datasource := handoffProcessorHarness(t)
+
+	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
+		Return([]model.BalanceMonitorHandoff{legacyMonitoredHandoff(t, "bmh_legacy")}, nil).Once()
+	// REQUIRED, not Maybe: the whole point of this test is that the legacy row DOES reach the
+	// live read, so an implementation that refused or skipped it fails here.
+	datasource.On("GetBalanceMonitors", "bln_monitored").
+		Return([]model.BalanceMonitor{crossedMonitor()}, nil).Once()
+
+	var captured []*model.EventOutbox
+	datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_legacy", mock.Anything).
+		Run(func(args mock.Arguments) { captured, _ = args.Get(2).([]*model.EventOutbox) }).
+		Return(nil).Once()
+
+	processor.processBatch(context.Background())
+
+	require.Len(t, captured, 1,
+		"a row that predates the snapshot column must still be evaluated, or an upgrade strands "+
+			"every handoff already in the table")
+	assert.Equal(t, "balance.monitor", captured[0].EventType)
+	datasource.AssertExpectations(t)
+}
+
+// TestBalanceMonitorHandoff_FailsAnUndecodableMonitorSnapshotPermanently mirrors the balance
+// snapshot's treatment, and for the same reason.
+//
+// Stored bytes do not change, so a snapshot that does not decode will not decode on the sixth
+// attempt either. It must NOT be mistaken for a legacy row: falling back to a live read for
+// undecodable bytes would evaluate the wrong definitions while reporting success, which is worse
+// than failing the row.
+func TestBalanceMonitorHandoff_FailsAnUndecodableMonitorSnapshotPermanently(t *testing.T) {
+	processor, datasource := handoffProcessorHarness(t)
+
+	broken := monitoredHandoff(t, "bmh_broken_monitors")
+	broken.MonitorSnapshot = []byte("{not json")
+
+	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
+		Return([]model.BalanceMonitorHandoff{broken}, nil).Once()
+
+	permanent := false
+	datasource.On("MarkBalanceMonitorHandoffFailed", mock.Anything, "bmh_broken_monitors", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { permanent = args.Bool(3) }).Return(nil).Once()
+
+	processor.processBatch(context.Background())
+
+	assert.True(t, permanent,
+		"undecodable bytes cannot decode later, so the remaining budget only delays the same "+
+			"conclusion")
+	datasource.AssertNotCalled(t, "CompleteBalanceMonitorHandoffWithEvents",
+		mock.Anything, mock.Anything, mock.Anything)
+	// AND IT IS NOT TREATED AS A LEGACY ROW. Falling back here would evaluate definitions the
+	// mutation never saw and report success.
+	datasource.AssertNotCalled(t, "GetBalanceMonitors", mock.Anything)
 }
 
 // TestBalanceMonitorHandoff_DerivesAStableEventIDAcrossEvaluations proves the duplicate a
@@ -216,8 +482,8 @@ func TestBalanceMonitorHandoff_DerivesAStableEventIDAcrossEvaluations(t *testing
 
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
 		Return([]model.BalanceMonitorHandoff{handoff}, nil).Twice()
-	datasource.On("GetBalanceMonitors", "bln_monitored").
-		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
+	// No live read on either evaluation: both judge the same snapshotted definitions, which is
+	// what makes the two verdicts comparable at all.
 
 	ids := make([]string, 0, 2)
 	datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_stable", mock.Anything).
@@ -257,9 +523,9 @@ func TestBalanceMonitorHandoff_CompletesWithNoEventsWhenNoConditionIsMet(t *test
 	unmet.Condition.Operator = "<"
 
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
-		Return([]model.BalanceMonitorHandoff{monitoredHandoff(t, "bmh_quiet")}, nil).Once()
-	datasource.On("GetBalanceMonitors", "bln_monitored").
-		Return([]model.BalanceMonitor{unmet}, nil)
+		Return([]model.BalanceMonitorHandoff{
+			monitoredHandoffWithMonitors(t, "bmh_quiet", unmet),
+		}, nil).Once()
 
 	completed := false
 	datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_quiet", mock.Anything).
@@ -306,8 +572,12 @@ func TestBalanceMonitorHandoff_FailsAnUndecodableSnapshotPermanently(t *testing.
 func TestBalanceMonitorHandoff_RetriesATransientEvaluationFailure(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
+	// THE TRANSIENT FAULT IS THE LEGACY FALLBACK READ, and it is the only read left on this
+	// path: a row carrying a monitor snapshot needs no database at all to be evaluated. A row
+	// written before sql/1781252100.sql does, so it is the one that can still fail this way —
+	// and the assertion below is that such a failure keeps the budget.
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
-		Return([]model.BalanceMonitorHandoff{monitoredHandoff(t, "bmh_transient")}, nil).Once()
+		Return([]model.BalanceMonitorHandoff{legacyMonitoredHandoff(t, "bmh_transient")}, nil).Once()
 	datasource.On("GetBalanceMonitors", "bln_monitored").
 		Return([]model.BalanceMonitor(nil), errors.New("connection reset"))
 
@@ -331,8 +601,6 @@ func TestBalanceMonitorHandoff_RecordsTheFailureWhenTheCaptureCannotCommit(t *te
 
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
 		Return([]model.BalanceMonitorHandoff{monitoredHandoff(t, "bmh_uncommitted")}, nil).Once()
-	datasource.On("GetBalanceMonitors", "bln_monitored").
-		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
 	datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_uncommitted", mock.Anything).
 		Return(errors.New("could not commit")).Once()
 	datasource.On("MarkBalanceMonitorHandoffFailed", mock.Anything, "bmh_uncommitted", mock.Anything, false).
@@ -358,8 +626,6 @@ func TestBalanceMonitorHandoff_EvaluatesEveryHandoffInABatch(t *testing.T) {
 		Return([]model.BalanceMonitorHandoff{broken, monitoredHandoff(t, "bmh_second_ok")}, nil).Once()
 	datasource.On("MarkBalanceMonitorHandoffFailed", mock.Anything, "bmh_first_broken", mock.Anything, true).
 		Return(nil).Once()
-	datasource.On("GetBalanceMonitors", "bln_monitored").
-		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
 	datasource.On("CompleteBalanceMonitorHandoffWithEvents", mock.Anything, "bmh_second_ok", mock.Anything).
 		Return(nil).Once()
 

@@ -459,6 +459,26 @@ func initializeWebhookTaskHandlers(b *blnkInstance, mux *asynq.ServeMux) {
 		return
 	}
 
+	// FOUR HANDLERS ON ONE MUX, AND ONLY THE FIRST BELONGS TO THE LEGACY WEBHOOK TRANSPORT.
+	//
+	// The terminal release of the Kafka event-streaming feature — the one enumerated in
+	// docs/webhook-to-kafka-migration.md and in the sunset block at the foot of webhooks.go —
+	// removes the ProcessWebhook line below AND NOTHING ELSE HERE. That is the whole of this
+	// function's part in it, and the AAP schedules it for after the 30-day dual-delivery window
+	// has closed, not before: until then the handler must stay registered, because a delivery
+	// enqueued inside the window has to be drained by something.
+	//
+	// The three lines after it belong to other features and must SURVIVE that release. Nothing
+	// here fails to compile if they are removed by mistake — the failure is silent, and it is
+	// transaction hooks and search indexing that stop:
+	//
+	//   - new:hook_execution is the /hooks feature's PRE_TRANSACTION and POST_TRANSACTION
+	//     callouts, which internal/hooks/manager.go enqueues onto cfg.Queue.WebhookQueue BY
+	//     NAME. That is why the queue itself outlives this transport.
+	//   - cfg.Queue.IndexQueue and new:index:batch are TypeSense indexing.
+	//
+	// TestWebhookTerminalRelease_ChecklistMatchesTheSurface asserts all three are still here, so
+	// an over-applied deletion fails a test rather than degrading a deployment quietly.
 	mux.HandleFunc(cfg.Queue.WebhookQueue, b.blnk.ProcessWebhook)
 	mux.HandleFunc("new:hook_execution", b.blnk.Hooks.ProcessHookTask)
 	mux.HandleFunc(cfg.Queue.IndexQueue, b.indexData)

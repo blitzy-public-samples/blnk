@@ -259,9 +259,10 @@ func TestEventPipelineLogging_NoSiteUsesLogrusWithError(t *testing.T) {
 // credential and is absent from this map fails it — so adding a credential to the
 // configuration forces a decision here instead of quietly arriving unredacted.
 //
-// A field is listed with false when its name reads like a credential but its value is not
-// one; there are none today, and the entry form exists so that a routing field named
-// "…Key" can be classified with a reason rather than by weakening the redaction rule.
+// A field is listed with false when its name reads like a credential but its value is not one.
+// That is what keeps the redaction rule strict: the alternative to classifying such a field is
+// loosening the name test until it stops matching, which would also stop it matching a real
+// credential named the same way.
 var credentialConfigurationFields = map[string]bool{
 	".AwsSecretAccessKey":        true,
 	".Server.SecretKey":          true,
@@ -270,6 +271,13 @@ var credentialConfigurationFields = map[string]bool{
 	".TokenizationSecret":        true,
 	".Kafka.SASLSecret":          true,
 	".Kafka.SASLAdminSecret":     true,
+
+	// A BOOLEAN DECLARATION, not a secret. It states whether this host has anything in front
+	// of it, which decides whether a loopback caller may be issued a Kafka credential over
+	// plaintext — so its NAME reads as a credential while its value is "true" or "false" and
+	// discloses nothing. Redacting it would hide which transport declaration a refusal was
+	// decided by, in the log line an operator reads to fix exactly that.
+	".Server.AllowLoopbackCredentialIssuance": false,
 }
 
 // TestConfiguredCredentials_CannotSurviveALogLine is the guard that ties redaction to THIS

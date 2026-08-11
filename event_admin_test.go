@@ -134,19 +134,6 @@ type fakeAdminClient struct {
 	// read in its OWN round trip and only when one was asked for.
 	timeOffsetRequests int
 
-	// records is the fake log: the records Fetch serves, per topic and partition, in offset
-	// order. Each record carries the offset it sits at, so a test can model a compacted or
-	// sparse log without the fake inventing offsets.
-	records map[string]map[int][]kafka.Record
-
-	// fetchErrors is the error Fetch reports INSIDE its response for a topic and partition,
-	// which is where the authorizer's verdict arrives. A test uses it to model
-	// TOPIC_AUTHORIZATION_FAILED without a broker.
-	fetchErrors map[string]map[int]error
-
-	// fetchRequests records what the gateway asked the broker for, so the bounds it applies
-	// are assertable rather than inferred from what came back.
-	fetchRequests []*kafka.FetchRequest
 	// scram maps a principal to the SCRAM mechanisms it holds credentials for.
 	scram map[string][]kafka.ScramMechanism
 	// bindings is the broker's ACL store: CreateACLs adds to it, DeleteACLs removes the
@@ -237,53 +224,11 @@ func newFakeAdminClient() *fakeAdminClient {
 		committedErrors:     map[string]map[int]error{},
 		windowStart:         map[string]map[int]int64{},
 		windowStartOmitted:  map[string]map[int]bool{},
-		records:             map[string]map[int][]kafka.Record{},
-		fetchErrors:         map[string]map[int]error{},
 	}
-}
-
-// withRecords seeds the fake log of one partition, numbering offsets from the given base.
-//
-// The key and value are the two fields the gateway acts on: the key decides whether a
-// key-scoped subscriber is entitled to the record, and the value is what a delivered record
-// carries. kafka.NewBytes is used rather than a raw slice because RecordReader consumers read
-// through the Bytes interface, exactly as the real client's do.
-func (f *fakeAdminClient) withRecords(
-	topic string,
-	partition int,
-	base int64,
-	pairs ...[2]string,
-) *fakeAdminClient {
-	if f.records[topic] == nil {
-		f.records[topic] = map[int][]kafka.Record{}
-	}
-
-	stamp := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-	for index, pair := range pairs {
-		f.records[topic][partition] = append(f.records[topic][partition], kafka.Record{
-			Offset: base + int64(index),
-			Time:   stamp.Add(time.Duration(index) * time.Second),
-			Key:    kafka.NewBytes([]byte(pair[0])),
-			Value:  kafka.NewBytes([]byte(pair[1])),
-		})
-	}
-
-	return f
-}
-
-// withFetchError makes Fetch answer one partition with a broker-side error, which is how an
-// authorization refusal reaches a caller.
-func (f *fakeAdminClient) withFetchError(topic string, partition int, err error) *fakeAdminClient {
-	if f.fetchErrors[topic] == nil {
-		f.fetchErrors[topic] = map[int]error{}
-	}
-	f.fetchErrors[topic][partition] = err
-
-	return f
 }
 
 // withTopic adds an existing topic with the given number of partitions, numbered from
-// zero, and gives every partition an empty log.
+// zero.
 func (f *fakeAdminClient) withTopic(topic string, partitions int) *fakeAdminClient {
 	ids := make([]int, 0, partitions)
 	for id := 0; id < partitions; id++ {
@@ -1056,77 +1001,19 @@ func (f *fakeAdminClient) OffsetFetch(
 	return response, nil
 }
 
-// Fetch serves the seeded log of one partition.
+// THERE IS NO Fetch ON THIS FAKE, and its absence mirrors the seam.
 //
-// It models the three properties the gateway depends on and nothing more: records arrive in
-// offset order from the requested offset, the response reports the partition's watermarks,
-// and a broker-side error arrives in the response rather than as a returned error — which is
-// where an authorization refusal actually appears.
+// kafkaAdminAPI carried a Fetch method while Blnk hosted a read path that served a key-scoped
+// subscriber its own records. That path is gone — Blnk serves no subscriber records, and a
+// key-scoped subscriber's records are delivered by the component the deployment declares in front
+// of the brokers — so the seam no longer names Fetch and this fake no longer answers it. The
+// compile-time assertion below is what keeps the two in step: adding Fetch back to the seam breaks
+// this file until the fake grows it, which is the point at which somebody has to justify a second
+// data plane.
 //
-// kafka.NewRecordReader is the real client's own reader type, so the production code reads
-// through the same interface it reads a live broker through; a slice would let a reader bug
-// pass here and fail against Kafka.
-func (f *fakeAdminClient) Fetch(
-	ctx context.Context,
-	req *kafka.FetchRequest,
-) (*kafka.FetchResponse, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if err := f.record("Fetch", ctx); err != nil {
-		return nil, err
-	}
-	f.fetchRequests = append(f.fetchRequests, req)
-
-	log := f.records[req.Topic][req.Partition]
-
-	response := &kafka.FetchResponse{
-		Topic:            req.Topic,
-		Partition:        req.Partition,
-		LogStartOffset:   0,
-		HighWatermark:    int64(len(log)),
-		LastStableOffset: int64(len(log)),
-		Records:          kafka.NewRecordReader(),
-	}
-
-	if injected, ok := f.fetchErrors[req.Topic][req.Partition]; ok {
-		response.Error = injected
-
-		return response, nil
-	}
-
-	// FIRST/LAST sentinels resolved the way the broker resolves them, so a caller asking for
-	// the beginning or the end is served rather than silently given nothing.
-	from := req.Offset
-	switch from {
-	case int64(kafka.FirstOffset):
-		from = 0
-	case int64(kafka.LastOffset):
-		from = int64(len(log))
-	}
-
-	served := make([]kafka.Record, 0, len(log))
-	for _, record := range log {
-		if record.Offset < from {
-			continue
-		}
-
-		served = append(served, record)
-	}
-
-	response.Records = kafka.NewRecordReader(served...)
-
-	return response, nil
-}
-
-// fetchBounds returns the requests Fetch received, so a test can assert the bounds the caller
-// applied rather than only the records it kept.
-func (f *fakeAdminClient) fetchBounds() []*kafka.FetchRequest {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return append([]*kafka.FetchRequest(nil), f.fetchRequests...)
-}
+// The record-serving scaffolding removed with it: a seeded per-partition log, an injected
+// per-partition response error for modelling TOPIC_AUTHORIZATION_FAILED, and a recorder for the
+// fetch bounds a caller applied. All three existed only to exercise the removed reader.
 
 // Compile-time proof that the fake is a faithful stand-in for the real client.
 var _ kafkaAdminAPI = (*fakeAdminClient)(nil)
@@ -1818,7 +1705,8 @@ const testSubscriberID = "sub_0f6e2c8a"
 //
 // It used to carry a prefix, "to prove it is carried and NOT enforced", which was accurate while
 // a key scope changed nothing about the grant. It changes the grant now — a key-scoped
-// subscriber is provisioned with Describe and NO Read so that Blnk's stream gateway is the only
+// subscriber is provisioned with Describe and NO Read so that the declared key-authorising
+// component is the only
 // path its records can take — so a fixture carrying one would quietly make every binding
 // assertion in this file assert the narrowed shape. testKeyScopedSubscriber is that case, named.
 func testSubscriber() *model.EventSubscriber {
@@ -1845,7 +1733,8 @@ func testSubscriber() *model.EventSubscriber {
 //
 // It is the fixture for the boundary Kafka cannot express: such a subscriber is granted Describe
 // but not Read on its topics, so the broker refuses every record fetch and the records it is
-// entitled to are delivered — key-filtered — by Blnk's subscriber stream gateway. Every test
+// entitled to are delivered — key-filtered — by the key-authorising component the deployment
+// declared. Every test
 // about that shape names this fixture, so no test asserts it by accident.
 func testKeyScopedSubscriber() *model.EventSubscriber {
 	prefix := "acme-"
@@ -2089,7 +1978,7 @@ func TestProvisionSubscriberPrincipal_BindsLeastPrivilegeACLs(t *testing.T) {
 //
 // Describe, so the subscriber can still resolve its topics and their offsets. Read on its own
 // consumer-group namespace, so the namespace stays reserved to it. And NO topic Read, so the
-// broker refuses every fetch it attempts — which is what makes Blnk's stream gateway, where the
+// broker refuses every fetch it attempts — which is what makes the declared component, where the
 // prefix IS applied, the only path its records can take.
 //
 // The equality assertion is deliberate rather than a scan: this grant is smaller than the
@@ -3112,7 +3001,7 @@ func TestProvisionSubscriberPrincipal_WarnsWhenTheGrantIsEmpty(t *testing.T) {
 // which is strictly worse than not enforcing it at all.
 //
 // Its PRESENCE is mapped, onto KeyScoped, and that is what makes the boundary real: a key-scoped
-// request withholds record-level Read so that Blnk's stream gateway is the only path records can
+// request withholds record-level Read so that the declared component is the only path records can
 // take. Both halves are asserted here, because mapping neither leaves the prefix unenforced and
 // mapping the value would widen the grant.
 func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKeyPrefix(t *testing.T) {
@@ -3153,7 +3042,7 @@ func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKe
 	// AND THE REQUEST IS VALID, precisely BECAUSE of the narrowing above. A declared key scope has
 	// no broker representation, so what makes such a request safe is that it asks for none: no
 	// topic Read is requested, every direct fetch is refused by the broker, and the records are
-	// delivered key-filtered by the stream gateway.
+	// delivered key-filtered by the declared key-authorising component.
 	require.NoError(t, request.validate(),
 		"a key-scoped request that withholds record-level Read must be provisionable: refusing it "+
 			"withholds the credential instead of narrowing it, and leaves the third dimension of "+
@@ -3184,7 +3073,7 @@ func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKe
 // the fail-closed rule, and it asserts the part that matters: NOTHING reaches the broker.
 //
 // A key-scoped row IS provisionable — its bindings are Describe on the topics and Read on the
-// consumer group, with no record-level Read anywhere, and the stream gateway delivers its records
+// consumer group, with no record-level Read anywhere, and the declared component delivers its records
 // key-filtered. What must never be provisioned is a request that names the prefix while asking for
 // the ordinary grant, because the credential it mints reads every record on every granted topic,
 // including other ledgers' and other subscribers', beneath a registry row saying it may see one
