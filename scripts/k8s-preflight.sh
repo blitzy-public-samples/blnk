@@ -63,6 +63,13 @@
 #      builds would migrate to one schema and serve against another. A Go contract test
 #      asserts this too; it is repeated here because this is the check that runs against
 #      the manifests an operator is ACTUALLY about to apply, which may be a rendered copy.
+#   5. Every Secret KEY the manifests reference exists. This is the same failure class as
+#      an unresolved image and the only other one that survives a successful-looking
+#      apply: a missing Secret or a Secret with the wrong key name leaves the pod in
+#      ContainerCreating, admitted and scheduled, with the reason visible only in
+#      `kubectl describe pod`. The required inventory is derived from the manifests
+#      themselves — every `secretKeyRef` under the tree being checked — so it stays
+#      correct as the manifests change instead of being a list that rots here.
 #
 # HOW TO RESOLVE THE APPLICATION IMAGE
 #
@@ -88,8 +95,12 @@
 #   0  every image is resolved, digest-pinned and consistent; safe to apply
 #   1  at least one problem, each reported with the file, the container and the remedy
 #
-# This script reads manifests and, with --render, writes copies. It never contacts a
-# cluster and never runs kubectl, so it is safe in CI with no kubeconfig.
+# The image checks read manifests and, with --render, write copies; they never contact a
+# cluster. The Secret check (5) needs one, and degrades rather than failing when there is
+# none: with no kubectl or no reachable cluster it PRINTS the inventory the manifests
+# require and reports the check as not run, so the script stays usable in CI with no
+# kubeconfig. Pass --require-secrets in a deploy pipeline to make "could not verify" a
+# failure, which is what you want on the run that is about to apply.
 
 set -euo pipefail
 
@@ -136,11 +147,20 @@ Usage:
       BLNK_IMAGE, then check OUT_DIR. Apply OUT_DIR, not the source tree.
 
 Options:
-  -h, --help     This text.
+  -h, --help            This text.
+  --namespace NS        Namespace the Secret check reads (default: the namespace the
+                        manifests declare, else blnk).
+  --require-secrets     Fail when the Secret check cannot run — no kubectl, or no
+                        reachable cluster. Use this on the run that is about to apply.
+  --skip-secrets        Skip the Secret check entirely.
+  --list-secrets        Print "SECRET<TAB>KEY" for every Secret key the manifests
+                        reference and exit 0. Contacts no cluster and checks no image;
+                        this is the list to create before applying.
 
 Environment:
-  BLNK_IMAGE     Digest-pinned application image. Required by --render.
-  NO_COLOR       Any value disables colour.
+  BLNK_IMAGE            Digest-pinned application image. Required by --render.
+  BLNK_NAMESPACE        Same as --namespace.
+  NO_COLOR              Any value disables colour.
 USAGE
 }
 
@@ -150,6 +170,10 @@ USAGE
 
 RENDER_DIR=''
 MANIFEST_DIR=''
+NAMESPACE="${BLNK_NAMESPACE:-}"
+REQUIRE_SECRETS='no'
+CHECK_SECRETS='yes'
+LIST_SECRETS='no'
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -158,6 +182,12 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || die '--render requires an output directory.' \
                 'Usage: --render OUT_DIR'
             RENDER_DIR="$2"; shift 2 ;;
+        --namespace)
+            [ "$#" -ge 2 ] || die '--namespace requires a namespace name.'
+            NAMESPACE="$2"; shift 2 ;;
+        --require-secrets) REQUIRE_SECRETS='yes'; shift ;;
+        --skip-secrets) CHECK_SECRETS='no'; shift ;;
+        --list-secrets) LIST_SECRETS='yes'; shift ;;
         -*) die "unknown option: $1" 'Run with --help for usage.' ;;
         *)
             [ -z "${MANIFEST_DIR}" ] || die "unexpected extra argument: $1"
@@ -270,6 +300,75 @@ extract_images() {
     ' "$1"
 }
 
+# Prints "secret<TAB>key" for every secretKeyRef in a file, ignoring comments.
+#
+# Textual for the same reasons extract_images is, and indentation-scoped rather than
+# window-scoped: the two child keys may appear in either order, and the block ends at the
+# first line indented no further than `secretKeyRef:` itself. A window of N lines would
+# either miss a `key:` written after an `optional:` or spill into the next env entry.
+extract_secret_refs() {
+    awk '
+        {
+            line = $0
+            trimmed = line
+            sub(/^[[:space:]]+/, "", trimmed)
+            if (trimmed ~ /^#/) next
+            if (trimmed == "") next
+
+            indent = match(line, /[^ \t]/)
+            if (indent == 0) indent = 1
+
+            # Leaving the block: anything indented no further than the ref key itself.
+            if (inref && indent <= refindent) inref = 0
+
+            if (trimmed ~ /^-?[[:space:]]*secretKeyRef:[[:space:]]*$/) {
+                inref = 1; refindent = indent; sname = ""; skey = ""
+                next
+            }
+
+            if (!inref) next
+
+            if (trimmed ~ /^-?[[:space:]]*name:[[:space:]]*/) {
+                v = trimmed
+                sub(/^-?[[:space:]]*name:[[:space:]]*/, "", v)
+                sub(/[[:space:]]*#.*$/, "", v)
+                gsub(/^["'"'"']|["'"'"']$/, "", v)
+                sname = v
+            } else if (trimmed ~ /^-?[[:space:]]*key:[[:space:]]*/) {
+                v = trimmed
+                sub(/^-?[[:space:]]*key:[[:space:]]*/, "", v)
+                sub(/[[:space:]]*#.*$/, "", v)
+                gsub(/^["'"'"']|["'"'"']$/, "", v)
+                skey = v
+            }
+
+            if (sname != "" && skey != "") {
+                print sname "\t" skey
+                inref = 0
+            }
+        }
+    ' "$1"
+}
+
+# Prints the namespace the manifests declare, or nothing. First one wins: every object in
+# this set lives in the same namespace, and a set that did not would need a flag anyway.
+manifest_namespace() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (line ~ /^#/) next
+            if (line !~ /^namespace:[[:space:]]*/) next
+            sub(/^namespace:[[:space:]]*/, "", line)
+            sub(/[[:space:]]*#.*$/, "", line)
+            gsub(/^["'"'"']|["'"'"']$/, "", line)
+            if (line == "") next
+            print line
+            exit
+        }
+    ' "$1"
+}
+
 # Prints the image for one container name in one manifest, or nothing. Tracks `name:` and
 # returns the first `image:` that follows the requested container.
 image_for_container() {
@@ -297,6 +396,27 @@ image_for_container() {
         }
     ' "$1"
 }
+
+# Prints the de-duplicated "secret<TAB>key" inventory for every manifest in a directory.
+#
+# One function so the list mode and the cluster check cannot disagree about what is
+# required: a list an operator creates from and a check that then demands something else
+# is worse than no list.
+collect_secret_refs() {
+    for secret_manifest in "$1"/*.yaml; do
+        [ -f "${secret_manifest}" ] || continue
+        extract_secret_refs "${secret_manifest}"
+    done | sort -u
+}
+
+# ---------------------------------------------------------------------------------------
+# The list mode, which is not a check and therefore exits before any of them.
+# ---------------------------------------------------------------------------------------
+
+if [ "${LIST_SECRETS}" = 'yes' ]; then
+    collect_secret_refs "${MANIFEST_DIR}"
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------------------
 # The checks
@@ -412,6 +532,107 @@ if [ -f "${server_manifest}" ]; then
     fi
 fi
 
+# --- Check 5: every referenced Secret key exists ------------------------------------------
+#
+# The inventory comes from the manifests, never from a list maintained here: a workload
+# that starts consuming a new key gets checked without anyone remembering to update this
+# script, and a key that stops being referenced stops being demanded.
+# De-duplicated by collect_secret_refs: the same key is legitimately consumed by several
+# workloads, and it has to exist once rather than once per consumer.
+secret_refs="$(collect_secret_refs "${MANIFEST_DIR}")"
+secret_keys_required="$(printf '%s' "${secret_refs}" | grep -c . || true)"
+secret_objects_required="$(printf '%s\n' "${secret_refs}" | cut -f1 | sort -u | grep -c . || true)"
+
+secrets_verified=0
+secrets_missing=0
+secrets_checked='no'
+
+if [ "${CHECK_SECRETS}" = 'no' ]; then
+    warn 'Secret check skipped (--skip-secrets).'
+elif [ "${secret_keys_required}" -eq 0 ]; then
+    info 'no secretKeyRef found in these manifests, so there is nothing to verify.'
+    secrets_checked='yes'
+else
+    if [ -z "${NAMESPACE}" ]; then
+        for manifest in "${MANIFEST_DIR}"/*.yaml; do
+            [ -f "${manifest}" ] || continue
+            NAMESPACE="$(manifest_namespace "${manifest}")"
+            [ -n "${NAMESPACE}" ] && break
+        done
+    fi
+    NAMESPACE="${NAMESPACE:-blnk}"
+
+    reachable='no'
+    if command -v kubectl >/dev/null 2>&1; then
+        if kubectl --request-timeout=10s get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+            reachable='yes'
+        fi
+    fi
+
+    if [ "${reachable}" = 'yes' ]; then
+        secrets_checked='yes'
+        for secret in $(printf '%s\n' "${secret_refs}" | cut -f1 | sort -u); do
+            # One request per Secret rather than one per key: the key set comes back whole,
+            # and a Secret that does not exist is then one failure rather than several.
+            if ! present_keys="$(kubectl -n "${NAMESPACE}" --request-timeout=10s get secret \
+                "${secret}" -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null)"; then
+                present_keys=''
+                missing_object='yes'
+            else
+                missing_object='no'
+            fi
+
+            for key in $(printf '%s\n' "${secret_refs}" | awk -F'\t' -v s="${secret}" '$1 == s { print $2 }'); do
+                if [ "${missing_object}" = 'yes' ]; then
+                    secrets_missing=$((secrets_missing + 1))
+                    problems=$((problems + 1))
+                    finding "Secret ${secret} does not exist in namespace ${NAMESPACE} (needs key ${key})"
+                    detail 'A workload referencing it is admitted and scheduled, then sticks in'
+                    detail 'ContainerCreating with the reason only in `kubectl describe pod`.'
+                    detail 'Create it before applying, for example:'
+                    detail ''
+                    detail "  kubectl -n ${NAMESPACE} create secret generic ${secret} --from-literal=${key}=..."
+                    continue
+                fi
+
+                if printf '%s\n' "${present_keys}" | grep -qx -- "${key}"; then
+                    secrets_verified=$((secrets_verified + 1))
+                    continue
+                fi
+
+                secrets_missing=$((secrets_missing + 1))
+                problems=$((problems + 1))
+                finding "Secret ${secret} exists in namespace ${NAMESPACE} but carries no key ${key}"
+                detail 'The manifests reference this key by name, and a Secret with the right'
+                detail 'name and the wrong key fails exactly like a missing Secret.'
+                detail "present keys: $(printf '%s' "${present_keys}" | tr '\n' ' ')"
+                detail 'Add it, for example:'
+                detail ''
+                detail "  kubectl -n ${NAMESPACE} patch secret ${secret} \\"
+                detail "    -p '{\"stringData\":{\"${key}\":\"...\"}}'"
+            done
+        done
+    else
+        # Not a failure by default: this script's image checks are meant to run in a CI job
+        # with no kubeconfig, and refusing there would mean either a permanently red job or a
+        # script nobody runs. The inventory is printed instead, so the requirement is visible
+        # even when it cannot be verified.
+        if [ "${REQUIRE_SECRETS}" = 'yes' ]; then
+            problems=$((problems + 1))
+            finding "the Secret check could not run: no reachable cluster for namespace ${NAMESPACE}"
+            detail '--require-secrets was passed, so this is a failure rather than a warning.'
+        else
+            warn "Secret check NOT RUN: no kubectl, or namespace ${NAMESPACE} is unreachable. Pass --require-secrets to make this a failure."
+        fi
+
+        info "${secret_keys_required} Secret key(s) across ${secret_objects_required} Secret object(s) must exist in namespace ${NAMESPACE} before applying:"
+        printf '%s\n' "${secret_refs}" | while IFS="$(printf '\t')" read -r secret key; do
+            [ -n "${secret}" ] || continue
+            printf '%s\n' "    ${secret} / ${key}"
+        done
+    fi
+fi
+
 # ---------------------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------------------
@@ -423,6 +644,9 @@ if [ "${problems}" -gt 0 ]; then
 fi
 
 ok "preflight passed: ${checked_images} image reference(s) checked; every owned image is resolved and digest-pinned."
+if [ "${secrets_checked}" = 'yes' ] && [ "${secret_keys_required}" -gt 0 ]; then
+    ok "${secrets_verified} Secret key(s) across ${secret_objects_required} Secret object(s) verified present in namespace ${NAMESPACE}."
+fi
 if [ "${unpinned_third_party}" -gt 0 ]; then
     warn "${unpinned_third_party} third-party image(s) are tag-only rather than digest-pinned. Pre-existing, and outside the error scope of this gate - see the header note."
 fi

@@ -4,6 +4,8 @@ Blnk's HTTP webhook push is being retired and replaced by a Kafka event stream. 
 
 Read [event-streaming.md](event-streaming.md) first if you have not already. It is the subscriber-facing contract — the topic catalogue, the `LedgerEvent` envelope, the event types and your idempotency obligation — and this document deliberately does not restate any of it.
 
+> **Upgrading rather than adopting?** [Upgrade Notes](#upgrade-notes) lists every change in this release that reaches a deployment which has not enabled Kafka at all — 5xx response bodies, the default rate limit, the TypeSense credential, the Kubernetes image placeholder, one irreversible migration, and the Go language floor. There is no `CHANGELOG` in this repository; that section is the release note.
+
 ## What You Need To Do
 
 Seven steps. The first five can all be done while your webhook receiver is still running and still being delivered to, which is the entire point of the window.
@@ -82,6 +84,7 @@ This is worth knowing precisely, because the behaviour is deliberately strict an
 | A sunset that is not a valid RFC3339 instant | **Startup is refused.** The error names the variable and the expected layout. This is fatal with or without brokers. |
 | No sunset, and `KAFKA_BROKERS` **is** set | **Startup is refused.** The error names the variable, the 30-day window length and how to compute the instant. |
 | No sunset, and `KAFKA_BROKERS` is empty | Accepted quietly. There is no transport to migrate to, so there is no window, and the deprecated routes keep answering as they always did. |
+| The literal `retired` (any casing) | Accepted, with or without brokers. The window is **closed**: the legacy leg does not run and the deprecated routes answer `410 Gone`. See below. |
 | A valid sunset | Normalised to UTC. The window start is back-filled as *sunset minus 30 days*. |
 
 Refusing to start is the point. The date governs two security-relevant behaviours — whether the deprecated, less protected HTTP transport still runs, and whether the deprecated management routes still answer — and an operator who states a retirement instant and mis-types it must not have it silently reinterpreted. Refusing happens before any traffic is served, and it is the only signal that cannot be overlooked.
@@ -90,13 +93,34 @@ Should a configuration carrying brokers but no usable window ever reach the runt
 
 > One state is rejected outright rather than tolerated: a process publishing to Kafka *before* its declared window has opened. The relay refuses to start, because running there would make the real concurrent-delivery period longer than the 30 days subscribers were told about.
 
+#### After the window closes: `WEBHOOK_DEPRECATION_SUNSET_DATE=retired`
+
+The variable is mandatory whenever `KAFKA_BROKERS` is set, and it does not stop being mandatory when the migration it describes is over. That leaves a deployment past its sunset with an awkward choice: keep last quarter's instant on file for ever, which reads to the next person exactly like a stale value nobody noticed, or clear it and fail to start.
+
+So the literal `retired` is accepted in place of an instant:
+
+```bash
+WEBHOOK_DEPRECATION_SUNSET_DATE=retired
+```
+
+It states the true thing — the window has closed — and it resolves to the same behaviour a past instant does:
+
+- `WebhookSunsetPassed` answers **true**, so the relay publishes to Kafka and enqueues no legacy webhook task.
+- The deprecated webhook management routes answer **`410 Gone`**.
+- The window state is **closed**, which is a state the relay *starts* in. This is the difference between the sentinel and an empty value: an empty value is not a declaration, so a publishing process refuses to start on it, and that refusal is exactly what would otherwise make an obsolete date permanent.
+- There is **no instant to describe**, so the `410` response carries no `Sunset` or `Deprecation` header rather than a fabricated one.
+
+The sentinel is one exact word. `retire`, `already retired` and anything else that is neither the word nor an RFC3339 instant is still refused at startup, naming both accepted forms — a value that merely mentions retirement is a mis-stated instant, not a declaration.
+
+Use a **date** during the migration; use the sentinel afterwards. Both are honest statements of where the deployment is, and neither can be confused for the other.
+
 ### Configuration reference
 
 Only the keys this document names. The complete set is documented with commentary in `.env.example`, and the subscriber-facing subset is in [event-streaming.md](event-streaming.md#configuration).
 
 | Variable | Purpose |
 |---|---|
-| `WEBHOOK_DEPRECATION_SUNSET_DATE` | The RFC3339 instant the legacy HTTP transport retires. Required once `KAFKA_BROKERS` is set. The window opens 30 days earlier. |
+| `WEBHOOK_DEPRECATION_SUNSET_DATE` | The RFC3339 instant the legacy HTTP transport retires, or the literal `retired` once it has. Required once `KAFKA_BROKERS` is set. The window opens 30 days earlier. |
 | `KAFKA_BROKERS` | The brokers Blnk itself publishes to. Empty disables publishing. |
 | `KAFKA_SUBSCRIBER_BROKERS` | The externally advertised brokers reported to a subscriber when credentials are issued. **Required for issuance, with no fallback**: left unset, `POST /subscribers/{id}/kafka-credentials` answers `503 SUBSCRIBER_BROKERS_NOT_CONFIGURED` and mints nothing, rather than publishing the internal `KAFKA_BROKERS` addresses. Set it to the same value as `KAFKA_BROKERS` if your subscribers really do run inside the deployment. |
 | `BLNK_WEBHOOK_URL` | The single global legacy webhook destination — see [What Never Existed](#what-never-existed). |
@@ -539,7 +563,7 @@ as the feature's terminal step rather than as part of the release that introduce
 | `processHTTP`, `processHTTPRaw`, `SendWebhook`, `EnqueueLegacyWebhookDelivery`, `ProcessWebhook`, `legacyWebhookTaskID`, `LegacyWebhookRetention`, `LegacyWebhookEventIDHeader` | `webhooks.go` | **DELETE the whole file.** Nothing else in it outlives the transport; confirm that with a build rather than by reading |
 | The transport's own tests | `webhooks_test.go`, `webhooks_process_test.go`, `webhooks_destination_test.go`, `webhooks_logging_test.go` | **DELETE.** Their subject is the HTTP transport; the payload and vocabulary behaviours they also touch are covered where those two symbols now live |
 | `mux.HandleFunc(cfg.Queue.WebhookQueue, b.blnk.ProcessWebhook)` | `cmd/workers.go` | **UNREGISTER THIS ONE LINE**, and nothing else on that mux. See the preserve table below — this is the row most likely to be over-applied |
-| The dual-delivery branch and its state: `eventRelayLegacyTransport`, `dualDeliveryActive`, `MarkEventWebhookPending`, the `webhook_pending` status, `kafka_dispatched_at`, `webhook_attempts` | `event_relay.go` | **DELETE.** All of it exists to keep a failed legacy enqueue recoverable *during* the window. Deleting `webhooks.go` breaks the build at the enqueue call site, which is the intended reminder that the two go together |
+| The dual-delivery branch and its state: `eventRelayLegacyTransport`, `dualDeliveryActive`, `MarkEventWebhookPending`, the `webhook_pending` status, `kafka_dispatched_at`, `webhook_attempts` | `event_relay.go`, `model/event.go` | **DELETE.** All of it exists to keep a failed legacy enqueue recoverable *during* the window. Deleting `webhooks.go` breaks the build at the enqueue call site, which is the intended reminder that the two go together |
 | The delivery use of the webhook configuration block — `WebhookConfig`, reached as the `Webhook` member of the notification config | `config/config.go`, `webhooks.go` | **STOP READING IT for delivery.** The struct may stay so existing `blnk.json` files keep loading; nothing may deliver from it |
 | The dual-delivery test | `event_dual_delivery_test.go` | **DELETE**, with the branch it tests — not with `webhooks.go`, since its subject is the branch |
 
@@ -726,6 +750,100 @@ During the window this costs you nothing extra. The same `event_id` travels on b
 
 > The legacy queue's own duplicate suppression is bounded and short-lived by design, and it was never intended to cover the migration. Your idempotency horizon is yours to choose against your own storage, which is strictly better than any window Blnk could pick on your behalf.
 
+## Upgrade Notes
+
+**Read this before you deploy, whether or not you are adopting Kafka.** Everything above is about the event pipeline. This section is about the changes in this release that reach a deployment which has not enabled Kafka at all — behaviour that differs from the previous release on the same configuration, and the one migration that cannot be undone.
+
+There is no `CHANGELOG` in this repository, so this is the release note: every upgrade-affecting change is listed here rather than left to be discovered from `.env.example`, an in-file comment or a manifest.
+
+| # | What changed | Who is affected | What you must do |
+|---|---|---|---|
+| 1 | **5xx response bodies are sanitised.** An unclassified error behind a server-fault code answers `"internal server error"` instead of the underlying error text. | **Every endpoint**, including transactions, balances, ledgers, identities and reconciliation. | Stop parsing the `error` string on a 5xx. Read the `code` field. |
+| 2 | **The default rate limit is 2,000 requests per second**, from 5,000,000. | Any deployment that never set `BLNK_RATE_LIMIT_RPS`. | Set it explicitly if your traffic exceeds 2,000 rps. |
+| 3 | **A publicly-known TypeSense key is no longer substituted** in secure mode. | `BLNK_SERVER_SECURE=true` with `BLNK_TYPESENSE_DNS` set and no key. | Set `BLNK_TYPESENSE_API_KEY`, or unset `BLNK_TYPESENSE_DNS`. |
+| 4 | **The Kubernetes manifests carry an unresolvable image placeholder.** | Anyone applying `infrastructure/k8s-manifests/` directly. | Render first: `make k8s_render BLNK_IMAGE=repo@sha256:…`, then apply `./rendered`. |
+| 5 | **`sql/1781252200` withdraws the internal `system` topic from every subscriber grant, and is irreversible.** | Deployments whose subscribers were granted `<prefix>.system`. | Record which subscribers hold it **before** migrating; re-record with `PUT /subscribers/{id}` if you roll back. |
+| 6 | **`KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS` now ships as `true`.** | Secure-mode deployments that relied on the unset value to block credential issuance. | Set it to `false` to keep that refusal. |
+| 7 | **The PostgreSQL volume is not sized for event retention.** | Anyone enabling the event pipeline on Kubernetes. | Size `volumeClaimTemplates` before the first apply — the template is immutable afterwards. |
+
+### 1. Every 5xx response body is sanitised, on every endpoint
+
+This is the one change in this list with a **cross-cutting API-contract consequence**, and it reaches endpoints this release otherwise does not touch.
+
+`respondError` in `api/errors.go` now substitutes a fixed string for the underlying error text on any response whose default code maps to a 5xx status. Before, a client received the error as raised — which for a database fault meant a PostgreSQL message naming the schema, table, column and routine, and for a broker fault meant internal addresses.
+
+```
+Before:  {"error": "pq: relation \"blnk.transactions\" does not exist", "code": "TXN_INTERNAL"}
+After:   {"error": "internal server error",                              "code": "TXN_INTERNAL"}
+```
+
+**The cause is not lost, it is moved.** It is logged at `error` level under a `cause` field, through the same redaction the rest of the service uses. Diagnosis moves from the response body to the log, which is where it belonged: a response body crosses a trust boundary and a log does not.
+
+**4xx bodies are unchanged**, and deliberately so — the decision is made on the resulting HTTP status rather than on a list of codes. A 4xx is a caller-actionable refusal whose message is the useful part of the response, so those stay verbatim. A caller-supplied `fallbackMessage` is also honoured verbatim, because the caller chose that wording for a client to read.
+
+**What breaks.** Any client, test or runbook that matches on the `error` string of a 5xx. Match on `code` instead: it is the stable field, it is enumerated in `internal/apierror/codes.go`, and it did not change.
+
+**Why it is here rather than in its own release.** It is a CWE-209 (information exposure through an error message) fix, and the event pipeline's own errors carry broker addresses and internal topic names — so shipping the pipeline without it would have added new disclosure paths on the same release. It is called out here because it is the only change in this document that alters an endpoint no other part of this release goes near.
+
+### 2. The default rate limit is 2,000 requests per second
+
+`BLNK_RATE_LIMIT_RPS` unset previously resolved to 5,000,000 requests per second, which is not a limit — it is a limiter that never engages. It now defaults to 2,000.
+
+A deployment that set the variable is unaffected. A deployment that did not now has a real limit, and traffic above it receives `429`. **If you sustain more than 2,000 rps, set the variable explicitly**; the previous behaviour is `BLNK_RATE_LIMIT_RPS=5000000`, though a number that large is better read as "disabled" and stated as such.
+
+### 3. A publicly-known TypeSense key is no longer substituted
+
+`resolveSearchCredential` refuses to start a **secure-mode** deployment that names a TypeSense host and supplies no API key. It previously fell back to the key the public example uses, which is a credential printed in this repository.
+
+The refusal is narrow by construction. It requires all three of `BLNK_SERVER_SECURE=true`, a non-empty `BLNK_TYPESENSE_DNS`, and an empty key — so a local stack, a test and any deployment outside secure mode all behave exactly as before. **Set `BLNK_TYPESENSE_API_KEY` to the key your TypeSense was started with, or unset `BLNK_TYPESENSE_DNS` if you are not using search.**
+
+### 4. The Kubernetes manifests must be rendered before they are applied
+
+`server-deployment.yaml` and `worker-deployment.yaml` carry `REPLACE_WITH_PINNED_DIGEST` where the application image belongs. That is deliberate: a committed digest is a promise that an apply runs a specific build, and a repository cannot make that promise on your behalf.
+
+```bash
+make k8s_render BLNK_IMAGE=ghcr.io/you/blnk@sha256:<64 hex>   # writes ./rendered
+kubectl apply -f ./rendered
+```
+
+`./rendered` is gitignored, so a resolved digest cannot be committed by accident. `make k8s_preflight` checks a tree before it reaches a cluster — every image digest-pinned, and every Secret key the manifests reference present in the namespace — and it is **expected to fail on the committed tree**, because the placeholder is intentional there. Every other image in the manifests is already digest-pinned; only the application image is yours to supply.
+
+### 5. `sql/1781252200` is irreversible, and it changes existing grants
+
+The migration removes every `<anything>.system` entry from `authorized_topics` on every subscriber row, and stamps `grant_reconcile_pending_at` on each row it changed so the settlement pass reconciles the broker side.
+
+**The prior grant is preserved nowhere.** The `Down` section is deliberately a no-op with the reason recorded in the file: rolling the schema back does not restore a topic whose payload renders Blnk's own error text verbatim.
+
+The topic itself is unaffected — `<prefix>.system` is still created and still published to, carrying `ledger.created`, `system.error` and every event type the catalogue does not yet recognise. What changes is that **no subscriber principal may hold an ACL over it**.
+
+**Before you migrate**, record which subscribers hold it, because afterwards you cannot ask:
+
+```bash
+psql "$BLNK_DATA_SOURCE_DNS" -c \
+  "SELECT subscriber_id, authorized_topics FROM blnk.event_subscribers
+    WHERE EXISTS (SELECT 1 FROM unnest(authorized_topics) t WHERE t LIKE '%.system');"
+```
+
+If you roll back to a build where the category was grantable, re-record each one with `PUT /subscribers/{id}` — one deliberate request per subscriber, which is the right cost for restoring access to that topic. There is no `PATCH` route; an unregistered verb is answered by the router, not the handler.
+
+### 6. `KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS` now ships as `true`
+
+Every shipped configuration — `.env.example`, both Compose files and `infrastructure/k8s-manifests/blnk-config.yaml` — now declares that a subscriber credential reads every record on each topic it is granted. That **is** the mandated access model: category topics, no per-tenant topics, and a Kafka authorizer with no message-key dimension.
+
+Shipping it undeclared alongside `BLNK_SERVER_SECURE=true`, which the Kubernetes ConfigMap also sets, meant the reference production deployment answered `409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED` on the credential-issuance endpoint out of the box.
+
+**If you relied on the unset value as a gate, set it to `false` explicitly** and the refusal returns. For access genuinely narrower than a whole topic, narrow each subscriber's `authorized_topics` — the topic dimension is enforced at the broker in full — and read [Requirement Divergence](kafka-operations.md#requirement-divergence--partition-key-scoping-has-no-enforcement-point-in-this-repository) first: the record-key dimension of the access model **has no enforcement point in this repository**, so a boundary narrower than a topic is not something Blnk alone can give you.
+
+### 7. Size the PostgreSQL volume before the first apply
+
+The event outbox is a new table on an existing database, and `volumeClaimTemplates` in a StatefulSet is **immutable after creation** — so a volume that turns out to be too small cannot be enlarged by editing the manifest. The reference `postgres-statefulset.yaml` ships the same `10Gi` it always has, which is deliberately not sized for any particular event rate.
+
+[Storage — Size The Volume From The Row](kafka-operations.md#storage--size-the-volume-from-the-row-not-from-a-round-number) carries the arithmetic, the measured per-row cost, and the `kubectl delete statefulset postgres --cascade=orphan` procedure for the case where you have to correct it after the fact.
+
+### The Go language floor, and where the toolchain is pinned
+
+`go.mod` declares `go 1.25.0` — the language floor, not a toolchain pin. The patched toolchain a build actually uses is pinned where a build resolves one: the four `go-version` entries in `.github/workflows/go.yml` and the `golang:1.25-alpine` base in the `Dockerfile`. **Building from source needs Go 1.25.0 or newer**; use the current 1.25.x patch release, and note that the language floor deliberately does not force one, so a distribution-supplied toolchain is enough to build.
+
 ## Related Documents
 
 | Document | Covers |
@@ -733,3 +851,4 @@ During the window this costs you nothing extra. The same `event_id` travels on b
 | [event-streaming.md](event-streaming.md) | The subscriber contract: the topic catalogue, the `LedgerEvent` envelope, the event types, partitioning and ordering, and your idempotency obligation |
 | [kafka-operations.md](kafka-operations.md) | The operator side: provisioning topics and principals, the ACL model, dead-letter triage and replay |
 | [metrics.md](metrics.md) | The metric catalogue and example queries, including publish throughput, dead-letter counts and consumer lag |
+| [Upgrade Notes](#upgrade-notes) (this document) | Every change in this release that affects a deployment not adopting Kafka, and the one migration that cannot be undone |

@@ -28,14 +28,6 @@ import (
 // postLedgerActions performs some actions after a ledger has been created. It sends the
 // newly created ledger to the search index queue, which indexes the ledger in
 // Typesense.
-//
-// Indexing stays here because it is genuinely post-commit work: TypeSense is a separate
-// system with its own retry queue and nothing about it belongs in a ledger transaction.
-//
-// Parameters:
-//   - ctx context.Context: the creating request's context. Detached from cancellation
-//     before it is handed to the publish, which outlives the request that spawned it.
-//   - ledger *model.Ledger: A pointer to the newly created Ledger model.
 func (l *Blnk) postLedgerActions(ctx context.Context, ledger *model.Ledger) {
 	// Derived outside the goroutine, while ctx is still live, and detached from
 	// cancellation for the same reason postBalanceActions detaches: CreateLedger is
@@ -61,17 +53,6 @@ func (l *Blnk) postLedgerActions(ctx context.Context, ledger *model.Ledger) {
 
 // ledgerCreatedEventPreparer returns the preparer that builds the ledger.created outbox
 // row, for the repository to insert INSIDE the transaction that inserts the ledger.
-//
-// That is the window the requirement exists to close: the ledger was durable and its
-// event was not, so a crash — or a failed insert — between the two left a ledger that
-// no subscriber would ever hear about, with nothing left to replay from. The event now
-// commits with the ledger or not at all.
-//
-// Parameters:
-//   - ctx context.Context: the creating request's context, captured for tracing only.
-//
-// Returns:
-//   - database.EventPreparer[model.Ledger]: the preparer to hand to the repository.
 func (l *Blnk) ledgerCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Ledger] {
 	// A NIL PREPARER when nothing is configured, so the repository stays on its
 	// single-statement path instead of opening a transaction to insert no event. See
@@ -89,12 +70,6 @@ func (l *Blnk) ledgerCreatedEventPreparer(ctx context.Context) database.EventPre
 }
 
 // CreateLedger creates a new ledger together with its ledger.created event, atomically.
-//
-// The event preparer is handed to the repository, which inserts the ledger and the
-// event row in one transaction. A failure to prepare or insert the event therefore
-// fails the creation, and the caller sees no ledger — which is the correct outcome: a
-// ledger whose event was lost is a ledger no subscriber knows exists, and the
-// alternative silently trades a visible failure for an invisible one.
 //
 // Parameters:
 // - ledger: A Ledger model representing the ledger to be created.
@@ -115,7 +90,6 @@ func (l *Blnk) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
 }
 
 // GetAllLedgers retrieves all ledgers from the datasource.
-// It returns a slice of Ledger models and an error if the operation fails.
 //
 // Returns:
 // - []model.Ledger: A slice of Ledger models.
@@ -125,7 +99,6 @@ func (l *Blnk) GetAllLedgers(limit, offset int) ([]model.Ledger, error) {
 }
 
 // GetAllLedgersWithFilter retrieves ledgers from the datasource using advanced filters.
-// It returns a slice of Ledger models and an error if the operation fails.
 //
 // Parameters:
 // - ctx: Context for the operation.
@@ -158,7 +131,6 @@ func (l *Blnk) GetAllLedgersWithFilterAndOptions(ctx context.Context, filters *f
 }
 
 // GetLedgerByID retrieves a ledger by its ID from the datasource.
-// It returns a pointer to the Ledger model and an error if the operation fails.
 //
 // Parameters:
 // - id: A string representing the ID of the ledger to retrieve.
@@ -171,7 +143,6 @@ func (l *Blnk) GetLedgerByID(id string) (*model.Ledger, error) {
 }
 
 // UpdateLedger updates an existing ledger's name.
-// It calls postLedgerActions after a successful update to handle indexing and webhooks.
 //
 // Parameters:
 // - id: A string representing the ID of the ledger to update.

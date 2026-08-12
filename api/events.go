@@ -34,43 +34,6 @@ import (
 
 // This file holds the three master-key-gated operational endpoints of the Kafka event
 // pipeline:
-//
-// Domain rules stay out of this file: no SQL, no retry policy, no metrics instrument
-// and no definition of what "stuck" means. What the handlers do own is the HTTP
-// contract — parameter validation, paging bounds, response shape and error codes — and,
-// for the statistics endpoint, composing two sources into one answer.
-//
-//   - The dead-letter inventory and its filtering predicates live in the root package's
-//     EventDeadLetterService, so the relay, the metrics collector and this endpoint
-//     share one answer.
-//   - Replay re-publishes the STORED BYTES of the event. Nothing here unmarshals,
-//     re-marshals, re-keys or otherwise reconstructs the message.
-//   - Error responses go through respondCode/respondError from api/errors.go with a
-//     typed code from internal/apierror.
-//
-// All three are OPERATOR endpoints: the inventory names every stuck event in the
-// deployment, the replay re-publishes ledger events, and the statistics expose the
-// whole outbox and the broker's offsets. They are therefore gated on the master key as
-// their very first act, before any parameter is read and before any service is touched,
-// mirroring ensureHookManagementAuthorized. A non-master caller learns only that the
-// master key is required — never whether an event id exists, which would otherwise turn
-// the replay route into an oracle.
-//
-// Write-side exactly-once is a property of the events captured INSIDE their mutation's
-// database transaction, not of the catalogue as a whole. That is every event type but
-// two, and the two differ from each other:
-//
-//   - `bulk_transaction.<status>` is captured in the same transaction as the batch
-//     coordinator's terminal transition, so it is lost only if that transaction never
-//     commits — which leaves the batch countable as unfinalized.
-//   - `system.error` reports a process fault rather than a ledger mutation, so it has
-//     no transaction to join and is captured standalone.
-//
-// Everything else, `balance.monitor` and a coalesced batch's `transaction.*` events
-// included, has its row inserted before the mutation commits. docs/event-streaming.md
-// carries the per-event-type table. Kafka delivery is at-least-once regardless of how a
-// row was captured, and event_id is the subscriber's idempotency key, so no message or
-// field below claims a stronger guarantee than that.
 
 const (
 	// deadLetterPageDefaultLimit and deadLetterPageMaxLimit are the page bounds applied at
@@ -103,11 +66,6 @@ const (
 )
 
 // Window bounds for GET /events/stats.
-//
-// A window fixes both. The dispatched count and the audit are bounded by it, the broker
-// side is measured over the SAME interval, and every other status is still counted
-// exactly and in full — so nothing an operator acts on is hidden by choosing a short
-// window.
 const (
 	// eventStatsDefaultWindow is the window applied when a request names none. One day,
 	// matching the daily zero-loss reconciliation the runbook describes.
@@ -163,19 +121,6 @@ func ensureEventManagementAuthorized(c *gin.Context) bool {
 
 // rejectUnsupportedQueryParameters refuses a request that carries a query parameter the
 // endpoint cannot honour.
-//
-// It is shared by the event surface and the subscriber surface — both close their
-// parameter sets for the reason below, and one implementation means the two cannot
-// disagree about what an unsupported name does.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//   - supported []string: the accepted parameter names, in the order they should be
-//     listed back to the caller.
-//
-// Returns:
-//   - bool: true when every parameter present is supported.
 func rejectUnsupportedQueryParameters(c *gin.Context, supported []string) bool {
 	if c.Request == nil || c.Request.URL == nil {
 		return true
@@ -206,12 +151,6 @@ func rejectUnsupportedQueryParameters(c *gin.Context, supported []string) bool {
 }
 
 // quotedQueryParameters renders parameter names for an error message.
-//
-// Parameters:
-//   - names []string: the names to render.
-//
-// Returns:
-//   - []string: a fresh slice of quoted names, in the order given.
 func quotedQueryParameters(names []string) []string {
 	quoted := make([]string, 0, len(names))
 	for _, name := range names {
@@ -222,19 +161,6 @@ func quotedQueryParameters(names []string) []string {
 }
 
 // includeCountFromQuery parses the include_count option EXPLICITLY.
-//
-// ParseQueryOptions reads include_count as `value == "true"`, so "TRUE", "True", "1"
-// and "yes" all mean false. A caller that asked for a total and received a bare array
-// has no way to tell its spelling was ignored from a deployment that does not support
-// counting, and the two call for opposite responses.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - bool: whether a total was requested.
-//   - bool: false when the refusal has been written.
 func includeCountFromQuery(c *gin.Context) (bool, bool) {
 	raw := strings.TrimSpace(c.Query(eventQueryParamIncludeCount))
 	if raw == "" {
@@ -256,13 +182,6 @@ func includeCountFromQuery(c *gin.Context) (bool, bool) {
 
 // ListDeadLetterEvents serves GET /events/dead-letter: the paged inventory an operator
 // triages dead-lettered ledger events from.
-//
-// limit and offset follow this package's uniform convention: a non-positive or
-// oversized limit becomes 20, a negative offset becomes 0, and a value that is not an
-// integer at all is a client mistake and is refused rather than silently defaulted.
-// Ordering is FIXED by the repository at newest occurrence first, ties broken by
-// descending id, which is what makes paging stable; sort_by and sort_order are accepted
-// for client compatibility and do not change it.
 //
 // Parameters:
 //   - c *gin.Context: the request and response.
@@ -289,13 +208,6 @@ func (a *Api) ListDeadLetterEvents(c *gin.Context) {
 	}
 
 	// ONE READ WHEN A TOTAL WAS ASKED FOR, TWO OTHERWISE.
-	//
-	// On a triage endpoint that reads as a different amount of stuck work than there is,
-	// and a client comparing the page against the total does not terminate.
-	//
-	// The combined read draws both from one read-only REPEATABLE READ snapshot. A caller
-	// that did not ask for a total still takes the cheaper single-statement path, because
-	// there is then no second answer to be coherent with.
 	var (
 		page  coremodel.DeadLetterInventoryPage
 		total int64
@@ -341,10 +253,6 @@ func (a *Api) ListDeadLetterEvents(c *gin.Context) {
 		// because a total was once derived from a whole-table per-status aggregate that knew
 		// nothing about event_type, topic or the occurrence window; the snapshot matters
 		// because two reads sharing a predicate still observe two populations.
-		//
-		// What it is not is a promise about the paging SESSION. Paging spans many requests
-		// over a live inventory that the relay adds to and a replay removes from, so a later
-		// page can reveal entries this total did not count.
 		response.TotalCount = &total
 	}
 
@@ -352,11 +260,6 @@ func (a *Api) ListDeadLetterEvents(c *gin.Context) {
 }
 
 // DeadLetterPageResponse is the body GET /events/dead-letter returns.
-//
-// It carries the page and the position to resume from, which is what replaced an offset
-// a caller pages by handing next_cursor back rather than by naming a depth, so a page's
-// cost is independent of how deep it is and no page can repeat or skip a row because
-// something was written while the caller was paging.
 type DeadLetterPageResponse struct {
 	// Data is the page, newest occurrence first. Never null.
 	Data []model.DeadLetterEvent `json:"data"`
@@ -376,19 +279,6 @@ type DeadLetterPageResponse struct {
 
 // deadLetterListOptionsFromQuery reads the page and the filters from the query string,
 // writing the refusal itself when a value is unusable.
-//
-// The status filter is passed through verbatim after trimming rather than validated
-// here: the service owns the vocabulary and rejects an unsupported value with a typed
-// validation error naming the two states it accepts, and a second copy of that list in
-// this file would be a second thing to keep correct.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - blnk.DeadLetterListOptions: the page and its narrowing.
-//   - bool: false when the refusal has been written.
 func deadLetterListOptionsFromQuery(c *gin.Context) (blnk.DeadLetterListOptions, bool) {
 	limit, ok := deadLetterPageLimitFromQuery(c)
 	if !ok {
@@ -427,22 +317,6 @@ func deadLetterListOptionsFromQuery(c *gin.Context) (blnk.DeadLetterListOptions,
 }
 
 // deadLetterOccurrenceBoundFromQuery reads one end of the occurrence window.
-//
-// The format is RFC3339 because that is the format the event envelope's occurred_at is
-// serialised in and the format every dead-letter item echoes back — a caller pasting a
-// timestamp out of a response into a filter must have it accepted. An offset is
-// required by the format, so "2026-01-02T03:04:05Z" and "2026-01-02T04:04:05+01:00" are
-// both accepted and both name the same instant; a bare date or a local timestamp with
-// no zone is refused, because guessing a zone would silently shift the window by hours.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//   - parameter string: the query-parameter name to read, for the error message.
-//
-// Returns:
-//   - time.Time: the parsed instant, or the zero time when the parameter is absent.
-//   - bool: false when the refusal has been written.
 func deadLetterOccurrenceBoundFromQuery(c *gin.Context, parameter string) (time.Time, bool) {
 	raw := strings.TrimSpace(c.Query(parameter))
 	if raw == "" {
@@ -463,19 +337,6 @@ func deadLetterOccurrenceBoundFromQuery(c *gin.Context, parameter string) (time.
 }
 
 // deadLetterPageLimitFromQuery reads limit and applies this package's normalisation.
-//
-// A non-positive or oversized value becomes the default, matching ParseFiltersFromBody.
-// A value that does not parse as an integer is refused instead, matching GetAllLedgers:
-// defaulting it would silently serve a page the caller did not ask for, and the mistake
-// is the caller's to see.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - int: the normalised limit.
-//   - bool: false when the refusal has been written.
 func deadLetterPageLimitFromQuery(c *gin.Context) (int, bool) {
 	raw := strings.TrimSpace(c.Query(eventQueryParamLimit))
 	if raw == "" {
@@ -497,23 +358,6 @@ func deadLetterPageLimitFromQuery(c *gin.Context) (int, bool) {
 }
 
 // deadLetterCursorFromQuery reads the opaque page cursor.
-//
-// PostgreSQL reads and discards every row before an offset, so the cost of a page grew
-// with its depth and the depth was the caller's to choose without any bound — on a
-// table that gains 43.2 million rows a day. The page-size cap bounded the RESPONSE and
-// bounded no work at all.
-//
-// A MALFORMED CURSOR IS REFUSED, never coerced. Defaulting it to the beginning would
-// restart a paging client at page one, which is an infinite loop for any client that
-// pages until the cursor is absent.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - *model.DeadLetterCursor: the decoded position, nil for the first page.
-//   - bool: false when the refusal has been written.
 func deadLetterCursorFromQuery(c *gin.Context) (*coremodel.DeadLetterCursor, bool) {
 	cursor, err := coremodel.ParseDeadLetterCursor(c.Query(eventQueryParamCursor))
 	if err != nil {
@@ -531,18 +375,6 @@ func deadLetterCursorFromQuery(c *gin.Context) (*coremodel.DeadLetterCursor, boo
 
 // deadLetterTopicFilterFromQuery resolves the topic filter to an ORIGINAL category
 // topic, which is what the service filters on.
-//
-// Both spellings are accepted because both are natural. An operator reading the
-// inventory sees dlt_topic on every item and will filter by it; an operator asking
-// "which transaction events are stuck" thinks in category topics.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - string: the original category topic to filter on, or "" for no narrowing.
-//   - bool: false when the refusal has been written.
 func deadLetterTopicFilterFromQuery(c *gin.Context) (string, bool) {
 	topic := strings.TrimSuffix(
 		strings.TrimSpace(c.Query(eventQueryParamTopic)), blnk.DeadLetterTopicSuffix)
@@ -570,27 +402,6 @@ func deadLetterTopicFilterFromQuery(c *gin.Context) (string, bool) {
 // ReplayDeadLetterEvent serves POST /events/dead-letter/:event_id/replay: it
 // re-publishes one dead-lettered event to its ORIGINAL category topic.
 //
-// The service re-publishes the bytes stored on the outbox row, stripping only the
-// failure metadata the dead-letter copy added. This handler passes an id in and
-// serialises an acknowledgement out; it does not read, decode, re-encode or re-key the
-// message, because a round trip through a Go struct would reorder JSON object keys and
-// break the byte-for-byte guarantee the replay is scored on. The acknowledgement
-// deliberately does not echo the payload either, so a caller cannot be tempted to diff
-// the wrong pair of byte strings.
-//
-// The event id is unchanged by a replay, which is what lets a subscriber deduplicating
-// on event_id absorb the copy. Delivery remains at-least-once.
-//
-//	200 OK                        the broker acknowledged the re-publish
-//	400 GEN_MISSING_PARAMETER     no event id in the route
-//	403 AUTH_MASTER_KEY_REQUIRED  the caller does not hold the master key
-//	404 EVENT_NOT_FOUND           no event with that id exists
-//	409 EVENT_NOT_DEAD_LETTERED   the event exists but is not replayable — already
-//	                              replayed, or a concurrent replay holds it
-//	500 EVENT_REPLAY_FAILED       the re-publish failed, or it succeeded and the
-//	                              outbox entry could not be cleared
-//	503 EVENT_KAFKA_UNAVAILABLE   no broker is configured, or the broker is down
-//
 // Parameters:
 //   - c *gin.Context: the request and response.
 func (a *Api) ReplayDeadLetterEvent(c *gin.Context) {
@@ -611,12 +422,6 @@ func (a *Api) ReplayDeadLetterEvent(c *gin.Context) {
 	// The identifier is checked against the CANONICAL form the pipeline mints before it is
 	// used to look anything up, because a value that cannot be an event id is a malformed
 	// request and not a missing event.
-	//
-	// It matters for two reasons. A 404 EVENT_NOT_FOUND tells an operator the event was
-	// purged or never existed and sends them to look for it; a 400 tells them the id they
-	// pasted is wrong, which is the actual problem, and every id this pipeline mints is a
-	// lowercase canonical UUID — model.NewEventID generates it and the event_id column
-	// carries a uniqueness constraint over exactly that form.
 	if !coremodel.IsCanonicalUUID(eventID) {
 		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
 			"event_id must be a canonical lowercase UUID such as %q",
@@ -650,20 +455,6 @@ func (a *Api) ReplayDeadLetterEvent(c *gin.Context) {
 // GetEventOutboxStats serves GET /events/stats: the outbox side of the daily zero-loss
 // reconciliation, and — when the broker can be read — the broker side and the verdict
 // as well.
-//
-// include_offsets selects between the three postures — and, because the two are one
-// decision, whether the DISPATCHED HISTORY is counted at all(/M02):
-//
-//	absent       skipped. No broker round trip, and the counts cover the exact UNRESOLVED
-//	             inventory only. This is the cheap default every routine caller should take.
-//	false        skipped, said explicitly. Identical to absent.
-//	best_effort  the dispatched history is counted over the window and the broker is read
-//	             when one is configured; a failure is logged, the broker-side keys are
-//	             omitted, and the answer is still 200. This is what a broker-less
-//	             deployment wants, and what the daily check uses when a 503 is unhelpful.
-//	true         required. As best_effort, except that a failure to read the broker answers
-//	             503 EVENT_KAFKA_UNAVAILABLE, because the caller asked for the half of the
-//	             reconciliation that is missing. This is what the reconciliation runbook uses.
 //
 // Parameters:
 //   - c *gin.Context: the request and response.
@@ -712,19 +503,6 @@ func (a *Api) GetEventOutboxStats(c *gin.Context) {
 
 // eventOffsetInclusionFromQuery reads include_offsets, writing the refusal itself for a
 // value that is neither "true" nor "false".
-//
-// An unrecognised value is refused rather than treated as false: silently skipping the
-// broker would return a response whose offsets_complete is false for a reason the
-// caller cannot see, and they would read a missing verdict as an unreachable broker.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - blnk.EventOffsetInclusion: the requested posture, in the root package's own
-//     vocabulary.
-//   - bool: false when the refusal has been written.
 func eventOffsetInclusionFromQuery(c *gin.Context) (blnk.EventOffsetInclusion, bool) {
 	switch strings.ToLower(strings.TrimSpace(c.Query(eventQueryParamIncludeOffsets))) {
 	case "", "false":
@@ -745,18 +523,6 @@ func eventOffsetInclusionFromQuery(c *gin.Context) (blnk.EventOffsetInclusion, b
 
 // eventStatsWindowFromQuery reads the `window` option, refusing a value it cannot
 // honour.
-//
-// The service clamps — it is the floor under every non-HTTP caller — but a REQUEST that
-// names a window this endpoint will not serve must be told so. and the arithmetic that
-// follows is wrong in a direction nothing on the response reveals.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when this
-//     returns.
-//
-// Returns:
-//   - time.Duration: the requested window, or the default when none was named.
-//   - bool: false when the refusal has been written.
 func eventStatsWindowFromQuery(c *gin.Context) (time.Duration, bool) {
 	raw := strings.TrimSpace(c.Query(eventQueryParamWindow))
 	if raw == "" {
@@ -800,16 +566,6 @@ func eventStatsWindowFromQuery(c *gin.Context) (time.Duration, bool) {
 }
 
 // eventOutboxStatsResponseFrom projects the service's statistics onto the response DTO.
-//
-// A state the aggregate holds that this DTO has no field for is reported to the log by
-// the service, which is where the enumeration lives; nothing is silently dropped here
-// without being named there.
-//
-// Parameters:
-//   - statistics blnk.EventOutboxStatistics: the assembled statistics.
-//
-// Returns:
-//   - model.EventOutboxStatsResponse: the response, ready to marshal.
 func eventOutboxStatsResponseFrom(statistics blnk.EventOutboxStatistics) model.EventOutboxStatsResponse {
 	counts := statistics.CountsByStatus
 
@@ -828,10 +584,6 @@ func eventOutboxStatsResponseFrom(statistics blnk.EventOutboxStatistics) model.E
 	// THE DISPATCHED COUNT, emitted only when it was actually taken. Every other count
 	// above is exact and complete on every request; this one is a count of the single
 	// unbounded population and is taken only for a request that asked for the broker side.
-	// Indexing the map would yield zero for both "none dispatched in the window" and
-	// "never counted", and a reconciliation reading the second as the first concludes that
-	// nothing was published at all — so the key is omitted instead, and the flag above
-	// says which it is.
 	if statistics.DispatchedHistoryCounted {
 		dispatched := counts[coremodel.EventOutboxStatusDispatched]
 		response.Dispatched = &dispatched
@@ -900,12 +652,6 @@ func eventOutboxStatsResponseFrom(statistics blnk.EventOutboxStatistics) model.E
 		RecordsRetained:    verdict.RecordsRetained,
 		BlnkRecordShare:    verdict.BlnkRecordShare,
 		// THE SURPLUS AND THE SCOPE IT WAS MEASURED IN, which have to travel together.
-		// overhead is records minus claims, and it is only interpretable once a reader knows
-		// whether the two sides describe the same interval: a cumulative surplus grows for
-		// the life of the topic and means nothing, while a windowed one is the number the
-		// verdict is drawn from. Reporting overhead without windowed invites the first to be
-		// read as the second, and leaving windowed unset reported `false` — "this comparison
-		// declined to conclude" — for every verdict, including the ones that did.
 		Overhead:     verdict.Overhead,
 		Windowed:     verdict.Windowed,
 		LossDetected: verdict.LossDetected,

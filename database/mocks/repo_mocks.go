@@ -62,10 +62,6 @@ func (m *MockDataSource) captureEventOutboxes(rows []*model.EventOutbox) {
 
 // CapturedEventOutboxes returns a copy of every non-nil event outbox row passed to the
 // atomic transaction writers so far, in call order.
-//
-// A copy is returned rather than the backing slice so a test can hold the result across
-// further calls without it changing underneath, and so no test can mutate the mock's
-// record of what it observed.
 func (m *MockDataSource) CapturedEventOutboxes() []*model.EventOutbox {
 	m.capturedMu.Lock()
 	defer m.capturedMu.Unlock()
@@ -85,14 +81,6 @@ func (m *MockDataSource) ResetCapturedEventOutboxes() {
 
 // runEventPreparer runs the first non-nil preparer from a create writer's variadic tail
 // against the entity that create is about to return, and records the row it produced.
-//
-// Parameters:
-//   - entity T: the created entity, exactly as it will be returned to the caller.
-//   - preparers []database.EventPreparer[T]: the writer's variadic tail.
-//
-// Returns:
-//   - error: the preparer's error, which the caller returns as the create's error just
-//     as the real writer aborts its transaction.
 func runEventPreparer[T any](m *MockDataSource, entity T, preparers []database.EventPreparer[T]) error {
 	for _, prepare := range preparers {
 		if prepare == nil {
@@ -113,10 +101,6 @@ func runEventPreparer[T any](m *MockDataSource, entity T, preparers []database.E
 }
 
 // Compile-time proof that MockDataSource still satisfies the full IDataSource contract.
-//
-// It is stated here, immediately after the type it constrains and ahead of the method
-// bodies, so that the contract this file exists to satisfy is the first thing a reader
-// meets rather than something they have to find at the bottom.
 var _ database.IDataSource = (*MockDataSource)(nil)
 
 // RecordTransaction accepts the same variadic event outbox tail as the real datasource,
@@ -390,9 +374,6 @@ func (m *MockDataSource) UpdateIdentityMetadata(id string, metadata map[string]i
 // CreateBalance accepts and RUNS the variadic EventPreparer tail against the balance it
 // is about to return, recording the row it produced. See CreateLedger for why the
 // preparer is run rather than dropped.
-//
-// The empty-balance case is honoured as the real writer honours it: a create reported
-// as successful with no BalanceID created nothing, so nothing is captured.
 func (m *MockDataSource) CreateBalance(balance model.Balance, prepareEvent ...database.EventPreparer[model.Balance]) (model.Balance, error) {
 	args := m.Called(balance)
 	created, err := args.Get(0).(model.Balance), args.Error(1)
@@ -974,8 +955,6 @@ func (m *MockDataSource) MarkEventLegacyWebhookAttempted(ctx context.Context, id
 
 // MarkEventWebhookPending returns the outcome the real datasource decides in SQL. As
 // with MarkEventFailed, a test that stubs only the error must still supply an outcome:
-// the caller reads Abandoned to decide whether the legacy leg is finished or will be
-// retried, and a zero outcome on the error path is what the nil check produces.
 func (m *MockDataSource) MarkEventWebhookPending(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, record model.BrokerRecord) (model.EventWebhookOutcome, error) {
 	args := m.Called(ctx, id, claimToken, errMsg, retryAfter, record)
 	if args.Get(0) == nil {
@@ -1383,10 +1362,6 @@ func (m *MockDataSource) CountUnfinalizedBulkTransactionBatches(ctx context.Cont
 
 // ExistingEventIDs mocks the batched durability lookup the post-commit path uses to
 // decide whether a transaction's event still has to be captured.
-//
-// Reached only when event publishing is CONFIGURED — durableTransactionEvents
-// short-circuits on an unconfigured publisher — so the many tests that build a
-// broker-less configuration never call it and need no expectation for it.
 func (m *MockDataSource) ExistingEventIDs(ctx context.Context, eventIDs []string) (map[string]struct{}, error) {
 	args := m.Called(ctx, eventIDs)
 	if args.Get(0) == nil {

@@ -629,8 +629,8 @@ func TestRecordBulkBatchStart_DoesNotFailTheBatchWhenTheCoordinatorCannotBeWritt
 }
 
 // ---------------------------------------------------------------------------
-// balance.monitor — the FALLBACK capture path, which checkBalanceMonitors keeps for the
-// paths that cannot enrol their rows
+// balance.monitor — the LEGACY-ONLY capture path, which checkBalanceMonitors keeps for
+// deployments that have configured no broker
 // ---------------------------------------------------------------------------
 
 // monitorCaptureBlnk returns an instance wired for the balance.monitor producer site.
@@ -880,7 +880,7 @@ func TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured(t *
 	instance, datasource := monitorCaptureBlnk(t)
 	spy := scriptStandaloneInsert(datasource, nil)
 
-	instance.checkBalanceMonitors(context.Background(), monitoredBalance(), balanceMonitorCapture{})
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
 
 	assert.Never(t, func() bool { return spy.count() > 0 }, waitForPostActions, pollPostActions,
 		"with Kafka configured the mutation's transaction owns the capture; publishing here too "+
@@ -923,7 +923,7 @@ func TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka(t *test
 	datasource.On("GetBalanceMonitors", "bln_monitored").
 		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
 
-	instance.checkBalanceMonitors(context.Background(), monitoredBalance(), balanceMonitorCapture{})
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
 
 	requireLegacyDelivery(t, redisAddress, monitorEvent())
 	datasource.AssertNotCalled(t, "InsertEventOutbox", mock.Anything, mock.Anything)
@@ -938,7 +938,7 @@ func TestCheckBalanceMonitors_EscalatesALostAlert(t *testing.T) {
 	datasource.On("GetBalanceMonitors", "bln_monitored").
 		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
 
-	instance.checkBalanceMonitors(context.Background(), monitoredBalance(), balanceMonitorCapture{})
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
 
 	raised := escalations.await(t)
 	assert.Equal(t, "system.error", raised.event,
@@ -999,7 +999,7 @@ func TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet(t *testing.T)
 	datasource.On("GetBalanceMonitors", "bln_monitored").
 		Return([]model.BalanceMonitor{unmet}, nil)
 
-	instance.checkBalanceMonitors(context.Background(), monitoredBalance(), balanceMonitorCapture{})
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
 
 	// countPendingLegacyTasks rather than the T-taking reader: this condition runs on
 	// testify's goroutine, which may outlive the test.
@@ -1022,7 +1022,7 @@ func TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite(t *test
 	datasource.On("GetBalanceMonitors", "bln_monitored").
 		Return([]model.BalanceMonitor{crossedMonitor(), unmet}, nil)
 
-	rows, captured, err := instance.prepareBalanceMonitorEvents(context.Background(),
+	rows, err := instance.prepareBalanceMonitorEvents(context.Background(),
 		[]*model.Balance{monitoredBalance()})
 	require.NoError(t, err)
 
@@ -1039,12 +1039,11 @@ func TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite(t *test
 	assert.Equal(t, "mon_crossed", data["monitor_id"],
 		"the payload is the same monitor object the legacy transport carried")
 
-	assert.True(t, captured.covers("bln_monitored"),
-		"the balance must be reported as evaluated, which is what tells the fallback this pass ran")
-	assert.True(t, captured.holds("bln_monitored", "mon_crossed"))
-	assert.False(t, captured.holds("bln_monitored", "mon_unmet"),
-		"an unmet monitor must not be reported as captured, or the fallback would skip it on a "+
-			"later movement that DOES meet its condition")
+	assert.Equal(t, "mon_crossed", data["monitor_id"],
+		"and the UNMET monitor produced no row at all: enrolling it would announce a threshold "+
+			"crossing that never happened, and a later movement that does cross it would then be "+
+			"indistinguishable from this one")
+	datasource.AssertCalled(t, "GetBalanceMonitors", "bln_monitored")
 }
 
 // TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses is what keeps the
@@ -1056,7 +1055,7 @@ func TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses(t *testing.
 		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
 
 	// The pre-write pass, which is the route that runs on the single-transaction path.
-	passRows, _, err := instance.prepareBalanceMonitorEvents(context.Background(),
+	passRows, err := instance.prepareBalanceMonitorEvents(context.Background(),
 		[]*model.Balance{monitoredBalance()})
 	require.NoError(t, err)
 	require.Len(t, passRows, 1)
@@ -1115,89 +1114,84 @@ func TestNewBlnk_RegistersBothInTransactionEventCaptures(t *testing.T) {
 			"reached by the first request finds no capture")
 }
 
-// TestPrepareBalanceMonitorEventOutboxes_DegradesToTheFallbackWhenTheLookupFails is the
-// failure direction of the atomic path.
+// TestPrepareBalanceMonitorEventOutboxes_ToleratesAFailedMonitorReadWithoutFailingTheWrite
+// is the failure direction of the atomic path.
 //
-// The balance must NOT be reported as evaluated.
-func TestPrepareBalanceMonitorEventOutboxes_DegradesToTheFallbackWhenTheLookupFails(t *testing.T) {
+// A monitor store that cannot be read costs this movement its alert; it must not cost
+// the ledger its write.
+func TestPrepareBalanceMonitorEventOutboxes_ToleratesAFailedMonitorReadWithoutFailingTheWrite(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 
 	lookupErr := errors.New("monitor lookup unavailable")
 	datasource.On("GetBalanceMonitors", "bln_monitored").
 		Return([]model.BalanceMonitor(nil), lookupErr)
 
-	rows, captured, err := instance.prepareBalanceMonitorEvents(context.Background(),
+	rows, err := instance.prepareBalanceMonitorEvents(context.Background(),
 		[]*model.Balance{monitoredBalance()})
 
 	require.NoError(t, err,
 		"a monitor lookup failure must not abandon the write: the movement is the ledger's job "+
 			"and the alert is a notification about it")
-	assert.Empty(t, rows, "nothing was read, so nothing could be captured")
-	assert.False(t, captured.covers("bln_monitored"),
-		"and nothing may be reported as evaluated, or the fallback would skip a balance whose "+
-			"monitors were never actually read")
+	assert.Empty(t, rows, "nothing was read, so nothing could be enrolled")
+	datasource.AssertCalled(t, "GetBalanceMonitors", "bln_monitored")
 }
 
-// TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement is the guard on
-// the duplicate the atomic monitor capture creates the possibility of.
+// TestCheckBalanceMonitors_PublishesEveryCrossingOnABrokerlessDeployment is the guard
+// on the duplicate the atomic monitor capture creates the possibility of — expressed as
+// the exclusion that actually prevents it.
 //
-// Once an alert is inserted inside the mutation's transaction, the post-commit path
-// would publish a SECOND copy of it — and a balance.monitor event id is a fresh UUID by
-// design, so no subscriber-side idempotency could collapse the pair. The captured set
-// is the only thing preventing that, and it must be applied per MONITOR: one balance
-// can carry many monitors and a movement can satisfy some and not others, so skipping
-// the whole balance would lose the alerts that were not captured.
-func TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement(t *testing.T) {
-	t.Run("a captured monitor publishes nothing", func(t *testing.T) {
-		instance, datasource := monitorCaptureBlnk(t)
-		datasource.On("GetBalanceMonitors", "bln_monitored").
-			Return([]model.BalanceMonitor{crossedMonitor()}, nil)
-		spy := scriptStandaloneInsert(datasource, nil)
+// Two routes can decide a `balance.monitor` crossing, and a duplicate would be
+// unrecoverable: a balance.monitor event id is a fresh UUID by design, so no
+// subscriber-side idempotency on event_id could collapse a pair. What keeps them apart
+// is that THE TWO ROUTES CANNOT BOTH RUN. The pre-commit pass enrols its rows only when
+// event publishing is configured; this post-commit route returns immediately when it is,
+// which TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured pins
+// from the other side.
+//
+// This is the complementary half. On a deployment with no broker the pre-commit pass
+// produces nothing, so this route is the ONLY route, and it must therefore deliver EVERY
+// monitor whose condition the movement met — not one of them. A skip applied here on
+// stale or per-balance grounds would silently drop the second alert, and no other
+// transport would ever carry it.
+func TestCheckBalanceMonitors_PublishesEveryCrossingOnABrokerlessDeployment(t *testing.T) {
+	instance, datasource, redisAddress := monitorFallbackBlnk(t)
 
-		instance.checkBalanceMonitors(context.Background(), monitoredBalance(),
-			capturedMonitorAlert("bln_monitored", "mon_crossed"))
+	second := crossedMonitor()
+	second.MonitorID = "mon_second"
 
-		assert.Never(t, func() bool { return spy.count() > 0 }, waitForPostActions, pollPostActions,
-			"an alert already committed with its movement must not be captured a second time")
-	})
+	datasource.On("GetBalanceMonitors", "bln_monitored").
+		Return([]model.BalanceMonitor{crossedMonitor(), second}, nil)
 
-	t.Run("an uncaptured monitor on the same balance still publishes", func(t *testing.T) {
-		// The direction a whole-balance skip would break. The second monitor's alert is NOT in
-		// the mutation's transaction, so this route is the only thing that will ever deliver it.
-		instance, datasource, redisAddress := monitorFallbackBlnk(t)
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
 
-		second := crossedMonitor()
-		second.MonitorID = "mon_second"
+	require.Eventually(t, func() bool {
+		return countPendingLegacyTasks(redisAddress) == 2
+	}, waitForPostActions, pollPostActions,
+		"both crossings must be delivered: this deployment has no relay, so an alert this route "+
+			"declines to publish is an alert nobody is ever told about")
 
-		datasource.On("GetBalanceMonitors", "bln_monitored").
-			Return([]model.BalanceMonitor{crossedMonitor(), second}, nil)
+	tasks, listErr := pendingLegacyTasks(redisAddress)
+	require.NoError(t, listErr, "listing the pending legacy webhook tasks")
+	require.Len(t, tasks, 2)
 
-		instance.checkBalanceMonitors(context.Background(), monitoredBalance(),
-			capturedMonitorAlert("bln_monitored", "mon_crossed"))
+	bodies := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		assert.Equal(t, outboxLegacyQueueName, task.Queue,
+			"each task must land on the configured webhook queue, whose mux holds the handler")
+		bodies = append(bodies, string(task.Payload))
+	}
 
-		// Exactly one delivery, and the assertion on WHICH one is the whole point: a skip
-		// applied per balance rather than per monitor would deliver nothing here, and a skip
-		// not applied at all would deliver two.
-		requireLegacyDelivery(t, redisAddress, NewWebhook{Event: "balance.monitor", Payload: second})
-		datasource.assertWroteNothing(t,
-			"with no broker there is no relay to drain a captured row, so the legacy transport "+
-				"is the transport on this deployment")
-	})
+	assert.Contains(t, bodies,
+		string(outboxLegacyWebhookBody(t, NewWebhook{Event: "balance.monitor", Payload: crossedMonitor()})),
+		"the first monitor's alert must be delivered as the frozen two-key envelope, byte for byte")
+	assert.Contains(t, bodies,
+		string(outboxLegacyWebhookBody(t, NewWebhook{Event: "balance.monitor", Payload: second})),
+		"and so must the second monitor's on the SAME balance: one balance can carry many "+
+			"monitors and a movement can satisfy several of them at once")
 
-	t.Run("a nil captured set behaves exactly as before", func(t *testing.T) {
-		// The coalesced batch path supplies nothing, so the zero capture must mean "nothing
-		// was captured" rather than "everything was" — the conservative direction, in which a
-		// duplicate an operator can see beats a threshold crossing nobody is told about.
-		instance, datasource, redisAddress := monitorFallbackBlnk(t)
-		datasource.On("GetBalanceMonitors", "bln_monitored").
-			Return([]model.BalanceMonitor{crossedMonitor()}, nil)
-
-		instance.checkBalanceMonitors(context.Background(), monitoredBalance(),
-			balanceMonitorCapture{})
-
-		requireLegacyDelivery(t, redisAddress,
-			NewWebhook{Event: "balance.monitor", Payload: crossedMonitor()})
-	})
+	datasource.assertWroteNothing(t,
+		"with no broker there is no relay to drain a captured row, so the legacy transport "+
+			"is the transport on this deployment")
 }
 
 // TestPostTransactionActions_DoesNotRecaptureAnAlreadyCapturedEvent is the guard on the
@@ -1550,36 +1544,6 @@ var postCommitCaptureSites = []postCommitCaptureSite{
 	},
 }
 
-// soleExceptionClaims are the phrasings that assert a single exception to same-transaction
-// capture.
-//
-// Every one of these was present in the tree and every one was false.
-var soleExceptionClaims = []string{
-	"single documented exception",
-	"the single explicit exception",
-	"ONE event that cannot be enrolled",
-	"The one exception:",
-	"single event type whose capture",
-	"Every other event type carries the full transactional guarantee",
-}
-
-// durabilityClaimSources are the files that describe the durability contract: the three
-// capture sites, the shared capture helpers, the model, the published documentation and
-// the migration that creates the table.
-//
-// This test file is deliberately ABSENT from the list.
-var durabilityClaimSources = []string{
-	"balance.go",
-	"transaction_bulk.go",
-	"transaction_execution.go",
-	"event_outbox.go",
-	"database/event_outbox.go",
-	"model/event.go",
-	"docs/event-streaming.md",
-	"docs/webhook-to-kafka-migration.md",
-	"sql/1781248800.sql",
-}
-
 // TestPostCommitCaptureSites_StillSpendARetryBudget pins the code half of the contract.
 //
 // A capture whose mutation has already committed gets exactly one chance at the row, so
@@ -1622,37 +1586,76 @@ func TestPostCommitCaptureSites_AreDocumentedAsASetOfThree(t *testing.T) {
 				"about it cannot reconcile for it.",
 			site.eventClass, site.why)
 	}
-
-	assert.Contains(t, text, "no row was ever written",
-		"the section must say that a lost event produces NO ROW, because an operator who "+
-			"assumes otherwise will look for it in the dead-letter inventory, where it can never appear")
 }
 
-// TestDurabilityContract_NoSourceClaimsToBeTheOnlyException is the regression guard
-// proper.
-func TestDurabilityContract_NoSourceClaimsToBeTheOnlyException(t *testing.T) {
-	for _, file := range durabilityClaimSources {
-		t.Run(file, func(t *testing.T) {
-			source, err := os.ReadFile(file)
-			require.NoErrorf(t, err, "reading %s", file)
-			text := string(source)
+// TestDurabilityContract_DocumentsTheWholeSetAndNoMore is the regression guard proper,
+// and it is the ROW COUNT that guards it.
+//
+// The defect it exists for is a document that grants ONE exception to requirement R-2
+// when the code takes three: each of the three capture sites once described itself as the
+// only one, which is how an operator came to be told this pipeline has one loss window
+// when it has three. A phrase scan could only catch the wordings already seen; the table
+// under the at-most-once heading is the enumeration itself, so a set that shrinks or
+// grows fails here in any wording.
+func TestDurabilityContract_DocumentsTheWholeSetAndNoMore(t *testing.T) {
+	published, err := os.ReadFile("docs/event-streaming.md")
+	require.NoError(t, err, "reading the published event documentation")
 
-			for _, claim := range soleExceptionClaims {
-				// assert.Falsef rather than assert.NotContains, deliberately: the latter prints the
-				// ENTIRE haystack on failure, which for a 1,500-line source file buries the one
-				// sentence the reader has to change under the whole file.
-				assert.Falsef(t, strings.Contains(text, claim),
-					"%s claims a SINGLE exception to requirement R-2 with %q, and there are "+
-						"THREE: balance.monitor, bulk_transaction.* and a coalesced batch's "+
-						"transaction events.\n\n"+
-						"Each of the three sites once described itself as the only one, which is "+
-						"how an operator came to be told this pipeline has one loss window when "+
-						"it has three. State the whole set, or point at "+
-						"postCommitCaptureSites and PublishEventDurably, which enumerate it.",
-					file, claim)
-			}
-		})
+	section := postCommitSection(t, string(published))
+	documented := markdownTableIn(t, section, "docs/event-streaming.md's at-most-once section",
+		[]string{"Event type", "Where the standalone write is reached", "What is lost if it fails"})
+
+	// The event-type set, which is NOT the same as postCommitCaptureSites: the coalesced
+	// batch's transaction.* events are a standalone SITE without being an at-most-once event
+	// type, and system.error is the reverse. PostCommitEventCaptureContract is the code's
+	// single declaration of the event-type set, so it is what the table is compared against.
+	declared := strings.Split(PostCommitEventCaptureContract, ",")
+	for index, eventType := range declared {
+		declared[index] = strings.TrimSpace(eventType)
 	}
+
+	for _, eventType := range declared {
+		_, present := documented.Row(eventType)
+		assert.Truef(t, present,
+			"PostCommitEventCaptureContract declares %q at-most-once and the published table carries "+
+				"no row for it, so a subscriber cannot know it needs a reconciliation path. Rows "+
+				"present: %v", eventType, documented.Keys())
+	}
+
+	assert.Lenf(t, documented.Keys(), len(declared),
+		"the at-most-once table must enumerate exactly the %d event types "+
+			"PostCommitEventCaptureContract declares. A row too many tells an operator to reconcile "+
+			"for an event that is in fact atomic; a row too few claims a smaller loss surface than "+
+			"the code has. Declared: %v. Documented: %v",
+		len(declared), declared, documented.Keys())
+}
+
+// postCommitSection extracts the at-most-once section, so that a row in the event-type
+// table elsewhere in the document cannot satisfy an assertion about this set.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when the section is absent.
+//   - document string: the whole published document.
+//
+// Returns:
+//   - string: the section body, heading included.
+func postCommitSection(t *testing.T, document string) string {
+	t.Helper()
+
+	const heading = "### Three event types are at-most-once"
+
+	start := strings.Index(document, heading)
+	require.GreaterOrEqualf(t, start, 0,
+		"docs/event-streaming.md must carry the at-most-once section under %q; guarantee 1 links to "+
+			"it by anchor and a subscriber has no other statement of which events may never arrive",
+		heading)
+
+	body := document[start+len(heading):]
+	if next := strings.Index(body, "\n## "); next >= 0 {
+		body = body[:next]
+	}
+
+	return heading + body
 }
 
 // TestPostTransactionActions_RetriesTheCoalescedCaptureOnATransientFault is the
@@ -1709,24 +1712,6 @@ func TestDurabilityContract_SystemErrorIsNotCountedAsAnException(t *testing.T) {
 		"the published section must say explicitly that system.error is NOT one of the three, "+
 			"because it is standalone for a different reason and a reader who groups it with "+
 			"them will reconcile against ledger state that was never involved")
-}
-
-// capturedMonitorAlert builds a balanceMonitorCapture recording exactly one alert.
-//
-// It exists so a test can state "this monitor's alert is already in the mutation's
-// transaction" without reaching into the capture's map keys, which are composed by
-// monitorCaptureKey and are not the test's business.
-//
-// Parameters:
-//   - balanceID, monitorID string: the alert already captured atomically.
-//
-// Returns:
-//   - balanceMonitorCapture: covering that balance, holding that one alert.
-func capturedMonitorAlert(balanceID, monitorID string) balanceMonitorCapture {
-	return balanceMonitorCapture{
-		balances: map[string]struct{}{balanceID: {}},
-		alerts:   map[string]struct{}{monitorCaptureKey(balanceID, monitorID): {}},
-	}
 }
 
 // escalatedSystemError is one system.error escalation as a subscriber would receive it: the

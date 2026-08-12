@@ -352,6 +352,21 @@ Nothing else is needed: the load shape, the target, the latency ceiling and the 
 ceiling all default to the criteria's own figures — 550/s offered for 30 minutes and judged
 against the 500/s throughput target, p99 under 2 seconds, dead-letter rate under 0.1%.
 
+**THE TARGET IS A FIGURE ACROSS MANY LEDGERS, AND THAT IS NOT A DETAIL OF THE HARNESS.** The
+relay's claim returns at most one row per message key — the ledger id wherever the event's
+subject belongs to a ledger — so one key's events publish strictly serially, one round trip at a
+time. Throughput is therefore **key-diversity-bound**: its ceiling is the number of distinct keys
+with work pending times the round-trip rate on one key, and no `RELAY_*` setting and no number of
+relay instances raises it, because the serialisation is what delivers the per-aggregate ordering
+guarantee.
+
+That is why `LEDGER_SPREAD` exists and why narrowing it measures something different: a run
+concentrated on one ledger cannot reach 500/s however the relay is tuned, and a `LEDGER_SPREAD=2`
+run measures less concurrency than the target is stated over. Leave the spread at its default for
+an acceptance run. [kafka-operations.md](../../docs/kafka-operations.md#throughput--it-is-bound-by-key-diversity-not-by-relay-tuning)
+carries the capacity-planning form of this, including how to tell this limit apart from a genuine
+relay bottleneck.
+
 To certify repeatedly without growing the database, reuse the fixtures the first run created —
 Blnk cannot delete them, so reuse is the only way to keep certifying without adding more. The run
 prints them at the end as a single base64 token:

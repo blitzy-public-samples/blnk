@@ -34,21 +34,6 @@ import (
 // resolveBatchEventOutboxes returns the event rows the batch writer must insert inside its
 // transaction: the caller's rows when it supplied any, otherwise rows derived from the
 // registered transaction event capture.
-//
-// The durability contract is that a ledger mutation and the event announcing it commit
-// together. The
-// single-transaction path satisfies it by preparing the row before the write and handing it
-// in.
-//
-// Parameters:
-//   - ctx context.Context: the writer's context, forwarded to the capture for tracing.
-//   - txns []*model.Transaction: the transactions about to be committed. transaction's
-//     ledger.
-//   - supplied []*model.EventOutbox: the caller's event rows, usually empty on this path.
-//
-// Returns:
-//   - []*model.EventOutbox: the rows to insert, nil when publishing is not configured.
-//   - error: a cardinality mismatch in the supplied rows, or a capture failure.
 func resolveBatchEventOutboxes(
 	ctx context.Context,
 	txns []*model.Transaction,
@@ -65,21 +50,6 @@ func resolveBatchEventOutboxes(
 
 // deriveBatchEventOutboxes builds one event row per transaction using the registered
 // capture.
-//
-// A nil row means event publishing is not configured, which is a PROCESS-WIDE condition:
-// the capture consults one configuration, so either every row is nil or none is. All-nil is
-// therefore the ordinary unconfigured case and returns no rows at all, preserving the
-// no-op-when-unconfigured contract inherited from SendWebhook.
-//
-// Parameters:
-//   - ctx context.Context: forwarded to the capture.
-//   - txns []*model.Transaction: the transactions about to be committed.
-//   - balances []*model.Balance: the balance set, for ledger resolution.
-//
-// Returns:
-//   - []*model.EventOutbox: one row per non-nil transaction, or nil when publishing is off
-//     or no capture is registered.
-//   - error: a capture failure, or a mixed nil/non-nil result.
 func deriveBatchEventOutboxes(
 	ctx context.Context,
 	txns []*model.Transaction,
@@ -133,20 +103,6 @@ func deriveBatchEventOutboxes(
 
 // resolveEventOutboxes settles which event rows an atomic writer will insert, and enforces
 // the transaction-to-event cardinality.
-//
-// Deriving the class from the event type rather than from a flag on the row is deliberate.
-// A flag would be a second statement of the same fact, settable independently, and the two
-// would drift — at which point a genuine duplicate could be waved through by mislabelling
-// it.
-//
-// Parameters:
-//   - txnCount: the number of transactions being committed by this writer.
-//   - supplied: the caller's rows, possibly empty or containing nils.
-//
-// Returns:
-//   - []*model.EventOutbox: the rows to insert, never containing a nil.
-//   - error: a typed bad request when the mutation-describing count does not match
-//     txnCount.
 func resolveEventOutboxes(txnCount int, supplied []*model.EventOutbox) ([]*model.EventOutbox, error) {
 	present := make([]*model.EventOutbox, 0, len(supplied))
 	for _, row := range supplied {
@@ -195,12 +151,6 @@ func utcOrNil(t *time.Time) *time.Time {
 
 // RecordTransaction persists one transaction row, optionally together with the event that
 // describes it.
-//
-// Supplying an event row moves this method onto a TRANSACTION: the transaction row and the
-// event row are inserted together and committed together, so a status mutation can no
-// longer be durable while the event announcing it is lost.
-//
-// Exactly one event per transaction is permitted; see resolveEventOutboxes.
 //
 // Parameters:
 //   - ctx: The context for the operation.
@@ -256,20 +206,6 @@ func (d Datasource) RecordTransaction(ctx context.Context, txn *model.Transactio
 
 // recordTransactionWithEvents inserts one transaction row and its event rows inside a
 // single transaction.
-//
-// It is the atomic arm of RecordTransaction and reuses recordTransactionInTx and
-// InsertEventOutboxInTx rather than restating either statement, so this path and the
-// balance-updating writers insert a transaction identically and an event identically.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - span: The caller's span, so the two paths report under one operation name.
-//   - txn: The transaction to record.
-//   - eventRows: The resolved event rows, never empty and never containing a nil.
-//
-// Returns:
-//   - *model.Transaction: The recorded transaction.
-//   - error: A typed error if the begin, either insert, or the commit fails.
 func (d Datasource) recordTransactionWithEvents(ctx context.Context, span trace.Span, txn *model.Transaction, eventRows []*model.EventOutbox) (*model.Transaction, error) {
 	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
@@ -313,9 +249,6 @@ func (d Datasource) recordTransactionWithEvents(ctx context.Context, span trace.
 // transaction. This is a helper function used by RecordTransactionWithBalances for atomic
 // operations. RecordTransactionWithEvent records ONE transaction and its event in ONE
 // transaction.
-//
-// The insert is the SAME recordTransactionInTx body every other writer uses, so there is no
-// second copy of the transaction INSERT.
 //
 // Parameters:
 //   - ctx context.Context: cancels the transaction.
@@ -595,8 +528,6 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 	// the commit. This placement is the whole mechanism behind the transactional-outbox
 	// guarantee: the event rows share this transaction with the balance updates and the
 	// transaction record above, so the mutation and its events commit or roll back together.
-	// There is no window in which a balance moved but its event was lost, and none in which an
-	// event describes a mutation that was rolled back.
 	eventRows, err := resolveEventOutboxes(1, eventOutbox)
 	if err != nil {
 		span.RecordError(err)
@@ -643,10 +574,6 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 // RecordTransactionsWithBalancesAndOutboxes atomically records multiple transactions,
 // updates the source and destination balances once, and inserts any lineage and event
 // outbox entries in the same database transaction.
-//
-// The variadic event outbox entries are forwarded verbatim with eventOutboxes... so this
-// delegation stays a pure pass-through: an omitted variadic arrives as an empty slice and
-// is forwarded as one, which is why a caller that captures no events needs no change here.
 func (d Datasource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
 	return d.RecordTransactionsWithBalanceSetAndOutboxes(ctx, txns, []*model.Balance{sourceBalance, destinationBalance}, outboxes, eventOutboxes...)
 }
@@ -654,10 +581,6 @@ func (d Datasource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Contex
 // RecordTransactionsWithBalanceSetAndOutboxes atomically records multiple transactions,
 // updates all changed balances, and inserts any lineage and event outbox entries in the
 // same database transaction.
-//
-// eventOutboxes is variadic for the same source-compatibility reason documented on the
-// declaration in repository.go: the transaction coalescing path calls this method with four
-// arguments and belongs to a frozen pipeline.
 func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordTransactionsWithBalancesAndOutboxes")
 	defer span.End()
@@ -725,9 +648,3 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 }
 
 // GetTransaction retrieves a transaction by its ID from the database.
-// It logs the transaction retrieval using OpenTelemetry tracing.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// - id: The unique transaction ID.
-// Returns:
-// - The retrieved transaction if successful, or an error if retrieval fails.

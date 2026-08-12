@@ -33,9 +33,10 @@ both matter operationally:
   version floors apply to whichever release you run:
   - **Feature floor — 3.5.** `kafka-storage format --add-scram` arrived in Kafka 3.5, and SASL/SCRAM
     in KRaft mode cannot be bootstrapped without it. Nothing below 3.5 can run this pipeline.
-  - **Security floor — the highest advisory floor, currently 4.2.0.** 3.5 being capable does not
-    make it safe: four advisories bear on this image, three with ranges firm enough to pin
-    against, and the highest of those floors is 4.2.0. Run an advisory-fixed release. This
+  - **Security floor — the pinned release itself.** 3.5 being capable does not make it safe: four
+    advisories bear on this image, all four with established ranges, and the highest floor among
+    them — CVE-2026-41115's, affecting 4.0.0 through 4.3.0 — is cleared only by the release pinned
+    here. Run an advisory-fixed release. This
     repository pins `apache/kafka:4.3.1` **by immutable digest** for its own broker, the same
     digest in the Compose stack and in the Kubernetes StatefulSet, so local development and
     production run identical bytes. `.env.example` carries the per-advisory table at
@@ -337,6 +338,27 @@ Re-encoding would break both silently: a JSON round trip reorders object members
 
 > Blnk also keeps a parsed copy of the payload for SQL-side triage queries. That copy is never read as the message body, for exactly the reasons above.
 
+### A mutation whose event cannot be prepared is refused
+
+This is a deliberate decision with a real cost, so it is recorded here rather than left to be inferred from the code.
+
+Preparing an event row happens **before** the write and involves no I/O: it marshals the payload, resolves the partition key and builds the envelope. If that fails, the mutation is refused and the caller receives an error. Nothing is written — not the ledger movement, not the balance update, not a partial event.
+
+The failure is refused at every producer that enrols a row inside its mutation's transaction:
+
+| Producer | Behaviour when preparation fails |
+| --- | --- |
+| A transaction on the single-transaction path | The transaction is not persisted. `persistSingleTransactionExecutionWork` returns the error. |
+| A rejection | The rejection is not persisted; the transaction keeps its prior status. |
+| A ledger, identity or balance creation | The entity is not created. |
+| A `balance.monitor` alert on the durable handoff | The movement is refused along with the alert. |
+
+**Why refusing, rather than committing the mutation and recording a capture failure.** The only ways preparation can fail are a payload `encoding/json` will not marshal — a channel, a function value or a cyclic structure in a metadata map — and a partition key that cannot be resolved. Both are producer-side defects in Blnk or in a caller's metadata, not transient conditions that clear on their own. Committing the mutation anyway would produce exactly the outcome the whole outbox design exists to prevent: a ledger movement that no subscriber is ever told about, indistinguishable from a movement that was announced correctly, with no row anywhere for the daily outbox-versus-offset reconciliation to count. Refusing makes the defect visible at the call that caused it, on the request that caused it, while the state is still consistent.
+
+**What it costs.** A serialisation defect can block a financially valid mutation. A caller that puts an unmarshalable value into a transaction's metadata gets its transaction refused rather than accepted-and-unannounced. That is the intended trade: a refusal is visible, retryable once the metadata is corrected, and leaves nothing to reconcile.
+
+**Where it does not apply.** A monitor **read** that fails is a transient condition, not a defect, and is handled the other way: it is logged, the movement commits, and the crossing that read would have found is simply not enrolled with this movement. The next movement on that balance evaluates its monitors again. The distinction is whether the failure is in Blnk's own encoding of an event it already holds, or in a dependency that may be back in a second.
+
 ## Delivery Guarantees and Your Idempotency Obligation
 
 Read this section before you write a consumer. It states what Blnk guarantees, what it does not, and the one thing it needs you to do.
@@ -516,6 +538,21 @@ therefore produces is a **gap** in that key's sequence, not a permanent stall: t
 are delivered in order relative to each other, with the failed one missing until an operator replays
 it, and a replay lands after everything published in the meantime. Design for a gap you may have to
 reconcile, not for a queue that stops.
+
+**One consequence is a throughput limit, and it is worth planning capacity around.** Because at most
+one row per key is ever in flight, a single key's events are published **strictly serially** — one
+publish round trip at a time, however the relay is tuned or scaled. Throughput is therefore
+**key-diversity-bound**: the ceiling is the number of distinct keys with work pending, multiplied by
+the round-trip rate on one key, and `RELAY_*` batch and poll settings cannot raise it because they
+govern how many rows are claimed rather than how many may be in flight per key.
+
+Since the key is the ledger id wherever a ledger exists, that means a workload concentrated on **one
+ledger** cannot exceed roughly one publish round trip at a time on that ledger — a few hundred
+events a second against a local broker, and materially fewer across a network — regardless of
+configuration. The validated 500 events a second is measured across many ledgers. If you need high
+throughput on a single logical stream, the lever is key diversity, not relay tuning: spread the work
+across ledgers. There is no configuration that trades this away, because the serialisation is what
+delivers the per-aggregate ordering guarantee.
 
 ### Topic geometry
 
@@ -775,6 +812,8 @@ The topic grant is therefore not merely *a* boundary, it is **the** boundary. If
 
 Your subscriber record may carry a `partition_key_prefix`. It names a real boundary — and because Kafka cannot express it, **the boundary is kept outside the broker, by a component your Blnk operator declares in front of it.** Read this section before you write a consumer, because it determines whether you can consume at all.
 
+> **This dimension of the access model is not delivered by Blnk, and that is a stated divergence rather than a defect to wait out.** Blnk's subscriber access model has three dimensions — topics, consumer group, and record-key prefix. The first two are enforced by the Kafka broker from ACLs Blnk creates. **The third has no enforcement point in Blnk's repository at all**: Blnk ships a client for an external key-authorising component and nothing else — no gateway, no proxy, no image, and no read path of its own. Key-prefix isolation is therefore **out of product scope**; a deployment that wants it must build and operate that component against the contract below. Everything fails closed in the meantime, so you will be refused a credential rather than handed one that reads too much. The operator-facing statement is [Requirement Divergence](kafka-operations.md#requirement-divergence--partition-key-scoping-has-no-enforcement-point-in-this-repository).
+
 Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topic*, never on a slice of one. So a credential holding topic `Read` reads every record on that topic whatever the keys are. Rather than hand you such a credential and ask you to discard what is not yours, Blnk **withholds record-level `Read`** from a key-scoped subscriber — your principal keeps `Describe`, so you can still read partition counts and offsets, and every fetch you attempt at the broker is refused with `TOPIC_AUTHORIZATION_FAILED`.
 
 **Blnk does not ship the component that applies the prefix, and Blnk serves no records itself.** There is no read path under `/subscribers` and no Blnk endpoint that returns records. What Blnk owns is the grant and the refusal:
@@ -814,7 +853,7 @@ When your subscriber is deregistered, Blnk withdraws that binding from the compo
 
 Two refusals share this endpoint, and they point in opposite directions. If your deployment declares the key-scoped model, then **every** subscriber must carry a prefix: a subscriber registered without one would hold whole-topic `Read` on a shared category topic in a deployment whose whole point is that it should not. That request is `409 SUBSCRIBER_KEY_SCOPE_REQUIRED`, and clearing a prefix that is already recorded is refused the same way.
 
-Separately, a deployment running with `BLNK_SERVER_SECURE=true` must have declared **which** model it is. If it has declared neither, credential issuance answers `409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED`. Both are operator-side configuration decisions rather than anything about your request: retrying is pointless, and the message names exactly what an operator must set.
+Separately, a deployment running with `BLNK_SERVER_SECURE=true` must have declared **which** model it is. If it has declared neither, credential issuance answers `409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED`. Every shipped configuration declares whole-topic access, so this is a refusal you meet only on a deployment that has been configured to withhold the declaration deliberately. Both are operator-side configuration decisions rather than anything about your request: retrying is pointless, and the message names exactly what an operator must set.
 
 A credential response for a key-scoped subscriber therefore always describes a live enforcement point:
 

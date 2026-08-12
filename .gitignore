@@ -19,3 +19,10 @@ tests/loadtest/*.ndjson
 # deliberately carry an unresolvable placeholder so that an apply cannot silently run a
 # build other than the one intended. A digest checked in here would defeat that.
 /rendered/
+
+# Scratch files written by `make alerts_configmap`: the alert rule file as the Kubernetes
+# ConfigMap projects it, plus a unit-test file pointed at that projection. Both are removed
+# on exit and are dot-prefixed so the rule_files glob (alerts/*.yml, non-recursive) cannot
+# see them even mid-run; they are listed here so an interrupted run cannot leave one staged.
+/alerts/tests/.configmap-projection.yml
+/alerts/tests/.configmap-projection_test.yml

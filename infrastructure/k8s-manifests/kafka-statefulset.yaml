@@ -820,15 +820,26 @@ spec:
           # authenticate — there is no running broker to create the first credential
           # against.
           #
-          # SECURITY: the floors below. Three have ranges firm enough to pin against,
-          # and the highest of them is 4.2.0:
+          # SECURITY: the floors below. All four have established ranges, and the
+          # highest floor among them is the release pinned here:
           #
           #   CVE-2026-33558  <=3.9.1, 4.0.0            fixed 3.9.2, 4.0.1
           #   CVE-2026-35554  <=3.9.1, <=4.0.1, <=4.1.1  fixed 3.9.2, 4.0.2,
           #                                                    4.1.2, 4.2.0
           #   CVE-2026-33557  4.1.0-4.1.1               fixed 4.1.2, 4.2.0
+          #   CVE-2026-41115  4.0.0-4.3.0               THIS PIN IS ABOVE IT
           #
-          # 33558 is the one that reaches THIS deployment hardest: DEBUG-level
+          # 41115 is the one that lands on the mechanism THIS deployment isolates
+          # subscribers with: CONSUMER_GROUP_DESCRIBE validates Describe on GROUP where
+          # the documentation says Read. The ASF's determination is that Describe is
+          # CORRECT and the documentation is what gets corrected, so the remediation is
+          # an ACL review rather than a version bump. That review is recorded in
+          # docs/kafka-operations.md beside the digest; its finding is that Blnk issues
+          # exactly one GROUP binding per subscriber, PREFIXED Read on that
+          # subscriber's own group prefix, and the exposure needs Describe WITHOUT Read.
+          #
+          # 33558 is the one that reaches THIS deployment hardest of the credential
+          # advisories: DEBUG-level
           # NetworkClient logging renders AlterUserScramCredentialsRequest verbatim,
           # putting SASL credentials, SCRAM salts and salted passwords into a log file —
           # and subscriber provisioning calls precisely that API. 35554 is a

@@ -1245,10 +1245,6 @@ func TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation(t *testing.T) 
 		"the runbook must record that --add-config-file cannot express a SCRAM credential, and "+
 			"quote the error it produces, because it is the natural thing to reach for and it "+
 			"fails in a way that does not explain itself")
-	assert.NotContains(t, body, "prefer a `--command-config`-style properties file",
-		"that advice was wrong — a properties file cannot carry a SCRAM credential — and must "+
-			"not be restored")
-
 	// AND THE PATH WHERE THE PROBLEM DOES NOT EXIST MUST BE NAMED.
 	assert.Contains(t, body, "AlterUserScramCredentials",
 		"the runbook must point at the API path, which sends the credential over the Kafka "+

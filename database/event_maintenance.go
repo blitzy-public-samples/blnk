@@ -16,25 +16,6 @@ limitations under the License.
 
 // event_maintenance.go provides the singleton claim that decides WHICH replica runs the
 // event pipeline's maintenance work.
-//
-// The event metrics collector and the retention sweeper are maintenance, not serving:
-// one measures the pipeline and the other deletes from it. Both were started
-// unconditionally in the server role, so a deployment scaled to N replicas ran N of
-// each.
-//
-// For the COLLECTOR that is not merely wasteful, it is wrong. Its gauges are
-// process-scoped observations of a shared table, so N replicas publish N series for one
-// truth and each retires the others' as stale — the reading an alert evaluates then
-// depends on which replica scraped last.
-//
-// The relay is deliberately NOT gated by this. Its claim query is FOR UPDATE SKIP
-// LOCKED, which is designed for exactly this concurrency: N relays divide the work and
-// none of them duplicates it.
-//
-// The alternative — a configuration flag naming the maintenance replica — pushes the
-// decision to whoever writes the manifest and fails in both directions: set on every
-// replica it changes nothing, set on none it silently stops all measurement and all
-// deletion, and set on one it stops both the moment that pod is rescheduled.
 package database
 
 import (
@@ -48,16 +29,10 @@ import (
 )
 
 // EventMaintenanceLockKey identifies the event-maintenance advisory lock.
-//
-//	'b'=0x62 'l'=0x6c 'n'=0x6e 'k'=0x6b 'e'=0x65 'v'=0x76 'm'=0x6d '1'=0x31
 const EventMaintenanceLockKey int64 = 0x626c6e6b65766d31
 
 // ErrEventMaintenanceLeaseHeld reports that another process already owns the
 // maintenance lease.
-//
-// A SENTINEL and not a failure. On a deployment of N replicas this is the expected
-// answer for N-1 of them on every attempt, so it is something callers branch on, not
-// something they log as a problem.
 var ErrEventMaintenanceLeaseHeld = errors.New("blnk: the event maintenance lease is held by another process")
 
 // EventMaintenanceLease is a held, session-scoped singleton claim.
@@ -67,11 +42,6 @@ type EventMaintenanceLease struct {
 }
 
 // TryAcquireEventMaintenanceLease attempts to take the event-maintenance lease.
-//
-// Non-blocking, deliberately. pg_try_advisory_lock returns false rather than waiting,
-// so a replica that is not the leader learns so immediately and can go and do its real
-// work; the blocking form would park a connection for the life of the process on every
-// non-leader.
 //
 // Parameters:
 //   - ctx context.Context: bounds acquiring the connection and issuing the lock.
@@ -151,9 +121,6 @@ func (l *EventMaintenanceLease) Release(ctx context.Context) error {
 
 // Held reports whether this lease still owns its connection.
 //
-// Used by the maintenance loop to decide whether it is still the leader before it keeps
-// running work that only the leader may do.
-//
 // Returns:
 //   - bool: true while the lease is held.
 func (l *EventMaintenanceLease) Held() bool {
@@ -161,11 +128,6 @@ func (l *EventMaintenanceLease) Held() bool {
 }
 
 // StillHeld verifies with the DATABASE that this lease is intact.
-//
-// Held() only reports what this process believes. The lock lives in the database and is
-// released by the SESSION ending, which can happen without this process being involved
-// at all — a connection reset by a proxy, a failover, an administrator terminating the
-// backend.
 //
 // Parameters:
 //   - ctx context.Context: bounds the check.

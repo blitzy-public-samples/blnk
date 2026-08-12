@@ -33,10 +33,6 @@ import (
 )
 
 // Every error response carries two payloads during the transition period:
-// the legacy field clients depend on today (flat "error"/"errors" string,
-// preserved verbatim) and the structured "error_detail" object with the
-// canonical error code. The legacy field is removed — and error_detail
-// renamed to error — at the next major release. See docs/errors.md.
 
 const errorDetailKey = "error_detail"
 
@@ -105,8 +101,6 @@ func respondCode(c *gin.Context, code apierror.ErrorCode, message string, detail
 }
 
 // respondError resolves err to a catalog code and writes the dual payload.
-// Resolution order: typed APIError → known sentinels → message patterns →
-// fallback (withDefault or GEN_INTERNAL with a sanitized message).
 func respondError(c *gin.Context, err error, opts ...respondOpt) {
 	o := buildOptions(opts)
 	if err == nil {
@@ -141,11 +135,6 @@ func respondError(c *gin.Context, err error, opts ...respondOpt) {
 
 		case serverFacingStatus(o.defaultCode, o):
 			// A 5xx DEFAULT MUST NOT ECHO err.Error.
-			//
-			// The test is on the STATUS rather than on a list of codes: a 4xx default is a
-			// caller-actionable refusal whose message is the useful part of the response, and
-			// keeping those verbatim is why this is not a blanket sanitize. A code added later
-			// gets the right treatment from its own status entry, with nothing here to update.
 			msg = sanitizedInternalMessage
 			logrus.WithFields(logrus.Fields{
 				"code":  string(o.defaultCode),
@@ -167,13 +156,6 @@ func respondError(c *gin.Context, err error, opts ...respondOpt) {
 // serverFacingStatus reports whether the response this code produces will be a
 // server-fault status, and therefore whether an unclassified error message must be
 // withheld from the client.
-//
-// Parameters:
-//   - code apierror.ErrorCode: the default code respondError is about to write.
-//   - o *respondOptions: the resolved options, consulted for its upgrade table.
-//
-// Returns:
-//   - bool: true when the effective status is 500 or above.
 func serverFacingStatus(code apierror.ErrorCode, o *respondOptions) bool {
 	effective := apierror.Normalize(code)
 	if to, ok := o.upgrades[effective]; ok {
@@ -221,11 +203,6 @@ func classifySentinel(err error) (apierror.ErrorCode, bool) {
 
 // messagePattern entries are evaluated in order; more specific patterns must
 // precede broader ones (e.g. "field ... not found" before bare "not found").
-// This table bridges the core packages' unstructured fmt.Errorf messages to
-// catalog codes without editing ~280 core call sites. Any core error later
-// converted to a typed APIError bypasses this table entirely (it resolves in
-// respondError's errors.As step), so entries here can be retired
-// incrementally as core adopts typed errors.
 type messagePattern struct {
 	contains []string // all substrings must match
 	code     apierror.ErrorCode

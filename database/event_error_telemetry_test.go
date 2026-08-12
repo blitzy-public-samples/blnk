@@ -24,6 +24,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/lib/pq"
@@ -301,7 +304,7 @@ func TestFailDatabaseSpan_SetsABoundedStatusAndRecordsNoException(t *testing.T) 
 // reintroduced span.RecordError re-opens the disclosure on whichever path nobody
 // happened to exercise.
 func TestNeitherEventRepositoryCallsSpanRecordError(t *testing.T) {
-	for _, name := range []string{"event_outbox.go", "event_subscriber.go"} {
+	for _, name := range packageSourceGroups(t, "event_outbox.go", "event_subscriber.go") {
 		t.Run(name, func(t *testing.T) {
 			calls := recordErrorCallCount(t, name)
 			assert.Zero(t, calls,
@@ -400,4 +403,68 @@ func recordErrorCallCount(t *testing.T, name string) int {
 	})
 
 	return calls
+}
+
+// packageSourceGroup returns the file names, relative to this package directory, that
+// together constitute the logical unit named by base: base itself plus the files it was
+// split into, which by convention carry base's stem followed by an underscore.
+//
+// The package-local counterpart of the root package's eventSourceGroup, and it exists for
+// the same reason. Both repositories in this package were split for size, and a structural
+// guard that kept naming one file would stop covering every failure path that moved into a
+// sibling — while still passing, which is the failure mode worth engineering against.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - base string: a file name in this directory, e.g. "event_outbox.go".
+//
+// Returns:
+//   - []string: sorted file names, always including base.
+func packageSourceGroup(t *testing.T, base string) []string {
+	t.Helper()
+
+	stem := strings.TrimSuffix(base, ".go")
+	matches, err := filepath.Glob(stem + "*.go")
+	require.NoErrorf(t, err, "the source group for %s must be enumerable", base)
+
+	group := make([]string, 0, len(matches))
+
+	for _, match := range matches {
+		if strings.HasSuffix(match, "_test.go") {
+			continue
+		}
+
+		if match != base && !strings.HasPrefix(match, stem+"_") {
+			continue
+		}
+
+		group = append(group, match)
+	}
+
+	sort.Strings(group)
+	require.Containsf(t, group, base, "%s must exist and must belong to its own source group", base)
+
+	return group
+}
+
+// packageSourceGroups expands every base through packageSourceGroup, preserving order and
+// dropping duplicates.
+func packageSourceGroups(t *testing.T, bases ...string) []string {
+	t.Helper()
+
+	seen := make(map[string]struct{}, len(bases))
+	expanded := make([]string, 0, len(bases))
+
+	for _, base := range bases {
+		for _, member := range packageSourceGroup(t, base) {
+			if _, already := seen[member]; already {
+				continue
+			}
+
+			seen[member] = struct{}{}
+			expanded = append(expanded, member)
+		}
+	}
+
+	return expanded
 }

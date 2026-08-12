@@ -40,18 +40,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/segmentio/kafka-go"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"net/http"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/segmentio/kafka-go"
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
@@ -2800,45 +2798,47 @@ func TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns(t *testing.T) {
 //
 // The runtime test above proves Close works.
 func TestBlnkSubscriberWrappers_EveryOneClosesTheServiceItBuilds(t *testing.T) {
-	fileSet := token.NewFileSet()
-	path := filepath.Join(moduleRootDir(t), "event_subscriber.go")
-	parsed, err := parser.ParseFile(fileSet, path, nil, parser.ParseComments)
-	require.NoError(t, err, "event_subscriber.go must be parseable to assert its structure")
-
-	// Every *Blnk method that builds a subscriber service, discovered from the file rather
-	// than listed here: a wrapper added later is covered without this test being touched.
+	// Every *Blnk method that builds a subscriber service, discovered from the SOURCE GROUP
+	// rather than listed here: a wrapper added later is covered without this test being
+	// touched, and one that moves into a sibling of event_subscriber.go stays covered.
 	wrappers := map[string]bool{}
-	for _, declaration := range parsed.Decls {
-		function, isFunction := declaration.(*ast.FuncDecl)
-		if !isFunction || function.Recv == nil || function.Body == nil {
-			continue
-		}
 
-		if !isBlnkReceiver(function.Recv) {
-			continue
-		}
+	for _, member := range eventSourceGroup(t, "event_subscriber.go") {
+		parsed := parseRepositoryGoFile(t, member)
 
-		buildsService := false
-		closesService := false
-		ast.Inspect(function.Body, func(node ast.Node) bool {
-			switch typed := node.(type) {
-			case *ast.CallExpr:
-				if selector, ok := typed.Fun.(*ast.SelectorExpr); ok &&
-					selector.Sel.Name == "EventSubscribers" {
-					buildsService = true
-				}
-			case *ast.DeferStmt:
-				if selector, ok := typed.Call.Fun.(*ast.Ident); ok &&
-					selector.Name == "closeEventSubscriberService" {
-					closesService = true
-				}
+		for _, declaration := range parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv == nil || function.Body == nil {
+				continue
 			}
 
-			return true
-		})
+			if !isBlnkReceiver(function.Recv) {
+				continue
+			}
 
-		if buildsService {
-			wrappers[function.Name.Name] = closesService
+			buildsService := false
+			closesService := false
+
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.CallExpr:
+					if selector, ok := typed.Fun.(*ast.SelectorExpr); ok &&
+						selector.Sel.Name == "EventSubscribers" {
+						buildsService = true
+					}
+				case *ast.DeferStmt:
+					if selector, ok := typed.Call.Fun.(*ast.Ident); ok &&
+						selector.Name == "closeEventSubscriberService" {
+						closesService = true
+					}
+				}
+
+				return true
+			})
+
+			if buildsService {
+				wrappers[function.Name.Name] = closesService
+			}
 		}
 	}
 
@@ -6299,10 +6299,18 @@ func TestCompensationDeadline_IsOneWindowPerRequestHoweverDeeplyNested(t *testin
 // kafkaCleanupContext are the only places context.WithoutCancel is called in the
 // subscriber lifecycle, and both re-impose the request's deadline.
 func TestSubscriberLifecycle_NoDetachedContextEscapesTheCleanupHelpers(t *testing.T) {
-	// The two files the subscriber issuance path spans, and the line each is allowed to detach on.
-	allowed := map[string]string{
-		"event_subscriber.go": "withSubscriberIssuanceDeadline(context.WithoutCancel(ctx), deadline)",
-		"event_admin.go":      "withSubscriberIssuanceDeadline(context.WithoutCancel(ctx), deadline)",
+	// The two source UNITS the subscriber issuance path spans, and the line each is allowed
+	// to detach on. Expanded through the source group rather than named file by file,
+	// because a file split for size moves detaching sites into siblings — and a guard that
+	// still names only the remnant would stop seeing them at the moment they moved.
+	const permittedDetachment = "withSubscriberIssuanceDeadline(context.WithoutCancel(ctx), deadline)"
+
+	allowed := map[string]string{}
+
+	for _, unit := range []string{"event_subscriber.go", "event_admin.go"} {
+		for _, member := range eventSourceGroup(t, unit) {
+			allowed[member] = permittedDetachment
+		}
 	}
 
 	for file, permitted := range allowed {

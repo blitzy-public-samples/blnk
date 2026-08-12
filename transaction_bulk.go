@@ -111,35 +111,6 @@ func (l *Blnk) logRollbackResult(batchID string, action string, err error) {
 
 // sendBulkTransactionWebhook captures the bulk_transaction.<status> event for a batch
 // result.
-//
-// THE PAYLOAD MAP IS PASSED THROUGH UNCHANGED. The same map value is what is marshaled
-// into the outbox payload, so re-shaping it into a struct or normalising its keys would
-// change what subscribers receive.
-//
-// This is a statement about what the event IS, not a licence to record it loosely. The
-// guarantee is made as strong as it can be rather than left as a log line, and the
-// caller does not announce the batch complete until it holds:
-//
-//   - The capture is SYNCHRONOUS. The caller does not return believing the outcome was
-//     recorded while the write is still in flight.
-//   - It is RETRIED with bounded backoff, because the realistic failure is a transient
-//     database error and a single attempt turned that into permanent loss of the
-//     outcome.
-//   - Failure is reported as an ERROR RETURN, so callers can act on it, AND it is
-//     ESCALATED through notification.NotifyError so that a lost batch summary raises a
-//     system.error event exactly as a lost monitor alert does.
-//
-// Parameters:
-//   - ctx context.Context: the caller's context, used for the retry sleeps only.
-//   - batchID string: the parent transaction id of the batch, and the event's
-//     aggregate.
-//   - status string: the batch outcome — "applied", "inflight" or "failed" today.
-//   - errorMsg string: the failure detail, including rollback status.
-//   - transactionCount int: the number of transactions in the batch.
-//
-// Returns:
-//   - error: the last persistence error when every attempt failed; nil on success and
-//     on every no-op, including the unconfigured case.
 func (l *Blnk) sendBulkTransactionWebhook(ctx context.Context, batchID, status, errorMsg string, transactionCount int) error {
 	// Create payload with or without error info depending on status
 	payload := map[string]interface{}{
@@ -167,8 +138,6 @@ func (l *Blnk) sendBulkTransactionWebhook(ctx context.Context, batchID, status, 
 	// shares it. The outcome has already happened, so its capture must not be abandoned
 	// because a long rollback exhausted the caller's deadline — and context.Background()
 	// would buy that at the cost of the trace, leaving the outbox span an unparented root.
-	// The one event that says a batch FAILED would then appear in no trace at all, which
-	// is precisely the batch an operator goes looking for.
 	publishCtx := context.WithoutCancel(ctx)
 
 	// THE ATOMIC PATH. When the coordinator record exists, the outcome and its event are
@@ -205,9 +174,6 @@ func (l *Blnk) sendBulkTransactionWebhook(ctx context.Context, batchID, status, 
 
 // bulkBatchCoordinationEnabled reports whether the coordinator record backs this
 // deployment's batch outcomes.
-//
-// Returns:
-//   - bool: true when batch outcomes are recorded and finalised atomically.
 func (l *Blnk) bulkBatchCoordinationEnabled() bool {
 	if l == nil {
 		return false
@@ -217,35 +183,10 @@ func (l *Blnk) bulkBatchCoordinationEnabled() bool {
 }
 
 // errBulkBatchNotCoordinated marks a batch whose outcome cannot be captured atomically.
-//
-// It signals ONE condition, and it is not a database failure: event capture is not
-// configured, so PrepareEventOutbox yields no row and there is no event for a
-// transaction to carry. The outcome then goes down the legacy transport alone.
 var errBulkBatchNotCoordinated = errors.New("bulk transaction outcome capture is unavailable")
 
 // finalizeBulkBatchOutcome records the batch outcome and its event in ONE transaction,
 // retrying a transient failure with the SAME prepared event.
-//
-//   - nil: the outcome and its event are durable, either written here or already
-//     written.
-//   - errBulkBatchNotCoordinated: event capture is not configured, so there is no event
-//     row to be atomic with and the caller routes the outcome down the legacy
-//     transport.
-//   - anything else: the outcome is NOT captured, and the caller reports it.
-//
-// Parameters:
-//   - ctx context.Context: the caller's context, used for the retry sleeps only, so a
-//     caller going away stops the retry rather than the write.
-//   - publishCtx context.Context: the cancellation-detached context the write itself
-//     uses.
-//   - batchID string: the batch being finalised.
-//   - status string: the terminal outcome.
-//   - errorMsg string: the failure detail, empty on success.
-//   - transactionCount int: the number of transactions in the batch.
-//   - event NewWebhook: the outcome event, unchanged from the legacy body.
-//
-// Returns:
-//   - error: as enumerated above.
 func (l *Blnk) finalizeBulkBatchOutcome(
 	ctx context.Context,
 	publishCtx context.Context,
@@ -373,34 +314,6 @@ func (l *Blnk) finalizeBulkBatchOutcome(
 }
 
 // escalateLostBulkOutcome raises a batch summary that will never reach the outbox.
-//
-// ESCALATED, NOT ONLY LOGGED. A lost batch summary is an event that now exists nowhere:
-// there is no outbox row to claim, nothing to dead-letter and nothing to replay, so
-// unless it is raised the only trace is a log line nobody is alerted on.
-//
-// This is now reached only when the finalising TRANSACTION itself cannot commit after
-// every attempt, or when the caller's context is cancelled mid-retry. It is no longer
-// reached because a coordinator row was missing: that case is adopted rather than
-// refused.
-//
-// ONE HELPER FOR ALL THREE UNRECOVERABLE EXITS, because all three lose the same thing.
-// A reused event id, a retry abandoned by a cancelled caller, and a fully spent budget
-// differ in why the outcome is gone, not in whether it is: escalating only the third
-// would have left two silent ways to lose a batch summary.
-//
-// There is no recursion risk. NotifyError dispatches system.error through the
-// registered sender, whose own failure it logs rather than re-notifying, so an outbox
-// that is refusing writes produces one escalation attempt per lost outcome and not a
-// cascade.
-//
-// Parameters:
-//   - batchID string: the batch whose summary was lost, so the escalation names the
-//     batch an operator has to reconcile by hand.
-//   - status string: the outcome that was being captured — "applied", "inflight" or
-//     "failed".
-//   - reason string: which of the three exits was taken, in words.
-//   - cause error: the last persistence error, wrapped so %w unwrapping still reaches
-//     it.
 func escalateLostBulkOutcome(batchID, status, reason string, cause error) {
 	notification.NotifyError(fmt.Errorf(
 		"blnk: the bulk transaction outcome event for batch %s (status %s) was not captured — %s: %w",
@@ -409,20 +322,6 @@ func escalateLostBulkOutcome(batchID, status, reason string, cause error) {
 }
 
 // recordBulkBatchStart writes the coordinator record for an asynchronous batch.
-//
-// It owns the whole decision — whether coordination applies, what the row says, and
-// what a failure means — so the call site reads as one intent and the gate cannot be
-// duplicated slightly differently later. The gate is the same predicate the finalise
-// reads, which is what stops a batch being finalised against a row that was never
-// written.
-//
-// Parameters:
-//   - ctx context.Context: the caller's context. The write is a single statement and is
-//     bounded by whatever deadline the request carries.
-//   - batchID string: the batch's parent transaction id.
-//   - req *model.BulkTransactionRequest: read for the transaction count and the atomic
-//     and inflight flags, which are recorded so a stuck row tells an operator what the
-//     batch was attempting — the fact that decides how to finish it by hand.
 func (l *Blnk) recordBulkBatchStart(ctx context.Context, batchID string, req *model.BulkTransactionRequest) {
 	if !l.bulkBatchCoordinationEnabled() || l.datasource == nil || req == nil {
 		return
@@ -449,11 +348,6 @@ func (l *Blnk) recordBulkBatchStart(ctx context.Context, batchID string, req *mo
 }
 
 // The retry budget for the bulk outcome finalise.
-//
-// Three attempts at 200ms, 400ms is deliberately far smaller than the relay's own
-// budget and is not trying to be it. This is one short transaction against the local
-// database — a guarded UPDATE and one INSERT — retried to survive a transient error
-// such as a momentary connection reset or a brief pool exhaustion, and nothing more.
 const (
 	bulkOutcomeCaptureAttempts = 3
 	bulkOutcomeCaptureBackoff  = 200 * time.Millisecond
@@ -501,9 +395,6 @@ func (l *Blnk) handleAsyncBulkTransactionFailure(ctx context.Context, err error,
 }
 
 // CreateBulkTransactions handles the creation of multiple transactions in a batch.
-// If atomic is true: Any failure will cause all transactions to be rolled back (or voided if inflight).
-// If atomic is false: Failures will stop processing but previous transactions remain unaffected.
-// If run_async is true: Processing happens in background with webhook notifications.
 func (l *Blnk) CreateBulkTransactions(ctx context.Context, req *model.BulkTransactionRequest) (*model.BulkTransactionResult, error) {
 	ctx, span := tracer.Start(ctx, "Blnk.CreateBulkTransactions")
 	defer span.End()

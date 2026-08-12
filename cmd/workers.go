@@ -49,15 +49,12 @@ import (
 )
 
 // indexData represents the data structure used for indexing data in the system.
-// It includes the collection name and the payload which is the data to be indexed.
 type indexData struct {
 	Collection string                 `json:"collection"`
 	Payload    map[string]interface{} `json:"payload"`
 }
 
 // processTransaction processes a transaction received from the Redis queue.
-// If a transaction fails due to "insufficient funds", it is rejected, and a webhook is sent.
-// Otherwise, it retries the transaction in case of other failures.
 func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) error {
 	ctx, span := otel.Tracer("blnk.transactions.worker").Start(ctx, "Process Transaction From Redis Queue")
 	defer span.End()
@@ -153,10 +150,6 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 
 // handleTransactionRejection rejects a transaction that has exhausted its retries or
 // hit a terminal processing error.
-//
-// That was a DUPLICATE: RejectTransaction runs postTransactionActions, whose
-// status-derived producer already emits transaction.rejected for the very transaction
-// being rejected here.
 func handleTransactionRejection(ctx context.Context, b *blnkInstance, txn *model.Transaction, err error) error {
 	_, rejectErr := b.blnk.RejectTransaction(ctx, txn, err.Error())
 
@@ -178,8 +171,6 @@ func shouldRejectLockContentionImmediately(cfg *config.Configuration, err error)
 }
 
 // indexData indexes data into TypeSense for searchability.
-// It fetches the collection name and payload from the task, ensures the collections exist,
-// and sends the payload to the appropriate TypeSense collection for indexing.
 func (b *blnkInstance) indexData(ctx context.Context, t *asynq.Task) error {
 	if b.cnf.TypeSense.Dns == "" {
 		return nil
@@ -216,8 +207,6 @@ func (b *blnkInstance) indexData(ctx context.Context, t *asynq.Task) error {
 }
 
 // indexBatchData indexes a batch of items into TypeSense in dependency order.
-// It first indexes all dependencies (e.g., balances), then indexes the primary item (e.g., transaction).
-// This ensures referential integrity in the search index.
 func (b *blnkInstance) indexBatchData(ctx context.Context, t *asynq.Task) error {
 	if b.cnf.TypeSense.Dns == "" {
 		return nil
@@ -288,7 +277,6 @@ func (b *blnkInstance) processInflightCommit(ctx context.Context, t *asynq.Task)
 }
 
 // processInflightExpiry handles the expiry of inflight transactions.
-// It voids the transaction by its ID and logs the action.
 func (b *blnkInstance) processInflightExpiry(cxt context.Context, t *asynq.Task) error {
 	var txnID string
 	// Unmarshal the transaction ID from the task payload.
@@ -447,27 +435,6 @@ func initializeWebhookTaskHandlers(b *blnkInstance, mux *asynq.ServeMux) {
 
 	// FOUR HANDLERS ON ONE MUX, AND ONLY THE FIRST BELONGS TO THE LEGACY WEBHOOK
 	// TRANSPORT.
-	//
-	// The terminal release of the Kafka event-streaming feature — the one enumerated in
-	// docs/webhook-to-kafka-migration.md and in the sunset block at the foot of
-	// webhooks.go — removes the ProcessWebhook line below AND NOTHING ELSE HERE. That is
-	// the whole of this function's part in it, not before: until then the handler must
-	// stay registered, because a delivery enqueued inside the window has to be drained by
-	// something.
-	//
-	// The three lines after it belong to other features and must SURVIVE that release.
-	// Nothing here fails to compile if they are removed by mistake — the failure is
-	// silent, and it is transaction hooks and search indexing that stop:
-	//
-	//   - new:hook_execution is the /hooks feature's PRE_TRANSACTION and POST_TRANSACTION
-	//     callouts, which internal/hooks/manager.go enqueues onto cfg.Queue.WebhookQueue
-	//     BY NAME. That is why the QUEUE ITSELF outlives this transport: only the handler
-	//     mapping below goes, never the queue, its config key or its worker server.
-	//   - cfg.Queue.IndexQueue and new:index:batch are TypeSense indexing.
-	//
-	// TestWebhookTerminalRelease_ChecklistMatchesTheSurface asserts all three survivors are
-	// still here, so an over-applied deletion fails a test rather than degrading a
-	// deployment quietly.
 	mux.HandleFunc(cfg.Queue.WebhookQueue, b.blnk.ProcessWebhook)
 	mux.HandleFunc("new:hook_execution", b.blnk.Hooks.ProcessHookTask)
 	mux.HandleFunc(cfg.Queue.IndexQueue, b.indexData)
@@ -475,7 +442,6 @@ func initializeWebhookTaskHandlers(b *blnkInstance, mux *asynq.ServeMux) {
 }
 
 // workerCommands defines the "workers" command to start worker processes.
-// The workers listen to various queues such as transaction processing, indexing, and inflight expiry.
 func workerCommands(b *blnkInstance) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "workers",

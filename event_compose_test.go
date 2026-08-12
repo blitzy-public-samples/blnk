@@ -1231,6 +1231,53 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 		}
 	})
 
+	// The OTHER failure class that survives a successful-looking apply, and the one the
+	// gate did not cover: a Secret that does not exist, or exists under the wrong key
+	// name. The workload is admitted, scheduled, and then sticks in ContainerCreating
+	// with the reason reachable only from `kubectl describe pod` — indistinguishable, from
+	// the operator's side, from the image problem this script already refuses.
+	t.Run("the preflight enumerates every Secret key the manifests reference", func(t *testing.T) {
+		script := filepath.Join(root, "scripts", "k8s-preflight.sh")
+		manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
+
+		// EXECUTED, and compared against an inventory this test derives INDEPENDENTLY from
+		// the manifests. Two derivations of the same set is the point: a script that scanned
+		// for the wrong key, or stopped at the first entry of an env list, would agree with
+		// itself and disagree here.
+		list := exec.Command(script, "--list-secrets", manifests)
+		list.Env = append(os.Environ(), "NO_COLOR=1")
+		listed, listErr := list.CombinedOutput()
+		require.NoErrorf(t, listErr,
+			"scripts/k8s-preflight.sh --list-secrets must exit 0 and contact no cluster; it is the "+
+				"list an operator creates Secrets from.\n--- output ---\n%s", listed)
+
+		reported := map[string]struct{}{}
+		for _, line := range strings.Split(strings.TrimSpace(string(listed)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+
+			reported[strings.Join(strings.Fields(line), "/")] = struct{}{}
+		}
+
+		required := manifestSecretKeyRefs(t, manifests)
+		require.NotEmpty(t, required,
+			"the manifests must reference at least one Secret key, or this test proves nothing")
+
+		for _, pair := range required {
+			_, ok := reported[pair]
+			assert.Truef(t, ok, "scripts/k8s-preflight.sh does not enumerate %s, so an operator "+
+				"following its output creates an incomplete set and the workload consuming it stays "+
+				"in ContainerCreating. Reported: %v", pair, reported)
+		}
+
+		assert.Lenf(t, reported, len(required),
+			"the preflight enumerates %d Secret key(s) and the manifests reference %d. A demanded "+
+				"key that nothing consumes sends an operator to create something unused; the reverse "+
+				"is the ContainerCreating failure this check exists for. Reported: %v. Required: %v",
+			len(reported), len(required), reported, required)
+	})
+
 	// A SHAPE assertion on the one manifest that can silently corrupt a metadata log.
 	//
 	// What is forbidden is therefore the SINGLETON, not the file.
@@ -2228,5 +2275,76 @@ func TestRelayTarget_RequiresAnActuallyUsableBrokerList(t *testing.T) {
 					"behind a healthy-looking API.\n--- output ---\n%s",
 				shape.config, shape.because, output)
 		})
+	}
+}
+
+// manifestSecretKeyRefs collects every "secret/key" pair the manifests in a directory
+// reference through a secretKeyRef, de-duplicated and sorted.
+//
+// Derived by PARSING the YAML rather than by scanning text, so that it is a genuinely
+// independent second opinion on what scripts/k8s-preflight.sh reports: the script is
+// textual by design — what it checks is the literal text an operator hands to kubectl —
+// and two derivations that share a technique share its blind spots.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when a manifest cannot be read or parsed.
+//   - directory string: the manifest directory.
+//
+// Returns:
+//   - []string: "secret/key" pairs, sorted.
+func manifestSecretKeyRefs(t *testing.T, directory string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(directory)
+	require.NoErrorf(t, err, "%s must be readable", directory)
+
+	unique := map[string]struct{}{}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
+			continue
+		}
+
+		for _, document := range readYAMLDocuments(t, filepath.Join(directory, entry.Name())) {
+			collectSecretKeyRefs(document, unique)
+		}
+	}
+
+	pairs := make([]string, 0, len(unique))
+	for pair := range unique {
+		pairs = append(pairs, pair)
+	}
+
+	sort.Strings(pairs)
+
+	return pairs
+}
+
+// collectSecretKeyRefs walks a decoded YAML document and records every secretKeyRef it
+// carries as "name/key".
+//
+// Parameters:
+//   - node interface{}: the current node.
+//   - into map[string]struct{}: the accumulator.
+func collectSecretKeyRefs(node interface{}, into map[string]struct{}) {
+	switch typed := node.(type) {
+	case map[string]interface{}:
+		for key, value := range typed {
+			if key == "secretKeyRef" {
+				if ref, ok := value.(map[string]interface{}); ok {
+					name := toStringValue(ref["name"])
+					secretKey := toStringValue(ref["key"])
+					if name != "" && secretKey != "" {
+						into[name+"/"+secretKey] = struct{}{}
+					}
+				}
+			}
+
+			collectSecretKeyRefs(value, into)
+		}
+	case []interface{}:
+		for _, value := range typed {
+			collectSecretKeyRefs(value, into)
+		}
 	}
 }

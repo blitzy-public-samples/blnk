@@ -65,16 +65,27 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- the per-aggregate ordering verification queries on.
     aggregate_id        TEXT                      NOT NULL,
 
-    -- The Kafka message key, and the column the relay serialises on.
+    -- The FALLBACK message key: what the event is keyed on when it belongs to no ledger.
     --
-    -- IT IS STILL NOT DEFINED AS THE LEDGER ID, which is why it remains its own column.
-    -- Splitting them means each column means one thing: this one is "where does this
-    -- message go" and is never NULL; ledger_id is "which ledger is this about" and is
-    -- NULL when the answer is none.
+    -- NEITHER THIS COLUMN NOR ledger_id IS THE KEY ON ITS OWN. The Kafka message key, and
+    -- the expression the relay serialises publishes on, are both the EFFECTIVE key:
+    --
+    --     COALESCE(NULLIF(btrim(ledger_id), ''), btrim(partition_key))
+    --
+    -- Three code sites resolve it by that one rule — model.EventOutbox.EffectiveKey, the
+    -- publisher's message key, and the claim query's per-key anti-join — and
+    -- sql/1781252000.sql creates the expression index that makes the anti-join cheap. A
+    -- change to the keying rule therefore belongs in all four places, not in this column.
+    --
+    -- It remains its own column because it is never NULL, so every row has a key even when
+    -- it has no ledger: this one answers "where does this message go if no ledger says",
+    -- while ledger_id answers "which ledger is this about".
     partition_key       TEXT                      NOT NULL,
 
     -- The AUTHORITATIVE ledger this event belongs to, or NULL when the event genuinely
-    -- has no ledger. It takes no part in partitioning or in ordering.
+    -- has no ledger. It is the FIRST term of the effective key above, so for the eleven
+    -- of thirteen event types that belong to a ledger it IS what the event is keyed and
+    -- serialised on; partition_key only decides the key for the ones that do not.
     --
     -- NULLABLE, deliberately, and this is the point of the split: NULL states "this
     -- event has no ledger" as a fact. The previous NOT NULL column with '' as its
@@ -440,8 +451,14 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_claim
 CREATE INDEX IF NOT EXISTS idx_event_outbox_aggregate
     ON blnk.event_outbox (aggregate_id, occurred_at);
 
--- The index that makes PER-KEY ORDERING enforceable rather than merely intended, and
--- the most consequential index in this migration.
+-- The index for the claim's per-key predicate AS THIS MIGRATION LEFT IT.
+--
+-- SUPERSEDED BY sql/1781252000.sql, which drops this index and creates
+-- idx_event_outbox_effective_key_inflight on the effective key expression instead —
+-- COALESCE(NULLIF(btrim(ledger_id), ''), btrim(partition_key)) — because that is the
+-- expression the claim's anti-join actually compares. It is declared here because this is
+-- the migration that created it and a rollback of that one restores it; on a current
+-- schema it does not exist, so do not tune the claim against it.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_partition_key_inflight
     ON blnk.event_outbox (partition_key, occurred_at, id)
     WHERE status IN ('pending', 'processing');

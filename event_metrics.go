@@ -16,18 +16,6 @@ limitations under the License.
 
 // event_metrics.go holds the ONE production maintainer of the event pipeline's three
 // gauges: the outbox backlog, the dead-letter age, and subscriber consumer lag.
-//
-// A COUNTER can be incremented where the thing it counts happens, because a counter
-// only ever accumulates. A GAUGE cannot, and the difference is not stylistic:
-//
-//   - A gauge RETAINS ITS LAST VALUE until it is written again or the process restarts.
-//   - A gauge written from the code path that CAUSES the condition measures the wrong
-//     quantity.
-//   - A series whose subject DISAPPEARS is never written again, so it too keeps its
-//     last value.
-//
-// NewBlnkEventMetricsCollector is deliberately a one-liner so the wiring cannot pair
-// one instance's datasource with another's admin client.
 package blnk
 
 import (
@@ -55,8 +43,6 @@ const (
 	DefaultSubscriberMetricsBudget = 200
 
 	// subscriberMetricsPageSize is how many registry rows one enumeration query reads.
-	// The registry is small and read-rarely — the schema says so explicitly — so a single
-	// modest page keeps the whole enumeration to one or two queries.
 	subscriberMetricsPageSize = 50
 
 	// lagMeasurementConcurrency is how many subscribers are measured AT ONCE within a
@@ -74,10 +60,6 @@ const (
 )
 
 // The "collection" attribute values of metrics.EventMetricsCollectionFailuresTotal.
-//
-// A CLOSED set of fixed literals, one per independent collection plus the registry
-// enumeration, so the counter's cardinality is a property of this file rather than of whatever
-// failed. No error text and no identifier ever reaches the attribute.
 const (
 	collectionOutboxBacklog     = "outbox_backlog"
 	collectionDeadLetterAge     = "dead_letter_age"
@@ -96,11 +78,6 @@ type lagReading struct {
 
 // eventMetricsOutboxStore is the repository surface the backlog gauge needs, and
 // nothing else.
-//
-// One method. The backlog is a COUNT BY STATUS and not a scan, deliberately: the count
-// is answered by an index-only aggregate, whereas walking rows to size a queue would
-// make the cost of observing the backlog grow with the backlog — worst exactly when the
-// system is already struggling.
 type eventMetricsOutboxStore interface {
 	// CountUnresolvedEventOutbox returns a status-keyed count of every NON-DISPATCHED
 	// status, exact and complete for all time. A status with no rows is ABSENT from the
@@ -110,9 +87,6 @@ type eventMetricsOutboxStore interface {
 }
 
 // eventMetricsSubscriberStore is the registry surface the lag gauge needs.
-//
-// Paging rather than "give me all of them": the collector applies a cardinality budget, and
-// a paged read lets it stop at the budget instead of loading a registry it will not measure.
 type eventMetricsSubscriberStore interface {
 	// ListEventSubscribers pages the registry, resuming from a keyset cursor.
 	ListEventSubscribers(ctx context.Context, query model.SubscriberPageQuery) (model.SubscriberPage, error)
@@ -128,17 +102,12 @@ type eventMetricsSubscriberStore interface {
 	CountSubscriberSettlementObligations(ctx context.Context) (model.SubscriberSettlementBacklog, error)
 
 	// CountSubscriberAccessResidue returns how much broker-side access is UNACCOUNTED FOR:
-	// credentials that outlived their registry record, and revocations the broker refused.
 	CountSubscriberAccessResidue(ctx context.Context) (model.SubscriberAccessResidue, error)
 }
 
 // eventMetricsLagMeasurer is the broker surface the lag gauge needs: one method of
 // KafkaAdmin, so a test needs no broker and the collector cannot reach any other
 // administrative operation.
-//
-// It notably CANNOT create a topic, mint a credential or bind an ACL. A metrics
-// collector that could provision would be one misplaced call away from changing the
-// system it is supposed to be observing.
 type eventMetricsLagMeasurer interface {
 	// IsConfigured reports whether a broker is configured at all.
 	IsConfigured() bool
@@ -148,11 +117,6 @@ type eventMetricsLagMeasurer interface {
 }
 
 // eventMetricsAgeRefresher is the dead-letter surface the age gauge needs.
-//
-// The collector delegates rather than reimplementing, because the age has to be measured
-// from the persisted dead_lettered_at over dead-lettered rows only, and a second
-// implementation of that rule would be a second thing to keep correct. See
-// RefreshDeadLetterAgeGauge.
 type eventMetricsAgeRefresher interface {
 	// RefreshDeadLetterAgeGauge recomputes the per-topic dead-letter ages and records
 	// them, zero included for every topic Blnk owns.
@@ -177,10 +141,6 @@ type lagSeries struct {
 }
 
 // EventMetricsCollector recomputes the event pipeline's gauges on a fixed interval.
-//
-// One instance per process is enough and it is safe for concurrent use: its
-// dependencies are read-only after construction and its lifecycle state is
-// mutex-guarded.
 type EventMetricsCollector struct {
 	outbox      eventMetricsOutboxStore
 	subscribers eventMetricsSubscriberStore
@@ -212,8 +172,6 @@ type EventMetricsCollector struct {
 
 	// lagCursor is where the NEXT lag sweep resumes, and it is what gives every registered
 	// subscriber coverage rather than only the newest ones.
-	//
-	// Nil means "start at the newest", which is both the first sweep and the wrap-around.
 	lagCursor *model.SubscriberCursor
 
 	// lagPassSeen is every series measured SO FAR IN THE CURRENT PASS, accumulated across
@@ -268,9 +226,6 @@ func NewEventMetricsCollector(
 // NewBlnkEventMetricsCollector builds the collector a running Blnk instance needs,
 // wiring its datasource, its dead-letter service and its Kafka admin.
 //
-// It exists so that the eventual start-up call in the server role is one line and
-// cannot pair one instance's datasource with another's admin client.
-//
 // Parameters:
 //   - b *Blnk: the service container. A nil container, or one without a datasource,
 //     yields a collector whose ticks report an error rather than panicking a ledger
@@ -315,12 +270,6 @@ func NewBlnkEventMetricsCollector(
 }
 
 // WithTickBudget sets the bound on ONE WHOLE COLLECTION.
-//
-// A non-positive value falls back to the default rather than being rejected, and —
-// unlike the interval — an UNBOUNDED value is not offered at all. The whole purpose of
-// the bound is that a hung dependency cannot freeze the refresh of gauges that go on
-// being scraped as current, and a configuration knob that could switch that protection
-// off would be a knob for reintroducing the defect.
 //
 // Parameters:
 //   - budget time.Duration: the per-collection bound.
@@ -371,10 +320,6 @@ func (c *EventMetricsCollector) WithCallBudget(budget time.Duration) *EventMetri
 
 // WithInterval sets how often the collector recomputes the gauges.
 //
-// A non-positive interval falls back to the default rather than being rejected: a
-// misconfigured cadence must not be able to stop the gauges being published, because
-// the failure mode of that is silent — an alert that never fires.
-//
 // Parameters:
 //   - interval time.Duration: the collection interval.
 //
@@ -424,11 +369,6 @@ func (c *EventMetricsCollector) WithSubscriberBudget(budget int) *EventMetricsCo
 
 // Start begins collecting in the background.
 //
-// It collects ONCE IMMEDIATELY and then on every tick. Waiting a full interval before
-// the first collection would leave the gauges absent from `/metrics` for that interval
-// after every deployment, and an absent gauge is not the same as a zero one: a
-// dashboard shows a gap and an alert expression over it evaluates to nothing at all.
-//
 // Parameters:
 //   - ctx context.Context: cancelling it stops the loop.
 func (c *EventMetricsCollector) Start(ctx context.Context) {
@@ -456,10 +396,6 @@ func (c *EventMetricsCollector) Start(ctx context.Context) {
 }
 
 // Stop signals the loop to finish and waits for the in-flight tick to complete.
-//
-// Waiting matters rather than being tidy: a tick that is interrupted mid-way has published
-// some gauges and not others, so the last values in the exporter would be a mix of two
-// different instants.
 func (c *EventMetricsCollector) Stop() {
 	c.mu.Lock()
 	if !c.running {
@@ -512,11 +448,6 @@ func (c *EventMetricsCollector) run(ctx context.Context) {
 
 // collectAndLog runs one BOUNDED collection, publishes the collection-health signals,
 // and logs whatever failed.
-//
-// The error is logged and discarded because there is nothing above this to handle it:
-// the loop must continue whatever one tick reported, since stopping the collector on a
-// transient failure would silence every gauge — including the backlog gauge that would
-// have shown the problem.
 func (c *EventMetricsCollector) collectAndLog(ctx context.Context) {
 	bounded, cancel := context.WithTimeout(ctx, c.tickBudget)
 	defer cancel()
@@ -541,13 +472,6 @@ func (c *EventMetricsCollector) collectAndLog(ctx context.Context) {
 
 // callContext derives the bound on ONE dependency call from the collection's own
 // context.
-//
-// Parameters:
-//   - ctx context.Context: the collection's context.
-//
-// Returns:
-//   - context.Context: the bounded call context.
-//   - context.CancelFunc: must be called by the caller, conventionally deferred.
 func (c *EventMetricsCollector) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	budget := c.callBudget
 	if budget <= 0 {
@@ -558,14 +482,6 @@ func (c *EventMetricsCollector) callContext(ctx context.Context) (context.Contex
 }
 
 // recordCollectionFailure counts one failed collection under its fixed name.
-//
-// It exists so that a partially failed tick is visible in METRICS and not only in one
-// log line. "The backlog is 0" and "the backlog could not be counted" are the same
-// series otherwise, and the second is the one an operator has to act on.
-//
-// Parameters:
-//   - ctx context.Context: the recording context.
-//   - collection string: one of the closed collection literals declared in this file.
 func recordCollectionFailure(ctx context.Context, collection string) {
 	metrics.EventMetricsCollectionFailuresTotal.Add(ctx, 1, otelmetric.WithAttributes(
 		attribute.String("collection", collection),
@@ -574,11 +490,6 @@ func recordCollectionFailure(ctx context.Context, collection string) {
 
 // EventMetricsReport is what one collection observed, for the caller's log line and for
 // tests.
-//
-// It reports the FAILURES as well as the values, because a partially failed tick is the
-// case that matters: knowing that the backlog was published and the lag was not is the
-// difference between "consumer lag is zero" and "consumer lag is unknown", which no
-// gauge can express on its own.
 type EventMetricsReport struct {
 	// CollectedAt is when the collection ran.
 	CollectedAt time.Time
@@ -732,10 +643,6 @@ func (r EventMetricsReport) LogFields() logrus.Fields {
 
 // Collect performs ONE collection of every gauge it owns and returns what it observed.
 //
-// It is exported so that a caller can drive a collection on demand — a test, or an
-// operational endpoint — without owning a loop, and so that the loop itself has nothing
-// in it but scheduling.
-//
 // Parameters:
 //   - ctx context.Context: cancels every underlying query.
 //
@@ -754,10 +661,6 @@ func (c *EventMetricsCollector) Collect(ctx context.Context) (EventMetricsReport
 	c.collectSubscriberRevocations(ctx, &report)
 	c.collectSubscriberSettlement(ctx, &report)
 	// THE UNACCOUNTED-ACCESS RESIDUE, and it is not a duplicate of the two steps above it.
-	// Those report work the registry KNOWS is outstanding — a revocation pending, a
-	// settlement owed. This reports the residue those two cannot see: a credential written
-	// at the broker whose registry record could not be updated, and a revocation the
-	// broker REFUSED.
 	c.collectSubscriberAccessResidue(ctx, &report)
 	c.collectSubscriberLag(ctx, &report)
 
@@ -769,11 +672,6 @@ func (c *EventMetricsCollector) Collect(ctx context.Context) (EventMetricsReport
 }
 
 // collectOutboxBacklog records the relay's backlog: pending plus processing rows.
-//
-// PROCESSING ROWS ARE INCLUDED, and that is the whole reason this cannot be a count of
-// the pending literal alone. A processing row has been claimed by a relay instance
-// under a lease but not yet acknowledged by the broker, so it is still un-published
-// work.
 func (c *EventMetricsCollector) collectOutboxBacklog(ctx context.Context, report *EventMetricsReport) {
 	if c.outbox == nil {
 		report.Failures = append(report.Failures,
@@ -826,16 +724,6 @@ func (c *EventMetricsCollector) collectOutboxBacklog(ctx context.Context, report
 
 // collectDeadLetterAge refreshes the dead-letter age gauge by delegating to the
 // dead-letter service.
-//
-// Delegation rather than reimplementation: the age has to be measured from the
-// persisted dead_lettered_at, over dead-lettered rows only, with every topic Blnk owns
-// published including the zeros. A second implementation of those three rules would be
-// a second thing to keep correct, and the two would diverge exactly when one of them
-// was fixed.
-//
-// A collector with no dead-letter service is not a failure. The service needs a
-// datasource and, for its other operations, a transport; a deployment that has not
-// wired one still wants its backlog gauge.
 func (c *EventMetricsCollector) collectDeadLetterAge(ctx context.Context, report *EventMetricsReport) {
 	if c.deadLetters == nil {
 		return
@@ -857,11 +745,6 @@ func (c *EventMetricsCollector) collectDeadLetterAge(ctx context.Context, report
 
 // collectSubscriberRevocations publishes how much broker-side credential revocation is
 // outstanding and how old the oldest obligation is.
-//
-// Recording them here rather than in the deregistration path is what makes them true
-// rather than merely written. A gauge maintained by the code that creates the
-// obligation reports only what that code observed on its way past; the obligation
-// persists in a row and outlives the request, so the reading has to come from the row.
 func (c *EventMetricsCollector) collectSubscriberRevocations(ctx context.Context, report *EventMetricsReport) {
 	if c.subscribers == nil {
 		// No registry surface: there is nothing to read, and a zero would be an invention.
@@ -901,11 +784,6 @@ func (c *EventMetricsCollector) collectSubscriberRevocations(ctx context.Context
 
 // collectSubscriberSettlement publishes how much broker-side reconciliation subscribers
 // owe and how old the oldest obligation is.
-//
-// Like the revocation backlog and unlike consumer lag, this is not skipped when no
-// broker is configured. Obligations are raised BY broker failures, and the commonest of
-// those is the broker being unreachable — so declining to measure the backlog without a
-// broker would hide it exactly when it is growing fastest.
 func (c *EventMetricsCollector) collectSubscriberSettlement(ctx context.Context, report *EventMetricsReport) {
 	if c.subscribers == nil {
 		// No registry surface: there is nothing to read, and a zero would be an invention.
@@ -953,11 +831,6 @@ func (c *EventMetricsCollector) collectSubscriberSettlement(ctx context.Context,
 
 // collectSubscriberLag measures consumer lag for every registered subscriber and
 // publishes the result as the complete current inventory.
-//
-// ConsumerLag measures ONE group when asked. Nothing asks it on a schedule, so without
-// this the lag gauge only ever held whatever an operator's ad-hoc query happened to
-// record — which is to say the consumer-lag alert could not fire for a subscriber
-// nobody had thought to query.
 func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report *EventMetricsReport) {
 	if c.subscribers == nil {
 		// No registry: nothing to enumerate, so the inventory is empty and every previously
@@ -1107,18 +980,6 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 
 // publishLagCoverage records how well the rotation is keeping up, alongside the lag
 // readings themselves.
-//
-// The lag gauges cannot report their own blind spots. A subscriber the rotation has not
-// returned to within the reading TTL stops being exported, and an ABSENT series
-// breaches no threshold — so the >10000 rule reports nothing wrong for exactly the
-// subscribers it can no longer see.
-//
-// Parameters:
-//   - ctx context.Context: the collection context.
-//   - report *EventMetricsReport: the tick's report, read for the published series
-//     count.
-//   - passStartedAt time.Time: when the in-progress pass began.
-//   - passComplete bool: whether this tick reached the end of the registry.
 func (c *EventMetricsCollector) publishLagCoverage(
 	ctx context.Context,
 	report *EventMetricsReport,
@@ -1144,14 +1005,6 @@ func (c *EventMetricsCollector) publishLagCoverage(
 
 // coveredSubscriberCount is how many DISTINCT subscribers currently have an exported
 // lag series.
-//
-// Distinct SUBSCRIBERS rather than series, because the inventory carries one series per
-// subscriber-topic pair: counting series would report a subscriber authorised on four
-// topics as four covered subscribers and make the comparison against the registry size
-// meaningless.
-//
-// Returns:
-//   - int: the number of distinct subscribers in the currently exported inventory.
 func (c *EventMetricsCollector) coveredSubscriberCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1170,10 +1023,6 @@ func (c *EventMetricsCollector) coveredSubscriberCount() int {
 
 // beginLagSweep reads the position this tick resumes from and the instant the current pass
 // began, starting a new pass when there is none in progress.
-//
-// Returns:
-//   - *model.SubscriberCursor: the resume position, nil at the start of a pass.
-//   - time.Time: when the current pass began.
 func (c *EventMetricsCollector) beginLagSweep() (*model.SubscriberCursor, time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1192,15 +1041,6 @@ func (c *EventMetricsCollector) beginLagSweep() (*model.SubscriberCursor, time.T
 }
 
 // finishLagSweep records where the next tick resumes.
-//
-// A completed pass resets both the cursor and the pass clock, so coverage restarts from
-// the newest subscriber. An incomplete one carries the cursor forward — and a nil
-// cursor from an incomplete sweep, which is what a listing failure on the first page
-// leaves behind, restarts the pass rather than silently pinning it.
-//
-// Parameters:
-//   - cursor *model.SubscriberCursor: where the sweep stopped.
-//   - complete bool: whether the sweep reached the end of the registry.
 func (c *EventMetricsCollector) finishLagSweep(cursor *model.SubscriberCursor, complete bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1216,21 +1056,6 @@ func (c *EventMetricsCollector) finishLagSweep(cursor *model.SubscriberCursor, c
 }
 
 // sweepWasComplete decides whether this tick measured EVERY registered subscriber.
-//
-// It is deliberately conservative: a sweep whose registry enumeration failed reports
-// INCOMPLETE even if it happened to examine every row it did see, because the number of
-// rows it never reached is unknown and claiming completeness on an unknown is the
-// failure this signal exists to prevent.
-//
-// Parameters:
-//   - report *EventMetricsReport: the report so far, read for its failure flags.
-//   - covered int: rows this tick examined.
-//   - total int: the registry size observed, or -1 when the sweep never reached the
-//     end.
-//
-// Returns:
-//   - bool: true only when the whole registry was examined and nothing was left
-//     unmeasured by a failure.
 func (c *EventMetricsCollector) sweepWasComplete(report *EventMetricsReport, covered, total int) bool {
 	if report.ListingFailed || report.BudgetReached || total < 0 {
 		return false
@@ -1243,17 +1068,6 @@ func (c *EventMetricsCollector) sweepWasComplete(report *EventMetricsReport, cov
 }
 
 // publishSweepCoverage records the coverage gauges for this tick.
-//
-// EVERY reason value is written on every tick, zeros included. A reason that disappears
-// from the export is indistinguishable from one that has been resolved, and the whole
-// point of these two series is to make the unmeasured case observable rather than
-// absent.
-//
-// Parameters:
-//   - ctx context.Context: the recording context.
-//   - report *EventMetricsReport: the tick's tallies.
-//   - covered int: rows examined this tick.
-//   - total int: the registry size observed, or -1 when unknown.
 func (c *EventMetricsCollector) publishSweepCoverage(
 	ctx context.Context,
 	report *EventMetricsReport,
@@ -1325,14 +1139,6 @@ func (c *EventMetricsCollector) publishSweepCoverage(
 
 // publishCoverage publishes how large the registry is, so the unmeasured count can be
 // read as a proportion.
-//
-// The unmeasured COUNT is not published here: it is exported ATTRIBUTED BY REASON from
-// publishSweepCoverage, because the reason decides the remediation and only 'budget' is
-// answered by configuration. Summing the reasons away recovers this number.
-//
-// Parameters:
-//   - ctx context.Context: passed to the instrument.
-//   - report *EventMetricsReport: read for the registry size, already counted.
 func (c *EventMetricsCollector) publishCoverage(ctx context.Context, report *EventMetricsReport) {
 	// Nil-guarded because metrics.Init may not have run: every other recording site in this
 	// file does the same, and a collector that panicked because telemetry was not initialised
@@ -1353,18 +1159,6 @@ func (c *EventMetricsCollector) publishCoverage(ctx context.Context, report *Eve
 
 // publishLagInventory replaces the exported consumer-lag inventory and reports the
 // churn.
-//
-// It is the ONE place the inventory is published, so the whole-set semantics cannot be
-// bypassed by a caller holding only part of the registry, and the retained set is
-// tracked here so the churn figure and the publication cannot disagree.
-//
-// Parameters:
-//   - samples []metrics.ConsumerLagSample: the readings measured on THIS tick.
-//   - passComplete bool: whether the sweep has now covered the whole registry.
-//
-// Returns:
-//   - int: how many series from the previous publication are absent from this one, and
-//     so stop being exported.
 func (c *EventMetricsCollector) publishLagInventory(
 	samples []metrics.ConsumerLagSample,
 	passComplete bool,
@@ -1456,12 +1250,6 @@ func (c *EventMetricsCollector) publishLagInventory(
 
 // seriesOf is the label tuple a sample is exported under, in one place so the
 // retained-reading key and the published attribute set cannot drift apart.
-//
-// Parameters:
-//   - sample metrics.ConsumerLagSample: the reading.
-//
-// Returns:
-//   - lagSeries: its identity.
 func seriesOf(sample metrics.ConsumerLagSample) lagSeries {
 	return lagSeries{
 		subscriber: sample.Subscriber,
@@ -1471,27 +1259,6 @@ func seriesOf(sample metrics.ConsumerLagSample) lagSeries {
 }
 
 // measureSubscriber measures one subscriber's lag and appends the samples it produced.
-//
-// It APPENDS to the caller's accumulator and returns it, rather than publishing,
-// because the inventory the asynchronous gauges observe is replaced as a whole:
-// publishing per subscriber would retire every other subscriber's series on each call.
-// See collectSubscriberLag.
-//
-// A subscriber with no authorised topics is SKIPPED rather than measured. That is the
-// fail-closed default of a freshly registered row — authorised for nothing — and
-// measuring it would publish a zero-lag series for a subscriber that is consuming
-// nothing, which reads as a healthy consumer rather than as an unprovisioned one.
-//
-// Parameters:
-//   - ctx context.Context
-//   - subscriber model.EventSubscriber: the registry row to measure.
-//   - samples []metrics.ConsumerLagSample: the accumulator so far.
-//   - report *EventMetricsReport: updated with the measured, skipped and failure
-//     tallies.
-//
-// Returns:
-//   - []metrics.ConsumerLagSample: the accumulator, with this subscriber's samples
-//     appended.
 func (c *EventMetricsCollector) measureSubscriber(
 	ctx context.Context,
 	subscriber model.EventSubscriber,
@@ -1543,8 +1310,6 @@ func (c *EventMetricsCollector) measureSubscriber(
 }
 
 // lagMeasurement is one subscriber's measurement outcome, as a value.
-//
-// Exactly one of skipped, measured and failure is set.
 type lagMeasurement struct {
 	// samples are the per-topic lag samples, present only on a successful measurement.
 	samples []metrics.ConsumerLagSample
@@ -1567,20 +1332,6 @@ type lagMeasurement struct {
 
 // measurePage measures one page of subscribers with BOUNDED CONCURRENCY and merges the
 // results into the report in page order.
-//
-// The concurrency is fixed and small, following the house semaphore pattern. An
-// unbounded fan-out over a page would open one connection per subscriber against a
-// broker that may already be the thing failing, which is how an observability sweep
-// becomes the cause of the outage it is measuring.
-//
-// Parameters:
-//   - ctx context.Context: the collection context, shared by every measurement.
-//   - subscribers []model.EventSubscriber: the page to measure.
-//   - samples []metrics.ConsumerLagSample: the accumulating inventory.
-//   - report *EventMetricsReport: the tick's report, updated with counts and failures.
-//
-// Returns:
-//   - []metrics.ConsumerLagSample: samples with this page's readings appended.
 func (c *EventMetricsCollector) measurePage(
 	ctx context.Context,
 	subscribers []model.EventSubscriber,
@@ -1648,10 +1399,6 @@ func (c *EventMetricsCollector) collectSubscriberAccessResidue(ctx context.Conte
 		report.Failures = append(report.Failures,
 			fmt.Errorf("counting unaccounted subscriber access: %w", err))
 		// Counted as well as reported, and this collection is the one where it matters most:
-		// the figures it publishes are unaccounted BROKER ACCESS, so "the last four readings
-		// were zero and the query has been failing since" must not look like "nothing is
-		// unaccounted for". ResidueMeasured carries that to a caller holding the report; this
-		// counter carries it to whoever is only watching the metrics.
 		recordCollectionFailure(ctx, collectionAccessResidue)
 
 		return

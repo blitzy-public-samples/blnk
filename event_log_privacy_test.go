@@ -377,7 +377,10 @@ func TestEventLogFields_CarryNoRawSubscriberOrGroupIdentifier(t *testing.T) {
 		"consumer_group_prefix": "use consumer_group_hash with consumerGroupLogLabel",
 	}
 
-	for _, name := range []string{"event_admin.go", "event_subscriber.go", "event_metrics.go"} {
+	// Expanded through the source group, so a file split for size widens this guard
+	// instead of narrowing it to the remnant that kept the original name.
+	for _, name := range eventSourceGroups(t,
+		"event_admin.go", "event_subscriber.go", "event_metrics.go") {
 		t.Run(name, func(t *testing.T) {
 			file := parseRepositoryGoFile(t, name)
 

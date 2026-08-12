@@ -15,19 +15,6 @@ limitations under the License.
 */
 
 // event_settlement.go finishes the broker-side work a subscriber operation could not.
-//
-// A subscriber's state lives in two systems that cannot be written atomically: the
-// registry row in PostgreSQL, and the principal, credential and ACL bindings at the
-// Kafka broker. Three operations span both — issuing a credential, changing an
-// authorization, deregistering — and every one of them has intermediate states that are
-// reachable in practice:
-//
-//   - an authorization change that pruned the broker and then failed to persist, or
-//     persisted and then failed to grant, or whose process disappeared between the two;
-//   - a credential written at the broker whose compensating revocation itself failed,
-//     leaving a principal that can authenticate with no authorization boundary;
-//   - a credential revoked and confirmed gone whose registry record could not be
-//     cleared, leaving the registry reporting access that does not exist.
 package blnk
 
 import (
@@ -78,11 +65,6 @@ var (
 )
 
 // subscriberSettlementStore is the persistence surface the processor needs, and nothing more.
-//
-// Two methods: find the obligations, and record that they were attempted. Everything that
-// DISCHARGES an obligation is deliberately absent, because discharging belongs to the remedy
-// that satisfied it — a processor able to clear a marker without performing the remedy would be
-// one mistake away from silently declaring the divergence settled.
 type subscriberSettlementStore interface {
 	// ListSubscriberSettlementObligations returns the subscribers owing broker-side work,
 	// oldest attempt first, skipping any attempted at or after the caller's bound.
@@ -94,11 +76,6 @@ type subscriberSettlementStore interface {
 }
 
 // subscriberSettler is the remedy surface the processor drives.
-//
-// One method, so the processor owns the loop and the registry service owns every decision about
-// broker state. That separation is what keeps the fencing, the tombstone handling and the
-// ordering between the two remedies in the one file that already implements them, rather than
-// duplicated here where a second opinion could disagree with the first.
 type subscriberSettler interface {
 	// SettleSubscriber discharges whatever a subscriber owes, under its provisioning claim.
 	SettleSubscriber(ctx context.Context, subscriberID string) error
@@ -120,7 +97,6 @@ type SubscriberSettlementProcessor struct {
 	retryInterval time.Duration
 
 	// now is the clock, replaceable in-package so a test can assert the retry bound exactly.
-	// It follows the retention sweeper's and the relay's now field.
 	now func() time.Time
 
 	stopCh  chan struct{}
@@ -169,17 +145,6 @@ func NewSubscriberSettlementProcessor(b *Blnk) *SubscriberSettlementProcessor {
 }
 
 // subscriberSettlementConfigured reports whether a Kafka broker is configured.
-//
-// It asks the same question every other part of this feature asks — is the broker list
-// non-empty — rather than a variant of it, because a worker that disagreed with the
-// publisher about whether Kafka exists would either poll forever on a deployment
-// without it or stay silent on one with it.
-//
-// Parameters:
-//   - cnf *config.Configuration: the instance's configuration, possibly nil.
-//
-// Returns:
-//   - bool: true when at least one broker is configured.
 func subscriberSettlementConfigured(cnf *config.Configuration) bool {
 	if cnf != nil {
 		return len(cnf.Kafka.Brokers) > 0
@@ -194,10 +159,6 @@ func subscriberSettlementConfigured(cnf *config.Configuration) bool {
 }
 
 // WithInterval sets how often a pass runs.
-//
-// A non-positive interval falls back to the default rather than being rejected,
-// matching every other worker here: a misconfigured cadence must not be able to stop
-// settlement running, because the failure mode is a divergence nobody notices.
 //
 // Parameters:
 //   - interval time.Duration: the pass interval.
@@ -240,10 +201,6 @@ func (p *SubscriberSettlementProcessor) WithBatchSize(size int) *SubscriberSettl
 }
 
 // WithRetryInterval sets how long a failed attempt is left alone.
-//
-// A non-positive value falls back to the default. Zero is NOT read as "retry
-// immediately", because that is the one setting that would turn a broker outage into a
-// busy loop.
 //
 // Parameters:
 //   - interval time.Duration: the retry interval.
@@ -369,16 +326,6 @@ func (p *SubscriberSettlementProcessor) IsRunning() bool {
 }
 
 // run is the ticker loop.
-//
-// The first pass is on the first tick rather than at start-up, matching the retention
-// sweeper. An obligation that has been outstanding since before this process existed
-// can wait one more interval, and a pass during a rollout would have every replica
-// making administrative calls to the broker at the same moment.
-//
-// Parameters:
-//   - ctx context.Context: cancelling it ends the loop.
-//   - stop <-chan struct{}: the stop channel, captured by Start rather than read from
-//     the field.
 func (p *SubscriberSettlementProcessor) run(ctx context.Context, stop <-chan struct{}) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -401,10 +348,6 @@ func (p *SubscriberSettlementProcessor) run(ctx context.Context, stop <-chan str
 
 // Pass performs ONE bounded settlement pass and returns how many obligations it
 // discharged.
-//
-// It is exported so an operator-facing path can run settlement on demand — the same
-// code, the same bounds, the same ordering — rather than a second implementation able
-// to disagree with this one.
 //
 // Parameters:
 //   - ctx context.Context: cancels the pass. A deadline of its own is applied on top.
@@ -464,18 +407,6 @@ func (p *SubscriberSettlementProcessor) Pass(ctx context.Context) int {
 }
 
 // settle discharges one subscriber's obligations and records the attempt either way.
-//
-// The attempt is recorded on a context DETACHED from the per-subscriber deadline,
-// because the commonest failure is that deadline expiring and an attempt that could not
-// be recorded would never pace the next one — turning a broker outage into a
-// pass-per-minute busy loop against the same failing subscriber.
-//
-// Parameters:
-//   - ctx context.Context: the pass context.
-//   - obligation model.SubscriberSettlementObligation: what this subscriber owes.
-//
-// Returns:
-//   - bool: true when the remedy completed and the obligations were discharged.
 func (p *SubscriberSettlementProcessor) settle(
 	ctx context.Context,
 	obligation model.SubscriberSettlementObligation,

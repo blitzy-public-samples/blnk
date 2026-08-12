@@ -1397,10 +1397,12 @@ func relayTransactionRow(id int64, eventID string) model.EventOutbox {
 // changes one of them, and the entire reason single ownership is worth asserting.
 //
 // IT IS THE AST, NOT THE TEXT, and that is the whole difference.
-func relayParseOwnSource(t *testing.T) *ast.File {
+func relayParseOwnSource(t *testing.T) []*ast.File {
 	t.Helper()
 
-	return parseRepositoryGoFile(t, "event_relay.go")
+	// The GROUP, because every assertion built on this helper asserts an ABSENCE — and an
+	// absence proven of one file of a split unit is not an absence.
+	return parseRepositoryGoFiles(t, "event_relay.go")
 }
 
 // relayPinLogLevel sets the standard logger's level for one test and restores whatever
@@ -1613,19 +1615,19 @@ func TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly(t *
 	// proves the relay's answer AGREES with event_sunset.go's today; this proves there is
 	// only one thing that could answer, so it cannot stop agreeing tomorrow.
 	source := relayParseOwnSource(t)
-	assert.Zero(t, identifierUses(source, "WebhookDeprecationSunsetDate"),
+	assert.Zero(t, sumIdentifierUses(source, "WebhookDeprecationSunsetDate"),
 		"the relay must never read the configured sunset date; event_sunset.go owns it, and a "+
 			"second reader is a second interpretation of the same string")
-	assert.Zero(t, identifierUses(source, "WebhookDeprecationStartDate"),
+	assert.Zero(t, sumIdentifierUses(source, "WebhookDeprecationStartDate"),
 		"nor the start date, for the same reason: the window is one decision with two ends")
-	assert.Zero(t, qualifiedCallCount(source, "time", "Parse"),
+	assert.Zero(t, sumQualifiedCallCount(source, "time", "Parse"),
 		"and it must never parse a date; a second parse is a second chance to disagree about "+
 			"what the configured instant means")
 
 	// The comparison primitives too, so the rule is about the OPERATION rather than about
 	// one spelling of one helper. A relay that compared instants itself would satisfy
 	// every assertion above and still own a second copy of the boundary.
-	calls := selectorCallNames(source)
+	calls := sumSelectorCallNames(source)
 	assert.Zero(t, calls["Before"],
 		"the relay must not compare instants itself; that comparison is the sunset decision")
 	assert.Zero(t, calls["After"], "the same, in the other direction")
@@ -3008,16 +3010,16 @@ func TestProcessRow_DoesNotRetryInProcess(t *testing.T) {
 	// The structural half. The elapsed-time assertion above proves THIS path does not sleep;
 	// this proves no path does, including the ones a fixture does not reach.
 	source := relayParseOwnSource(t)
-	assert.Zero(t, qualifiedCallCount(source, "time", "Sleep"),
+	assert.Zero(t, sumQualifiedCallCount(source, "time", "Sleep"),
 		"the relay must never sleep a retry delay in process: the backoff is persisted as "+
 			"next_attempt_at and waited out by the claim predicate, and a sleep here would "+
 			"outlive the lease and let a second instance republish the row mid-sleep")
 
 	// The equivalent written another way. time.After in a blocking receive, or a Timer, sleeps
 	// just as effectively, so the rule names the operation rather than one function.
-	assert.Zero(t, qualifiedCallCount(source, "time", "After"),
+	assert.Zero(t, sumQualifiedCallCount(source, "time", "After"),
 		"nor block on a timer channel, which is the same wait spelled differently")
-	assert.Zero(t, qualifiedCallCount(source, "time", "NewTimer"),
+	assert.Zero(t, sumQualifiedCallCount(source, "time", "NewTimer"),
 		"nor a Timer, for the same reason")
 }
 
@@ -3842,7 +3844,7 @@ func TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports(t *testing.T) {
 		// The structural half. The recorder above proves this batch wrote nothing; this proves
 		// no code path in the file can, which is what "the collector owns the gauge" means.
 		source := relayParseOwnSource(t)
-		assert.Zero(t, identifierUses(source, "OutboxPendingBacklog"),
+		assert.Zero(t, sumIdentifierUses(source, "OutboxPendingBacklog"),
 			"and it must not reference the gauge at all: a second writer would make the gauge "+
 				"disagree with itself between the collector's ticks")
 
@@ -3859,7 +3861,7 @@ func TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports(t *testing.T) {
 		//     collector reading the table would see the row GONE from the backlog and could
 		//     not tell a repair from a purge.
 		//   - EventRepairSaturated is whether this tick's repair BUDGET ended the chain.
-		selections := qualifiedSelections(source, "metrics")
+		selections := sumQualifiedSelections(source, "metrics")
 		assert.Equal(t,
 			[]string{"EventRepairSaturated", "EventRepairsCompletedTotal", "EventsDispatchedTotal"},
 			sortedKeys(selections),
@@ -3876,7 +3878,7 @@ func TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports(t *testing.T) {
 
 		// The collector's gauge must NOT be reachable from here, stated as an absence for the
 		// same reason OutboxPendingBacklog is above.
-		assert.Zero(t, identifierUses(source, "EventRepairBacklog"),
+		assert.Zero(t, sumIdentifierUses(source, "EventRepairBacklog"),
 			"the repair BACKLOG is a count of rows, so EventMetricsCollector owns it and publishes "+
 				"it from the aggregate it already reads; a relay writing it would be a second "+
 				"writer of one gauge")

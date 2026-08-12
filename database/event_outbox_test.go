@@ -4776,54 +4776,64 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 
 	// (2) The import block, parsed rather than grepped.
 	t.Run("the repository imports no password-hashing library", func(t *testing.T) {
-		const source = "event_subscriber.go"
-
-		fileSet := token.NewFileSet()
-		parsed, err := parser.ParseFile(fileSet, source, nil, parser.ImportsOnly)
-		require.NoError(t, err, "failed to parse %s", source)
+		// Every file of the subscriber repository, because an import in a sibling grants the
+		// same capability the ban exists to withhold.
+		group := packageSourceGroup(t, "event_subscriber.go")
 
 		var imported []string
-		for _, spec := range parsed.Imports {
-			path := strings.Trim(spec.Path.Value, `"`)
-			imported = append(imported, path)
+
+		for _, source := range group {
+			fileSet := token.NewFileSet()
+			parsed, err := parser.ParseFile(fileSet, source, nil, parser.ImportsOnly)
+			require.NoErrorf(t, err, "failed to parse %s", source)
+
+			for _, spec := range parsed.Imports {
+				imported = append(imported, source+" -> "+strings.Trim(spec.Path.Value, `"`))
+			}
 		}
+
 		require.NotEmpty(t, imported)
 
 		for _, path := range imported {
 			for _, hashing := range []string{"bcrypt", "scrypt", "argon2", "pbkdf2", "sasl/scram"} {
 				assert.NotContains(t, path, hashing,
-					"%s imports %s; hashing and derivation belong to the caller that owns issuance, and importing one here signals that this layer handles raw credentials", source, path)
+					"%s; hashing and derivation belong to the caller that owns issuance, and importing one here signals that this layer handles raw credentials", path)
 			}
 		}
 	})
 
 	// (3) Parameter names on the exported subscriber methods.
 	t.Run("no exported subscriber method takes a credential-named parameter", func(t *testing.T) {
-		const source = "event_subscriber.go"
-
-		fileSet := token.NewFileSet()
-		parsed, err := parser.ParseFile(fileSet, source, nil, 0)
-		require.NoError(t, err, "failed to parse %s", source)
-
+		// The whole subscriber repository, since the exported surface is spread across the
+		// files it was split into and a method moved next door would stop being inspected.
 		inspected := 0
-		for _, decl := range parsed.Decls {
-			funcDecl, ok := decl.(*ast.FuncDecl)
-			if !ok || funcDecl.Recv == nil || !funcDecl.Name.IsExported() {
-				continue
-			}
-			inspected++
 
-			assert.False(t, credentialBearingIdentifier(funcDecl.Name.Name),
-				"%s is named as though it handles a raw credential", funcDecl.Name.Name)
+		for _, source := range packageSourceGroup(t, "event_subscriber.go") {
+			fileSet := token.NewFileSet()
+			parsed, err := parser.ParseFile(fileSet, source, nil, 0)
+			require.NoErrorf(t, err, "failed to parse %s", source)
 
-			for _, param := range funcDecl.Type.Params.List {
-				for _, name := range param.Names {
-					assert.False(t, credentialBearingIdentifier(name.String()),
-						"%s takes a parameter named %q; the repository must receive an already-derived, non-reversible reference",
-						funcDecl.Name.Name, name.String())
+			for _, decl := range parsed.Decls {
+				funcDecl, ok := decl.(*ast.FuncDecl)
+				if !ok || funcDecl.Recv == nil || !funcDecl.Name.IsExported() {
+					continue
+				}
+
+				inspected++
+
+				assert.Falsef(t, credentialBearingIdentifier(funcDecl.Name.Name),
+					"%s.%s is named as though it handles a raw credential", source, funcDecl.Name.Name)
+
+				for _, param := range funcDecl.Type.Params.List {
+					for _, name := range param.Names {
+						assert.Falsef(t, credentialBearingIdentifier(name.String()),
+							"%s takes a parameter named %q; the repository must receive an already-derived, non-reversible reference",
+							funcDecl.Name.Name, name.String())
+					}
 				}
 			}
 		}
+
 		assert.Positive(t, inspected, "no exported methods were inspected, so this assertion proved nothing")
 	})
 }

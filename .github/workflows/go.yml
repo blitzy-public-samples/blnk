@@ -37,6 +37,61 @@ jobs:
       - name: Build
         run: go build ./cmd/*.go
 
+  # ALERT RULES ARE A BUILD ARTEFACT AND ARE GATED LIKE ONE.
+  #
+  # `promtool check rules` proves the file parses and that every expression is valid PromQL.
+  # It cannot prove a rule FIRES, and the two are independent: SubscriberSettlementNotProgressing
+  # passed `check rules` for its entire life while being unable to fire on the one deployment it
+  # exists for, because its right-hand counter has no series until the settlement pass discharges
+  # its first obligation and `and` against an empty vector is empty. Only `promtool test rules`
+  # catches that, so this job runs both — and it is a separate job rather than a step on `test`
+  # because it needs no database, no Redis and no Go build, so it reports in seconds.
+  #
+  # A silent alert rule is indistinguishable from a healthy system, which is why an untested
+  # rule file is a worse failure than a broken one: nobody is paged either way, and only one of
+  # the two is visible.
+  alerts:
+    name: Alert rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The promtool from the SAME Prometheus release the stack pins, resolved out of
+      # docker-compose.yaml so the version lives in exactly one place and the engine that
+      # validates a rule here is the engine that loads it in the deployment. The archive is
+      # checksum-verified against the release's own sha256sums.txt, because an unverified
+      # download is a supply-chain hole in the job whose purpose is assurance.
+      - name: Install promtool matching the pinned Prometheus image
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's|^[[:space:]]*image:[[:space:]]*prom/prometheus:v\([0-9][^@[:space:]]*\).*|\1|p' \
+            docker-compose.yaml | head -1)"
+          if [ -z "${version}" ]; then
+            echo "::error::could not read the pinned prom/prometheus version out of docker-compose.yaml"
+            exit 1
+          fi
+          echo "pinned Prometheus version: ${version}"
+          archive="prometheus-${version}.linux-amd64.tar.gz"
+          base="https://github.com/prometheus/prometheus/releases/download/v${version}"
+          curl -fsSL -o "${archive}" "${base}/${archive}"
+          curl -fsSL -o sha256sums.txt "${base}/sha256sums.txt"
+          grep " ${archive}\$" sha256sums.txt | sha256sum -c -
+          tar xzf "${archive}"
+          sudo install -m 0755 "prometheus-${version}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      # THROUGH THE SAME MAKE TARGET A CONTRIBUTOR RUNS, so the gate and the local command
+      # cannot drift apart. `make alerts` is `check rules` + `test rules` on the repository
+      # copy, and then both again on the rule file as the Kubernetes ConfigMap projects it —
+      # because Kubernetes has no directory to bind-mount, so the manifests carry a copy, and
+      # a copy is a thing that can diverge. A rule file Prometheus refuses takes every rule in
+      # it down, so the deployed projection is proven to LOAD and to FIRE, which no YAML
+      # comparison can establish. TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot
+      # separately asserts the two documents are semantically equal.
+      - name: Check and unit-test the alert rules, including the Kubernetes projection
+        run: make alerts
+
   test:
     runs-on: ubuntu-latest
 
@@ -252,12 +307,13 @@ jobs:
       # a Kafka client that is neither TLS-protected nor explicitly marked as local
       # development, and this acknowledges that rather than silently connecting in the clear.
       KAFKA_INSECURE_LOCAL_DEV: "true"
-      # The broker really is configured with allow.everyone.if.no.acl.found=false — see the
-      # kafka service in docker-compose.yaml — and Kafka reports that setting as sensitive
-      # with an empty value, so it cannot be read back and has to be attested. Attesting it
-      # here is truthful; the isolation suite FAILS rather than skips if the broker turns out
-      # not to enforce, so a false attestation could not make this job pass.
-      KAFKA_DENY_BY_DEFAULT_ATTESTED: "true"
+      # NO VARIABLE ATTESTS THE BROKER'S DENY-BY-DEFAULT POSTURE, and none should. Kafka
+      # reports allow.everyone.if.no.acl.found as sensitive with an empty value, so it cannot
+      # be read back — but the isolation suite does not need to read it. It PROBES the broker
+      # instead, through KafkaAdminClient.AuthorizerActive, and t.Fatal's when the broker
+      # answers that security is disabled. A probe cannot be wrong about the cluster it
+      # queried, whereas an environment variable set to "true" in a workflow file proves only
+      # that somebody typed it.
       # THE SUBSCRIBER-FACING BROKER LIST, AND IT IS NOT OPTIONAL.
       #
       # Credential issuance names the addresses a SUBSCRIBER will connect to, which in a real
@@ -438,9 +494,10 @@ jobs:
             echo ""
             echo "A skipped acceptance test is reported as a pass by every CI summary, so this job"
             echo "fails on it deliberately. The usual cause is that the broker did not come up, or"
-            echo "that one of KAFKA_BROKERS, KAFKA_SASL_ADMIN_USER, KAFKA_SASL_ADMIN_SECRET or"
-            echo "KAFKA_DENY_BY_DEFAULT_ATTESTED is not reaching the test process under the name it"
-            echo "reads. Each skip message above names what it could not find."
+            echo "that one of KAFKA_BROKERS, KAFKA_SUBSCRIBER_BROKERS, KAFKA_SASL_ADMIN_USER or"
+            echo "KAFKA_SASL_ADMIN_SECRET is not reaching the test process under the name it reads."
+            echo "Each skip message above names what it could not find. A broker that is reachable"
+            echo "but does NOT enforce ACLs fails rather than skips, so it will not appear here."
             exit 1
           fi
           echo "every selected Kafka acceptance test ran"

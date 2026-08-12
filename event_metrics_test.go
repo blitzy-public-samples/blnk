@@ -3579,8 +3579,10 @@ func TestCollectionHealthAlerts_CoverEveryWayTheInventoryCanGoUnmeasured(t *test
 
 		// The budget branch is the only one whose action is a configuration change, and the
 		// variable name is the actionable part.
-		assert.Contains(t, description, "EVENT_METRICS_SUBSCRIBER_BUDGET",
-			"the budget reason is resolved by raising the budget, so the variable must be named")
+		assert.Contains(t, description, "RELAY_SUBSCRIBER_METRICS_BUDGET",
+			"the budget reason is resolved by raising the budget, so the CANONICAL variable must be "+
+				"named — an operator who is handed the alias has to discover the canonical spelling "+
+				"before they can find it in .env.example or the ConfigMap")
 	})
 
 	t.Run("the absence rule is scoped to the one role that runs a collector", func(t *testing.T) {

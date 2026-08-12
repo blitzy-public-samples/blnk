@@ -34,31 +34,6 @@ import (
 
 // CreateIdentity inserts a new identity record into the database.
 //
-// IdentityID handling:
-//   - If the caller supplies identity.IdentityID, it is preserved as-is.
-//     The value must carry the canonical "idt_" prefix followed by a valid
-//     UUID; otherwise the request is rejected with a 400. This lets callers
-//     derive deterministic identity ids (e.g. UUIDv5 of an external holder
-//     key) and rely on the UNIQUE constraint on identity_id for safe
-//     concurrent creation: parallel requests for the same external holder
-//     produce identical ids, one wins the insert, the others receive 409
-//     Conflict and can fetch the existing row.
-//   - If identity.IdentityID is empty, a fresh id is generated (existing
-//     behaviour).
-//
-// # Atomic event capture
-//
-// When a caller supplies an EventPreparer, the identity INSERT and the identity.created
-// event row are written inside ONE transaction: the preparer is handed the finished identity
-// — the only point at which the resolved IdentityID and CreatedAt exist — and the row it
-// returns is inserted before the commit. Either both land or neither does, so an identity
-// can no longer exist with no event describing it, and no event can describe an identity
-// that was rolled back.
-//
-// With no preparer the behaviour is EXACTLY as before: one statement and no transaction.
-// That is what keeps every pre-existing caller compiling and behaving unchanged, which is
-// why the parameter is a variadic tail rather than a positional argument.
-//
 // Parameters:
 //   - identity: The identity object to be inserted.
 //   - prepareEvent: Optional. Builds the identity.created outbox row from the created
@@ -99,15 +74,6 @@ func (d Datasource) CreateIdentity(identity model.Identity, prepareEvent ...Even
 
 // insertIdentity performs the identity INSERT against either the connection or an open
 // transaction, and is the single statement both CreateIdentity paths run.
-//
-// Parameters:
-//   - ctx: The context for the statement.
-//   - execer: The connection or transaction to insert through.
-//   - identity: The identity to insert.
-//
-// Returns:
-//   - The created identity, or a typed error. A caller-supplied id that is not a canonical
-//     idt_<uuid> is a bad request; a duplicate id is a conflict.
 func (d Datasource) insertIdentity(ctx context.Context, execer sqlExecer, identity model.Identity) (model.Identity, error) {
 	// Marshal metadata into JSON format
 	metaDataJSON, err := json.Marshal(identity.MetaData)
@@ -148,11 +114,6 @@ func (d Datasource) insertIdentity(ctx context.Context, execer sqlExecer, identi
 }
 
 // GetIdentityByID retrieves an identity from the database based on the given identity ID.
-// It starts a transaction, executes a query to fetch the identity details, and commits the transaction upon success.
-// Parameters:
-// - id: The ID of the identity to be retrieved.
-// Returns:
-// - A pointer to the Identity object if found, or an error if the identity is not found or the query fails.
 func (d Datasource) GetIdentityByID(id string) (*model.Identity, error) {
 	// Set a timeout for the context and ensure cancellation
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
@@ -208,9 +169,6 @@ func (d Datasource) GetIdentityByID(id string) (*model.Identity, error) {
 }
 
 // GetAllIdentities retrieves all identities from the database.
-// It executes a query to fetch all identity records, parses the result into Identity structs, and handles metadata unmarshalling.
-// Returns:
-// - A slice of Identity objects if successful, or an error if any operation fails.
 func (d Datasource) GetAllIdentities() ([]model.Identity, error) {
 	// Execute query to retrieve all identities, ordered by creation date
 	rows, err := d.Conn.QueryContext(context.Background(), `
@@ -261,11 +219,6 @@ func (d Datasource) GetAllIdentities() ([]model.Identity, error) {
 }
 
 // UpdateIdentity updates a specific identity record in the database.
-// It marshals the identity metadata, constructs an SQL update query, and checks the result.
-// Parameters:
-// - identity: A pointer to the Identity object containing the updated details.
-// Returns:
-// - An error if the update fails, or nil if successful.
 func (d Datasource) UpdateIdentity(identity *model.Identity) error {
 	var setFields []string
 	var args []interface{}
@@ -358,11 +311,6 @@ func (d Datasource) UpdateIdentity(identity *model.Identity) error {
 }
 
 // DeleteIdentity deletes a specific identity record from the database.
-// It executes the SQL delete query based on the provided identity ID.
-// Parameters:
-// - id: The ID of the identity to be deleted.
-// Returns:
-// - An error if the deletion fails, or nil if successful.
 func (d Datasource) DeleteIdentity(id string) error {
 	// Execute the SQL delete query
 	result, err := d.Conn.ExecContext(context.Background(), `
@@ -389,11 +337,6 @@ func (d Datasource) DeleteIdentity(id string) error {
 }
 
 // GetAllIdentitiesPaginated retrieves identities from the database with pagination support.
-// Parameters:
-// - limit: The maximum number of identities to return.
-// - offset: The offset to start fetching identities from (for pagination).
-// Returns:
-// - A slice of Identity objects if successful, or an error if any operation fails.
 func (d Datasource) GetAllIdentitiesPaginated(limit, offset int) ([]model.Identity, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -442,7 +385,6 @@ func (d Datasource) GetAllIdentitiesPaginated(limit, offset int) ([]model.Identi
 }
 
 // GetAllIdentitiesWithFilter retrieves identities with advanced filtering support.
-// It delegates to GetAllIdentitiesWithFilterAndOptions with nil options.
 //
 // Parameters:
 // - ctx: Context for the database operation.
@@ -459,7 +401,6 @@ func (d Datasource) GetAllIdentitiesWithFilter(ctx context.Context, filters *fil
 }
 
 // GetAllIdentitiesWithFilterAndOptions retrieves identities with filtering, sorting, and optional count.
-// It uses the filter package to build SQL WHERE and ORDER BY conditions.
 //
 // Parameters:
 // - ctx: Context for the database operation.

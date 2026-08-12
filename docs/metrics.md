@@ -195,10 +195,10 @@ failed permanently, it did not run out of tries.
 | `blnk_subscribers_revocation_pending` | Gauge | — | Subscribers whose broker-side credential revocation is still owed. Normally zero. |
 | `blnk_subscribers_oldest_revocation_age_seconds` | Gauge | — | How long the oldest outstanding revocation has been owed. Zero when nothing is owed. |
 | `blnk_kafka_consumer_lag_pass_age_seconds` | Gauge | — | How long the consumer-lag rotation took to get back round the whole subscriber registry. This is the series `SubscriberLagCoverageStale` reads. It matters because a reading EXPIRES after ten minutes: a subscriber the rotation does not return to inside that retention has its `blnk_kafka_consumer_lag` series stop being exported, and an absent series breaches no threshold — so `SubscriberConsumerLagHigh` goes quiet for exactly the subscribers it can no longer see. |
-| `blnk_kafka_consumer_lag_covered_subscribers` | Gauge | — | How many subscribers currently have an exported lag reading. Read it against `blnk_subscribers_registered` to see what proportion of the registry the rotation is actually covering; the remedy for a shortfall is a larger `EVENT_METRICS_SUBSCRIBER_BUDGET`, or narrowing over-broad grants so each subscriber costs fewer round trips per tick. The collection interval is fixed at 15 seconds and is not operator-configurable, so it is not a lever. |
+| `blnk_kafka_consumer_lag_covered_subscribers` | Gauge | — | How many subscribers currently have an exported lag reading. Read it against `blnk_subscribers_registered` to see what proportion of the registry the rotation is actually covering; the remedy for a shortfall is a larger `RELAY_SUBSCRIBER_METRICS_BUDGET`, or narrowing over-broad grants so each subscriber costs fewer round trips per tick. The collection interval is fixed at 15 seconds and is not operator-configurable, so it is not a lever. |
 | `blnk_kafka_subscribers_unmeasured` | Gauge | `reason` | Registered subscribers the last collection did not measure lag for **at all**, attributed by why. Non-zero means those subscribers have NO `blnk_kafka_consumer_lag` series, so `SubscriberConsumerLagHigh` cannot fire for them however far behind they fall. Normally zero. The `reason` domain is closed at five values and every one of them is written on every tick, zeros included, so a healthy collection is distinguishable from a stopped one: `budget` (the rotation has not got back to them, which is the only reason a configuration change fixes), `unprovisioned` (the row has no authorised topics, or identifiers the registry did not generate), `measure_failed` (the broker refused the measurement), `registry_failed` (the registry enumeration itself failed) and `topic_missing` (a row authorises a topic that does not exist). Each subscriber is counted under exactly ONE reason, so `sum without(reason)(…)` never exceeds `blnk_subscribers_registered`. Sum the reasons away for the total; read them apart to know what to do. See the note below — this is not the same condition as `blnk_kafka_consumer_lag_unmeasured_partitions`. |
 | `blnk_subscribers_registered` | Gauge | — | Subscribers the registry holds. Published so the row above reads as a proportion, and so the measurement budget's headroom is visible before it is exhausted rather than only after. |
-| `blnk_subscribers_measurement_budget` | Gauge | — | Subscribers **one consumer-lag sweep may measure**, as configured — `EVENT_METRICS_SUBSCRIBER_BUDGET`, alias `RELAY_SUBSCRIBER_METRICS_BUDGET`, default 200. Exported so headroom is a difference of two series: `blnk_subscribers_measurement_budget - blnk_subscribers_registered`, which goes negative before any subscriber goes unmeasured. It is the figure the sweep actually stops at rather than the configured value re-read, so it cannot disagree with the behaviour. Published on every tick, like the row above, so a reconfiguration is visible and a stopped collector is not mistaken for a small registry. |
+| `blnk_subscribers_measurement_budget` | Gauge | — | Subscribers **one consumer-lag sweep may measure**, as configured — `RELAY_SUBSCRIBER_METRICS_BUDGET`, alias `EVENT_METRICS_SUBSCRIBER_BUDGET`, default 200. Exported so headroom is a difference of two series: `blnk_subscribers_measurement_budget - blnk_subscribers_registered`, which goes negative before any subscriber goes unmeasured. It is the figure the sweep actually stops at rather than the configured value re-read, so it cannot disagree with the behaviour. Published on every tick, like the row above, so a reconfiguration is visible and a stopped collector is not mistaken for a small registry. |
 | `blnk_subscribers_settlement_outstanding` | Gauge | — | Subscribers with a broker obligation — a revocation, a grant reconciliation or a credential cleanup — still to be settled. Read with `blnk_subscribers_obligations_settled_total`: `SubscriberSettlementNotProgressing` fires on outstanding work whose settlement rate is flat **or absent**, which is the signature of a stalled settler rather than a busy one. |
 | `blnk_subscribers_oldest_settlement_age_seconds` | Gauge | — | How long the oldest unsettled obligation has stood. This is the series `SubscriberSettlementOutstanding` reads. Zero when nothing is outstanding. |
 | `blnk_subscribers_revocation_failures` | Gauge | — | Subscribers whose last revocation attempt was REFUSED by the broker, as opposed to merely still owed. The distinction is the remedy: a pending revocation needs time, a refused one needs an operator, because it will not clear by retrying. Normally zero. |
@@ -602,14 +602,13 @@ worst property a monitoring system can have, which is why this is published as a
 than left in a log line.
 
 **That budget has TWO accepted environment names, and they are ONE knob.**
-`EVENT_METRICS_SUBSCRIBER_BUDGET` and `RELAY_SUBSCRIBER_METRICS_BUDGET` both set it; both were
-published, so both are honoured, and configuration reconciles them onto a single value before the
-collector reads it. Set either. If you set both to DIFFERENT values,
-`EVENT_METRICS_SUBSCRIBER_BUDGET` wins — it is the field the collector reads and the one the
-supported ceiling clamps — and start-up logs a warning naming both variables and the value
-applied. The alert remediations below and in `alerts/blnk-kafka-alerts.yml` name
-`EVENT_METRICS_SUBSCRIBER_BUDGET`; `.env.example` and `blnk-config.yaml` ship the other. They are
-the same ceiling, not two.
+`RELAY_SUBSCRIBER_METRICS_BUDGET` is the **canonical** name — it is a relay setting, like every
+other `RELAY_` key, and it is what `.env.example`, `blnk-config.yaml` and the alert remediations
+use. `EVENT_METRICS_SUBSCRIBER_BUDGET` is an accepted **alias**, kept because it was published
+first. Both are honoured and configuration reconciles them onto a single value before the
+collector reads it, so no construction path can read a budget other than the one that took
+effect. Set either. If you set both to DIFFERENT values the canonical name wins, and start-up
+logs a warning naming both variables and both values. They are the same ceiling, not two.
 
 Read it beside `blnk_subscribers_registered`, which is why that gauge exists: three unmeasured
 out of five is a different situation from three out of three thousand, and the pair shows the
@@ -624,7 +623,7 @@ under exactly one reason, which is what makes the sum comparable with the regist
 
 - **`budget`** — the rotation has not got back to this subscriber inside the reading's ten-minute
   retention. The usual case on a large registry, and the ONLY one a configuration change fixes:
-  raise `EVENT_METRICS_SUBSCRIBER_BUDGET` (or its alias `RELAY_SUBSCRIBER_METRICS_BUDGET`) above
+  raise `RELAY_SUBSCRIBER_METRICS_BUDGET` (or its alias `EVENT_METRICS_SUBSCRIBER_BUDGET`) above
   `blnk_subscribers_registered` and restart the server role, remembering that each additional
   subscriber costs broker round trips per tick and a retained series per authorised topic.
 - **`measure_failed`** — the broker refused the measurement. An ACL or connectivity fault; raising
@@ -865,7 +864,7 @@ sum without(reason)(blnk_kafka_subscribers_unmeasured) > 0
 
 # The same gap by cause, which is what decides the remedy: `measure_failed` needs the broker,
 # `registry_failed` needs the database, `unprovisioned` needs a grant, `topic_missing` needs
-# provisioning, and only `budget` needs EVENT_METRICS_SUBSCRIBER_BUDGET.
+# provisioning, and only `budget` needs RELAY_SUBSCRIBER_METRICS_BUDGET.
 blnk_kafka_subscribers_unmeasured > 0
 
 # The same gap as a PROPORTION of the registry, which is how to judge its severity: 3 of 3000
@@ -877,8 +876,8 @@ sum without(reason)(blnk_kafka_subscribers_unmeasured) / clamp_min(blnk_subscrib
 # negative BEFORE any subscriber goes unmeasured. BOTH OPERANDS ARE SERIES, which is what makes
 # the query true on every deployment: writing the default as a literal — `200 -
 # blnk_subscribers_registered` — would show a deployment running a budget of 1000 as exhausted
-# eight hundred subscribers early. The budget is set by EVENT_METRICS_SUBSCRIBER_BUDGET (alias
-# RELAY_SUBSCRIBER_METRICS_BUDGET) and exported as the gauge below.
+# eight hundred subscribers early. The budget is set by RELAY_SUBSCRIBER_METRICS_BUDGET (alias
+# EVENT_METRICS_SUBSCRIBER_BUDGET) and exported as the gauge below.
 blnk_subscribers_measurement_budget - blnk_subscribers_registered
 
 # Relay backlog: rows captured but not yet published, counted as pending plus processing. A

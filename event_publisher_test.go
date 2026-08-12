@@ -754,14 +754,17 @@ func TestPublishSuccessLog_IsGuardedByTheDebugLevel(t *testing.T) {
 	})
 
 	t.Run("the success call is structurally enclosed by the level guard", func(t *testing.T) {
-		file := parseRepositoryGoFile(t, "event_publisher.go")
+		// The whole publisher source group: the write path lives in a sibling of
+		// event_publisher.go, and a containment assertion aimed at one file of a split unit
+		// would be satisfied by the file that no longer holds the call.
+		files := parseRepositoryGoFiles(t, "event_publisher.go")
 
 		// The call exists at all. Without this the containment assertion below is satisfied by
-		// a file that stopped logging the success case entirely.
-		require.Positive(t, selectorCallNames(file)["Debug"],
+		// a unit that stopped logging the success case entirely.
+		require.Positive(t, sumSelectorCallNames(files)["Debug"],
 			"the success debug log must still exist; the fix is to guard it, not to delete it")
 
-		guarded := callsGuardedBy(file, "logrus", "IsLevelEnabled")
+		guarded := sumCallsGuardedBy(files, "logrus", "IsLevelEnabled")
 		assert.Positive(t, guarded["Debug"],
 			"a Debug call must sit INSIDE an if whose condition calls logrus.IsLevelEnabled. "+
 				"logrus evaluates the WithFields argument before it checks the level, so an "+

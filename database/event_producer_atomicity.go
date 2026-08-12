@@ -17,22 +17,6 @@ limitations under the License.
 // event_producer_atomicity.go is the repository implementation for the last two event
 // families to be brought under the requirement: balance.monitor and
 // bulk_transaction.<status>.
-//
-// Every other event type is captured inside the database transaction that performs its
-// mutation — see the three atomic writers in transaction.go. These two looked as though
-// they could not be, and for two different structural reasons:
-//
-//   - balance.monitor fires because a CONDITION was met on a balance, and the original
-//     design evaluated that condition after the movement had committed.
-//   - bulk_transaction.<status> summarises a batch executed one transaction at a time,
-//     each under its own transaction.
-//
-// Neither is solved by retrying the capture, because retrying cannot close a
-// process-crash window. They are solved differently from each other, and the difference
-// matters:
-//
-//   - balance.monitor is now DECIDED INSIDE the mutation's transaction.
-//   - bulk_transaction.<status> is given something durable to be atomic WITH.
 package database
 
 import (
@@ -63,22 +47,6 @@ const balanceMonitorHandoffColumns = `id, handoff_id, balance_id, ledger_id, bal
 
 // selectBalanceMonitorsInTx reads the monitor definitions of the supplied balances
 // INSIDE the caller's transaction, keyed by balance id.
-//
-// A `balance.monitor` alert is decided by two inputs: the balance's post-mutation state
-// and the monitor definitions in force at that moment. The balance was already
-// snapshotted in this transaction.
-//
-// None of it was visible from the outbox, because the row looked identical either way.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statement.
-//   - tx *sql.Tx: the caller's open transaction. Required.
-//   - balanceIDs []string: the balances to read monitors for. Empty yields no read.
-//
-// Returns:
-//   - map[string][]model.BalanceMonitor: the definitions, keyed by balance id.
-//   - error: the wrapped statement or scan error, which correctly rolls the caller
-//     back.
 func selectBalanceMonitorsInTx(
 	ctx context.Context, tx *sql.Tx, balanceIDs []string,
 ) (map[string][]model.BalanceMonitor, error) {
@@ -153,20 +121,6 @@ func selectBalanceMonitorsInTx(
 // insertBalanceMonitorHandoffsInTx records, inside the caller's transaction, the
 // pending evaluation of every supplied balance's monitors — together with both inputs
 // that evaluation depends on.
-//
-// The transaction belongs to the atomic writer that is updating these balances. Writing
-// the row here — after the balance UPDATEs and before the COMMIT — is what makes a
-// committed movement inseparable from its pending evaluation.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statement.
-//   - tx *sql.Tx: the caller's open transaction.
-//   - balances []*model.Balance: the balances the transaction is updating, in their
-//     POST-mutation state.
-//
-// Returns:
-//   - error: nil when nothing needed writing or the write succeeded; the wrapped
-//     statement error otherwise.
 func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances []*model.Balance) error {
 	if len(balances) == 0 {
 		return nil
@@ -255,28 +209,6 @@ func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances 
 
 // balancesAlreadyEvaluatedInTx reports which balances the CALLER has already evaluated
 // the monitors of, read from the event rows this same transaction is inserting.
-//
-// Two mechanisms in this repository bring `balance.monitor` under the requirement, and
-// they were built independently:
-//
-//   - the CALLER-SIDE pass — blnk.prepareBalanceMonitorEvents — reads a moved balance's
-//     monitors before the write and hands the resulting `balance.monitor` rows to the
-//     writer, so the alert is inserted in the very transaction that moved the balance.
-//   - the WRITER-SIDE capture — recordBalanceMonitorEvaluation below — reads those
-//     definitions inside the writer's own transaction, applies the same
-//     model.BalanceMonitor.CheckCondition, and inserts the canonical alert row there.
-//
-// Both are correct in isolation. Run together on one balance they publish the SAME
-// crossing twice, under two different event ids — and a `balance.monitor` id is a fresh
-// UUID by design, precisely so a monitor that fires repeatedly is not collapsed into
-// one event, so no subscriber-side idempotency could ever collapse the pair. The
-// duplicate would be indistinguishable from two genuine crossings.
-//
-// Parameters:
-//   - rows []*model.EventOutbox: the event rows this transaction is inserting.
-//
-// Returns:
-//   - map[string]struct{}: the balances whose monitors the caller evaluated.
 func balancesAlreadyEvaluatedInTx(rows []*model.EventOutbox) map[string]struct{} {
 	var evaluated map[string]struct{}
 
@@ -313,18 +245,6 @@ func balancesAlreadyEvaluatedInTx(rows []*model.EventOutbox) map[string]struct{}
 
 // balancesAwaitingMonitorEvaluation is the balance set the handoff is written for: the
 // ones the caller did not already evaluate.
-//
-// The caller-side pass evaluates ALL of a balance's monitors in one read. So a balance
-// that produced even one alert had every one of its monitors judged, and the ones that
-// did not fire need no second look — a later movement will bring its own handoff.
-//
-// Parameters:
-//   - balances []*model.Balance: the balances this transaction is updating.
-//   - evaluated map[string]struct{}: the coverage from balancesAlreadyEvaluatedInTx.
-//
-// Returns:
-//   - []*model.Balance: the balances still needing evaluation. The input slice is
-//     returned unchanged when nothing was covered, which is the common case.
 func balancesAwaitingMonitorEvaluation(balances []*model.Balance, evaluated map[string]struct{}) []*model.Balance {
 	if len(evaluated) == 0 {
 		return balances
@@ -347,24 +267,6 @@ func balancesAwaitingMonitorEvaluation(balances []*model.Balance, evaluated map[
 // captureBalanceMonitorAlertsInTx evaluates the monitors of the supplied balances
 // inside the caller's transaction and inserts the CANONICAL balance.monitor event rows
 // for the crossings it decides.
-//
-// This is what replaced the deferred conversion. See recordBalanceMonitorEvaluation for
-// the one shape that still takes the handoff.
-//
-// Parameters:
-//   - ctx context.Context: the writer's context.
-//   - d Datasource: the datasource whose InsertEventOutboxInTx performs the insert,
-//     passed explicitly for the same reason captureEntityEvent takes it — one exported
-//     in-transaction insert serves every producer.
-//   - tx *sql.Tx: the caller's open transaction. Required.
-//   - balances []*model.Balance: the balances this transaction is updating,
-//     POST-mutation.
-//   - capture BalanceMonitorAlertCapture: the registered row builder.
-//
-// Returns:
-//   - int: the number of balances that carried at least one monitor and were evaluated.
-//   - int: the number of canonical alert rows inserted.
-//   - error: the monitor read's error, the capture's error, or the insert's error.
 func captureBalanceMonitorAlertsInTx(
 	ctx context.Context,
 	d Datasource,
@@ -454,39 +356,6 @@ func captureBalanceMonitorAlertsInTx(
 }
 
 // recordBalanceMonitorEvaluation is the gate the atomic writers call.
-//
-// It answers two questions — does this deployment capture events at all, and did the
-// caller already evaluate these monitors inside this very transaction — and evaluates
-// only what is left. The first gate is not an optimisation; it is what keeps two
-// deployment shapes correct at once:
-//
-//   - With Kafka configured, the monitors are evaluated here and the canonical alert
-//     rows are inserted in this transaction.
-//   - With no Kafka configured there is no relay and no outbox to drain, so a row
-//     written here would be one nothing can ever publish. The gate writes nothing, and
-//     the post-commit path publishes down the legacy transport exactly as it did before
-//     this feature existed.
-//
-// The predicate is config.Configuration.EventPublishingConfigured, deliberately shared
-// with the root package's eventPublishingConfigured so the writer and the post-commit
-// path cannot reach opposite conclusions and leave a movement evaluated by neither.
-//
-// The SECOND gate is what keeps the two same-transaction mechanisms from publishing one crossing
-// twice — see balancesAlreadyEvaluatedInTx for why both exist and how they compose.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statements.
-//   - d Datasource: the datasource whose InsertEventOutboxInTx inserts the alert rows.
-//   - tx *sql.Tx: the writer's open transaction.
-//   - span trace.Span: the writer's span, annotated with what was evaluated and
-//     captured.
-//   - balances []*model.Balance: the balances this transaction is updating.
-//   - capturedEvents []*model.EventOutbox: the event rows this transaction is
-//     inserting, read for the balances whose monitors the caller already evaluated.
-//
-// Returns:
-//   - error: only a genuine capture or statement failure, which correctly rolls the
-//     writer back.
 func recordBalanceMonitorEvaluation(ctx context.Context, d Datasource, tx *sql.Tx, span trace.Span, balances []*model.Balance, capturedEvents []*model.EventOutbox) error {
 	cnf, err := config.Fetch()
 	if err != nil || !cnf.EventPublishingConfigured() {
@@ -560,18 +429,6 @@ const claimPendingBalanceMonitorHandoffQuery = `
 
 // ClaimPendingBalanceMonitorHandoffs claims a batch of handoffs for evaluation.
 //
-// It is the event outbox claim query with this table's columns: a MATERIALIZED CTE
-// selects a bounded, creation-ordered, FOR UPDATE SKIP LOCKED set of ids, a second CTE
-// UPDATEs exactly those ids, and the outer SELECT re-sorts the returned rows because
-// UPDATE... RETURNING does not preserve the inner ORDER BY.
-//
-// A claim is a LEASE, not a lock: it sets status to processing and locked_until to now
-// plus the lease, so a processor that dies mid-evaluation has its rows re-claimed once
-// the lease expires. That is the at-least-once half of the guarantee. The exactly-once
-// half is not enforced here — it is enforced by the DERIVED event ids the evaluation
-// produces, which make a re-evaluation of the same handoff insert the same rows and
-// collide with the unique index rather than duplicate the alert.
-//
 // Parameters:
 //   - ctx context.Context: the context for the query.
 //   - batchSize int: the maximum number of handoffs to claim.
@@ -606,22 +463,6 @@ func (d Datasource) ClaimPendingBalanceMonitorHandoffs(ctx context.Context, batc
 
 // CompleteBalanceMonitorHandoffWithEvents writes the evaluation's result and the
 // handoff's completion in ONE database transaction.
-//
-// The alert events and the record that this balance's monitors have been evaluated
-// commit together. There is therefore no state in which the evaluation is marked done
-// and its alerts are missing, and none in which the alerts exist and the handoff is
-// still claimable — the two failure modes that a "publish then mark" sequence permits.
-//
-// A zero-length event list is the COMMON case and is not a no-op: it means the monitors
-// were evaluated and no condition was met, which is a result worth recording. Recording
-// it is what distinguishes "evaluated, nothing fired" from "never evaluated", and those
-// are indistinguishable from the event outbox alone.
-//
-// A lapsed lease can let two processors evaluate one handoff concurrently. That is
-// tolerated deliberately rather than fenced, because the events they produce carry
-// DERIVED ids — a function of the handoff id and the monitor id — so the second insert
-// collides with the unique index on event_id and the repository reports the existing
-// row as success.
 //
 // Parameters:
 //   - ctx context.Context: the context for the transaction.
@@ -707,20 +548,6 @@ func (d Datasource) CompleteBalanceMonitorHandoffWithEvents(ctx context.Context,
 }
 
 // filterAlreadyStoredMonitorAlerts drops the alerts that are already durable.
-//
-// A handoff can legitimately be evaluated twice — a lapsed claim lease, a retry after a
-// failed commit, a restart — and both evaluations derive the SAME event ids, because
-// the identity is the pair (handoff, monitor). That collision is the mechanism working:
-// it is what stops the alert being delivered twice.
-//
-// Parameters:
-//   - ctx context.Context: the context for the query.
-//   - tx *sql.Tx: the completion's transaction, so the read shares its snapshot.
-//   - events []*model.EventOutbox: the alerts the evaluation produced.
-//
-// Returns:
-//   - []*model.EventOutbox: the alerts not yet stored, in input order.
-//   - error: the wrapped query error.
 func filterAlreadyStoredMonitorAlerts(ctx context.Context, tx *sql.Tx, events []*model.EventOutbox) ([]*model.EventOutbox, error) {
 	if len(events) == 0 {
 		return events, nil
@@ -795,11 +622,6 @@ func filterAlreadyStoredMonitorAlerts(ctx context.Context, tx *sql.Tx, events []
 
 // MarkBalanceMonitorHandoffFailed records an evaluation failure against a handoff.
 //
-// The row returns to pending while attempts remain, so the next poll re-claims it, and
-// is marked failed once the budget is spent. That mirrors how both existing outboxes
-// treat a failed unit of work, and it means an exhausted handoff stays in the table as
-// the record of an evaluation that never happened rather than disappearing.
-//
 // Parameters:
 //   - ctx context.Context: the context for the statement.
 //   - handoffID string: the handoff that failed.
@@ -837,11 +659,6 @@ func (d Datasource) MarkBalanceMonitorHandoffFailed(ctx context.Context, handoff
 
 // CountBalanceMonitorHandoffByStatus returns the number of handoffs in each status.
 //
-// It answers the operational question the event outbox cannot: whether a balance
-// movement's monitors were evaluated at all. A non-zero failed count means alerts were
-// never judged, which is a materially different fact from an alert that was judged and
-// did not fire.
-//
 // Parameters:
 //   - ctx context.Context: the context for the query.
 //
@@ -875,17 +692,6 @@ func (d Datasource) CountBalanceMonitorHandoffByStatus(ctx context.Context) (map
 }
 
 // scanBalanceMonitorHandoff reads one row of balanceMonitorHandoffColumns.
-//
-// The nullable columns are read through sql.Null* and flattened, so the caller never
-// has to distinguish "SQL NULL" from "zero" for a field where the two mean the same
-// thing.
-//
-// Parameters:
-//   - rows *sql.Rows: positioned on a row.
-//
-// Returns:
-//   - *model.BalanceMonitorHandoff: the decoded row.
-//   - error: the wrapped scan error.
 func scanBalanceMonitorHandoff(rows *sql.Rows) (*model.BalanceMonitorHandoff, error) {
 	handoff := &model.BalanceMonitorHandoff{}
 	var ledgerID, lastError sql.NullString
@@ -936,16 +742,6 @@ func scanBalanceMonitorHandoff(rows *sql.Rows) (*model.BalanceMonitorHandoff, er
 
 // InsertBulkTransactionBatch records that a bulk batch has begun.
 //
-// It is written BEFORE any member transaction runs, and that ordering is the point: the
-// batch is durable and enumerable from the moment it starts, so a process that dies
-// half way through leaves a row saying "this batch began and never reported an outcome"
-// rather than leaving nothing at all.
-//
-// The insert is idempotent on the primary key. A batch id is minted fresh per request,
-// so a conflict means the same batch is being started twice — a retry of the enclosing
-// request — and the correct answer is to accept the existing row rather than to fail a
-// batch because its coordinator was already recorded.
-//
 // Parameters:
 //   - ctx context.Context: the context for the statement.
 //   - batch *model.BulkTransactionBatch: the coordinator row.
@@ -982,19 +778,6 @@ func (d Datasource) InsertBulkTransactionBatch(ctx context.Context, batch *model
 
 // FinalizeBulkTransactionBatchWithEvent moves a batch to its terminal outcome AND
 // inserts the outcome event, in ONE database transaction.
-//
-//   - a terminal coordinator row whose outcome event was never written, and
-//   - an outcome event describing a batch the coordinator still calls in-progress.
-//
-// The guard is what makes the whole finalise idempotent, and idempotence is required
-// because this is retried. A first attempt whose COMMIT succeeded but whose
-// acknowledgement was lost must not be followed by a second, differently-identified
-// event for one batch outcome.
-//
-// An already-terminal row is therefore reported as SUCCESS rather than as a conflict —
-// but only when it agrees. A row already terminal with a DIFFERENT status is a genuine
-// conflict: something else declared a different outcome for this batch, and silently
-// discarding either answer would be worse than reporting it.
 //
 // Parameters:
 //   - ctx context.Context: the context for the transaction.
@@ -1102,32 +885,6 @@ func (d Datasource) FinalizeBulkTransactionBatchWithEvent(
 
 // adoptOrExplainUnfinalizableBulkBatch resolves a finalise that matched no row, either
 // by adopting the batch or by explaining why it cannot be finalised.
-//
-// It runs inside the caller's still-open transaction so the row it reads is the row the
-// UPDATE failed to match, rather than whatever a later connection would see — and, in
-// the adoption case, so the row it writes commits with the event the caller is
-// inserting.
-//
-// Three answers are possible and they are genuinely different:
-//
-//   - no row at all: the coordinator write at batch start did not happen.
-//   - a terminal row with the SAME outcome: the finalise already happened.
-//   - a terminal row with a DIFFERENT outcome: two answers exist for one batch.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statements.
-//   - tx *sql.Tx: the caller's open transaction. Both the read and any adoption insert
-//     run inside it.
-//   - batchID string: the trimmed batch id.
-//   - outcome *model.BulkTransactionBatch: the terminal outcome the caller is
-//     recording.
-//   - event *model.EventOutbox: the prepared outcome event, whose id the adopted row
-//     records so the outcome and its event stay joinable.
-//
-// Returns:
-//   - bool: true when this call recorded the outcome — including by adoption — and
-//     false when it found the batch already finalised with the same outcome.
-//   - error: nil when the outcome is recorded or already present with the same value.
 func (d Datasource) adoptOrExplainUnfinalizableBulkBatch(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1158,22 +915,6 @@ func (d Datasource) adoptOrExplainUnfinalizableBulkBatch(
 
 // adoptBulkTransactionBatch inserts an already-terminal coordinator row for a batch
 // whose start was never recorded.
-//
-// Called only from adoptOrExplainUnfinalizableBulkBatch, and only when the read inside
-// the caller's transaction found no row at all. See that function for why the values
-// are the caller's computed outcome rather than a reconstruction.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statements.
-//   - tx *sql.Tx: the caller's open transaction.
-//   - batchID string: the trimmed batch id.
-//   - outcome *model.BulkTransactionBatch: the terminal outcome being adopted.
-//   - event *model.EventOutbox: the prepared outcome event, recorded on the row.
-//
-// Returns:
-//   - bool: true when the adoption inserted the row.
-//   - error: the wrapped statement error, or a conflict when a concurrent finaliser
-//     inserted a different outcome first.
 func (d Datasource) adoptBulkTransactionBatch(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1231,16 +972,6 @@ func (d Datasource) adoptBulkTransactionBatch(
 
 // reconcileAdoptedBulkBatch reports whether the row a concurrent finaliser inserted
 // agrees with the outcome this caller was adopting.
-//
-// Parameters:
-//   - ctx context.Context: the context for the query.
-//   - tx *sql.Tx: the caller's open transaction.
-//   - batchID string: the trimmed batch id.
-//   - attempted string: the outcome this caller was recording.
-//
-// Returns:
-//   - error: nil when the stored outcome matches, a conflict when it does not, and the
-//     wrapped read error when the row cannot be read at all.
 func (d Datasource) reconcileAdoptedBulkBatch(ctx context.Context, tx *sql.Tx, batchID, attempted string) error {
 	var stored string
 	if err := tx.QueryRowContext(ctx, `

@@ -52,11 +52,6 @@ import (
 var legacyWebhookPrivateDestinationWarning sync.Once
 
 // errLegacyWebhookRedirect is the sentinel every refused redirect wraps.
-//
-// A sentinel rather than a formatted string so a test can assert the REASON a delivery
-// failed with errors.Is instead of matching prose, and so a future caller can
-// distinguish "the endpoint tried to redirect us" from a transport failure it should
-// retry differently.
 var errLegacyWebhookRedirect = errors.New("legacy webhook delivery refused to follow a redirect")
 
 // errLegacyWebhookDestination is the sentinel every refused destination wraps.
@@ -64,12 +59,6 @@ var errLegacyWebhookDestination = errors.New("legacy webhook destination is not 
 
 // legacyWebhookAllowsPrivateDestination reports whether the operator has asserted that
 // the webhook destination is on a network they own.
-//
-// It FAILS CLOSED. Unfetchable configuration answers false, so an unconfigured process
-// refuses internal destinations rather than permitting them by accident.
-//
-// Returns:
-//   - bool: true only when configuration loads and the assertion is set.
 func legacyWebhookAllowsPrivateDestination() bool {
 	conf, err := config.Fetch()
 	if err != nil || conf == nil {
@@ -81,14 +70,6 @@ func legacyWebhookAllowsPrivateDestination() bool {
 
 // refuseLegacyWebhookRedirect is the http.Client CheckRedirect hook for the legacy
 // transport. It never permits a redirect.
-//
-// Parameters:
-//   - req *http.Request: the request the client is about to make to the redirect
-//     target.
-//   - via []*http.Request: the requests already made, so the hop count can be reported.
-//
-// Returns:
-//   - error: always non-nil, wrapping errLegacyWebhookRedirect.
 func refuseLegacyWebhookRedirect(req *http.Request, via []*http.Request) error {
 	target := "unknown"
 	if req != nil && req.URL != nil {
@@ -111,17 +92,6 @@ func refuseLegacyWebhookRedirect(req *http.Request, via []*http.Request) error {
 // guardLegacyWebhookDial is the net.Dialer Control hook for the legacy transport. It
 // runs after DNS resolution and before connect, and refuses an address Blnk must not
 // reach.
-//
-// This is the only point at which the address actually being connected to is known. A
-// check on the URL text judges a name; this judges the answer.
-//
-// Parameters:
-//   - network string: the dial network, e.g. "tcp4".
-//   - address string: "host:port", where host is always a resolved literal.
-//   - _ syscall.RawConn: the raw connection, unused. No socket option is set here.
-//
-// Returns:
-//   - error: non-nil to abandon this address, wrapping errLegacyWebhookDestination.
 func guardLegacyWebhookDial(network, address string, _ syscall.RawConn) error {
 	if !strings.HasPrefix(network, "tcp") {
 		return fmt.Errorf("%w: %s is not a TCP network", errLegacyWebhookDestination,
@@ -165,17 +135,6 @@ func guardLegacyWebhookDial(network, address string, _ syscall.RawConn) error {
 
 // validateLegacyWebhookDestination applies the URL-text half of the destination policy
 // to the configured endpoint.
-//
-// It is the cheap, early half. It rejects the schemes and the obviously-internal hosts
-// before a request is built, so the common misconfiguration produces one clear error
-// instead of a dial failure an operator has to interpret.
-//
-// Parameters:
-//   - rawURL string: the configured destination. Never empty; callers check first.
-//
-// Returns:
-//   - error: non-nil when the destination is refused, wrapping
-//     errLegacyWebhookDestination, and naming only the host.
 func validateLegacyWebhookDestination(rawURL string) error {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
@@ -222,29 +181,6 @@ func validateLegacyWebhookDestination(rawURL string) error {
 }
 
 // processHTTP sends a webhook notification via HTTP POST request.
-//
-// The wire contract it implements is unchanged by the move to Kafka and is asserted end
-// to end by webhooks_process_test.go, which reconstructs the signature from what the
-// receiver was handed:
-//
-//   - The body is the marshaled NewWebhook envelope, sent with
-//     Content-Type: application/json.
-//   - When server.secret_key is configured, X-Blnk-Timestamp carries the unix second
-//     and X-Blnk-Signature carries the hex-encoded HMAC-SHA256 of
-//     timestamp + "." + body under that key. The timestamp is inside the signed
-//     material, which is what lets a receiver reject replays. When no secret is
-//     configured the request goes out unsigned and a warning says so.
-//   - Configured Notification.Webhook.Headers are applied, EXCEPT the ones the transport
-//     computes for itself — see applyConfiguredWebhookHeaders, which explains why a
-//     configured X-Blnk-Signature is an integrity problem rather than an override.
-//
-// Parameters:
-// - ctx context.Context: bounds the request. Cancelling it abandons the delivery.
-// - data NewWebhook: The webhook notification data to send.
-// - client *http.Client: The HTTP client to use for the request.
-//
-// Returns:
-// - error: An error if the request or processing fails.
 func processHTTP(ctx context.Context, data NewWebhook, client *http.Client) error {
 	payloadBytes, err := json.Marshal(data)
 	if err != nil {
@@ -258,19 +194,6 @@ func processHTTP(ctx context.Context, data NewWebhook, client *http.Client) erro
 
 // processHTTPRaw sends an already-serialised webhook body, signing and posting the
 // exact bytes it was handed.
-//
-// It returns the failure, status code included, and its callers record it once. At the
-// pipeline's 500-events-per-second target that duplicate is not a second opinion, it is
-// half the log.
-//
-// Parameters:
-//   - ctx context.Context: bounds the request. Cancelling it abandons the delivery.
-//   - payloadBytes []byte: the body to send, verbatim. Never inspected, never
-//     rewritten.
-//   - client *http.Client: the pooled client to send with.
-//
-// Returns:
-//   - error: a configuration, request-construction, transport or non-2xx failure.
 func processHTTPRaw(ctx context.Context, eventID string, payloadBytes []byte, client *http.Client) error {
 	conf, err := config.Fetch()
 	if err != nil {
@@ -345,17 +268,6 @@ func processHTTPRaw(ctx context.Context, eventID string, payloadBytes []byte, cl
 
 // transportOwnedWebhookHeaders are the headers processHTTPRaw computes for itself, in
 // the canonical form net/http stores them under.
-//
-// They are listed rather than derived because each one carries a guarantee the delivery
-// makes about ITSELF, which no amount of configuration can be allowed to restate:
-//
-//   - X-Blnk-Signature and X-Blnk-Timestamp are the HMAC over timestamp + "." + body and the
-//     timestamp it is computed against. They are the only evidence a subscriber has that the
-//     body came from this deployment.
-//   - Content-Type describes a body this function marshalled. The body is always JSON, and a
-//     receiver told otherwise mis-parses a payload that is perfectly well formed.
-//   - Content-Length is set by net/http from the body it is actually sending; a configured
-//     value would either truncate the request or make it hang waiting for bytes.
 var transportOwnedWebhookHeaders = map[string]struct{}{
 	textproto.CanonicalMIMEHeaderKey("Content-Type"):     {},
 	textproto.CanonicalMIMEHeaderKey("Content-Length"):   {},
@@ -371,23 +283,10 @@ var transportOwnedWebhookHeaders = map[string]struct{}{
 
 // LegacyWebhookEventIDHeader carries the outbox event id to the receiver of a legacy
 // HTTP delivery.
-//
-// The body is FROZEN. Its bytes are asserted equal to the bytes published to Kafka, and
-// the payload-preservation guarantee is that a subscriber's existing parser works
-// unchanged.
 const LegacyWebhookEventIDHeader = "X-Blnk-Event-Id"
 
 // applyConfiguredWebhookHeaders copies the operator's configured headers onto an
 // outgoing request, refusing the ones the transport owns.
-//
-// Only the four headers the transport computes are refused. A configured Authorization,
-// X-Tenant or User-Agent is exactly what this setting is for — the receiver's own
-// requirements — and filtering by prefix or by an allowlist would break that.
-//
-// Parameters:
-//   - header http.Header: the outgoing request's headers, already carrying the computed
-//     ones.
-//   - configured map[string]string: the operator's configured headers.
 func applyConfiguredWebhookHeaders(header http.Header, configured map[string]string) {
 	refused := make([]string, 0, len(configured))
 
@@ -424,9 +323,6 @@ var configuredWebhookHeaderWarning = &rateLimitedWarning{
 // warnConfiguredWebhookHeadersRefused reports refused headers at most once per
 // unsignedWebhookWarningInterval, naming which ones and how many deliveries the silence
 // covered.
-//
-// Parameters:
-//   - refused []string: the canonical names that were not applied, already sorted.
 func warnConfiguredWebhookHeadersRefused(refused []string) {
 	emit, suppressed := configuredWebhookHeaderWarning.admit()
 	if !emit {
@@ -480,11 +376,6 @@ type rateLimitedWarning struct {
 
 // admit records one occurrence of the condition and decides whether it should be
 // logged.
-//
-// Returns:
-//   - bool: true when the caller should log this occurrence.
-//   - uint64: when logging, how many occurrences were withheld since the previous
-//     logged one, not counting this one.
 func (w *rateLimitedWarning) admit() (bool, uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -510,11 +401,6 @@ func (w *rateLimitedWarning) admit() (bool, uint64) {
 }
 
 // unsignedWebhookWarning rate-limits the unsigned-delivery warning for the process.
-//
-// It is package-level state because the condition is package-level: it describes the
-// deployment's configuration, not any one delivery, so every delivery site must share
-// one budget or the limit means nothing. It is created here rather than lazily so there
-// is no initialisation race between concurrent workers.
 var unsignedWebhookWarning = &rateLimitedWarning{
 	interval: unsignedWebhookWarningInterval,
 	now:      time.Now,
@@ -539,21 +425,6 @@ func warnWebhookSentUnsigned() {
 
 // legacyWebhookFailureRecord assembles the one structured record a failed legacy
 // delivery produces, naming what failed as precisely as the available identity allows.
-//
-// The context getters return ok=false for a context asynq did not create, and every
-// such field is then OMITTED. A record that says retry_count=0 for a context that never
-// carried one is worse than a record that says nothing: it reads as a first attempt.
-//
-// Parameters:
-//   - ctx context.Context: the asynq handler context, read for identity only.
-//   - task *asynq.Task: the task being processed. Read for its type and payload length.
-//   - envelope NewWebhook: the decoded envelope, or the zero value when it could not be
-//     decoded.
-//   - cause error: the failure. Never nil at any call site; a nil cause simply
-//     contributes no error field.
-//
-// Returns:
-//   - *logrus.Entry: the assembled record, ready for the caller to give a message.
 func legacyWebhookFailureRecord(ctx context.Context, task *asynq.Task, envelope NewWebhook, cause error) *logrus.Entry {
 	fields := logrus.Fields{
 		"transport": "legacy_webhook",
@@ -597,12 +468,6 @@ func legacyWebhookFailureRecord(ctx context.Context, task *asynq.Task, envelope 
 
 // legacyWebhookEventID recovers the outbox event id from a task id that
 // legacyWebhookTaskID produced.
-//
-// Parameters:
-//   - taskID string: the asynq task id, as the handler context reported it.
-//
-// Returns:
-//   - string: the event id, or "" when the task did not come from the relay.
 func legacyWebhookEventID(taskID string) string {
 	eventID, found := strings.CutPrefix(taskID, legacyWebhookTaskIDNamespace)
 	if !found {
@@ -614,12 +479,6 @@ func legacyWebhookEventID(taskID string) string {
 
 // legacyWebhookEventIDFromContext recovers the outbox event id for the delivery being
 // handled.
-//
-// Parameters:
-//   - ctx context.Context: the handler context asynq supplied. May be nil.
-//
-// Returns:
-//   - string: the event id, or "" when this task did not come from the relay.
 func legacyWebhookEventIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -634,18 +493,10 @@ func legacyWebhookEventIDFromContext(ctx context.Context) string {
 }
 
 // LegacyWebhookRetention is how long a completed legacy-delivery task is kept in Redis.
-//
-// Because the cost is unbounded where the alternative is free. Retention keeps the
-// completed task, not a token: covering the full thirty-day dual-delivery window would
-// hold every legacy delivery of those thirty days in Redis, which at the pipeline's
-// target rate is on the order of a billion tasks.
 const LegacyWebhookRetention = 24 * time.Hour
 
 // EnqueueLegacyWebhookDelivery enqueues the legacy HTTP delivery of ONE outbox event,
 // carrying the stored bytes verbatim and using the event ID as the task's identity.
-//
-// So this path never decodes. It validates that the bytes are a well-formed legacy
-// envelope, and then carries them unchanged all the way to the socket.
 //
 // Parameters:
 //   - eventID string: the outbox row's event_id, which is the task's identity.
@@ -708,12 +559,6 @@ func (b *Blnk) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 
 // legacyWebhookTaskID namespaces the event ID so it cannot collide with another
 // producer's task identity on the shared webhook queue.
-//
-// Parameters:
-//   - eventID string: the outbox event id, already trimmed.
-//
-// Returns:
-//   - string: the namespaced task identity.
 func legacyWebhookTaskID(eventID string) string {
 	return "legacy-webhook:" + eventID
 }
@@ -749,10 +594,6 @@ func (b *Blnk) SendWebhook(newWebhook NewWebhook) error {
 
 // ProcessWebhook processes a webhook notification task from the queue.
 //
-// An unmarshalable task payload is a permanent failure that returning an error cannot
-// cure, but the error is returned regardless: asynq's retry and archival machinery is
-// how such a task becomes visible to an operator rather than vanishing silently.
-//
 // Parameters:
 // - ctx context.Context: The context for the operation, read for its trace identifiers.
 // - task *asynq.Task: The task containing the webhook notification data.
@@ -781,10 +622,6 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 	}
 
 	// Unmarshal to VALIDATE, then deliver the ORIGINAL BYTES.
-	//
-	// The unmarshal is kept because a malformed task payload must still be recognised: it
-	// is a permanent failure that no retry can cure, and returning the error is how
-	// asynq's archival machinery makes it visible to an operator instead of it vanishing.
 	var payload NewWebhook
 	if err := json.Unmarshal(task.Payload(), &payload); err != nil {
 		// The ZERO envelope is passed deliberately: nothing was decoded, so there is no event
@@ -816,41 +653,8 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 }
 
 // ===== SUNSET (terminal step of the Kafka event-streaming feature) =====
-//
-// This block is the executable contract for retiring the legacy HTTP transport. It is
-// written as an ordered procedure because the order matters: step 1 before step 2
-// preserves a contract that step 2 would otherwise destroy, and step 4 is a prohibition
-// that step 3 makes tempting.
-//
-// THE OBLIGATION IS PUBLISHED AND ENFORCED, not merely recorded here. This procedure
-// has two counterparts, and all three describe one release:
-//
-//   - docs/webhook-to-kafka-migration.md carries the same release as an operator-facing
-//     DELETION CHECKLIST — the artifacts, where each lives, and the preserve half — because
-//     the party who performs it reads the migration guide, not this file.
-//   - TestWebhookTerminalRelease_ChecklistMatchesTheSurface (event_sunset_test.go) holds that
-//     checklist to this tree in both directions: a row naming something that no longer exists
-//     fails, and an exported symbol declared here that the checklist does not name fails. So
-//     the release cannot be performed without editing the checklist, and the checklist cannot
-//     rot while the transport is still compiled in.
-//
-// STEP 6 — REMOVE NO DEPENDENCY. Nothing leaves go.mod at sunset.
-//
-// ===== END SUNSET =====
 
 // retiredLegacyWebhookLogFields describes a task dropped because the sunset has passed.
-//
-// The retry count is the field worth having. A task at retry 0 was merely sitting in
-// the queue when the sunset arrived; a task at retry 4 has been failing against the
-// subscriber for the whole of its backoff schedule and would have gone on trying across
-// the boundary.
-//
-// Parameters:
-//   - ctx context.Context: the handler context, or any context at all.
-//
-// Returns:
-//   - logrus.Fields: the reason, plus whichever of task ID, queue and retry count are
-//     known.
 func retiredLegacyWebhookLogFields(ctx context.Context) logrus.Fields {
 	fields := logrus.Fields{"reason": legacyWebhookRetiredAtSunsetReason}
 
@@ -878,7 +682,4 @@ func retiredLegacyWebhookLogFields(ctx context.Context) logrus.Fields {
 }
 
 // legacyWebhookRetiredAtSunsetReason is the fixed reason a dropped delivery reports.
-//
-// A constant rather than a sentence written at each site, so an operator grepping for
-// retirement finds one string and a test can assert the exact value the log carries.
 const legacyWebhookRetiredAtSunsetReason = "legacy webhook obligation retired undelivered: the webhook deprecation sunset date has passed"

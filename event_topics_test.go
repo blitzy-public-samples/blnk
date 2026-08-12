@@ -355,11 +355,23 @@ func constStringValue(parsed *ast.File, name string) (string, bool) {
 func discoverEventVocabulary(t *testing.T) []string {
 	t.Helper()
 
-	path := filepath.Join(moduleRootDir(t), "model", "event.go")
-	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	require.NoError(t, err, "model/event.go must be parseable to discover the event vocabulary")
+	// The model's event surface is split across files, so both the mapping function and the
+	// catalogue table are located by searching the GROUP. Naming one file would make this
+	// discovery silently incomplete the moment either moved.
+	var (
+		parsed  *ast.File
+		mapping *ast.FuncDecl
+	)
 
-	mapping := findFunctionDeclaration(parsed, "EventCategory")
+	for _, member := range eventSourceGroup(t, "model/event.go") {
+		candidate := parseRepositoryGoFile(t, member)
+		if found := findFunctionDeclaration(candidate, "EventCategory"); found != nil {
+			parsed, mapping = candidate, found
+
+			break
+		}
+	}
+
 	require.NotNil(t, mapping,
 		"model.EventCategory must exist: it is the single event-type-to-category mapping the topic layer delegates to")
 
@@ -1485,28 +1497,26 @@ func TestEventTopicsSource_ImportsNoKafkaClient(t *testing.T) {
 //     compile, so this is the assertion that fails if someone restores the old
 //     declaration.
 //
-// The documentation record is asserted too, because the reason this function lives
-// beside topic resolution rather than beside a transport is a fact only a comment
-// carries.
+// The relocation RECORD is asserted against the published migration document rather than
+// against this file's comments. The record is a deliverable an operator performing the
+// terminal release reads, so the document is where it has to be correct; pinning a comment's
+// wording only made a prose edit a test failure.
 func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) {
 	parsed := parseEventTopicsSource(t)
 
-	var comments strings.Builder
-	for _, group := range parsed.Comments {
-		comments.WriteString(group.Text())
-	}
-	documentation := comments.String()
+	relocation := readRepoFile(t, "docs/webhook-to-kafka-migration.md")
 
-	// Each fragment is one part of the record: the symbol, what it is, and where the table
-	// it delegates to lives. Losing any one of them leaves a reader with no way back to
-	// the other two.
+	// Each fragment is one part of the record: the symbol, where it now lives, and that it
+	// is the transaction event vocabulary. Losing any one leaves a release engineer with no
+	// way back to the other two.
 	for _, fragment := range []string{
 		"getEventFromStatus",
-		"transaction event-string vocabulary",
-		"model.EventTypeForTransactionStatus",
+		"`event_topics.go`",
+		"event vocabulary",
 	} {
-		assert.True(t, strings.Contains(documentation, fragment),
-			"event_topics.go's documentation must still contain %q; it is the only record of why the transaction event vocabulary lives here rather than beside a transport", fragment)
+		assert.Truef(t, strings.Contains(relocation, fragment),
+			"docs/webhook-to-kafka-migration.md must record %q; it is the only record of where the "+
+				"transaction event vocabulary was relocated to and why it survives the sunset", fragment)
 	}
 
 	declarations := 0

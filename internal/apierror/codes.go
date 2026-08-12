@@ -20,11 +20,6 @@ import "net/http"
 
 // Domain-prefixed error codes. These are the canonical, client-facing codes
 // returned in the `error_detail.code` field of every error response.
-// Each code maps to exactly one default HTTP status (see statusByCode).
-//
-// The six legacy codes in apierror.go (NOT_FOUND, CONFLICT, ...) remain valid
-// for internal construction — they are normalized to their GEN_* equivalents
-// at the response boundary via Normalize.
 const (
 	// GEN — generic / cross-cutting
 	ErrGenMalformedRequest ErrorCode = "GEN_MALFORMED_REQUEST"
@@ -151,9 +146,6 @@ const (
 	ErrEventKeyUnresolvable ErrorCode = "EVENT_KEY_UNRESOLVABLE"
 
 	// SUBSCRIBER — Kafka subscriber registry & credentials.
-	// ErrSubscriberProvisioningFailed also resolves to 503 rather than 500 for the same
-	// reason: provisioning depends on the Kafka admin API, so a failure is retryable by
-	// the caller rather than a server defect.
 	ErrSubscriberNotFound           ErrorCode = "SUBSCRIBER_NOT_FOUND"
 	ErrSubscriberProvisioningFailed ErrorCode = "SUBSCRIBER_PROVISIONING_FAILED"
 
@@ -164,43 +156,16 @@ const (
 	// ErrSubscriberKeyScopeRequired is the MIRROR of the code above: the refusal to issue
 	// a credential to a subscriber that records NO partition_key_prefix, in a deployment
 	// that has declared its subscriber access to be key-scoped.
-	//
-	// So under a declared key-scoped model, a key scope is MANDATORY, and this is the
-	// refusal. The remedies are both real and both named in the message: record the
-	// ledger-id prefix the subscriber is entitled to, or stop declaring the key-scoped
-	// model and acknowledge whole-topic access explicitly
-	// (KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS), which is a decision somebody has then made
-	// rather than one the system made for them.
 	ErrSubscriberKeyScopeRequired ErrorCode = "SUBSCRIBER_KEY_SCOPE_REQUIRED"
 
 	// ErrSubscriberSharedTopicAccessUnacknowledged is the refusal to mint a whole-topic
 	// credential in a production deployment that has declared nothing about its access
 	// model.
-	//
-	// Blnk therefore asks a secure-mode deployment to declare its model once, explicitly:
-	// either KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with a verified key-authorising
-	// component in front of the brokers, or KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS=true,
-	// which records that whole-topic reads are understood and intended. Until one of them
-	// is set, issuance refuses with this code rather than handing out a credential whose
-	// breadth nobody has acknowledged.
 	ErrSubscriberSharedTopicAccessUnacknowledged ErrorCode = "SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED"
 
 	// ErrSubscriberKeyScopeUnattested is the refusal to mint a key-scoped credential when
 	// the declared key-authorising component did not ATTEST the boundary it is supposed to
 	// keep.
-	//
-	// A key-scoped credential is issued with NO topic Read: the broker refuses every
-	// fetch, and the subscriber's records reach it through the component the deployment
-	// declared in front of the brokers. A deployment could name any address, and Blnk
-	// would mint a credential declaring an enforced key boundary that nothing was
-	// applying, which is the same false assurance the pre-refusal behaviour had.
-	//
-	// So before the secret exists and before the broker is touched, Blnk asks the declared
-	// component, over an authenticated channel, to confirm three things: that it enforces
-	// key scopes at all, that it will do so for THIS principal, and that the prefix it
-	// holds is byte-for-byte the prefix the registry recorded. Anything else —
-	// unreachable, unauthorised, a mismatched prefix, a malformed answer, a refusal — is
-	// this code.
 	ErrSubscriberKeyScopeUnattested ErrorCode = "SUBSCRIBER_KEY_SCOPE_UNATTESTED"
 
 	// ErrSubscriberAccessExceedsAuthorization is the refusal to issue a credential to a
@@ -209,13 +174,6 @@ const (
 
 	// ErrSubscriberBrokersNotConfigured is the refusal to issue a credential when NO Kafka
 	// broker list is configured at all.
-	//
-	// It resolves to 503 SERVICE UNAVAILABLE rather than 500, for the same reason
-	// ErrSubscriberProvisioningFailed does: nothing about the request is wrong and no
-	// server defect is implied. A dependency of issuance is not configured, the caller can
-	// do nothing but retry once it is, and the alternative — succeeding with an unusable
-	// endpoint — turns a clear refusal into a subscriber-side connection timeout diagnosed
-	// days later.
 	ErrSubscriberBrokersNotConfigured ErrorCode = "SUBSCRIBER_BROKERS_NOT_CONFIGURED"
 
 	// ErrSubscriberDeprovisioning is the refusal to act on a subscriber whose broker-side
@@ -224,12 +182,6 @@ const (
 
 	// ErrSubscriberGrantEmpty is the refusal to mint a credential for a subscriber whose
 	// authorized-topic list is empty.
-	//
-	// An empty list is a LEGITIMATE registry state — it is the fail-closed default of a
-	// newly registered subscriber, and setting it back to empty is the only way to express
-	// "authorised for nothing" on a row that currently holds topics. What it is not is
-	// something to issue a credential against: the SASL principal would authenticate, hold
-	// no topic binding at all, and read nothing.
 	ErrSubscriberGrantEmpty ErrorCode = "SUBSCRIBER_GRANT_EMPTY"
 
 	// ErrSubscriberInsecureTransport is the refusal to return a one-time SASL password
@@ -414,7 +366,6 @@ var legacyToCanonical = map[ErrorCode]ErrorCode{
 }
 
 // Normalize converts a legacy error code to its canonical equivalent.
-// Canonical codes pass through unchanged.
 func Normalize(code ErrorCode) ErrorCode {
 	if canonical, ok := legacyToCanonical[code]; ok {
 		return canonical
@@ -423,7 +374,6 @@ func Normalize(code ErrorCode) ErrorCode {
 }
 
 // StatusForCode returns the default HTTP status for an error code.
-// Unknown codes default to 500.
 func StatusForCode(code ErrorCode) int {
 	if status, ok := statusByCode[code]; ok {
 		return status

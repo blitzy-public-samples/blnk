@@ -28,9 +28,6 @@ import (
 )
 
 // This file is the single decision point for the legacy webhook sunset.
-//
-// THERE IS ONE CONFIGURABLE END, and it is WEBHOOK_DEPRECATION_SUNSET_DATE. See
-// config.WebhookDeprecationStartDate, which is a derived, read-only field.
 
 // webhookSunsetLayout is the layout the sunset date is written in. RFC3339 is the
 // deployment contract for WEBHOOK_DEPRECATION_SUNSET_DATE, and it is what the
@@ -38,11 +35,6 @@ import (
 const webhookSunsetLayout = time.RFC3339
 
 // sunsetWarnGuard suppresses repeat warnings about the same malformed sunset date.
-//
-// The guard remembers only the most recently warned value, so its memory cost is a
-// single string regardless of uptime. It deliberately holds no parsed date and no
-// verdict: the decision itself is always recomputed from live configuration, so this
-// state can never make the sunset behave differently from what is configured.
 type sunsetWarnGuard struct {
 	mu        sync.Mutex
 	lastValue string
@@ -102,17 +94,14 @@ const (
 	// missing or will not parse. This FAILS CLOSED: the sunset is treated as passed, so
 	// dual delivery stops and the deprecated webhook management routes answer 410 Gone.
 	sunsetUnusableWithTransport
+
+	// sunsetRetired means configuration DECLARES the legacy transport retired, with the
+	// literal config.WebhookSunsetRetiredSentinel in place of an instant.
+	sunsetRetired
 )
 
 // webhookSunsetInstant resolves the sunset instant, and what its absence means, from a
 // configuration value.
-//
-// Parameters:
-//   - cnf *config.Configuration: the configuration to read the sunset date from.
-//
-// Returns:
-//   - time.Time: the sunset instant in UTC, or the zero time when none is configured.
-//   - webhookSunsetResolution: which of the three situations applies.
 func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetResolution) {
 	if cnf == nil {
 		// No configuration at all means no brokers either, so there is no transport to
@@ -131,6 +120,15 @@ func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetRe
 	}
 
 	raw := strings.TrimSpace(cnf.WebhookDeprecationSunsetDate)
+
+	// THE DECLARED RETIREMENT, checked before the parse because it is not an instant and
+	// must not be reported as a malformed one. Configuration has already normalised the
+	// casing; EqualFold here so a value that reached this struct without passing through
+	// validateAndAddDefaults — a hand-built Configuration in a test, say — reads the same.
+	if strings.EqualFold(raw, config.WebhookSunsetRetiredSentinel) {
+		return time.Time{}, sunsetRetired
+	}
+
 	if raw == "" {
 		if publishing && sunsetParseWarnings.shouldWarn("") {
 			logrus.Error(
@@ -176,14 +174,6 @@ func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetRe
 }
 
 // resolveWebhookSunset reads the sunset instant from the live configuration store.
-//
-// A configuration store that has not been populated is not an error here. It means
-// nothing is configured at all — no window and no brokers — which resolves to
-// sunsetAbsentNoTransport, and is logged at debug level so the hot paths stay quiet.
-//
-// Returns:
-//   - time.Time: the sunset instant in UTC, or the zero time when none is configured.
-//   - webhookSunsetResolution: which of the three situations applies.
 func resolveWebhookSunset() (time.Time, webhookSunsetResolution) {
 	cnf, err := fetchConfiguration()
 	if err != nil {
@@ -199,11 +189,6 @@ func resolveWebhookSunset() (time.Time, webhookSunsetResolution) {
 
 // WebhookSunsetDate returns the configured webhook sunset instant.
 //
-// It exists so that callers which need to describe the sunset — an RFC 8594 Sunset
-// response header, a Deprecation header, an operator-facing error message — can do so
-// from the same parse that drives the decision, instead of re-parsing the raw
-// configuration string and risking a different reading of it.
-//
 // Returns:
 //   - time.Time: the sunset instant in UTC, or the zero time when none is configured.
 //   - bool: true only when a sunset date is configured AND parses.
@@ -214,10 +199,6 @@ func WebhookSunsetDate() (time.Time, bool) {
 }
 
 // WebhookSunsetPassed reports whether the legacy webhook sunset has passed as of now.
-//
-// This is the authoritative sunset predicate. Every consumer of the sunset — the
-// relay's dual-delivery branch and the HTTP 410 Gone guard alike — must call it, and no
-// consumer may compare against the configured date itself.
 //
 // Parameters:
 //   - now time.Time: the instant to evaluate the sunset against.
@@ -234,15 +215,6 @@ func WebhookSunsetPassed(now time.Time) bool {
 
 // webhookSunsetPassedFor is the sunset comparison itself, separated from where the
 // configuration came from.
-//
-// Parameters:
-//   - sunset time.Time: the resolved sunset instant. Meaningful only with
-//     sunsetResolved.
-//   - resolution webhookSunsetResolution: which of the three situations applies.
-//   - now time.Time: the instant to evaluate.
-//
-// Returns:
-//   - bool: true when the sunset has passed, including the fail-closed arm.
 func webhookSunsetPassedFor(
 	sunset time.Time,
 	resolution webhookSunsetResolution,
@@ -251,7 +223,7 @@ func webhookSunsetPassedFor(
 	switch resolution {
 	case sunsetResolved:
 		return !now.UTC().Before(sunset)
-	case sunsetUnusableWithTransport:
+	case sunsetUnusableWithTransport, sunsetRetired:
 		return true
 	case sunsetAbsentNoTransport:
 		return false
@@ -264,10 +236,6 @@ func webhookSunsetPassedFor(
 
 // WebhookSunsetSnapshot is the sunset as ONE request saw it: the instant to describe
 // and the verdict to act on, resolved together.
-//
-// The mismatch is small and the window for it is narrow, which is precisely why it must
-// be closed structurally rather than watched for: it cannot be reproduced on demand and
-// would never be observed in testing.
 type WebhookSunsetSnapshot struct {
 	// Date is the resolved sunset instant in UTC. Meaningful only when DateConfigured
 	// is true; otherwise it is the zero time and must not be rendered.
@@ -291,11 +259,6 @@ type WebhookSunsetSnapshot struct {
 
 // WebhookSunsetSnapshotAt resolves the sunset ONCE and answers every question about it.
 //
-// It reads the configuration store a single time, so the date it reports and the
-// verdict it returns cannot describe different configurations. Callers that need both —
-// the 410 guard being the one that does — must use this rather than pairing
-// WebhookSunsetDate with WebhookSunsetPassed.
-//
 // Parameters:
 //   - now time.Time: the instant to evaluate the sunset against, injected for the same
 //     reason WebhookSunsetPassed takes it — so tests pin the boundary exactly.
@@ -315,18 +278,6 @@ func WebhookSunsetSnapshotAt(now time.Time) WebhookSunsetSnapshot {
 
 // resolveWebhookWindow resolves BOTH ends of the retirement window and the resolution
 // that produced them from ONE read of the configuration store.
-//
-// The consequence was not theoretical. The two ends are rendered into the Sunset and
-// Deprecation headers of one response, and RFC 9745 §4 requires the deprecation instant
-// to precede the sunset instant.
-//
-// Returns:
-//   - time.Time: the window's opening instant in UTC, or the zero time when the sunset
-//     did not resolve.
-//   - time.Time: the sunset instant as webhookSunsetInstant reported it, which callers
-//     needing a verdict must pass to webhookSunsetPassedFor together with the
-//     resolution.
-//   - webhookSunsetResolution: which of the situations applies.
 func resolveWebhookWindow() (time.Time, time.Time, webhookSunsetResolution) {
 	cnf, err := fetchConfiguration()
 	if err != nil {
@@ -361,12 +312,6 @@ func WebhookSunsetPassedNow() bool {
 
 // WebhookWindowState is where a given instant falls relative to the dual-delivery
 // window.
-//
-// It is four states rather than a boolean because the three ways dual delivery can be
-// OFF call for three different operator responses, and collapsing them would make the
-// most dangerous of them look like the most ordinary. "The window has not opened yet"
-// is a misconfiguration to correct; "the window has closed" is the intended end state;
-// "there is no usable window" is a failure that has been failed closed.
 type WebhookWindowState int
 
 const (
@@ -409,17 +354,6 @@ func (s WebhookWindowState) String() string {
 }
 
 // webhookWindowStart resolves the instant the dual-delivery window opens.
-//
-// The configured start is used when it is present and parses. When it is absent or
-// malformed the start is DERIVED as sunset minus the 30-day window, which is exactly
-// what config.Configuration.resolveWebhookDeprecationWindow does when only the sunset
-// is supplied.
-//
-// Parameters:
-//   - cnf *config.Configuration: the configuration to read. May be nil.
-//
-// Returns:
-//   - time.Time: the window's opening instant in UTC.
 func webhookWindowStart(cnf *config.Configuration, sunset time.Time) time.Time {
 	derived := sunset.Add(-config.WebhookDualDeliveryWindow())
 
@@ -458,15 +392,6 @@ var startParseWarnings = &sunsetWarnGuard{}
 
 // WebhookDualDeliveryWindowState reports where now falls relative to the window.
 //
-// It is the one resolution both dual-delivery callers share, and it re-reads live
-// configuration on every call for the same reasons WebhookSunsetPassed does.
-//
-// The whole window comes from a single resolveWebhookWindow call. The state this
-// decides is the relay's legacy leg, while the 410 guard decides from
-// WebhookSunsetSnapshotAt, which already reads once: a mixed-generation read here is
-// therefore exactly how "the legacy leg has stopped" and "the webhook routes answer
-// 410" could disagree across a reload.
-//
 // Parameters:
 //   - now time.Time: the instant to place.
 //
@@ -474,6 +399,14 @@ var startParseWarnings = &sunsetWarnGuard{}
 //   - WebhookWindowState: which of the four states applies.
 func WebhookDualDeliveryWindowState(now time.Time) WebhookWindowState {
 	start, sunset, resolution := resolveWebhookWindow()
+
+	// A DECLARED retirement is the window's closed end, not an absent window. The
+	// difference is what WebhookWindowObstacle acts on: closed is a legitimate state to
+	// publish in, unavailable is not.
+	if resolution == sunsetRetired {
+		return WebhookWindowClosed
+	}
+
 	if resolution != sunsetResolved {
 		return WebhookWindowUnavailable
 	}
@@ -499,9 +432,6 @@ func WebhookDualDeliveryWindowState(now time.Time) WebhookWindowState {
 
 // WebhookDualDeliveryActive reports whether the LEGACY HTTP LEG must run for an event
 // being dispatched at now.
-//
-// It is true only inside [start, sunset) — so it is false before the window opens,
-// false from the sunset instant onwards, and false when no usable window is configured.
 //
 // Parameters:
 //   - now time.Time: the instant to evaluate.
@@ -535,20 +465,6 @@ func WebhookDeprecationWindow() (time.Time, time.Time, bool) {
 // on the window state the caller resolved, or nil when the state is a legitimate one to
 // run in.
 //
-// SUNSET: goes with the legacy leg.
-//
-// TWO STATES ARE REFUSED and two are accepted, and the asymmetry is the whole point:
-//
-//   - WebhookWindowActive is the dual-delivery window itself. Run.
-//   - WebhookWindowClosed is the intended END state — Kafka is the only transport. Run.
-//   - WebhookWindowPending means the process would publish to Kafka BEFORE the window it
-//     declared has opened, enqueuing no legacy webhooks while claiming a migration has not
-//     started. Refuse; see WebhookWindowPendingObstacle for the message.
-//   - WebhookWindowUnavailable, FOR A PUBLISHING PROCESS, means configuration describes no
-//     usable window at all. The sunset predicate fails closed on it — WebhookSunsetPassed
-//     answers true — so the legacy leg silently stops while configuration says nothing
-//     about a retirement. Refuse, and name the variable.
-//
 // Parameters:
 //   - state WebhookWindowState: the state the caller resolved.
 //
@@ -571,8 +487,6 @@ func WebhookWindowObstacle(state WebhookWindowState) error {
 
 // WebhookWindowPendingObstacle describes why a process must not begin publishing to
 // Kafka before the dual-delivery window opens, or nil when the state is anything else.
-//
-// SUNSET: goes with the legacy leg.
 //
 // Parameters:
 //   - state WebhookWindowState: the state the caller resolved.

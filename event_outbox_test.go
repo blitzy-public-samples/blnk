@@ -2107,7 +2107,7 @@ func TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured(t *testing.T
 				"being unconfigured is the ONE nil-nil case: it is a no-op, not a failure")
 			assert.NoError(t, blnk.PublishEvent(context.Background(), event),
 				"not being configured is not a failure of the mutation the caller just performed")
-			assert.NoError(t, blnk.PublishEventInTx(context.Background(), nil, event),
+			assert.NoError(t, blnk.publishEvent(context.Background(), nil, singleEventCaptureAttempt, event),
 				"the in-transaction entry point must honour the same contract")
 
 			datasource.assertWroteNothing(t)
@@ -2279,7 +2279,7 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 		// A non-nil transaction is what a caller holding an open ledger transaction passes. A
 		// real one is unnecessary — nothing dereferences it on this path — and opening one
 		// would make this test depend on a database it has no business needing.
-		require.NoError(t, instance.PublishEventInTx(context.Background(), new(sql.Tx), event),
+		require.NoError(t, instance.publishEvent(context.Background(), new(sql.Tx), singleEventCaptureAttempt, event),
 			"an in-transaction capture on a Kafka-less deployment is a documented no-op, not a failure")
 
 		datasource.assertWroteNothing(t)
@@ -2545,12 +2545,12 @@ func TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport(t
 	})
 }
 
-// TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction asserts the
+// TestPublishEventInTransaction_UsesTheInTransactionInsertWithTheCallersTransaction asserts the
 // transactional-outbox guarantee at its narrowest.
 //
 // The caller has already begun a transaction and applied its mutation; passing that
 // same *sql.Tx here ties the event's fate to it.
-func TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction(t *testing.T) {
+func TestPublishEventInTransaction_UsesTheInTransactionInsertWithTheCallersTransaction(t *testing.T) {
 	_, db, controller := newOutboxSQLDatasource(t)
 	controller.ExpectBegin()
 	transaction, err := db.Begin()
@@ -2562,7 +2562,7 @@ func TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction(t 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 	event := NewWebhook{Event: "transaction.applied", Payload: outboxSampleTransaction(StatusApplied)}
 
-	require.NoError(t, blnk.PublishEventInTx(context.Background(), transaction, event))
+	require.NoError(t, blnk.publishEvent(context.Background(), transaction, singleEventCaptureAttempt, event))
 
 	inTxRows, transactions := datasource.inTx()
 	require.Len(t, inTxRows, 1, "exactly one in-transaction insert must have been issued")
@@ -2581,15 +2581,15 @@ func TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction(t 
 		"a transaction was supplied, so the standalone path must not be taken")
 }
 
-// TestPublishEventInTx_NilTransactionFallsBackToTheStandaloneInsert asserts the convenience
+// TestPublishEventInTransaction_NilTransactionFallsBackToTheStandaloneInsert asserts the convenience
 // the two entry points share: a nil transaction is accepted and routed to the standalone
 // path, so a caller holding a conditionally-open transaction needs no branch of its own.
-func TestPublishEventInTx_NilTransactionFallsBackToTheStandaloneInsert(t *testing.T) {
+func TestPublishEventInTransaction_NilTransactionFallsBackToTheStandaloneInsert(t *testing.T) {
 	datasource := newOutboxSpyDatasource()
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 	event := NewWebhook{Event: "identity.created", Payload: outboxSampleIdentity()}
 
-	require.NoError(t, blnk.PublishEventInTx(context.Background(), nil, event))
+	require.NoError(t, blnk.publishEvent(context.Background(), nil, singleEventCaptureAttempt, event))
 
 	standalone := datasource.standalone()
 	require.Len(t, standalone, 1, "a nil transaction must route to the standalone insert")
@@ -2670,10 +2670,10 @@ func TestPublishEvent_OpensNoTransactionOfItsOwn(t *testing.T) {
 	}), "the standalone insert must succeed without any transaction being opened")
 }
 
-// TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction asserts the same statement
+// TestPublishEventInTransaction_IssuesTheInsertInsideTheCallersTransaction asserts the same statement
 // is issued between the caller's Begin and Commit, so the event and the mutation share one
 // transaction boundary.
-func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.T) {
+func TestPublishEventInTransaction_IssuesTheInsertInsideTheCallersTransaction(t *testing.T) {
 	datasource, db, controller := newOutboxSQLDatasource(t)
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 	event := NewWebhook{Event: "transaction.queued", Payload: outboxSampleTransaction(StatusQueued)}
@@ -2718,7 +2718,7 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 	transaction, err := db.Begin()
 	require.NoError(t, err)
 
-	require.NoError(t, blnk.PublishEventInTx(context.Background(), transaction, event))
+	require.NoError(t, blnk.publishEvent(context.Background(), transaction, singleEventCaptureAttempt, event))
 	require.NoError(t, transaction.Commit(),
 		"the event commits with the mutation, or not at all")
 }
@@ -2754,7 +2754,7 @@ func TestPublishEvent_ReturnsThePersistenceError(t *testing.T) {
 		datasource.insertErr = sentinel
 		blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-		err := blnk.PublishEventInTx(context.Background(), transaction, NewWebhook{
+		err := blnk.publishEvent(context.Background(), transaction, singleEventCaptureAttempt, NewWebhook{
 			Event:   "transaction.applied",
 			Payload: outboxSampleTransaction(StatusApplied),
 		})
@@ -2849,7 +2849,7 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 		require.NotPanics(t, func() { err = blnk.PublishEvent(context.Background(), event) })
 		requireAPIErrorCode(t, err, apierror.ErrInternalServer)
 
-		require.NotPanics(t, func() { err = blnk.PublishEventInTx(context.Background(), nil, event) })
+		require.NotPanics(t, func() { err = blnk.publishEvent(context.Background(), nil, singleEventCaptureAttempt, event) })
 		requireAPIErrorCode(t, err, apierror.ErrInternalServer)
 
 		// The row is still built, which is what gives the log line an event identity an
@@ -2912,7 +2912,7 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 			"a nil receiver must not panic: post-action hooks call this from goroutines")
 		require.Error(t, err, "a nil instance cannot capture the event, and saying so is the honest answer")
 
-		require.NotPanics(t, func() { err = blnk.PublishEventInTx(context.Background(), nil, event) })
+		require.NotPanics(t, func() { err = blnk.publishEvent(context.Background(), nil, singleEventCaptureAttempt, event) })
 		require.Error(t, err, "the in-transaction entry point must honour the same contract")
 
 		// The row is still constructible from the configuration store alone, which is what
@@ -3668,25 +3668,21 @@ func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *te
 	// No monitor is configured here, so no alert row is produced and this test still
 	// asserts exactly one event row — see
 	// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement for
-	// the case where one is.
-	datasource.On("GetBalanceMonitors", mock.Anything).Return([]model.BalanceMonitor{}, nil)
+	// the case where one is. Registered PER BALANCE rather than on mock.Anything, so the
+	// assertion below that each balance was evaluated can distinguish them.
+	datasource.On("GetBalanceMonitors", sourceBalance.BalanceID).Return([]model.BalanceMonitor{}, nil)
+	datasource.On("GetBalanceMonitors", destinationBalance.BalanceID).Return([]model.BalanceMonitor{}, nil)
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	persisted, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+	persisted, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
 		transaction:        transaction,
 		sourceBalance:      sourceBalance,
 		destinationBalance: destinationBalance,
 	})
 	require.NoError(t, err)
-	assert.True(t, capturedMonitors.covers(sourceBalance.BalanceID),
-		"both balances were EVALUATED before the write, so the post-commit check must skip them: "+
-			"it would re-read the same monitor list and re-evaluate the same conditions against the "+
-			"same values, and conclude nothing new at the cost of a read per balance")
-	assert.True(t, capturedMonitors.covers(destinationBalance.BalanceID))
-	assert.False(t, capturedMonitors.holds(sourceBalance.BalanceID, "mon_absent"),
-		"no monitor was configured, so no CROSSING was captured — covered and captured are "+
-			"different facts and this test is the one that keeps them apart")
+	datasource.AssertCalled(t, "GetBalanceMonitors", sourceBalance.BalanceID)
+	datasource.AssertCalled(t, "GetBalanceMonitors", destinationBalance.BalanceID)
 	require.NotNil(t, persisted.transaction)
 	assert.True(t, eventCaptured,
 		"the writer committed the event, so the post-commit hook must be told not to capture it "+
@@ -3770,7 +3766,7 @@ func TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMoveme
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	_, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(
+	_, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(
 		context.Background(), queuedBatchPostCommitWork{
 			transaction:        transaction,
 			sourceBalance:      sourceBalance,
@@ -3801,17 +3797,20 @@ func TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMoveme
 	assert.Contains(t, string(alert.Payload), firing.MonitorID,
 		"the payload must be the monitor object the legacy transport received, unchanged")
 
-	assert.True(t, capturedMonitors.holds(sourceBalance.BalanceID, firing.MonitorID),
-		"exactly the crossing that fired must be reported back, so the post-commit path skips it "+
-			"and publishes nothing twice. A balance.monitor id is a fresh UUID by design, so no "+
-			"subscriber-side idempotency on event_id could collapse a duplicate pair")
-	assert.False(t, capturedMonitors.holds(destinationBalance.BalanceID, firing.MonitorID),
-		"and the crossing is keyed on BOTH halves: one balance can carry several monitors and one "+
-			"monitor names one balance, so a balance-only key would let a sibling's crossing be "+
-			"mistaken for this one and dropped by both routes")
-	assert.True(t, capturedMonitors.covers(destinationBalance.BalanceID),
-		"the destination's monitors were read and evaluated too — it simply had none that fired, "+
-			"which is a skip rather than a capture")
+	monitorRows := 0
+
+	for _, row := range captured {
+		if row.EventType == model.EventTypeBalanceMonitor {
+			monitorRows++
+		}
+	}
+
+	assert.Equal(t, 1, monitorRows,
+		"EXACTLY the crossing that fired is enrolled, and only once. A balance.monitor id is a "+
+			"fresh UUID by design, so no subscriber-side idempotency on event_id could collapse a "+
+			"duplicate pair — the single enrolment is the only thing standing between one crossing "+
+			"and two alerts")
+	datasource.AssertCalled(t, "GetBalanceMonitors", destinationBalance.BalanceID)
 
 	datasource.AssertExpectations(t)
 }
@@ -3848,7 +3847,7 @@ func TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeRead
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	_, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(
+	_, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(
 		context.Background(), queuedBatchPostCommitWork{
 			transaction:        transaction,
 			sourceBalance:      sourceBalance,
@@ -3862,18 +3861,13 @@ func TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeRead
 		"the transaction's own event was captured with the write, which the monitor read has no "+
 			"bearing on")
 
-	assert.False(t, capturedMonitors.covers(sourceBalance.BalanceID),
-		"THE BALANCE WHOSE MONITORS COULD NOT BE READ MUST NOT BE CLAIMED AS COVERED. Claiming it "+
-			"would suppress the post-commit evaluation as well, so a crossing would be examined by "+
-			"neither route — strictly worse than the loss window this path exists to narrow")
-	assert.True(t, capturedMonitors.covers(destinationBalance.BalanceID),
-		"and degradation is per balance, not per transaction: the sibling whose read succeeded is "+
-			"still covered, so one unreadable monitor set does not send the whole write back")
+	datasource.AssertCalled(t, "GetBalanceMonitors", destinationBalance.BalanceID)
 
 	captured := datasource.CapturedEventOutboxes()
 	require.Len(t, captured, 1,
 		"exactly the transaction event, and no alert: no monitor was evaluated for the source, so "+
-			"no crossing could be captured for it")
+			"no crossing could be captured for it — and DEGRADATION IS PER BALANCE, which is what "+
+			"the destination's own read having still happened above establishes")
 	assert.Equal(t, "transaction.applied", captured[0].EventType)
 
 	datasource.AssertExpectations(t)
@@ -3908,7 +3902,7 @@ func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEven
 	datasource := new(mocks.MockDataSource)
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	_, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+	_, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
 		transaction:        transaction,
 		sourceBalance:      sourceBalance,
 		destinationBalance: destinationBalance,
@@ -3918,9 +3912,7 @@ func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEven
 		"a transaction whose event could not be prepared must be refused, not committed with the "+
 			"event silently dropped")
 	assert.False(t, eventCaptured, "nothing was written, so nothing was captured")
-	assert.Empty(t, capturedMonitors,
-		"and no monitor alert was captured either: the transaction event is prepared first, so the "+
-			"refusal happens before any monitor is even resolved")
+	datasource.AssertNotCalled(t, "GetBalanceMonitors", mock.Anything)
 	assert.Empty(t, datasource.CapturedEventOutboxes(),
 		"the atomic writer must not have been reached")
 
@@ -3995,6 +3987,63 @@ func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T
 			"reconciliation and by any consumer")
 
 	datasource.AssertExpectations(t)
+}
+
+// TestRejectTransaction_RefusesToPersistAnUncapturableRejection pins the refusal side of
+// the decision recorded under "A mutation whose event cannot be prepared is refused" in
+// docs/event-streaming.md.
+//
+// A rejection whose event cannot be prepared is NOT committed with the event dropped.
+// Committing it would change a transaction's status with no outbox row anywhere, so no
+// subscriber would learn of the rejection and the daily outbox-versus-offset
+// reconciliation would have nothing to count it as — a silent divergence rather than a
+// visible failure.
+//
+// The unserialisable payload is a channel in the transaction's metadata, which
+// encoding/json refuses. That is exactly the failure the production path can encounter,
+// and it is reached without any database or broker being involved.
+func TestRejectTransaction_RefusesToPersistAnUncapturableRejection(t *testing.T) {
+	transaction := &model.Transaction{
+		TransactionID: "txn_uncapturable_8d42",
+		Source:        "bln_source_8d42",
+		Destination:   "bln_dest_8d42",
+		PreciseAmount: big.NewInt(750),
+		Currency:      "USD",
+		Status:        StatusQueued,
+		CreatedAt:     time.Now().UTC(),
+		MetaData:      map[string]interface{}{"unserialisable": make(chan struct{})},
+	}
+
+	// NO EXPECTATION IS REGISTERED ON RecordTransaction AT ALL. testify fails an unexpected
+	// call, so this is what proves the rejection was never persisted rather than merely
+	// unobserved.
+	datasource := new(mocks.MockDataSource)
+	datasource.On("GetBalanceByIDLite", transaction.Source).Return(&model.Balance{
+		BalanceID: transaction.Source,
+		LedgerID:  "ldg_uncapturable_8d42",
+	}, nil)
+
+	redisServer := miniredis.RunT(t)
+	cnf := outboxPublishingConfiguration()
+	cnf.Kafka.InsecureLocalDev = true
+	cnf.Redis = config.RedisConfig{Dns: redisServer.Addr()}
+	cnf.Queue = config.QueueConfig{WebhookQueue: "webhook_queue", IndexQueue: "index_queue", NumberOfQueues: 1}
+	outboxStoreConfiguration(t, cnf)
+
+	blnk, err := NewBlnk(datasource)
+	require.NoError(t, err)
+
+	rejected, err := blnk.RejectTransaction(context.Background(), transaction, "insufficient funds")
+
+	require.Error(t, err,
+		"a rejection whose event could not be prepared must be refused, so the caller sees the "+
+			"producer defect on the request that caused it")
+	assert.Nil(t, rejected,
+		"and no transaction is returned, because none was written")
+	assert.Empty(t, datasource.CapturedEventOutboxes(),
+		"nothing reached the writer")
+
+	datasource.AssertNotCalled(t, "RecordTransaction", mock.Anything, mock.Anything)
 }
 
 // TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved is the other half of

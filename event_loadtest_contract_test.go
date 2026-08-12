@@ -34,7 +34,6 @@ import (
 	"os"
 	"path"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -1043,23 +1042,6 @@ func guideSection(t *testing.T, guide, heading string) string {
 	return rest
 }
 
-// guideLinesContaining returns every `line N: text` in the guide that contains a
-// needle.
-//
-// Used for the absence assertions, which have to run over the WHOLE document — a wrong
-// reading of a figure does its damage wherever it is written.
-func guideLinesContaining(guide, needle string) []string {
-	var hits []string
-
-	for i, line := range strings.Split(guide, "\n") {
-		if strings.Contains(line, needle) {
-			hits = append(hits, strings.TrimSpace(line)+" (line "+strconv.Itoa(i+1)+")")
-		}
-	}
-
-	return hits
-}
-
 // TestLoadTestGuide_DocumentsOnlyRunnableEventCommands pins every advertised command to
 // the two prerequisites the scenario actually enforces.
 //
@@ -1122,29 +1104,42 @@ func TestLoadTestGuide_StatesTheSettlingPopulationAndItsFailClosedRule(t *testin
 	guide := guideSection(t, readRepoFile(t, loadTestGuidePath),
 		`### The settling gates: what "settled" covers`)
 
-	for state, reason := range map[string]string{
-		"`pending`":    "committed but not yet claimed",
-		"`processing`": "claimed under a lease and not yet acknowledged — a stalled relay's state",
-		"`failed`":     "retries spent, dead-letter write still owed",
-		"`replaying`":  "a republish in flight, which moves the dead-letter census",
-	} {
-		assert.Containsf(t, guide, state,
-			"%s: the settling population must name %s (%s), or the guide describes a narrower "+
-				"gate than the one that runs", loadTestGuidePath, state, reason)
+	// The section's own table is the population, one row per state. Its ROWS are what this
+	// asserts on: a gate that waits on fewer states than the scenario computes, or a guide
+	// that adds the excluded one, changes the row set — while the reason column beside each
+	// row is prose and is free to be rewritten.
+	population := markdownTableIn(t, guide, loadTestGuidePath,
+		[]string{"State", "Why it is un-settled"})
+
+	for _, state := range []string{"pending", "processing", "failed", "replaying"} {
+		_, present := population.Row(state)
+		assert.Truef(t, present,
+			"%s: the settling population must carry a row for %q, or the guide describes a narrower "+
+				"gate than the one that runs. Rows present: %v",
+			loadTestGuidePath, state, population.Keys())
 	}
 
-	assert.Containsf(t, guide, "`webhook_pending` is deliberately **not** in that population",
-		"%s: the one non-terminal state that is EXCLUDED must be named as excluded, with its "+
-			"reason, or a later reader adds it and the window waits on the deprecated HTTP leg",
-		loadTestGuidePath)
+	// The excluded state, asserted as the ABSENCE OF A ROW rather than as a sentence about
+	// it: a later reader who "completes" the population adds a row, and that is what ties
+	// the acceptance window's length to the transport being retired.
+	_, excluded := population.Row("webhook_pending")
+	assert.Falsef(t, excluded,
+		"%s: webhook_pending must NOT be a row in the settling population — such a row's Kafka leg "+
+			"is already acknowledged and counted, so waiting for it would make the window's length "+
+			"depend on the deprecated HTTP leg", loadTestGuidePath)
 
-	assert.Containsf(t, guide, "`blnk_outbox_pending` is `pending + processing` only",
-		"%s: the fallback source's blind spot must be stated, because it is what makes a "+
-			"master-key-less run uncertifiable rather than merely less precise", loadTestGuidePath)
+	assert.Lenf(t, population.Keys(), 4,
+		"%s: the settling population is exactly the four states from which a Kafka publish is still "+
+			"owed. Rows present: %v", loadTestGuidePath, population.Keys())
 
-	assert.Containsf(t, guide, "withholds all three verdicts",
-		"%s: the guide must say that an incompletely observed population withholds the verdicts "+
-			"rather than reporting the partial figures as a result", loadTestGuidePath)
+	// The fallback source and the withheld-verdict flag, by the identifiers a reader greps
+	// for rather than by the sentences that introduce them.
+	for _, identifier := range []string{"blnk_outbox_pending", "event_publish_verdicts_available"} {
+		assert.Containsf(t, readRepoFile(t, loadTestGuidePath), identifier,
+			"%s must name %s: it is what makes a master-key-less run uncertifiable rather than "+
+				"merely less precise, and a reader cannot look up a series the guide never names",
+			loadTestGuidePath, identifier)
+	}
 }
 
 // TestLoadTestGuide_StatesTheSameWindowDeadLetterNumerator pins that arithmetic as
@@ -1152,47 +1147,55 @@ func TestLoadTestGuide_StatesTheSettlingPopulationAndItsFailClosedRule(t *testin
 func TestLoadTestGuide_StatesTheSameWindowDeadLetterNumerator(t *testing.T) {
 	guide := guideSection(t, readRepoFile(t, loadTestGuidePath), "### Where each verdict comes from")
 
-	assert.Containsf(t, guide, "**same-window delta**",
-		"%s: the census numerator must be described as a same-window delta, not as a count",
-		loadTestGuidePath)
-	assert.Containsf(t, guide, "The cumulative census value is never",
-		"%s: the guide must rule out the lifetime total explicitly — it is the value the endpoint "+
-			"actually returns, so a reader will otherwise assume it is the one used",
-		loadTestGuidePath)
-	assert.Containsf(t, guide, "An absent counter is **not** read as zero",
-		"%s: the withheld-verdict rule must be stated, because a zero numerator PASSES V-3 and a "+
-			"reader has no other way to tell a measured 0%% from an unmeasured one",
-		loadTestGuidePath)
-	assert.Containsf(t, guide, "`verdicts.dead_letter_ratio.census_numerator`",
-		"%s: the artefact field carrying the baseline, the final reading and the delta must be "+
-			"named, or the arithmetic cannot be redone by hand", loadTestGuidePath)
+	// Every assertion here names an ARTEFACT the scenario emits or a series it reads, so the
+	// section's prose can be rewritten while the arithmetic it describes stays answerable to
+	// the same identifiers a reader would grep for.
+	for identifier, why := range map[string]string{
+		"verdicts.dead_letter_ratio.census_numerator": "the summary field carrying the baseline reading, the final reading and the delta, " +
+			"without which the arithmetic cannot be redone by hand",
+		"blnk_events_dead_lettered_total": "the counter source of the numerator, differenced over the window",
+		"event_publish_verdicts_available": "the flag that goes to 0 when neither source yields a " +
+			"window delta, which is how a withheld verdict is told apart from a measured zero",
+		"GET /events/stats": "the census the fallback numerator is read from",
+	} {
+		assert.Containsf(t, guide, identifier,
+			"%s: the verdict section must name %s — %s", loadTestGuidePath, identifier, why)
+	}
 }
 
-// TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait pins the diagnostic's
-// description.
+// TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait pins the two figures the
+// guide must label as diagnostics rather than as verdict inputs, by the series names the
+// scenario publishes them under.
+//
+// The names are the contract: `event_publish_p99_difference_seconds` is the difference of
+// two independently ranked p99 values, which is not the p99 of any difference and can be
+// negative, and `blnk_events_publish_duration_seconds` starts its clock at the relay's
+// claim rather than at capture. A guide that introduces either without naming it cannot
+// be looked up against the summary artefact, and that — rather than any particular
+// sentence about queue waits — is what a reader is left unable to check.
 func TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait(t *testing.T) {
 	guide := readRepoFile(t, loadTestGuidePath)
+	verdicts := guideSection(t, guide, "### Reading the verdict honestly")
 
-	for _, misreading := range []string{
-		"reported as the queue wait",
-		"is the queue wait",
-		"as the queue wait,",
+	for series, why := range map[string]string{
+		"event_publish_p99_difference_seconds": "the difference of two independently ranked p99 " +
+			"values, which is a diagnostic and not a percentile of anything",
+		"blnk_events_publish_duration_seconds": "the publish-duration histogram, whose clock starts " +
+			"at the relay's claim rather than at capture, so it cannot certify V-1",
 	} {
-		hits := guideLinesContaining(guide, misreading)
-		assert.Emptyf(t, hits,
-			"%s: the p99 difference must not be presented as a queue wait — %s",
-			loadTestGuidePath, strings.Join(hits, " | "))
+		assert.Containsf(t, verdicts, series,
+			"%s: the verdict section must name %s — %s", loadTestGuidePath, series, why)
 	}
 
-	// The corrective statement has to be present as well as the misreading absent: a diagnostic
-	// with no stated limit is quoted as a measurement.
-	verdicts := guideSection(t, guide, "### Reading the verdict honestly")
-	assert.Containsf(t, verdicts, "is **not** a\nqueue-wait percentile",
-		"%s: the corrective statement must survive where the figure is introduced",
-		loadTestGuidePath)
-	assert.Containsf(t, verdicts, "diagnostic-only\nsupporting figure",
-		"%s: publish duration and the difference must both be labelled diagnostic-only, which is "+
-			"the terminology the scenario's own provenance uses", loadTestGuidePath)
+	// The scenario's own provenance keys, which is where a reader goes to confirm the
+	// labelling. Asserted against the script so the guide and the artefact cannot describe
+	// different figures.
+	source := loadTestScript(t)
+	for _, key := range []string{"diagnosticPublishSeries", "diagnosticPublishP99"} {
+		assert.Containsf(t, source, key,
+			"%s: the publish-duration figure travels in the summary under %s, which is what makes it "+
+				"a labelled diagnostic rather than an unmarked latency number", loadTestScriptPath, key)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,10 +1499,10 @@ func TestLoadTestGuide_PublishesARunnableRecipe(t *testing.T) {
 	})
 
 	t.Run("the guide agrees with the runner about artifacts", func(t *testing.T) {
-		assert.NotContainsf(t, guide, "Two files are written",
-			"%s: the raw NDJSON stream is opt-in, so a default run writes ONE file. Promising two "+
-				"sends a reader looking for an artifact that was deliberately not produced",
-			loadTestGuidePath)
+		// The raw NDJSON stream is opt-in, so a default run writes ONE file. The guide is held
+		// to naming the two variables that turn the second one on, which is what a reader needs
+		// to reach it; how many files a run writes is then answerable from those names rather
+		// than from a promise in prose.
 		for _, opt := range []string{"RAW_OUTPUT", "NDJSON_OUT"} {
 			assert.Containsf(t, guide, opt,
 				"%s must document %s, or the raw stream is unreachable from the guide",

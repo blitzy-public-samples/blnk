@@ -63,30 +63,16 @@ const logIdentifierHashLength = logsafe.IdentifierHashLength
 
 // maxLazyTopicWriters bounds how many writers may be cached for topics that were not
 // part of the publisher's constructed inventory.
-//
-// Four categories → 8 writers per generation → 16 for two.
 const maxLazyTopicWriters = 16
 
 // PublishPurpose distinguishes the three reasons a message is written, so that one
 // event's telemetry cannot be confused with another's.
-//
-// It exists because all three go through the same writer and would otherwise be
-// indistinguishable in the metrics, with two concrete consequences:
-//
-//   - The dead-letter RATE divides dead-lettered events by the TOTAL TERMINAL OUTCOMES
-//     — dead-lettered plus DISPATCHED — so both counters have to count the same
-//     population, each event once.
-//   - The latency TARGET is stated for first-attempt original publishes.
 type PublishPurpose string
 
 const (
 	// PublishPurposeOriginal is a first delivery of an event to its category topic. An
 	// UNSTATED purpose — the empty string a zero-valued PublishRequest carries — resolves
 	// to it, which is the only thing the mandated envelope-only Publish method can mean.
-	// It is the only purpose the relay publishes under, and therefore the only one that
-	// can reach the published-events counter — which the RELAY increments, after the
-	// transition that makes the delivery durable, rather than the publisher on the
-	// broker's acknowledgement.
 	PublishPurposeOriginal PublishPurpose = "original"
 
 	// PublishPurposeReplay is an operator-triggered re-publication of a dead-lettered
@@ -105,15 +91,6 @@ const (
 
 // resolvePurpose normalises the publish purpose, defaulting an unstated one to
 // original.
-//
-// A NON-EMPTY unrecognised value is different. It is a caller that meant something
-// specific and got the vocabulary wrong, which is worth exactly one line.
-//
-// Parameters:
-//   - req PublishRequest: the request to resolve.
-//
-// Returns:
-//   - PublishPurpose: one of the three declared values, never the empty string.
 func resolvePurpose(req PublishRequest) PublishPurpose {
 	switch req.Purpose {
 	case PublishPurposeReplay:
@@ -134,17 +111,6 @@ func resolvePurpose(req PublishRequest) PublishPurpose {
 }
 
 // resolveMaxAttempts normalises the stated retry budget.
-//
-// A value below 1 is not a budget of zero attempts, it is an unstated budget: the relay
-// path always states one (from the row's max_attempts), and the envelope-only path has
-// none to state. Both collapse to 0, which fail and attemptBudgetSpent read as
-// "unknown".
-//
-// Parameters:
-//   - req PublishRequest: the request to resolve.
-//
-// Returns:
-//   - int: the budget, or 0 when none was stated.
 func resolveMaxAttempts(req PublishRequest) int {
 	if req.MaxAttempts < 1 {
 		return 0
@@ -154,41 +120,12 @@ func resolveMaxAttempts(req PublishRequest) int {
 }
 
 // attemptBudgetSpent reports whether an attempt was the last one a budget allowed.
-//
-// A budget of zero or less means none was stated, which is NOT the same as a budget of
-// zero attempts: the caller simply did not say, so nothing about the attempt count can
-// rule out a further attempt and this returns false.
-//
-// Parameters:
-//   - attempt int: the 1-based attempt number, already normalised.
-//   - maxAttempts int: the stated budget, or zero when unstated.
-//
-// Returns:
-//   - bool: true when a budget was stated and this attempt reached or passed it.
 func attemptBudgetSpent(attempt, maxAttempts int) bool {
 	return maxAttempts > 0 && attempt >= maxAttempts
 }
 
 // attemptLabel renders the attempt attribute, and it is the ONLY place that attribute's
 // value is produced.
-//
-// Three inputs could otherwise widen it, and each is closed off here:
-//
-//   - A configured budget above the ceiling. config.setRelayDefaults already clamps
-//     RELAY_MAX_RETRY_ATTEMPTS, so this is the second line of defence.
-//   - A row whose max_attempts was raised directly in the database, bypassing
-//     configuration entirely.
-//   - A replay or a dead-letter write. Neither is part of a retry sequence, so neither
-//     gets a number: labelling a replay "attempt 6" would extend the numeric domain
-//     past the budget and would also misdescribe it, since the sequence it belongs to
-//     ended.
-//
-// Parameters:
-//   - purpose PublishPurpose: the resolved purpose.
-//   - attempt int: the resolved, 1-based attempt number.
-//
-// Returns:
-//   - string: one of the eight declared label values.
 func attemptLabel(purpose PublishPurpose, attempt int) string {
 	switch purpose {
 	case PublishPurposeReplay:
@@ -210,28 +147,12 @@ func attemptLabel(purpose PublishPurpose, attempt int) string {
 
 // hashLogIdentifier turns a financial identifier into a stable, non-reversible token
 // suitable for a log field.
-//
-// The point is to keep the one property a log needs — that the same identifier always
-// produces the same token, so two lines can be recognised as belonging to the same
-// ledger or partition — while giving up the one it does not need, the identifier
-// itself. SHA-256 truncated to logIdentifierHashLength hex characters does that.
-//
-// Parameters:
-//   - value string: the identifier. May be empty.
-//
-// Returns:
-//   - string: a short hex token, or "" for an empty input.
 func hashLogIdentifier(value string) string {
 	return model.HashIdentifier(value)
 }
 
 // HashLogIdentifier is the exported form of hashLogIdentifier, so that every layer
 // produces the SAME token for the same identifier.
-//
-// It exists because the pseudonym has to be a PIVOT rather than a per-package
-// convention. An operator reads subscriber_id_hash in a log line or on a metric series
-// and needs to resolve it to a subscriber; the API layer therefore has to publish the
-// same token on the subscriber resource, and the API layer is a different package.
 //
 // Parameters:
 //   - value string: the identifier. May be empty.
@@ -243,12 +164,6 @@ func HashLogIdentifier(value string) string {
 }
 
 // The bounded classes a Kafka failure is reported as in a LOG LINE.
-//
-// Separate from the adminSpanError* vocabulary in event_tracing.go, and deliberately
-// so: that set describes an administrative operation, while a log line is also emitted
-// for a produce, a metadata read and an offset read, and it has to distinguish the two
-// conditions that are nobody's fault — no broker configured, and a caller that gave up
-// — from the ones that are.
 const (
 	kafkaErrorClassNone          = "none"
 	kafkaErrorClassNotConfigured = "not_configured"
@@ -263,12 +178,6 @@ const (
 )
 
 // KafkaErrorClass maps a Kafka failure to one of the bounded classes above.
-//
-// The two context conditions are tested FIRST because they are reachable through every
-// other condition: a produce that was cancelled mid-flight surfaces as a wrapped
-// context error on one path and as a broker write error on another, and reporting one
-// operator-visible event under two classes depending on where it landed makes the
-// series useless for alerting.
 //
 // Parameters:
 //   - cause error: the Kafka failure. May be nil.
@@ -303,10 +212,6 @@ func KafkaErrorClass(cause error) string {
 // LogKafkaDiagnostic sends a Kafka client's own error text to the trace-level
 // diagnostic sink.
 //
-// The level is checked before the error is formatted rather than left to logrus,
-// because WithError formats eagerly and this is on failure paths that a broker outage
-// makes hot.
-//
 // Parameters:
 //   - operation string: a FIXED literal naming what was attempted, for correlation with
 //     the bounded line that precedes it.
@@ -329,20 +234,6 @@ func LogKafkaDiagnostic(operation string, cause error) {
 
 // withKafkaError attaches the BOUNDED CLASS of a Kafka failure to a log entry and
 // routes the raw cause to the trace-level diagnostic sink.
-//
-// It exists so a call site can be converted by wrapping one expression rather than by
-// restructuring the statement, which is what keeps twenty conversions reviewable. The
-// diagnostic is emitted here rather than left to each caller for the same reason: a
-// caller that forgets it loses the raw text entirely, and the failure is silent.
-//
-// Parameters:
-//   - entry *logrus.Entry: the entry to extend. Must not be nil.
-//   - operation string: a FIXED literal naming what was attempted.
-//   - cause error: the failure. A nil cause still yields the "none" class, so a shared
-//     line keeps a stable field set.
-//
-// Returns:
-//   - *logrus.Entry: the entry carrying error_class, ready for a level call.
 func withKafkaError(entry *logrus.Entry, operation string, cause error) *logrus.Entry {
 	LogKafkaDiagnostic(operation, cause)
 
@@ -351,17 +242,6 @@ func withKafkaError(entry *logrus.Entry, operation string, cause error) *logrus.
 
 // kafkaErrorClassField is withKafkaError for a site that builds a logrus.Fields map
 // rather than chaining onto an entry.
-//
-// It routes the raw cause to the trace-level sink and returns the class, so converting
-// a field is a value substitution inside the map literal and the statement around it is
-// untouched.
-//
-// Parameters:
-//   - operation string: a FIXED literal naming what was attempted.
-//   - cause error: the failure. May be nil.
-//
-// Returns:
-//   - string: a bounded class, suitable as an "error_class" field value.
 func kafkaErrorClassField(operation string, cause error) string {
 	LogKafkaDiagnostic(operation, cause)
 
@@ -370,30 +250,12 @@ func kafkaErrorClassField(operation string, cause error) string {
 
 // kafkaErrorEntry starts a log entry carrying only the bounded class of a Kafka
 // failure.
-//
-// Parameters:
-//   - operation string: a FIXED literal naming what was attempted.
-//   - cause error: the failure. May be nil.
-//
-// Returns:
-//   - *logrus.Entry: ready for a level call.
 func kafkaErrorEntry(operation string, cause error) *logrus.Entry {
 	return withKafkaError(logrus.NewEntry(logrus.StandardLogger()), operation, cause)
 }
 
 // publisherAuthMode names the authentication the publisher will use, without disclosing
 // anything an attacker could use.
-//
-// It returns the MECHANISM only. The administrative username is not included even
-// though it is not a secret: paired with the SCRAM mechanism it is half of a credential
-// and names a valid principal on the cluster, which is a starting point for a
-// brute-force attempt that a mode name is not.
-//
-// Parameters:
-//   - cfg config.KafkaConfig: the Kafka configuration block.
-//
-// Returns:
-//   - string: "scram-sha-512" or "none".
 func publisherAuthMode(cfg config.KafkaConfig) string {
 	// The PRODUCER pair first, because that is the one the publisher prefers, and reading
 	// only the administrative pair reported "none" for the recommended configuration — a
@@ -420,9 +282,6 @@ var sharedEventPublisher struct {
 	mu sync.Mutex
 
 	// publisher is the shared instance, nil until first use.
-	//
-	// It is held as TopicEventPublisher rather than EventPublisher because a shared
-	// instance must be closeable at shutdown, and Close is part of the fuller contract.
 	publisher TopicEventPublisher
 
 	// fingerprint identifies the configuration publisher was built from, so a configuration
@@ -436,27 +295,6 @@ var sharedEventPublisher struct {
 }
 
 // eventPublisherFingerprint digests the configuration a publisher would be built from.
-//
-// The fingerprint is the cache key: an unchanged digest means the cached publisher —
-// with its existing connections, its existing SASL session and its existing TLS
-// configuration — keeps being handed out. So a transport-affecting field left out of
-// the digest is not merely an optimisation gone wrong; it is a configuration change
-// that NEVER TAKES EFFECT, silently, for the lifetime of the process.
-//
-// Three of the groups below were missing, and each has a concrete cost:
-//
-//   - THE PRODUCER PAIR (SASLUser / SASLSecret) is the credential the publisher PREFERS
-//     — see kafkaTransportCredentials, which reads it before the administrative pair.
-//   - THE TLS BLOCK. Enabling TLS, changing the CA bundle, adding a client certificate
-//     for mutual TLS, or correcting a server name all rebuild the transport.
-//   - InsecureSkipVerify and InsecureLocalDev, both of which decide whether the
-//     transport will dial at all and under what verification.
-//
-// Parameters:
-//   - cnf *config.Configuration: the configuration snapshot. May be nil.
-//
-// Returns:
-//   - string: a hex digest, or "nil" when there is no configuration.
 func eventPublisherFingerprint(cnf *config.Configuration) string {
 	if cnf == nil {
 		return "nil"
@@ -501,11 +339,6 @@ func eventPublisherFingerprint(cnf *config.Configuration) string {
 
 // SharedEventPublisher returns the process-owned publisher, building it at most once
 // per configuration.
-//
-// Use it wherever a publisher is needed but none is held: a request handler, a
-// dead-letter replay, a maintenance task. What it prevents is a second transport —
-// every extra publisher is another connection pool and another SASL session against the
-// same brokers.
 //
 // Returns:
 //   - TopicEventPublisher: the shared publisher. Never nil when the error is nil, and
@@ -570,11 +403,6 @@ func SharedEventPublisher() (TopicEventPublisher, error) {
 // SetSharedEventPublisher installs a publisher the caller already owns as the shared
 // one.
 //
-// It exists so that a process which builds a publisher for its own use — the relay in
-// the server role — can donate that instance instead of leaving this package to build a
-// second one. One publisher per process is the goal; two would double the connections
-// and the SASL sessions while each looked correct on its own.
-//
 // Parameters:
 //   - publisher TopicEventPublisher: the publisher to share. Nil clears the slot.
 func SetSharedEventPublisher(publisher TopicEventPublisher) {
@@ -596,13 +424,6 @@ func SetSharedEventPublisher(publisher TopicEventPublisher) {
 }
 
 // CloseSharedEventPublisher releases the shared publisher at process shutdown.
-//
-// It closes ONLY a publisher this package built, following the same ownership rule as
-// everywhere else in this feature: an injected publisher belongs to its injector, and
-// closing it here would tear down a transport its owner is still using. The slot is
-// cleared either way, so a subsequent SharedEventPublisher call builds afresh.
-//
-// It is idempotent and safe to call when nothing was ever built.
 //
 // Returns:
 //   - error: the publisher's close error, or nil when there was nothing this package

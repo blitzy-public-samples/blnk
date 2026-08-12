@@ -240,16 +240,6 @@ type lineage interface {
 }
 
 // eventOutbox defines methods for the Kafka event-publishing transactional outbox:
-// blnk.event_outbox, and the relay state machine that drains it.
-//
-// It reuses the lineage outbox's shape — an in-transaction insert, a FIFO claim that
-// takes a lease, explicit terminal-state transitions — but the two are separate
-// contracts over separate tables served by separate relays.
-//
-// InsertEventOutboxInTx takes an existing *sql.Tx so the event row commits in the SAME
-// transaction as the mutation that produced it: exactly-once ON THE WRITE SIDE. Kafka
-// delivery stays at-least-once, which is why event_id is uniquely indexed and why
-// duplicate suppression on it is a documented subscriber obligation.
 type eventOutbox interface {
 	// Insert methods for atomic event capture
 	InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error // Inserts an event outbox entry within an existing transaction
@@ -262,11 +252,6 @@ type eventOutbox interface {
 	// which is the no-op-when-unconfigured contract inherited from SendWebhook.
 
 	// Relay state machine: claim a batch, then drive each row to a terminal state.
-	//
-	// EVERY TRANSITION IS CONDITIONAL ON THE CLAIM TOKEN the claim issued, and returns a
-	// typed conflict when no row matches. A caller that receives the conflict has lost
-	// the row and must stop working on it — it must NOT treat its own publish as
-	// recorded.
 	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
 	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error               // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned
 
@@ -286,37 +271,11 @@ type eventOutbox interface {
 	// budget MarkEventFailed already exhausted into the dead_lettered terminal state, and
 	// records the dead-letter topic the event was written to together with the marshaled
 	// failure metadata.
-	//
-	// The two halves are separate methods because they know different things.
-	// MarkEventFailed knows only that a publish attempt failed and whether the budget is
-	// spent, so it can say no more than "failed".
-	//
-	// This method is what makes the dead-letter surface work at all: dlt_topic and
-	// failure_metadata are what the dead-letter inventory displays, and dead_lettered is
-	// the state a replay requires before it will re-publish. Left uncalled, those columns
-	// stay NULL and no event is ever replayable. claimToken is the one MarkEventFailed
-	// returned on its exhaustion arm, or the original claim token when a non-retryable
-	// failure dead-letters a row directly.
 	MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage, record model.BrokerRecord) error
 
 	// ClaimEventForReplay atomically moves a dead-lettered row to replaying and returns it
 	// with a fresh claim token, so a replay is a CLAIM rather than a read followed by a
 	// check.
-	//
-	// It exists because the read-then-check form let two concurrent replays of one event
-	// both see a dead_lettered row, both pass the check, and both publish — an operator
-	// clicking twice, or two operators triaging the same backlog, putting two copies on
-	// the topic. Only the caller whose update actually changed a row proceeds to publish.
-	//
-	// An unknown event_id is a not-found; a row that exists but is not dead-lettered is a
-	// conflict naming the state it is actually in, because replaying an already-dispatched
-	// event and replaying a still-pending one are different operator mistakes that deserve
-	// different answers.
-	//
-	// It also takes over a replaying row whose LEASE HAS EXPIRED. Admitting only
-	// dead_lettered left a row stranded by a crash — or by a release that failed on an
-	// already-cancelled request context — permanently unreplayable, with the lease written
-	// down and nothing ever reading it.
 	ClaimEventForReplay(ctx context.Context, eventID string, lockDuration time.Duration) (*model.EventOutbox, error)
 
 	// ReleaseEventReplay returns a replaying row to dead_lettered, recording replayErr in
@@ -337,20 +296,6 @@ type eventOutbox interface {
 	// legacy leg of the dual-delivery window, and BOTH ARE DELETED at the webhook sunset
 	// together with webhooks.go and the relay branch that calls them. Every other method
 	// in this interface outlives it.
-	//
-	// The claim exists because the legacy enqueue is deliberately allowed to fail without
-	// failing the Kafka publish — a webhook receiver being down must not consume a Kafka
-	// retry attempt — and the Kafka publish then drives the row to its terminal state,
-	// past everything the main claim predicate looks at. Without an independent way back
-	// to that row the outstanding webhook was lost silently, for precisely the subscribers
-	// that have not migrated yet.
-	//
-	// It admits ALL THREE Kafka end states — dispatched, failed and dead_lettered —
-	// because the relay enqueues the webhook BEFORE it publishes, so when both legs fail
-	// on the attempt that spends the retry budget the row goes terminal on the failure
-	// path with its webhook still owed. Restricting the set to dispatched discarded that
-	// webhook in the one circumstance where the webhook is the only transport that might
-	// still work: the broker being unreachable is why the Kafka leg failed.
 	ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims rows in any Kafka end state whose legacy webhook leg is still owed, taking a lease and stamping a claim token without altering status
 
 	// MarkEventLegacyWebhookAttempted records one FAILED legacy enqueue against a row
@@ -360,9 +305,6 @@ type eventOutbox interface {
 
 	// MarkEventWebhookPending records a Kafka leg that is COMPLETE alongside a legacy
 	// webhook leg that is still OWED, and reports which arm the in-SQL decision took:
-	// another webhook attempt (webhook_pending, claimable again after retryAfter) or the
-	// legacy leg abandoned (dispatched, terminal on the strength of the Kafka delivery
-	// alone).
 	MarkEventWebhookPending(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, record model.BrokerRecord) (model.EventWebhookOutcome, error)
 
 	// Dead-letter and reporting reads
@@ -411,20 +353,6 @@ type eventOutbox interface {
 
 	// AuditEventRecordsInIntervals is the OUTBOX SIDE of the zero-loss reconciliation, and
 	// it is what makes that reconciliation able to prove anything at all.
-	//
-	// CountEventOutboxByStatus alone cannot. Comparing its terminal counts against the
-	// broker's cumulative end offsets compares two populations that share no baseline, no
-	// time window and no topic incarnation: outbox pruning shrinks one side, Kafka
-	// retention deletes records the other side still counts, recreating a topic resets it
-	// to zero, and foreign traffic on a shared topic inflates it by an unknown amount.
-	//
-	// This method replaces that arithmetic with a BOUNDED MAPPING. Given the measured
-	// [first_offset, end_offset) window of each partition, it places every row that claims
-	// a record — every row whose Kafka leg completed, plus every dead-lettered row — into
-	// exactly one bucket: corroborated inside a window, naming no record at all, naming an
-	// unmeasured topic or partition, aged out below the window by retention, or AT OR
-	// ABOVE the log end, which is only possible if the partition was truncated or the
-	// topic recreated.
 	AuditEventRecordsInIntervals(ctx context.Context, intervals []model.PartitionOffsetInterval) (model.EventRecordIntervalAudit, error)
 
 	// AuditEventRecordCoordinates reports, per (topic, partition), how many terminal rows
@@ -459,11 +387,6 @@ type eventOutbox interface {
 }
 
 // eventSubscriber defines methods for the Kafka subscriber registry:
-// blnk.event_subscribers. A row records one subscriber's identity together with the
-// values that describe its access.
-//
-// This is a hard constraint on what may be declared in this contract, not a guideline,
-// and it is why the credential method below takes a reference rather than a password.
 type eventSubscriber interface {
 	// Registry CRUD
 	CreateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) (*model.EventSubscriber, error) // Registers a subscriber and returns the stored row
@@ -503,7 +426,6 @@ type eventSubscriber interface {
 
 	// RecordSubscriberCredentialIfUnchanged persists an issuance only while the subscriber
 	// still holds the reference the caller observed before it provisioned at the broker.
-	// Pass expected == nil to require that no credential has ever been issued.
 	RecordSubscriberCredentialIfUnchanged(ctx context.Context, subscriberID string, expected *string, credentialReference string, issuedAt time.Time, claimToken string) error
 
 	// ClearSubscriberCredential erases the credential reference and issuance instant,
@@ -573,8 +495,6 @@ type eventSubscriber interface {
 	CountSubscriberRevocationsPending(ctx context.Context) (model.SubscriberRevocationBacklog, error)
 
 	// CountSubscriberAccessResidue reports how much broker-side access is UNACCOUNTED FOR:
-	// SCRAM credentials that outlived their registry record, and revocations the broker
-	// refused.
 	CountSubscriberAccessResidue(ctx context.Context) (model.SubscriberAccessResidue, error)
 
 	// MarkSubscriberCredentialOrphaned records that a credential exists at the broker
@@ -626,15 +546,12 @@ type balanceMonitorHandoff interface {
 	ClaimPendingBalanceMonitorHandoffs(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.BalanceMonitorHandoff, error)
 	// CompleteBalanceMonitorHandoffWithEvents writes the alerts and the completion in ONE
 	// transaction. An empty event list is the common case and still completes the row:
-	// "evaluated, nothing fired" is a result, and recording it is what distinguishes it
-	// from "never evaluated".
 	CompleteBalanceMonitorHandoffWithEvents(ctx context.Context, handoffID string, events []*model.EventOutbox) error
 	// MarkBalanceMonitorHandoffFailed returns the row to pending while attempts remain and
 	// marks it failed once the budget is spent, leaving the record of an evaluation that
 	// never happened rather than deleting it.
 	MarkBalanceMonitorHandoffFailed(ctx context.Context, handoffID, reason string, permanent bool) error
 	// CountBalanceMonitorHandoffByStatus answers the question the event outbox cannot:
-	// whether a movement's monitors were evaluated at all.
 	CountBalanceMonitorHandoffByStatus(ctx context.Context) (map[string]int64, error)
 }
 

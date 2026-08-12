@@ -32,15 +32,6 @@ import (
 
 // postIdentityActions performs actions after an identity has been created. It sends the
 // newly created identity to the search index queue.
-//
-// Indexing stays here because it is genuinely post-commit work: TypeSense is a separate
-// system with its own retry queue, and nothing about it belongs in a ledger
-// transaction.
-//
-// Parameters:
-//   - ctx context.Context: the creating request's context. Detached from cancellation
-//     before it is handed to the publish, which outlives the request that spawned it.
-//   - identity *model.Identity: A pointer to the newly created Identity model.
 func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity) {
 	// Derived outside the goroutine, while ctx is still live. See postLedgerActions.
 	publishCtx := context.WithoutCancel(ctx)
@@ -63,15 +54,6 @@ func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity
 // identityCreatedEventPreparer returns the preparer that builds the identity.created
 // outbox row, for the repository to insert INSIDE the transaction that inserts the
 // identity.
-//
-// Capturing it here closes the window in which an identity exists and its event does
-// not: the event commits with the identity or not at all.
-//
-// Parameters:
-//   - ctx context.Context: the creating request's context, captured for tracing only.
-//
-// Returns:
-//   - database.EventPreparer[model.Identity]: the preparer to hand to the repository.
 func (l *Blnk) identityCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Identity] {
 	// A NIL PREPARER when nothing is configured, so the repository stays on its
 	// single-statement path instead of opening a transaction to insert no event. See
@@ -91,13 +73,7 @@ func (l *Blnk) identityCreatedEventPreparer(ctx context.Context) database.EventP
 // CreateIdentity creates a new identity together with its identity.created event,
 // atomically.
 //
-// postIdentityActions then performs the remaining post-commit work, which is indexing
-// only.
-//
-// - identity model.Identity: The Identity model to be created.
-//
 // Parameters:
-// # This is the requirement applied to identity creation
 //
 // Returns:
 //   - model.Identity: The created Identity model.
@@ -386,7 +362,6 @@ func (l *Blnk) TokenizeAllPII(identityID string) error {
 }
 
 // GetDetokenizedIdentity returns a copy of the identity with all fields detokenized.
-// Note: This does not modify the stored identity.
 //
 // Parameters:
 // - identityID string: The ID of the identity.

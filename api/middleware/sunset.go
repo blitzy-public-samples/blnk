@@ -31,21 +31,6 @@ import (
 
 // The advisory response headers the guard advertises whenever a retirement instant is
 // configured, on both sides of the boundary.
-//
-// THEY COME FROM TWO DIFFERENT RFCs AND USE TWO DIFFERENT DATE FORMATS, which is the
-// detail most easily got wrong here:
-//
-//   - Sunset is RFC 8594. It carries the instant at which the routes stop responding,
-//     as an HTTP-date — the IMF-fixdate that http.TimeFormat renders.
-//   - Deprecation is RFC 9745. Its value MUST be a Structured Fields Date (RFC 9651
-//     §3.3.7): an "@" followed by integer seconds since the Unix epoch, for example
-//     "@1688169599".
-//
-// The instant each carries is different too, and deliberately so. Deprecation carries
-// the moment the surface BECAME deprecated, which is when the dual-delivery window
-// opened; Sunset carries the moment it stops answering.
-//
-// Both are purely informational. The refusal below is never a function of either.
 const (
 	webhookSunsetHeader      = "Sunset"
 	webhookDeprecationHeader = "Deprecation"
@@ -91,16 +76,6 @@ func IsDeprecatedWebhookSubscriptionRequest(fullPath, method string) bool {
 // requestAddressesRetiredWebhookSurface reports whether THIS request addresses the
 // retired webhook-subscription surface, by whichever of the two available facts
 // applies.
-//
-// The method is only consulted on the template branch. On the fallback branch the verb
-// is precisely what did not match, so requiring it to be one of the four would defeat
-// the purpose.
-//
-// Parameters:
-//   - c *gin.Context: the request in flight.
-//
-// Returns:
-//   - bool: true when the request addresses the retired surface, by either reading.
 func requestAddressesRetiredWebhookSurface(c *gin.Context) bool {
 	if template := c.FullPath(); template != "" {
 		return IsDeprecatedWebhookSubscriptionRequest(template, c.Request.Method)
@@ -116,11 +91,6 @@ func requestAddressesRetiredWebhookSurface(c *gin.Context) bool {
 // WebhookSunsetPreAuthGuard answers the four deprecated webhook-subscription routes
 // with 410 Gone BEFORE authentication runs, and lets every other request through
 // untouched.
-//
-// After the retirement instant the webhook REST API answers 410 Gone on EVERY request.
-// The per-route WebhookSunsetGuard cannot deliver that on its own, because api/api.go
-// installs Authenticate() with router.Use, and gin runs global middleware ahead of
-// per-route middleware.
 //
 // Returns:
 //   - gin.HandlerFunc: global middleware that aborts with apierror.ErrGenGone for the
@@ -166,9 +136,6 @@ func WebhookSunsetPreAuthGuard() gin.HandlerFunc {
 // formatDeprecationDate renders an instant as an RFC 9651 Structured Fields Date, the
 // form RFC 9745 requires of the Deprecation field.
 //
-// DeprecationHeaderValue is the exported rendering of the Deprecation field value, for
-// tests and for any caller that must predict exactly what the guards emit.
-//
 // Parameters:
 //   - instant time.Time: the moment to render. Any location; the epoch value is
 //     absolute.
@@ -191,24 +158,11 @@ func formatDeprecationDate(instant time.Time) string {
 
 // webhookSunsetGoneMessage is the single, stable explanation returned once the legacy
 // webhook surface has been retired.
-//
-// It says "retired", not "removed", and that is precise rather than euphemistic. The
-// routes and their handlers stay registered after the sunset PERMANENTLY, because the
-// requirement is that this surface answer 410 Gone on every request once the window
-// closes — and only a registered route can answer anything. A deleted route answers
-// 404, which says "no such endpoint" rather than "this endpoint is gone", and would
-// fail the very criterion the guard exists to satisfy.
 const webhookSunsetGoneMessage = "Webhook subscription management has been retired and is no " +
 	"longer available. Use the Kafka event stream and the subscriber credential endpoint " +
 	"instead; see the webhook-to-Kafka migration guide under docs/."
 
 // deprecatedWebhookSubscriptionSegments is the path shape of the retired surface:
-// /subscribers/{subscriber_id}/webhook-subscription.
-//
-// The first and last segments are matched literally and the middle one is the
-// subscriber id, whatever it happens to be. Matching a shape rather than a list of
-// concrete paths is what lets one guard cover every subscriber without the router and
-// this file having to agree on a set of ids.
 const (
 	deprecatedWebhookSubscriptionPathSegments = 3
 	deprecatedWebhookSubscriptionRoot         = "subscribers"
@@ -230,21 +184,6 @@ func IsDeprecatedWebhookSubscriptionPath(path string) bool {
 
 // isDeprecatedWebhookSubscriptionPath reports whether a request path addresses the
 // retired webhook-subscription surface.
-//
-// Two decisions here are worth stating because both look like oversights:
-//
-//   - The comparison is case-sensitive, matching Gin's own routing. "/Subscribers/..."
-//     never named a route in this API, so it answered 404 before the retirement; it
-//     should answer 404 after it too.
-//   - Exactly one trailing slash is tolerated. Gin redirects "/a/b/" to "/a/b" before
-//     any handler runs when the latter is registered FOR THAT METHOD, so the tolerance
-//     is not what handles the common case.
-//
-// Parameters:
-//   - path: the request path, already percent-decoded, as Gin itself routes on.
-//
-// Returns:
-//   - bool: true when the path addresses the retired webhook-subscription surface.
 func isDeprecatedWebhookSubscriptionPath(path string) bool {
 	if len(path) > 1 {
 		path = strings.TrimSuffix(path, "/")
@@ -268,43 +207,6 @@ func isDeprecatedWebhookSubscriptionPath(path string) bool {
 // management routes once the webhook retirement instant has passed. Before it, the
 // guard is transparent: it adds the advisory headers and hands the request on, so the
 // routes answer exactly as they did before it was attached.
-//
-// The retired surface is /subscribers/{subscriber_id}/webhook-subscription, whose POST,
-// GET, PUT and DELETE forms api/api.go registers for the dual-delivery window.
-//
-// That reasoning does not hold, and it left the retirement incomplete in two ways that
-// no error surfaces:
-//
-//   - Authentication is installed with router.Use and therefore precedes every
-//     per-route handler.
-//   - Only four method-and-path pairs were registered. Any other method on the retired
-//     path — PATCH, HEAD, OPTIONS — matched no route, so it was answered by Gin's
-//     fallback handling as though the surface had never existed, which is a different
-//     claim from the one the retirement makes.
-//
-// This must be registered before router.Use(auth.Authenticate()). Registered after it,
-// the retirement is once again invisible to unauthenticated callers — the precise
-// defect above, reintroduced silently, because every test using a valid master key
-// still passes. api/api.go registers it immediately before authentication for that
-// reason, and the webhook_sunset tests assert the unauthenticated case specifically so
-// the ordering cannot regress unnoticed.
-//
-// blnk.WebhookSunsetSnapshotAt is the only thing consulted, and it is consulted EXACTLY
-// ONCE per request from inside the returned handler. Three properties of that are worth
-// stating, because each is easy to break by accident:
-//
-//   - No date is compared here. event_sunset.go resolves one retirement window, which
-//     this guard and the relay's dual-delivery predicate both read, so they cannot form
-//     different opinions about when it closes. An unconfigured instant is a legitimate
-//     steady state for a deployment with NO Kafka brokers, and the routes keep
-//     answering indefinitely; brokers configured without an instant is rejected at
-//     start-up and fails closed if it reaches the runtime anyway.
-//   - The verdict is not resolved when the middleware is built. Configuration is read
-//     live from a store whose contents are replaced wholesale, so a verdict captured at
-//     construction time would answer the question as it stood when the router was
-//     assembled rather than when the request arrived.
-//   - ONE SNAPSHOT SERVES BOTH HEADERS AND THE VERDICT, and the "is there a window to
-//     render" test with them.
 //
 // Returns:
 //   - gin.HandlerFunc: a global middleware function that aborts with

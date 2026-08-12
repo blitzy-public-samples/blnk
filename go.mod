@@ -1,19 +1,17 @@
 module github.com/blnkfinance/blnk
 
-// The Go language and MINIMUM TOOLCHAIN version, and 1.25.12 is a security floor
-// rather than a preference. 1.25.0 shipped with fixed vulnerabilities that this
-// service is exposed to through code it runs on every request: net/url parsing
-// (every inbound URL and every configured webhook endpoint), crypto/x509 and
-// crypto/tls certificate handling (the Kafka SASL/TLS transport, the outbound
-// webhook client and the PostgreSQL connection), and cmd/go plus cgo in the build
-// itself. 1.25.12 is the current 1.25 maintenance release and carries all of those
-// fixes.
+// The LANGUAGE VERSION, and it is deliberately the minimum this module needs rather
+// than the newest patch available. Raising it raises the floor for every contributor
+// and every downstream builder, which is a cost this module has no reason to impose:
+// the security fixes in later 1.25 patches are consumed by the TOOLCHAIN that builds
+// the binary, not by the language version declared here.
 //
-// Keep this in step with the three go-version pins in .github/workflows/go.yml and
-// with CONTRIBUTING.md. The Dockerfile deliberately tracks the floating
-// golang:1.25-alpine tag, which always resolves to the newest 1.25 patch, so it
-// needs no edit when this floor moves.
-go 1.25.12
+// Where the patched toolchain is pinned instead: the four go-version pins in
+// .github/workflows/go.yml, which is what builds and tests every change, and the
+// Dockerfile's golang:1.25-alpine tag, which always resolves to the newest 1.25
+// patch. Build locally with the newest 1.25 patch for the same reason — see
+// CONTRIBUTING.md.
+go 1.25.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
@@ -60,6 +58,17 @@ require (
 	go.opentelemetry.io/otel/trace v1.43.0
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
+
+	// TEST-ONLY, and listed here rather than as an indirect requirement because a Go
+	// module is "direct" the moment any package in the main module imports it, tests
+	// included. No production file imports it — TestDependencies_YAMLParsingStaysTestOnly
+	// enforces that — and it adds nothing to the build: gin, gorp and sonic already
+	// require this exact version, so go.sum is unchanged by its presence here.
+	//
+	// It parses the alert rules, their ConfigMap copy and the Kubernetes manifests in the
+	// deployment parity tests. The alternative is a hand-written parser for the YAML
+	// subset those files use, which would put 30-odd machine-checkable parity assertions
+	// behind an unproven parser — a worse trade than one test-scoped requirement.
 	gopkg.in/yaml.v3 v3.0.1
 )
 

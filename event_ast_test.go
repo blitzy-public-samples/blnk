@@ -282,3 +282,96 @@ func wrapStatementsAsDecl(body *ast.BlockStmt) ast.Decl {
 		Body: body,
 	}
 }
+
+// ---------------------------------------------------------------------------------------
+// Source groups
+//
+// Every helper above answers a question about ONE file. A production file split for size
+// answers the same questions across a GROUP, and the questions worth asserting are mostly
+// about ABSENCE — that nothing reads a value, sleeps, or writes an instrument. An absence
+// assertion narrowed to the remnant of a split file is the worst outcome available: it
+// keeps passing, and it stops meaning anything the moment the code moves next door.
+//
+// So each single-file helper has a group counterpart here, and structural assertions use
+// the counterpart.
+// ---------------------------------------------------------------------------------------
+
+// parseRepositoryGoFiles parses every non-test member of base's source group.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - base string: a repository-relative path, e.g. "event_relay.go".
+//
+// Returns:
+//   - []*ast.File: one parsed file per group member, in sorted path order.
+func parseRepositoryGoFiles(t *testing.T, base string) []*ast.File {
+	t.Helper()
+
+	group := eventSourceGroup(t, base)
+	parsedFiles := make([]*ast.File, 0, len(group))
+
+	for _, member := range group {
+		parsedFiles = append(parsedFiles, parseRepositoryGoFile(t, member))
+	}
+
+	return parsedFiles
+}
+
+// sumIdentifierUses totals identifierUses across a parsed group.
+func sumIdentifierUses(files []*ast.File, name string) int {
+	total := 0
+	for _, file := range files {
+		total += identifierUses(file, name)
+	}
+
+	return total
+}
+
+// sumQualifiedCallCount totals qualifiedCallCount across a parsed group.
+func sumQualifiedCallCount(files []*ast.File, qualifier, name string) int {
+	total := 0
+	for _, file := range files {
+		total += qualifiedCallCount(file, qualifier, name)
+	}
+
+	return total
+}
+
+// sumSelectorCallNames merges selectorCallNames across a parsed group.
+func sumSelectorCallNames(files []*ast.File) map[string]int {
+	merged := map[string]int{}
+
+	for _, file := range files {
+		for name, count := range selectorCallNames(file) {
+			merged[name] += count
+		}
+	}
+
+	return merged
+}
+
+// sumQualifiedSelections merges qualifiedSelections across a parsed group.
+func sumQualifiedSelections(files []*ast.File, qualifier string) map[string]int {
+	merged := map[string]int{}
+
+	for _, file := range files {
+		for name, count := range qualifiedSelections(file, qualifier) {
+			merged[name] += count
+		}
+	}
+
+	return merged
+}
+
+// sumCallsGuardedBy merges callsGuardedBy across a parsed group.
+func sumCallsGuardedBy(files []*ast.File, guardQualifier, guardName string) map[string]int {
+	merged := map[string]int{}
+
+	for _, file := range files {
+		for name, count := range callsGuardedBy(file, guardQualifier, guardName) {
+			merged[name] += count
+		}
+	}
+
+	return merged
+}

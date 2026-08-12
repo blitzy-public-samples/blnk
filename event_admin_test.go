@@ -952,17 +952,42 @@ func newTestKafkaAdmin(fake *fakeAdminClient, partitions, replicationFactor int)
 	}
 }
 
-// parseEventAdminSource parses event_admin.go into an AST, comments included, so
-// structural guarantees about the implementation can be asserted rather than trusted.
-func parseEventAdminSource(t *testing.T) (*ast.File, *token.FileSet) {
+// parseEventAdminSource parses the whole event-admin source group into ASTs, comments
+// included, so structural guarantees about the implementation can be asserted rather than
+// trusted.
+//
+// The group rather than the single file: the admin surface is split across
+// event_admin.go and its event_admin_*.go siblings, and a structural guarantee that
+// scanned only the remnant would stop covering every declaration that moved.
+func parseEventAdminSource(t *testing.T) ([]*ast.File, *token.FileSet) {
 	t.Helper()
 
 	fileSet := token.NewFileSet()
-	path := filepath.Join(moduleRootDir(t), "event_admin.go")
-	parsed, err := parser.ParseFile(fileSet, path, nil, parser.ParseComments)
-	require.NoError(t, err, "event_admin.go must be parseable to assert its structure")
+	root := moduleRootDir(t)
+	group := eventSourceGroup(t, "event_admin.go")
+	parsedFiles := make([]*ast.File, 0, len(group))
 
-	return parsed, fileSet
+	for _, relative := range group {
+		parsed, err := parser.ParseFile(
+			fileSet, filepath.Join(root, filepath.FromSlash(relative)), nil, parser.ParseComments)
+		require.NoErrorf(t, err, "%s must be parseable to assert its structure", relative)
+
+		parsedFiles = append(parsedFiles, parsed)
+	}
+
+	return parsedFiles, fileSet
+}
+
+// inspectAll runs ast.Inspect over every file in a parsed group, so a structural
+// assertion is written once and applied to the whole unit.
+//
+// Parameters:
+//   - parsedFiles []*ast.File: the group, as returned by parseEventAdminSource.
+//   - visit func(ast.Node) bool: the visitor, with ast.Inspect's own semantics.
+func inspectAll(parsedFiles []*ast.File, visit func(ast.Node) bool) {
+	for _, parsed := range parsedFiles {
+		ast.Inspect(parsed, visit)
+	}
 }
 
 // createdTopicConfigs flattens every topic configuration the fake was asked to create.
@@ -1967,14 +1992,14 @@ func TestVerifyKeyScopeBoundary_RefusesEveryWayTheBoundaryCanBeAbsent(t *testing
 		})
 
 		err := verifyKeyScopeBoundary(scoped, wide, reconciliation, true)
-		require.ErrorIs(t, err, ErrSubscriberKeyScopeUnenforced,
+		require.ErrorIs(t, err, ErrSubscriberKeyScopeBoundaryUnverified,
 			"a grant carrying Read admits the principal to every record on the topic, so the "+
 				"prefix bounds nothing")
 	})
 
 	t.Run("a broker whose enforcement is unconfirmed", func(t *testing.T) {
 		err := verifyKeyScopeBoundary(scoped, narrow, reconciliation, false)
-		require.ErrorIs(t, err, ErrSubscriberKeyScopeUnenforced,
+		require.ErrorIs(t, err, ErrSubscriberKeyScopeBoundaryUnverified,
 			"withholding Read withholds nothing where no authorizer evaluates the bindings")
 	})
 
@@ -1985,7 +2010,7 @@ func TestVerifyKeyScopeBoundary_RefusesEveryWayTheBoundaryCanBeAbsent(t *testing
 		}
 
 		err := verifyKeyScopeBoundary(scoped, narrow, widened, true)
-		require.ErrorIs(t, err, ErrSubscriberKeyScopeUnenforced,
+		require.ErrorIs(t, err, ErrSubscriberKeyScopeBoundaryUnverified,
 			"a binding Blnk did not create may restore exactly the access this boundary withholds")
 	})
 
@@ -4279,7 +4304,7 @@ func TestMissingTopics_NamesTheAbsentOnesInRequestedOrder(t *testing.T) {
 //
 // The runtime tests above prove the password does not leak on the paths they exercise.
 func TestEventAdminSource_NeverHandsThePasswordToALogOrAnErrorCall(t *testing.T) {
-	parsed, fileSet := parseEventAdminSource(t)
+	parsedFiles, fileSet := parseEventAdminSource(t)
 
 	// Names that hold or produce the secret. SaltedPassword is deliberately absent: it is
 	// a one-way derivation and logging it, while pointless, would not disclose the secret.
@@ -4347,7 +4372,7 @@ func TestEventAdminSource_NeverHandsThePasswordToALogOrAnErrorCall(t *testing.T)
 		return found
 	}
 
-	ast.Inspect(parsed, func(node ast.Node) bool {
+	inspectAll(parsedFiles, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok || !loggingOrFormatting(call) {
 			return true
@@ -4438,9 +4463,9 @@ func fieldIndexNamed(structType reflect.Type, name string) int {
 // TestEventAdminSource_SpellsNoTopicNameAsALiteral enforces the single source of truth
 // for topic naming.
 func TestEventAdminSource_SpellsNoTopicNameAsALiteral(t *testing.T) {
-	parsed, fileSet := parseEventAdminSource(t)
+	parsedFiles, fileSet := parseEventAdminSource(t)
 
-	ast.Inspect(parsed, func(node ast.Node) bool {
+	inspectAll(parsedFiles, func(node ast.Node) bool {
 		literal, ok := node.(*ast.BasicLit)
 		if !ok || literal.Kind != token.STRING {
 			return true
@@ -4462,11 +4487,14 @@ func TestEventAdminSource_SpellsNoTopicNameAsALiteral(t *testing.T) {
 // TestEventAdminSource_StaysWithinItsMandate pins the boundaries the plan draws around this
 // file, each of which is a real hazard rather than a style preference.
 func TestEventAdminSource_StaysWithinItsMandate(t *testing.T) {
-	parsed, _ := parseEventAdminSource(t)
+	parsedFiles, _ := parseEventAdminSource(t)
 
 	imports := map[string]struct{}{}
-	for _, spec := range parsed.Imports {
-		imports[strings.Trim(spec.Path.Value, "\"")] = struct{}{}
+
+	for _, parsed := range parsedFiles {
+		for _, spec := range parsed.Imports {
+			imports[strings.Trim(spec.Path.Value, "\"")] = struct{}{}
+		}
 	}
 
 	forbiddenImports := map[string]string{
@@ -4495,7 +4523,7 @@ func TestEventAdminSource_StaysWithinItsMandate(t *testing.T) {
 	// deliberately not wrapped is part of the documentation, and a text search cannot tell
 	// an explanation apart from a call.
 	referenced := map[string]struct{}{}
-	ast.Inspect(parsed, func(node ast.Node) bool {
+	inspectAll(parsedFiles, func(node ast.Node) bool {
 		switch value := node.(type) {
 		case *ast.SelectorExpr:
 			referenced[value.Sel.Name] = struct{}{}
@@ -4545,16 +4573,25 @@ func TestEventAdminSource_StaysWithinItsMandate(t *testing.T) {
 			"isolation criterion passes vacuously")
 }
 
-// readEventAdminSource returns event_admin.go as text, for assertions that are about the
-// presence or absence of a reference rather than about syntax.
+// readEventAdminSource returns the whole event-admin source group as one text, for
+// assertions that are about the presence or absence of a reference rather than about
+// syntax. Concatenated for the same reason parseEventAdminSource parses the group.
 func readEventAdminSource(t *testing.T) string {
 	t.Helper()
 
-	path := filepath.Join(moduleRootDir(t), "event_admin.go")
-	contents, err := os.ReadFile(path)
-	require.NoError(t, err, "event_admin.go must be readable")
+	root := moduleRootDir(t)
 
-	return string(contents)
+	var joined strings.Builder
+
+	for _, relative := range eventSourceGroup(t, "event_admin.go") {
+		contents, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))
+		require.NoErrorf(t, err, "%s must be readable", relative)
+
+		joined.Write(contents)
+		joined.WriteString("\n")
+	}
+
+	return joined.String()
 }
 
 // ---------------------------------------------------------------------------------------

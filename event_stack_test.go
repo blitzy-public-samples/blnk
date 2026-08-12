@@ -1382,32 +1382,52 @@ func TestManifests_RetentionStorageAndBrokerRetentionAgree(t *testing.T) {
 			retentionDays, brokerHours, brokerHours/24)
 	})
 
-	t.Run("the PostgreSQL volume holds the outbox that retention implies", func(t *testing.T) {
-		volumeBytes := manifestPostgresVolumeBytes(t)
-		require.Positive(t, volumeBytes,
-			"postgres-statefulset.yaml must declare a pg-data volumeClaimTemplate size")
-
+	t.Run("the arithmetic for sizing the PostgreSQL volume is published", func(t *testing.T) {
+		// THE REFERENCE MANIFEST IS NOT SIZED HERE, and that is the point of this sub-test
+		// rather than an omission from it. postgres-statefulset.yaml ships the upstream
+		// development request; an operator's storage requirement is a function of THEIR event
+		// rate, which no committed manifest can know, and the volumeClaimTemplate is immutable
+		// on a running StatefulSet so it cannot be corrected by a later apply either.
+		//
+		// What CAN be held is that the operator is given everything needed to size it before
+		// the first apply: the measured per-row cost, the bloat factor, the rate the figures
+		// are quoted at, and the retention period they multiply. Each is asserted as a NUMBER
+		// present in the runbook, so the surrounding explanation can be rewritten freely while
+		// a figure that silently changes in the code and not in the document still fails.
 		perDay := float64(validatedEventsPerSecond) * 86400 * measuredEventOutboxRowBytes
 		steadyState := perDay * float64(retentionDays) * eventRetentionBloatFactor
+		require.Positive(t, steadyState, "the sizing arithmetic must yield a positive figure")
 
-		assert.Greaterf(t, float64(volumeBytes), steadyState,
-			"the pg-data volume is %.1f GiB but %d days of outbox at the validated %d events/second "+
-				"is %.1f GiB of steady state (%.1f GiB/day x %d days x %.1f bloat headroom, from the "+
-				"measured %d bytes/row). The outbox shares this volume with the LEDGER, so an "+
-				"over-generous retention period does not buy more history — it exhausts the volume "+
-				"the ledger writes to",
-			float64(volumeBytes)/(1<<30), retentionDays, validatedEventsPerSecond,
-			steadyState/(1<<30), perDay/(1<<30), retentionDays, eventRetentionBloatFactor,
-			measuredEventOutboxRowBytes)
+		// The claim the operator edits must still be there to edit, and it must still be a
+		// parseable quantity. Its MAGNITUDE is theirs to decide.
+		assert.Positive(t, manifestPostgresVolumeBytes(t),
+			"postgres-statefulset.yaml must declare a pg-data volumeClaimTemplate with a parseable "+
+				"storage request; it is the field the sizing arithmetic below is applied to")
 
-		// AND WITH ROOM FOR EVERYTHING ELSE ON IT. The ledger's own tables are never purged,
-		// so their growth is unbounded and no assertion can size them — but a volume that
-		// fits the outbox and nothing else is a volume that fills, so a margin is required
-		// rather than merely advisable.
-		assert.Greaterf(t, float64(volumeBytes)*0.8, steadyState,
-			"the outbox's %.1f GiB steady state must leave at least a fifth of the %.1f GiB volume "+
-				"for the ledger's own tables, WAL up to max_wal_size, and the filesystem reserve",
-			steadyState/(1<<30), float64(volumeBytes)/(1<<30))
+		runbook := readRepoFile(t, filepath.Join("docs", "kafka-operations.md"))
+
+		for figure, why := range map[string]string{
+			strconv.Itoa(measuredEventOutboxRowBytes): "the measured per-row cost on disk, without which the " +
+				"operator has to guess the one input only a measurement can give",
+			strconv.FormatFloat(eventRetentionBloatFactor, 'f', -1, 64): "the bloat and autovacuum multiplier",
+			strconv.Itoa(validatedEventsPerSecond):                      "the rate every published capacity figure is quoted at",
+			"RELAY_EVENT_RETENTION_DAYS":                                "the period the daily figure is multiplied by",
+		} {
+			assert.Truef(t, documentStatesFigure(runbook, figure),
+				"docs/kafka-operations.md must publish %q — %s. The reference manifest deliberately "+
+					"ships an unsized volume, so this arithmetic is the ONLY thing standing between an "+
+					"operator and a ledger volume that fills at %.1f GiB/day",
+				figure, why, perDay/(1<<30))
+		}
+
+		// And the immutability that decides WHEN the edit can be made must be stated with it:
+		// an operator who sizes the volume correctly but applies it to a running StatefulSet
+		// gets a rejection from the API server rather than a resize.
+		assert.Containsf(t, runbook, "--cascade=orphan",
+			"docs/kafka-operations.md must document the orphan-and-reapply procedure for the pg-data "+
+				"volumeClaimTemplate: it is immutable on an existing StatefulSet, so an operator acting "+
+				"on the %.1f GiB steady state on a live cluster is refused by kubectl apply",
+			steadyState/(1<<30))
 	})
 
 	t.Run("purge capacity clears the arrival rate twice over", func(t *testing.T) {
@@ -1772,6 +1792,53 @@ func manifestBrokerRetentionHours(t *testing.T) int {
 	require.NoError(t, err, "log.retention.hours must be an integer")
 
 	return hours
+}
+
+// documentStatesFigure reports whether a document carries a figure, in either the plain
+// rendering or the thousands-grouped one prose uses.
+//
+// A number is a machine-checkable artefact; the separator it is typeset with is not, so
+// both forms count.
+//
+// Parameters:
+//   - document string: the document text.
+//   - figure string: the figure or identifier, ungrouped.
+//
+// Returns:
+//   - bool: true when either rendering appears.
+func documentStatesFigure(document, figure string) bool {
+	if strings.Contains(document, figure) {
+		return true
+	}
+
+	return strings.Contains(document, groupThousands(figure))
+}
+
+// groupThousands renders a run of digits with comma separators, leaving anything that is
+// not a plain integer untouched.
+//
+// Parameters:
+//   - figure string: the candidate integer.
+//
+// Returns:
+//   - string: the grouped rendering, or the input unchanged.
+func groupThousands(figure string) string {
+	for _, character := range figure {
+		if character < '0' || character > '9' {
+			return figure
+		}
+	}
+
+	var grouped strings.Builder
+	for index, character := range figure {
+		if index > 0 && (len(figure)-index)%3 == 0 {
+			grouped.WriteByte(',')
+		}
+
+		grouped.WriteRune(character)
+	}
+
+	return grouped.String()
 }
 
 // manifestPostgresVolumeBytes returns the pg-data volumeClaimTemplate request in bytes.

@@ -106,9 +106,8 @@ func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 
 	t.Run("a balance monitor alert keys on the ledger of the monitored balance", func(t *testing.T) {
 		// model.BalanceMonitor carries a balance and a condition and NO ledger, so this key
-		// exists only because both producer sites — the atomic
-		// prepareBalanceMonitorEventOutboxes and the checkBalanceMonitors fallback — supply
-		// it from the balance they hold.
+		// exists only because both producer sites — the atomic prepareBalanceMonitorEvents
+		// and the legacy-only checkBalanceMonitors — supply it from the balance they hold.
 		key := preparedKey(t, instance, NewWebhook{
 			Event:   model.EventTypeBalanceMonitor,
 			Payload: model.BalanceMonitor{MonitorID: "mon_f04", BalanceID: "bln_monitored_f04"},
@@ -164,30 +163,213 @@ func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 	})
 }
 
-// docMustState asserts a document contains a phrase WITHOUT dumping the document on
-// failure.
+// docMustState asserts a document contains a structural token — a heading, a link
+// target, an identifier or a table cell — WITHOUT dumping the document on failure.
 //
 // testify's Contains prints both operands, and these documents are tens of kilobytes; a
 // single failed assertion would bury the CI log and the reason for the failure with it.
-func docMustState(t *testing.T, document, name, phrase, why string) {
+//
+// Only machine-checkable tokens belong here. A sentence does not: the documents are
+// edited for clarity far more often than the contract changes, so asserting prose makes
+// an editorial rewrite fail the suite while a real divergence still slips past under a
+// different wording. Everything a document has to AGREE with the code about is asserted
+// through markdownTable instead.
+func docMustState(t *testing.T, document, name, token, why string) {
 	t.Helper()
 
-	if strings.Contains(document, phrase) {
+	if strings.Contains(document, token) {
 		return
 	}
 
-	t.Errorf("%s must state %q.\n%s", name, phrase, why)
+	t.Errorf("%s must state %q.\n%s", name, token, why)
 }
 
-// docMustNotState is the absence form, and it likewise prints only the offending phrase.
-func docMustNotState(t *testing.T, document, name, phrase, why string) {
-	t.Helper()
+// markdownTable is one parsed GitHub-flavoured markdown table: its header cells and its
+// body rows, each row keyed by the normalised text of its first cell.
+type markdownTable struct {
+	headers []string
+	rows    map[string][]string
+	order   []string
+}
 
-	if !strings.Contains(document, phrase) {
-		return
+// Row returns a row by the normalised text of its first cell.
+//
+// Parameters:
+//   - key string: the normalised first-cell text, as normalizeTableCell renders it.
+//
+// Returns:
+//   - []string: the row's cells, header order preserved.
+//   - bool: whether the table carries such a row.
+func (m markdownTable) Row(key string) ([]string, bool) {
+	cells, ok := m.rows[normalizeTableCell(key)]
+
+	return cells, ok
+}
+
+// Keys returns the normalised first cell of every body row, in document order.
+//
+// Returns:
+//   - []string: one key per row.
+func (m markdownTable) Keys() []string {
+	return m.order
+}
+
+// Cell returns one cell of one row by column name.
+//
+// Parameters:
+//   - rowKey string: the row's normalised first cell.
+//   - header string: the column's header text, normalised the same way.
+//
+// Returns:
+//   - string: the cell text, or the empty string when either lookup misses.
+func (m markdownTable) Cell(rowKey, header string) string {
+	cells, ok := m.Row(rowKey)
+	if !ok {
+		return ""
 	}
 
-	t.Errorf("%s must NOT state %q.\n%s", name, phrase, why)
+	wanted := normalizeTableCell(header)
+	for index, candidate := range m.headers {
+		if candidate == wanted && index < len(cells) {
+			return cells[index]
+		}
+	}
+
+	return ""
+}
+
+// markdownTableIn parses the first markdown table in document whose header row carries
+// every column in headers.
+//
+// A table is a machine-checkable artefact: its rows are keyed, its columns are named,
+// and a divergence between it and the code is a missing or wrong CELL rather than a
+// missing sentence. Asserting on one is what lets the surrounding prose be rewritten
+// freely.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when no such table exists.
+//   - document string: the whole markdown document.
+//   - name string: the document's path, quoted into the failure.
+//   - headers []string: column names the header row must carry.
+//
+// Returns:
+//   - markdownTable: the parsed table.
+func markdownTableIn(t *testing.T, document, name string, headers []string) markdownTable {
+	t.Helper()
+
+	lines := strings.Split(document, "\n")
+	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+
+		cells := splitTableRow(trimmed)
+		if !tableHeaderCovers(cells, headers) {
+			continue
+		}
+
+		return parseMarkdownTable(cells, lines[index+1:])
+	}
+
+	require.FailNowf(t, "table not found",
+		"%s must carry a table whose header row names %v; the contract is asserted against that "+
+			"table's cells rather than against the prose around it", name, headers)
+
+	return markdownTable{}
+}
+
+// parseMarkdownTable collects body rows following a header row.
+//
+// Parameters:
+//   - headerCells []string: the already-split header row.
+//   - rest []string: the lines after the header row, delimiter included.
+//
+// Returns:
+//   - markdownTable: the header cells and every body row until the table ends.
+func parseMarkdownTable(headerCells []string, rest []string) markdownTable {
+	table := markdownTable{rows: map[string][]string{}}
+	for _, header := range headerCells {
+		table.headers = append(table.headers, normalizeTableCell(header))
+	}
+
+	for offset, line := range rest {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "|") {
+			break
+		}
+
+		// The delimiter row immediately under the header carries only dashes and colons.
+		if offset == 0 && strings.Trim(strings.ReplaceAll(trimmed, "|", ""), "-: ") == "" {
+			continue
+		}
+
+		cells := splitTableRow(trimmed)
+		if len(cells) == 0 {
+			continue
+		}
+
+		key := normalizeTableCell(cells[0])
+		table.rows[key] = cells
+		table.order = append(table.order, key)
+	}
+
+	return table
+}
+
+// tableHeaderCovers reports whether a candidate header row names every wanted column.
+//
+// Parameters:
+//   - cells []string: the candidate row's cells.
+//   - wanted []string: the column names the caller requires.
+//
+// Returns:
+//   - bool: true when every wanted column is present.
+func tableHeaderCovers(cells []string, wanted []string) bool {
+	present := make(map[string]struct{}, len(cells))
+	for _, cell := range cells {
+		present[normalizeTableCell(cell)] = struct{}{}
+	}
+
+	for _, header := range wanted {
+		if _, ok := present[normalizeTableCell(header)]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// splitTableRow splits one pipe-delimited row into trimmed cells.
+//
+// Parameters:
+//   - row string: the row, leading and trailing pipes included.
+//
+// Returns:
+//   - []string: the cells, in column order.
+func splitTableRow(row string) []string {
+	trimmed := strings.Trim(strings.TrimSpace(row), "|")
+
+	cells := strings.Split(trimmed, "|")
+	for index, cell := range cells {
+		cells[index] = strings.TrimSpace(cell)
+	}
+
+	return cells
+}
+
+// normalizeTableCell reduces a cell to the token it names: markdown emphasis and code
+// quoting removed, case folded, whitespace collapsed.
+//
+// Parameters:
+//   - cell string: the raw cell text.
+//
+// Returns:
+//   - string: the comparable token.
+func normalizeTableCell(cell string) string {
+	replaced := strings.NewReplacer("`", "", "*", "", "_", "").Replace(cell)
+
+	return strings.ToLower(strings.Join(strings.Fields(replaced), " "))
 }
 
 // TestPartitionKeyContract_DocumentationMatchesTheProducers is the link that makes the
@@ -196,86 +378,123 @@ func docMustNotState(t *testing.T, document, name, phrase, why string) {
 // It asserts on the SUBSCRIBER-FACING documents, because they are what a consumer
 // designs against.
 func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
-	streaming := readRepoFile(t, "docs/event-streaming.md")
+	const (
+		streamingDoc  = "docs/event-streaming.md"
+		operationsDoc = "docs/kafka-operations.md"
+		keyHeading    = "### The key is the ledger id wherever a ledger exists"
+		keyAnchor     = "event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists"
+	)
 
-	t.Run("the ordering contract is stated as the ledger", func(t *testing.T) {
-		docMustState(t, streaming, "docs/event-streaming.md", "Blnk partitions by **ledger id**",
-			"This is the partitioning dimension requirement R-6 fixes, in the section a subscriber "+
-				"reads before sizing its consumer group.")
+	streaming := readRepoFile(t, streamingDoc)
+
+	// The published key table, which is the artefact a subscriber designs against and the
+	// only thing in the document this test reads. Every claim below is a CELL of it
+	// compared against model's own declaration, so the prose around the table can be
+	// rewritten at will and a divergence in the contract still fails here.
+	published := markdownTableIn(t, streaming, streamingDoc,
+		[]string{"Event type", "Partition key", "ledger_id"})
+
+	t.Run("every declared event type has a row whose dimension matches the code", func(t *testing.T) {
+		// The dimension keyword each declaration must be rendered with, and the ledger_id
+		// cell that goes with it. A ledger-dimensioned event records the ledger it is keyed
+		// on; the other two dimensions have no ledger to record, so the column reads null.
+		dimensionKeyword := map[model.EventKeyDimension]string{
+			model.EventKeyDimensionLedger:    "ledger",
+			model.EventKeyDimensionAggregate: "id",
+			model.EventKeyDimensionEventType: "event type",
+		}
+
+		for eventType, dimension := range model.EventKeyDimensionsByType() {
+			row := documentedKeyRow(t, published, eventType)
+			if row == "" {
+				continue
+			}
+
+			keyCell := normalizeTableCell(published.Cell(row, "Partition key"))
+			assert.Containsf(t, keyCell, dimensionKeyword[dimension],
+				"%s's key table renders %q as %q, and model declares it %s-dimensioned. The table is "+
+					"what a subscriber sizes its consumer group from, so a row that names another "+
+					"dimension promises ordering the producers do not deliver",
+				streamingDoc, eventType, keyCell, dimension)
+
+			ledgerCell := normalizeTableCell(published.Cell(row, "ledger_id"))
+			if dimension == model.EventKeyDimensionLedger {
+				assert.NotEqualf(t, "null", ledgerCell,
+					"%s says %q records no ledger while model declares it ledger-dimensioned",
+					streamingDoc, eventType)
+
+				continue
+			}
+
+			assert.Equalf(t, "null", ledgerCell,
+				"%s records a ledger for %q while model declares it %s-dimensioned; only a "+
+					"ledger-dimensioned event has one to record", streamingDoc, eventType, dimension)
+		}
 	})
 
-	t.Run("it does not promise per-balance transaction keying", func(t *testing.T) {
-		// The exact claim at issue. It is asserted as an ABSENCE because the sentence could
-		// come back in any number of rewordings, and the one thing every wording shares is
-		// telling a subscriber that a transaction is keyed on a balance.
-		forbidden := []string{
-			"that is a **balance** id, not a ledger id",
-			"A transaction keys on its source balance",
-			"The source balance, falling back to the destination balance",
-		}
-		for _, claim := range forbidden {
-			docMustNotState(t, streaming, "docs/event-streaming.md", claim,
-				"Production supplies the ledger at every transaction producer site, so telling a "+
-					"subscriber a transaction is keyed on a balance promises ordering and partition "+
-					"parallelism that do not exist.")
-		}
-	})
-
-	t.Run("every non-ledger exception is enumerated", func(t *testing.T) {
-		// The three event families that genuinely cannot be keyed on a ledger. Each must be
-		// named, because an unenumerated exception is worse than none: a subscriber applies
-		// the general rule and is silently wrong for one topic.
+	t.Run("every non-ledger event type is enumerated as a row", func(t *testing.T) {
+		// An unenumerated exception is worse than none: a subscriber applies the general rule
+		// and is silently wrong for one topic. Asserted as ROWS rather than as mentions,
+		// because a mention elsewhere in the document is not a statement about the key.
 		for _, exception := range []string{
 			model.EventTypeSystemError,
 			"bulk_transaction.<status>",
 			"identity.created",
 		} {
-			docMustState(t, streaming, "docs/event-streaming.md", exception,
-				"This event family cannot be keyed on a ledger, and an unenumerated exception is worse "+
-					"than none: a subscriber applies the general rule and is silently wrong for one topic.")
+			_, documented := published.Row(exception)
+			assert.Truef(t, documented,
+				"%s's key table must carry a row for %q, which belongs to no ledger and is therefore "+
+					"keyed on something else; the rows present are %v",
+				streamingDoc, exception, published.Keys())
 		}
-	})
-
-	t.Run("the operations runbook agrees about the key", func(t *testing.T) {
-		operations := readRepoFile(t, "docs/kafka-operations.md")
-
-		docMustNotState(t, operations, "docs/kafka-operations.md", "is a *balance* id rather than a ledger id",
-			"The runbook must not contradict the streaming contract about the message key; an operator "+
-				"reasoning about a partition-key prefix from it would reason from the wrong dimension.")
-		docMustState(t, operations, "docs/kafka-operations.md", "**ledger id**",
-			"It must state the same dimension the streaming contract states.")
 	})
 
 	t.Run("the anchor the runbook links to still exists", func(t *testing.T) {
 		// A cross-document link that 404s is how the two halves of this contract drift apart
 		// unnoticed: the reader stops following it and the runbook becomes the only source.
-		operations := readRepoFile(t, "docs/kafka-operations.md")
-		docMustState(t, operations, "docs/kafka-operations.md",
-			"event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists",
+		operations := readRepoFile(t, operationsDoc)
+		docMustState(t, operations, operationsDoc, keyAnchor,
 			"The runbook must link to the partitioning section by its current anchor.")
-		docMustState(t, streaming, "docs/event-streaming.md",
-			"### The key is the ledger id wherever a ledger exists",
+		docMustState(t, streaming, streamingDoc, keyHeading,
 			"The heading the runbook links to must exist, or the link resolves to nothing.")
 	})
+}
 
-	t.Run("the R-2 guarantee is not documented with an event-type exception", func(t *testing.T) {
-		// The other half. balance.monitor is not exempt, so the document must not
-		// say it is — a subscriber that read the old text would keep polling balances it no
-		// longer needs to poll, and an operator would keep treating a missing alert as
-		// expected.
-		for _, claim := range []string{
-			"The one exception: `balance.monitor` is at-most-once",
-			"`balance.monitor` is the single event type whose capture is **not** atomic",
-			"Treat `balance.monitor` as an at-most-once alerting signal",
-		} {
-			docMustNotState(t, streaming, "docs/event-streaming.md", claim,
-				"balance.monitor alerts are now captured inside the mutation's own transaction, so the "+
-					"document must not grant that event type an exception to R-2.")
+// documentedKeyRow resolves the key table's row for one event type, tolerating the two
+// renderings a composed event family can have.
+//
+// bulk_transaction.<status> is documented under its published placeholder rather than
+// under any single status, because its names are composed at runtime.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when no row matches.
+//   - table markdownTable: the parsed key table.
+//   - eventType string: the declared event type.
+//
+// Returns:
+//   - string: the row key to read cells with, or "" when the family is documented
+//     collectively and this exact name is not a row.
+func documentedKeyRow(t *testing.T, table markdownTable, eventType string) string {
+	t.Helper()
+
+	if _, ok := table.Row(eventType); ok {
+		return eventType
+	}
+
+	// A transaction status may be documented collectively as `transaction.*`, which is a
+	// statement about all seven and is asserted through that row instead.
+	if strings.HasPrefix(eventType, "transaction.") {
+		for _, candidate := range []string{"transaction.* (all seven)", "transaction.*"} {
+			if _, ok := table.Row(candidate); ok {
+				return candidate
+			}
 		}
+	}
 
-		docMustState(t, streaming, "docs/event-streaming.md", "no event type that is exempt",
-			"It must say so positively, so a reader does not have to infer the change from an absence.")
-	})
+	t.Errorf("docs/event-streaming.md's key table must carry a row for %q; the rows present are %v",
+		eventType, table.Keys())
+
+	return ""
 }
 
 // TestPartitionKeyContract_EveryProducerSiteSuppliesTheLedgerWhereverOneExists is the

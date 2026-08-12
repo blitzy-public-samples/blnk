@@ -17,23 +17,6 @@
 // event_monitor_handoff.go is the evaluation half of the balance-monitor handoff: the
 // processor that drains blnk.balance_monitor_handoff, judges each snapshot against its
 // monitors, and captures the resulting alerts transactionally.
-//
-// The atomic writers now decide a crossing and insert the canonical blnk.event_outbox
-// row inside the transaction that moved the balance, which is the requirement met
-// literally see database.captureBalanceMonitorAlertsInTx and, for the builder they
-// share with the pre-write pass, blnk.prepareBalanceMonitorAlertRow. A movement made by
-// a process with the alert capture registered, which every process built through
-// NewBlnk is, writes NO handoff.
-//
-// This processor remains, and is still started by the server, for two populations that
-// are real and finite:
-//
-//   - Handoff rows written by releases that PREDATE the in-transaction capture.
-//   - Handoff rows written by a process with NO capture registered — a Datasource
-//     constructed directly, without the root service, which is what this repository's
-//     own tests do. database.recordBalanceMonitorEvaluation falls back to the handoff
-//     there rather than leaving the movement's alerts to be decided later against a
-//     monitors table an operator can edit in the meantime.
 package blnk
 
 import (
@@ -50,10 +33,6 @@ import (
 // The processor's defaults, matching LineageOutboxProcessor's so the two background
 // relays behave alike under load and an operator has one set of numbers to reason
 // about.
-//
-// The poll interval deserves a word, because it is the only latency this mechanism
-// adds. That is immaterial in context: the event still has to be claimed by the event
-// relay, which polls on the same interval, and then published to Kafka and consumed.
 const (
 	defaultMonitorHandoffBatchSize    = 100
 	defaultMonitorHandoffPollInterval = 1 * time.Second
@@ -61,19 +40,9 @@ const (
 )
 
 // balanceMonitorEventType is the event name a fired monitor publishes under.
-//
-// It is a constant here because every route that can decide a crossing must agree on it
-// — this processor, the pre-write pass and the writer's in-transaction capture, which
-// both reach it through blnk.prepareBalanceMonitorAlertRow, and the legacy post-commit
-// path in balance.go — and a typo in any of them would route the alert to the wrong
-// topic while every test that only checks "an event was captured" still passed.
 const balanceMonitorEventType = "balance.monitor"
 
 // BalanceMonitorHandoffProcessor drains blnk.balance_monitor_handoff.
-//
-// It holds no state beyond its configuration and its lifecycle: everything about a unit
-// of work travels in the claimed row, which is what lets several processors run
-// concurrently and what lets a crashed one's work be picked up by another.
 type BalanceMonitorHandoffProcessor struct {
 	blnk         *Blnk
 	batchSize    int
@@ -137,11 +106,6 @@ func (p *BalanceMonitorHandoffProcessor) WithPollInterval(interval time.Duration
 
 // WithLockDuration sets how long a claim is leased.
 //
-// A lease that is too short lets a second processor claim a handoff the first is still
-// evaluating. That is tolerated rather than fatal — the derived event ids make the
-// duplicate collide with the unique index — but it wastes work, so the default is
-// generous relative to the evaluation, which is a cached read and some comparisons.
-//
 // Parameters:
 //   - duration time.Duration: the lease. Non-positive values are ignored.
 //
@@ -156,10 +120,6 @@ func (p *BalanceMonitorHandoffProcessor) WithLockDuration(duration time.Duration
 }
 
 // Start begins draining handoffs in the background.
-//
-// The double-start guard is not decoration. Two loops on one processor would double
-// every claim attempt and halve the effective lease, and Stop would close a channel one
-// of them no longer reads.
 //
 // Parameters:
 //   - ctx context.Context: cancelled to stop the loop.
@@ -187,9 +147,6 @@ func (p *BalanceMonitorHandoffProcessor) Start(ctx context.Context) {
 }
 
 // Stop signals the loop and waits for the in-flight batch to finish.
-//
-// Waiting matters: a batch abandoned mid-way leaves claimed handoffs whose lease has to
-// expire before anything else will touch them, which delays every alert in it.
 func (p *BalanceMonitorHandoffProcessor) Stop() {
 	p.mu.Lock()
 	if !p.running {
@@ -235,13 +192,6 @@ func (p *BalanceMonitorHandoffProcessor) run(ctx context.Context) {
 }
 
 // processBatch claims a batch and evaluates each handoff in it.
-//
-// A claim failure is logged and the poll returns: the rows are untouched, so the next
-// tick tries again, and there is nothing to compensate for.
-//
-// Each handoff is evaluated independently. One that fails does not abandon the rest,
-// because its failure is recorded against its own row and the remainder are unrelated
-// balances whose alerts have no reason to wait.
 func (p *BalanceMonitorHandoffProcessor) processBatch(ctx context.Context) {
 	if p.blnk == nil || p.blnk.datasource == nil {
 		return
@@ -268,23 +218,6 @@ func (p *BalanceMonitorHandoffProcessor) processBatch(ctx context.Context) {
 }
 
 // processHandoff evaluates one handoff and captures its result atomically.
-//
-//  1. Decode the BALANCE snapshot. The condition is judged against the balance AS THE
-//     TRANSACTION WROTE IT, not against the balance now: re-reading would judge
-//     whatever later transactions had done to it, so a threshold crossed by this
-//     movement and uncrossed by the next would produce no alert, and two attempts could
-//     disagree.
-//  2. Decode the MONITOR snapshot, for the same reason applied to the other input.
-//  3. Evaluate each condition with the UNCHANGED CheckCondition.
-//  4. Prepare an event row per fired monitor, with a DERIVED id.
-//  5. Write the rows and the completion in ONE transaction.
-//
-// Parameters:
-//   - ctx context.Context: the context for the evaluation and the write.
-//   - handoff model.BalanceMonitorHandoff: the claimed row.
-//
-// Returns:
-//   - error: the failure to record against the row; nil when the handoff is completed.
 func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, handoff model.BalanceMonitorHandoff) error {
 	balance, err := handoff.Balance()
 	if err != nil {
@@ -313,10 +246,6 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 			Payload: monitor,
 		},
 			// THE LEDGER IS SUPPLIED EXPLICITLY, from the handoff rather than from the monitor.
-			// model.BalanceMonitor carries a balance and a condition and no ledger, so without
-			// this the event's ledger column would be NULL — and Kafka partitions by ledger id.
-			// The handoff carries the ledger of the balance whose movement created it, which is
-			// the authoritative answer.
 			WithEventLedgerID(handoff.LedgerID),
 			// THE DERIVED IDENTITY, and it is what makes a repeated evaluation idempotent.
 			WithEventIdentity(model.BalanceMonitorEventIdentity(handoff.HandoffID, monitor.MonitorID)),
@@ -352,21 +281,6 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 
 // monitorsForHandoff resolves the monitor definitions this handoff is to be evaluated
 // against, preferring the snapshot the mutation captured.
-//
-// A row written BEFORE sql/1781252100.sql carries no snapshot. So the fallback exists,
-// it is taken only for those rows, and it is logged at WARN so the older guarantee is
-// never applied silently.
-//
-// Parameters:
-//   - ctx context.Context: the context for the fallback read, unused on the snapshot
-//     path.
-//   - handoff model.BalanceMonitorHandoff: the claimed row.
-//
-// Returns:
-//   - []model.BalanceMonitor: the definitions to evaluate. Empty is a legitimate answer
-//     and completes the handoff with no events.
-//   - error: a permanent error for an undecodable snapshot, a retryable one for a
-//     failed fallback read.
 func (p *BalanceMonitorHandoffProcessor) monitorsForHandoff(
 	ctx context.Context, handoff model.BalanceMonitorHandoff,
 ) ([]model.BalanceMonitor, error) {
@@ -402,15 +316,6 @@ func (p *BalanceMonitorHandoffProcessor) monitorsForHandoff(
 }
 
 // recordHandoffFailure writes an evaluation failure against the row and reports it.
-//
-// The failure is logged at ERROR with the attempt count on EVERY attempt, not only the
-// last, because a handoff that is failing repeatedly is the signal that alerts are
-// being delayed — and by the time the budget is spent the delay has already happened.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statement.
-//   - handoff model.BalanceMonitorHandoff: the row that failed.
-//   - cause error: the failure.
 func (p *BalanceMonitorHandoffProcessor) recordHandoffFailure(ctx context.Context, handoff model.BalanceMonitorHandoff, cause error) {
 	permanent := isPermanentMonitorHandoffError(cause)
 
@@ -429,21 +334,11 @@ func (p *BalanceMonitorHandoffProcessor) recordHandoffFailure(ctx context.Contex
 }
 
 // permanentMonitorHandoffError marks a failure no retry can resolve.
-//
-// It is a distinct type rather than a sentinel value because the underlying cause must
-// survive for the log line and for last_error: an operator reading "the snapshot did not
-// decode" needs the decoder's own message, not a category name.
 type permanentMonitorHandoffError struct {
 	cause error
 }
 
 // newPermanentMonitorHandoffError wraps a cause as permanently unrecoverable.
-//
-// Parameters:
-//   - cause error: the underlying failure.
-//
-// Returns:
-//   - error: the wrapped failure.
 func newPermanentMonitorHandoffError(cause error) error {
 	return &permanentMonitorHandoffError{cause: cause}
 }
@@ -469,15 +364,6 @@ func (e *permanentMonitorHandoffError) Unwrap() error {
 
 // isPermanentMonitorHandoffError reports whether a failure should skip the retry
 // budget.
-//
-// Parameters:
-//   - err error: the failure to classify.
-//
-// Returns:
-//   - bool: true only for a failure explicitly marked permanent. Everything else is
-//     treated as retryable, which is the conservative direction: a retryable failure
-//     wrongly called permanent loses the alert, while a permanent one wrongly called
-//     retryable only wastes the budget.
 func isPermanentMonitorHandoffError(err error) bool {
 	var permanent *permanentMonitorHandoffError
 
@@ -486,23 +372,6 @@ func isPermanentMonitorHandoffError(err error) bool {
 
 // balanceMonitorHandoffEnabled reports whether the WRITER owns monitor evaluation on
 // this deployment, rather than the post-commit hook.
-//
-// Two call sites depend on the answer and must never disagree:
-//
-//   - the atomic writers, which evaluate the monitors inside the balance transaction
-//     and insert the canonical alert rows there — or, with no capture registered,
-//     commit the handoff instead (both through
-//     database.recordBalanceMonitorEvaluation), and
-//   - the post-commit hook in transaction_execution.go, which evaluates monitors
-//     inline.
-//
-// A captured alert is only useful if something publishes it, and what publishes it is
-// the event relay, which refuses to run without Kafka. A deployment with no broker has
-// neither the relay nor this processor, so a row written there would be one nothing can
-// ever act on — the alert would simply never be delivered.
-//
-// Returns:
-//   - bool: true when the writer owns evaluation, false when the post-commit path does.
 func (l *Blnk) balanceMonitorHandoffEnabled() bool {
 	if l == nil {
 		return false

@@ -30,21 +30,6 @@ import (
 )
 
 // CreateLedger inserts a new ledger record into the database, ensuring metadata is properly marshaled into JSON format.
-// It assigns a unique ledger ID with a suffix and captures the current timestamp as the creation time.
-//
-// # Atomic event capture
-//
-// When a caller supplies an EventPreparer, the ledger INSERT and the ledger.created event
-// row are written inside ONE transaction: the preparer is handed the finished ledger — the
-// only point at which the generated LedgerID and CreatedAt exist — and the row it returns
-// is inserted before the commit. Either both land or neither does, so there is no window in
-// which a ledger exists with no event describing it, and none in which an event describes a
-// ledger that was rolled back.
-//
-// With no preparer the behaviour is EXACTLY as before: one statement, no transaction, no
-// cost. That is what keeps every pre-existing caller — the API layer and a long tail of
-// tests — working untouched, and it is why the parameter is a variadic tail rather than a
-// positional argument.
 //
 // Parameters:
 //   - ledger: The ledger data to be inserted into the database.
@@ -91,15 +76,6 @@ func (d Datasource) CreateLedger(ledger model.Ledger, prepareEvent ...EventPrepa
 
 // insertLedger performs the ledger INSERT against either the connection or an open
 // transaction, and is the single statement both CreateLedger paths run.
-//
-// Parameters:
-//   - ctx: The context for the statement.
-//   - execer: The connection or transaction to insert through.
-//   - ledger: The ledger to insert. Its LedgerID and CreatedAt are assigned here.
-//
-// Returns:
-//   - model.Ledger: The created ledger.
-//   - error: A typed conflict error for a unique violation, or a typed internal error.
 func (d Datasource) insertLedger(ctx context.Context, execer sqlExecer, ledger model.Ledger) (model.Ledger, error) {
 	// Marshal the metadata into JSON format
 	metaDataJSON, err := json.Marshal(ledger.MetaData)
@@ -134,7 +110,6 @@ func (d Datasource) insertLedger(ctx context.Context, execer sqlExecer, ledger m
 }
 
 // GetAllLedgers retrieves a paginated list of ledger records from the database, unmarshaling their metadata from JSON format.
-// This method supports pagination and can be used to efficiently retrieve all ledgers over multiple requests.
 //
 // Parameters:
 // - limit: The maximum number of ledgers to return (e.g., 20).
@@ -191,7 +166,6 @@ func (d Datasource) GetAllLedgers(limit, offset int) ([]model.Ledger, error) {
 }
 
 // GetLedgerByID retrieves a ledger record from the database by its ID.
-// It handles cases where the ledger is not found and unmarshals the metadata from JSON format.
 //
 // Parameters:
 // - id: The unique ID of the ledger to retrieve.
@@ -229,7 +203,6 @@ func (d Datasource) GetLedgerByID(id string) (*model.Ledger, error) {
 }
 
 // UpdateLedger updates an existing ledger's name in the database.
-// It validates that the ledger exists and updates only the name field.
 //
 // Parameters:
 // - id: The unique ID of the ledger to update.
@@ -271,7 +244,6 @@ func (d Datasource) UpdateLedger(id, name string) (*model.Ledger, error) {
 }
 
 // GetAllLedgersWithFilter retrieves ledgers with advanced filtering support.
-// It delegates to GetAllLedgersWithFilterAndOptions with nil options.
 //
 // Parameters:
 // - ctx: Context for the database operation.
@@ -288,7 +260,6 @@ func (d Datasource) GetAllLedgersWithFilter(ctx context.Context, filters *filter
 }
 
 // GetAllLedgersWithFilterAndOptions retrieves ledgers with filtering, sorting, and optional count.
-// It uses the filter package to build SQL WHERE and ORDER BY conditions.
 //
 // Parameters:
 // - ctx: Context for the database operation.

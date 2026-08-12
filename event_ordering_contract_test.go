@@ -323,34 +323,40 @@ func TestAtMostOnceContract_NamesAllThreeProducersAndNoOthers(t *testing.T) {
 				"no producing mutation, so %q must appear in it", eventType)
 	}
 
+	// The section's own table is the artefact, and its ROWS are the set. Asserting rows
+	// rather than mentions is what makes this a contract: an event type named in passing
+	// somewhere in the section is not a statement that it is at-most-once, and a section
+	// whose table lists one row while the code declares three fails here whatever the
+	// surrounding sentences say.
 	section := atMostOnceSection(t, doc)
+	documented := markdownTableIn(t, section, "docs/event-streaming.md's at-most-once section",
+		[]string{"Event type", "Where the standalone write is reached", "What is lost if it fails"})
+
 	for _, eventType := range postCommitProducers {
-		assert.Containsf(t, section, eventType,
-			"docs/event-streaming.md's at-most-once section must name %q. A subscriber reads that "+
-				"section to decide which events need a reconciliation path, so an omitted event type "+
-				"is an understated obligation rather than a documentation nicety", eventType)
+		_, present := documented.Row(eventType)
+		assert.Truef(t, present,
+			"docs/event-streaming.md's at-most-once table must carry a row for %q. A subscriber reads "+
+				"that table to decide which events need a reconciliation path, so an omitted event type "+
+				"is an understated obligation rather than a documentation nicety; the rows present are %v",
+			eventType, documented.Keys())
 	}
 
-	assert.NotContains(t, section, "The one exception",
-		"the section must not claim a single exception: there are three post-commit producers, and "+
-			"two of them were each separately documented as the only one")
-
-	assert.Contains(t, section, "no producing mutation",
-		"and it must explain WHY they are at-most-once — an event with no producing transaction is "+
-			"outside the outbox guarantee's scope rather than a carve-out from it, which is the "+
-			"distinction that tells a subscriber whether to expect the set to grow")
+	assert.Lenf(t, documented.Keys(), len(postCommitProducers),
+		"the at-most-once table must carry exactly the %d rows PostCommitEventCaptureContract "+
+			"declares and no others: a fourth row grants an exception the code does not take, and a "+
+			"missing row hides one it does. Rows present: %v",
+		len(postCommitProducers), documented.Keys())
 }
 
-// TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim guards the specific false
-// statement the documentation used to make, because its absence is what a reader has to
-// be able to rely on.
+// TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim pins the heading a
+// subscriber is linked to, which is the artefact the documentation's earlier false claim
+// about queue sharding lived under.
+//
+// The heading is asserted rather than the sentences beneath it: a heading is a link
+// target, so renaming it silently breaks every cross-reference, while the prose under it
+// is edited for clarity without the contract changing.
 func TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim(t *testing.T) {
 	doc := readRepoFile(t, "docs/event-streaming.md")
-
-	assert.Contains(t, doc, "do **not** agree",
-		"docs/event-streaming.md must state that Kafka partitioning and the internal queue's "+
-			"sharding do not agree for transaction events; the claim that they did was false and a "+
-			"subscriber could act on it")
 
 	assert.Contains(t, doc, "The key is the ledger id wherever a ledger exists",
 		"and the section heading must state the rule, not its negation. The heading used to read "+

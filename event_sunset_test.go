@@ -24,7 +24,9 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -752,11 +754,28 @@ func TestSunsetWarnGuard_WarnsOnChangeAndAfterReset(t *testing.T) {
 
 // The single-decision-point invariant.
 
-// sunsetRawDateReaders are the only files permitted to read the raw sunset value,
-// given as paths relative to the module root.
-var sunsetRawDateReaders = map[string]struct{}{
-	"event_sunset.go":  {},
-	"config/config.go": {},
+// sunsetRawDateReaders returns the only files permitted to read the raw sunset value,
+// as paths relative to the module root.
+//
+// Built from the SOURCE GROUPS of the two units that own the decision rather than from
+// two fixed names. The invariant is about which CODE may read the value, and splitting a
+// file for size moves code without changing what is permitted — so the allow-list has to
+// follow the split or it starts failing on a file that was always allowed.
+//
+// Parameters:
+//   - t *testing.T: the test, for the group lookup's assertions.
+//
+// Returns:
+//   - map[string]struct{}: the permitted set, keyed by repository-relative path.
+func sunsetRawDateReaders(t *testing.T) map[string]struct{} {
+	t.Helper()
+
+	permitted := map[string]struct{}{}
+	for _, member := range eventSourceGroups(t, "event_sunset.go", "config/config.go") {
+		permitted[member] = struct{}{}
+	}
+
+	return permitted
 }
 
 // sunsetRawDateFieldIdents are the configuration fields holding the raw window values.
@@ -805,11 +824,91 @@ func moduleRootDir(t *testing.T) string {
 	}
 }
 
+// eventSourceGroup returns the repository-relative paths of every non-test Go file that
+// together constitutes the logical unit named by base: base itself plus the files it was
+// split into, which by convention carry base's stem followed by an underscore.
+//
+// Source-level assertions name a UNIT, not a file. When a file is split for size the
+// assertion must widen to the whole group rather than silently narrow to the remnant,
+// because a declaration that moved into a sibling would otherwise stop being checked at
+// the moment it moved — a guard that quietly stops guarding is worse than no guard.
+//
+// Parameters:
+//   - t *testing.T: the test, used for its helper marking and its assertions.
+//   - base string: a repository-relative path such as "event_admin.go" or
+//     "database/event_outbox.go".
+//
+// Returns:
+//   - []string: repository-relative, slash-separated, sorted, always containing base.
+func eventSourceGroup(t *testing.T, base string) []string {
+	t.Helper()
+
+	root := moduleRootDir(t)
+	dir := path.Dir(base)
+	stem := strings.TrimSuffix(path.Base(base), ".go")
+
+	matches, err := filepath.Glob(filepath.Join(root, filepath.FromSlash(dir), stem+"*.go"))
+	require.NoErrorf(t, err, "the source group for %s must be enumerable", base)
+
+	group := make([]string, 0, len(matches))
+
+	for _, match := range matches {
+		name := filepath.Base(match)
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+
+		// stem+"*" also matches an unrelated file that merely shares the prefix without
+		// the separator, so membership requires either the base itself or the "<stem>_"
+		// form the splitter produces.
+		if name != stem+".go" && !strings.HasPrefix(name, stem+"_") {
+			continue
+		}
+
+		group = append(group, path.Join(dir, name))
+	}
+
+	sort.Strings(group)
+	require.Containsf(t, group, base, "%s must exist and must belong to its own source group", base)
+
+	return group
+}
+
+// eventSourceGroups expands every base in bases through eventSourceGroup, preserving the
+// given order and dropping the duplicates that overlapping bases would produce.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - bases ...string: repository-relative paths.
+//
+// Returns:
+//   - []string: the union of the groups, in the order the bases were given.
+func eventSourceGroups(t *testing.T, bases ...string) []string {
+	t.Helper()
+
+	seen := make(map[string]struct{}, len(bases))
+	expanded := make([]string, 0, len(bases))
+
+	for _, base := range bases {
+		for _, member := range eventSourceGroup(t, base) {
+			if _, already := seen[member]; already {
+				continue
+			}
+
+			seen[member] = struct{}{}
+			expanded = append(expanded, member)
+		}
+	}
+
+	return expanded
+}
+
 // TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead enforces that exactly one
 // place in this repository reads the sunset date and compares a clock against it.
 func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
 	root := moduleRootDir(t)
 	fset := token.NewFileSet()
+	permittedRawDateReaders := sunsetRawDateReaders(t)
 
 	// findings maps an offending file to the human-readable places it read the value.
 	findings := make(map[string][]string)
@@ -839,7 +938,7 @@ func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
 		}
 		relative = filepath.ToSlash(relative)
 
-		if _, allowed := sunsetRawDateReaders[relative]; allowed {
+		if _, allowed := permittedRawDateReaders[relative]; allowed {
 			return nil
 		}
 
@@ -1429,6 +1528,30 @@ func terminalReleaseChecklist(t *testing.T) ([]terminalReleaseRow, []terminalRel
 	return deletes, preserves
 }
 
+// terminalReleaseLocations expands one checklist location into the files it stands for.
+//
+// A production Go file stands for its whole SOURCE GROUP, because that is the unit the
+// release edits and a split moves artifacts between siblings. Anything else — a test file,
+// a manifest, a migration, go.mod — stands only for itself: the group convention is about
+// production source, and applying it elsewhere would either widen the check or, for a test
+// file, resolve to nothing at all.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - location string: a repository-relative path taken from the checklist's location column.
+//
+// Returns:
+//   - []string: the files to read for that location, never empty.
+func terminalReleaseLocations(t *testing.T, location string) []string {
+	t.Helper()
+
+	if !strings.HasSuffix(location, ".go") || strings.HasSuffix(location, "_test.go") {
+		return []string{location}
+	}
+
+	return eventSourceGroup(t, location)
+}
+
 // TestWebhookTerminalRelease_ChecklistMatchesTheSurface is what turns the deferred
 // deletion from an acknowledgement into an obligation.
 //
@@ -1469,16 +1592,27 @@ func TestWebhookTerminalRelease_ChecklistMatchesTheSurface(t *testing.T) {
 			"every %s row must name where its artifacts live, so the release does not have to go "+
 				"looking. Row: %s", half, row.line)
 
+		// Each location is read as a source UNIT: the named file plus the files it was split
+		// into. The checklist names where an artifact LIVES, and a file split for size moves
+		// artifacts between siblings without changing which unit the release edits — so
+		// resolving the group is what keeps the checklist a statement about the code rather
+		// than about one file's current contents.
 		contents := make([]string, 0, len(row.locations))
+
 		for _, location := range row.locations {
-			path := filepath.Join(root, location)
-			body, err := os.ReadFile(path)
-			require.NoErrorf(t, err,
-				"the %s checklist names %s, which must exist while the row does. If this release has "+
-					"been performed, DELETE THE ROW in docs/webhook-to-kafka-migration.md — the "+
-					"checklist and the tree are two halves of one statement. Row: %s",
-				half, location, row.line)
-			contents = append(contents, string(body))
+			if _, statErr := os.Stat(filepath.Join(root, location)); statErr != nil {
+				require.NoErrorf(t, statErr,
+					"the %s checklist names %s, which must exist while the row does. If this release has "+
+						"been performed, DELETE THE ROW in docs/webhook-to-kafka-migration.md — the "+
+						"checklist and the tree are two halves of one statement. Row: %s",
+					half, location, row.line)
+			}
+
+			for _, member := range terminalReleaseLocations(t, location) {
+				body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(member)))
+				require.NoErrorf(t, err, "%s must be readable to check the %s checklist", member, half)
+				contents = append(contents, string(body))
+			}
 		}
 
 		for _, artifact := range row.artifacts {
@@ -1594,4 +1728,59 @@ func exportedTopLevelNames(file *ast.File) []string {
 	}
 
 	return names
+}
+
+// TestWebhookSunset_TheRetiredSentinelIsTheClosedWindow pins the state a deployment ends
+// up in once the migration is over and there is no instant left to state.
+//
+// Two things have to be true at once, and only one of them is obvious. The sentinel must
+// behave like a sunset that has PASSED — the legacy leg stops, the deprecated routes
+// answer 410 — and it must be a state the relay is willing to START in. A value that
+// merely failed closed would achieve the first and not the second: WebhookWindowObstacle
+// refuses an unavailable window, so `blnk start` would exit, and the deployment would be
+// forced to keep an obsolete date on file for ever to avoid it.
+func TestWebhookSunset_TheRetiredSentinelIsTheClosedWindow(t *testing.T) {
+	now := time.Date(2027, 6, 1, 9, 30, 0, 0, time.UTC)
+
+	for _, spelling := range []string{"retired", "RETIRED", " Retired "} {
+		t.Run("spelled "+spelling, func(t *testing.T) {
+			storeSunsetDate(t, spelling)
+
+			assert.True(t, WebhookSunsetPassed(now),
+				"a declared retirement is a sunset that has passed; the legacy transport must not run")
+			assert.Equal(t, WebhookWindowClosed, WebhookDualDeliveryWindowState(now),
+				"the CLOSED state is the intended end state, and it is what makes this a state the "+
+					"relay may run in rather than one it refuses")
+			assert.False(t, WebhookDualDeliveryActive(now),
+				"dual delivery is over, so the legacy leg must not be enqueued for any event")
+
+			require.NoError(t, WebhookWindowObstacle(WebhookDualDeliveryWindowState(now)),
+				"a retired deployment must be able to START. Refusing here is what would make an "+
+					"obsolete date a permanent deployment requirement")
+
+			// NOTHING TO DESCRIBE, and that is the point of the sentinel rather than a
+			// shortcoming of it: there is no instant, so the 410 response carries no Sunset
+			// header instead of carrying a fabricated one.
+			snapshot := WebhookSunsetSnapshotAt(now)
+			assert.True(t, snapshot.Passed, "the guard reads the same verdict from the snapshot")
+			assert.False(t, snapshot.DateConfigured,
+				"there is no date to render, so no Sunset or Deprecation header may be emitted")
+			assert.True(t, snapshot.Date.IsZero(), "and no instant may be invented for one")
+
+			_, _, ok := WebhookDeprecationWindow()
+			assert.False(t, ok, "a closed window has no ends left to publish")
+		})
+	}
+
+	t.Run("an unusable window is still refused", func(t *testing.T) {
+		// The distinction the sentinel exists to draw. Both states stop the legacy leg, and
+		// only one of them is a DECLARATION; the other is a value nobody supplied, and a
+		// publishing process must not start on it.
+		storeSunsetDate(t, "")
+
+		assert.Equal(t, WebhookWindowUnavailable, WebhookDualDeliveryWindowState(now))
+		require.Error(t, WebhookWindowObstacle(WebhookDualDeliveryWindowState(now)),
+			"an absent window must keep refusing to start, or the sentinel has bought silence "+
+				"rather than clarity")
+	})
 }

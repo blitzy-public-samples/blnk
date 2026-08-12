@@ -1351,18 +1351,6 @@ func dltEventIDs(page model.DeadLetterInventoryPage) []string {
 	return ids
 }
 
-// dltReadSource returns the text of a repository file, so a structural guarantee can be
-// asserted rather than trusted.
-func dltReadSource(t *testing.T, elements ...string) string {
-	t.Helper()
-
-	path := filepath.Join(append([]string{moduleRootDir(t)}, elements...)...)
-	contents, err := os.ReadFile(path) //nolint:gosec // a fixed, repository-relative path
-	require.NoError(t, err, "%s must be readable to assert its structure", path)
-
-	return string(contents)
-}
-
 // dltReadCode returns a Go file's source with EVERY COMMENT REMOVED, so a structural
 // assertion judges the code rather than the prose about it.
 func dltReadCode(t *testing.T, elements ...string) string {
@@ -1496,10 +1484,21 @@ func TestDeadLetterRouting_RecordsTheDeadLetterTopicOnTheOutboxRow(t *testing.T)
 //  2. the claim requires attempts < max_attempts, and an exhausted row has spent its
 //     budget.
 func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *testing.T) {
-	source := dltReadSource(t, "database", "event_outbox.go")
+	// The outbox repository is split across files, so the query is located by searching the
+	// GROUP for the one member that declares it rather than by naming a file.
+	var source string
+
+	for _, member := range eventSourceGroup(t, "database/event_outbox.go") {
+		if candidate := readRepoFile(t, member); strings.Contains(candidate, "claimPendingEventOutboxQuery =") {
+			source = candidate
+
+			break
+		}
+	}
 
 	claimStart := strings.Index(source, "claimPendingEventOutboxQuery")
-	require.NotEqual(t, -1, claimStart, "the claim query must exist in database/event_outbox.go")
+	require.NotEqual(t, -1, claimStart,
+		"the claim query must exist in exactly one file of the database/event_outbox.go source group")
 
 	claimEnd := strings.Index(source[claimStart:], "ClaimPendingEventOutbox claims")
 	require.NotEqual(t, -1, claimEnd, "the claim query must be followed by its method documentation")
@@ -2556,11 +2555,12 @@ func TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery(t *testing.T) 
 		"the replay must be visible SOMEWHERE, or the absence above is satisfied by a replay "+
 			"that records nothing; the per-attempt instruments are where re-delivery belongs")
 
-	source := parseRepositoryGoFile(t, "event_dlt.go")
-	assert.Zero(t, identifierUses(source, "EventsDispatchedTotal"),
-		"no code path in this file may increment the per-event delivery count: the relay's "+
-			"durable transition is its only owner, and a second writer here would count one "+
-			"event twice")
+	for _, member := range eventSourceGroup(t, "event_dlt.go") {
+		assert.Zerof(t, identifierUses(parseRepositoryGoFile(t, member), "EventsDispatchedTotal"),
+			"no code path in %s may increment the per-event delivery count: the relay's "+
+				"durable transition is its only owner, and a second writer here would count one "+
+				"event twice", member)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -4644,7 +4644,18 @@ func TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden(t
 //
 // Blnk publishes the `<topic>.dlt` naming convention AND NOTHING MORE.
 func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
-	code := dltReadCode(t, "event_dlt.go")
+	// The whole dead-letter source group, so a consumer surface cannot be introduced by
+	// putting it in a sibling file.
+	group := eventSourceGroup(t, "event_dlt.go")
+
+	var joined strings.Builder
+
+	for _, member := range group {
+		joined.WriteString(dltReadCode(t, member))
+		joined.WriteString("\n")
+	}
+
+	code := joined.String()
 
 	for _, consumerSurface := range []string{
 		"kafka.Reader",
@@ -4655,21 +4666,34 @@ func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
 		"ConsumerGroup",
 		"CommitMessages",
 	} {
-		assert.NotContains(t, code, consumerSurface,
-			"event_dlt.go must not reference %s: Blnk implements no consumer, and the listing and "+
-				"replay both read the outbox row so that none is needed", consumerSurface)
+		assert.NotContainsf(t, code, consumerSurface,
+			"no file in %v may reference %s: Blnk implements no consumer, and the listing and "+
+				"replay both read the outbox row so that none is needed", group, consumerSurface)
 	}
 
-	// The boundary is documented in the file itself, so the next contributor reads it
-	// before reaching for a reader. This one is asserted against the raw source, because a
-	// comment is exactly what is being required.
-	assert.Contains(t, dltReadSource(t, "event_dlt.go"), "subscriber-side dead-lettering is NOT Blnk's",
-		"the scope boundary must stay documented at the top of event_dlt.go")
+	// The boundary is asserted where R-9 requires it to be PUBLISHED — in the subscriber
+	// documentation — rather than as a sentence in a Go comment. A comment tells the next
+	// contributor; the document tells the subscriber who has to build the other half, and
+	// only one of those two is a deliverable. Asserting the comment also pinned its exact
+	// wording, which made a prose edit a test failure for no gain.
+	convention := readRepoFile(t, "docs/event-streaming.md")
+	assert.Contains(t, convention, "### Blnk does not manage subscriber-side dead-lettering",
+		"the published convention must carry the boundary as a section of its own")
+
+	for _, excluded := range []string{
+		"a consumer or consumer-group library of any kind",
+		"subscriber-side dead-letter management",
+		"a consumer error-handling or poison-message framework",
+	} {
+		assert.Containsf(t, convention, excluded,
+			"the published convention must name %q among what Blnk does not provide, because a "+
+				"subscriber planning its own dead-lettering reads this list and nothing else", excluded)
+	}
 
 	// And the `.dlt` suffix has exactly one source of truth, in event_topics.go. Spelling it out
 	// here would fork the published convention.
 	assert.NotContains(t, code, `".dlt"`,
-		"the .dlt suffix must be resolved through DLTFor, never spelled out in event_dlt.go")
+		"the .dlt suffix must be resolved through DLTFor, never spelled out in the dead-letter source")
 	assert.Contains(t, code, "DLTFor(",
 		"every dead-letter destination must be resolved through the single naming function")
 

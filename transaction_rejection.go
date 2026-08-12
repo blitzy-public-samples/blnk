@@ -34,12 +34,6 @@ import (
 // RejectTransaction records a transaction as REJECTED together with the event that
 // announces it, atomically.
 //
-// The status change and the transaction.rejected event are written in ONE database
-// transaction, so a crash can never leave a transaction recorded as rejected with
-// nothing telling a subscriber it was. The event is prepared once and reused across
-// retries, so a retried write cannot lean on the event-id unique index to deduplicate
-// and turn a logged conflict into part of normal operation.
-//
 // Parameters:
 //   - ctx context.Context: the context for the operation.
 //   - transaction *model.Transaction: the transaction to reject. Its status and
@@ -73,6 +67,12 @@ func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transac
 		Payload: transaction,
 	}, WithEventLedgerID(l.transactionRejectionLedgerID(transaction)))
 	if err != nil {
+		// THE REJECTION IS REFUSED, not committed with the event dropped. Preparation does no
+		// I/O, so the only failures it can report are a payload encoding/json will not marshal
+		// and a partition key that will not resolve — producer-side defects rather than
+		// transient conditions. Committing anyway would leave a status change no subscriber is
+		// told about and no outbox row for reconciliation to count. Recorded in full under
+		// "A mutation whose event cannot be prepared is refused" in docs/event-streaming.md.
 		span.RecordError(err)
 		logrus.WithError(err).WithField("transaction_id", transaction.TransactionID).
 			Error("failed to prepare the rejection event; the rejection was not persisted")
@@ -123,16 +123,6 @@ func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transac
 // transactionRejectionLedgerID resolves the ledger a rejected transaction belongs to,
 // so its event is keyed on the same dimension as every other event in that
 // transaction's lifecycle.
-//
-// The SOURCE balance is preferred and the destination is the fallback, matching
-// transactionLedgerID in transaction_execution.go so that the two producers of one
-// transaction's events cannot disagree about which balance names the ledger.
-//
-// Parameters:
-//   - transaction *model.Transaction: the transaction being rejected.
-//
-// Returns:
-//   - string: the ledger id, or the empty string when it cannot be resolved.
 func (l *Blnk) transactionRejectionLedgerID(transaction *model.Transaction) string {
 	if l == nil || l.datasource == nil || transaction == nil {
 		return ""

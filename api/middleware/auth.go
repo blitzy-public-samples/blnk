@@ -52,7 +52,6 @@ func abortWithCode(c *gin.Context, code apierror.ErrorCode, message string) {
 }
 
 // pathToResource maps URL paths to their corresponding resource types.
-// This is used by the authentication middleware to determine the required permissions.
 var pathToResource = map[string]Resource{
 	"ledgers":          ResourceLedgers,
 	"balances":         ResourceBalances,
@@ -71,7 +70,6 @@ var pathToResource = map[string]Resource{
 }
 
 // AuthMiddleware handles authentication and authorization for API routes.
-// It supports both master key and API key authentication using the X-Blnk-Key header.
 type AuthMiddleware struct {
 	service *blnk.Blnk
 }
@@ -88,12 +86,6 @@ func NewAuthMiddleware(blnk *blnk.Blnk) *AuthMiddleware {
 }
 
 // getResourceFromPath determines the resource type from the URL path.
-//
-// Parameters:
-// - path: The URL path to analyze.
-//
-// Returns:
-// - Resource: The determined resource type, or empty string if not found.
 func getResourceFromPath(path string) Resource {
 	// Remove leading slash and get first path segment
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
@@ -124,15 +116,6 @@ func getResourceFromPath(path string) Resource {
 }
 
 // injectAPIKeyToMetadata modifies the request body to include the API key ID in the meta_data.
-// This function reads the request body, adds or updates the meta_data field, and sets the modified
-// body back to the request.
-//
-// Parameters:
-// - c: The Gin context containing the request.
-// - apiKeyID: The API key ID to inject into the metadata.
-//
-// Returns:
-// - error: An error if the body processing fails.
 func injectAPIKeyToMetadata(c *gin.Context, apiKeyID string) error {
 	// Only proceed if this is a POST request
 	if c.Request.Method != "POST" {
@@ -188,17 +171,9 @@ func injectAPIKeyToMetadata(c *gin.Context, apiKeyID string) error {
 }
 
 // Authenticate returns a middleware function that handles authentication and authorization for all routes.
-// It checks for the X-Blnk-Key header and validates it against either the master key or API keys.
-// For API keys, it verifies the key's validity and checks permissions based on the resource and HTTP method.
-// For POST requests with API keys, it injects the API key ID into the metadata of the request body.
 //
 // Returns:
 // - gin.HandlerFunc: A middleware function that performs the authentication.
-//
-// Responses:
-// - 200 OK: When authentication succeeds.
-// - 401 Unauthorized: When the API key is missing or invalid.
-// - 403 Forbidden: When the API key lacks sufficient permissions.
 func (m *AuthMiddleware) Authenticate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Skip auth for root path
@@ -307,12 +282,6 @@ func (m *AuthMiddleware) Authenticate() gin.HandlerFunc {
 }
 
 // extractKey retrieves the authentication key from the X-Blnk-Key header.
-//
-// Parameters:
-// - c: The Gin context containing the request headers.
-//
-// Returns:
-// - string: The authentication key, or empty string if not found.
 func extractKey(c *gin.Context) string {
 	return c.GetHeader(KeyHeader)
 }

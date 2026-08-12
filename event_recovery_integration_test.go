@@ -23,7 +23,7 @@
 //
 //  1. THE OUTBOX GUARANTEES THE ROW SURVIVES, and event_id carries a unique index so one id is
 //     recorded at most once. How the row and the ledger mutation relate depends on the capture:
-//     an IN-TRANSACTION capture (PublishEventInTx, the atomic writers) commits both together, so
+//     an IN-TRANSACTION capture (the atomic writers in database/) commits both together, so
 //     neither can exist without the other; the STANDALONE capture the domain call sites use
 //     commits the row afterwards, so a crash between the two can leave a mutation with no event.
 //     Recapture is idempotent only where the id is DERIVED from the mutation

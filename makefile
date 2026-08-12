@@ -154,21 +154,22 @@ run:
 run_workers:
 	./${PROJECT} workers
 
-# Start the SERVER PROCESS ROLE, which is what hosts the event outbox relay.
+# Start the SERVER PROCESS ROLE, which is what hosts the event outbox relay. The name is
+# the one the operations runbook uses, so it answers "where does the relay run" without
+# anyone reading cmd/server.go.
 #
-# and because it is the name the operations runbook documents. It answers "where does
-# the relay run" without reading cmd/server.go.
-#
-#   it tested the config file with `grep '"brokers"'`, which reads `"brokers": []` as configured;
-#
-#   and no first-non-empty scan can express that an empty value at a higher-precedence name CLEARS
-#   what a lower one supplied, because that is a property of the overlay and not of any one source.
+# THE APPLICATION DECIDES WHETHER IT HAS A BROKER, not this recipe. `--require-kafka`
+# makes `blnk start` run its own configuration resolution and refuse when that yields no
+# broker, naming every source it read. An earlier version of this target tried to answer
+# the question here and got it wrong twice: `grep '"brokers"'` reads `"brokers": []` as
+# configured, and no first-non-empty scan can express that an empty value at a
+# higher-precedence name CLEARS what a lower one supplied, because that is a property of
+# the overlay rather than of any one source.
 #
 # A DELIBERATELY EMPTY VALUE FROM THE CALLER WINS TOO, because `export -p` records a
-# set-but- empty variable: `KAFKA_BROKERS= make run_relay` means "no brokers for this
-# run", so it is refused rather than quietly falling back to .env.
-# docs/kafka-operations.md documents that behaviour by example and it is a property of
-# the replay, not a special case in the guard.
+# set-but-empty variable: `KAFKA_BROKERS= make run_relay` means "no brokers for this run",
+# so it is refused rather than quietly falling back to .env. That follows from replaying
+# the caller's environment over .env below; it is not a special case anywhere.
 CONFIG_FILE?=blnk.json
 
 # Answers "does ${CONFIG_FILE} declare at least one USABLE Kafka broker?" through an
@@ -252,13 +253,8 @@ build_test_run:
 # count is reduced, and no existing credential is replaced unless a KAFKA_ROTATE_*
 # variable asks for it.
 #
-#   The ADMIN PRINCIPAL AND SECRET. KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET are
-#   forwarded, never defaulted. That principal is a broker super-user — it mints SCRAM
-#   credentials and rewrites every ACL — and the SASL listener is published on the host, so a
-#   default committed here would hand anyone who can reach that port the cluster's entire
-#   authorization model. `./stack.sh --init` generates both into a mode-0600 .env, which is
-#   exactly where the sourcing above picks them up; without them the script refuses before
-#   touching the broker and names the remedy.
+# Checks a manifest tree before it reaches a cluster: every image digest-pinned, and every
+# Secret key the manifests reference present in the namespace when a cluster is reachable.
 #
 #   make k8s_preflight                     check the committed tree (EXPECTED to fail:
 #                                          the placeholder is intentional in git)
@@ -286,6 +282,92 @@ kafka_provision:
 	export KAFKA_MIN_PARTITIONS="$${KAFKA_MIN_PARTITIONS:-6}"; \
 	export KAFKA_REPLICATION_FACTOR="$${KAFKA_REPLICATION_FACTOR:-1}"; \
 	./scripts/kafka-provision.sh
+
+# THE ALERT RULES ARE GATED, not merely linted.
+#
+# `promtool check rules` proves the file parses and that every expression is valid PromQL.
+# It CANNOT prove a rule fires, and the two are independent: SubscriberSettlementNotProgressing
+# passed `check rules` for its entire life while being unable to fire on the one deployment
+# it exists for, because its right-hand counter has no series until the settlement pass
+# discharges its first obligation and `and` against an empty vector is empty. Only
+# `promtool test rules` catches that, so both run and `alerts_test` depends on `alerts_check`.
+#
+# The promtool used is the one from the Prometheus image the stack already pins, read out of
+# docker-compose.yaml so the version lives in exactly one place and the engine that validates
+# a rule is the engine that will load it. A promtool already on PATH is preferred because it
+# is faster, and because CI installs one.
+PROMETHEUS_IMAGE = $(shell sed -n 's|^[[:space:]]*image:[[:space:]]*\(prom/prometheus:[^[:space:]]*\).*|\1|p' docker-compose.yaml | head -1)
+
+ALERT_RULES=blnk-kafka-alerts.yml
+ALERT_RULE_TESTS=blnk-kafka-alerts_test.yml
+
+# Resolves promtool and expresses every path relative to alerts/tests, which is where the
+# unit-test file's own `rule_files: ../blnk-kafka-alerts.yml` resolves from. The image's
+# entrypoint is /bin/prometheus, so the container form overrides it rather than appending a
+# subcommand the server would reject.
+define RESOLVE_PROMTOOL
+	if command -v promtool >/dev/null 2>&1; then \
+		promtool_prefix="cd alerts/tests &&"; \
+		promtool_cmd="promtool"; \
+	elif command -v docker >/dev/null 2>&1 && [ -n "$(PROMETHEUS_IMAGE)" ]; then \
+		echo "promtool is not on PATH; using $(PROMETHEUS_IMAGE) from docker-compose.yaml"; \
+		promtool_prefix=""; \
+		promtool_cmd="docker run --rm --entrypoint promtool \
+			-v $(CURDIR)/alerts:/alerts:ro -w /alerts/tests $(PROMETHEUS_IMAGE)"; \
+	else \
+		echo "ALERT GATE FAILED: neither promtool nor docker is available, so the alert rules"; \
+		echo "cannot be validated. Install promtool from the Prometheus release that matches"; \
+		echo "$(PROMETHEUS_IMAGE), or make docker available, then re-run."; \
+		exit 1; \
+	fi
+endef
+
+alerts_check:
+	@set -e; \
+	$(RESOLVE_PROMTOOL); \
+	eval "( $$promtool_prefix $$promtool_cmd check rules ../$(ALERT_RULES) )"
+
+alerts_test: alerts_check
+	@set -e; \
+	$(RESOLVE_PROMTOOL); \
+	eval "( $$promtool_prefix $$promtool_cmd test rules $(ALERT_RULE_TESTS) )"
+
+# THE KUBERNETES COPY IS GATED TOO. Kubernetes has no directory to bind-mount, so the
+# manifests carry the rule file projected into the glob directory as a ConfigMap key. A
+# copy is a thing that can diverge, and a rule file Prometheus refuses takes every rule
+# with it — so the projection is extracted and put through the same two checks as the
+# original. TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot separately
+# asserts the two documents are semantically equal; this proves the projected copy LOADS
+# and FIRES, which no YAML comparison can.
+PROMETHEUS_CONFIGMAP=infrastructure/k8s-manifests/prometheus-configmap.yaml
+
+# Written into alerts/tests and removed on exit. Dot-prefixed so the rule_files glob
+# (alerts/*.yml, non-recursive) can never see them even mid-run.
+PROJECTION=.configmap-projection.yml
+PROJECTION_TESTS=.configmap-projection_test.yml
+
+# Reads the projected rule file out of the ConfigMap and writes it where the unit tests
+# can reach it. A make variable rather than recipe lines, following BROKER_ARRAY_DECLARED
+# above, so the recipe stays one tab-indented statement per step.
+EXTRACT_PROJECTED_RULES = python3 -c "import sys, yaml; data = (yaml.safe_load(open('$(PROMETHEUS_CONFIGMAP)')) or {}).get('data') or {}; text = data.get('$(ALERT_RULES)'); sys.exit('$(PROMETHEUS_CONFIGMAP) projects no $(ALERT_RULES) key, so Kubernetes would load no rules at all') if text is None else open('alerts/tests/$(PROJECTION)', 'w').write(text)"
+
+alerts_configmap:
+	@set -e; \
+	$(RESOLVE_PROMTOOL); \
+	python3 -c "import yaml" 2>/dev/null || { \
+		echo "ALERT GATE FAILED: python3 with PyYAML is needed to read the rule file out of"; \
+		echo "$(PROMETHEUS_CONFIGMAP). Install it, or run 'make alerts_test' to check the"; \
+		echo "repository copy alone."; \
+		exit 1; \
+	}; \
+	trap 'rm -f alerts/tests/$(PROJECTION) alerts/tests/$(PROJECTION_TESTS)' EXIT; \
+	$(EXTRACT_PROJECTED_RULES); \
+	sed 's|\.\./$(ALERT_RULES)|$(PROJECTION)|' alerts/tests/$(ALERT_RULE_TESTS) > alerts/tests/$(PROJECTION_TESTS); \
+	eval "( $$promtool_prefix $$promtool_cmd check rules $(PROJECTION) )"; \
+	eval "( $$promtool_prefix $$promtool_cmd test rules $(PROJECTION_TESTS) )"
+
+# Everything the alert rules are gated on, in one run.
+alerts: alerts_test alerts_configmap
 
 migrate_up:
 	./${PROJECT} migrate up

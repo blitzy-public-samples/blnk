@@ -198,7 +198,10 @@ func TestEventPipelineLogging_NoSiteUsesLogrusWithError(t *testing.T) {
 	// services, the repositories beneath them and the process wiring above them. A
 	// redaction that holds in the service and not in the repository underneath it protects
 	// nothing, because the same failure is logged at both.
-	files := []string{
+	//
+	// Each name is expanded through its SOURCE GROUP, so splitting one of these files for
+	// size widens the guard to the siblings rather than leaving the moved sites unchecked.
+	files := eventSourceGroups(t,
 		"event_relay.go",
 		"event_admin.go",
 		"event_publisher.go",
@@ -213,7 +216,7 @@ func TestEventPipelineLogging_NoSiteUsesLogrusWithError(t *testing.T) {
 		"database/event_outbox.go",
 		"database/event_subscriber.go",
 		"cmd/server.go",
-	}
+	)
 
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {

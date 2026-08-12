@@ -15,25 +15,6 @@ limitations under the License.
 */
 
 // event_outbox.go is the producer-facing edge of the Kafka event-publishing pipeline.
-// It does exactly two things, and deliberately nothing else:
-//
-//  1. PrepareEventOutbox turns a domain event into a blnk.event_outbox row. It is
-//     modelled on PrepareLineageOutbox, which is the house pattern for outbox row
-//     construction in this repository, and it is where THE PAYLOAD-PRESERVATION
-//     GUARANTEE is implemented rather than merely asserted.
-//  2. PublishEvent (and its in-transaction sibling PublishEventInTx) persists that
-//     row. It is the one-for-one transport substitution for SendWebhook at every
-//     producer call site.
-//
-// Two consequences of that shape are load-bearing and easy to get wrong:
-//
-//   - NOTHING HERE TALKS TO KAFKA. This file holds no Kafka import, no writer and
-//     no broker address. The relay is the only caller of a kafka.Writer. A producer
-//     that published inline would block a ledger write on broker availability and
-//     would break the transactional-outbox guarantee it exists to provide.
-//   - NOTHING HERE HOLDS SQL. Every statement lives in database/event_outbox.go and
-//     is reached through the datasource interface. This file never opens a database
-//     transaction either; when a caller already holds one, it passes it in.
 
 package blnk
 
@@ -70,18 +51,10 @@ const defaultEventMaxAttempts = 5
 
 // postCommitEventPublishSem bounds how many post-commit event captures may be in flight
 // at once, across every transaction and balance in the process.
-//
-// The balance-monitor fan-out is the worst shape of it. One balance can carry many
-// monitors and many of them can fire on one update, so the number of goroutines is a
-// PRODUCT of two counts rather than one per transaction.
 var postCommitEventPublishSem = make(chan struct{}, 64)
 
 // eventConfiguration reads the configuration this file needs, tolerating both an
 // uninitialised Blnk instance and an unloaded configuration store.
-//
-// Returns:
-//   - *config.Configuration: the effective configuration, or nil when none can be
-//     resolved.
 func (l *Blnk) eventConfiguration() *config.Configuration {
 	if l != nil {
 		return l.Config()
@@ -97,16 +70,6 @@ func (l *Blnk) eventConfiguration() *config.Configuration {
 
 // eventPublishingConfigured reports whether this deployment has asked for events to be
 // CAPTURED IN THE OUTBOX at all, which is to say whether Kafka is configured.
-//
-// That reasoning is only sound while a relay is running, and the relay REFUSES TO RUN
-// without Kafka: it would otherwise be handed the no-op publisher, report every publish
-// as dispatched and retire the whole outbox having sent nothing.
-//
-// Parameters:
-//   - cnf *config.Configuration: the configuration to inspect. May be nil.
-//
-// Returns:
-//   - bool: true when at least one usable Kafka broker is configured.
 func eventPublishingConfigured(cnf *config.Configuration) bool {
 	// Delegated rather than reimplemented. The database layer asks the SAME question when
 	// it decides whether to write a balance-monitor handoff inside a ledger transaction,
@@ -119,12 +82,6 @@ func eventPublishingConfigured(cnf *config.Configuration) bool {
 // legacyWebhookOnly reports that this deployment has a webhook URL and no Kafka broker,
 // which is the pre-migration steady state and the state every deployment is in before
 // it opts in.
-//
-// Parameters:
-//   - cnf *config.Configuration: the configuration to inspect. May be nil.
-//
-// Returns:
-//   - bool: true when a legacy webhook URL is configured.
 func legacyWebhookOnly(cnf *config.Configuration) bool {
 	if cnf == nil {
 		return false
@@ -134,9 +91,6 @@ func legacyWebhookOnly(cnf *config.Configuration) bool {
 }
 
 // eventCaptureEnabled reports whether this process captures events at all.
-//
-// Returns:
-//   - bool: true when Kafka brokers or a legacy webhook URL are configured.
 func (l *Blnk) eventCaptureEnabled() bool {
 	if l == nil {
 		return false
@@ -148,23 +102,6 @@ func (l *Blnk) eventCaptureEnabled() bool {
 // publishEntityEventWhenUncaptured delivers a ledger, identity or balance creation
 // event from the post-commit path WHEN, AND ONLY WHEN, the repository did not capture
 // it.
-//
-// The preparer constructors return nil when eventCaptureEnabled is false, so that a
-// deployment with no broker does not pay a transaction per creation to insert no event.
-//
-// Parameters:
-//   - ctx context.Context: the publishing context. Callers detach it from request
-//     cancellation before handing it over; see postBalanceActions.
-//   - aggregateID string: the created entity's identifier. Empty means nothing was
-//     created.
-//   - event NewWebhook: the event string and payload object, unchanged from what the
-//     legacy transport was handed.
-//   - options ...EventOption: applied only on the outbox path, which this fallback
-//     cannot reach; passed so the two capture sites read identically.
-//
-// Returns:
-//   - error: SendWebhook's enqueue error, exactly as the pre-migration call site
-//     returned it, or nil when there was nothing to do.
 func (l *Blnk) publishEntityEventWhenUncaptured(ctx context.Context, aggregateID string, event NewWebhook, options ...EventOption) error {
 	if l == nil {
 		return nil
@@ -184,17 +121,6 @@ func (l *Blnk) publishEntityEventWhenUncaptured(ctx context.Context, aggregateID
 }
 
 // eventMaxAttempts resolves the per-row retry budget from RELAY_MAX_RETRY_ATTEMPTS.
-//
-// The budget is stamped on the row rather than read by the relay at publish time so
-// that an operator can extend the budget for one stuck event without reconfiguring and
-// restarting the relay, and so that a configuration change never retroactively alters
-// the budget of rows already in flight.
-//
-// Parameters:
-//   - cnf *config.Configuration: the configuration to read. May be nil.
-//
-// Returns:
-//   - int: a strictly positive retry budget.
 func eventMaxAttempts(cnf *config.Configuration) int {
 	if cnf != nil && cnf.Relay.MaxRetryAttempts > 0 {
 		return cnf.Relay.MaxRetryAttempts
@@ -205,13 +131,6 @@ func eventMaxAttempts(cnf *config.Configuration) int {
 
 // mapStringValue extracts a trimmed string value from a map payload, tolerating a value
 // that is not a string.
-//
-// Parameters:
-//   - payload map[string]interface{}: the map to read. May be nil.
-//   - key string: the key to read.
-//
-// Returns:
-//   - string: the trimmed string value, or "" when it is missing or not a string.
 func mapStringValue(payload map[string]interface{}, key string) string {
 	raw, ok := payload[key]
 	if !ok {
@@ -228,28 +147,6 @@ func mapStringValue(payload map[string]interface{}, key string) string {
 
 // eventAggregateID derives the aggregate identifier — the entity the event is ABOUT —
 // from the payload object the producer handed over.
-//
-// Derivation, covering every one of the thirteen event strings Blnk emits:
-//
-//	ledger.created            *model.Ledger         → LedgerID
-//	identity.created          *model.Identity       → IdentityID
-//	balance.created           *model.Balance        → BalanceID
-//	balance.monitor            model.BalanceMonitor → MonitorID (the monitor that fired)
-//	transaction.queued         *model.Transaction   → TransactionID
-//	transaction.applied        *model.Transaction   → TransactionID
-//	transaction.scheduled      *model.Transaction   → TransactionID
-//	transaction.inflight       *model.Transaction   → TransactionID
-//	transaction.void           *model.Transaction   → TransactionID
-//	transaction.rejected       model.Transaction    → TransactionID
-//	transaction.unknown        *model.Transaction   → TransactionID
-//	bulk_transaction.<status>  map[string]any       → batch_id
-//	system.error               map[string]any       → "" (no aggregate; the caller falls back)
-//
-// Parameters:
-//   - payload interface{}: the NewWebhook payload object. May be nil or of any type.
-//
-// Returns:
-//   - string: the aggregate identifier, or "" when the payload carries none.
 func eventAggregateID(payload interface{}) string {
 	switch typed := payload.(type) {
 	case *model.Transaction:
@@ -302,36 +199,6 @@ func eventAggregateID(payload interface{}) string {
 
 // resolveEventPartitionKey picks the Kafka message key and reports WHICH dimension it
 // came from.
-//
-// Precedence, and why it is this order:
-//
-//  1. derived — the key eventPartitionKey resolved from the payload. That function
-//     applies the ledger rule itself: a payload that knows its ledger returns the
-//     ledger, whatever its category, so a non-empty answer here is the ledger for every
-//     ledger-bearing event and the event's own aggregate otherwise.
-//  2. aggregate — the aggregate id resolved separately by eventAggregateID, for a
-//     payload shape eventPartitionKey has no arm for but that still names something.
-//  3. eventType — the type itself, which is what gives system.error a single partition
-//     and therefore a total order.
-//
-// The dimension reported for candidates 1 and 2 is ledger when the caller's derived key
-// IS the ledger and aggregate otherwise, which the caller decides by passing the ledger
-// it resolved; this function only distinguishes "from the payload" from "from the type".
-// The ledger-versus-aggregate question is answered by eventLedgerID, and duplicating it
-// here would create a second answer able to disagree.
-//
-// Parameters:
-//   - derived string: the key resolved from the payload, or the caller-supplied ledger
-//     when one was given.
-//   - aggregateID string: the separately resolved aggregate id. Empty when there is
-//     none.
-//   - eventType string: the trimmed event name. Empty only for a zero-valued event.
-//   - ledgerID string: the authoritative ledger, empty when the event has none.
-//
-// Returns:
-//   - string: the chosen key, empty when every candidate is empty.
-//   - model.EventKeyDimension: the dimension the key came from. Meaningless when the
-//     key is empty, and the caller refuses that case.
 func resolveEventPartitionKey(
 	derived, aggregateID, eventType, ledgerID string,
 ) (string, model.EventKeyDimension) {
@@ -355,17 +222,6 @@ func resolveEventPartitionKey(
 }
 
 // eventPartitionKey derives the KAFKA MESSAGE KEY for an event FROM ITS PAYLOAD ALONE.
-//
-// That ledger arrives through WithEventLedgerID, supplied by the producer, and it
-// OVERRIDES whatever this function returns. Every ledger-scoped producer supplies it:
-// transaction execution (resolved from the loaded source balance, falling back to the
-// destination), the balance post-action and monitor check, and the ledger post-action.
-//
-// Parameters:
-//   - payload interface{}: the NewWebhook payload object. May be nil or of any type.
-//
-// Returns:
-//   - string: the partition key, or "" when the payload carries none.
 func eventPartitionKey(payload interface{}) string {
 	// applied before any per-type fallback: an event that knows its ledger is keyed by its
 	// ledger, whatever its category.
@@ -411,16 +267,6 @@ func eventPartitionKey(payload interface{}) string {
 
 // eventLedgerID resolves the AUTHORITATIVE ledger an event belongs to, or "" when the
 // event genuinely has no ledger.
-//
-// It takes no part in partitioning, in ordering, or in routing. Its only job is to
-// answer "which ledger is this about" honestly, which means returning nothing rather
-// than something plausible when the payload does not actually say.
-//
-// Parameters:
-//   - payload interface{}: the NewWebhook payload object. May be nil or of any type.
-//
-// Returns:
-//   - string: the ledger id, trimmed, or "" when the payload carries none.
 func eventLedgerID(payload interface{}) string {
 	switch typed := payload.(type) {
 	case *model.Ledger:
@@ -446,25 +292,12 @@ func eventLedgerID(payload interface{}) string {
 // transactionPartitionKey applies the transaction key preference documented on
 // eventPartitionKey: source balance, then destination balance, then the transaction
 // itself.
-//
-// Parameters:
-//   - source, destination, transactionID string: the candidate keys, in preference
-//     order.
-//
-// Returns:
-//   - string: the first non-blank candidate, or "" when all three are blank.
 func transactionPartitionKey(source, destination, transactionID string) string {
 	return firstNonBlank(source, destination, transactionID)
 }
 
 // firstNonBlank returns the first candidate that is not empty once trimmed, or "" when
 // every candidate is blank.
-//
-// Parameters:
-//   - candidates ...string: the candidates, in preference order.
-//
-// Returns:
-//   - string: the first non-blank candidate, trimmed, or "".
 func firstNonBlank(candidates ...string) string {
 	for _, candidate := range candidates {
 		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
@@ -477,11 +310,6 @@ func firstNonBlank(candidates ...string) string {
 
 // PrepareEventOutbox builds the blnk.event_outbox row for a domain event, ready to be
 // inserted either standalone or inside a caller's ledger transaction.
-//
-// A payload that CANNOT BE MARSHALED is an ERROR, and this is a deliberate change from
-// the earlier behaviour of logging it and returning nil.
-//
-// EventOption supplies a fact about an event that the payload cannot yield.
 //
 // Parameters:
 //   - ctx context.Context: the context for the operation, used for tracing only.
@@ -496,31 +324,20 @@ func firstNonBlank(candidates ...string) string {
 type EventOption func(*eventAttributes)
 
 // eventAttributes carries what a caller supplied, before any derivation runs.
-//
-// It is a struct rather than a bare string so that adding a second caller-supplied
-// attribute is an additive change here instead of a new parameter everywhere.
 type eventAttributes struct {
 	// ledgerID is the ledger the mutation belonged to, as supplied by the caller.
-	// Empty means "not supplied", which sends the derivation on to the payload.
 	ledgerID string
 	// identity is a caller-supplied stable identity for the event, used to DERIVE its id.
-	// Empty means "not supplied", which sends the decision on to model.EventIdentityFor.
-	// See WithEventIdentity.
 	identity string
 }
 
 // WithEventLedgerID supplies THE LEDGER THE MUTATION BELONGED TO.
 //
-// model.Transaction HAS NO LEDGER FIELD. A transaction's ledger association is
-// indirect, through the balances it moves value between, so a transaction payload
-// simply cannot yield the ledger — and MetaData is caller-controlled and unfit to
-// derive a routing key from.
-//
 // Parameters:
 //   - ledgerID string: the ledger the mutation belonged to.
 //
 // Returns:
-//   - EventOption: applied by PrepareEventOutbox, PublishEvent and PublishEventInTx.
+//   - EventOption: applied by PrepareEventOutbox and PublishEvent.
 func WithEventLedgerID(ledgerID string) EventOption {
 	return func(attributes *eventAttributes) {
 		if trimmed := strings.TrimSpace(ledgerID); trimmed != "" {
@@ -531,10 +348,6 @@ func WithEventLedgerID(ledgerID string) EventOption {
 
 // WithEventIdentity supplies A STABLE IDENTITY THE PAYLOAD CANNOT YIELD, so the event's
 // id is derived rather than random.
-//
-// A supplied identity wins over model.EventIdentityFor, including over its refusal to
-// derive. That is the whole purpose: the caller is asserting an identity the payload
-// could not express.
 //
 // Parameters:
 //   - identity string: the stable identity of this logical event.
@@ -550,16 +363,6 @@ func WithEventIdentity(identity string) EventOption {
 }
 
 // applyEventOptions folds a caller's options into a fresh attribute set.
-//
-// A nil option is skipped rather than panicking: the list is variadic and assembled at
-// call sites that may build it conditionally, and a nil entry there is a caller's slip
-// that must not take a ledger write down with it.
-//
-// Parameters:
-//   - options []EventOption: the caller's options, possibly empty or containing nils.
-//
-// Returns:
-//   - eventAttributes: the folded attributes.
 func applyEventOptions(options []EventOption) eventAttributes {
 	var attributes eventAttributes
 	for _, option := range options {
@@ -747,8 +550,6 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 // PublishEvent captures a domain event in the transactional outbox. It is the
 // one-for-one replacement for SendWebhook at every producer call site.
 //
-// THIS FUNCTION DOES NOT TALK TO KAFKA. It writes one pending row and returns.
-//
 // Parameters:
 //   - ctx context.Context: the context for the operation.
 //   - event NewWebhook: the event name and payload object, unchanged from the producer
@@ -763,9 +564,6 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // PostCommitEventCaptureContract is the SINGLE place the post-commit producers are
 // described, and it exists because the alternative was three files each claiming to
 // hold the only one.
-//
-// Once captured, the event is indistinguishable from any other: the same relay, the
-// same bounded retry, the same dead-lettering, the same replay, the same metrics.
 const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<status>, system.error"
 
 // PublishEventDurably captures a domain event on the standalone path and RETRIES a
@@ -786,43 +584,8 @@ func (l *Blnk) PublishEventDurably(ctx context.Context, event NewWebhook, option
 	return l.publishEvent(ctx, nil, standaloneEventCaptureAttempts, event, options...)
 }
 
-// PublishEventInTx captures a domain event inside an existing database transaction, so
-// the event and the ledger mutation that produced it commit or roll back together.
-//
-// There is no window in which a balance moved but its event was lost, and none in which
-// an event describes a mutation that was rolled back. That is what makes exactly-once
-// semantics on the write side possible, layered over Kafka's at-least-once delivery.
-//
-// Parameters:
-//   - ctx context.Context: the context for the operation.
-//   - tx *sql.Tx: the caller's open transaction. May be nil, which selects the
-//     standalone insert.
-//   - event NewWebhook: the event name and payload object, unchanged from the producer
-//     call site.
-//
-// Returns:
-//   - error: nil on success and on every no-op; the persistence error otherwise.
-func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhook, options ...EventOption) error {
-	return l.publishEvent(ctx, tx, singleEventCaptureAttempt, event, options...)
-}
-
-// publishEvent is the single implementation behind PublishEvent and PublishEventInTx.
-//
-// Both entry points share one body so the two paths cannot diverge: they build the row
-// identically and differ only in which repository method persists it. A second copy of
-// the guard sequence would be a second place for the no-op contract to rot.
-//
-// Parameters:
-//   - ctx context.Context: the context for the operation.
-//   - tx *sql.Tx: the caller's transaction, or nil for the standalone insert.
-//   - captureAttempts int: the standalone insert budget. Values below one are treated
-//     as one, so a miswired caller still attempts the capture once.
-//   - event NewWebhook: the event to capture.
-//   - options ...EventOption: caller-supplied facts the payload cannot yield, forwarded
-//     verbatim to PrepareEventOutbox.
-//
-// Returns:
-//   - error: nil on success and on every no-op; the persistence error otherwise.
+// publishEvent is the single implementation behind PublishEvent and PublishEventDurably,
+// and the one place the in-transaction insert is reached from.
 func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, captureAttempts int, event NewWebhook, options ...EventOption) error {
 	ctx, span := tracer.Start(ctx, "PublishEvent")
 	defer span.End()
@@ -922,28 +685,6 @@ const (
 
 // insertEventOutboxWithRetry persists an already-prepared row on the standalone path,
 // spending up to attempts tries on a transient failure.
-//
-// The repository maps every driver failure onto a typed error before it gets here
-// (wrapEventOutboxInsertError), and that classification is what decides:
-//
-//   - A CONFLICT is not retried. It means the unique index on event_id refused this row,
-//     and the repository has already separated the two ways that happens: an identical
-//     event already recorded is reported as SUCCESS and never reaches here, so anything
-//     that does is a genuine id collision that no further attempt can resolve. Spending
-//     the budget on it only delays the error the caller needs to see.
-//   - A BAD REQUEST is not retried. A not-null, foreign-key or CHECK violation is a value
-//     the schema refuses; re-sending the identical row cannot change that answer.
-//   - Everything else is retried. That is the transient class this function exists for, and
-//     it is where a connection reset, a pool timeout, a statement timeout and a
-//     server-side error all land.
-//
-// Parameters:
-//   - ctx context.Context: the insert's context.
-//   - outbox *model.EventOutbox: the PREPARED row.
-//   - attempts int: the budget. Anything below one is treated as one.
-//
-// Returns:
-//   - error: nil once the row is recorded; otherwise the last failure.
 func (l *Blnk) insertEventOutboxWithRetry(ctx context.Context, outbox *model.EventOutbox, attempts int) error {
 	if attempts < singleEventCaptureAttempt {
 		attempts = singleEventCaptureAttempt
@@ -1007,14 +748,6 @@ func (l *Blnk) insertEventOutboxWithRetry(ctx context.Context, outbox *model.Eve
 
 // eventCaptureLogFields is the field set every capture-attempt line carries, so the
 // attempts of one event join on the same keys.
-//
-// Parameters:
-//   - outbox *model.EventOutbox: the row being captured.
-//   - attempt int: the attempt just made, one-based.
-//   - attempts int: the budget.
-//
-// Returns:
-//   - logrus.Fields: the structured context for the line.
 func eventCaptureLogFields(outbox *model.EventOutbox, attempt, attempts int) logrus.Fields {
 	return logrus.Fields{
 		"event_id":          outbox.EventID,
@@ -1029,13 +762,6 @@ func eventCaptureLogFields(outbox *model.EventOutbox, attempt, attempts int) log
 
 // standaloneEventCaptureRetryable reports whether a failed standalone insert is worth
 // attempting again.
-//
-// Parameters:
-//   - err error: the insert failure. nil answers false, because there is nothing to
-//     retry.
-//
-// Returns:
-//   - bool: true when another attempt could plausibly succeed.
 func standaloneEventCaptureRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -1053,17 +779,6 @@ func standaloneEventCaptureRetryable(err error) bool {
 }
 
 // eventCaptureBadRequest reports whether an error carries the generic bad-request code.
-//
-// It mirrors isConflictError and isInternalServerError: the code is read through
-// apierror.Normalize so the legacy BAD_REQUEST the database layer still constructs and
-// the canonical GEN_BAD_REQUEST classify identically, and errors.As is used rather than
-// a type assertion so a wrapped error classifies the same as a bare one.
-//
-// Parameters:
-//   - err error: the error to classify. May be nil.
-//
-// Returns:
-//   - bool: true when the error is a bad request.
 func eventCaptureBadRequest(err error) bool {
 	if err == nil {
 		return false
@@ -1089,19 +804,6 @@ func eventCaptureBadRequest(err error) bool {
 // deliverLegacyWebhookOnly delivers an event over the legacy HTTP transport on a
 // deployment that has no Kafka, by making exactly the call every producer made before
 // this feature existed.
-//
-// Two callers of one decision, one of which did not ask.
-//
-// Parameters:
-//   - ctx context.Context: the context for the operation, used for tracing only —
-//     SendWebhook takes none.
-//   - tx *sql.Tx: the caller's transaction, or nil. Non-nil selects the skip described
-//     above.
-//   - event NewWebhook: the event name and payload object, forwarded verbatim.
-//
-// Returns:
-//   - error: whatever SendWebhook reports, or nil on the in-transaction skip and on the
-//     post-sunset skip.
 func (l *Blnk) deliverLegacyWebhookOnly(ctx context.Context, tx *sql.Tx, event NewWebhook) error {
 	_, span := tracer.Start(ctx, "DeliverLegacyWebhookOnly")
 	defer span.End()

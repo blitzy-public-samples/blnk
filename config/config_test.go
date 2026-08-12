@@ -5081,3 +5081,83 @@ func TestValidateForwardedProtoTrust_RefusesADeclarationNothingScopes(t *testing
 				"discover it as a 403 on a credential request")
 	})
 }
+
+// TestResolveWebhookDeprecationWindow_AcceptsTheRetiredSentinel pins the one value that
+// lets a post-sunset deployment stop carrying an obsolete date.
+//
+// The variable becomes MANDATORY the moment kafka.brokers is set, and it stays mandatory
+// after the migration it describes is over. Without a sentinel the only way to satisfy it
+// is a date that has already passed — which reads, to anyone looking at the configuration
+// afterwards, exactly like a stale value nobody has noticed. The sentinel states the true
+// thing: the window is closed.
+func TestResolveWebhookDeprecationWindow_AcceptsTheRetiredSentinel(t *testing.T) {
+	clearEventStreamingEnv(t)
+
+	for _, spelling := range []string{"retired", "RETIRED", "Retired", "  retired  "} {
+		t.Run("the sentinel is accepted as "+spelling, func(t *testing.T) {
+			cnf := eventStreamingBaseConfig()
+			cnf.Kafka.Brokers = []string{"kafka:9092"}
+			cnf.WebhookDeprecationSunsetDate = spelling
+
+			if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
+				t.Fatalf("Expected %q to be accepted beside configured brokers, got %v", spelling, err)
+			}
+
+			// NORMALISED, so every reader downstream compares against one value rather than
+			// against whichever casing a deployment happened to write.
+			if cnf.WebhookDeprecationSunsetDate != WebhookSunsetRetiredSentinel {
+				t.Errorf("Expected the sentinel to normalise to %q, got %q",
+					WebhookSunsetRetiredSentinel, cnf.WebhookDeprecationSunsetDate)
+			}
+
+			// A closed window has no opening instant left to describe, and a start with no
+			// sunset beside it is what the orphaned-start rule refuses everywhere else.
+			if cnf.WebhookDeprecationStartDate != "" {
+				t.Errorf("Expected no window start beside the sentinel, got %q",
+					cnf.WebhookDeprecationStartDate)
+			}
+		})
+	}
+
+	t.Run("it does not weaken the malformed-date refusal", func(t *testing.T) {
+		// The sentinel is one exact word, not a licence for prose. A value that merely
+		// mentions retirement is still a mis-stated instant.
+		for _, value := range []string{"retire", "retired soon", "already retired", "sunset"} {
+			cnf := eventStreamingBaseConfig()
+			cnf.Kafka.Brokers = []string{"kafka:9092"}
+			cnf.WebhookDeprecationSunsetDate = value
+
+			err := cnf.resolveWebhookDeprecationWindow()
+			if err == nil {
+				t.Errorf("Expected %q to be refused as neither the sentinel nor an instant", value)
+
+				continue
+			}
+			if !strings.Contains(err.Error(), WebhookSunsetRetiredSentinel) {
+				t.Errorf("Expected the refusal to name the accepted sentinel, got %v", err)
+			}
+		}
+	})
+
+	t.Run("it survives a full load", func(t *testing.T) {
+		// Through validateAndAddDefaults rather than the single function, because the sunset
+		// is also read by the Kafka validators and a value one of them rejected would never
+		// reach the runtime.
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"kafka:9092"}
+		cnf.Kafka.InsecureLocalDev = true
+		cnf.Kafka.SASLAdminUser = "admin"
+		cnf.Kafka.SASLAdminSecret = "admin-secret"
+		cnf.Kafka.SASLUser = "producer"
+		cnf.Kafka.SASLSecret = "producer-secret"
+		cnf.WebhookDeprecationSunsetDate = WebhookSunsetRetiredSentinel
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected a retired deployment to load cleanly, got %v", err)
+		}
+		if cnf.WebhookDeprecationSunsetDate != WebhookSunsetRetiredSentinel {
+			t.Errorf("Expected the sentinel to survive the full load, got %q",
+				cnf.WebhookDeprecationSunsetDate)
+		}
+	})
+}

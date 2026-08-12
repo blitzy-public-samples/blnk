@@ -15,21 +15,6 @@ limitations under the License.
 */
 
 // event_retention.go holds the production caller of the event outbox's retention purge.
-//
-// database.PurgeTerminalEventsBefore existed, was documented, was tested — and nothing
-// in a running process ever called it. That is not a smaller version of the same
-// problem; it is the whole problem, because what the table accumulates in the meantime
-// is the ledger's most sensitive data.
-//
-// EVERY ROW'S PAYLOAD IS THE WEBHOOK BODY VERBATIM. A transaction event carries amounts
-// and balance identifiers.
-//
-// The cadence differs from a relay's on purpose. A relay polls every second because a
-// claimable row is work waiting to be done.
-//
-// ONE ELIGIBLE STATE, enforced in SQL rather than here, and it is narrower than
-// "terminal". The repository deletes a DISPATCHED row on age alone — it is a receipt
-// for an event a subscriber has already had.
 package blnk
 
 import (
@@ -70,10 +55,6 @@ const (
 )
 
 // eventRetentionStore is the repository surface the sweeper needs, and nothing more.
-//
-// One method, so the sweeper can be driven in a test without a database and so the delete
-// predicate stays where it belongs: the repository owns which statuses are eligible, and
-// re-expressing that here would be a second opinion able to disagree with the first.
 type eventRetentionStore interface {
 	// PurgeTerminalEventsBefore deletes at most limit TERMINAL rows older than cutoff and
 	// returns how many it removed. A returned count below the limit means the eligible set
@@ -99,7 +80,6 @@ type EventRetentionSweeper struct {
 	maxBatches int
 
 	// now is the clock, replaceable in-package so a test can assert the cutoff exactly.
-	// It follows the relay's and the dead-letter service's now field.
 	now func() time.Time
 
 	stopCh  chan struct{}
@@ -140,14 +120,6 @@ func NewEventRetentionSweeper(b *Blnk) *EventRetentionSweeper {
 }
 
 // applyPurgeCapacity reads the configured purge capacity onto the sweeper.
-//
-// Falls back to the process configuration for the same reason retentionPeriodFor does:
-// a Blnk built before configuration was published would otherwise silently run on the
-// built-in defaults, so an operator who had deliberately raised the capacity to match
-// their arrival rate would get the shipped one and a table that kept growing anyway.
-//
-// Parameters:
-//   - cnf *config.Configuration: the instance's configuration, possibly nil.
 func (s *EventRetentionSweeper) applyPurgeCapacity(cnf *config.Configuration) {
 	if cnf == nil {
 		fetched, err := config.Fetch()
@@ -178,17 +150,6 @@ func (s *EventRetentionSweeper) applyPurgeCapacity(cnf *config.Configuration) {
 
 // retentionPeriodFor reads the configured retention period, falling back to the process
 // configuration when the instance carries none.
-//
-// The fallback exists because a Blnk built before configuration was published would
-// otherwise report retention as disabled and silently never sweep — a failure mode with
-// no symptom other than a table that keeps growing.
-//
-// Parameters:
-//   - cnf *config.Configuration: the instance's configuration, possibly nil.
-//
-// Returns:
-//   - time.Duration: the retention period, or 0 when retention is disabled or
-//     unreadable.
 func retentionPeriodFor(cnf *config.Configuration) time.Duration {
 	if cnf != nil {
 		return cnf.EventRetentionPeriod()
@@ -203,10 +164,6 @@ func retentionPeriodFor(cnf *config.Configuration) time.Duration {
 }
 
 // WithInterval sets how often the sweep runs.
-//
-// A non-positive interval falls back to the default rather than being rejected,
-// matching every other worker here: a misconfigured cadence must not be able to stop
-// retention running, because the failure mode is silent growth.
 //
 // Parameters:
 //   - interval time.Duration: the sweep interval.
@@ -248,8 +205,6 @@ func (s *EventRetentionSweeper) WithBatchSize(size int) *EventRetentionSweeper {
 
 // WithMaxBatches sets how many batches one sweep may issue.
 //
-// A sweep with no ceiling is still bounded by eventRetentionSweepTimeout.
-//
 // Parameters:
 //   - batches int: the per-sweep batch ceiling. Negative means unbounded; zero keeps
 //     the default.
@@ -275,12 +230,6 @@ func (s *EventRetentionSweeper) WithMaxBatches(batches int) *EventRetentionSweep
 }
 
 // StartupObstacle reports why the sweeper must not run, or nil when it may.
-//
-// The DISABLED case is a legitimate steady state rather than a fault, and it is
-// reported as a distinct error so the caller can log it at the right level: retention
-// shipping switched off is the default and an operator has not necessarily done
-// anything wrong, while a missing datasource on a deployment that HAS configured
-// retention means the control they asked for is not running.
 //
 // Returns:
 //   - error: the reason the sweeper must not run, or nil.
@@ -381,17 +330,6 @@ func (s *EventRetentionSweeper) IsRunning() bool {
 }
 
 // run is the ticker loop.
-//
-// The FIRST sweep is deliberately on the first tick rather than immediately at
-// start-up. A sweep at start-up would run during the busiest moment of a deployment —
-// every instance starting at once, caches cold, the relay draining whatever accumulated
-// during the rollout — and it is housekeeping over rows that have already been terminal
-// for days.
-//
-// Parameters:
-//   - ctx context.Context: cancelling it ends the loop.
-//   - stop <-chan struct{}: the stop channel, captured by Start rather than read from
-//     the field.
 func (s *EventRetentionSweeper) run(ctx context.Context, stop <-chan struct{}) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -413,10 +351,6 @@ func (s *EventRetentionSweeper) run(ctx context.Context, stop <-chan struct{}) {
 }
 
 // Sweep performs ONE bounded retention sweep and returns how many rows it deleted.
-//
-// It is exported so an operator-facing path can run retention on demand — the same
-// code, the same bounds, the same cutoff arithmetic — rather than a second
-// implementation that could disagree with this one about what is eligible.
 //
 // Parameters:
 //   - ctx context.Context: cancels the sweep. A deadline of its own is applied on top.
@@ -520,12 +454,6 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 }
 
 // The three obstacles, as values rather than freshly-built errors.
-//
-// ErrEventRetentionDisabled is EXPORTED and the other two are not, and the split is the
-// point: a caller must be able to recognise "retention is switched off" and log it as
-// the unremarkable default it is, while the other two are wiring defects there is
-// nothing useful to branch on. Matching on message text instead would break the moment
-// the wording improved.
 var (
 	// ErrEventRetentionDisabled means RELAY_EVENT_RETENTION_DAYS is unset or zero. Not a
 	// fault: retention ships switched off because deleting ledger-adjacent records is an

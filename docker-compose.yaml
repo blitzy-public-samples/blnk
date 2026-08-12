@@ -126,7 +126,7 @@ services:
       # That is the correct model for a single-tenant ledger or a trusted internal
       # consumer; what it must not be is the model a deployment arrives at by
       # configuring nothing.
-      KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: ${KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS:-false}
+      KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: ${KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS:-true}
       # THE INTERNAL-TOPIC ACKNOWLEDGEMENT, and it is read in every mode rather than
       # only in secure mode. "true" acknowledges that a subscriber granted
       # <prefix>.system reads Blnk's own error text verbatim, for the whole deployment,
@@ -495,16 +495,20 @@ services:
   #   bootstrapped and local bring-up fails outright rather than degrading.
   #
   #   SECURITY. 4.3.1 is the release this stack is TESTED against and it clears every
-  #   advisory floor below. Four advisories bear on this image; three have ranges firm
-  #   enough to pin against and the highest of those floors is 4.2.0. .env.example
+  #   advisory floor below. Four advisories bear on this image and all four now carry an
+  #   established range; the highest floor among them is this pin itself. .env.example
   #   carries the full per-advisory table at KAFKA_IMAGE, including what each one does
-  #   and why it does or does not reach this deployment. In short: CVE-2026-33558
-  #   (<=3.9.1, 4.0.0) leaks SCRAM credentials through DEBUG-level NetworkClient
-  #   logging and is the one that reaches this stack hardest, because provisioning calls
-  #   AlterUserScramCredentials; CVE-2026-35554 (<=3.9.1, <=4.0.1, <=4.1.1) misroutes
-  #   producer records to the wrong topic silently; CVE-2026-33557 (4.1.0-4.1.1) needs
-  #   OAUTHBEARER, which this stack does not enable; and CVE-2026-41115 is named there
-  #   without a range because none was verified.
+  #   and why it does or does not reach this deployment. In short: CVE-2026-41115
+  #   (4.0.0-4.3.0) validates Describe on GROUP where the documentation says Read, and
+  #   the ASF's determination is that Describe is correct and the DOCUMENTATION is what
+  #   gets corrected - so the remediation is an ACL review, recorded in
+  #   docs/kafka-operations.md beside the digest, and this pin is already above the
+  #   range; CVE-2026-33558 (<=3.9.1, 4.0.0) leaks SCRAM credentials through DEBUG-level
+  #   NetworkClient logging and is the one that reaches this stack hardest of the
+  #   credential advisories, because provisioning calls AlterUserScramCredentials;
+  #   CVE-2026-35554 (<=3.9.1, <=4.0.1, <=4.1.1) misroutes producer records to the wrong
+  #   topic silently; and CVE-2026-33557 (4.1.0-4.1.1) needs OAUTHBEARER, which this
+  #   stack does not enable.
   kafka:
     # OPT-IN, through the same mechanism the prometheus service already uses in this
     # file.

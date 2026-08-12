@@ -34,13 +34,9 @@ import (
 )
 
 // SlackNotification sends an error message to a Slack webhook.
-// It formats the error details and the current time into a Slack message payload.
 //
 // Parameters:
 // - err: The error to be reported via Slack.
-//
-// The function retrieves configuration for the Slack webhook URL, formats the error,
-// and sends it as a JSON payload to the Slack webhook.
 func SlackNotification(err error) {
 	// Build the Slack message payload with typed structs and json.Marshal so
 	// error text containing quotes, backslashes, or newlines is safely
@@ -134,24 +130,12 @@ func getWebhookSender() WebhookSender {
 
 // notifyErrorCompleted is called, if set, when NotifyError's goroutine has finished —
 // on every path, including the ones that dispatch nothing.
-//
-// NotifyError returns as soon as it has SPAWNED its work, so from the outside there is no
-// moment at which "the dispatch decision has been made" is observable — and the
-// assertions that matter most here are NEGATIVE ones ("an unconfigured deployment stays
-// silent", "both transports configured dispatch exactly once"), which a sleep-based test
-// would pass on a merely slow machine. So the goroutine announces its own completion.
-// Unset in production, where it costs one nil comparison per notified error, and set by a
-// test that then knows the decision is behind it before asserting anything.
 var (
 	notifyErrorCompletedMu sync.RWMutex
 	notifyErrorCompleted   func()
 )
 
 // setNotifyErrorCompleted installs — or clears, with nil — the completion callback.
-//
-// Unexported: it is a seam for this package's own tests, not an API. A caller outside the
-// package that wanted to know when a notification finished would be asking for a synchronous
-// notifier, which is a different function.
 func setNotifyErrorCompleted(callback func()) {
 	notifyErrorCompletedMu.Lock()
 	notifyErrorCompleted = callback
@@ -170,12 +154,9 @@ func announceNotifyErrorCompleted() {
 }
 
 // NotifyError sends an error notification through the configured notification system.
-// It logs the error locally and sends a notification via Slack (if configured).
 //
 // Parameters:
 // - systemError: The error to notify.
-//
-// This function runs the notification process asynchronously using a goroutine to avoid blocking.
 func NotifyError(systemError error) {
 	go func(systemError error) {
 		// Deferred, so that EVERY exit announces completion — including the early return on a
@@ -185,14 +166,6 @@ func NotifyError(systemError error) {
 
 		// ONE OPERATOR RECORD PER OCCURRENCE, and it is emitted here — before anything can
 		// fail or be skipped — so an error is never swallowed.
-		//
-		// One record rather than two, because whatever an error renders is disclosed once per
-		// record: a PostgreSQL error names schema, table, column and routine, and a broker
-		// error names internal addresses. This record is correlated, classified, bounded and
-		// stripped of control characters — a raw text printed verbatim lets a newline inside
-		// it forge a second entry in a line-oriented aggregator. The full text still reaches
-		// the operator, because a system error nobody can read is an undiagnosable outage;
-		// what the SUBSCRIBER receives is the frozen legacy body and nothing more.
 		correlationID := newCorrelationID()
 		operatorRecord := logrus.WithFields(logrus.Fields{
 			"correlation_id": correlationID,
@@ -251,16 +224,17 @@ func NotifyError(systemError error) {
 }
 
 // systemErrorEventType is the event name system.error is published under.
-//
-// A constant rather than a literal at the call site, because it is one of the thirteen
-// event strings the event catalogue routes on: model.EventCategory maps it to the
-// internal system category, and a typo here would route the event to the catch-all
-// category instead with nothing failing.
 const systemErrorEventType = "system.error"
 
-// The classified reasons a system error is reduced to. Every value a subscriber or an
-// operator can see in a system.error payload is one of these, and each says something
-// different about where the fault is without saying anything about the deployment.
+// The classified reasons a system error is reduced to, FOR THE OPERATOR LOG.
+//
+// The classification bounds what the LOG says: each value states something about where
+// the fault is without saying anything about the deployment. It does NOT bound what a
+// subscriber sees. systemErrorPayload carries systemError.Error() verbatim, because the
+// payload must match the legacy webhook body field for field, so a subscriber granted the
+// system topic reads the original error text — including whatever a driver or a client
+// library put in it. Classify the log; treat the payload as disclosure, and grant the
+// system topic as the entitlement decision it is.
 const (
 	// SystemErrorReasonPersistence — the database rejected or could not serve a
 	// statement. Includes constraint violations and connectivity alike, because from
@@ -294,10 +268,6 @@ const (
 
 // systemErrorSignatures maps a lowercase substring of an error's text to the reason it
 // implies, most specific first.
-//
-// Order is load-bearing. Authorization is checked before transport because a broker or
-// database can report both in one message and the authorization failure is the
-// actionable half — it will not clear on its own.
 var systemErrorSignatures = []struct {
 	signature string
 	reason    string
@@ -329,18 +299,6 @@ var systemErrorSignatures = []struct {
 }
 
 // classifySystemError reduces an error to one reason from the vocabulary above.
-//
-// The RETURN IS ALWAYS A VOCABULARY VALUE — never a fragment of the error, never the
-// error itself. That property is what makes the result safe to use as a log field, a
-// metric label or, should the payload ever be versioned to carry a summary instead of
-// the error, a payload value: no error, however constructed, can produce output that
-// describes the deployment.
-//
-// Parameters:
-//   - systemError error: the error being notified. Nil yields the unclassified reason.
-//
-// Returns:
-//   - string: one value from the SystemErrorReason* set.
 func classifySystemError(systemError error) string {
 	if systemError == nil {
 		return SystemErrorReasonUnclassified
@@ -364,18 +322,6 @@ func classifySystemError(systemError error) string {
 }
 
 // reasonForErrorCode classifies a typed apierror code.
-//
-// It reads the code's HTTP status rather than enumerating every code, so a code added
-// to apierror later is classified without an edit here. Enumerating them would mean
-// this function silently returning "" for every new code — the failure mode where a
-// growing vocabulary quietly degrades into unclassified.
-//
-// Parameters:
-//   - code apierror.ErrorCode: the typed code.
-//
-// Returns:
-//   - string: a reason, or "" when the status implies nothing more specific than the
-//     text matching would find.
 func reasonForErrorCode(code apierror.ErrorCode) string {
 	switch apierror.StatusForCode(code) {
 	case http.StatusUnauthorized, http.StatusForbidden:
@@ -393,17 +339,6 @@ func reasonForErrorCode(code apierror.ErrorCode) string {
 
 // systemErrorCode returns the typed apierror code an error carries, or "" when it
 // carries none.
-//
-// The code is safe to publish and worth publishing: it is drawn from a fixed vocabulary
-// declared in internal/apierror, it is the same value the HTTP API already returns to
-// callers for the same condition, and it is more precise than the reason. An untyped
-// error yields "" rather than a manufactured code.
-//
-// Parameters:
-//   - systemError error: the error being notified.
-//
-// Returns:
-//   - string: the error code, or "".
 func systemErrorCode(systemError error) string {
 	var apiErr apierror.APIError
 	if errors.As(systemError, &apiErr) {
@@ -414,11 +349,6 @@ func systemErrorCode(systemError error) string {
 }
 
 // maxLoggedErrorLength bounds an error's rendering in a log field, in runes.
-//
-// The value is generous because the point is not brevity but the existence of a CEILING: a
-// PostgreSQL driver error can embed a whole statement, a Kafka error a response body, and
-// neither has any upper bound at all. 512 runes is more than enough to identify any error
-// this package handles while making a pathological one incapable of dominating the log.
 const maxLoggedErrorLength = 512
 
 // logTruncationSuffix marks a rendering that was cut short, so a reader can tell a bounded
@@ -427,18 +357,6 @@ const logTruncationSuffix = "…[truncated]"
 
 // boundedErrorText renders an error for a log FIELD: control characters neutralised and
 // the length capped.
-//
-// Two independent problems, and neither is hypothetical for the errors this package
-// receives.
-//
-// UNBOUNDED LENGTH. There is no limit on how long an error's text may be.
-//
-// Parameters:
-//   - err error: the error to render. A nil error yields the empty string, which is how
-//     an absent error reads in a log field.
-//
-// Returns:
-//   - string: a single-line, length-capped rendering.
 func boundedErrorText(err error) string {
 	if err == nil {
 		return ""
@@ -471,48 +389,11 @@ func boundedErrorText(err error) string {
 
 // newCorrelationID returns the identifier that ties a system.error event to the log
 // line carrying the full error.
-//
-// uuid.NewString cannot fail in the way a caller must handle — it panics only if the
-// system entropy source is unavailable, which is not a condition an error notification
-// can meaningfully recover from — so there is no error to propagate here.
-//
-// Returns:
-//   - string: a fresh UUID.
 func newCorrelationID() string {
 	return uuid.NewString()
 }
 
 // systemErrorPayload builds the system.error event body.
-//
-// A LedgerEvent's payload must match the legacy webhook body
-// FIELD-FOR-FIELD, and the webhook body for system.error has always been these two
-// keys. Every subscriber's parser is written against them.
-//
-// What the concern DOES justify, and what is done instead:
-//
-//   - system.error routes to the blnk.system category, which NO SUBSCRIBER IS GRANTED
-//     BY DEFAULT — model.SubscriberGrantableEventCategories withholds it, for this
-//     payload's sake among others — so the audience for this body is the operator
-//     unless a deployment deliberately widens it. Widening takes two declarations that
-//     are hard to make by accident: the deployment sets
-//     KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true, and the subscriber's own grant then
-//     has to name the topic.
-//
-//   - The bounded classification — classifySystemError and systemErrorCode, both fixed
-//     vocabularies — is logged at the dispatch site alongside a correlation id, so an
-//     operator gets the diagnosis without the raw text being repeated across log sinks.
-//
-//   - error: systemError.Error(), verbatim. This is the value subscribers parse.
-//
-//   - time: time.Now(), as the original payload carried it. A time.Time rather than a
-//     formatted string, because that is what the legacy payload put in the map and what
-//     the JSON encoder therefore rendered.
-//
-// Parameters:
-//   - systemError error: the error being notified.
-//
-// Returns:
-//   - map[string]interface{}: the event payload, exactly as the legacy webhook body.
 func systemErrorPayload(systemError error) map[string]interface{} {
 	return map[string]interface{}{
 		"error": systemError.Error(),

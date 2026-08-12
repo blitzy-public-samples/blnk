@@ -57,6 +57,28 @@ data:
   # that is the whole reason it exists as its own key.
   KAFKA_SUBSCRIBER_BROKERS: ""
 
+  # ===================================================================
+  # THE BROKERS' OWN EXTERNAL ADDRESSES — read by kafka-statefulset.yaml, not by Blnk.
+  #
+  # Left commented out because an unset value and an empty value mean different things
+  # here: unset runs the broker with the in-cluster listener only, which is a complete
+  # and supported configuration, while a value present but short of one entry per replica
+  # makes a broker refuse to start rather than advertise an address it does not have.
+  #
+  # Set it when subscribers connect from OUTSIDE the cluster. kafka-service.yaml
+  # provisions one LoadBalancer per broker on 29092, and the address each receives is
+  # assigned by the cloud provider at apply time — which is why this repository cannot
+  # supply it. ONE COMMA-SEPARATED ENTRY PER REPLICA, in ordinal order, matching the
+  # kafka-external-<ordinal> Services:
+  #
+  #   KAFKA_EXTERNAL_ADVERTISED_HOSTS: "a.example.com,b.example.com,c.example.com"
+  #
+  # It is the brokers' advertised listener and NOT the list handed to subscribers: put
+  # the same addresses in KAFKA_SUBSCRIBER_BROKERS above for that. See the Kubernetes
+  # section of docs/kafka-operations.md.
+  # ===================================================================
+  # KAFKA_EXTERNAL_ADVERTISED_HOSTS: ""
+
   # WHETHER ANYTHING IN FRONT OF THE BROKERS AUTHORISES RECORD KEYS, which is what
   # decides whether a subscriber recording a partition_key_prefix can be issued a
   # credential at all.
@@ -116,7 +138,18 @@ data:
   # trusted internal consumer. What it must not be is the model a cluster reaches by
   # configuring nothing: in secure mode with neither declaration, issuance refuses with
   # 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED.
-  KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: "false"
+  #
+  # THIS MANIFEST DECLARES IT, because this manifest also sets BLNK_SERVER_SECURE=true.
+  # Shipping the pair as secure-plus-undeclared meant the reference production deployment
+  # answered 409 on POST /subscribers/{id}/kafka-credentials out of the box — the endpoint
+  # the requirement asks for, refused by the configuration that is supposed to demonstrate
+  # it. Declaring the model here is not a relaxation: it states the model the requirement
+  # mandates, on the deployment that implements it.
+  #
+  # Change it to "false" if this cluster has NOT decided its access model and you want
+  # issuance to stop until it has. For access narrower than a whole topic, narrow each
+  # subscriber's authorized_topics, or declare the key-scope enforcement mode above.
+  KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS: "true"
 
   # THE INTERNAL-TOPIC ACKNOWLEDGEMENT, and unlike the declaration above it is read in
   # every mode rather than only in secure mode.
@@ -242,13 +275,16 @@ data:
   # registry costs nothing, because the sweep stops when the registry runs out; a value
   # below it costs coverage.
   #
-  # TWO NAMES, ONE KNOB. EVENT_METRICS_SUBSCRIBER_BUDGET sets the same ceiling and is
-  # the name the alert remediations use.
+  # TWO NAMES, ONE KNOB, AND THIS ONE IS CANONICAL. EVENT_METRICS_SUBSCRIBER_BUDGET is an
+  # accepted alias of it, kept because it was published first; the key below is left
+  # commented out for that reason. Set either. Set both to DIFFERENT values and the
+  # canonical name wins, with a start-up warning naming both variables and both values.
   #
   # 200 matches the application default and is stated explicitly here so the deployed
   # budget is greppable rather than implicit. Zero or a negative value is rejected in
   # favour of the default: a budget of zero measures nothing while reporting no error.
   RELAY_SUBSCRIBER_METRICS_BUDGET: "200"
+  # EVENT_METRICS_SUBSCRIBER_BUDGET: "200"
 
   # How many days an outbox row is kept before the purge removes it.
   #
@@ -289,9 +325,13 @@ data:
   #      skipped, or spans a Friday-to-Monday gap still has both sides.
   #   3. It is well inside the broker's 7 days.
   #   4. At 500 events a second it is 439-655 GiB of steady state depending on payload
-  #      size, which is what the 900Gi pg-data volume is sized for. Raising it requires
-  #      raising that volume in the same change, and — above 7 days —
-  #      log.retention.hours in kafka-statefulset.yaml. Measure your own row cost.
+  #      size. THE pg-data VOLUME MUST BE SIZED FOR THAT FIGURE BEFORE THE FIRST APPLY:
+  #      postgres-statefulset.yaml ships the upstream 10Gi development request and is
+  #      deliberately not sized for any event rate. Raising this period requires raising
+  #      that volume in the same change, and — above 7 days — log.retention.hours in
+  #      kafka-statefulset.yaml. See "Retention Sizing" in docs/kafka-operations.md for
+  #      the arithmetic, the immutable-volumeClaimTemplates procedure and the measured
+  #      per-row cost to check against your own data.
   # ===================================================================
   # TWO POPULATIONS, TWO LIFECYCLES:
   #

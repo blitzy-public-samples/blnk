@@ -340,13 +340,16 @@ func TestDeadLetterEnvelope_TotalCountIsDocumentedAsConditional(t *testing.T) {
 	require.NoError(t, err)
 	text := string(runbook)
 
-	assert.NotContains(t, text, "which is present either way",
-		"docs/kafka-operations.md must not claim total_count is present either way: the field "+
-			"is omitempty on the response type, so the key is omitted unless include_count is "+
-			"supplied")
+	// The runbook must name the parameter that makes the key appear. That is a query
+	// parameter name rather than a sentence, so the surrounding text can be rewritten
+	// without failing here, while a runbook that stopped mentioning the option — and so
+	// described the key as unconditional — still does.
+	assert.Contains(t, text, "include_count",
+		"docs/kafka-operations.md must name include_count where it documents total_count: the field "+
+			"is omitempty on the response type, so the key is absent unless the option is supplied")
 
-	// And the response type it describes must still be omitempty, so the corrected sentence
-	// cannot become wrong in the other direction.
+	// And the response type it describes must still be omitempty, so the documented
+	// condition cannot become wrong in the other direction.
 	field, ok := reflect.TypeOf(DeadLetterPageResponse{}).FieldByName("TotalCount")
 	require.True(t, ok, "DeadLetterPageResponse must carry TotalCount")
 	assert.Contains(t, field.Tag.Get("json"), "omitempty",

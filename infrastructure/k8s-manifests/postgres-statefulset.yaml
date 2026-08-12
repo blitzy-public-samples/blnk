@@ -54,50 +54,10 @@ spec:
               subPath: pgdata
       restartPolicy: Always
   volumeClaimTemplates:
-    # SIZED FROM THE MEASURED COST OF blnk.event_outbox, NOT FROM A ROUND NUMBER. A retention
-    # period is not a storage policy on its own, and the volume that loses if the two
-    # disagree is the one the LEDGER lives on.
-    #
-    # THE DERIVATION, from the measurement and the query recorded in sql/1781248800.sql. Both
-    # columns are the same event type; they differ only in the size of the caller's payload:
-    #
-    #                              minimal body   populated body
-    #     measured row cost, on disk  2,427 bytes   3,619 bytes  (heap + TOAST + 17 indexes)
-    #     load-tested throughput        500 events/second
-    #     rows/day                   43,200,000
-    #     bytes/day                        98 GiB      146 GiB
-    #     retention                          3 days   (RELAY_EVENT_RETENTION_DAYS)
-    #     bloat/vacuum factor              1.5x       (every row is UPDATEd twice, non-HOT)
-    #     ---------------------------------------------------------------------------------
-    #     event outbox steady state       439 GiB      655 GiB
-    #
-    # 900Gi is the POPULATED figure — the one that has to fit — plus roughly a fifth of the
-    # volume left for everything else on it: the ledger's own tables and indexes, WAL up to
-    # max_wal_size, and the filesystem's reserve. Measure your own row cost and confirm it
-    # before production.
-    #
-    # THE LEDGER'S GROWTH IS NOT BOUNDED BY ANY OF THIS. Transactions and balances are never
-    # purged, so their tables grow for the life of the deployment and only YOU can project
-    # them from your own transaction rate and history requirements. Do that projection before
-    # going to production and add it to the figures above, which are the part this feature is
-    # responsible for and the part that has a ceiling.
-    #
-    # RESCALING, in either direction:
-    #
-    #   * a different event rate scales linearly —
-    #     `GiB/day = rate x 86400 x measured_bytes_per_row / 1024^3`;
-    #   * each extra retention day is one day's worth of that figure times 1.5;
-    #   * a deployment running at, say, 20 events/second needs 5.4 GiB/day on the full-bodied
-    #     figure, so the outbox share is 24 GiB and this volume is far larger than it has to
-    #     be. Size it down.
-    #
-    # Growing it later requires a StorageClass with allowVolumeExpansion: true. Set that up
-    # BEFORE you need it: expanding a claim whose class forbids it means a restore, and the
-    # moment you need the space is the moment the ledger has stopped accepting writes.
     - metadata:
         name: pg-data
       spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 900Gi
+            storage: 10Gi 
