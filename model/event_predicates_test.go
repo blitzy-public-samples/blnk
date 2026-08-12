@@ -31,29 +31,20 @@ func eventPredicatesInstant() time.Time {
 	return time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
 }
 
-// This file unit-tests the PURE DECISION FUNCTIONS of the event contract, in the package that
-// owns them.
+// This file unit-tests the PURE DECISION FUNCTIONS of the event contract, in the
+// package that owns them.
 //
-// # Why it exists
+// Every predicate here was exercised only from the root blnk package — through a
+// service, a relay or a live broker.
 //
-// Every predicate here was exercised only from the root blnk package — through a service, a
-// relay or a live broker. That is the right place to prove the behaviour those layers deliver,
-// and it is the wrong place to be the ONLY proof of a predicate, for two reasons.
+// The first is diagnostic.
 //
-// The first is diagnostic. When IsSubscriberGrantableTopicName stops refusing "*", the failure
-// surfaces as an integration test somewhere else reporting that a credential was issued, and the
-// distance between that symptom and its cause is the whole subscriber service.
+// The second is that the repository gates this package with mutation testing, and
+// gremlins scores only mutants a test in the package REACHES.
 //
-// The second is that the repository gates this package with mutation testing, and gremlins scores
-// only mutants a test in the package REACHES. A predicate no test here calls contributes nothing
-// to the score either way — its mutants are reported "not covered" and excluded from the efficacy
-// figure — so the gate that is supposed to protect the model was silently not looking at these
-// functions at all.
-//
-// Several of these are security decisions: which topics a subscriber may be granted, whether a
-// recorded isolation boundary is enforceable, whether a name is a topic this deployment owns.
-// Each is tested with its boundary cases beside the ordinary ones, because a predicate is only
-// as good as its edges.
+// Several of these are security decisions: which topics a subscriber may be granted,
+// whether a recorded isolation boundary is enforceable, whether a name is a topic this
+// deployment owns.
 
 // TestEventOutboxStatusVocabulary_IsClosedAndAgreesWithItself covers the four status helpers
 // together, because their value is in AGREEING: a status the CHECK constraint permits that
@@ -74,13 +65,13 @@ func TestEventOutboxStatusVocabulary_IsClosedAndAgreesWithItself(t *testing.T) {
 		"EventOutboxStatuses must be the whole vocabulary the migration's CHECK constraint permits; a "+
 			"status missing here is a status the statistics endpoint cannot report")
 
-	// AND IT MUST BE THE WHOLE CLOSED SET, checked by size against the predicate rather than
-	// by another hand-written list. The enumerated slice and the closed set behind
+	// AND IT MUST BE THE WHOLE CLOSED SET, checked by size against the predicate rather
+	// than by another hand-written list. The enumerated slice and the closed set behind
 	// IsKnownEventOutboxStatus are two spellings of one vocabulary, and they drifted: the
 	// slice omitted webhook_pending while the predicate accepted it, so a state the relay
 	// really writes was absent from everything driven off the slice — including the
 	// statistics response — and the loop below could not notice, because it only walks the
-	// slice. Comparing the counts is what makes the omission fail.
+	// slice.
 	known := 0
 	for _, status := range []string{
 		EventOutboxStatusPending, EventOutboxStatusProcessing, EventOutboxStatusWebhookPending,
@@ -101,12 +92,10 @@ func TestEventOutboxStatusVocabulary_IsClosedAndAgreesWithItself(t *testing.T) {
 			"%q is in the vocabulary but IsKnownEventOutboxStatus rejects it", status)
 	}
 
-	// "dlt_pending" is in this list deliberately. It was a status once, and it was impossible to
-	// reach: nothing in the relay ever wrote it, while the migration's CHECK constraint, two
-	// partial indexes and the dead-letter listing all carried the vocabulary for it. What the
-	// exhaustion arm really writes is 'failed' with dlt_topic still NULL, and that pair is what
-	// the repair claim selects on. Asserting the literal is REJECTED is what keeps the retired
-	// spelling from being reintroduced on one side of that agreement only.
+	// "dlt_pending" is in this list deliberately. It was a status once, and it was
+	// impossible to reach: nothing in the relay ever wrote it, while the migration's CHECK
+	// constraint, two partial indexes and the dead-letter listing all carried the
+	// vocabulary for it.
 	for _, unknown := range []string{
 		"", " ", "PENDING", "pending ", "done", "dead-lettered", "replay", "dlt_pending",
 	} {
@@ -124,9 +113,9 @@ func TestEventOutboxStatusVocabulary_IsClosedAndAgreesWithItself(t *testing.T) {
 			"IsTerminalEventOutboxStatus(%q) must agree with the terminal list", status)
 	}
 
-	// The two that matter most, spelled out: 'failed' is NOT terminal, because a failed row still
-	// owes a dead-letter write and the relay's sweep must keep finding it; 'replaying' is not
-	// terminal for the same shape of reason.
+	// The two that matter most, spelled out: 'failed' is NOT terminal, because a failed
+	// row still owes a dead-letter write and the relay's sweep must keep finding it;
+	// 'replaying' is not terminal for the same shape of reason.
 	assert.False(t, IsTerminalEventOutboxStatus(EventOutboxStatusFailed),
 		"a failed row still owes its dead-letter write; calling it terminal is what strands it")
 	assert.False(t, IsTerminalEventOutboxStatus(EventOutboxStatusReplaying),
@@ -165,11 +154,11 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 
 		// Inside the namespace but naming no category Blnk has. These are the cases that
 		// distinguish "the name is in our namespace" from "the name is one of ours": a topic
-		// somebody created under our prefix is still not a topic we own, and treating it as ours
-		// would let a stray name reach a writer and a dead-letter composition.
+		// somebody created under our prefix is still not a topic we own, and treating it as
+		// ours would let a stray name reach a writer and a dead-letter composition.
 		"blnk.unknown":            "the namespace is right but there is no such category",
 		"blnk.quarantine":         "the catalogue is four categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
-		"blnk.ledgers":            "a withdrawn fifth category: it is not in the catalogue, so it is not a topic Blnk owns, creates or writes to",
+		"blnk.ledgers":            "not a category in the catalogue, so not a topic Blnk owns, creates or writes to",
 		"blnk.transaction":        "the singular is not the category name",
 		"blnk.orders":             "a category this deployment does not have",
 		"blnk.transactions.other": "a deeper name is not a category topic",
@@ -188,22 +177,20 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		"an empty prefix must not admit a foreign name")
 }
 
-// TestValidateSubscriberTopics_RefusesEveryShapeThatCouldReachAnACL covers the grant validator
-// and, through it, the topic-name legality check.
+// TestValidateSubscriberTopics_RefusesEveryShapeThatCouldReachAnACL covers the grant
+// validator and, through it, the topic-name legality check.
 //
-// The list it validates is composed into a Postgres array literal and into Kafka ACL resource
-// names, so a character it lets through is a character in both. The count bound matters for the
-// same reason from the other side: a grant of unbounded length is an unbounded number of ACL
-// bindings created inside one issuance's five-second budget.
+// The list it validates is composed into a Postgres array literal and into Kafka ACL
+// resource names, so a character it lets through is a character in both.
 func TestValidateSubscriberTopics_RefusesEveryShapeThatCouldReachAnACL(t *testing.T) {
 	t.Run("an ordinary grant is accepted", func(t *testing.T) {
 		require.NoError(t, ValidateSubscriberTopics([]string{"blnk.transactions", "blnk.balances"}))
 	})
 
 	t.Run("an empty grant is accepted here and refused where it means something", func(t *testing.T) {
-		// Emptiness is not this function's decision: a subscriber may legitimately be registered
-		// before its grant is known, and the issuance path is what refuses to mint a credential
-		// for an empty grant.
+		// Emptiness is not this function's decision: a subscriber may legitimately be
+		// registered before its grant is known, and the issuance path is what refuses to mint
+		// a credential for an empty grant.
 		require.NoError(t, ValidateSubscriberTopics(nil))
 		require.NoError(t, ValidateSubscriberTopics([]string{}))
 	})
@@ -257,7 +244,7 @@ func TestValidateSubscriberTopics_RefusesEveryShapeThatCouldReachAnACL(t *testin
 }
 
 // TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming covers the four state predicates on
-// the registry row, including C-08's and C-10's.
+// the registry row, including the migration-stamp and key-scope predicates.
 func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 	t.Run("a nil subscriber answers false to everything", func(t *testing.T) {
 		var absent *EventSubscriber
@@ -270,13 +257,14 @@ func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 	})
 
 	t.Run("RequiresGatewayDelivery states which path this subscriber's records take", func(t *testing.T) {
-		// The predicate decides the SHAPE OF THE GRANT and what the credential contract says. Kafka
-		// has no key-level ACL resource, so a recorded prefix is a boundary kept OUTSIDE the broker:
-		// such a subscriber is provisioned without topic Read, and its records are delivered
-		// key-filtered by the component the deployment declared — or, where none is declared, it is
-		// refused a credential entirely rather than issued a wider one. Its edges are therefore the
-		// difference between withholding record access from a subscriber that asked for a narrowing
-		// and granting a whole shared topic to one that did.
+		// The predicate decides the SHAPE OF THE GRANT and what the credential contract says.
+		// Kafka has no key-level ACL resource, so a recorded prefix is a boundary kept
+		// OUTSIDE the broker: such a subscriber is provisioned without topic Read, and its
+		// records are delivered key-filtered by the component the deployment declared — or,
+		// where none is declared, it is refused a credential entirely rather than issued a
+		// wider one. Its edges are therefore the difference between withholding record access
+		// from a subscriber that asked for a narrowing and granting a whole shared topic to
+		// one that did.
 		none := &EventSubscriber{}
 		assert.False(t, none.RequiresGatewayDelivery(),
 			"no recorded prefix means the topic grant is the boundary, so the broker delivers")
@@ -325,15 +313,10 @@ func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 	})
 }
 
-// TestEventTypeForTransactionStatus_CoversEverySevenNamesIncludingTheCommitFallThrough is
-// requirement R-1's transaction half.
+// TestEventTypeForTransactionStatus_CoversEverySevenNamesIncludingTheCommitFallThrough
+// is the requirement transaction half.
 //
-// The COMMIT case is asserted as transaction.unknown ON PURPOSE. That is the pre-existing
-// behaviour of the legacy mapping, the dual-delivery comparison asserts both transports carry
-// identical bytes, and "correcting" it inside this change would make that comparison fail for a
-// reason unrelated to the transport. It is recorded in docs/event-streaming.md so it can be
-// changed deliberately, and this assertion is what makes such a change a visible decision rather
-// than an accident.
+// The COMMIT case is asserted as transaction.unknown ON PURPOSE.
 func TestEventTypeForTransactionStatus_CoversEverySevenNamesIncludingTheCommitFallThrough(t *testing.T) {
 	cases := map[string]string{
 		"QUEUED":    EventTypeTransactionQueued,
@@ -405,12 +388,11 @@ func TestEventIdentityAndDerivation_MakeACaptureIdempotent(t *testing.T) {
 		require.True(t, ok, "a ledger payload carries an identity")
 		assert.Equal(t, "ldg_identity", identity)
 
-		// The remaining two POINTER shapes, which are the shapes the producers
-		// actually pass: identity.created carries *Identity and balance.created
-		// carries *Balance. Both arms went unexercised here, so the mutation gate
-		// reported them NOT COVERED — and an id derived from the wrong field, or not
-		// derived at all, is a duplicate-suppression key that stops working, which
-		// is the one failure the derived id exists to prevent.
+		// The remaining two POINTER shapes, which are the shapes the producers actually pass:
+		// identity.created carries *Identity and balance.created carries *Balance. Both arms
+		// went unexercised here, so the mutation gate reported them NOT COVERED — and an id
+		// derived from the wrong field, or not derived at all, is a duplicate-suppression key
+		// that stops working, which is the one failure the derived id exists to prevent.
 		subject := &Identity{IdentityID: "idt_identity"}
 		identity, ok = EventIdentityFor("identity.created", subject)
 		require.True(t, ok, "an identity payload carries an identity")
@@ -474,9 +456,9 @@ func TestEventIdentityAndDerivation_MakeACaptureIdempotent(t *testing.T) {
 
 // TestGeneratedIdentifiers_AreCanonicalByConstruction covers the two generators.
 //
-// Both feed values that are copied verbatim into a Kafka principal and a consumer group id, so an
-// identifier that cannot be canonicalised cannot be provisioned at all — and the generator is the
-// one place that guarantee can be made rather than checked.
+// Both feed values that are copied verbatim into a Kafka principal and a consumer group
+// id, so an identifier that cannot be canonicalised cannot be provisioned at all — and
+// the generator is the one place that guarantee can be made rather than checked.
 func TestGeneratedIdentifiers_AreCanonicalByConstruction(t *testing.T) {
 	t.Run("a generated subscriber id is canonical and prefixed", func(t *testing.T) {
 		id := GenerateSubscriberID()
@@ -536,30 +518,23 @@ func TestIsCanonicalUUID_AcceptsOnlyTheCanonicalForm(t *testing.T) {
 	}
 }
 
-// TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic is the allowlist's
-// contract from both directions: exactly what it admits, and everything of Blnk's that it does
-// not.
+// TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic is the
+// allowlist's contract from both directions: exactly what it admits, and everything of
+// Blnk's that it does not.
 //
-// The set is exactly the THREE TENANT categories the requirement names. The topic catalogue has a
-// fourth, `blnk.system`, and it is deliberately NOT in this list.
+// The set is exactly the THREE TENANT categories the requirement names.
 //
-// TWO CLASSES OF NAME ARE WITHHELD, and both are operator surfaces read under the master key:
+// TWO CLASSES OF NAME ARE WITHHELD, and both are operator surfaces read under the
+// master key:
 //
-//   - Every `<topic>.dlt`. A dead-letter record carries the original payload PLUS Blnk's
-//     failure metadata — broker error text, attempt windows, internal topic names — and is
-//     triaged through the master-key-gated dead-letter API. A subscriber that wants its own
-//     dead-lettering builds its own topic under its own namespace, which is what the published
-//     `<topic>.dlt` convention exists to keep clear of. No acknowledgement makes a `.dlt` name
-//     grantable.
-//   - `blnk.system`. It carries `system.error`, whose frozen payload renders Blnk's error text
-//     verbatim, and it is the catalogue's catch-all, so a grant of it would also stand over
-//     every event type nobody has catalogued yet. It is absent from THIS list — the default one —
-//     and reachable only through SubscriberPrivilegedTopics, which takes a deployment-level
-//     acknowledgement rather than an operator rule one PUT can violate.
+//   - Every `<topic>.dlt`. A dead-letter record carries the original payload PLUS
+//     Blnk's failure metadata — broker error text, attempt windows, internal topic
+//     names — and is triaged through the master-key-gated dead-letter API.
+//   - `blnk.system`. It carries `system.error`, whose frozen payload renders Blnk's
+//     error text verbatim, and it is the catalogue's catch-all, so a grant of it would
+//     also stand over every event type nobody has catalogued yet.
 //
-// `ledger.created` shares that topic, so it depends on that acknowledgement too. That is the
-// published four-category contract, and the cost is documented for subscribers rather than
-// removed by adding a category: a fifth `blnk.ledgers` existed here once and was withdrawn.
+// `ledger.created` shares that topic, so it depends on that acknowledgement too.
 //
 // Grantable is not the same as granted: this list is what MAY be granted, and any given
 // subscriber holds only the subset recorded on it.
@@ -604,9 +579,9 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 			"%q must NOT be grantable: %s", topic, because)
 	}
 
-	// The grantable set is a strict subset of the namespace: everything in it is Blnk's, and not
-	// everything of Blnk's is in it. Both halves are asserted so a future widening cannot pass
-	// unnoticed.
+	// The grantable set is a strict subset of the namespace: everything in it is Blnk's,
+	// and not everything of Blnk's is in it. Both halves are asserted so a future widening
+	// cannot pass unnoticed.
 	for _, topic := range grantable {
 		assert.Truef(t, IsBlnkEventTopic(topic, prefix), "%q must be inside the owned namespace", topic)
 	}
@@ -623,16 +598,15 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 	}
 }
 
-// TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies pins the policy that used to exist
-// twice.
+// TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies pins the policy that used
+// to exist twice.
 //
-// The https, host, whitespace and internal-destination rules were implemented independently in the
-// repository and in the request DTO, each with its own destination classifier and its own wording.
-// One column, two rules: a service, CLI or migration caller reaching the repository directly was
-// judged by a different standard from an HTTP caller, and the same rejected host produced two
-// different reason phrases depending on which door the request arrived through.
+// The https, host, whitespace and internal-destination rules were implemented
+// independently in the repository and in the request DTO, each with its own destination
+// classifier and its own wording.
 //
-// This test is where the rule now lives, so both callers inherit it and neither can drift.
+// This test is where the rule now lives, so both callers inherit it and neither can
+// drift.
 func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
 	t.Run("an absent endpoint is acceptable and means clear the record", func(t *testing.T) {
 		// The column is nullable precisely so "no endpoint" and "this endpoint" stay
@@ -687,8 +661,8 @@ func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
 
 	t.Run("every spelling of an internal destination is refused", func(t *testing.T) {
 		// A webhook URL is third-party input that Blnk itself dials, which makes it a
-		// server-side request forgery vector straight at the cloud metadata endpoint and at every
-		// service that trusts the network rather than the caller.
+		// server-side request forgery vector straight at the cloud metadata endpoint and at
+		// every service that trusts the network rather than the caller.
 		internal := map[string]string{
 			"loopback literal":          "https://127.0.0.1/blnk",
 			"loopback by name":          "https://localhost/blnk",
@@ -732,8 +706,8 @@ func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
 		// 256 by a CHECK, each topic at 249 by Kafka — and this one was not: a
 		// 100,020-character https URL was accepted and stored. No security consequence, since
 		// the destination is validated and the surface is master-key gated behind a body cap,
-		// but an unbounded column only stays harmless while nothing reads it, and this one is a
-		// future request sink.
+		// but an unbounded column only stays harmless while nothing reads it, and this one is
+		// a future request sink.
 		prefix := "https://hooks.example.com/"
 		atLimit := prefix + strings.Repeat("a", MaxWebhookURLLength-len(prefix))
 		require.Len(t, atLimit, MaxWebhookURLLength)
@@ -756,8 +730,8 @@ func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
 
 	t.Run("an over-long URL is refused without being parsed", func(t *testing.T) {
 		// The refusal has to precede url.Parse: parsing a 100 KB string is work spent on a
-		// value that was never going to be accepted. It is observable through the ANSWER —
-		// a value that is both over-length and unparseable is refused for its length.
+		// value that was never going to be accepted. It is observable through the ANSWER — a
+		// value that is both over-length and unparseable is refused for its length.
 		message, reason := ValidateWebhookURL("https://exa mple.com/" + strings.Repeat("z", 100000))
 		require.NotEmpty(t, message)
 		assert.Contains(t, message, "too long",

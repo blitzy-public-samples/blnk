@@ -534,14 +534,9 @@ func TestDeleteIdentity_QueryError(t *testing.T) {
 	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
 }
 
-// TestCreateIdentity_CommitsTheEventWithTheIdentity is requirement R-2 for identity creation,
-// and like its ledger counterpart the assertion is the SHAPE OF THE TRANSACTION.
-//
-// identity.created used to be inserted from a goroutine after CreateIdentity had committed, so a
-// crash in between left an identity no subscriber would hear about. The ordered expectations pin
-// the repair — BEGIN, the identity INSERT, the event INSERT, COMMIT — and moving the event
-// insert back out of the transaction breaks only that ordering, which is why it is what is
-// asserted.
+// TestCreateIdentity_CommitsTheEventWithTheIdentity is the requirement for identity
+// creation, and like its ledger counterpart the assertion is the SHAPE OF THE
+// TRANSACTION.
 func TestCreateIdentity_CommitsTheEventWithTheIdentity(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
@@ -600,9 +595,10 @@ func TestCreateIdentity_APreparerFailureCreatesNoIdentity(t *testing.T) {
 		})
 
 	require.Error(t, err, "the preparer's failure must be reported rather than swallowed")
-	// The returned value is deliberately not asserted to be empty: every error path in this
-	// method returns the identity alongside the error, and a caller must read err. What matters
-	// is that NOTHING WAS COMMITTED, which the rollback expectation below is what proves.
+	// The returned value is deliberately not asserted to be empty: every error path in
+	// this method returns the identity alongside the error, and a caller must read err.
+	// What matters is that NOTHING WAS COMMITTED, which the rollback expectation below is
+	// what proves.
 	assert.NoError(t, mock.ExpectationsWereMet(),
 		"the identity INSERT must be rolled back rather than left committed without its event")
 }

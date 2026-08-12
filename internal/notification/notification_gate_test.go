@@ -477,7 +477,7 @@ func TestNotifyError_KafkaConfiguredWithNoSenderRegistered_DoesNotPanic(t *testi
 //
 // # The shape asserted here is the FROZEN LEGACY one, and the name means what it says
 //
-// Requirement R-8 requires a LedgerEvent's payload to match today's webhook body
+// The payload contract requires a LedgerEvent's payload to match today's webhook body
 // FIELD-FOR-FIELD, and the webhook body for system.error has always been two keys: the
 // rendered error and the time. Every subscriber's parser is written against them, so the
 // migration must move the transport and leave the body alone — a subscriber re-points its

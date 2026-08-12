@@ -9,10 +9,10 @@ Apache 2.0
  * This scenario offers ledger mutations at a constant request rate and then decides two
  * acceptance criteria of the event-streaming pipeline:
  *
- *   V-1  500 events/sec sustained producer throughput, and a p99 outbox-to-Kafka publish
- *        latency under 2 seconds for non-retried events.
- *   V-3  under 0.1% of events reach a dead-letter topic over a 30-minute run at 500
- *        events/sec against a healthy broker.
+ *   - THROUGHPUT AND LATENCY: 500 events/sec sustained producer throughput, and a p99
+ *     latency under 2 seconds for non-retried events.
+ *   - DEAD-LETTER RATE: under 0.1% of events reach a dead-letter topic over a 30-minute
+ *     run at 500 events/sec against a healthy broker.
  *
  * Three properties of the measurement are load-bearing, because each one is a way the
  * verdicts could otherwise be certified from the wrong number:
@@ -39,7 +39,7 @@ Apache 2.0
  *   - THE UNSETTLED TAIL BELONGS INSIDE THE POPULATION. When the load stops, the relay is
  *     still working through whatever it has claimed and whatever is still pending. Reading
  *     /metrics at that instant excludes those events from the published counter, from the
- *     dead-letter ratio's population and from the latency histogram — which flatters V-3,
+ *     dead-letter ratio's population and from the latency histogram — which flatters the rate,
  *     since a dead-letter is precisely what a not-yet-terminal event may still become. So both
  *     ends of the window carry a settling gate that WAITS, under a bounded budget, and the run
  *     fails closed if a budget expires with rows still outstanding.
@@ -49,14 +49,15 @@ Apache 2.0
  *     dead-letter write is still owed, and `webhook_pending` rows, are published only on
  *     blnk_events_repair_backlog. The first is the one that matters to a verdict, because a
  *     `failed` row has not yet incremented blnk_events_dead_lettered_total — so treating the
- *     outbox as drained while such rows remain removes them from V-3's NUMERATOR. A gate that
- *     can read only the gauge therefore does not establish quiescence: it fails with
+ *     outbox as drained while such rows remain removes them from the rate's NUMERATOR. A
+ *     gate that can read only the gauge therefore does not establish quiescence: it fails with
  *     REASON_SETTLEMENT_STATE_UNAVAILABLE, whose remedy is a master key rather than a bigger
  *     budget, and the gauge stands as incomplete fallback evidence only.
- *   - THE LATENCY VERDICT HAS EXACTLY ONE ADMISSIBLE SOURCE. V-1's p99 is read from
+ *   - THE LATENCY VERDICT HAS EXACTLY ONE ADMISSIBLE SOURCE. The p99 is read from
  *     capture-to-dispatch and from nothing else. `publish_duration` measures a strictly
  *     shorter interval, so certifying the target from it would be optimistic; when
- *     capture-to-dispatch is unavailable, V-1 is INVALIDATED rather than substituted.
+ *     capture-to-dispatch is unavailable, the latency verdict is INVALIDATED rather than
+ *     substituted.
  *
  * ALL THREE VERDICTS ARE READ FROM THE SERVER'S /metrics ENDPOINT, NEVER FROM k6's OWN
  * TIMINGS. That distinction is the whole point of this file, so it is worth stating why:
@@ -91,15 +92,15 @@ Apache 2.0
  *     it is reported as the settlement gap against the published count rather than being
  *     substituted for it. The two converge at the sunset.
  *
- * TWO THINGS DEGRADE A RUN RATHER THAN BEING PAPERED OVER, and both used to be reported
- * beside a verdict that still passed:
+ * TWO THINGS DEGRADE A RUN RATHER THAN BEING PAPERED OVER, instead of being reported beside
+ * a verdict that still passes:
  *
- *   - THE LATENCY SERIES IS NOT SUBSTITUTABLE. V-1 is read from
+ *   - THE LATENCY SERIES IS NOT SUBSTITUTABLE. The verdict is read from
  *     `blnk_events_capture_to_dispatch_duration_seconds` and from nothing else. The broker
  *     publish duration measures claim-to-acknowledgement, which excludes the outbox row's
  *     wait for the next poll tick — so a relay an hour behind reports the same sub-second p99
- *     as an idle one. It used to be a recorded fallback; the record made the substitution
- *     visible but the verdict still PASSED from the shorter interval. It is now a diagnostic
+ *     as an idle one. Recording the substitution would make it visible while the verdict
+ *     still PASSED from the shorter interval, so it is a diagnostic
  *     that no verdict can read, and an absent capture series fails the run.
  *   - A RESTART INVALIDATES EVERY DELTA. Each figure is the difference between two readings of
  *     a monotonic counter, which means nothing unless both come from the same process.
@@ -109,8 +110,8 @@ Apache 2.0
  *     absent process marker all withhold the verdict gauges instead of recording a number
  *     computed across two populations.
  *
- * TWO PROPERTIES OF V-1 CANNOT BE ESTABLISHED FROM A SINGLE PAIR OF SCRAPES, and each has
- * its own machinery below:
+ * TWO PROPERTIES OF THE THROUGHPUT TARGET CANNOT BE ESTABLISHED FROM A SINGLE PAIR OF
+ * SCRAPES, and each has its own machinery below:
  *
  *   - "SUSTAINED 500 events/sec" is not an average. A run that published nothing for fifteen
  *     minutes and then 1000/sec for fifteen minutes averages 500 and sustained it at no
@@ -129,7 +130,7 @@ Apache 2.0
  *
  * Every verdict carries its provenance — the exact Prometheus series it was computed from,
  * and for the latency figure the bucket boundary it landed in — into the summary JSON under
- * the top-level `blnk_event_streaming` key, so a reviewer can confirm at a glance which
+ * the top-level `blnk_event_streaming` key, so a reader can confirm at a glance which
  * series produced which number. The verdicts themselves are k6 thresholds on custom
  * metrics, which is what makes them render as pass/fail rows in the existing dashboard with
  * no change to anything under tools/.
@@ -162,29 +163,15 @@ import { Counter, Gauge, Rate, Trend } from "k6/metrics";
 // mangle. See the LEDGER_PAIRS line in logMeasurement.
 import encoding from "k6/encoding";
 
-// uuidv4 and textSummary are DELIBERATELY NOT IMPORTED. They were imported from the jslib CDN,
-// and both imports are gone rather than pinned — see the note below for why, and for the local
-// reimplementations that replace them. Restoring either import here would restore the finding:
-// the two declarations below would also become duplicate lexical bindings, which is an early
-// error the ESM parser reports and the CommonJS syntax check does not.
+// uuidv4 and textSummary are DELIBERATELY NOT IMPORTED. They were imported from the
+// jslib CDN, and both imports are gone rather than pinned — see the note below for why,
+// and for the local reimplementations that replace them. Restoring either import here
+// reintroduce the failure: the two declarations below would also become duplicate
+// lexical bindings, which is an early error the ESM parser reports and the CommonJS
+// syntax check does not.
 
-// --- Local helpers, deliberately not imported -----------------------------------------
-//
-// `uuidv4` and `textSummary` used to be imported from the jslib CDN. k6 resolves a remote
-// import by FETCHING AND EXECUTING it in the same VU runtime as the rest of this file, so
-// those two URLs were arbitrary third-party code running with everything this scenario
-// holds. That matters more here than in the sibling scenarios: this is the only file in the
-// directory carrying three credentials at once — API_KEY for the transaction endpoint,
-// METRICS_BEARER_TOKEN for /metrics, and MASTER_KEY for the master-key-gated /events/stats
-// probe. Nor is such an import pinned by content: the URL names a version, but nothing
-// verifies that the bytes served under it today are the bytes that were reviewed.
-//
-// Both helpers are small and are reimplemented below, so there is no remote module left to
-// pin and nothing is fetched at all. That also makes the scenario runnable on an isolated
-// network, which a load generator sitting next to the ledger it measures often is.
-//
-// The sibling scenarios in this directory still import `uuidv4` remotely. They are outside
-// this change and each carries only an API key, but the same reasoning applies to them.
+// --- Local helpers, deliberately not imported
+// -----------------------------------------
 
 /**
  * uuidv4 returns a random RFC 4122 version 4 UUID.
@@ -250,7 +237,7 @@ function paint(text, color, enabled) {
  * formatValue renders one metric number, choosing a unit from what the metric contains.
  *
  * k6 reports durations in milliseconds and everything else as a bare number. Sub-second
- * durations stay in milliseconds because that is the scale the V-1 publish-latency ceiling
+ * durations stay in milliseconds because that is the scale the publish-latency ceiling
  * is stated in; anything at or above a second is promoted so a long tail stays legible.
  *
  * @param {number} value the raw value from the summary.
@@ -458,7 +445,7 @@ function renderGroup(group, indent, colors, out, prefix) {
 /**
  * textSummary renders a k6 end-of-test summary as plain text.
  *
- * Reimplements the k6-summary helper this file used to import. It is NOT a byte-for-byte
+ * Reimplements the k6-summary helper rather than importing it. It is NOT a byte-for-byte
  * clone of that renderer's layout and does not try to be — it reports the same facts from
  * the same summary object: every check, every metric with the aggregates its type actually
  * defines, and every threshold with its pass or fail. handleSummary concatenates the result
@@ -591,25 +578,20 @@ function parseDurationSeconds(raw, fallback) {
 
 const URL = __ENV.URL || "http://localhost:5001/transactions";
 const API_KEY = __ENV.API_KEY || __ENV.BLNK_API_KEY;
-// The frozen artefact name, and the same one run_case.sh defaults to. A direct `k6 run` of this
-// file must land in the file the acceptance record is filed under, or a run invoked without the
-// runner produces the right numbers somewhere nothing looks for them.
-// Deliberately ONE line: the runner's contract test reads this default out of the file to
-// discover the artefact stem, and a wrapped declaration hid it — the runner and the scenario were
-// then free to name the same run's output differently with nothing to catch it.
+// The frozen artefact name, and the same one run_case.sh defaults to. A direct `k6 run`
+// of this file must land in the file the acceptance record is filed under, or a run
+// invoked without the runner produces the right numbers somewhere nothing looks for
+// them. Deliberately ONE line: the runner's contract test reads this default out of the
+// file to discover the artefact stem, and a wrapped declaration hid it — the runner and
+// the scenario were then free to name the same run's output differently with nothing to
+// catch it.
 const SUMMARY_OUT = __ENV.SUMMARY_OUT || "tests/loadtest/summary-event-streaming.json";
 const SCENARIO = __ENV.SCENARIO || "event_publish";
 const DURATION = __ENV.DURATION || "30m"; // V-1 and V-3 are stated over 30 minutes
-// The same duration as a number. Derived from DURATION rather than configured separately, so
-// the two cannot drift, and it is the SAME NUMBER the throughput divisor uses — see LOAD_SECONDS
-// below, which is this constant under the name the verdict arithmetic reads it by.
-//
-// THE FALLBACK IS ZERO, and deliberately not 1800. An unparseable DURATION used to fall back to
-// an assumed thirty minutes here, which is a guess presented as a measurement: the divisor of
-// V-1's throughput would then be a number nobody supplied, in whichever direction the real run
-// length differed. Zero makes the run report REASON_LOAD_INTERVAL_UNKNOWN and certify nothing,
-// which is the same doctrine every other unmeasured input follows in this file. The sampler
-// reads it too, and zero disables the sampler rather than enabling it against a guess.
+// The same duration as a number. Derived from DURATION rather than configured
+// separately, so the two cannot drift, and it is the SAME NUMBER the throughput divisor
+// uses — see LOAD_SECONDS below, which is this constant under the name the verdict
+// arithmetic reads it by.
 const DURATION_SECONDS = parseDurationSeconds(DURATION, 0);
 // Required VUs are roughly arrival rate x response time, so 500/s needs ~150 at 300ms and
 // ~500 at 1s. Both stay overridable because the right figure depends on the deployment.
@@ -619,31 +601,8 @@ const AMOUNT_MIN = numberFrom(__ENV.AMOUNT_MIN, 100);
 const AMOUNT_MAX = numberFrom(__ENV.AMOUNT_MAX, 1000);
 const CURRENCY = __ENV.CURRENCY || "USD";
 
-// How many independent aggregates the offered load is spread over, provisioned in setup().
-//
-// This is the single setting that decides whether the run measures the PIPELINE's throughput
-// or one aggregate's serialisation ceiling, so it is worth stating why it exists rather than
-// leaving it to look like a tuning knob.
-//
-// Events are keyed by their aggregate so that per-aggregate ordering holds, and the relay's
-// claim enforces that by returning AT MOST ONE ROW PER PARTITION KEY PER BATCH — a later event
-// of the same key is not claimable while an earlier one is pending or in flight, which is what
-// makes ordering survive concurrent publishing. Within a batch the distinct keys are published
-// together, and a tick chains up to 50 batches, so a key whose earlier row has already been
-// dispatched can be claimed again later in the same tick. Throughput therefore scales with the
-// number of DISTINCT KEYS in flight, not with a larger batch — but there is no 1-event-per-key
-// -per-second ceiling.
-//
-// The `"@" + uuidv4()` shorthand the other scenarios in this directory use does NOT spread the
-// load. It mints a fresh BALANCE, and every balance created that way lands in the same default
-// ledger, so the whole run shares one partition key and the relay publishes that key's events
-// strictly one at a time however much load is offered. Measured directly: 200 transactions
-// offered at 20/s yielded 10 published events and 147 rows still pending.
-//
-// So setup() provisions this many ledgers, each with its own source and destination balance,
-// and each iteration picks one pair. Set it to 0 to fall back to the shorthand deliberately —
-// which is the right choice for measuring single-aggregate ordering, and the wrong one for
-// measuring throughput.
+// How many independent aggregates the offered load is spread over, provisioned in
+// setup().
 const LEDGER_SPREAD = numberFrom(__ENV.LEDGER_SPREAD, 128);
 
 // --- Measurement source ----------------------------------------------------------------
@@ -661,16 +620,12 @@ const MASTER_KEY = __ENV.MASTER_KEY || __ENV.BLNK_MASTER_KEY || "";
 const EVENTS_STATS_URL =
   __ENV.EVENTS_STATS_URL ||
   siblingURL(METRICS_URL, "/metrics", "/events/stats");
-// PERF-M02: the drain loop polls this endpoint once a second while waiting for the outbox to
-// quiesce, and it wants COUNTS ONLY. `include_offsets=false` says so explicitly rather than
-// relying on the endpoint's default: the posture also decides whether the endpoint runs an exact
-// COUNT of the dispatched history — 43.2 million index entries a day at this target rate — so a
-// poll that took the wrong posture would make the measurement a load source of its own.
-//
-// The consequence, stated here because it is not obvious: under this posture the response carries
-// no `dispatched` key and reports `dispatched_history_counted: false`. Every count the drain loop
-// and the quiescence gate actually read — pending, processing, failed, webhook_pending,
-// dead_lettered, replaying — is exact and complete on this posture.
+// The drain loop polls this endpoint once a second while waiting for the outbox to
+// quiesce, and it wants COUNTS ONLY. `include_offsets=false` says so explicitly rather
+// than relying on the endpoint's default: the posture also decides whether the endpoint
+// runs an exact COUNT of the dispatched history — 43.2 million index entries a day at
+// this target rate — so a poll that took the wrong posture would make the measurement a
+// load source of its own.
 const EVENTS_STATS_COUNTS_URL = withQueryParam(
   EVENTS_STATS_URL,
   "include_offsets",
@@ -681,12 +636,8 @@ const LEDGERS_URL =
 const BALANCES_URL =
   __ENV.BALANCES_URL || siblingURL(URL, "/transactions", "/balances");
 
-// Refuse a credential-bearing endpoint before anything is logged, requested or summarised.
-//
-// This runs at module scope so it fires during init, before setup() has echoed a single URL
-// and before the first request leaves the process. Authenticating through API_KEY, MASTER_KEY
-// or METRICS_BEARER_TOKEN is the supported route: those are sent as headers and are never
-// printed, whereas a URL is printed by design.
+// Refuse a credential-bearing endpoint before anything is logged, requested or
+// summarised.
 (function refuseCredentialBearingURLs() {
   var configured = [
     { name: "URL", value: URL },
@@ -713,16 +664,13 @@ const BALANCES_URL =
 })();
 
 
-// The exact interval the load is offered over. V-1's throughput is published events divided by
-// THIS, not by the wider scrape-to-scrape window: the window necessarily includes provisioning
-// and the tail drain, so dividing by it reports a rate the load never had to sustain and does
-// so in the failing direction.
-// LOAD_SECONDS and DURATION_SECONDS are ONE quantity under two names, and the alias is kept
-// because each name is read by a different half of the file: the verdict arithmetic divides by
-// LOAD_SECONDS, the sampler's enablement test reads DURATION_SECONDS. They used to be parsed
-// SEPARATELY, by two different helpers, with two different fallbacks — which is how the divisor
-// of the throughput verdict and the sampler's idea of the run length came to be able to
-// disagree about how long the run was.
+// The exact interval the load is offered over. Throughput is published events
+// divided by THIS, not by the wider scrape-to-scrape window: the window necessarily
+// includes provisioning and the tail drain, so dividing by it reports a rate the load
+// never had to sustain and does so in the failing direction. LOAD_SECONDS and
+// DURATION_SECONDS are ONE quantity under two names, and the alias is kept because each
+// name is read by a different half of the file: the verdict arithmetic divides by
+// LOAD_SECONDS, the sampler's enablement test reads DURATION_SECONDS.
 const LOAD_SECONDS = DURATION_SECONDS;
 
 // --- Verdict ceilings ------------------------------------------------------------------
@@ -733,73 +681,34 @@ const TARGET_EVENTS_PER_SEC = numberFrom(__ENV.TARGET_EVENTS_PER_SEC, 500);
 const MAX_P99_PUBLISH_SECONDS = numberFrom(__ENV.MAX_P99_PUBLISH_SECONDS, 2);
 const MAX_DEAD_LETTER_RATIO = numberFrom(__ENV.MAX_DEAD_LETTER_RATIO, 0.001);
 
-// --- Offered load, sized ABOVE the target on purpose ------------------------------------
-//
-// V-1 asks for 500 events/sec SUSTAINED and the verdict is `value>=500`, so offering exactly
-// 500 arrivals/sec makes a flawless run land ON the boundary and any imperfection land below
-// it. Every real effect pushes the same way: an arrival the executor could not start is a
-// dropped iteration, a transaction the API rejects produces no event, and the measured window
-// is never shorter than the load. There is no mechanism that pushes the other way.
-//
-// So the offered rate carries HEADROOM over the target. The verdict is still judged at 500 —
-// the headroom buys margin, it does not move the bar. A run that needs the full 10% to clear
-// the threshold is a run whose true sustained rate is close to the target, which is what the
-// throughput figure and the offered/published ratio in the summary are for.
+// --- Offered load, sized ABOVE the target on purpose
+// ------------------------------------
 const LOAD_HEADROOM_RATIO = numberFrom(__ENV.LOAD_HEADROOM_RATIO, 1.1);
 const RATE = numberFrom(
   __ENV.RATE,
   Math.ceil(TARGET_EVENTS_PER_SEC * LOAD_HEADROOM_RATIO),
 );
 
-// --- Run mode ---------------------------------------------------------------------------
-//
-// SMOKE=1 is the explicit opt-out from the acceptance contract: it permits the single-key
-// fallback and a short spread, for a five-second shakeout that proves the script runs. It
-// must never be set for a run whose numbers are quoted against V-1 or V-3, and the summary
-// records which mode produced every figure.
+// --- Run mode
+// ---------------------------------------------------------------------------
 const SMOKE = numberFrom(__ENV.SMOKE, 0) === 1;
 
 // FIXTURES=1 RUNS THIS FILE AGAINST ITSELF instead of against a deployment.
 //
-// Everything between a /metrics response and the ALL CRITERIA row is pure computation — the
-// exposition parser, the label matcher, the histogram collector and its quantile
-// interpolation, the counter and bucket deltas, the settling-gate classifier, the summary
-// readers and the verdict rules — and none of it was executable in a test. What existed was a
-// Go suite that read this file as TEXT and asserted that certain source strings were present,
-// which cannot tell a parser that works from one that does not, and could not have caught the
-// defect that made `verdicts_all_hold` false on every run this file has ever produced.
-//
-// So this mode drives those functions over a table of fixtures with expected answers, in the
-// real Goja runtime the acceptance run uses, and aborts the test when any of them disagrees.
-// It contacts nothing: no broker, no database, no server, no /metrics endpoint. Run it with
-//
-//	k6 run -e FIXTURES=1 tests/loadtest/events.js
-//
-// FIXTURES_SELFCHECK=1 inverts one expectation on purpose, which is how the harness proves it
-// is capable of failing. A harness that cannot be shown to fail is indistinguishable from one
-// that asserts nothing, and event_loadtest_harness_test.go drives both directions.
+// k6 run -e FIXTURES=1 tests/loadtest/events.js
 const FIXTURES = numberFrom(__ENV.FIXTURES, 0) === 1;
 const FIXTURES_SELFCHECK = numberFrom(__ENV.FIXTURES_SELFCHECK, 0) === 1;
 
 // Blnk exposes NO delete endpoint for a ledger or a balance — the API has DELETE for
-// identities, hooks, api-keys, balance-monitors, matching-rules and subscribers, and for
-// nothing else. A run that provisions its own spread therefore changes the database
+// identities, hooks, api-keys, balance-monitors, matching-rules and subscribers, and
+// for nothing else. A run that provisions its own spread therefore changes the database
 // PERMANENTLY, and every later run and benchmark sees the accumulated population.
-//
-// Cleanup cannot be written, so the contract is explicit instead, and one of the three must
-// hold before provisioning happens:
-//
-//   LEDGER_PAIRS          pre-provisioned fixtures, supplied as JSON. Nothing is created.
-//   ALLOW_FIXTURE_CREATION=1  an acknowledgement that this run permanently adds up to
-//                         LEDGER_SPREAD ledgers and twice that many balances, which is
-//                         appropriate for a disposable or per-run database.
-//   SMOKE=1               a shakeout, where the fallback is acceptable anyway.
 const ALLOW_FIXTURE_CREATION = numberFrom(__ENV.ALLOW_FIXTURE_CREATION, 0) === 1;
 const LEDGER_PAIRS_RAW = __ENV.LEDGER_PAIRS || "";
 // Fail closed by default: unless this is relaxed to 0, a run that could not read the
 // verdict inputs at all fails rather than reporting three vacuous zeroes as a pass.
 const REQUIRE_METRICS = numberFrom(__ENV.REQUIRE_METRICS, 1);
-// API-acceptance ceilings, in milliseconds. Deliberately NOT the V-1 latency figure; see
+// API-acceptance ceilings, in milliseconds. Deliberately NOT the latency target; see
 // the comment on the threshold itself.
 const MAX_API_P95_MS = numberFrom(__ENV.MAX_API_P95_MS, 500);
 const MAX_API_P99_MS = numberFrom(__ENV.MAX_API_P99_MS, 1000);
@@ -807,10 +716,10 @@ const MAX_API_P99_MS = numberFrom(__ENV.MAX_API_P99_MS, 1000);
 // because the two describe the same tolerance from opposite ends: at most one request in a
 // thousand may fail, so at most one response in a thousand may be the wrong shape.
 const MIN_CHECK_PASS_RATE = numberFrom(__ENV.MIN_CHECK_PASS_RATE, 0.999);
-// The ceiling on dropped iterations, expressed as a FRACTION of the arrivals the run intends
-// to offer and converted to a count for k6's Counter threshold. A proportion is the right way
-// to state it: the same absolute number means something different over five seconds than over
-// thirty minutes.
+// The ceiling on dropped iterations, expressed as a FRACTION of the arrivals the run
+// intends to offer and converted to a count for k6's Counter threshold. A proportion is
+// the right way to state it: the same absolute number means something different over
+// five seconds than over thirty minutes.
 const MAX_DROPPED_ITERATION_RATIO = numberFrom(
   __ENV.MAX_DROPPED_ITERATION_RATIO,
   0.001,
@@ -899,85 +808,52 @@ function urlCarriesCredential(url) {
   return redactURL(url).indexOf(" (redacted)") >= 0;
 }
 
-// --- Sustained-rate sampling -----------------------------------------------------------
+// --- Sustained-rate sampling
+// -----------------------------------------------------------
 //
 // The width of the windows the throughput verdict is stated over. A whole-run average
 // cannot distinguish sustained load from a burst followed by a stall, so the published
 // counter is sampled on this interval and the verdict is the PASS RATE across the
 // resulting per-window rates — at least MIN_SUSTAINED_SUBWINDOW_RATIO of the qualifying
-// windows must have met the target. The minimum per-window rate is reported as a
-// diagnostic and is not itself the verdict.
+// windows must have met the target.
 //
 // 30 seconds is wide enough that ordinary jitter — a garbage collection pause, one slow
 // scrape, a relay poll landing either side of a boundary — averages out inside a window
 // instead of failing the run, and narrow enough that a thirty-minute run is judged on
 // roughly its last 58 windows rather than on one number. It is also the floor the
 // measurement imposes: a window shorter than the server's event-metrics collector tick
-// would difference a counter against itself and report zero. Set it to 0 to switch the
-// sampler off, which also withdraws its thresholds; the whole-run average then carries the
-// throughput verdict on its own.
+// would difference a counter against itself and report zero.
 //
-// ONE CADENCE, UNDER THREE ACCEPTED NAMES (PERF-M10). There used to be two constants for this
-// single concept and they disagreed: RATE_WINDOW_SECONDS defaulted to 60 and SUBWINDOW_SECONDS
-// to 30, while every sleep the sampler performs and every qualification decision it makes read
-// the latter. Three things were therefore wrong at once, and none of them was visible in a
-// passing run:
+// ONE CADENCE, UNDER THREE ACCEPTED NAMES. Three things were therefore wrong at once,
+// and none of them was visible in a passing run:
 //
-//   * THE ENABLE GATE used the width the sampler does not measure on. It requires
-//     DURATION >= warmup + 2 windows, so at 60 it demanded 180 seconds — and a two-minute run,
-//     which comfortably contains four 30-second windows, silently disabled the sampler and fell
-//     back to the whole-run mean.
-//   * THE SUMMARY reported window_seconds: 60 as "the width of the windows the throughput
-//     verdict is stated over" beside subwindow_seconds: 30, and the verdict was stated over 30.
-//     A reader was told the wrong width by the artifact whose purpose is provenance.
-//   * THE WARM-UP defaulted to 60 and its comment says "one window's width", so it silently
-//     excluded TWO measurement windows.
-//
-// 30 is kept rather than 60 because it is what the code measured all along: MIN_QUALIFYING_
-// SUBWINDOWS, MIN_SUSTAINED_SUBWINDOW_RATIO and RAMP_EXCLUSION_SECONDS were all calibrated
-// against it, so widening to 60 would halve the sample count and quietly change what the
-// tolerance means. Fixing the reporting is a correction; changing the measurement would be a
-// different verdict.
-//
-// SUBWINDOW_SECONDS and SAMPLE_INTERVAL_SECONDS remain accepted as aliases, in that precedence,
-// so a runbook or CI job invoking either older name gets the cadence it asked for rather than
-// the default.
+//   * THE ENABLE GATE used the width the sampler does not measure on.
+//   * THE SUMMARY reported window_seconds: 60 as "the width of the windows the
+//     throughput verdict is stated over" beside subwindow_seconds: 30, and the verdict
+//     was stated over 30.
+//   * THE WARM-UP defaulted to 60 and its comment says "one window's width", so it
+//     silently excluded TWO measurement windows.
 const RATE_WINDOW_SECONDS = numberFrom(
   __ENV.RATE_WINDOW_SECONDS,
   numberFrom(__ENV.SUBWINDOW_SECONDS, numberFrom(__ENV.SAMPLE_INTERVAL_SECONDS, 30)),
 );
 // Windows that begin inside this much of the sampler's first reading are measured and
-// reported but NOT counted towards the verdict. The arrival-rate executor needs a moment to
-// reach its rate and the relay needs a moment to warm up, and neither is a throughput
-// deficiency. One window's width by default — and now genuinely one, since there is one width.
+// reported but NOT counted towards the verdict. The arrival-rate executor needs a
+// moment to reach its rate and the relay needs a moment to warm up, and neither is a
+// throughput deficiency. One window's width by default — and now genuinely one, since
+// there is one width.
 const RATE_WINDOW_WARMUP_SECONDS = numberFrom(
   __ENV.RATE_WINDOW_WARMUP_SECONDS,
   RATE_WINDOW_SECONDS,
 );
 
-// --- Sustained-window policy -------------------------------------------------------------
-//
-// The per-subwindow family that decides the SUSTAINED half of V-1. Recovered here beside the
-// sampling knobs above: every one of these constants was USED by the code below and declared
-// nowhere, which is a ReferenceError at module evaluation rather than dead configuration.
-//
-// The cadence a subwindow is measured over — WHICH IS THE SAME CADENCE the sampler sleeps on
-// and the same one the throughput windows are stated over. It is now an alias of
-// RATE_WINDOW_SECONDS rather than a second knob (PERF-M10): two constants for one concept
-// disagreed by a factor of two, and the disagreement reached the enable gate, the warm-up
-// default and the summary's own provenance. Resolving the environment names happens once, up
-// there, where the precedence RATE_WINDOW_SECONDS > SUBWINDOW_SECONDS > SAMPLE_INTERVAL_SECONDS
-// is stated.
-//
-// Kept as a named constant, rather than replaced at its ~10 use sites, because the phrase
-// "subwindow" is what the sustained-throughput family is called throughout this file, in the
-// summary keys and in tests/loadtest/README.md. Renaming those would be churn; making them
-// resolve to one number is the fix.
+// --- Sustained-window policy
+// -------------------------------------------------------------
 const SUBWINDOW_SECONDS = RATE_WINDOW_SECONDS;
-// The tolerance. 0.95 says: at most one subwindow in twenty may miss the target. It is not 1
-// because a single GC pause, a relay lease expiry or a checkpoint on the broker can cost one
-// interval without the pipeline having failed to sustain anything; it is not 0.5 because
-// that would re-admit exactly the averaging this replaces.
+// The tolerance. 0.95 says: at most one subwindow in twenty may miss the target. It is
+// not 1 because a single GC pause, a relay lease expiry or a checkpoint on the broker
+// can cost one interval without the pipeline having failed to sustain anything; it is
+// not 0.5 because that would re-admit exactly the averaging this replaces.
 const MIN_SUSTAINED_SUBWINDOW_RATIO = numberFrom(
   __ENV.MIN_SUSTAINED_SUBWINDOW_RATIO,
   0.95,
@@ -988,66 +864,51 @@ const MIN_QUALIFYING_SUBWINDOWS = numberFrom(
   __ENV.MIN_QUALIFYING_SUBWINDOWS,
   3,
 );
-// Ramp exclusion. A constant-arrival-rate executor still has to allocate VUs, and the first
-// and last subwindows of any run are partly outside the offered load. Excluding one
-// subwindow at each end is what stops the ramp being judged as a throughput failure, and it
-// is stated as a duration rather than a count of samples so that changing the cadence does
-// not silently change how much of the run is excluded.
+// Ramp exclusion. A constant-arrival-rate executor still has to allocate VUs, and the
+// first and last subwindows of any run are partly outside the offered load. Excluding
+// one subwindow at each end is what stops the ramp being judged as a throughput
+// failure, and it is stated as a duration rather than a count of samples so that
+// changing the cadence does not silently change how much of the run is excluded.
 const RAMP_EXCLUSION_SECONDS = numberFrom(
   __ENV.RAMP_EXCLUSION_SECONDS,
   SUBWINDOW_SECONDS,
 );
 
-// --- Outbox drain ----------------------------------------------------------------------
-//
-// How often the unsettled depth is re-read while waiting. SETTLE_POLL_SECONDS is honoured as an
-// alias.
+// --- Outbox drain
+// ----------------------------------------------------------------------
 const DRAIN_POLL_SECONDS = numberFrom(
   __ENV.DRAIN_POLL_SECONDS,
   numberFrom(__ENV.SETTLE_POLL_SECONDS, 5),
 );
-// --- Settling policy ---------------------------------------------------------------------
+// --- Settling policy
+// ---------------------------------------------------------------------
 //
 // The gates that make the measured window contain the load's events and only the load's
-// events. Both ends poll the outbox until every row whose KAFKA OUTCOME IS STILL OWED has
-// settled, then proceed.
+// events. Both ends poll the outbox until every row whose KAFKA OUTCOME IS STILL OWED
+// has settled, then proceed.
 //
-// THE POPULATION IS THE TOTAL OF FOUR STATES, not the `pending` literal: pending, processing,
-// failed-awaiting-its-dead-letter-write, and replaying. See probeEventStats for why each is in
-// and why webhook_pending is out. A gate over `pending` alone reported quiet while the slow and
-// FAILING tail was still outstanding, and that tail is enriched in dead letters — so excluding
-// it flattered V-3 rather than merely shortening the count.
+// THE POPULATION IS THE TOTAL OF FOUR STATES, not the `pending` literal: pending,
+// processing, failed-awaiting-its-dead-letter-write, and replaying. See probeEventStats
+// for why each is in and why webhook_pending is out.
 //
-// Quiet has to be observed more than once. A single reading at or below the floor can be the
-// gap between two claims rather than an empty outbox.
+// Quiet has to be observed more than once. A single reading at or below the floor can
+// be the gap between two claims rather than an empty outbox.
 const DRAIN_STABLE_SAMPLES = numberFrom(__ENV.DRAIN_STABLE_SAMPLES, 3);
-// The TOTAL unsettled depth that counts as quiet. Zero is the honest default: any non-zero
-// remainder is an event whose terminal outcome — delivered or dead-lettered — is still
-// undecided, and therefore missing from V-3's population. It is overridable because a shared
-// development database carries other writers' rows, and on such a stack the floor is the
-// resting depth rather than zero — but note that a non-zero floor and an acceptance verdict are
-// in tension, since those rows are the same contamination REQUIRE_ISOLATION exists to refuse.
-// DRAIN_TARGET_ROWS is honoured as an alias.
+// The TOTAL unsettled depth that counts as quiet. Zero is the honest default: any
+// non-zero remainder is an event whose terminal outcome — delivered or dead-lettered —
+// is still undecided, and therefore missing from the dead-letter population. It is overridable
+// because a shared development database carries other writers' rows, and on such a
+// stack the floor is the resting depth rather than zero — but note that a non-zero
+// floor and an acceptance verdict are in tension, since those rows are the same
+// contamination REQUIRE_ISOLATION exists to refuse.
 const DRAIN_FLOOR = numberFrom(
   __ENV.DRAIN_FLOOR,
   numberFrom(__ENV.DRAIN_TARGET_ROWS, 0),
 );
-// Bounded budgets, so a pipeline that never settles ends the gate instead of hanging. The
-// post-load budget is larger because it has the load's own backlog to clear.
-// The budgets have a FLOOR that depends on which source answers, and getting it wrong looks
-// like a backlog when it is not. Without a master key the depth comes from
-// blnk_outbox_pending, which the server republishes on its event-metrics collector tick
-// (15s by default), and only ONE independent confirmation can be counted per tick — so the
-// budget must be at least DRAIN_STABLE_SAMPLES times that tick, 45s at the defaults, plus
-// however long the events themselves take to drain. 120s leaves room for both. With a master
-// key the live /events/stats source is used, which needs no tick and settles in seconds.
-//
-// THE HISTORICAL NAMES ARE HONOURED AS ALIASES. Three generations of this gate each configured
-// its budget under its own name — SETTLE_TIMEOUT_SECONDS for the pre-load reading,
-// DRAIN_BUDGET_SECONDS and DRAIN_TIMEOUT_SECONDS for the closing one — and all three constants
-// coexisted in this file alongside two implementations of the gate itself. A run invoked with any
-// of those names must not silently fall back to the default, so each is read here rather than
-// being dropped with the constant that used to hold it.
+// Bounded budgets, so a pipeline that never settles ends the gate instead of hanging.
+// The post-load budget is larger because it has the load's own backlog to clear. The
+// budgets have a FLOOR that depends on which source answers, and getting it wrong looks
+// like a backlog when it is not.
 const PRE_DRAIN_BUDGET_SECONDS = numberFrom(
   __ENV.PRE_DRAIN_BUDGET_SECONDS,
   numberFrom(__ENV.SETTLE_TIMEOUT_SECONDS, 120),
@@ -1059,55 +920,37 @@ const POST_DRAIN_BUDGET_SECONDS = numberFrom(
     numberFrom(__ENV.DRAIN_TIMEOUT_SECONDS, 180),
   ),
 );
-// Fail closed on a pipeline that would not settle. Relaxing this to 0 keeps the gates and
-// their reported figures but stops an unsettled pipeline — or a tail this run could not
-// observe completely — from failing the run, which is only ever right for a smoke run, never
-// for an acceptance one.
+// Fail closed on a pipeline that would not settle. Relaxing this to 0 keeps the gates
+// and their reported figures but stops an unsettled pipeline — or a tail this run could
+// not observe completely — from failing the run, which is only ever right for a smoke
+// run, never for an acceptance one.
 const REQUIRE_DRAIN = numberFrom(__ENV.REQUIRE_DRAIN, 1);
 
-// --- Attribution: the measured population must belong to THIS run ------------------------
+// --- Attribution: the measured population must belong to THIS run
+// ------------------------
 //
-// EVERY FIGURE HERE IS PROCESS-GLOBAL. The verdicts are deltas of blnk_events_published_total,
-// blnk_events_dead_lettered_total and a capture-to-dispatch histogram, all summed across every
-// label set the exporting process holds. There is no run identifier, no workload dimension and
-// no way to filter one out: a Blnk instance serving other traffic while this scenario runs
-// contributes its events to the same counters and its latencies to the same histogram.
+// So the contract is a DEDICATED, ISOLATED Blnk instance, and it is enforced in two
+// ways because neither alone is enough:
 //
-// The consequences are not symmetric annoyances, they are all in the flattering direction for
-// two of the three verdicts. Foreign traffic INFLATES throughput, so V-1 can pass on work this
-// run never offered. It enlarges the dead-letter DENOMINATOR, so V-3's ratio falls. And it
-// shifts the latency population either way, so the p99 becomes a statement about a mixture.
-// Adding a run label to the production instruments is the alternative and it is worse: a
-// per-run label on a counter is unbounded cardinality in the server, paid for permanently to
-// serve a benchmark.
-//
-// So the contract is a DEDICATED, ISOLATED Blnk instance, and it is enforced in two ways
-// because neither alone is enough:
-//
-//   1. ISOLATED_INSTANCE=1 is an explicit acknowledgement by the operator. It is required for
-//      an acceptance run and cannot be inferred — nothing observable distinguishes "no other
-//      client is configured" from "no other client happens to be sending right now".
-//   2. An EMPIRICAL IDLE PROBE, taken after the pre-load settling gate and before the baseline
-//      scrape, with no load offered: two scrapes ISOLATION_PROBE_SECONDS apart. Any movement in
-//      the terminal event counters over that interval is traffic this run did not produce.
-//
-// The probe's limit is stated rather than glossed: it can DISPROVE isolation and it cannot
-// prove it, because a bursty foreign workload can be idle for the length of the probe. That is
-// why the acknowledgement is required as well, and why the summary records both.
+//   1. ISOLATED_INSTANCE=1 is an explicit acknowledgement by the operator.
+//   2. An EMPIRICAL IDLE PROBE, taken after the pre-load settling gate and before the
+//      baseline scrape, with no load offered: two scrapes ISOLATION_PROBE_SECONDS
+//      apart.
 const ISOLATED_INSTANCE = numberFrom(__ENV.ISOLATED_INSTANCE, 0) === 1;
 // Fail closed on an unattributable population, in the same shape as REQUIRE_DRAIN: 0 keeps the
 // probe and its reported figures but stops them failing the run. Only ever right for a smoke
 // run or a deliberately shared stack whose numbers are not quoted.
 const REQUIRE_ISOLATION = numberFrom(__ENV.REQUIRE_ISOLATION, 1);
-// How long the idle probe watches. Ten seconds catches any steady foreign traffic at the rates
-// that matter — one event per second is 10 events, well above the tolerance — and costs 0.6% of
-// a thirty-minute acceptance run. Set it to 0 to skip the probe, which leaves the
-// acknowledgement as the only evidence and is recorded as such.
+// How long the idle probe watches. Ten seconds catches any steady foreign traffic at
+// the rates that matter — one event per second is 10 events, well above the tolerance —
+// and costs 0.6% of a thirty-minute acceptance run. Set it to 0 to skip the probe,
+// which leaves the acknowledgement as the only evidence and is recorded as such.
 const ISOLATION_PROBE_SECONDS = numberFrom(__ENV.ISOLATION_PROBE_SECONDS, 10);
-// How many foreign events the probe tolerates. ZERO is the honest default: the outbox is quiet
-// when the probe runs — the pre-load gate has just proved it — so a terminal counter that moves
-// at all is another workload's event. Raise it only to accept a known background producer, and
-// know that doing so accepts the same amount of contamination in every verdict.
+// How many foreign events the probe tolerates. ZERO is the honest default: the outbox
+// is quiet when the probe runs — the pre-load gate has just proved it — so a terminal
+// counter that moves at all is another workload's event. Raise it only to accept a
+// known background producer, and know that doing so accepts the same amount of
+// contamination in every verdict.
 const ISOLATION_MAX_FOREIGN_EVENTS = numberFrom(
   __ENV.ISOLATION_MAX_FOREIGN_EVENTS,
   0,
@@ -1127,24 +970,19 @@ const DRAIN_NOT_SETTLED = 0;
 
 // The sampler is enabled only when it was asked for AND the run is long enough for the
 // warm-up to elapse and counted windows to follow it. Without the second condition a
-// deliberately short smoke run would fail the "at least one window was counted" guard it
-// never had the duration to satisfy, and the operator would have to know to switch the
-// sampler off by hand. The margin is two window widths past the warm-up, which is what makes
-// the guard hold rather than merely be likely to.
+// deliberately short smoke run would fail the "at least one window was counted" guard
+// it never had the duration to satisfy, and the operator would have to know to switch
+// the sampler off by hand. The margin is two window widths past the warm-up, which is
+// what makes the guard hold rather than merely be likely to.
 const RATE_SAMPLER_ENABLED =
   RATE_WINDOW_SECONDS > 0 &&
   DURATION_SECONDS >= RATE_WINDOW_WARMUP_SECONDS + 2 * RATE_WINDOW_SECONDS;
 const SAMPLER_SCENARIO = "event_publish_rate_sampler";
 
-// How often the sampler scenario takes an interval throughput reading during the run. Short
-// enough that a thirty-minute run yields enough observations for the median to be a statement
-// about, long enough that each delta is large relative to the collector's own publish tick.
-//
-// AN ALIAS OF SUBWINDOW_SECONDS, not a second knob. The sampler sleeps SUBWINDOW_SECONDS between
-// readings and the qualification arithmetic is stated in it, so a separate value here was simply
-// a wrong number reported as the interval the samples were taken over — 15 in the summary beside
-// intervals that were actually 30 seconds long, which is a factor of two on every figure a
-// reader might recompute. Both environment names are accepted; see SUBWINDOW_SECONDS above.
+// How often the sampler scenario takes an interval throughput reading during the run.
+// Short enough that a thirty-minute run yields enough observations for the median to be
+// a statement about, long enough that each delta is large relative to the collector's
+// own publish tick.
 const SAMPLE_INTERVAL_SECONDS = SUBWINDOW_SECONDS;
 
 /**
@@ -1172,7 +1010,7 @@ function siblingURL(url, marker, replacement) {
  * already carries and leaving an existing value for the same name alone.
  *
  * It exists because EVENTS_STATS_URL is OVERRIDABLE. The probe must send `include_offsets=false`
- * so a drain poll cannot trigger a broker round trip and a history-sized count (PERF-M02), and
+ * so a drain poll cannot trigger a broker round trip and a history-sized count, and
  * naive concatenation would produce `...?a=b?include_offsets=false` for an operator who supplied
  * their own query string. Leaving an existing value alone is deliberate too: an operator who
  * deliberately set a posture on the override has said what they want, and silently replacing it
@@ -1209,44 +1047,23 @@ function withQueryParam(url, name, value) {
 
 // ---------------------------------------------------------------------------------------
 // The Prometheus series the verdicts are read from.
-//
-// Every name below is the frozen exposition name of an instrument declared in
-// internal/metrics/metrics.go and catalogued in docs/metrics.md. None of them is invented
-// here, and none is substituted for another when it is missing: a missing series is
-// reported as missing.
-//
-// Each entry is a candidate list rather than a single string. The exporter's suffixing is a
-// runtime property — a counter named `blnk.events.published.total` is exported as
-// `blnk_events_published_total`, but the trailing `_total` is applied by the exporter and
-// could legitimately be configured off — so the documented name is tried first and the
-// bare form second. Whichever one matched is recorded as the verdict's provenance, which
-// makes the tolerance visible instead of silent and doubles as the debugging aid when a
-// name fails to resolve at all.
 // ---------------------------------------------------------------------------------------
 
 // The SETTLED count, reported as a supporting figure and used for NO verdict. It is
-// incremented once per event, at the terminal dispatched transition — conditional on the
-// claim token that authorised the publish, so it succeeds for one worker once in an event's
-// life. It is per-event and cannot double-count; what makes it unsuitable for the verdicts is
-// WHEN it moves. A row whose legacy webhook is still owed sits in webhook_pending and is not
-// counted here until that leg settles, so during the dual-delivery window this count trails
-// the published count by the population still owed a webhook. Its ratio to that count is the
-// settlement gap, which is worth reporting; substituted for it, throughput would be
-// understated by however much of the legacy leg was still outstanding at the closing scrape.
+// incremented once per event, at the terminal dispatched transition — conditional on
+// the claim token that authorised the publish, so it succeeds for one worker once in an
+// event's life. It is per-event and cannot double-count; what makes it unsuitable for
+// the verdicts is WHEN it moves.
 const SERIES_DISPATCHED = [
   "blnk_events_dispatched_total",
   "blnk_events_dispatched",
 ];
-// The EVENT count, and the series every per-event verdict is computed from. It is incremented
-// once per event, at the transition that records the Kafka leg as durably delivered — either
-// MarkEventDispatched or MarkEventWebhookPending, both conditional on the claim token and both
-// clearing or consuming it, so each succeeds for one worker once in an event's life. That
-// uniqueness is what makes a throughput figure and a dead-letter rate derived from it mean
-// events rather than writes.
-//
-// It is NOT the broker write count. That is blnk_events_broker_acknowledgements_total, which
-// this harness deliberately does not read: it moves again on every republish, and substituted
-// here it would over-report throughput and halve the apparent dead-letter rate.
+// The EVENT count, and the series every per-event verdict is computed from. It is
+// incremented once per event, at the transition that records the Kafka leg as durably
+// delivered — either MarkEventDispatched or MarkEventWebhookPending, both conditional
+// on the claim token and both clearing or consuming it, so each succeeds for one worker
+// once in an event's life. That uniqueness is what makes a throughput figure and a
+// dead-letter rate derived from it mean events rather than writes.
 const SERIES_PUBLISHED = [
   "blnk_events_published_total",
   "blnk_events_published",
@@ -1259,107 +1076,59 @@ const SERIES_PUBLISH_ATTEMPTS = [
   "blnk_events_publish_attempts_total",
   "blnk_events_publish_attempts",
 ];
-// V-1's latency series. capture_to_dispatch, NOT publish_duration: the target is stated
-// over the interval a subscriber actually waits, which begins when the ledger transaction
-// committed the outbox row. publish_duration's clock starts at the relay CLAIM, so it
-// excludes the row waiting for the next poll tick, the poll interval and the claim query
-// itself — a relay an hour behind would report the same sub-second p99 as an idle one.
+// The latency series. capture_to_dispatch, NOT publish_duration: the target is stated
+// over the interval a subscriber actually waits, which begins when the ledger
+// transaction committed the outbox row. publish_duration's clock starts at the relay
+// CLAIM, so it excludes the row waiting for the next poll tick, the poll interval and
+// the claim query itself — a relay an hour behind would report the same sub-second p99
+// as an idle one.
 const SERIES_CAPTURE_TO_DISPATCH = [
   "blnk_events_capture_to_dispatch_duration_seconds",
   "blnk_events_capture_to_dispatch_duration",
 ];
-// The broker write in relative isolation. Reported ALONGSIDE the verdict and never AS it:
-// it measures a strictly shorter interval, so substituting it for the absent
-// capture_to_dispatch would certify V-1 from a number that cannot fail the way V-1 can. When
-// capture_to_dispatch is missing, V-1 is invalidated instead — see the reason chain in
-// teardown.
-//
-// It is reported because the gap between the two figures is what tells an operator whether a
-// slow end-to-end reading is the broker or a relay backlog. Read that gap as an indication of
-// where the time goes and not as a quantile of anything: the difference of two p99s is not
-// the p99 of the difference, because the two are quantiles of different populations and the
-// event at the 99th percentile of one need not be the event at the 99th percentile of the
-// other.
+// The broker write in relative isolation. Reported ALONGSIDE the verdict and never AS
+// it: it measures a strictly shorter interval, so substituting it for the absent
+// capture_to_dispatch would certify the target from a number that cannot fail the way the
+// target can.
+// When capture_to_dispatch is missing, the latency verdict is invalidated instead — see
+// the reason chain in teardown.
 const SERIES_PUBLISH_DURATION = [
   "blnk_events_publish_duration_seconds",
   "blnk_events_publish_duration",
 ];
 const SERIES_OUTBOX_PENDING = ["blnk_outbox_pending"];
-// THE REPAIR BACKLOGS, which blnk_outbox_pending does NOT include (PERF-C01).
+// THE REPAIR BACKLOGS, which blnk_outbox_pending does NOT include.
 //
-// That gauge is pending plus processing and nothing else. Two further non-terminal states exist
-// and are published only here, attributed by `leg`:
-//
-//   leg="dead_letter"    -- `failed`: the retry budget is spent and the .dlt write is STILL OWED
-//   leg="legacy_webhook" -- `webhook_pending`: the Kafka leg is durable, the webhook is owed
-//
-// The first matters most to a verdict. An event in `failed` has not yet incremented
-// blnk_events_dead_lettered_total, so treating the outbox as drained while such rows remain
-// removes them from V-3's NUMERATOR — understating the dead-letter rate, which is the direction
-// that lets a failing pipeline certify. Both legs fill during an outage, all at once, which is
-// precisely when a drain gate must not conclude the run is finished.
-//
-// Summed across legs deliberately: the gate asks "is anything still owed", not which leg owes it.
+// Summed across legs deliberately: the gate asks "is anything still owed", not which
+// leg owes it.
 const SERIES_REPAIR_BACKLOG = ["blnk_events_repair_backlog"];
-// Not a verdict input. The settling gates need to know whether a pending reading is FRESH:
-// blnk_outbox_pending is republished by the server's event-metrics collector on its own
-// tick, so polling faster than that tick returns the same number repeatedly, and three
-// identical readings would satisfy a naive stability rule without a single new observation
-// having been made. This gauge resets towards zero on each successful collection, so a
-// DECREASE in it is proof that a new collection happened between two polls.
+// Not a verdict input. The settling gates need to know whether a pending reading is
+// FRESH: blnk_outbox_pending is republished by the server's event-metrics collector on
+// its own tick, so polling faster than that tick returns the same number repeatedly,
+// and three identical readings would satisfy a naive stability rule without a single
+// new observation having been made. This gauge resets towards zero on each successful
+// collection, so a DECREASE in it is proof that a new collection happened between two
+// polls.
 const SERIES_COLLECTION_AGE = [
   "blnk_event_metrics_last_collection_age_seconds",
 ];
 // THE PROCESS IDENTITY, and the only thing here that can positively identify a restart
-// (PERF-P03). Every verdict below is a DELTA between two scrapes of a monotonic counter, and
-// a delta is only meaningful while both readings come from the same process: a restart resets
-// every counter to zero, so the baseline belongs to a process that no longer exists.
-//
-// Comparing the two readings cannot detect that reliably. `end < start` catches a restart
-// only when the new process has not yet counted past the old one's total — and at 500 events
-// a second it passes that point in seconds, after which the arithmetic silently produces a
-// delta that is neither the old process's work nor the new one's. On a long run the likely
-// case is the undetectable one.
-//
-// process_start_time_seconds is the Prometheus client's own standard process-collector gauge:
-// the wall-clock instant this process started, constant for its whole life and different for
-// any replacement. A CHANGE in it between the two scrapes is a restart, whatever the counters
-// happen to show, and its ABSENCE means the run cannot rule one out.
+// Every verdict below is a DELTA between two scrapes of a monotonic counter, and a
+// delta is only meaningful while both readings come from the same process: a restart
+// resets every counter to zero, so the baseline belongs to a process that no longer
+// exists.
 const SERIES_PROCESS_START = ["process_start_time_seconds"];
 
-// --- Measurement scope -------------------------------------------------------------------
+// --- Measurement scope
+// -------------------------------------------------------------------
 //
-// HOW MANY SERVER PROCESSES THE METRICS ENDPOINT FRONTS (PERF-M08).
-//
-// Every verdict here is a delta of a PER-PROCESS counter read from one URL. That is sound
-// against a single process and unsound against several: behind a Kubernetes Service, or any
-// load balancer, consecutive scrapes reach ARBITRARY backends, so the "delta" mixes counters
-// that never belonged to one series. The failure is silent and biased — a scrape landing on a
-// less busy replica looks like a throughput dip, and one landing on a busier replica looks
-// like a burst — and the repository ships exactly that topology: server-deployment.yaml is
-// horizontally scaled by server-hpa.yaml between 2 and 10 replicas.
-//
-// So the assumption is DECLARED rather than assumed. 1 says "this endpoint is one process",
-// which is true of the Compose stack, of a port-forward to a single pod, and of a local
-// binary. Anything greater says the endpoint fronts several, and the acceptance verdicts are
-// then withheld with a reason naming this — because the correct instrument for a scaled
-// deployment is a Prometheus query that aggregates across replicas, which is quoted in the
-// summary's equivalent_promql for every verdict and is not something this harness can perform
-// from a single scrape.
-//
-// Declaring 1 when it is false does not make the measurement sound; it makes the harness
-// believe you. The per-sample identity check above is the backstop that catches it anyway.
+// HOW MANY SERVER PROCESSES THE METRICS ENDPOINT FRONTS.
 const SERVER_REPLICAS = numberFrom(__ENV.SERVER_REPLICAS, 1);
 
 // The closed `attempt`, `outcome` and `terminal` label domains, per docs/metrics.md.
 // FIRST_ATTEMPT is the population both latency targets are stated over; DISPATCHED
 // additionally narrows publish_duration to successful writes, without which that filter
 // matches nothing at all.
-//
-// The outcome vocabulary is THREE values. "failed" is not one of them: a failed attempt
-// reports outcome="retrying", and whether anything further will be tried is carried by the
-// separate `terminal` dimension. Selecting outcome="failed" therefore matches nothing at
-// all, which would silently read as "no events are stuck".
 const FIRST_ATTEMPT = "1";
 const OUTCOME_DISPATCHED = "dispatched";
 const OUTCOME_RETRYING = "retrying";
@@ -1367,7 +1136,7 @@ const OUTCOME_DEAD_LETTERED = "dead_lettered";
 const TERMINAL_TRUE = "true";
 const TERMINAL_FALSE = "false";
 
-// The quantile V-1 is stated at.
+// The quantile the latency target is stated at.
 const TARGET_QUANTILE = 0.99;
 
 // Numeric codes, recorded into gauges because a gauge carries a number and the strings they
@@ -1378,17 +1147,17 @@ const SERIES_CODE_DOCUMENTED_NAME = 1;
 const SERIES_CODE_TOLERATED_NAME = 2;
 
 // P99_SOURCE_* names WHICH INSTRUMENT a latency figure came from. Only
-// CAPTURE_TO_DISPATCH is ever a verdict source; PUBLISH_DURATION exists solely to label the
-// supporting broker-write figure, which is reported and never thresholded. NONE is what the
-// verdict source becomes when the canonical histogram is absent, and it travels with
-// REASON_NO_FIRST_ATTEMPT_SAMPLES rather than with a substituted number.
+// CAPTURE_TO_DISPATCH is ever a verdict source; PUBLISH_DURATION exists solely to label
+// the supporting broker-write figure, which is reported and never thresholded. NONE is
+// what the verdict source becomes when the canonical histogram is absent, and it
+// travels with REASON_NO_FIRST_ATTEMPT_SAMPLES rather than with a substituted number.
 const P99_SOURCE_NONE = 0;
 const P99_SOURCE_CAPTURE_TO_DISPATCH = 1;
-// RESERVED AND NEVER EMITTED. publish_duration was once a fallback source for the V-1 p99;
-// it is now a diagnostic that cannot certify anything, because its clock starts at the relay
-// claim and so omits the queue wait. The code keeps its number so that an artefact from a run
-// that did emit a 2 still decodes, and so the numbering of any code added later does not
-// shift under a reader comparing two summaries.
+// RESERVED AND NEVER EMITTED. publish_duration is not an admissible source for the latency
+// p99; it is now a diagnostic that cannot certify anything, because its clock starts at
+// the relay claim and so omits the queue wait. The code keeps its number so that an
+// artefact from a run that did emit a 2 still decodes, and so the numbering of any code
+// added later does not shift under a reader comparing two summaries.
 const P99_SOURCE_PUBLISH_DURATION = 2;
 
 const INTERPOLATION_NONE = 0;
@@ -1400,54 +1169,46 @@ const REASON_AVAILABLE = 0;
 const REASON_START_SCRAPE_UNAVAILABLE = 1;
 const REASON_END_SCRAPE_UNAVAILABLE = 2;
 const REASON_WINDOW_NOT_POSITIVE = 3;
-// Named for the PUBLISHED series, which is the one every per-event verdict is read from. It
-// used to be keyed on the dispatched series, and after the verdict source moved an absent
-// dispatched series degraded a run that was perfectly measurable while an absent PUBLISHED
-// series fell through to REASON_NO_TERMINAL_EVENTS and reported a no-op publisher. The numeric
-// code is deliberately unchanged so an artefact from an earlier run still decodes to the same
-// slot.
+// Named for the PUBLISHED series, which is the one every per-event verdict is read
+// from.
 const REASON_PUBLISHED_SERIES_ABSENT = 4;
 const REASON_NO_TERMINAL_EVENTS = 5;
 const REASON_NO_FIRST_ATTEMPT_SAMPLES = 6;
-// The dead-letter counter was ABSENT rather than zero, and no authenticated stats source
-// corroborated it. An absent counter and a genuine zero are indistinguishable once absence is
-// coerced to 0, and the coercion favours a pass: 0/N is a 0% dead-letter rate, which clears
-// V-3 while proving nothing about it. A broken exporter must not certify a delivery target.
+// The dead-letter counter was ABSENT rather than zero, and no authenticated stats
+// source corroborated it. An absent counter and a genuine zero are indistinguishable
+// once absence is coerced to 0, and the coercion favours a pass: 0/N is a 0%
+// dead-letter rate, which clears the target while proving nothing about it. A broken exporter
+// must not certify a delivery target.
 const REASON_DEAD_LETTER_UNMEASURED = 7;
-// A required counter or histogram RESET inside the window, so the delta describes only the
-// fraction of the run after the restart. A relay restarted twenty-nine minutes into a
-// thirty-minute run would otherwise certify a sustained-throughput target from one minute.
-// RESERVED AND NO LONGER EMITTED, superseded by REASON_COUNTER_RESET and
-// REASON_EXPORTER_RESTARTED below, which say whether the reset had an attributable cause. The
-// code keeps its number so an artefact from a run that did emit an 8 still decodes.
+// A required counter or histogram RESET inside the window, so the delta describes only
+// the fraction of the run after the restart. A relay restarted twenty-nine minutes into
+// a thirty-minute run would otherwise certify a sustained-throughput target from one
+// minute. RESERVED AND NO LONGER EMITTED, superseded by REASON_COUNTER_RESET and
+// REASON_EXPORTER_RESTARTED below, which say whether the reset had an attributable
+// cause.
 const REASON_SERIES_RESET = 8;
-// The outbox backlog had not drained when the closing scrape was due. The events still in the
-// outbox belong to the load that was offered, so counting the arrivals without them
-// understates throughput, and the load interval is the divisor either way.
-// RESERVED AND NO LONGER EMITTED, superseded by REASON_PIPELINE_NOT_SETTLED, which checks BOTH
-// settling gates rather than only the closing one and honours REQUIRE_DRAIN. Emitting this one
-// after that check would have defeated the knob: with REQUIRE_DRAIN=0 the run is meant to
-// proceed on an unsettled pipeline and report the figures, not to be degraded anyway.
+// The outbox backlog had not drained when the closing scrape was due. The events still
+// in the outbox belong to the load that was offered, so counting the arrivals without
+// them understates throughput, and the load interval is the divisor either way.
+// RESERVED AND NO LONGER EMITTED, superseded by REASON_PIPELINE_NOT_SETTLED, which
+// checks BOTH settling gates rather than only the closing one and honours
+// REQUIRE_DRAIN.
 const REASON_BACKLOG_NOT_DRAINED = 9;
-// The load interval could not be parsed, so V-1's divisor is unknown. Reporting a rate
+// The load interval could not be parsed, so the throughput divisor is unknown. Reporting a
+// rate
 // requires knowing what it is a rate over.
 const REASON_LOAD_INTERVAL_UNKNOWN = 10;
 // Acceptance mode was asked for without the aggregate spread it requires. With a single
 // partition key the relay publishes one event per poll interval whatever the offered load, so
-// the run measures one aggregate's serialisation ceiling and cannot speak to V-1 at all.
+// the run measures one aggregate's serialisation ceiling and cannot speak to throughput at
+// all.
 const REASON_SPREAD_INSUFFICIENT = 11;
-// CODES 12 THROUGH 16 WERE USED BY THE CASCADE IN teardown AND DECLARED NOWHERE, which is a
-// ReferenceError at module evaluation — the whole scenario failed to load rather than any one
-// verdict failing. They are numbered from 12 rather than from the 7-to-10 range they were
-// originally written in, because 7 through 11 above are already taken by other codes: a numeric
-// vocabulary assembled from more than one source cannot preserve every source's numbering, and
-// preserving the MEANINGS is what matters to a reader of a summary.
-//
-// Distinct from code 6, and the distinction leads an operator to a different place: 6 is "the
-// pipeline produced no first-attempt samples", while this is "the series V-1 is defined over is
-// not exported at all", which is a build or a configuration predating
-// blnk_events_capture_to_dispatch_duration_seconds. The broker publish duration is NOT
-// substituted for it — see the note at the verdict.
+// CODES 12 THROUGH 16 ARE THE CASCADE IN teardown, and every one of them is declared
+// here: a code the cascade names but nothing declares is a ReferenceError at module
+// evaluation, which fails the whole scenario to load rather than any one verdict. They
+// are numbered from 12 because 7 through 11 above are already taken — a numeric
+// vocabulary assembled from more than one source cannot preserve every source's
+// numbering, and preserving the MEANINGS is what matters to a reader of a summary.
 const REASON_CAPTURE_SERIES_ABSENT = 12;
 // The exporter restarted between the two scrapes, so the baseline belongs to a process that no
 // longer exists and every counter delta is arithmetic across two populations. Checked BEFORE the
@@ -1465,26 +1226,27 @@ const REASON_PROCESS_IDENTITY_UNKNOWN = 15;
 // window's contents are not the load's events. This is the two-gate successor to code 9: it
 // covers BOTH ends, and it honours REQUIRE_DRAIN.
 const REASON_PIPELINE_NOT_SETTLED = 16;
-// A settling gate could not read the WHOLE unsettled population, so quiescence was never
-// established even though the depth it COULD read was at the floor. Distinguished from code 16
-// because it sends an operator somewhere completely different: 16 is a relay that is behind,
-// this is a measurement that cannot see the tail — blnk_outbox_pending carries pending plus
-// processing only, so without a master key the failed-awaiting-dead-letter rows and any replay
-// in flight are invisible, and those are precisely the rows whose exclusion flatters V-3. The
-// remedy is a master key, not a bigger budget.
+// A settling gate could not read the WHOLE unsettled population, so quiescence was
+// never established even though the depth it COULD read was at the floor. Distinguished
+// from code 16 because it sends an operator somewhere completely different: 16 is a
+// relay that is behind, this is a measurement that cannot see the tail —
+// blnk_outbox_pending carries pending plus processing only, so without a master key the
+// failed-awaiting-dead-letter rows and any replay in flight are invisible, and those
+// are precisely the rows whose exclusion flatters the rate. The remedy is a master key, not
+// a bigger budget.
 const REASON_SETTLEMENT_STATE_UNAVAILABLE = 17;
-// The measured population cannot be attributed to THIS run: the idle probe saw terminal event
-// counters move while no load was offered, or the isolated-instance contract was not
-// established at all. Every verdict here is a delta of process-global counters, so foreign
-// traffic inflates throughput, dilutes the dead-letter rate and mixes the latency population —
-// all in the passing direction for two of the three verdicts.
+// The measured population cannot be attributed to THIS run: the idle probe saw terminal
+// event counters move while no load was offered, or the isolated-instance contract was
+// not established at all. Every verdict here is a delta of process-global counters, so
+// foreign traffic inflates throughput, dilutes the dead-letter rate and mixes the
+// latency population — all in the passing direction for two of the three verdicts.
 const REASON_INSTANCE_NOT_ISOLATED = 18;
-// The measurement was taken across MORE THAN ONE PROCESS (PERF-M08). Appended at the END of the
+// The measurement was taken across MORE THAN ONE PROCESS. Appended at the END of the
 // range rather than inserted, because these codes are written into published artifacts and
 // renumbering would change what an archived summary means.
 const REASON_MEASUREMENT_NOT_SINGLE_PROCESS = 19;
 
-// Where V-3's dead-letter figure came from. NONE is a failing state, not a zero: it is the
+// Where the dead-letter figure came from. NONE is a failing state, not a zero: it is the
 // difference between "no events were dead-lettered" and "nothing could tell us either way".
 const DEAD_LETTER_SOURCE_NONE = 0;
 const DEAD_LETTER_SOURCE_SERIES = 1;
@@ -1496,23 +1258,11 @@ const STATUS_UNREACHABLE = 0;
 
 // ---------------------------------------------------------------------------------------
 // Custom metrics, registered in the init context.
-//
-// This is not a stylistic choice. handleSummary cannot make HTTP requests, and it cannot
-// see module state assigned in setup() or teardown() — each lifecycle stage runs in its own
-// context. A custom metric registered here is the only reliable channel from a
-// teardown-time computation into the summary JSON, and a threshold on one is what turns the
-// computed number into an auditable pass/fail row that the existing dashboard renders
-// without any change under tools/.
-//
-// Every one is a Gauge because every one is a single end-of-run value. A Counter would also
-// publish a k6-derived `rate` — count divided by the k6 run duration — and that second,
-// differently-derived throughput number sitting beside the authoritative one is precisely
-// the confusion this file exists to prevent.
 // ---------------------------------------------------------------------------------------
 
 // The three verdicts, plus the guard that says whether they mean anything.
 const M_EVENTS_PER_SEC = "event_publish_events_per_second";
-// The INTERVAL-AWARE throughput series, and the one V-1's sustained-rate claim is actually read
+// The INTERVAL-AWARE throughput series, and the one the sustained-rate claim is read
 // from. See intervalEventsPerSecond for why a two-point average over the whole run is not
 // evidence of a sustained rate.
 const M_INTERVAL_EVENTS_PER_SEC = "event_publish_interval_events_per_second";
@@ -1555,15 +1305,6 @@ const M_P99_SOURCE_CODE = "event_publish_p99_source_code";
 const M_P99_SERIES_SPELLING_CODE = "event_publish_p99_series_spelling_code";
 const M_BROKER_WRITE_P99 = "event_publish_broker_write_p99_seconds";
 // NOT a percentile, and named so it cannot be read as one.
-//
-// It is the difference of two INDEPENDENTLY RANKED p99 values, and the p99 of a difference is
-// not the difference of p99s. The two ranks come from different populations at different points
-// in each distribution, so the figure can exceed the true p99 queue wait, understate it, or
-// come out NEGATIVE when the broker-write histogram's coarser buckets place its p99 above the
-// end-to-end one. It remains a useful ORDER-OF-MAGNITUDE diagnostic — a large positive value
-// does mean backlog rather than broker — which is why it is kept and renamed rather than
-// deleted. Neither the metric name nor the gauge nor the PromQL constant says "queue wait"
-// any more; anything quoting a queue-wait percentile must instrument queue wait directly.
 const M_P99_DIFFERENCE = "event_publish_p99_difference_seconds";
 const M_ATTEMPTS_DISPATCHED = "event_publish_attempts_dispatched_delta";
 const M_ATTEMPTS_RETRYING = "event_publish_attempts_retrying_delta";
@@ -1583,10 +1324,11 @@ const M_OUTBOX_PENDING_END = "event_publish_outbox_pending_end";
 const M_DRAIN_WAIT_SECONDS = "event_publish_drain_wait_seconds";
 const M_DRAIN_COMPLETE = "event_publish_drain_complete";
 const M_DRAIN_POLLS = "event_publish_drain_polls";
-// event_publish_settlement_gap_factor and event_publish_dispatched_series_code were USED by this
-// script and not DECLARED in it, which is a ReferenceError at run time rather than a missing
-// figure: `node --check` parses the file without resolving identifiers, so the gap survived
-// every syntax gate. Both are restored here beside their siblings.
+// event_publish_settlement_gap_factor and event_publish_dispatched_series_code were
+// USED by this script and not DECLARED in it, which is a ReferenceError at run time
+// rather than a missing figure: `node --check` parses the file without resolving
+// identifiers, so the gap survived every syntax gate. Both are restored here beside
+// their siblings.
 const M_SETTLEMENT_GAP_FACTOR = "event_publish_settlement_gap_factor";
 const M_DISPATCHED_SERIES_CODE = "event_publish_dispatched_series_code";
 const M_PUBLISHED_SERIES_CODE = "event_publish_published_series_code";
@@ -1594,8 +1336,8 @@ const M_DEAD_LETTERED_SERIES_CODE = "event_publish_dead_lettered_series_code";
 const M_METRICS_STATUS_START = "event_publish_metrics_status_start";
 const M_METRICS_STATUS_END = "event_publish_metrics_status_end";
 const M_COUNTER_RESET = "event_publish_counter_reset";
-// PERF-P03. The process identity at each end of the window, and whether it changed. Recorded
-// as three separate figures rather than one boolean because the boolean alone leaves an
+// The process identity at each end of the window, and whether it changed. Recorded as
+// three separate figures rather than one boolean because the boolean alone leaves an
 // operator unable to tell a restart from an absent marker: -1 on either side means the
 // exporter did not publish process_start_time_seconds for that scrape, so continuity is
 // UNKNOWN rather than intact.
@@ -1607,23 +1349,23 @@ const M_STATS_STATUS = "event_publish_stats_endpoint_status";
 const M_STATS_DISPATCHED = "event_publish_stats_dispatched";
 const M_STATS_DEAD_LETTERED = "event_publish_stats_dead_lettered";
 const M_STATS_PENDING = "event_publish_stats_pending";
-// The rest of the outbox census, and the reason it is here rather than only in a log line: the
-// settling gates are computed from the TOTAL of these states, so a reader who wants to check the
-// gate's arithmetic needs the components. `failed` in particular is the row a run must not close
-// its window over — its retry budget is spent and its dead-letter write is still owed, so it has
-// reached neither terminal counter.
+// The rest of the outbox census, and the reason it is here rather than only in a log
+// line: the settling gates are computed from the TOTAL of these states, so a reader who
+// wants to check the gate's arithmetic needs the components. `failed` in particular is
+// the row a run must not close its window over — its retry budget is spent and its
+// dead-letter write is still owed, so it has reached neither terminal counter.
 const M_STATS_PROCESSING = "event_publish_stats_processing";
 const M_STATS_FAILED = "event_publish_stats_failed";
 const M_STATS_REPLAYING = "event_publish_stats_replaying";
 const M_STATS_UNSETTLED = "event_publish_stats_unsettled";
-// V-3's numerator when the exported counter is absent: the census reading taken in setup, and
-// the SAME-WINDOW delta against the final one. Recorded so the substitution is auditable — a
-// provenance field that named the stats endpoint while the numerator silently stayed at zero is
-// the defect these two rows close.
+// The dead-letter numerator when the exported counter is absent: the census reading taken in
+// setup, and the SAME-WINDOW delta against the final one. Recorded so the substitution is
+// auditable: without them a provenance field could name the stats endpoint while the
+// numerator silently stayed at zero.
 const M_STATS_DEAD_LETTERED_START = "event_publish_stats_dead_lettered_start";
 const M_STATS_DEAD_LETTERED_DELTA = "event_publish_stats_dead_lettered_delta";
 const M_PARTITION_KEYS = "event_publish_partition_keys";
-// The exact interval the load was offered over, and the divisor V-1's throughput is stated
+// The exact interval the load was offered over, and the divisor the throughput rate is stated
 // over. Recorded so the rate in the summary can be recomputed by hand from the delta.
 const M_LOAD_SECONDS = "event_publish_load_seconds";
 // The offered arrival rate, which carries headroom over the target on purpose, and the ratio
@@ -1634,10 +1376,10 @@ const M_OFFERED_RATE = "event_publish_offered_rate";
 // and the measurement is therefore short by whatever was still queued.
 const M_BACKLOG_DRAINED = "event_publish_backlog_drained";
 const M_DRAIN_SECONDS = "event_publish_drain_seconds";
-// The dead-letter counter's provenance: whether V-3 rests on an explicit series, on the
+// The dead-letter counter's provenance: whether the rate rests on an explicit series, on the
 // authenticated stats endpoint, or on nothing at all.
 const M_DEAD_LETTER_SOURCE = "event_publish_dead_letter_source";
-// How many sampler readings came from a different process than their predecessor (PERF-M08).
+// How many sampler readings came from a different process than their predecessor.
 // A Gauge rather than a Counter because the useful figure is the final total for the run, and
 // because it must publish 0 for a clean run rather than be absent.
 const M_SAMPLER_IDENTITY_CHANGES = "event_publish_sampler_identity_changes";
@@ -1650,10 +1392,9 @@ const M_SUBWINDOWS_QUALIFYING = "event_publish_subwindows_qualifying";
 const M_SUBWINDOWS_OBSERVED = "event_publish_subwindows_observed";
 const M_SUBWINDOW_RESETS = "event_publish_subwindow_counter_resets";
 
-// The settling gates. The two `_pending` rows carry the TOTAL unsettled depth at each gate's
-// exit — pending plus processing plus failed-awaiting-dead-letter plus replaying — rather than
-// the `pending` literal they were named for. The names are kept so an artefact produced by an
-// earlier revision still decodes to the same slot; the summary states the population.
+// The settling gates. The two `_pending` rows carry the TOTAL unsettled depth at each
+// gate's exit — pending plus processing plus failed-awaiting-dead-letter plus replaying
+// — rather than the `pending` literal they were named for.
 const M_PRE_DRAIN_SETTLED = "event_publish_pre_drain_settled";
 const M_PRE_DRAIN_SECONDS = "event_publish_pre_drain_seconds";
 const M_PRE_DRAIN_PENDING = "event_publish_pre_drain_pending";
@@ -1661,10 +1402,10 @@ const M_POST_DRAIN_SETTLED = "event_publish_post_drain_settled";
 const M_POST_DRAIN_SECONDS = "event_publish_post_drain_seconds";
 const M_POST_DRAIN_PENDING = "event_publish_post_drain_pending";
 const M_DRAIN_SOURCE_CODE = "event_publish_drain_source_code";
-// 1 when BOTH gates read the whole unsettled population, 0 when either could only read part of
-// it. It is the row that separates "the tail had settled" from "the tail could not be seen",
-// which the depth figures alone cannot express: an incomplete reading at the floor looks exactly
-// like a settled one.
+// 1 when BOTH gates read the whole unsettled population, 0 when either could only read
+// part of it. It is the row that separates "the tail had settled" from "the tail could
+// not be seen", which the depth figures alone cannot express: an incomplete reading at
+// the floor looks exactly like a settled one.
 const M_SETTLEMENT_POPULATION_COMPLETE =
   "event_publish_settlement_population_complete";
 
@@ -1767,17 +1508,15 @@ const samplerIdentityChangeCount = new Gauge(M_SAMPLER_IDENTITY_CHANGES);
 
 // The sustained-throughput instruments, and the one place in this file where a
 // non-Gauge type is correct: each carries MANY observations, one per subwindow.
-//
-// A Trend for the distribution of per-subwindow rates, so the summary shows the min — the
-// worst interval the pipeline had — beside the average that used to be the only figure.
 const subwindowThroughput = new Trend(M_SUBWINDOW_EVENTS_PER_SEC);
 // A Rate for the tolerance policy: the fraction of qualifying subwindows that individually
 // reached the target.
 const subwindowMetTarget = new Rate(M_SUBWINDOW_MET_TARGET);
-// Counters for the evidence behind that fraction. `count>=N` on a k6 Counter is evaluated
-// even when the metric received no samples at all, which is what makes the qualifying-count
-// threshold the fail-closed guard for the whole family: a `rate>=x` threshold on an EMPTY
-// Rate passes vacuously, so the Rate alone could never be trusted.
+// Counters for the evidence behind that fraction. `count>=N` on a k6 Counter is
+// evaluated even when the metric received no samples at all, which is what makes the
+// qualifying-count threshold the fail-closed guard for the whole family: a `rate>=x`
+// threshold on an EMPTY Rate passes vacuously, so the Rate alone could never be
+// trusted.
 const subwindowsQualifying = new Counter(M_SUBWINDOWS_QUALIFYING);
 const subwindowsObserved = new Counter(M_SUBWINDOWS_OBSERVED);
 const subwindowResets = new Counter(M_SUBWINDOW_RESETS);
@@ -1818,56 +1557,26 @@ function dth(scn) {
   o["http_req_failed{scenario:" + scn + "}"] = ["rate<0.001"];
 
   // API ACCEPTANCE latency — how long the server took to accept a transaction. This is
-  // emphatically NOT the V-1 publish latency, which is measured from the event's capture in
-  // the transactional outbox to broker acknowledgement and lives on the custom metric
-  // `event_publish_p99_seconds` below. Reading this row as the latency verdict is the single
-  // most likely way V-1 gets falsely reported as passing.
-  //
-  // The numbers are not copied from script.js, which is calibrated for 300 arrivals/sec.
-  // These are sized for 500/sec and stay overridable, because the right ceiling for
-  // acceptance latency depends on the deployment rather than on the acceptance criteria.
+  // emphatically NOT the publish-latency target, which is measured from the event's
+  // capture in the transactional outbox to broker acknowledgement and lives on the
+  // custom metric `event_publish_p99_seconds` below. Reading this row as the latency
+  // verdict is the single most likely way the latency target gets falsely reported as passing.
   o[`http_req_duration{scenario:${scn},expected_response:true}`] = [
     "p(95)<" + MAX_API_P95_MS,
     "p(99)<" + MAX_API_P99_MS,
   ];
 
   // The per-response assertions, promoted from advisory to enforced.
-  //
-  // postTxn checks the status AND the returned identifier and status field, but a `check` that
-  // fails only colours the console: k6 exits 0 unless a THRESHOLD fails. Without this row the
-  // run went green while every transaction came back 200-with-no-id or 202-queued-forever —
-  // responses that produce no applied ledger mutation and therefore no event, which is exactly
-  // the state that makes the throughput verdict meaningless.
-  //
-  // Scoped to the scenario tag for the same reason the two rows above are: the /metrics and
-  // /events/stats probes run outside every scenario and must not be able to move a verdict.
   o["checks{scenario:" + scn + "}"] = ["rate>" + MIN_CHECK_PASS_RATE];
 
   // Arrivals the executor could not start, because every VU was busy.
-  //
-  // A dropped iteration is offered load that never happened, so it silently lowers the events
-  // the window can contain while the verdict still divides by the full load interval. It is
-  // also the signal that maxVUs is too small for the offered rate — a configuration fault in
-  // the harness rather than a finding about the system under test, and one that would otherwise
-  // be reported as the system failing to sustain throughput.
-  //
-  // Counted rather than rated because k6 publishes dropped_iterations as a Counter and it is
-  // untagged by scenario; with one scenario in this file that distinction does not matter.
-  //
-  // `count<=`, INCLUSIVE, and the distinction is not pedantic (PERF-m04). maxDroppedIterations
-  // returns a MAXIMUM TOLERATED count and floors at 1, precisely so that the single iteration
-  // k6's arrival-rate executor can drop while ramping VUs does not fail a thirty-minute run.
-  // Expressed exclusively as `count<1`, that floor forbade the one drop it existed to allow: any
-  // short run — every smoke run, and any run whose intended total puts the proportion below one
-  // — demanded ZERO drops and failed on the ramp artefact the comment above calls noise. The
-  // same off-by-one applies at every scale: a tolerance of N accepted only N-1.
   o["dropped_iterations"] = ["count<=" + maxDroppedIterations()];
 
   return o;
 }
 
 /**
- * verdictThresholds builds the thresholds that decide V-1 and V-3.
+ * verdictThresholds builds the thresholds that decide the throughput and dead-letter verdicts.
  *
  * Most are expressed against a Gauge, whose only supported aggregation is `value`: the p99 is
  * already computed from the server's histogram before it reaches the gauge, so k6 is not being
@@ -1881,48 +1590,23 @@ function dth(scn) {
 function verdictThresholds() {
   var o = {};
 
-  // V-1, throughput. Computed as the delta of blnk_events_published_total, the per-event
-  // counter incremented at the transition that records the Kafka leg as durable — NOT from
-  // k6's http_reqs, which counts the requests OFFERED rather than the events produced, and NOT
-  // from the broker acknowledgement counter, which counts writes and would over-report by the
-  // redelivery rate.
-  //
-  // The numerator is read AFTER the outbox has drained, so it includes the tail the relay was
-  // still working through when the load stopped, while the denominator stays the interval the
-  // load was actually offered over. Both halves matter: crediting the tail to a window
-  // lengthened by the drain wait would understate the rate, and dropping the tail entirely
-  // would understate the event count.
-  //
-  // When the sampler is running this is a DIAGNOSTIC average and the verdict below is what
-  // decides sustained throughput. It carries the verdict itself only when the sampler is off,
-  // because then it is the only throughput figure the run produced.
+  // THROUGHPUT. Computed as the delta of blnk_events_published_total, the
+  // per-event counter incremented at the transition that records the Kafka leg as
+  // durable — NOT from k6's http_reqs, which counts the requests OFFERED rather than
+  // the events produced, and NOT from the broker acknowledgement counter, which counts
+  // writes and would over-report by the redelivery rate.
   if (!RATE_SAMPLER_ENABLED) {
     o[M_EVENTS_PER_SEC] = ["value>=" + TARGET_EVENTS_PER_SEC];
   }
 
-  // V-1, SUSTAINED throughput. `min` and not `avg`: the criterion is that the rate held, and
-  // an average over the windows would readmit exactly the burst-then-stall run that the
-  // whole-run average already fails to distinguish.
+  // SUSTAINED THROUGHPUT. `min` and not `avg`: the criterion is that the rate
+  // held, and an average over the windows would readmit exactly the burst-then-stall
+  // run that the whole-run average already fails to distinguish.
   //
-  // EVERY SAMPLER-FED THRESHOLD IS REGISTERED HERE AND ONLY HERE (PERF-M10).
-  //
-  // Three of the five below used to be registered unconditionally, and that contradicted the
-  // branch above outright. With the sampler off — which is what RATE_WINDOW_SECONDS=0 asks for,
-  // and what any run too short to hold two windows gets — the whole-run mean was made the
-  // verdict-carrying figure, and then these fired against metrics no scenario ever fed:
-  //
-  //   M_SUBWINDOWS_QUALIFYING  count>=3   on an empty Counter — EVALUATED AND FAILED
-  //   M_SUBWINDOW_MET_TARGET   rate>=0.95 on an empty Rate    — passed VACUOUSLY
-  //   M_INTERVAL_EVENTS_PER_SEC p(50)>=N  on an empty Trend    — failed
-  //
-  // So a deliberately unsampled run could not pass, whatever the pipeline did, and it failed
-  // naming a subwindow count as the cause. Observed directly: a smoke run reported
-  // `✗ count>=3` beside `✓ rate>=0.95` on the same absent measurement.
-  //
-  // The fail-closed intent behind those thresholds is real and is PRESERVED — it just belongs
-  // inside the branch where the sampler is running. There, an empty Counter failing is exactly
-  // the wanted behaviour: it is what stops a sampler that never read /metrics from certifying
-  // sustained throughput by producing no evidence at all.
+  // The fail-closed intent behind those thresholds is real and is PRESERVED — it just
+  // belongs inside the branch where the sampler is running. There, an empty Counter
+  // failing is exactly the wanted behaviour: it is what stops a sampler that never read
+  // /metrics from certifying sustained throughput by producing no evidence at all.
   if (RATE_SAMPLER_ENABLED) {
     o[M_WINDOW_EVENTS_PER_SEC] = ["min>=" + TARGET_EVENTS_PER_SEC];
     // Fail closed on the sampler itself. Without this, a sampler that could not read
@@ -1930,70 +1614,59 @@ function verdictThresholds() {
     // fail, and the absence of the measurement would read as a pass.
     o[M_RATE_WINDOWS_COUNTED] = ["value>=1"];
 
-    // And the SUSTAINED rate, which is what the criterion actually says. The median of the
-    // per-interval samples at or above the target means at least half the sampled intervals met
-    // it; the run average alone passes for a pipeline that hit 1000/s for eight minutes and
-    // 350/s for the rest, having sustained the target for a quarter of the run. Both thresholds
-    // must hold, so neither statistic can certify the criterion on its own.
+    // And the SUSTAINED rate, which is what the criterion actually says. The median of
+    // the per-interval samples at or above the target means at least half the sampled
+    // intervals met it; the run average alone passes for a pipeline that hit 1000/s for
+    // eight minutes and 350/s for the rest, having sustained the target for a quarter
+    // of the run. Both thresholds must hold, so neither statistic can certify the
+    // criterion on its own.
     o[M_INTERVAL_EVENTS_PER_SEC] = ["p(50)>=" + TARGET_EVENTS_PER_SEC];
 
-    // V-1, SUSTAINED. The whole-window figure above is an average, and an average cannot tell
-    // 500/sec throughout from nothing for half the run and 1000/sec for the other half. This
-    // pair of thresholds is what "sustained" means here, and both are needed:
+    // SUSTAINED THROUGHPUT. The whole-window figure above is an average, and an average
+    // cannot tell 500/sec throughout from nothing for half the run and 1000/sec for the
+    // other half.
     //
-    //   - the RATIO is the tolerance: at most one qualifying subwindow in twenty may miss the
-    //     target at the default 0.95;
-    //   - the COUNT is the evidence floor, and it is also the FAIL-CLOSED GUARD for the pair. A
-    //     `rate>=x` threshold on a Rate that received NO samples passes vacuously in k6, so the
-    //     ratio alone would certify sustained throughput for a run whose sampler never ran. A
-    //     `count>=n` threshold on a Counter is evaluated at zero samples and fails, so the count
-    //     is what makes an unsampled run fail rather than pass.
+    //   - the RATIO is the tolerance: at most one qualifying subwindow in twenty may
+    //     miss the target at the default 0.95;
+    //   - the COUNT is the evidence floor, and it is also the FAIL-CLOSED GUARD for the
+    //     pair.
     o[M_SUBWINDOW_MET_TARGET] = ["rate>=" + MIN_SUSTAINED_SUBWINDOW_RATIO];
     o[M_SUBWINDOWS_QUALIFYING] = ["count>=" + MIN_QUALIFYING_SUBWINDOWS];
   }
 
-  // V-1, latency. The p99 of blnk_events_capture_to_dispatch_duration_seconds_bucket
-  // filtered to attempt="1", interpolated exactly as histogram_quantile would. That series
-  // and no other: when it is absent the gauge is left unrecorded and the availability guard
-  // below fails the run, rather than the shorter publish_duration figure being certified in
-  // its place.
+  // LATENCY. The p99 of blnk_events_capture_to_dispatch_duration_seconds_bucket
+  // filtered to attempt="1", interpolated exactly as histogram_quantile would. That
+  // series and no other: when it is absent the gauge is left unrecorded and the
+  // availability guard below fails the run, rather than the shorter publish_duration
+  // figure being certified in its place.
   o[M_P99_SECONDS] = ["value<" + MAX_P99_PUBLISH_SECONDS];
 
-  // V-3, dead-letter rate. dead_lettered / (dead_lettered + published): the two counters
-  // partition a captured event's terminal outcomes — an event is either delivered or
-  // dead-lettered, never both — so their SUM is the population. Dividing by the delivered
-  // count alone reports dead-letters as a fraction of successes, which overstates the rate and
-  // diverges without bound as failures rise: every event failing gives a denominator of zero.
-  //
-  // The partition is what makes this a rate over EVENTS rather than over broker writes, and it
-  // holds only because BOTH counters are incremented at their durable row transition —
-  // dispatched or webhook-pending on one side, the acknowledged `.dlt` write recorded on the row
-  // on the other. A duplicated broker write counted as a delivery would enlarge the denominator
-  // without enlarging the numerator and understate the rate, which is the direction that lets a
-  // failing pipeline pass.
+  // DEAD-LETTER RATE. dead_lettered / (dead_lettered + published): the two
+  // counters partition a captured event's terminal outcomes — an event is either
+  // delivered or dead-lettered, never both — so their SUM is the population. Dividing
+  // by the delivered count alone reports dead-letters as a fraction of successes, which
+  // overstates the rate and diverges without bound as failures rise: every event
+  // failing gives a denominator of zero.
   o[M_DEAD_LETTER_RATIO] = ["value<" + MAX_DEAD_LETTER_RATIO];
 
-  // V-1, SUSTAINED. The whole-window figure above is an average, and an average cannot tell
-  // 500/sec throughout from nothing for half the run and 1000/sec for the other half. This
-  // pair of thresholds is what "sustained" means here, and both are needed:
+  // SUSTAINED THROUGHPUT. The whole-window figure above is an average, and an average cannot
+  // tell 500/sec throughout from nothing for half the run and 1000/sec for the other
+  // half.
   //
-  //   - the RATIO is the tolerance: at most one qualifying subwindow in twenty may miss the
-  //     target at the default 0.95;
-  //   - the COUNT is the evidence floor, and it is also the FAIL-CLOSED GUARD for the pair. A
-  //     `rate>=x` threshold on a Rate that received NO samples passes vacuously in k6, so the
-  //     ratio alone would certify sustained throughput for a run whose sampler never ran. A
-  //     `count>=n` threshold on a Counter is evaluated at zero samples and fails, so the count
-  //     is what makes an unsampled run fail rather than pass.
+  //   - the RATIO is the tolerance: at most one qualifying subwindow in twenty may miss
+  //     the target at the default 0.95;
+  //   - the COUNT is the evidence floor, and it is also the FAIL-CLOSED GUARD for the
+  //     pair.
   o[M_SUBWINDOW_MET_TARGET] = ["rate>=" + MIN_SUSTAINED_SUBWINDOW_RATIO];
   o[M_SUBWINDOWS_QUALIFYING] = ["count>=" + MIN_QUALIFYING_SUBWINDOWS];
 
-  // Fail closed. This is 1 only when both scrapes succeeded, NO COUNTER RESET occurred, the
-  // INSTANCE WAS ATTRIBUTABLE TO THIS RUN, BOTH SETTLING GATES HELD OVER THE WHOLE UNSETTLED
-  // POPULATION, the series resolved, the window was positive, at least one terminal event was
-  // observed, at least one first-attempt latency sample existed and V-3's numerator came from a
-  // real window delta. Without it, a run against a stack whose observability was disabled would
-  // report three zeroes, two of which pass their `<` thresholds, and certify criteria it never
-  // measured.
+  // Fail closed. This is 1 only when both scrapes succeeded, NO COUNTER RESET occurred,
+  // the INSTANCE WAS ATTRIBUTABLE TO THIS RUN, BOTH SETTLING GATES HELD OVER THE WHOLE
+  // UNSETTLED POPULATION, the series resolved, the window was positive, at least one
+  // terminal event was observed, at least one first-attempt latency sample existed and
+  // the dead-letter numerator came from a real window delta. Without it, a run against a stack
+  // whose observability was disabled would report three zeroes, two of which pass their
+  // `<` thresholds, and certify criteria it never measured.
   o[M_VERDICTS_AVAILABLE] = ["value>=" + REQUIRE_METRICS];
 
   return o;
@@ -2084,10 +1757,11 @@ function maxDroppedIterations() {
 function setupTimeoutSeconds() {
   var provisioningRequests = LEDGER_PAIRS_RAW ? 0 : 3 * Math.max(LEDGER_SPREAD, 0);
   var provisioningSeconds = (provisioningRequests * MAX_API_P99_MS) / 1000;
-  // 60s covers the baseline scrape, the exposition parse and process start-up. The isolation
-  // probe's own sleep is added because it is wall-clock time setup SPENDS: sized without it, a
-  // long probe would be truncated by the stage timeout, and an aborted setup loses the baseline
-  // entirely — the same defect lifecycleTimeout exists to prevent for the settling gate.
+  // 60s covers the baseline scrape, the exposition parse and process start-up. The
+  // isolation probe's own sleep is added because it is wall-clock time setup SPENDS:
+  // sized without it, a long probe would be truncated by the stage timeout, and an
+  // aborted setup loses the baseline entirely — the same defect lifecycleTimeout exists
+  // to prevent for the settling gate.
   var budget = lifecycleTimeout(
     Math.ceil(provisioningSeconds * 1.25) +
       60 +
@@ -2118,15 +1792,9 @@ function teardownTimeoutSeconds() {
 }
 
 function buildOptions() {
-  // THE FIXTURE HARNESS, dispatched before the load scenario so that a fixture run cannot
-  // offer load, register a load threshold or reach a deployment even by accident. One VU, one
-  // iteration, no HTTP: see the note on FIXTURES.
-  //
-  // The failure counter carries a `count==0` threshold so that a `k6 run` reader sees the
-  // verdict in the familiar place, and verdictFixtures ALSO aborts the test when a check
-  // fails. Both are deliberate: k6 skips a threshold on a metric that received no samples, so
-  // the threshold alone would pass vacuously on a harness that never ran a single check, while
-  // the abort is unconditional and sets a distinct exit code.
+  // THE FIXTURE HARNESS, dispatched before the load scenario so that a fixture run
+  // cannot offer load, register a load threshold or reach a deployment even by
+  // accident. One VU, one iteration, no HTTP: see the note on FIXTURES.
   if (FIXTURES) {
     var fixtureThresholds = {};
     fixtureThresholds[M_FIXTURE_FAILURES] = ["count==0"];
@@ -2150,15 +1818,15 @@ function buildOptions() {
   }
 
   if (SCENARIO === "event_publish") {
-    // THERE USED TO BE A SECOND `return` HERE, immediately, carrying only the scenarios map.
-    // It made everything below it unreachable: the verdict thresholds, the computed setup and
-    // teardown timeouts, discardResponseBodies and summaryTrendStats were all assembled and
-    // then never returned. A run therefore offered the load, measured it, and was judged
-    // against k6's defaults — no V-1, V-3 or sustained threshold registered at all, the
-    // /metrics response bodies discarded so every verdict read as unavailable, and setup
-    // killed at the default 60s in the middle of provisioning. It is the seam between two
-    // generations of this function, one that returned early with scenarios alone and one that
-    // built a `scenarios` local and returned it with everything else.
+    // It made everything below it unreachable: the verdict thresholds, the computed
+    // setup and teardown timeouts, discardResponseBodies and summaryTrendStats were all
+    // assembled and then never returned. A run therefore offered the load, measured it,
+    // and was judged against k6's defaults — no throughput, dead-letter or sustained threshold
+    // registered at all, the /metrics response bodies discarded so every verdict read
+    // as unavailable, and setup killed at the default 60s in the middle of
+    // provisioning. It is the seam between two generations of this function, one that
+    // returned early with scenarios alone and one that built a `scenarios` local and
+    // returned it with everything else.
     var scenarios = {};
 
     // constant-arrival-rate rather than constant-vus, so the OFFERED pressure stays
@@ -2178,30 +1846,8 @@ function buildOptions() {
 
     // The sustained-throughput sampler. It runs FOR THE SAME DURATION as the load, in
     // parallel with it, and reads the published counter on a fixed cadence so that each
-    // interval can be judged on its own instead of being averaged into the whole window.
-    //
-    // constant-vus with EXACTLY ONE VU, and both properties matter. `vus: 1` is what makes
-    // the readings a single sequential chain — the sampler's previous reading lives in
-    // per-VU module state, so a second VU would difference the same counter against its
-    // own earlier value and count every interval twice. constant-vus rather than
-    // constant-arrival-rate because the cadence is enforced by the iteration's own sleep,
-    // and an arrival-rate executor asked to keep a schedule it cannot meet would drop
-    // iterations and leave gaps in the chain. A scrape that overruns its cadence therefore
-    // costs nothing but a longer interval, because every rate is divided by the interval
-    // that actually elapsed rather than by the nominal width.
-    //
-    // Its /metrics requests are tagged into their own scenario, which keeps them out of
-    // the load's `http_req_failed` and `http_req_duration` thresholds: a scrape against a
-    // secured endpoint legitimately answers 401, and that must not read as the API
-    // failing.
-    //
-    // REGISTERED ONLY WHEN THE SAMPLER IS ENABLED, which is the same condition
-    // verdictThresholds() gates its two sampler thresholds on and the same one the provenance
-    // block reports as `sustained.enabled`. Registering the scenario unconditionally while
-    // gating the thresholds is how a run too short to contain a counted window came to spawn a
-    // sampler whose samples nothing judged. The exec name is `sampleThroughput`, which is the
-    // function this file actually exports; a second copy of this block named a `sampleRate`
-    // export that does not exist, and k6 refuses to start on an unknown exec.
+    // interval can be judged on its own instead of being averaged into the whole
+    // window.
     if (RATE_SAMPLER_ENABLED) {
       scenarios[SAMPLER_SCENARIO] = {
         executor: "constant-vus",
@@ -2215,16 +1861,10 @@ function buildOptions() {
     return {
       scenarios: scenarios,
       thresholds: merge(dth(SCENARIO), verdictThresholds()),
-      // The baseline and final scrapes each fetch and parse a full Prometheus exposition,
-      // so both stages get more room than the defaults allow. teardown additionally does
-      // the whole quantile computation, and now also waits for the outbox to drain.
-      //
-      // Both are COMPUTED rather than fixed, because a fixed 120s was not enough for the
-      // work setup actually does: provisioning the default spread is 128 ledger requests
-      // followed by 256 balance requests, all sequential, and at the API p99 this same file
-      // asserts (1000ms) that is 384 seconds — three times the budget. The run then failed
-      // in the worst possible way, by falling back to the single-key shorthand and carrying
-      // on for thirty minutes measuring one aggregate.
+      // The baseline and final scrapes each fetch and parse a full Prometheus
+      // exposition, so both stages get more room than the defaults allow. teardown
+      // additionally does the whole quantile computation, and now also waits for the
+      // outbox to drain.
       setupTimeout: setupTimeoutSeconds() + "s",
       teardownTimeout: teardownTimeoutSeconds() + "s",
       // Stated explicitly because the measurement depends on it: with response bodies
@@ -2232,14 +1872,6 @@ function buildOptions() {
       // unavailable.
       discardResponseBodies: false,
       // THE SUSTAINED VERDICT IS STATED OVER p(50), AND p(50) IS NOT A DEFAULT.
-      //
-      // k6's default set is ["avg","min","med","max","p(90)","p(95)"], so `values["p(50)"]`,
-      // `values["p(10)"]` and `values.count` are all absent from the summary unless asked for.
-      // The THRESHOLD is computed independently of this list and was correct without it — which
-      // is precisely why the omission was dangerous rather than merely untidy: the row rendered
-      // its value as "n/a" beside a genuinely passing mark, which reads as a criterion met on
-      // evidence nobody could see. Every k6 default is retained so the familiar rows are
-      // unchanged; the three additions are the ones this file reports.
       summaryTrendStats: [
         "avg",
         "min",
@@ -2259,14 +1891,6 @@ function buildOptions() {
 
 // ---------------------------------------------------------------------------------------
 // Prometheus exposition parsing.
-//
-// The format is line oriented: `#`-prefixed comment lines, then samples shaped as
-// `name{label="value",label="value"} value [timestamp]`. The parser is deliberately small,
-// it does not take shortcuts on the four things that actually vary in real output: label
-// ORDER (never assumed — labels go into a map), escaped characters inside label values,
-// `+Inf` bucket boundaries, and scientific notation. The OpenTelemetry exporter also adds
-// `otel_scope_name` and `otel_scope_version` labels to every series, which is exactly why
-// order-independent parsing is not optional here.
 // ---------------------------------------------------------------------------------------
 
 // parseSampleValue parses a Prometheus sample value.
@@ -2342,9 +1966,9 @@ function findLabelSetEnd(line, start) {
  */
 function parseLabels(text) {
   // A prototype-less map, because a Prometheus label name is only constrained to
-  // `[a-zA-Z_][a-zA-Z0-9_]*` and `__proto__` satisfies that. On an ordinary object literal,
-  // assigning that key would reset the prototype instead of storing a label, and reading
-  // `constructor` would return an inherited function rather than undefined.
+  // `[a-zA-Z_][a-zA-Z0-9_]*` and `__proto__` satisfies that. On an ordinary object
+  // literal, assigning that key would reset the prototype instead of storing a label,
+  // and reading `constructor` would return an inherited function rather than undefined.
   var labels = Object.create(null);
   var i = 0;
   var n = text.length;
@@ -2638,10 +2262,10 @@ function readNumber(bucket, key) {
   return v;
 }
 
-// The two histograms this scenario reads, each with the label filter its documented query
-// uses. publish_duration needs `outcome="dispatched"` as well as `attempt="1"`: it carries
-// three labels, and filtering on the attempt alone would match nothing at all while every
-// dashboard still looked populated.
+// The two histograms this scenario reads, each with the label filter its documented
+// query uses. publish_duration needs `outcome="dispatched"` as well as `attempt="1"`:
+// it carries three labels, and filtering on the attempt alone would match nothing at
+// all while every dashboard still looked populated.
 const HISTOGRAM_SPECS = [
   {
     candidates: SERIES_CAPTURE_TO_DISPATCH,
@@ -2694,9 +2318,9 @@ function collectSnapshot(index) {
       continue;
     }
     // The four populations are DISJOINT and together they are every attempt: a failed
-    // attempt is outcome="retrying" and is split by `terminal`, so summing all four still
-    // gives the attempt total. Reading `retrying` without narrowing on terminal="false"
-    // would double-count the terminal ones.
+    // attempt is outcome="retrying" and is split by `terminal`, so summing all four
+    // still gives the attempt total. Reading `retrying` without narrowing on
+    // terminal="false" would double-count the terminal ones.
     snapshot.attempts[attemptsName] = {
       dispatched:
         sumSeries(index, attemptsName, { outcome: OUTCOME_DISPATCHED }) || 0,
@@ -2732,7 +2356,7 @@ function collectSnapshot(index) {
     }
   }
 
-  // The repair backlogs, summed across both legs (PERF-C01). Collected here so the gauge
+  // The repair backlogs, summed across both legs. Collected here so the gauge
   // fallback in readPendingDepth can add the two non-terminal states blnk_outbox_pending omits,
   // rather than declaring a run drained while half a million rows still owe a dead-letter write.
   for (c = 0; c < SERIES_REPAIR_BACKLOG.length; c++) {
@@ -2742,15 +2366,7 @@ function collectSnapshot(index) {
     }
   }
 
-  // THE COLLECTION AGE, which was read by the drain gate and collected by nobody (PERF-M07).
-  //
-  // readPendingDepth looks this gauge up in snapshot.gauges to decide whether a pending reading
-  // is FRESH, and the lookup could only ever miss: the series was declared, documented as the
-  // freshness signal, and never put into the map. So `age` was unconditionally null, every
-  // reading counted as a new observation, and DRAIN_STABLE_SAMPLES was satisfiable by three
-  // polls of ONE collection — which is exactly the failure the constant exists to prevent, since
-  // the server republishes this backlog on its own tick and polling faster returns the same
-  // number repeatedly.
+  // THE COLLECTION AGE, which was read by the drain gate and collected by nobody.
   for (c = 0; c < SERIES_COLLECTION_AGE.length; c++) {
     var collectedAt = sumSeries(index, SERIES_COLLECTION_AGE[c], {});
     if (collectedAt !== null) {
@@ -2758,7 +2374,7 @@ function collectSnapshot(index) {
     }
   }
 
-  // The process-start marker (PERF-P03). Collected into the same gauge map, so the baseline
+  // The process-start marker. Collected into the same gauge map, so the baseline
   // travels through setup()'s return value exactly as every other reading does and teardown
   // compares like with like.
   for (c = 0; c < SERIES_PROCESS_START.length; c++) {
@@ -2990,26 +2606,6 @@ function bucketQuantile(quantile, bucketMap) {
 // Scraping.
 // ---------------------------------------------------------------------------------------
 
-/*
- * settleBacklog is RETIRED, superseded by waitForOutboxQuiescence.
- *
- * Both implementations of the settling gate were present in this file at once, and only one of
- * them could be the live one: teardown's drainHeld, preDrainSettled/postDrainSettled,
- * drainSourceCode and REASON_PIPELINE_NOT_SETTLED are all written against the two-phase
- * successor, while this one was still called from setup and returned a differently shaped result.
- *
- * The successor keeps every argument this function's documentation made — the biases at both
- * ends of the window, the bounded wait, the absent-series-is-settled rule and the absorption of
- * the exporter's own tick — and adds the two things this one could not do. It confirms quiet over
- * DRAIN_STABLE_SAMPLES readings whose FRESHNESS it verifies from
- * blnk_event_metrics_last_collection_age_seconds, so a single reading taken in the gap between
- * two relay claims cannot be mistaken for an empty outbox and three identical readings from one
- * collector tick cannot be mistaken for three observations. And it reads the depth from the live
- * GET /events/stats query when a master key is available, falling back to the gauge, recording
- * which source answered.
- */
-
-
 /**
  * scrapeMetrics fetches and parses the server's Prometheus exposition.
  *
@@ -3135,18 +2731,6 @@ function scrapeMetrics() {
   };
 }
 
-/*
- * awaitOutboxDrain is RETIRED, superseded by waitForOutboxQuiescence.
- *
- * Its argument survives in the successor and in the comment on the closing gate in teardown: the
- * excluded tail is ENRICHED in the outcome V-3 is about, so dropping it flatters the criterion
- * rather than merely shortening the count. What does not survive is the shape — it returned the
- * scrape that proved the drain, and teardown now takes its closing scrape immediately after the
- * gate returns, which is the same guarantee reached without one function returning two unrelated
- * things.
- */
-
-
 /**
  * pendingFromScrape reads the outbox backlog out of a scrape.
  *
@@ -3196,11 +2780,12 @@ function pendingFromScrape(scrape) {
  *   failed       the retry budget is spent and the DEAD-LETTER WRITE IS STILL OWED. This row
  *                has reached no terminal counter: it is absent from the published count and
  *                absent from the dead-lettered count, so a window that closes over it
- *                understates BOTH — and it understates V-3 specifically, because a failing
+ *                understates BOTH — and it understates the dead-letter rate specifically,
+ *                because a failing
  *                row is the one most likely to become a dead letter.
  *   replaying    a dead-lettered row a replay has claimed. A publish is in flight and the
  *                dead-lettered census moves when it settles, which is exactly the figure
- *                V-3's stats-sourced numerator differences.
+ *                the stats-sourced dead-letter numerator differences.
  *
  * `webhook_pending` is DELIBERATELY EXCLUDED and its exclusion is not an oversight. Such a
  * row's Kafka leg is acknowledged AND recorded — blnk_events_published_total has already
@@ -3217,7 +2802,7 @@ function pendingFromScrape(scrape) {
  * close — so the gate treats a null as "the population could not be read" and refuses to
  * certify quiescence from it.
  *
- * IT ASKS FOR COUNTS ONLY (PERF-M02). See EVENTS_STATS_COUNTS_URL: the drain loop polls this once
+ * IT ASKS FOR COUNTS ONLY. See EVENTS_STATS_COUNTS_URL: the drain loop polls this once
  * a second, and the alternative postures additionally make a broker round trip and run an exact
  * COUNT of the dispatched history, which would make the measurement a load source of its own.
  *
@@ -3265,11 +2850,11 @@ function probeEventStats() {
 
   var status =
     res && typeof res.status === "number" ? res.status : STATUS_UNREACHABLE;
-  // merge() over the unavailable shape rather than a hand-written literal, on every failing
-  // return. The literals used to name four fields, so adding a fifth left the failure paths
-  // handing back an object with `unsettled` UNDEFINED — and `undefined` is not `null`: a
-  // completeness test written as `!== null` would have read a missing field as a real
-  // population of NaN, which is the one reading a fail-closed gate must never make.
+  // merge() over the unavailable shape rather than a hand-written literal, on every
+  // failing return. A literal naming each field by hand leaves a newly added field
+  // UNDEFINED on the failure paths — and `undefined` is not `null`: a completeness test
+  // written as `!== null` would read a missing field as a real population of NaN, which
+  // is the one reading a fail-closed gate must never make.
   if (status !== 200 || !res.body) {
     return merge(unavailable, { status: status });
   }
@@ -3290,10 +2875,11 @@ function probeEventStats() {
   var failed = readOptionalNumber(body, "failed");
   var replaying = readOptionalNumber(body, "replaying");
 
-  // ALL FOUR OR NOTHING. A response that carried three of them would sum to a population
-  // short by the fourth, and a short population at or below the floor is indistinguishable
-  // from a settled one — which is the whole defect. Null here makes the gate say "the
-  // population could not be read" and withhold, rather than certify a partial sum.
+  // ALL FOUR OR NOTHING. A response that carried three of them would sum to a
+  // population short by the fourth, and a short population at or below the floor is
+  // indistinguishable from a settled one — which is the whole defect. Null here makes
+  // the gate say "the population could not be read" and withhold, rather than certify a
+  // partial sum.
   var unsettled =
     pending === null ||
     processing === null ||
@@ -3375,9 +2961,8 @@ function postJSON(url, body, endpointTag) {
  *
  * # The quantity, and why it is not "pending"
  *
- * This used to read the `pending` count alone, under the name readPendingDepth, and that is
- * the measurement defect it now exists to close. Three other states are un-settled Kafka work
- * and were all treated as quiet:
+ * Reading the `pending` count alone is the measurement defect this exists to close: three
+ * other states are un-settled Kafka work that a pending-only reading treats as quiet:
  *
  *   - `processing` — claimed under a lease, unacknowledged. It is not merely un-counted, it is
  *     the state a STALLED relay holds every row in.
@@ -3385,9 +2970,9 @@ function postJSON(url, body, endpointTag) {
  *     has reached NO terminal counter: absent from the published count and absent from the
  *     dead-lettered count. Closing the window over it understates throughput and understates
  *     the DEAD-LETTER RATE, and it is the row most likely to become a dead letter — so the
- *     exclusion flatters V-3 by removing exactly its enriched tail.
+ *     exclusion flatters the dead-letter rate by removing exactly its enriched tail.
  *   - `replaying` — a publish in flight whose completion moves the dead-lettered census that
- *     V-3's stats-sourced numerator is differenced from.
+ *     the stats-sourced dead-letter numerator is differenced from.
  *
  * `webhook_pending` is excluded: its Kafka leg is acknowledged and already counted, and only
  * the deprecated HTTP leg is owed. See probeEventStats for the full state-by-state rationale.
@@ -3448,11 +3033,11 @@ function readUnsettledDepth() {
     };
   }
 
-  // pendingFromScrape rather than a hand-rolled scan, and the two used to coexist — that helper
-  // was defined, documented and never called while this function open-coded the same lookup. The
-  // helper resolves the name through resolveSeries, which is the mechanism the rest of this file
-  // uses to tolerate the exporter's optional suffixing; the open-coded loop tolerated it too but
-  // by a second copy of the rule, which is how one of them comes to be updated and the other not.
+  // pendingFromScrape rather than a hand-rolled scan. The helper resolves the name
+  // through resolveSeries, which is the mechanism the rest of this file uses to tolerate
+  // the exporter's optional suffixing; open-coding the same lookup here would be a second
+  // copy of that rule, and a second copy is how one of them comes to be updated and the
+  // other not.
   var gauges = scrape.snapshot.gauges || {};
   var pending = pendingFromScrape(scrape);
   var c;
@@ -3467,15 +3052,12 @@ function readUnsettledDepth() {
     }
   }
 
-  // THE REPAIR BACKLOGS, ADDED TO THE GAUGE DEPTH (PERF-C01). blnk_outbox_pending is pending
-  // plus processing; blnk_events_repair_backlog carries `failed` and `webhook_pending` summed
-  // across its two legs. Without this addition the fallback path reproduced the very defect the
-  // stats path above was just fixed for, so a run whose master key was unset — which is all it
-  // takes to reach this branch — would still declare a drained outbox with the dead-letter write
-  // backlog untouched.
-  //
-  // `replaying` remains UNOBSERVABLE here: no gauge publishes it. The count is therefore a LOWER
-  // BOUND on this path and says so through `complete`, rather than being presented as authoritative.
+  // THE REPAIR BACKLOGS, ADDED TO THE GAUGE DEPTH. blnk_outbox_pending is pending plus
+  // processing; blnk_events_repair_backlog carries `failed` and `webhook_pending`
+  // summed across its two legs. Without this addition the fallback path reproduced the
+  // very defect the stats path above was just fixed for, so a run whose master key was
+  // unset — which is all it takes to reach this branch — would still declare a drained
+  // outbox with the dead-letter write backlog untouched.
   var owed = null;
   for (c = 0; c < SERIES_REPAIR_BACKLOG.length; c++) {
     if (
@@ -3535,7 +3117,8 @@ function readUnsettledDepth() {
  *     discards all three, which understates throughput and — the more serious direction —
  *     understates the DEAD-LETTER RATIO, because an event still working through its five
  *     attempts, or already past them, is precisely the one most likely to end up
- *     dead-lettered. V-3 is the criterion most flattered by stopping the clock early.
+ *     dead-lettered. The dead-letter rate is the criterion most flattered by stopping the
+ *     clock early.
  *
  * Neither distortion is bounded, so neither can be dismissed as small. This gate closes both:
  * the baseline is taken once the provisioning events have drained, and the final scrape once
@@ -3545,9 +3128,10 @@ function readUnsettledDepth() {
  *
  * The TOTAL of every state from which a Kafka publish is still owed — pending, processing,
  * failed-awaiting-its-dead-letter-write, and replaying — never the `pending` literal alone.
- * That distinction IS the fix: three of those four states used to read as quiet, and the
- * excluded rows are enriched in the outcome V-3 is about, so dropping them flattered the
- * criterion rather than merely shortening the count. readUnsettledDepth owns the arithmetic and
+ * That distinction matters because three of those four states read as quiet under a
+ * pending-only reading, and the excluded rows are enriched in the outcome the dead-letter
+ * rate is about, so dropping them flatters the criterion rather than merely shortening the
+ * count. readUnsettledDepth owns the arithmetic and
  * probeEventStats documents each state's membership.
  *
  * Quiescence requires DRAIN_STABLE_SAMPLES CONSECUTIVE readings whose TOTAL is at or below
@@ -3593,10 +3177,10 @@ function waitForOutboxQuiescence(phase, budgetSeconds) {
   var freshCollections = 0;
   var incompleteReadings = 0;
   // Gauge readings whose freshness could NOT be established because the collection-age series
-  // was absent (PERF-M07). Reported rather than tolerated silently: a confirmation that could not
+  // was absent. Reported rather than tolerated silently: a confirmation that could not
   // be proven to rest on a new collection is weaker evidence than one that could.
   var ageUnavailablePolls = 0;
-  // Whether the depth readings were an authoritative all-states count (PERF-C01) or a lower
+  // Whether the depth readings were an authoritative all-states count or a lower
   // bound. The gauge path cannot see `replaying`, so it is always a lower bound there.
   var depthComplete = null;
 
@@ -3656,32 +3240,21 @@ function waitForOutboxQuiescence(phase, budgetSeconds) {
     depthComplete =
       depthComplete === false ? false : reading.complete === true;
 
-    // AN INCOMPLETE POPULATION IS A REFUSAL, NOT A LOWER CONFIDENCE. The reading is real and is
-    // reported, and it cannot end the gate: the states it omits — a failed row owed a
-    // dead-letter write, a replay in flight — are precisely the tail whose exclusion flatters
-    // V-3, so counting a partial sum towards quiescence would reinstate the defect while
-    // looking like a measurement. The loop keeps polling so the figures and the freshness
-    // count are still gathered for the diagnostic below, and the budget then expires into the
-    // state_unavailable branch.
+    // AN INCOMPLETE POPULATION IS A REFUSAL, NOT A LOWER CONFIDENCE. The reading is
+    // real and is reported, and it cannot end the gate: the states it omits — a failed
+    // row owed a dead-letter write, a replay in flight — are precisely the tail whose
+    // exclusion flatters the dead-letter rate, so counting a partial sum towards
+    // quiescence would understate the tail while looking like a measurement. The loop
+    // keeps polling so
+    // the figures and the freshness count are still gathered for the diagnostic below,
+    // and the budget then expires into the state_unavailable branch.
     if (!reading.complete) {
       incompleteReadings++;
     }
 
-    // Freshness, as described above: the live endpoint always counts, a gauge reading counts
-    // only when a new collection has demonstrably occurred since the last counted one.
-    //
-    // THIS TEST WAS INERT UNTIL collectSnapshot COLLECTED THE AGE GAUGE (PERF-M07). The series
-    // was declared and documented as the freshness signal, and never put into snapshot.gauges —
-    // so `reading.age` was ALWAYS null, the first disjunct was always taken, `counts` was
-    // unconditionally true, and three polls of a SINGLE collection satisfied
-    // DRAIN_STABLE_SAMPLES. The gate then declared the outbox settled on one observation, which
-    // is precisely what the constant exists to prevent: the server republishes this backlog on
-    // its own collector tick, so polling faster than that tick re-reads one number.
-    //
-    // The `age === null` tolerance is KEPT — a deployment can legitimately lack the gauge — but
-    // it is no longer silent. ageUnavailablePolls counts the readings that could not be proven
-    // fresh, and it travels out with the result so a settled verdict cannot claim confirmations
-    // it did not earn.
+    // Freshness, as described above: the live endpoint always counts, a gauge reading
+    // counts only when a new collection has demonstrably occurred since the last
+    // counted one.
     var counts = reading.complete;
     if (reading.source === DRAIN_SOURCE_GAUGE && stable > 0) {
       if (reading.age === null) {
@@ -3725,18 +3298,14 @@ function waitForOutboxQuiescence(phase, budgetSeconds) {
     sleep(DRAIN_POLL_SECONDS);
   }
 
-  // The budget expired. There are THREE reasons that can happen and they call for different
-  // actions, so they are reported as different reasons rather than as one.
+  // The budget expired. There are THREE reasons that can happen and they call for
+  // different actions, so they are reported as different reasons rather than as one.
   //
-  // The message this replaced said "the outbox still held N pending rows" in both cases. When
-  // the depth was already at the floor and only the confirmations were short, that sentence
-  // named the wrong cause: it sent a reader to look at a backlog that was not there, while the
-  // actual fix was a larger budget or a master key. A diagnostic that points at the wrong
-  // thing is worse than no diagnostic.
-  //
-  // The third case is the incomplete population, and it is FIRST because it subsumes the other
-  // two: when the states are not all observable, neither "it drained" nor "the confirmations
-  // were short" is a claim this gate is entitled to make about the tail at all.
+  // The message this replaced said "the outbox still held N pending rows" in both
+  // cases. When the depth was already at the floor and only the confirmations were
+  // short, that sentence named the wrong cause: it sent a reader to look at a backlog
+  // that was not there, while the actual fix was a larger budget or a master key. A
+  // diagnostic that points at the wrong thing is worse than no diagnostic.
   var atFloor = lastPending !== null && lastPending <= DRAIN_FLOOR;
   var stateUnavailable = incompleteReadings > 0 && stable < DRAIN_STABLE_SAMPLES;
   var reason;
@@ -3963,14 +3532,6 @@ function provisionAggregates() {
   }
 
   // Two passes, ledgers first and balances second, rather than one interleaved pass.
-  //
-  // Creating a balance immediately after its ledger races the search indexer: the ledger's
-  // index write is queued asynchronously, and indexing a balance whose ledger document has not
-  // landed yet is rejected. That rejection is reported as a system error, and every system
-  // error shares ONE partition key, so a burst of them queues behind itself and lands in the
-  // latency tail of the very histogram this scenario measures. Separating the passes lets the
-  // ledger writes drain while the balances are being created, so the measurement is not
-  // polluted by a subsystem this scenario has no interest in.
   for (i = 0; i < LEDGER_SPREAD; i++) {
     var ledger = postJSON(
       LEDGERS_URL,
@@ -4187,10 +3748,11 @@ function verifyInstanceIsolation() {
  * @returns {object} the baseline snapshot and the configuration echo.
  */
 export function setup() {
-  // A fixture run contacts nothing, so it provisions nothing and takes no baseline. k6 calls
-  // setup for every run regardless of which scenarios are registered, so the guard has to be
-  // here rather than in the scenario map: without it, `-e FIXTURES=1` would provision ledgers
-  // and balances against whatever deployment happened to be reachable.
+  // A fixture run contacts nothing, so it provisions nothing and takes no baseline. k6
+  // calls setup for every run regardless of which scenarios are registered, so the
+  // guard has to be here rather than in the scenario map: without it, `-e FIXTURES=1`
+  // would provision ledgers and balances against whatever deployment happened to be
+  // reachable.
   if (FIXTURES) {
     return {};
   }
@@ -4207,16 +3769,8 @@ export function setup() {
         : ""),
   );
 
-  // Acceptance mode refuses to spend thirty minutes measuring something it cannot certify.
-  //
-  // Provisioning is sequential and can be cut short by a single failed request, and the old
-  // behaviour was to carry on with whatever it got — including nothing, which meant the
-  // shorthand fallback and a single partition key. The run then completed, produced a
-  // throughput figure that was really one aggregate's serialisation ceiling, and reported it
-  // against V-1. Failing here costs a minute; the alternative costs half an hour and produces
-  // a number that looks like an answer.
-  //
-  // SMOKE=1 opts out, and LEDGER_SPREAD=0 is the deliberate single-aggregate measurement.
+  // Acceptance mode refuses to spend thirty minutes measuring something it cannot
+  // certify.
   if (!SMOKE && LEDGER_SPREAD > 0 && pairs.length < requiredSpread()) {
     throw new Error(
       "acceptance mode needs at least " +
@@ -4234,22 +3788,8 @@ export function setup() {
   }
 
   // The baseline is taken AFTER provisioning on purpose: the ledger.created and
-  // balance.created events provisioning emits belong on the baseline side of the deltas.
-  //
-  // "After provisioning" was not enough on its own, though, and the gap is the relay's poll
-  // interval. Provisioning REQUESTS those events; the relay publishes them a poll or two later.
-  // A baseline taken in between put them on the right-hand side of every delta, so they were
-  // counted as the run's traffic and their end-to-end latencies — which include however long
-  // provisioning's own batch waited — entered the population V-1's p99 is read from. Waiting for
-  // the backlog to drain first is what actually puts them behind the baseline.
-  // THE PRE-LOAD SETTLING GATE, and there is exactly one of it. Two generations of this gate
-  // were both present: this call, and the `preDrain` the return block below hands to teardown
-  // — which was never produced, so setup threw a ReferenceError on its own return statement
-  // and no run ever reached the load. They are now one gate: the two-phase implementation is
-  // the survivor because it is what teardown's drainHeld, preDrainSettled, drainSourceCode and
-  // REASON_PIPELINE_NOT_SETTLED are all written against, and because it confirms quiet over
-  // DRAIN_STABLE_SAMPLES readings whose freshness it verifies rather than trusting a single
-  // reading that can be the gap between two claims.
+  // balance.created events provisioning emits belong on the baseline side of the
+  // deltas.
   var preDrain = waitForOutboxQuiescence("pre-load", PRE_DRAIN_BUDGET_SECONDS);
   // The shape the console line and the two baseline_* summary fields below read. Derived rather
   // than measured separately, so the pre-load figure the summary reports and the pre-load gate
@@ -4270,13 +3810,10 @@ export function setup() {
       " polls)",
   );
 
-  // ATTRIBUTION, checked here and not in teardown, for the same reason the spread check is here:
-  // a thirty-minute run that cannot be attributed to itself is thirty minutes spent producing a
-  // number nobody may quote, and the cost of finding out now is one idle probe.
-  //
-  // It runs AFTER the settling gate deliberately. The gate has just proved the outbox quiet, so
-  // any terminal counter that moves during the probe is another workload's event rather than
-  // this run's own provisioning still draining.
+  // ATTRIBUTION, checked here and not in teardown, for the same reason the spread check
+  // is here: a thirty-minute run that cannot be attributed to itself is thirty minutes
+  // spent producing a number nobody may quote, and the cost of finding out now is one
+  // idle probe.
   var isolation = verifyInstanceIsolation();
   console.log(
     "[event_publish] instance isolation " +
@@ -4309,29 +3846,8 @@ export function setup() {
   }
 
   var scrape = scrapeMetrics();
-  // THE BASELINE CENSUS, taken beside the baseline scrape and for one specific purpose: V-3's
-  // numerator when blnk_events_dead_lettered_total is absent from the exposition.
-  //
-  // Without it, teardown had only the CUMULATIVE dead-letter count — every dead letter the
-  // deployment has ever accumulated — which is not a window delta and cannot be used as one. The
-  // consequence was worse than unusable: the endpoint's mere reachability selected it as the
-  // numerator's provenance while the numerator itself stayed at the absent series' zero, so a
-  // run with real dead letters could certify a 0% rate. Two readings differenced over the same
-  // window is what makes the fallback an actual measurement.
-  // THE OUTBOX-TABLE BASELINE, taken beside the metrics baseline (PERF-M01).
-  //
-  // V-3's numerator has two possible sources and only one of them was ever read. When
-  // blnk_events_dead_lettered_total is ABSENT from the exposition, the run declared the stats
-  // endpoint as its provenance — and then computed the numerator from the metrics delta anyway,
-  // which is null for an absent series and became 0. So V-3 reported a 0.000000 dead-letter rate,
-  // passed its `value<0.001` threshold, and named a source that had contributed nothing. A
-  // criterion certified from an absent measurement is the exact failure this harness exists to
-  // prevent, and it was doing it on the one verdict whose threshold is tightest.
-  //
-  // A rate needs two readings, so the fallback needs a baseline here: the counter is cumulative
-  // and the endpoint's dead_lettered is a live table count, and neither is the run's own
-  // contribution on its own. Taken AFTER the pre-load gate, so it excludes provisioning's events
-  // exactly as the metrics baseline does.
+  // THE BASELINE CENSUS, taken beside the baseline scrape and for one specific purpose:
+  // The dead-letter numerator when blnk_events_dead_lettered_total is absent from the exposition.
   var statsBaseline = probeEventStats();
   console.log(
     "[event_publish] baseline outbox counts -> status " +
@@ -4368,7 +3884,8 @@ export function setup() {
     // The isolation outcome travels the same way, and for the same reason: teardown writes it
     // into a metric and folds it into the availability decision.
     isolation: isolation,
-    // The left-hand side of V-3's stats-sourced numerator. Carries no credential — it is a
+    // The left-hand side of the stats-sourced dead-letter numerator. Carries no
+    // credential — it is a
     // census of row counts — so it is safe in setup_data, which is embedded verbatim in the
     // summary.
     statsBaseline: statsBaseline,
@@ -4463,19 +3980,6 @@ function postTxn(source, destination) {
   });
 
   // The status alone is not enough to know an event will follow.
-  //
-  // 201 with no transaction_id, or a status this scenario does not expect, both mean the
-  // pipeline did not do what the throughput verdict assumes it did — and both used to leave the
-  // run green, because the response shape was never asserted and a failing `check` does not
-  // fail k6 on its own. The `checks` threshold in dth() is what makes these enforced; these are
-  // what make it meaningful.
-  //
-  // The accepted statuses are QUEUED and INFLIGHT. The request sets inflight:true, so an
-  // accepted transaction is INFLIGHT once applied and QUEUED while it waits for the transaction
-  // worker; both produce a captured event. APPLIED is accepted too, because a deployment
-  // running with skip_queue would return it and the event is captured just the same. REJECTED
-  // is NOT accepted: it is a 201 that produces a transaction.rejected event instead of the
-  // applied one this scenario is offering load to produce.
   var body = null;
   try {
     body = res.json();
@@ -4532,25 +4036,17 @@ export function publishEvents(data) {
 
 // ---------------------------------------------------------------------------------------
 // The sustained-throughput sampler.
-//
-// Module state, and the one place in this file where per-VU module state is load-bearing.
-// Each k6 VU gets its own JavaScript runtime, so a module-scoped variable is private to one
-// VU and persists across that VU's iterations. The sampler scenario is therefore pinned to
-// EXACTLY ONE VU (`constant-vus` with `vus: 1`), which makes this a single sequential series
-// of observations rather than several interleaved ones. With more than one VU each would hold
-// its own `samplerPrevious` and difference the same counter against its own earlier reading,
-// double-counting every interval.
 // ---------------------------------------------------------------------------------------
 
 var samplerPrevious = null;
 // How many sampler readings came from a DIFFERENT process than the reading before them
-// (PERF-M08). Non-zero means the endpoint is not a single process for the purposes of a counter
+// Non-zero means the endpoint is not a single process for the purposes of a counter
 // delta — either it restarted, or the scrape is load-balanced across replicas.
 var samplerIdentityChanges = 0;
-// Counted and skipped INTERVALS, reported as gauges so the summary can say how much of the run
-// the sustained claim actually rests on. They are cumulative counts rather than the module
-// mutables of the earlier sampler generation, whose value/anchor/name trio this function no
-// longer keeps: `samplerPrevious` above is the whole anchor.
+// Counted and skipped INTERVALS, reported as gauges so the summary can say how much of
+// the run the sustained claim actually rests on. They are cumulative counts rather than
+// the module mutables of the earlier sampler generation, whose value/anchor/name trio
+// this function no longer keeps: `samplerPrevious` above is the whole anchor.
 var samplerCounted = 0;
 var samplerSkipped = 0;
 
@@ -4558,11 +4054,11 @@ var samplerSkipped = 0;
  * sampleThroughput takes one reading of the published counter and judges the interval since
  * the previous reading on its own.
  *
- * WHY THIS SCENARIO EXISTS. V-1 asks for 500 events/sec SUSTAINED. A whole-window delta
+ * WHY THIS SCENARIO EXISTS. The target is 500 events/sec SUSTAINED. A whole-window delta
  * divided by the window is an AVERAGE, and an average cannot distinguish a pipeline that held
  * 500/sec throughout from one that published nothing for half the run and 1000/sec for the
  * other half. The second pipeline has not sustained anything, and under the old measurement
- * it certified V-1.
+ * it certified the target.
  *
  * So the counter is read on a fixed cadence and each inter-sample interval — a SUBWINDOW — is
  * judged separately. The tolerance is explicit and stated in one place: at least
@@ -4611,16 +4107,13 @@ export function sampleThroughput(data) {
     return;
   }
 
-  // THE PROCESS THIS READING CAME FROM (PERF-M08). Every sample is a delta of a per-process
-  // counter, so two readings taken from DIFFERENT processes do not difference to anything. The
-  // baseline-versus-final identity check cannot see this: it compares the two ends of the run and
-  // never the samples in between, so a run whose baseline and final scrape happened to land on
-  // one replica while the sampler rotated across the others passed it while every sustained-
-  // throughput sample was arithmetic across unrelated counters.
-  //
-  // Behind a Service or an ingress this is exactly what happens — server-deployment.yaml is
-  // horizontally scaled — and the symptom is not an error: it is a counter that appears to jump
-  // up and down, which reads as a throughput dip or a reset rather than as a measurement fault.
+  // THE PROCESS THIS READING CAME FROM. Every sample is a delta of a per-process
+  // counter, so two readings taken from DIFFERENT processes do not difference to
+  // anything. The baseline-versus-final identity check cannot see this: it compares the
+  // two ends of the run and never the samples in between, so a run whose baseline and
+  // final scrape happened to land on one replica while the sampler rotated across the
+  // others passed it while every sustained- throughput sample was arithmetic across
+  // unrelated counters.
   var identity = null;
   var identityGauges = scrape.snapshot.gauges || {};
   for (c = 0; c < SERIES_PROCESS_START.length; c++) {
@@ -4709,23 +4202,20 @@ export function sampleThroughput(data) {
     subwindowMetTarget.add(rate >= TARGET_EVENTS_PER_SEC);
   }
 
-  // THE SECOND FAMILY, RECORDED FROM THE SAME READING. event_publish_window_events_per_second
-  // and its counted/skipped pair are read by the sampler's own thresholds and by the provenance
-  // block, and they used to be fed by a SECOND sampler body spliced onto the end of this one —
-  // which maintained five module-level mutables this function no longer has, differenced against
-  // its own anchor, and applied its own warm-up rule. Two anchors over one counter is how two
-  // reported rates for one run come to disagree; feeding both families from this interval makes
-  // them the same measurement by construction. `counted` is the QUALIFYING interval rather than
-  // a separately warmed-up one, for the same reason.
+  // Two anchors over one counter is how two reported rates for one run come to
+  // disagree; feeding both families from this interval makes them the same measurement
+  // by construction. `counted` is the QUALIFYING interval rather than a separately
+  // warmed-up one, for the same reason.
   if (qualifies) {
     samplerCounted++;
     rateWindowsCounted.add(samplerCounted);
     windowEventsPerSecond.add(rate);
-    // THE THIRD READER OF THIS SAME NUMBER, and it carries the p(50) threshold the sustained
-    // criterion is stated on. It was declared, thresholded UNCONDITIONALLY and reported with a
-    // full distribution in the provenance block — and never recorded, so `p(50)` had no
-    // population and the row rendered a threshold nobody could evaluate. Recorded from the
-    // qualifying intervals, which is the population the sustained claim is about.
+    // THE THIRD READER OF THIS SAME NUMBER, and it carries the p(50) threshold the
+    // sustained criterion is stated on. It was declared, thresholded UNCONDITIONALLY
+    // and reported with a full distribution in the provenance block — and never
+    // recorded, so `p(50)` had no population and the row rendered a threshold nobody
+    // could evaluate. Recorded from the qualifying intervals, which is the population
+    // the sustained claim is about.
     intervalEventsPerSecond.add(rate);
   } else {
     // Measured, reported, and deliberately not counted: the interval was not wholly inside the
@@ -4737,16 +4227,6 @@ export function sampleThroughput(data) {
 
   sleep(SUBWINDOW_SECONDS);
 }
-
-/*
- * drainOutbox is RETIRED, superseded by waitForOutboxQuiescence.
- *
- * The third of three generations of the same gate to be present in this file simultaneously. Its
- * one distinct argument is preserved in the successor: an UNREADABLE backlog reports not-settled
- * rather than assuming zero, because an unreadable backlog is the same evidential state as a
- * large one.
- */
-
 
 /**
  * teardown takes the final reading, computes the three verdicts and records them.
@@ -4777,13 +4257,13 @@ export function teardown(data) {
   var startedAt = numberFrom(baseline.startedAt, 0);
   var startStatus = numberFrom(baseline.metricsStatus, STATUS_UNREACHABLE);
 
-  // The load has stopped, but the pipeline has not. Its last events are pending, an event
-  // mid-retry has reached no terminal counter, and an event whose retry budget is spent is
-  // waiting for its dead-letter write with no terminal counter either — so scraping now would
-  // end the window in the middle of the work it is supposed to be measuring, understating
-  // throughput and understating the dead-letter ratio by excluding exactly the events most
-  // likely to be dead-lettered. The gate runs first, over the WHOLE unsettled population, and
-  // the final scrape reads a settled pipeline.
+  // The load has stopped, but the pipeline has not. Its last events are pending, an
+  // event mid-retry has reached no terminal counter, and an event whose retry budget is
+  // spent is waiting for its dead-letter write with no terminal counter either — so
+  // scraping now would end the window in the middle of the work it is supposed to be
+  // measuring, understating throughput and understating the dead-letter ratio by
+  // excluding exactly the events most likely to be dead-lettered. The gate runs first,
+  // over the WHOLE unsettled population, and the final scrape reads a settled pipeline.
   var postDrain = waitForOutboxQuiescence(
     "post-load",
     POST_DRAIN_BUDGET_SECONDS,
@@ -4817,9 +4297,10 @@ export function teardown(data) {
     preDrain.state_unavailable === true || postDrain.state_unavailable === true;
   settlementPopulationComplete.add(settlementStateUnavailable ? 0 : 1);
   // THE outbox_drain BLOCK's four inputs. Every one of them was declared, read by
-  // buildProvenance and never recorded, and an unrecorded Gauge reads as 0 — so the summary
-  // reported `completed: false` and `waited_seconds: 0` for a gate that had in fact settled, on
-  // every run. They describe the CLOSING gate, which is the one that block is about.
+  // buildProvenance and never recorded, and an unrecorded Gauge reads as 0 — so the
+  // summary reported `completed: false` and `waited_seconds: 0` for a gate that had in
+  // fact settled, on every run. They describe the CLOSING gate, which is the one that
+  // block is about.
   drainComplete.add(postDrain.settled === true ? 1 : 0);
   drainWaitSeconds.add(numberFrom(postDrain.seconds, 0));
   drainSeconds.add(numberFrom(postDrain.seconds, 0));
@@ -4829,22 +4310,22 @@ export function teardown(data) {
     postDrain.source !== DRAIN_SOURCE_NONE ? postDrain.source : preDrain.source,
   );
 
-  // Both gates must have held for the window to contain the load's events and only those.
-  // REQUIRE_DRAIN=0 keeps the gates and their figures but stops an unsettled pipeline — or a
-  // tail this run could not observe completely — from failing the run, which is only ever right
-  // for a smoke run.
+  // Both gates must have held for the window to contain the load's events and only
+  // those. REQUIRE_DRAIN=0 keeps the gates and their figures but stops an unsettled
+  // pipeline — or a tail this run could not observe completely — from failing the run,
+  // which is only ever right for a smoke run.
   var drainHeld =
     REQUIRE_DRAIN !== 1 ||
     (preDrain.settled === true && postDrain.settled === true);
-  // The one figure that is about BOTH gates, which is why it is recorded here rather than beside
-  // the four above. Also previously never recorded, so `backlog_drained` read 0 — "the backlog
-  // did not drain" — on every run including the ones where both gates settled.
+  // The one figure that is about BOTH gates, which is why it is recorded here rather
+  // than beside the four above.
   backlogDrained.add(drainHeld ? 1 : 0);
 
-  // ATTRIBUTION, decided in setup and judged here. setup() refuses an acceptance run outright,
-  // so a run that reaches teardown unisolated is one that relaxed the requirement — and its
-  // figures are still recorded, exactly as REQUIRE_DRAIN=0 keeps the drain figures, with the
-  // reason and these four rows saying what the numbers are worth.
+  // ATTRIBUTION, decided in setup and judged here. setup() refuses an acceptance run
+  // outright, so a run that reaches teardown unisolated is one that relaxed the
+  // requirement — and its figures are still recorded, exactly as REQUIRE_DRAIN=0 keeps
+  // the drain figures, with the reason and these four rows saying what the numbers are
+  // worth.
   var isolation = baseline.isolation || {
     acknowledged: false,
     probeSeconds: 0,
@@ -4904,7 +4385,7 @@ export function teardown(data) {
     startGauges,
     endGauges,
   );
-  // The process identity (PERF-P03), resolved the same way as every other series so a
+  // The process identity, resolved the same way as every other series so a
   // spelling that matched in one scrape and not the other cannot be silently compared.
   var processSeries = resolveSeries(
     SERIES_PROCESS_START,
@@ -4916,38 +4397,26 @@ export function teardown(data) {
   publishedSeriesCode.add(published.code);
   deadLetteredSeriesCode.add(deadLettered.code);
 
-  // --- The measured window -------------------------------------------------------------
+  // --- The measured window
+  // -------------------------------------------------------------
   //
-  // THE NUMERATOR AND THE DENOMINATOR HAVE TO DESCRIBE THE SAME THING, and with settling
-  // gates at both ends there are two candidate intervals:
+  // THE NUMERATOR AND THE DENOMINATOR HAVE TO DESCRIBE THE SAME THING, and with
+  // settling gates at both ends there are two candidate intervals:
   //
-  //   - The SETTLED WINDOW spans baseline scrape to final scrape. Because each scrape sits on
-  //     the quiet side of a gate, that span contains every event the load produced and none
-  //     that it did not. It is the interval the DELTAS ACTUALLY ACCUMULATED OVER.
-  //   - The OFFERED WINDOW spans baseline scrape to the moment the load stopped. It is the
-  //     interval work was submitted over, and it EXCLUDES the post-load drain.
+  //   - The SETTLED WINDOW spans baseline scrape to final scrape. Because each scrape
+  //     sits on the quiet side of a gate, that span contains every event the load
+  //     produced and none that it did not.
+  //   - The OFFERED WINDOW spans baseline scrape to the moment the load stopped.
   //
-  // BETWEEN THOSE TWO, THE SETTLED WINDOW IS THE HONEST ONE, and the choice is not arbitrary.
-  // Events published during the drain are in the delta either way — the gate exists to include
-  // them — so dividing by the offered window credits drain-period publishing to load-period
-  // seconds. Measured directly on a backlogged pipeline: 153 events, 60.2s offered, 91.1s
-  // settled. Almost all of the publishing happened after the load stopped, and the offered
-  // denominator reported 2.54/sec against a real publish rate of 1.68/sec — a 51%
-  // OVERSTATEMENT, in the direction that produces a false PASS. The settled window has the
-  // opposite bias: a pipeline that kept up perfectly is still charged for the drain's few quiet
-  // seconds, understating its rate slightly, and that is the safe direction — a false FAIL is
-  // visible and investigated, a false PASS is not.
+  // BETWEEN THOSE TWO, THE SETTLED WINDOW IS THE HONEST ONE, and the choice is not
+  // arbitrary. Events published during the drain are in the delta either way — the gate
+  // exists to include them — so dividing by the offered window credits drain-period
+  // publishing to load-period seconds.
   //
-  // THE RATE IS NEVERTHELESS DIVIDED BY NEITHER OF THEM. It is divided by LOAD_SECONDS, the
-  // CONFIGURED load interval, which is what "500 events/sec sustained for 30 minutes" is a
-  // statement about; see the divisor comment at the throughput computation for why. The settled
-  // window is recorded as the audit figure for the delta and gates measurement soundness, and
-  // the offered window is recorded beside it so the gap between the two stays readable — a
-  // large gap IS the diagnosis that the relay fell behind during the load and caught up
-  // afterwards. Neither is the divisor, and the question the offered window was reaching for
-  // ("did the pipeline HOLD the rate while work was arriving") is answered by the per-subwindow
-  // family rather than by any whole-window ratio.
-  //
+  // THE RATE IS NEVERTHELESS DIVIDED BY NEITHER OF THEM. It is divided by LOAD_SECONDS,
+  // the CONFIGURED load interval, which is what "500 events/sec sustained for 30
+  // minutes" is a statement about; see the divisor comment at the throughput
+  // computation for why.
   var settledMillis = scrape.at - startedAt;
   var measuredWindow =
     startedAt > 0 && settledMillis > 0 ? settledMillis / 1000 : 0;
@@ -4957,31 +4426,19 @@ export function teardown(data) {
   windowSeconds.add(measuredWindow);
   offeredWindowSeconds.add(offeredWindow);
 
-  // Nothing derived from a delta means anything unless BOTH ends of it were read. With only
-  // one end, `deltaCounter` legitimately falls back to the reading it has — which is the
-  // right answer for a series that appeared partway through the run, and the wrong one for a
-  // scrape that never happened, because it would present a lifetime total as a windowed
-  // rate. The gate below is what keeps that number out of the verdicts.
-  //
-  // CONTINUITY IS PART OF THE GATE (PERF-P03), and it has to be here rather than only in the
-  // reason code. This flag decides whether each verdict gauge is RECORDED, and an unrecorded
-  // Gauge reads as 0 in the summary — where 0 passes both `value<x` thresholds. So a run whose
-  // exporter restarted must not record them: reporting the reason while still recording a
-  // number computed across two processes is how a reset gets reported alongside a pass, which
-  // is exactly the defect. `restarted` and `resetSeen` are computed below, so this is assigned
-  // there.
+  // Nothing derived from a delta means anything unless BOTH ends of it were read. With
+  // only one end, `deltaCounter` legitimately falls back to the reading it has — which
+  // is the right answer for a series that appeared partway through the run, and the
+  // wrong one for a scrape that never happened, because it would present a lifetime
+  // total as a windowed rate. The gate below is what keeps that number out of the
+  // verdicts.
   var scrapesUsable =
     baseline.metricsAvailable === true &&
     scrape.available &&
     measuredWindow > 0;
 
-  // --- Terminal outcome counters -------------------------------------------------------
-  //
-  // THE PUBLISHED COUNTER IS THE ONE THE VERDICTS ARE COMPUTED FROM. It moves once per
-  // event, at the transition that records the Kafka leg as durable. The dispatched counter is
-  // read too, but only so the settlement gap can be reported: it moves once per event as well,
-  // at the TERMINAL state, so it trails the published count by however many rows are still
-  // waiting in webhook_pending for a legacy webhook leg that has not settled yet.
+  // --- Terminal outcome counters
+  // -------------------------------------------------------
   var dispatchedFrom = readNumber(startCounters, dispatched.name);
   var dispatchedTo = readNumber(endCounters, dispatched.name);
   var dispatchedChange = deltaCounter(dispatchedFrom, dispatchedTo);
@@ -5036,25 +4493,11 @@ export function teardown(data) {
     endHistograms[publishSeries.name],
   );
 
-  // V-1'S LATENCY IS READ FROM capture_to_dispatch OR FROM NOTHING. There is no fallback,
-  // and removing the one that used to be here is the point.
-  //
-  // publish_duration measures a STRICTLY SHORTER INTERVAL: its clock starts at the relay's
-  // claim, so it excludes the row sitting in blnk.event_outbox waiting for the next poll
-  // tick, the poll interval itself, and the claim query. Those omitted parts are exactly
-  // where a backlog lives. A relay an hour behind reports the same sub-second
-  // publish_duration p99 as an idle one — so substituting it does not degrade the
-  // measurement, it answers a DIFFERENT QUESTION and certifies V-1 from the answer.
-  //
-  // The old code recorded which series it used, and that was judged sufficient. It is not:
-  // the substituted number still reached the thresholded gauge, the threshold still
-  // evaluated, and the run still reported PASS. A marker beside a wrong verdict does not
-  // stop the verdict being consumed — CI reads the threshold result, and a human reading
-  // "PASS" does not go looking for a source annotation to disqualify it.
+  // THE LATENCY TARGET IS READ FROM capture_to_dispatch OR FROM NOTHING.
   //
   // So the canonical histogram being absent now FAILS CLOSED through
-  // REASON_NO_FIRST_ATTEMPT_SAMPLES, and the broker-write p99 is retained as a supporting
-  // figure only — recorded, reported, never thresholded.
+  // REASON_NO_FIRST_ATTEMPT_SAMPLES, and the broker-write p99 is retained as a
+  // supporting figure only — recorded, reported, never thresholded.
   var latencySource =
     capture.quantile.value !== null
       ? P99_SOURCE_CAPTURE_TO_DISPATCH
@@ -5066,10 +4509,9 @@ export function teardown(data) {
   p99InterpolationCode.add(
     chosen ? chosen.quantile.interpolation : INTERPOLATION_NONE,
   );
-  // Only two spellings can be reported, because only one instrument can be the source. The
-  // publish-duration arm this ternary used to carry was removed with the fallback itself
-  // (PERF-P02): a branch that can never be taken reads as a live substitution to anyone
-  // grepping for it.
+  // Only two spellings can be reported, because only one instrument can be the source.
+  // There is no publish-duration arm: a branch that can never be taken reads as a live
+  // substitution to anyone grepping for it.
   p99SeriesSpellingCode.add(
     latencySource === P99_SOURCE_CAPTURE_TO_DISPATCH
       ? captureSeries.code
@@ -5078,17 +4520,6 @@ export function teardown(data) {
 
   // THE AUDIT TRAIL IS RECORDED WHETHER OR NOT A QUANTILE CAME OUT, and from `capture`
   // specifically rather than from `chosen`.
-  //
-  // These rows matter MOST on the runs where the verdict is unavailable, because they are what
-  // separates its two causes: `latency_count_end` of zero says the instrument was never
-  // populated, while a non-zero end with a zero delta says it was populated before this window
-  // and stopped. Gating them on `chosen` would have withheld exactly that evidence at exactly
-  // the moment it was needed — a real loss introduced by removing the publish_duration fallback,
-  // since `chosen` used to be non-null in cases where it now is not. `histogramDelta` always
-  // returns a fully-formed result, zeros included, so there is nothing to guard against.
-  //
-  // `latency_sum` and `latency_count` are for reading by hand; the p99 is never derived from
-  // their ratio, which is a mean.
   latencyCountStart.add(capture.countFrom);
   latencyCountEnd.add(capture.countTo);
   latencyCountDelta.add(capture.countDelta);
@@ -5113,66 +4544,17 @@ export function teardown(data) {
   }
 
   // The broker write is reported on its own, and NOTHING IS SUBTRACTED FROM IT.
-  //
-  // What used to be here computed a "queue wait p99" as capture_p99 - brokerWrite_p99.
-  // QUANTILES ARE NOT SUBTRACTIVE: the 99th percentile of a difference is not the
-  // difference of the 99th percentiles, because the two figures are computed over
-  // different populations and the slowest capture-to-dispatch event is generally not the
-  // slowest broker write. The result has no interpretation as a latency, and it can come
-  // out NEGATIVE — which it will whenever the two histograms' bucket boundaries put the
-  // longer interval's rank in a lower bucket than the shorter one's, an ordinary outcome
-  // when both p99s land inside one wide bucket.
-  //
-  // A negative "queue wait" is not merely odd. It is a figure an operator would read as
-  // "the relay is ahead of the broker", which is meaningless, and it was published as a
-  // supporting figure beside a certified verdict.
-  //
-  // The honest replacement is the two measurements side by side. A DIRECT capture-to-claim
-  // histogram would answer the queue-wait question properly, but no such instrument exists
-  // and inventing one in the load script — where it could only be estimated — would repeat
-  // the original mistake in a new place. The report says so explicitly rather than
-  // omitting the question.
   if (brokerWrite.quantile.value !== null) {
     brokerWriteP99.add(brokerWrite.quantile.value);
     if (capture.quantile.value !== null) {
-      // A ROUGH DIAGNOSTIC of how much of the end-to-end figure is backlog rather than broker,
-      // and deliberately not called a queue-wait p99.
-      //
-      // The difference of two quantiles is not the quantile of the difference. Each p99 is the
-      // 99th percentile of its OWN population, and the event sitting at the 99th percentile of
-      // end-to-end age is generally not the event sitting at the 99th percentile of broker
-      // write time — so this number is not any event's queue wait, and it is not the 99th
-      // percentile of the queue wait either. It can even come out negative when the two
-      // populations differ enough, which is the clearest possible sign that it is not a
-      // measurement of a duration.
-      //
-      // It is still worth reporting: a large positive value means the end-to-end figure is
-      // dominated by something other than the broker write, which is the question an operator
-      // actually asks first. Read it as that indication and nothing more. Measuring the queue
-      // wait itself would take an instrument recording the per-event interval, which the
-      // server does not currently export.
+      // A ROUGH DIAGNOSTIC of how much of the end-to-end figure is backlog rather than
+      // broker, and deliberately not called a queue-wait p99.
       p99Difference.add(capture.quantile.value - brokerWrite.quantile.value);
     }
   }
 
-  // --- V-3's numerator and its provenance, resolved BEFORE the arithmetic ----------------
-  //
-  // The order is the fix. Provenance used to be resolved eighty lines BELOW the arithmetic,
-  // which let the two disagree: `deadLetteredEvents` was assigned from the series delta and
-  // nothing else, while the provenance code could select DEAD_LETTER_SOURCE_STATS_ENDPOINT on
-  // the strength of any non-null cumulative census value. An absent counter therefore produced a
-  // numerator of ZERO labelled as having come from the stats endpoint — a 0% dead-letter rate
-  // that clears V-3 on a deployment with real dead letters, reported as a measurement. Resolving
-  // the source first and deriving the numerator FROM it is what makes the label and the number
-  // one decision.
-  //
-  // The census fallback is a SAME-WINDOW DELTA, never a cumulative value. `dead_lettered` counts
-  // every dead letter the deployment has ever accumulated — the count is not window-bounded, and
-  // dead-lettered rows are not purgeable by retention — so a cumulative reading substituted for
-  // a window delta would charge this run with the whole history. A NEGATIVE delta is refused
-  // rather than clamped to zero: it means rows left the state during the window (a replay, or an
-  // operator resolving them), so the difference is not this window's dead-letter count and no
-  // numerator can be formed from it.
+  // --- The dead-letter numerator and its provenance, resolved BEFORE the arithmetic
+  // ----------------
   var stats = probeEventStats();
   var statsBaseline = baseline.statsBaseline || {
     status: STATUS_UNREACHABLE,
@@ -5209,15 +4591,13 @@ export function teardown(data) {
   var dispatchedEvents =
     dispatchedChange.value === null ? 0 : dispatchedChange.value;
   // The EVENT count from the published counter. It is named for what the counter now
-  // measures: one increment per event whose Kafka leg became durable, not one per broker
-  // write. It used to be called brokerWrites, and the rename was applied to the readers
-  // and not to this declaration — which left publishedEvents used twice below and declared
-  // nowhere, a ReferenceError that `node --check` cannot see because it parses without
-  // resolving identifiers.
+  // measures: one increment per event whose Kafka leg became durable, not one per
+  // broker write.
   var publishedEvents =
     publishedChange.value === null ? 0 : publishedChange.value;
   // Taken from whichever source the provenance above SELECTED, so the two cannot diverge. An
-  // unmeasured numerator stays 0 and the availability gate below refuses to score V-3 from it.
+  // unmeasured numerator stays 0 and the availability gate below refuses to score the
+  // rate from it.
   var deadLetteredEvents = 0;
   if (deadLetterProvenance === DEAD_LETTER_SOURCE_SERIES) {
     deadLetteredEvents =
@@ -5227,61 +4607,23 @@ export function teardown(data) {
   }
   // The two counters partition a captured event's TERMINAL outcomes — delivered or
   // dead-lettered, never both — so their sum is the population the rate is stated over.
-  //
-  // Both are incremented at the durable outbox transition rather than at the broker write, so
-  // each captured event contributes exactly ONE to this population however many times it was
-  // written. That is what makes this a count of unique terminal outcomes; the stats
-  // corroboration below reads the same population straight off the outbox table.
   var terminalEvents = publishedEvents + deadLetteredEvents;
 
   // THE DIVISOR IS THE LOAD INTERVAL, not the measured window.
-  //
-  // V-1 asks whether the pipeline sustained 500 events/sec while 500/sec was being offered. The
-  // scrape-to-scrape window is necessarily LONGER than that: it starts at the baseline scrape,
-  // which happens after provisioning, and ends after the tail drain. Dividing by it charges the
-  // load for seconds during which no load was offered, so a pipeline that kept up perfectly
-  // reports below target — and the error grows with the drain, meaning the better the run the
-  // worse it looks. The window is still recorded, as the audit figure for the delta.
-  //
-  // This pairing is only sound because of the drain above: the numerator has to contain every
-  // event the load produced, or dividing by the load interval understates it just as badly.
-  //
-  // Every division is guarded. A zero interval and a zero terminal population are both real
-  // states of a real run, and neither may produce a NaN or an Infinity: JSON.stringify turns
-  // both into `null`, which reads as "not measured" for a figure that was measured, or
-  // worse, silently drops the finding.
   var throughput = LOAD_SECONDS > 0 ? publishedEvents / LOAD_SECONDS : 0;
   var ratio = terminalEvents > 0 ? deadLetteredEvents / terminalEvents : 0;
-  // Published over dispatched, and it is NOT a redelivery factor. Both counters now move
-  // ONCE PER EVENT: published at the transition that made the Kafka leg durable, dispatched
-  // at the terminal state where nothing further is owed for the row. Their ratio is
-  // therefore the SETTLEMENT GAP — how many events have been delivered to Kafka but still
-  // owe the legacy webhook leg — and it converges to 1.0 at the sunset, when that leg and
-  // the webhook_pending state are removed.
-  //
-  // The real redelivery factor needs blnk_events_broker_acknowledgements_total, which is the
-  // only per-WRITE counter and which this harness does not scrape. Its query is published in
-  // docs/metrics.md and is quoted as PROMQL_REDELIVERY_FACTOR below so an operator can run
-  // it; deriving it from the two per-event counters here would report 1.0 for every run and
-  // call it "no redeliveries".
+  // Published over dispatched, and it is NOT a redelivery factor. Both counters now
+  // move ONCE PER EVENT: published at the transition that made the Kafka leg durable,
+  // dispatched at the terminal state where nothing further is owed for the row. Their
+  // ratio is therefore the SETTLEMENT GAP — how many events have been delivered to
+  // Kafka but still owe the legacy webhook leg — and it converges to 1.0 at the sunset,
+  // when that leg and the webhook_pending state are removed.
   var settlementGap = dispatchedEvents > 0 ? publishedEvents / dispatchedEvents : 0;
   if (dispatchedEvents > 0 && publishedEvents > 0) {
     settlementGapFactor.add(settlementGap);
   }
 
-  // --- Continuity: did these two scrapes come from the same process? (PERF-P03) ----------
-  //
-  // Every figure above is a delta between two readings of a monotonic counter, and a delta is
-  // only meaningful while both readings belong to ONE process. The previous check was
-  // `end < start`, which catches a restart only while the replacement has not yet counted past
-  // the old total — at 500 events a second that window is seconds long, so on a 30-minute run
-  // the LIKELY case was the undetectable one: a restart that grows past the baseline and
-  // yields a delta that is neither process's work.
-  //
-  // process_start_time_seconds settles it. It is constant for a process's whole life and
-  // different for any replacement, so a change in it IS a restart regardless of what the
-  // counters show. Its ABSENCE is treated as unknown rather than as continuity, because
-  // assuming continuity is precisely how an undetected restart certifies a target.
+  // --- Continuity: did these two scrapes come from the same process? ----------
   var startedAtBefore = readNumber(startGauges, processSeries.name);
   var startedAtAfter = readNumber(endGauges, processSeries.name);
   var identityKnown = startedAtBefore !== null && startedAtAfter !== null;
@@ -5303,16 +4645,13 @@ export function teardown(data) {
   counterReset.add(resetSeen ? 1 : 0);
 
   // A SERIES PRESENT AT THE END AND ABSENT AT THE START — reported by the delta helpers
-  // themselves rather than re-derived here, so a fifth series added later cannot forget to be
-  // checked. Every such delta spans the exporter's whole LIFETIME instead of this window: for the
-  // counters an arbitrarily large overstatement of the throughput and of the dead-letter
-  // numerator, and for the histogram a confident p99 over the wrong population of samples. It
-  // happens for real — an observability stack brought up mid-run, a server restarted between the
-  // two scrapes, a series that only begins exporting once its first event exists.
-  //
-  // The same four series the reset guard covers, for the same reason: three of them feed a
-  // verdict directly, and the fourth is the subtrahend of the reported p99 DIFFERENCE, which is
-  // a diagnostic-only supporting figure and not a queue-wait percentile.
+  // themselves rather than re-derived here, so a fifth series added later cannot forget
+  // to be checked. Every such delta spans the exporter's whole LIFETIME instead of this
+  // window: for the counters an arbitrarily large overstatement of the throughput and
+  // of the dead-letter numerator, and for the histogram a confident p99 over the wrong
+  // population of samples. It happens for real — an observability stack brought up
+  // mid-run, a server restarted between the two scrapes, a series that only begins
+  // exporting once its first event exists.
   var baselineIncomplete =
     publishedChange.baselineMissing ||
     deadLetteredChange.baselineMissing ||
@@ -5336,129 +4675,105 @@ export function teardown(data) {
   finalSettleSeconds.add(settled.waitedSeconds);
   backlogPendingAtSettle.add(settled.pending === null ? -1 : settled.pending);
 
-  // Where V-3's numerator came from is decided ABOVE, beside the arithmetic that uses it, so the
-  // provenance and the number are one decision rather than two that can disagree. An ABSENT
-  // dead-letter counter is not a zero: `deltaCounter` hands back 0 for a series that was never
-  // exported, and 0/N is a 0% dead-letter rate, so a broken exporter used to certify the delivery
-  // target it had stopped measuring. The authenticated census is accepted in its place ONLY as a
-  // same-window delta, and when neither source yields one the verdict is unavailable rather than
-  // zero.
+  // Where the dead-letter numerator came from is decided ABOVE, beside the arithmetic that uses
+  // it, so the provenance and the number are one decision rather than two that can
+  // disagree. An ABSENT dead-letter counter is not a zero: `deltaCounter` hands back 0
+  // for a series that was never exported, and 0/N is a 0% dead-letter rate, so a broken
+  // exporter would otherwise certify the target it had stopped measuring. The
+  // authenticated census is accepted in its place ONLY as a same-window delta, and when
+  // neither source yields one the verdict is unavailable rather than zero.
 
-  // --- Fail closed unless every input was genuinely present ----------------------------
+  // --- Fail closed unless every input was genuinely present
+  // ----------------------------
   //
-  // Ordered from the most fundamental missing input to the most specific, so the ONE reason
-  // reported is the one an operator should act on first. Four of these conditions were
-  // previously computed and recorded on gauges beside the verdicts while the verdicts
-  // themselves were published anyway — and a gauge is not a threshold, so nothing failed:
+  // Ordered from the most fundamental missing input to the most specific, so the ONE
+  // reason reported is the one an operator should act on first.
   //
-  //   - a COUNTER RESET meant the exporting process restarted, so the "delta" was a partial
-  //     counter read as a whole window's traffic;
-  //   - an INCOMPLETE BASELINE meant a series present at the end was missing at the start, so
-  //     its delta was the counter's entire lifetime;
-  //   - an UNSETTLED BACKLOG meant events this run captured were still unpublished, so they
-  //     were absent from the counters and — being the slowest — from the latency histogram;
-  //   - an ABSENT END-TO-END LATENCY SERIES used to substitute the shorter publish-duration
-  //     histogram against the same threshold.
-  //
-  // Each is now a refusal to certify. That is the whole point of the guard: a criterion nobody
-  // measured must read as unmeasured, not as met.
+  //   - a COUNTER RESET meant the exporting process restarted, so the "delta" was a
+  //     partial counter read as a whole window's traffic;
+  //   - an INCOMPLETE BASELINE meant a series present at the end was missing at the
+  //     start, so its delta was the counter's entire lifetime;
+  //   - an UNSETTLED BACKLOG meant events this run captured were still unpublished, so
+  //     they were absent from the counters and — being the slowest — from the latency
+  //     histogram;
+  //   - an ABSENT END-TO-END LATENCY SERIES would otherwise be substituted by the
+  //     shorter publish-duration histogram against the same threshold.
   var reason = REASON_AVAILABLE;
   if (baseline.metricsAvailable !== true) {
     reason = REASON_START_SCRAPE_UNAVAILABLE;
   } else if (!scrape.available) {
     reason = REASON_END_SCRAPE_UNAVAILABLE;
   } else if (!isolationHeld) {
-    // ATTRIBUTION IS CHECKED BEFORE SETTLING, because it is the more fundamental failure: a
-    // window whose edges are fuzzy still measures this pipeline, whereas a population containing
-    // another workload's events is not this run's result at all. Naming the settling gate for
-    // such a run would send an operator to tune a budget when what they have is a shared stack.
+    // ATTRIBUTION IS CHECKED BEFORE SETTLING, because it is the more fundamental
+    // failure: a window whose edges are fuzzy still measures this pipeline, whereas a
+    // population containing another workload's events is not this run's result at all.
+    // Naming the settling gate for such a run would send an operator to tune a budget
+    // when what they have is a shared stack.
     reason = REASON_INSTANCE_NOT_ISOLATED;
   } else if (!drainHeld) {
     // Both settling gates must have held. See waitForOutboxQuiescence for what each end
     // distorts when it has not.
     //
-    // TWO CAUSES, REPORTED APART. "The relay is behind" and "the tail could not be observed"
-    // both leave the gate unsettled and lead an operator to different places: the first needs a
-    // bigger budget or a faster relay, the second needs a master key so the live census — which
-    // is the only source that can see a failed row awaiting its dead-letter write, or a replay
-    // in flight — answers instead of blnk_outbox_pending. The more specific cause wins.
+    // TWO CAUSES, REPORTED APART. "The relay is behind" and "the tail could not be
+    // observed" both leave the gate unsettled and lead an operator to different places:
+    // the first needs a bigger budget or a faster relay, the second needs a master key
+    // so the live census — which is the only source that can see a failed row awaiting
+    // its dead-letter write, or a replay in flight — answers instead of
+    // blnk_outbox_pending. The more specific cause wins.
     reason = settlementStateUnavailable
       ? REASON_SETTLEMENT_STATE_UNAVAILABLE
       : REASON_PIPELINE_NOT_SETTLED;
   } else if (!(measuredWindow > 0)) {
     reason = REASON_WINDOW_NOT_POSITIVE;
   } else if (restarted) {
-    // CONTINUITY IS CHECKED BEFORE SERIES PRESENCE, and the order is a diagnosis decision
-    // rather than a preference (PERF-P03). A restart can MAKE a counter look absent: an OTel
-    // counter is not exported until its first increment, so a replacement process that has not
-    // yet dispatched anything exports no blnk_events_dispatched_total at all. Reported in the
-    // other order, that run would say "the series was absent, so nothing has ever been
-    // durably recorded" — sending an operator to look for a build or configuration fault that
-    // does not exist, when the actual finding is that the process restarted mid-run.
-    //
-    // It also invalidates the population itself: the terminal count and every delta are
-    // computed across two processes, so nothing below this line is worth reporting as a cause.
+    // CONTINUITY IS CHECKED BEFORE SERIES PRESENCE, and the order is a diagnosis
+    // decision rather than a preference. A restart can MAKE a counter look absent: an
+    // OTel counter is not exported until its first increment, so a replacement process
+    // that has not yet dispatched anything exports no blnk_events_dispatched_total at
+    // all. Reported in the other order, that run would say "the series was absent, so
+    // nothing has ever been durably recorded" — sending an operator to look for a build
+    // or configuration fault that does not exist, when the actual finding is that the
+    // process restarted mid-run.
     reason = REASON_EXPORTER_RESTARTED;
   } else if (resetSeen) {
-    // A counter went backwards without an observed restart. Distinguished from the case above
-    // so an operator is not sent looking for a restart that did not happen.
-    //
-    // A RESET INVALIDATES THE WINDOW, it does not merely annotate it. Both scrapes succeeded, so
-    // the earlier branches passed, but every counter restarted at zero and deltaCounter then
-    // falls back to the end reading — which is right for a series that first appeared mid-run and
-    // wrong here: it presents a post-restart partial total as a full-window delta, and that
-    // number is LOWER than the truth for throughput and can go either way for the ratio. It used
-    // to be recorded in `event_publish_counter_reset` and nothing more, on the view that a marker
-    // was enough. It was not: the marker sat beside three gauges that were still written, still
-    // thresholded and still reported PASS.
-    //
-    // THIS BRANCH USED TO BE UNREACHABLE. An identical `resetSeen` test sat above the restart
-    // check, which is the merge of two cascades that each ordered these three causes for
-    // themselves — and the earlier copy answered every reset before the restart check could
-    // attribute one, so REASON_EXPORTER_RESTARTED was never emitted and the distinction this
-    // branch exists to draw was never drawn.
+    // A counter went backwards without an observed restart. Distinguished from the case
+    // above so an operator is not sent looking for a restart that did not happen.
     reason = REASON_COUNTER_RESET;
   } else if (!identityKnown) {
     reason = REASON_PROCESS_IDENTITY_UNKNOWN;
   } else if (SERVER_REPLICAS !== 1) {
-    // THE DECLARED HALF (PERF-M08), and it catches what no measurement can: a run against a
-    // Service fronting several replicas where every scrape happened to reach the same backend
-    // still produces a number describing ONE replica's share of the work, and reporting that as
-    // the pipeline's throughput understates it by the replica count.
-    //
-    // The OBSERVED half — the sampler watching the process identity change between consecutive
-    // readings — is enforced in buildProvenance rather than here, and not by choice: k6 gives
-    // each VU its own module context, so the sampler's counter does not exist in teardown's.
-    // The sampler publishes it as a Gauge and the summary reads it back.
+    // THE DECLARED HALF, and it catches what no measurement can: a run against a
+    // Service fronting several replicas where every scrape happened to reach the same
+    // backend still produces a number describing ONE replica's share of the work, and
+    // reporting that as the pipeline's throughput understates it by the replica count.
     reason = REASON_MEASUREMENT_NOT_SINGLE_PROCESS;
   } else if (published.code === SERIES_CODE_ABSENT) {
-    // The PUBLISHED series, not the dispatched one. The dispatched counter's absence degrades
-    // only the settlement gap, which is a supporting figure; no verdict reads it. Keying this
-    // on the dispatched series is what let an absent supporting counter invalidate a
-    // measurable run, and what let the absence of the counter the verdicts ARE read from fall
-    // through to REASON_NO_TERMINAL_EVENTS — which reads as "the publisher is a no-op, a
-    // legitimate steady state" and is exactly the wrong conclusion to hand an operator whose
-    // exporter has stopped exposing the series.
-    //
-    // Reached only once continuity is established, so an absent series here really is absent
-    // rather than a restart's after-effect.
+    // The PUBLISHED series, not the dispatched one. The dispatched counter's absence
+    // degrades only the settlement gap, which is a supporting figure; no verdict reads
+    // it. Keying this on the dispatched series is what let an absent supporting counter
+    // invalidate a measurable run, and what let the absence of the counter the verdicts
+    // ARE read from fall through to REASON_NO_TERMINAL_EVENTS — which reads as "the
+    // publisher is a no-op, a legitimate steady state" and is exactly the wrong
+    // conclusion to hand an operator whose exporter has stopped exposing the series.
     reason = REASON_PUBLISHED_SERIES_ABSENT;
   } else if (!(terminalEvents > 0)) {
     reason = REASON_NO_TERMINAL_EVENTS;
   } else if (captureSeries.code === SERIES_CODE_ABSENT) {
-    // THE SERIES IS NOT EXPORTED AT ALL, which is a different finding from the series being
-    // present and empty over the window, and it sends an operator somewhere different: this one
-    // is a build or a configuration predating
-    // blnk_events_capture_to_dispatch_duration_seconds, that one is a pipeline that published
-    // nothing on a first attempt. The broker publish duration is NOT substituted for either —
-    // its clock starts at the relay claim, so it measures a strictly shorter interval than the
-    // one V-1 is stated over.
+    // THE SERIES IS NOT EXPORTED AT ALL, which is a different finding from the series
+    // being present and empty over the window, and it sends an operator somewhere
+    // different: this one is a build or a configuration predating
+    // blnk_events_capture_to_dispatch_duration_seconds, that one is a pipeline that
+    // published nothing on a first attempt. The broker publish duration is NOT
+    // substituted for either — its clock starts at the relay claim, so it measures a
+    // strictly shorter interval than the one the throughput target is stated over.
     reason = REASON_CAPTURE_SERIES_ABSENT;
   } else if (capture.quantile.value === null) {
     // Keyed on the capture histogram itself rather than on `latencySource`, so that
-    // re-introducing any other source cannot quietly make the run certifiable again: V-1 has
-    // no population without first-attempt capture-to-dispatch observations, whatever else was
-    // scraped. This is the row that fails instead of a p99 borrowed from a shorter interval.
+    // re-introducing any other source cannot quietly make the run certifiable again:
+    // The latency verdict has no population without first-attempt capture-to-dispatch
+    // observations,
+    // whatever else was scraped. This is the row that fails instead of a p99 borrowed
+    // from a shorter interval.
     reason = REASON_NO_FIRST_ATTEMPT_SAMPLES;
   } else if (deadLetterProvenance === DEAD_LETTER_SOURCE_NONE) {
     reason = REASON_DEAD_LETTER_UNMEASURED;
@@ -5478,23 +4793,10 @@ export function teardown(data) {
   verdictsAvailable.add(reason === REASON_AVAILABLE ? 1 : 0);
 
   // Each verdict gauge is recorded only when it is a genuine measurement. An unrecorded
-  // Gauge reads as 0 in the summary, and 0 passes a `value<x` threshold — so recording a
-  // figure derived from a scrape that never happened is the one way this file could report a
-  // false pass. `event_publish_verdicts_available` is the row that fails instead, and the
-  // three code gauges beside each number say why.
-  // Each condition below mirrors one clause of the availability gate. A reset or an
-  // undrained backlog invalidates the MEASUREMENT, not just its label, so the numbers derived
-  // from it are not recorded at all — an unrecorded Gauge reads as 0 in the summary and 0
-  // passes a `value<x` threshold, so recording them would be the one way this file could
-  // report a false pass on a run it knows was compromised.
-  // drainHeld, not a third drain object: it is the conjunction of BOTH settling gates and it
-  // honours REQUIRE_DRAIN, so a smoke run that deliberately relaxed the gate still records its
-  // figures while an acceptance run that did not settle records none.
-  //
-  // isolationHeld is in the conjunction for the same reason and at the same strength: a
-  // population that includes another workload's events is not a measurement of this run, and
-  // recording a throughput figure derived from it would be the flattering direction. It honours
-  // REQUIRE_ISOLATION exactly as the drain honours REQUIRE_DRAIN.
+  // Gauge reads as 0 in the summary, and 0 passes a `value<x` threshold — so recording
+  // a figure derived from a scrape that never happened is the one way this file could
+  // report a false pass. `event_publish_verdicts_available` is the row that fails
+  // instead, and the three code gauges beside each number say why.
   var measurementSound =
     scrapesUsable && !resetSeen && drainHeld && isolationHeld;
 
@@ -5514,13 +4816,8 @@ export function teardown(data) {
     p99Seconds.add(chosen.quantile.value);
   }
 
-  // --- The outbox census -----------------------------------------------------------------
-  //
-  // Corroboration for the dispatched and dead-lettered totals, and — for the four unsettled
-  // states — the components of the quantity the settling gates are computed from, so the gate's
-  // arithmetic is checkable from the artefact. -1 means the figure was not read; the census is
-  // master-key gated, so a run without one records -1 across the board and its settling gates
-  // report an incomplete population.
+  // --- The outbox census
+  // -----------------------------------------------------------------
   statsEndpointStatus.add(stats.status);
   statsDispatched.add(stats.dispatched === null ? -1 : stats.dispatched);
   statsDeadLettered.add(stats.deadLettered === null ? -1 : stats.deadLettered);
@@ -5535,15 +4832,7 @@ export function teardown(data) {
     window: measuredWindow,
     loadSeconds: LOAD_SECONDS,
     offeredRate: RATE,
-    // THE SETTLING GATES, as one group. There used to be two — this one and a `drain.*` group
-    // thirty lines below reading an object that was never built — and duplicate keys in an
-    // object literal are legal, so the later group silently won and every one of its four
-    // values was a property read off `undefined`.
-    //
-    // `drained` is drainHeld, the conjunction of BOTH gates under REQUIRE_DRAIN, because that is
-    // what the report is asserting when it says the window contained the load's events. The
-    // per-gate figures are reported beside it, so a run that failed to settle says WHICH END
-    // failed rather than only that one did.
+    // THE SETTLING GATES, as one group.
     drained: drainHeld,
     drainSeconds: numberFrom(postDrain.seconds, 0),
     drainWaited: numberFrom(postDrain.seconds, 0),
@@ -5574,7 +4863,7 @@ export function teardown(data) {
     deadLetteredEvents: deadLetteredEvents,
     ratio: ratio,
     latencySource: latencySource,
-    // ALWAYS the capture-to-dispatch series, because that is the only series V-1 may be read
+    // ALWAYS the capture-to-dispatch series, because that is the only series the latency target
     // from. The publish-duration figure travels beside it as a labelled diagnostic rather
     // than in this field, so nothing downstream can print it where the verdict belongs.
     latencySeries: captureSeries.name,
@@ -5582,10 +4871,10 @@ export function teardown(data) {
     diagnosticPublishP99:
       brokerWrite.quantile.value === null ? null : brokerWrite.quantile.value,
     publishedSeries: published.name,
-    // Assigned because the console report reads it. The reversal that moved the verdicts onto
-    // the published series renamed the readers and dropped this field, and a missing property
-    // is not a ReferenceError — the provenance line simply printed "undefined" beside a real
-    // number, which is worse than failing.
+    // Assigned because the console report reads it. The reversal that moved the
+    // verdicts onto the published series renamed the readers and dropped this field,
+    // and a missing property is not a ReferenceError — the provenance line simply
+    // printed "undefined" beside a real number, which is worse than failing.
     dispatchedSeries: dispatched.name,
     deadLetteredSeries: deadLettered.name,
     quantile: chosen ? chosen.quantile : null,
@@ -5718,12 +5007,11 @@ function round(value, places) {
 
 // verdictMark renders a pass/fail marker for a console line.
 function verdictMark(ok) {
-  // NULL IS A THIRD OUTCOME, not a falsy second one (PERF-M09). A row whose metrics carry no
-  // registered threshold in this configuration is a diagnostic: it was measured and reported but
-  // nothing was asserted about it. Rendering that as FAIL states the opposite of the truth — the
-  // whole-run mean is a diagnostic whenever the sampler is running, and it would have printed
-  // FAIL beside a perfectly healthy figure. Four characters, so the column stays aligned with
-  // PASS and FAIL.
+  // NULL IS A THIRD OUTCOME, not a falsy second one. A row whose metrics carry no
+  // registered threshold in this configuration is a diagnostic: it was measured and
+  // reported but nothing was asserted about it. Rendering that as FAIL states the
+  // opposite of the truth — the whole-run mean is a diagnostic whenever the sampler is
+  // running, and it would have printed FAIL beside a perfectly healthy figure.
   if (ok === null || ok === undefined) {
     return "n/a ";
   }
@@ -5740,7 +5028,7 @@ function verdictMark(ok) {
  *
  * The filter differs between the two instruments: capture-to-dispatch carries `topic` and
  * `attempt`, while publish-duration carries `outcome` as well and needs it pinned to
- * `dispatched` or the filter matches nothing. Only the first can produce the V-1 figure now,
+ * `dispatched` or the filter matches nothing. Only the first can produce the latency figure,
  * so only its filter is ever built for a fresh run; the publish-duration branch is retained
  * because handleSummary also renders a summary from an artefact of a version that emitted the
  * reserved source code, and mislabelling that run's series would misreport what it measured.
@@ -5753,10 +5041,10 @@ function latencySeriesLabel(baseName, sourceCode) {
     return null;
   }
 
-  // The V-1 series carries no outcome filter — only acknowledged publishes are recorded on it
-  // at all — so the label is the same whichever spelling of the name resolved. sourceCode is
-  // still read, because a verdict computed from no series must not be labelled as if it came
-  // from one.
+  // The latency series carries no outcome filter — only acknowledged publishes are recorded
+  // on it at all — so the label is the same whichever spelling of the name resolved.
+  // sourceCode is still read, because a verdict computed from no series must not be
+  // labelled as if it came from one.
   if (sourceCode !== P99_SOURCE_CAPTURE_TO_DISPATCH) {
     return null;
   }
@@ -5901,7 +5189,8 @@ function reportToConsole(r) {
         INTERPOLATION_LABELS[r.quantile.interpolation],
     );
   } else if (r.latencySource === P99_SOURCE_PUBLISH_DURATION) {
-    // Not "no observations": there were observations, on the series V-1 is not stated over.
+    // Not "no observations": there were observations, on the series the target is not
+    // stated over.
     // Saying it the other way would send an operator looking for a load problem when what they
     // have is a missing instrument.
     lines.push(
@@ -5915,18 +5204,19 @@ function reportToConsole(r) {
     );
   } else {
     // No borrowed figure and no PASS. publish_duration may well have observations, and it is
-    // still printed among the supporting figures, but it cannot certify V-1 — so this run is
-    // reported as unable to certify rather than as having met the target.
+    // still printed among the supporting figures, but it cannot certify the latency target,
+    // so this run is reported as unable to certify rather than as having met it.
     lines.push(
       "[event_publish] V-1 p99 publish FAIL  not computable — no first-attempt observations on " +
         latencySeriesLabel(r.latencySeries, r.latencySource) +
         ". There is deliberately NO fallback: publish_duration starts its clock at the relay" +
         " claim, so it cannot certify a target stated from capture to acknowledgement.",
     );
-    // Printed BECAUSE it is tempting, and printed as a non-verdict for the same reason. An
-    // operator who sees "not computable" and then finds a healthy publish p99 in the summary
-    // will otherwise reach for it; saying here what it measures and what it omits is what
-    // stops that, and it is the only place the two numbers appear together.
+    // Printed BECAUSE it is tempting, and printed as a non-verdict for the same reason.
+    // An operator who sees "not computable" and then finds a healthy publish p99 in the
+    // summary will otherwise reach for it; saying here what it measures and what it
+    // omits is what stops that, and it is the only place the two numbers appear
+    // together.
     if (r.diagnosticPublishP99 !== null && r.diagnosticPublishP99 !== undefined) {
       lines.push(
         "[event_publish]   diagnostic only, NOT V-1: " +
@@ -6010,21 +5300,16 @@ function reportToConsole(r) {
 
   // THE FIXTURES THIS RUN CREATED, printed as a paste-ready LEDGER_PAIRS value.
   //
-  // Blnk has no delete endpoint for a ledger or a balance, so anything provisioned here is
-  // PERMANENT. That makes reuse the only way to certify repeatedly without growing the database
-  // without bound — and reuse needs the identifiers, which were otherwise reachable only by
-  // querying the API for balances this run happened to create. They cannot be published in the
-  // summary instead: k6 does not pass setup data to handleSummary, so this line is the channel.
-  //
-  // Printed only when the run created them. A run given LEDGER_PAIRS already has them, and a
-  // run that created nothing has nothing to offer.
+  // Printed only when the run created them. A run given LEDGER_PAIRS already has them,
+  // and a run that created nothing has nothing to offer.
   if (r.createdFixtures && r.pairs && r.pairs.length > 0) {
-    // BASE64, and not the JSON itself, because k6 renders every console line as logfmt: a value
-    // containing a double quote is emitted with the quotes BACKSLASH-ESCAPED, on a terminal as
-    // well as into a file. Printing the JSON directly therefore produces a line that looks
-    // copy-pasteable and is not — pasting it yields `[{\"source\":...` and the next run dies with
-    // "LEDGER_PAIRS is not valid JSON". Base64 has no quotes and no spaces, so logfmt passes it
-    // through byte for byte, and the decode is one documented command.
+    // BASE64, and not the JSON itself, because k6 renders every console line as logfmt:
+    // a value containing a double quote is emitted with the quotes BACKSLASH-ESCAPED,
+    // on a terminal as well as into a file. Printing the JSON directly therefore
+    // produces a line that looks copy-pasteable and is not — pasting it yields
+    // `[{\"source\":...` and the next run dies with "LEDGER_PAIRS is not valid JSON".
+    // Base64 has no quotes and no spaces, so logfmt passes it through byte for byte,
+    // and the decode is one documented command.
     lines.push(
       "[event_publish] fixtures created and PERMANENT. Reuse them instead of creating more — decode the token below as tests/loadtest/README.md describes:",
     );
@@ -6057,12 +5342,10 @@ const P99_SOURCE_LABELS = {};
 P99_SOURCE_LABELS[P99_SOURCE_NONE] = "not computable";
 P99_SOURCE_LABELS[P99_SOURCE_CAPTURE_TO_DISPATCH] =
   "capture-to-dispatch, the documented V-1 series: outbox capture to broker acknowledgement";
-// RETAINED BUT UNREACHABLE AS A VERDICT SOURCE (PERF-P02). Nothing assigns this code any
-// more: publish_duration measures claim-to-acknowledgement, a strictly shorter interval than
-// V-1 is stated over, so certifying the target from it was optimistic even though the
-// substitution was recorded. The label stays so a summary produced by an OLDER revision of
-// this script remains readable, and so the reason it was removed is written down where the
-// substitution used to be described.
+// RETAINED BUT UNREACHABLE AS A VERDICT SOURCE. Nothing assigns this code any more:
+// publish_duration measures claim-to-acknowledgement, a strictly shorter interval than
+// the throughput target is stated over, so certifying it from that figure is optimistic
+// even though the substitution was recorded.
 P99_SOURCE_LABELS[P99_SOURCE_PUBLISH_DURATION] =
   "publish-duration: claim to broker acknowledgement, a strictly shorter interval than V-1 is stated over. NO LONGER EMITTED — it was once accepted as a fallback, which passed runs whose queue wait was the whole problem; a summary carrying this code was produced by that earlier version";
 
@@ -6136,20 +5419,20 @@ DEAD_LETTER_SOURCE_LABELS[DEAD_LETTER_SOURCE_STATS_ENDPOINT] =
   "the authenticated GET /events/stats census, differenced between the BASELINE reading taken in setup and the final reading taken in teardown — the counter being absent from the exposition. A cumulative census value is never used on its own: it counts every dead letter the deployment has ever accumulated, so substituting it for a window delta would report the whole history as this run's numerator";
 
 // The canonical PromQL each figure is the in-script equivalent of, quoted from
-// docs/metrics.md so that the documented query and the reported number cannot drift apart.
-// sum(rate(...)), not rate(...). blnk_events_published_total carries `topic` and
-// `event_type`, so a bare rate() returns ONE SERIES PER LABEL COMBINATION — currently eight
-// topics times thirteen event types. The verdict is a single figure for the pipeline's total
-// output, and this script computes it by summing the counter across every label set before
-// differencing, so the equivalent query has to aggregate too. A bare rate() pasted into
-// Prometheus produces a graph of many lines, none of which is the number reported here, and
-// each of which is smaller — reading the largest as the throughput would understate it by
-// most of an order of magnitude.
+// docs/metrics.md so that the documented query and the reported number cannot drift
+// apart. sum(rate(...)), not rate(...). blnk_events_published_total carries `topic` and
+// `event_type`, so a bare rate() returns ONE SERIES PER LABEL COMBINATION — currently
+// eight topics times thirteen event types. The verdict is a single figure for the
+// pipeline's total output, and this script computes it by summing the counter across
+// every label set before differencing, so the equivalent query has to aggregate too. A
+// bare rate() pasted into Prometheus produces a graph of many lines, none of which is
+// the number reported here, and each of which is smaller — reading the largest as the
+// throughput would understate it by most of an order of magnitude.
 const PROMQL_THROUGHPUT = "sum(rate(blnk_events_published_total[5m]))";
-// The sustained claim, expressed the way an operator would check it on a dashboard: the same
-// aggregated rate, evaluated over the subwindow rather than a five-minute average, with the
-// target as the comparison. min_over_time is what makes it a statement about every interval
-// rather than about their mean.
+// The sustained claim, expressed the way an operator would check it on a dashboard: the
+// same aggregated rate, evaluated over the subwindow rather than a five-minute average,
+// with the target as the comparison. min_over_time is what makes it a statement about
+// every interval rather than about their mean.
 const PROMQL_SUSTAINED =
   "min_over_time(sum(rate(blnk_events_published_total[" +
   SUBWINDOW_SECONDS +
@@ -6163,16 +5446,13 @@ const PROMQL_BROKER_WRITE =
 // The subtraction of the two p99 figures. NOT a queue-wait p99 — see the comment on
 // M_P99_DIFFERENCE — so it is named and described as the difference it is.
 const PROMQL_P99_DIFFERENCE = PROMQL_P99 + " - " + PROMQL_BROKER_WRITE;
-// The sustained-rate verdict has no single-expression PromQL equivalent, because "every window
-// held the rate" is a statement over a range of instants rather than a value at one. The
-// closest reading in Prometheus is to graph the rate expression above and look at its minimum
-// over the run window, which is what min_over_time does.
+// The sustained-rate verdict has no single-expression PromQL equivalent, because "every
+// window held the rate" is a statement over a range of instants rather than a value at
+// one. The closest reading in Prometheus is to graph the rate expression above and look
+// at its minimum over the run window, which is what min_over_time does.
 const PROMQL_SUSTAINED_THROUGHPUT =
   "min_over_time(rate(blnk_events_published_total[1m])[30m:1m])";
-// Quoted from docs/metrics.md verbatim, denominator included. It used to read
-// blnk_events_dispatched_total there, which is per-event and partitions the terminal outcomes
-// just as validly — but it is not the counter this script differences, and a query that does
-// not match the number printed beside it defeats the whole point of quoting one.
+// Quoted from docs/metrics.md verbatim, denominator included.
 const PROMQL_DEAD_LETTER =
   "sum(rate(blnk_events_dead_lettered_total[30m])) / (sum(rate(blnk_events_dead_lettered_total[30m])) + sum(rate(blnk_events_published_total[30m])))";
 // The settlement gap: events whose Kafka leg is durable over events whose row has reached the
@@ -6180,24 +5460,24 @@ const PROMQL_DEAD_LETTER =
 // at the sunset when that leg is removed.
 const PROMQL_SETTLEMENT_GAP =
   "sum(rate(blnk_events_published_total[5m])) / sum(rate(blnk_events_dispatched_total[5m]))";
-// THE REAL REDELIVERY FACTOR, quoted from docs/metrics.md and reported here only as a pointer:
-// this harness does not scrape blnk_events_broker_acknowledgements_total, so it cannot compute
-// the figure. It is the only per-WRITE counter, and it is filtered to original publishes
-// because replays and dead-letter writes are acknowledged too and are deliberately never
-// counted as deliveries. Deriving a redelivery factor from the two PER-EVENT counters instead
-// would report 1.0 for every run and call it "nothing was republished".
+// THE REAL REDELIVERY FACTOR, quoted from docs/metrics.md and reported here only as a
+// pointer: this harness does not scrape blnk_events_broker_acknowledgements_total, so
+// it cannot compute the figure. It is the only per-WRITE counter, and it is filtered to
+// original publishes because replays and dead-letter writes are acknowledged too and
+// are deliberately never counted as deliveries. Deriving a redelivery factor from the
+// two PER-EVENT counters instead would report 1.0 for every run and call it "nothing
+// was republished".
 const PROMQL_REDELIVERY_FACTOR =
   'sum(rate(blnk_events_broker_acknowledgements_total{purpose="original"}[5m])) / sum(rate(blnk_events_published_total[5m]))';
 
 /**
  * promqlForLatencySource returns the query that matches the series a p99 actually came from.
  *
- * The provenance block used to quote the capture-to-dispatch query unconditionally, including
- * when the number beside it had been computed from publish_duration. A reader checking the
- * figure against Prometheus would then run a query over a different interval, get a different
- * answer, and have no way to tell which of the two was wrong. This file no longer substitutes
- * series at all, so the mismatch cannot arise from a fallback — but the query is still resolved
- * from the recorded source rather than assumed, because an assumption is what went wrong.
+ * Quoting the capture-to-dispatch query unconditionally would mis-describe a number computed
+ * from publish_duration: a reader checking the figure against Prometheus would run a query
+ * over a different interval, get a different answer, and have no way to tell which of the two
+ * was wrong. This file substitutes no series at all, so the mismatch cannot arise from a
+ * fallback — but the query is still resolved from the RECORDED source rather than assumed.
  *
  * @param {number|null} sourceCode the recorded P99_SOURCE_* value.
  * @returns {string} the PromQL equivalent, or a statement that there is none.
@@ -6350,10 +5630,10 @@ function thresholdVerdicts(metrics, name) {
 /**
  * verdictThresholdsFor resolves a verdict row against the thresholds ACTUALLY REGISTERED.
  *
- * # The defect this exists to remove (PERF-M09)
+ * # Why the resolution is derived rather than hand-wired
  *
- * The summary used to attach thresholds to rows by hand, and the hand-wiring drifted from what
- * `options` registered in two directions at once:
+ * Attaching thresholds to rows by hand drifts from what `options` registered, in two
+ * directions at once:
  *
  *   * A ROW SHOWED ANOTHER METRIC'S RESULT. `sustained_throughput_events_per_second` displayed
  *     min(window_events_per_second) and reported the pass/fail of interval_events_per_second's
@@ -6380,9 +5660,9 @@ function thresholdVerdicts(metrics, name) {
  * only sound if all of them are reflected somewhere. The windowed sustained verdict is the case
  * in point: verdictThresholds registers three for it — `min>=target` on the window trend,
  * `p(50)>=target` on the interval trend and `value>=1` on the counted-window gauge, the last
- * being its fail-closed guard — and the row used to report only the interval one. A sampler that
- * read /metrics for the first window and then failed for the rest would fail its own thresholds,
- * and k6's exit code, while `verdicts_all_hold` stayed true.
+ * being its fail-closed guard — so a row reporting only the interval one would hide the rest:
+ * a sampler that read /metrics for the first window and then failed for the others fails its
+ * own thresholds, and k6's exit code, while `verdicts_all_hold` stays true.
  *
  * @param {object|null} metrics k6's metrics map from the summary.
  * @param {string[]} names the metrics this row is certified by.
@@ -6435,7 +5715,7 @@ function resolvedSeriesName(candidates, code) {
 /**
  * buildProvenance assembles the audit record that accompanies the three verdicts.
  *
- * The point of this block is that a reviewer opening summary-event-streaming.json can
+ * The point of this block is that a reader opening summary-event-streaming.json can
  * confirm, without reading this file, that the p99 came from the event pipeline's own
  * histogram and not from k6's HTTP timings, and that the throughput came from the PER-EVENT
  * dispatched counter — not from k6's request count, and not from the broker write counter
@@ -6449,10 +5729,10 @@ function resolvedSeriesName(candidates, code) {
 function buildProvenance(metrics) {
   var sourceCode = gaugeValue(metrics, M_P99_SOURCE_CODE);
   var spellingCode = gaugeValue(metrics, M_P99_SERIES_SPELLING_CODE);
-  // The verdict's latency can only have come from capture-to-dispatch, so the series named
-  // here is that one unconditionally. sourceCode is still read, and still reported, because
-  // P99_SOURCE_NONE is a meaningful state: it says the histogram was absent and no figure
-  // was certified.
+  // The verdict's latency can only have come from capture-to-dispatch, so the series
+  // named here is that one unconditionally. sourceCode is still read, and still
+  // reported, because P99_SOURCE_NONE is a meaningful state: it says the histogram was
+  // absent and no figure was certified.
   var latencyBase = resolvedSeriesName(
     SERIES_CAPTURE_TO_DISPATCH,
     spellingCode,
@@ -6460,35 +5740,17 @@ function buildProvenance(metrics) {
   var bucketUpper = gaugeValue(metrics, M_P99_BUCKET_UPPER);
   var reason = gaugeValue(metrics, M_DEGRADED_REASON_CODE);
   var available = gaugeValue(metrics, M_VERDICTS_AVAILABLE);
-  // THE OBSERVED HALF of the single-process requirement (PERF-M08). The sampler recorded how
-  // often a reading came from a different process than the one before it; any change at all means
-  // the per-interval deltas it produced span unrelated counters. Folded into availability here,
-  // rather than in teardown, because a VU's module state is not visible to teardown — so this
-  // gauge is the only channel the observation has.
-  //
-  // Downgraded to unavailable rather than merely annotated, for the reason every other guard in
-  // this file is: a marker beside a published verdict does not stop the verdict being read.
+  // THE OBSERVED HALF of the single-process requirement. The sampler recorded how often
+  // a reading came from a different process than the one before it; any change at all
+  // means the per-interval deltas it produced span unrelated counters. Folded into
+  // availability here, rather than in teardown, because a VU's module state is not
+  // visible to teardown — so this gauge is the only channel the observation has.
   var samplerIdentityChangesObserved = gaugeValue(
     metrics,
     M_SAMPLER_IDENTITY_CHANGES,
   );
 
-  // THE SUSTAINED ROW'S VERDICT FIGURE, computed once (PERF-M09).
-  //
-  // This row is a FRACTION of intervals rather than a single measurement against a bound, so it
-  // never carried a `value` — and verdictHolds requires one, for a good reason: an unrecorded
-  // Gauge reads as 0 in a k6 summary and 0 satisfies both `< ceiling` verdicts, so a figure that
-  // is absent must not be treated as a figure that passed.
-  //
-  // The consequence was a THIRD structural reason verdicts_all_hold could never be true, on top
-  // of the two the certifying/diagnostic split fixes: this row's thresholds could BOTH pass —
-  // observed live at `rate>=0.95: true, count>=3: true` — and it still reported FAIL, because it
-  // had no value to be non-null. So the aggregate stayed false with every threshold in the run
-  // green.
-  //
-  // The fraction is the right figure: it is null exactly when NO subwindow was judged, which is
-  // the unmeasured case the value check exists to catch, and a number whenever one was. Computed
-  // here so `value` and `fraction_meeting_target` are the same expression rather than two.
+  // THE SUSTAINED ROW'S VERDICT FIGURE, computed once.
   var qualifyingSubwindows = counterTotal(metrics, M_SUBWINDOWS_QUALIFYING);
   var subwindowFraction =
     qualifyingSubwindows > 0 ? rateValue(metrics, M_SUBWINDOW_MET_TARGET) : null;
@@ -6508,7 +5770,7 @@ function buildProvenance(metrics) {
     measurement_source:
       "the blnk server's /metrics Prometheus exposition, on an instance dedicated to this run: a baseline scrape taken once every row whose Kafka outcome was still owed had settled, per-interval scrapes taken throughout the run by a dedicated sampler scenario, and a final scrape taken only once the same population had settled again",
     verdict_inputs_available: available === 1,
-    // THE MEASUREMENT SCOPE (PERF-M08), so a reader of an archived summary can see what the
+    // THE MEASUREMENT SCOPE, so a reader of an archived summary can see what the
     // numbers describe rather than having to assume a single process.
     measurement_scope: {
       declared_server_replicas: SERVER_REPLICAS,
@@ -6550,7 +5812,7 @@ function buildProvenance(metrics) {
           "the published counter is read every subwindow_seconds by a single-VU sampler, and each interval between readings is judged on its own. A subwindow qualifies only when it lies wholly inside the steady-state region, ramp_exclusion_seconds in from each end of the load. THIS, not the whole-window average below, is what decides whether the target was SUSTAINED: an average cannot distinguish 500/sec throughout from nothing for half the run and 1000/sec for the other half",
         equivalent_promql: PROMQL_SUSTAINED,
         // The registered family, resolved from verdictThresholds() rather than restated here
-        // (PERF-M09). Both metrics belong to this row: the ratio is the tolerance and the count
+        // Both metrics belong to this row: the ratio is the tolerance and the count
         // is its fail-closed guard, and neither certifies sustained throughput alone.
         certified_by: [M_SUBWINDOW_MET_TARGET, M_SUBWINDOWS_QUALIFYING],
         note: "the qualifying-subwindow count is the fail-closed guard: a rate>= threshold on an EMPTY k6 Rate passes vacuously, so without a count>= threshold beside it a run whose sampler never took a reading would certify sustained throughput",
@@ -6558,29 +5820,20 @@ function buildProvenance(metrics) {
       throughput_events_per_second: {
         metric: M_EVENTS_PER_SEC,
         // WHETHER THIS ENTRY IS A VERDICT AT ALL, stated on exactly the condition
-        // verdictThresholds() gates its threshold registration on. With the sampler running
-        // this figure is the diagnostic mean beside the windowed verdict and carries no
-        // threshold, so it is not scored; with the sampler off it is the only throughput figure
-        // the run produced and it is.
-        //
-        // It has to be explicit rather than inferred from `thresholds === null`, or a threshold
-        // registration accidentally dropped from verdictThresholds() would silently demote a
-        // real verdict to "not applicable" and the aggregate would stay true without it. Stated
-        // here, a dropped registration leaves this entry enabled with no thresholds, and
-        // allThresholdsOk answers false.
+        // verdictThresholds() gates its threshold registration on. With the sampler
+        // running this figure is the diagnostic mean beside the windowed verdict and
+        // carries no threshold, so it is not scored; with the sampler off it is the
+        // only throughput figure the run produced and it is.
         enabled: !RATE_SAMPLER_ENABLED,
         value: gaugeValue(metrics, M_EVENTS_PER_SEC),
         target: TARGET_EVENTS_PER_SEC,
         comparison: ">=",
-        // SERIES_PUBLISHED, because that is the counter the value beside it was differenced
-        // from: M_EVENTS_PER_SEC is publishedEvents / LOAD_SECONDS and is recorded only when
-        // the PUBLISHED series resolved. It used to report the DISPATCHED series here, which
-        // names a counter no part of this figure reads and contradicted the equivalent_promql
-        // in this very block — the one defect a provenance field exists to make impossible,
-        // and in the flattering direction too, since dispatched trails published by the
-        // population still owed a legacy webhook. The dispatched counter's own resolution is
-        // still auditable, on the event_publish_dispatched_series_code gauge and the
-        // dispatched_delta row under raw_inputs.
+        // SERIES_PUBLISHED, because that is the counter the value beside it was
+        // differenced from: M_EVENTS_PER_SEC is publishedEvents / LOAD_SECONDS and is
+        // recorded only when the PUBLISHED series resolved. The dispatched counter's
+        // own resolution is still auditable, on the
+        // event_publish_dispatched_series_code gauge and the dispatched_delta row under
+        // raw_inputs.
         series:
           resolvedSeriesName(
             SERIES_PUBLISHED,
@@ -6649,13 +5902,13 @@ function buildProvenance(metrics) {
         // average and this figure is the weakest interval, so quoting it here invited a reader to
         // check a windowed claim against an averaged query and get a different, larger number.
         equivalent_promql: PROMQL_SUSTAINED_THROUGHPUT,
-        // ITS OWN FAMILY, and all of it (PERF-M09). This row used to display
-        // min(window_events_per_second) while reporting interval_events_per_second's p(50)
-        // result — a different statistic of a different metric, so the number shown and the
-        // verdict beside it could disagree, and this row's own registered `min>=` threshold was
-        // reported nowhere. All three sustained-throughput metrics are named because all three
-        // are registered together and all three gate the same claim: the worst window, the
-        // median interval, and the fail-closed count of windows actually measured.
+        // ITS OWN FAMILY, and all of it. Displaying min(window_events_per_second) while
+        // reporting interval_events_per_second's p(50) result would put a different
+        // statistic of a different metric beside the verdict, so the two could disagree
+        // and this row's own registered `min>=` threshold would be reported nowhere. All
+        // three sustained-throughput metrics are named because all three are registered
+        // together and all three gate the same claim: the worst window, the median
+        // interval, and the fail-closed count of windows actually measured.
         certified_by: [
           M_WINDOW_EVENTS_PER_SEC,
           M_INTERVAL_EVENTS_PER_SEC,
@@ -6666,10 +5919,6 @@ function buildProvenance(metrics) {
         metric: M_P99_SECONDS,
         value: gaugeValue(metrics, M_P99_SECONDS),
         // Whether the figure beside it is a measurement at all.
-        //
-        // An unrecorded Gauge is reported by k6 as 0, and `0 < 2` satisfies the ceiling — so
-        // without this flag a run whose latency was never measured renders as the most
-        // emphatic possible pass. It is true only for the one admissible instrument.
         measured: sourceCode === P99_SOURCE_CAPTURE_TO_DISPATCH,
         ceiling: MAX_P99_PUBLISH_SECONDS,
         comparison: "<",
@@ -6679,7 +5928,7 @@ function buildProvenance(metrics) {
         instrument: describeCode(P99_SOURCE_LABELS, sourceCode),
         bucket_lower_seconds: gaugeValue(metrics, M_P99_BUCKET_LOWER),
         // -1 is the recorded stand-in for the +Inf boundary, because Infinity serialises to
-        // null in JSON and would erase the finding it represents.
+        // null in JSON and would erase the boundary it represents.
         bucket_upper_seconds: bucketUpper === -1 ? "+Inf" : bucketUpper,
         interpolation: describeCode(
           INTERPOLATION_LABELS,
@@ -6687,9 +5936,9 @@ function buildProvenance(metrics) {
         ),
         first_attempt_observations: gaugeValue(metrics, M_LATENCY_COUNT_DELTA),
         // The query for the series that ACTUALLY produced the number. Labelling a
-        // publish_duration figure with the capture-to-dispatch query is how a shorter interval
-        // came to be presented as V-1; this file no longer substitutes, and the provenance
-        // no longer asserts a query it did not use.
+        // publish_duration figure with the capture-to-dispatch query is how a shorter
+        // interval could be presented as the sustained rate; this file no longer substitutes, and
+        // the provenance no longer asserts a query it did not use.
         equivalent_promql: promqlForLatencySource(sourceCode),
         no_fallback_note:
           "V-1 is derived from capture-to-dispatch and from nothing else. When that series has no first-attempt samples this verdict is UNAVAILABLE; publish_duration is corroboration under supporting_figures, because its clock starts at the relay claim and so measures a strictly shorter interval than the target is stated over",
@@ -6857,11 +6106,11 @@ function buildProvenance(metrics) {
       outbox_pending_start: gaugeValue(metrics, M_OUTBOX_PENDING_START),
       outbox_pending_end: gaugeValue(metrics, M_OUTBOX_PENDING_END),
       counter_reset_detected: gaugeValue(metrics, M_COUNTER_RESET) === 1,
-      // PERF-P03. The provenance of the continuity decision, so a reader can see WHY a run
-      // was accepted or degraded rather than trusting the flag. -1 on either instant means the
-      // exporter published no process_start_time_seconds for that scrape, and continuity is
-      // then UNKNOWN rather than intact — which fails the run, because assuming continuity is
-      // how an undetected restart certifies a target.
+      // The provenance of the continuity decision, so a reader can see WHY a run was
+      // accepted or degraded rather than trusting the flag. -1 on either instant means
+      // the exporter published no process_start_time_seconds for that scrape, and
+      // continuity is then UNKNOWN rather than intact — which fails the run, because
+      // assuming continuity is how an undetected restart certifies a target.
       exporter_restarted: gaugeValue(metrics, M_EXPORTER_RESTARTED) === 1,
       process_start_before: gaugeValue(metrics, M_PROCESS_START_BEFORE),
       process_start_after: gaugeValue(metrics, M_PROCESS_START_AFTER),
@@ -6949,24 +6198,9 @@ function buildProvenance(metrics) {
     ],
   };
 
-  // Annotated after the fact so the JSON and the terminal block cannot disagree: both read
-  // `verdict_holds`, computed once, rather than each applying its own idea of what a pass is.
-  //
-  // EACH ROW IS RESOLVED AGAINST THE REGISTERED THRESHOLD GRAPH (PERF-M09). Every row declares
-  // the metrics it is `certified_by`; verdictThresholdsFor looks each one up in the same
-  // verdictThresholds() that built `options`, so a row can neither report a family that was
-  // never registered nor omit one that was.
-  //
-  // A row with no registered threshold is a DIAGNOSTIC for this configuration, not a failure.
-  // The whole-run mean is the standing example: it carries the throughput verdict when the
-  // sampler is off and is a diagnostic average when the sampler is on, and which of the two it
-  // is was previously decided in one place and read in another. Diagnostics report
-  // `verdict_holds: null` — distinguishable from false, which means measured and did not hold —
-  // and are excluded from the aggregate.
-  //
-  // `verdicts_all_hold` is the single line to read: true only when the inputs were available AND
-  // every CERTIFYING row holds. It also requires at least one certifying row, so a configuration
-  // that somehow registered nothing cannot certify by vacuous agreement.
+  // Annotated after the fact so the JSON and the terminal block cannot disagree: both
+  // read `verdict_holds`, computed once, rather than each applying its own idea of what
+  // a pass is.
   var allHold = available === 1;
   var certifyingRows = 0;
   for (var key in provenance.verdicts) {
@@ -7051,13 +6285,11 @@ function renderVerdictBlock(provenance) {
     });
   }
 
-  // OUTSIDE THE BRANCH, because both of these are reported whichever throughput shape was
-  // used. They used to sit inside the `else` arm, which meant a run WITH the sampler enabled
-  // — the acceptance configuration — rendered a block with no p99 row and no dead-letter row
-  // at all, while the JSON summary still carried both. The array literal that arm was written
-  // as also closed with `]` against a `rows.push(` opener, so the file did not parse: it is
-  // the shape of two generations of this block fused at the seam, one that built `rows` as a
-  // literal and one that pushes into it.
+  // OUTSIDE THE BRANCH, because both of these are reported whichever throughput shape
+  // was used. The array literal that arm was written as also closed with `]` against a
+  // `rows.push(` opener, so the file did not parse: it is the shape of two generations
+  // of this block fused at the seam, one that built `rows` as a literal and one that
+  // pushes into it.
   rows.push(
     {
       title: "V-1 p99 publish ",
@@ -7077,23 +6309,21 @@ function renderVerdictBlock(provenance) {
   lines.push(
     "  event-streaming verdicts, read from " + provenance.measurement_source,
   );
-  // A row is PASS only when its threshold passed AND the inputs behind it were available.
-  // An unwritten Gauge reads as 0 in the summary and 0 satisfies both `< 2s` and `< 0.001`,
-  // so a run that measured nothing at all would otherwise render two PASS rows above a
-  // failing inputs row — and a reader who takes the row at face value has been told the
-  // opposite of the truth. The threshold results are what set the exit code; this is what the
-  // human reads, and the two must not disagree.
+  // A row is PASS only when its threshold passed AND the inputs behind it were
+  // available. An unwritten Gauge reads as 0 in the summary and 0 satisfies both `< 2s`
+  // and `< 0.001`, so a run that measured nothing at all would otherwise render two
+  // PASS rows above a failing inputs row — and a reader who takes the row at face value
+  // has been told the opposite of the truth. The threshold results are what set the
+  // exit code; this is what the human reads, and the two must not disagree.
   for (var i = 0; i < rows.length; i++) {
     var entry = rows[i].entry;
-    // ONE IDEA OF "PASS", read from `verdict_holds` (PERF-M09). Two more used to live here: an
-    // `ok` local recomputing availability AND allThresholdsOk, and a `mark` local blanking the
-    // no-threshold case — both computed on every row and then DISCARDED, because the line below
-    // already rendered verdict_holds. Three definitions of a pass in one loop is how the JSON
-    // and the terminal came to disagree in the first place, so the two dead ones are gone rather
-    // than reconciled. buildProvenance computes verdict_holds once, against the registered
-    // threshold graph, and includes the availability precondition this comment used to restate:
-    // every verdict is a comparison against a Gauge, an unrecorded Gauge reads as 0, and 0
-    // satisfies both `< ceiling` bounds — so a run that measured nothing must not render passes.
+    // ONE IDEA OF "PASS", read from `verdict_holds`. Three definitions of a pass in one
+    // loop is how the JSON and the terminal came to disagree in the first place, so the
+    // two dead ones are gone rather than reconciled. buildProvenance computes
+    // verdict_holds once, against the registered threshold graph, and includes the
+    // availability precondition: every verdict is a comparison against a Gauge, an
+    // unrecorded Gauge reads as 0, and 0 satisfies both `< ceiling` bounds — so a run
+    // that measured nothing must not render passes.
     lines.push(
       "   " +
         rows[i].title +
@@ -7117,7 +6347,7 @@ function renderVerdictBlock(provenance) {
   lines.push(
     // `verdict_holds` here too, for the reason the loop above gives: this row recomputed the
     // judgement as `inputsOk && allThresholdsOk(...)`, which is a fourth definition of a pass and
-    // renders FAIL for a row that is merely a diagnostic in this configuration (PERF-M09).
+    // renders FAIL for a row that is merely a diagnostic in this configuration.
     "   V-1 sustained   " +
       verdictMark(sustained.verdict_holds) +
       "  " +
@@ -7192,7 +6422,7 @@ function renderVerdictBlock(provenance) {
       "  " +
       provenance.verdict_inputs_condition,
   );
-  // The bottom line, so that "did this run certify V-1 and V-3" is one row rather than an
+  // The bottom line, so that "did this run certify the targets" is one row rather than an
   // inference across five. It is false whenever any figure was unreadable or any input missing,
   // which is the only reading that cannot be mistaken for a pass.
   lines.push(
@@ -7232,10 +6462,10 @@ function verdictHolds(entry, inputsAvailable) {
     return false;
   }
 
-  // `measured: false` is the p99 entry's statement that the figure beside it came from no
-  // admissible instrument. The rendered block has always refused a PASS on it; this did not,
-  // so the JSON and the terminal block could disagree about the same entry — the one defect
-  // the whole provenance apparatus exists to make impossible.
+  // `measured: false` is the p99 entry's statement that the figure beside it came from
+  // no admissible instrument. The rendered block has always refused a PASS on it; this
+  // did not, so the JSON and the terminal block could disagree about the same entry —
+  // the one defect the whole provenance apparatus exists to make impossible.
   if (entry.measured === false) {
     return false;
   }
@@ -7277,11 +6507,11 @@ function verdictApplies(entry) {
  * beside `required_fraction`, because "was the target SUSTAINED" is a question about a
  * population of intervals rather than about one number.
  *
- * ONLY `value` USED TO BE RECOGNISED, and the consequence was total rather than partial:
+ * BOTH SHAPES MUST BE RECOGNISED, and the cost of missing one is total rather than partial:
  * verdictHolds requires a non-null figure, the subwindow entry has no `value` at all, and the
- * aggregate is a conjunction — so `verdicts_all_hold` and the ALL CRITERIA row were false on
- * every run this file has ever produced, including a perfect one. A thirty-minute acceptance
- * run could not certify V-1 and V-3 no matter what the pipeline did.
+ * aggregate is a conjunction — so reading only `value` makes `verdicts_all_hold` and the ALL
+ * CRITERIA row false on every run, including a perfect one, and a thirty-minute acceptance
+ * run cannot certify either target no matter what the pipeline did.
  *
  * The fraction is still allowed to be null, which is what keeps the fail-closed reading: a run
  * in which no qualifying subwindow was judged reports null rather than 0, and null does not
@@ -7336,15 +6566,6 @@ function allThresholdsOk(thresholds) {
 
 // ---------------------------------------------------------------------------------------
 // The fixture harness (FIXTURES=1).
-//
-// Everything below is reachable only in fixture mode. It contacts nothing and asserts on the
-// SAME functions the acceptance run uses, in the same runtime, so a regression in the parser,
-// a reducer, the quantile interpolation or a verdict rule fails here rather than being
-// discovered by a thirty-minute run that quietly reported the wrong number.
-//
-// Each fixture states its inputs and its EXPECTED answer as data. Nothing is asserted as "not
-// null" or "greater than zero": every expectation is the exact value, because an assertion that
-// admits a range admits the wrong answer.
 // ---------------------------------------------------------------------------------------
 
 // fixtureOutcomes accumulates one record per check, and becomes the fixture run's summary.
@@ -7557,7 +6778,8 @@ function passingMetrics() {
     fixturePass(["value>=" + REQUIRE_METRICS]),
   );
 
-  // V-1 sustained, the subwindow family: every qualifying subwindow met the target, and there
+  // SUSTAINED THROUGHPUT, the subwindow family: every qualifying subwindow met the
+  // target, and there
   // were more of them than the evidence floor requires.
   metrics[M_SUBWINDOW_MET_TARGET] = fixtureRate(
     1,
@@ -7576,7 +6798,7 @@ function passingMetrics() {
     count: MIN_QUALIFYING_SUBWINDOWS + 9,
   });
 
-  // V-1 throughput, whole-run mean. A threshold is registered for it only when the sampler is
+  // THROUGHPUT, whole-run mean. A threshold is registered for it only when the sampler is
   // off, and the fixture follows that rule rather than asserting one unconditionally.
   metrics[M_EVENTS_PER_SEC] = fixtureGauge(
     TARGET_EVENTS_PER_SEC + 17,
@@ -7585,7 +6807,7 @@ function passingMetrics() {
       : fixturePass(["value>=" + TARGET_EVENTS_PER_SEC]),
   );
 
-  // V-1 sustained, the windowed family.
+  // SUSTAINED THROUGHPUT, the windowed family.
   metrics[M_WINDOW_EVENTS_PER_SEC] = fixtureTrend(
     { min: TARGET_EVENTS_PER_SEC + 5, med: TARGET_EVENTS_PER_SEC + 30 },
     RATE_SAMPLER_ENABLED
@@ -7609,7 +6831,7 @@ function passingMetrics() {
   );
   metrics[M_RATE_WINDOWS_SKIPPED] = fixtureGauge(1);
 
-  // V-1 latency. The source code is what makes `measured` true; a figure from any other
+  // LATENCY. The source code is what makes `measured` true; a figure from any other
   // instrument is not admissible for this criterion however good it looks.
   metrics[M_P99_SECONDS] = fixtureGauge(
     MAX_P99_PUBLISH_SECONDS / 2,
@@ -7620,7 +6842,7 @@ function passingMetrics() {
   metrics[M_P99_BUCKET_UPPER] = fixtureGauge(1);
   metrics[M_LATENCY_COUNT_DELTA] = fixtureGauge(90000);
 
-  // V-3 dead-letter rate.
+  // DEAD-LETTER RATE.
   metrics[M_DEAD_LETTER_RATIO] = fixtureGauge(
     MAX_DEAD_LETTER_RATIO / 10,
     fixturePass(["value<" + MAX_DEAD_LETTER_RATIO]),
@@ -7718,7 +6940,7 @@ function runExpositionFixtures() {
     'blnk_events_capture_to_dispatch_duration_seconds_bucket{attempt="1",le="1"} 300',
     'blnk_events_capture_to_dispatch_duration_seconds_bucket{attempt="1",le="2"} 995',
     'blnk_events_capture_to_dispatch_duration_seconds_bucket{attempt="1",le="+Inf"} 1000',
-    // A SECOND ATTEMPT'S BUCKETS, which the filter must exclude. V-1 is stated over
+    // A SECOND ATTEMPT'S BUCKETS, which the filter must exclude. The target is stated over
     // non-retried events, so a retry's latency counted into this histogram would inflate the
     // p99 with intervals the criterion does not describe.
     'blnk_events_capture_to_dispatch_duration_seconds_bucket{attempt="2",le="0.5"} 1',
@@ -7798,10 +7020,10 @@ function runExpositionFixtures() {
       interpolation: quantile.interpolation,
     },
     {
-      // 1 + (990 - 300) / (995 - 300), which is what histogram_quantile computes for the same
-      // buckets. Asserted to full precision on purpose: an off-by-one in the rank or in the
-      // cumulative-to-per-bucket conversion moves this figure without moving the bucket, and a
-      // rounded expectation would absorb it.
+      // 1 + (990 - 300) / (995 - 300), which is what histogram_quantile computes for
+      // the same buckets. Asserted to full precision on purpose: an off-by-one in the
+      // rank or in the cumulative-to-per-bucket conversion moves this figure without
+      // moving the bucket, and a rounded expectation would absorb it.
       value: 1.9928057553956835,
       lower: 1,
       upper: 2,
@@ -8103,10 +7325,10 @@ function runVerdictAssemblyFixtures() {
     },
   );
 
-  // 6. A THRESHOLD REGISTRATION THAT WENT MISSING. This is the fail-closed property that lets
-  //    the not-applicable case be excluded from the aggregate at all: an entry the
-  //    configuration DOES score, whose thresholds are absent, must fail rather than be
-  //    silently treated as inapplicable.
+  // 6. A THRESHOLD REGISTRATION THAT WENT MISSING. This is the fail-closed property
+  //    that lets the not-applicable case be excluded from the aggregate at all: an
+  //    entry the configuration DOES score, whose thresholds are absent, must fail
+  //    rather than be silently treated as inapplicable.
   var droppedThreshold = passingMetrics();
   droppedThreshold[M_P99_SECONDS] = fixtureGauge(MAX_P99_PUBLISH_SECONDS / 2);
   fixtureExpect(
@@ -8148,10 +7370,11 @@ function runRunnerContractFixtures() {
   );
   fixtureExpect(
     "a URL that does not carry the marker path yields NOTHING rather than a guess",
-    // Empty, not the input and not a dirname-style truncation. `dirname` is not URL-aware and
-    // answers "http:" for a URL with no path, which is how METRICS_URL once became
-    // "http:/metrics" and every scrape failed silently. An empty answer is what the shell
-    // runner tests for before refusing the run and naming the variable to set.
+    // Empty, not the input and not a dirname-style truncation. `dirname` is not
+    // URL-aware and answers "http:" for a URL with no path, which is how METRICS_URL
+    // once became "http:/metrics" and every scrape failed silently. An empty answer is
+    // what the shell runner tests for before refusing the run and naming the variable
+    // to set.
     siblingURL("http://localhost:5001", "/transactions", "/metrics"),
     "",
   );
@@ -8253,10 +7476,11 @@ function fixtureSummary(data) {
   var metrics = data ? data.metrics : null;
   var checks = counterTotal(metrics, M_FIXTURE_CHECKS);
   var failures = counterTotal(metrics, M_FIXTURE_FAILURES);
-  // A failure counter that is absent OR zero means no failure was recorded — k6 reports a
-  // metric with no samples as absent unless a threshold is registered on it, and one is here,
-  // so both spellings occur. An absent or empty CHECK counter is a different matter: it means
-  // the iteration did not run, and a harness that asserted nothing must not report a pass.
+  // A failure counter that is absent OR zero means no failure was recorded — k6 reports
+  // a metric with no samples as absent unless a threshold is registered on it, and one
+  // is here, so both spellings occur. An absent or empty CHECK counter is a different
+  // matter: it means the iteration did not run, and a harness that asserted nothing
+  // must not report a pass.
   var held = checks !== null && checks > 0 && (failures === null || failures === 0);
   var report = {
     checks: checks,
@@ -8301,10 +7525,11 @@ export function handleSummary(data) {
   }
 
   var provenance = buildProvenance(data ? data.metrics : null);
-  // merge rather than spread, for Goja, and merge rather than mutate so that the top-level
-  // `metrics` key survives untouched: tools/dashboard_parser.py classifies a JSON file as a
-  // k6 summary only when that key is present, and silently ignores the file otherwise.
-  // Sibling keys are safe — the parser reads only metrics, root_group and state.
+  // merge rather than spread, for Goja, and merge rather than mutate so that the
+  // top-level `metrics` key survives untouched: tools/dashboard_parser.py classifies a
+  // JSON file as a k6 summary only when that key is present, and silently ignores the
+  // file otherwise. Sibling keys are safe — the parser reads only metrics, root_group
+  // and state.
   var enriched = merge(data, { blnk_event_streaming: provenance });
 
   return {

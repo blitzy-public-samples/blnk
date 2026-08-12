@@ -16,28 +16,16 @@ limitations under the License.
 
 // THE ACCEPTANCE SELECTION IS ITSELF UNDER TEST.
 //
-// Acceptance criteria V-5 (subscriber isolation), V-6 (per-aggregate ordering), V-7 (crash
-// recovery), V-9 (replay fidelity) and V-10 (the 410 sunset) are proved by suites that need a
-// live Kafka broker and a migrated database. Those exist in exactly one place: the `kafka` job in
-// .github/workflows/go.yml. Everywhere else they skip, deliberately, because Blnk must build and
-// pass its ordinary suite with no broker in sight.
+// Subscriber isolation, per-aggregate ordering, crash recovery, replay fidelity and the
+// 410 sunset are proved by
+// suites that need a live Kafka broker and a migrated database.
 //
-// That makes the job's SELECTOR a load-bearing part of the proof, and it is the one part nothing
-// else could check. A suite that is not selected does not run, does not skip, does not fail and
-// does not appear in any summary — so a selector that names a family which no longer exists
-// removes a security proof from the pipeline while every report stays green. The fail-on-skip
-// gate cannot see it either: nothing skipped, because nothing was selected.
+// That makes the job's SELECTOR a load-bearing part of the proof, and it is the one
+// part nothing else could check.
 //
-// It had happened. The selector named six families against three packages and matched tests in
-// one of them — 56 in the root package, ZERO in ./database, ZERO in ./api — and one of the six,
-// `TestEventReplay`, matched nothing anywhere because the replay suite is named
-// TestReplayFidelity_. Separately, KAFKA_SUBSCRIBER_BROKERS was not set in the job, so all nine
-// isolation tests skipped and the fail-on-skip gate then failed the job: the one job whose
-// purpose is to prove the security criteria could not go green while doing so.
+// It had happened.
 //
-// The workflow now declares its families as data and checks them before using them. These tests
-// assert the same property from the Go side, so a family renamed in a Go file fails the suite
-// that renamed it rather than only the CI job that selected it.
+// The workflow now declares its families as data and checks them before using them.
 package blnk
 
 import (
@@ -79,9 +67,7 @@ func readCIWorkflow(t *testing.T) string {
 
 // declaredAcceptanceFamilies parses the family table out of the workflow's heredoc.
 //
-// Read from the workflow rather than restated here on purpose. A second copy of the list in this
-// file would be a second opinion, and the two would disagree the first time one was edited —
-// which is the same class of defect as a selector naming a family that no longer exists.
+// Read from the workflow rather than restated here on purpose.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when the table cannot be found.
@@ -121,13 +107,13 @@ func declaredAcceptanceFamilies(t *testing.T) []ciAcceptanceFamily {
 	return families
 }
 
-// packageTestNames enumerates the top-level test functions of a package by parsing its test
-// files.
+// packageTestNames enumerates the top-level test functions of a package by parsing its
+// test files.
 //
-// Static enumeration rather than `go test -list`, for two reasons: it needs no build of the
-// package under test, so this test cannot fail for an unrelated compilation reason in a sibling
-// package, and it sees exactly what `-run` will see, which is the set of `func TestXxx(t
-// *testing.T)` declarations.
+// Static enumeration rather than `go test -list`, for two reasons: it needs no build of
+// the package under test, so this test cannot fail for an unrelated compilation reason
+// in a sibling package, and it sees exactly what `-run` will see, which is the set of
+// `func TestXxx(t *testing.T)` declarations.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -160,12 +146,10 @@ func packageTestNames(t *testing.T, pkg string) []string {
 	return names
 }
 
-// TestKafkaAcceptanceSelection_MatchesAtLeastOneTestPerDeclaredFamily is the guard on the
-// selector.
+// TestKafkaAcceptanceSelection_MatchesAtLeastOneTestPerDeclaredFamily is the guard on
+// the selector.
 //
-// Every declared family must match a test that exists. A family matching nothing removes an
-// acceptance proof from the pipeline silently, because an unselected suite cannot skip and the
-// job's fail-on-skip gate therefore reports success over its absence.
+// Every declared family must match a test that exists.
 func TestKafkaAcceptanceSelection_MatchesAtLeastOneTestPerDeclaredFamily(t *testing.T) {
 	for _, family := range declaredAcceptanceFamilies(t) {
 		declared := family
@@ -194,14 +178,11 @@ func TestKafkaAcceptanceSelection_MatchesAtLeastOneTestPerDeclaredFamily(t *test
 	}
 }
 
-// TestKafkaAcceptanceSelection_CoversEveryPackageThatHoldsALiveSuite pins the SET of packages.
+// TestKafkaAcceptanceSelection_CoversEveryPackageThatHoldsALiveSuite pins the SET of
+// packages.
 //
-// The property the previous selector lost was not that a pattern was wrong; it was that two
-// whole packages were unreached. The repository layer holds the FIFO claim, the SKIP LOCKED
-// contention proof, the lease expiry and the snapshot reads — every one of them a _RealDB test
-// that needs the migrated database — and the API layer holds the master-key gating, the replay
-// endpoint and the 410 sunset. Selecting neither left V-2, V-9 and V-10 unexercised against a
-// real dependency while the job announced that every selected test had run.
+// The property the previous selector lost was not that a pattern was wrong; it was that
+// two whole packages were unreached.
 func TestKafkaAcceptanceSelection_CoversEveryPackageThatHoldsALiveSuite(t *testing.T) {
 	packages := map[string]bool{}
 	for _, family := range declaredAcceptanceFamilies(t) {
@@ -228,11 +209,11 @@ func TestKafkaAcceptanceSelection_CoversEveryPackageThatHoldsALiveSuite(t *testi
 // TestKafkaAcceptanceJob_SuppliesTheSubscriberFacingBrokerList is the guard on the one
 // environment variable whose absence made this job unpassable.
 //
-// Credential issuance refuses when KAFKA_SUBSCRIBER_BROKERS is unset — a deployment must name
-// the addresses a subscriber will actually connect to rather than leaking its internal bootstrap
-// list by omission — and the isolation fixture refuses to paper over that refusal, so every
-// TestEventIsolation_ test skips without it. With the fail-on-skip gate in place, that is a job
-// that cannot go green on a healthy broker.
+// Credential issuance refuses when KAFKA_SUBSCRIBER_BROKERS is unset — a deployment
+// must name the addresses a subscriber will actually connect to rather than leaking its
+// internal bootstrap list by omission — and the isolation fixture refuses to paper over
+// that refusal, so every TestEventIsolation_ test skips without it. With the
+// fail-on-skip gate in place, that is a job that cannot go green on a healthy broker.
 func TestKafkaAcceptanceJob_SuppliesTheSubscriberFacingBrokerList(t *testing.T) {
 	workflow := readCIWorkflow(t)
 
@@ -255,12 +236,10 @@ func TestKafkaAcceptanceJob_SuppliesTheSubscriberFacingBrokerList(t *testing.T) 
 		"the gate must read the machine-readable skip records rather than grepping human output")
 }
 
-// TestKafkaAcceptanceJob_ChecksTheSelectionBeforeRunningIt asserts the precondition step exists.
+// TestKafkaAcceptanceJob_ChecksTheSelectionBeforeRunningIt asserts the precondition
+// step exists.
 //
-// The Go test above catches a family that matches nothing in this repository. The CI step
-// catches the same thing in the environment the suites actually run in, which is where a build
-// tag, a missing service or a package that fails to compile can also make a family unreachable.
-// Both are wanted: this test fails fast on a rename, and the step fails the job on anything else.
+// The Go test above catches a family that matches nothing in this repository.
 func TestKafkaAcceptanceJob_ChecksTheSelectionBeforeRunningIt(t *testing.T) {
 	workflow := readCIWorkflow(t)
 
@@ -271,19 +250,15 @@ func TestKafkaAcceptanceJob_ChecksTheSelectionBeforeRunningIt(t *testing.T) {
 		"the precondition must enumerate the selection rather than assuming it")
 }
 
-// TestDependencyManifests_AreCheckedRatherThanRepairedInCI is MIN-11's guard.
+// TestDependencyManifests_AreCheckedRatherThanRepairedInCI is the manifest-check guard.
 //
-// `go mod tidy` MUTATES go.mod and go.sum. A job that runs it and then builds and tests the
-// repaired tree accepts a pull request whose manifests do not describe it: an import added
-// without updating go.mod, or a requirement left stale, is silently fixed in CI and merged. The
-// module graph a release builds from is the one in the repository, not the one CI computed, so
-// the tidy has to be a CHECK.
+// `go mod tidy` MUTATES go.mod and go.sum.
 func TestDependencyManifests_AreCheckedRatherThanRepairedInCI(t *testing.T) {
 	workflow := readCIWorkflow(t)
 
 	// COMMAND LINES ONLY. The prose above each step names the command too, and counting
-	// occurrences in comments would make the two totals depend on how much the steps explain
-	// themselves rather than on what they run.
+	// occurrences in comments would make the two totals depend on how much the steps
+	// explain themselves rather than on what they run.
 	tidy := 0
 	for _, line := range strings.Split(workflow, "\n") {
 		if strings.TrimSpace(line) == "go mod tidy" {
@@ -304,13 +279,11 @@ func TestDependencyManifests_AreCheckedRatherThanRepairedInCI(t *testing.T) {
 			"manifests and then tests the repaired tree", ciWorkflowPath, tidy, verified)
 }
 
-// TestMakeInit_DownloadsAndVerifiesRatherThanResolving is the other half of MIN-11.
+// TestMakeInit_DownloadsAndVerifiesRatherThanResolving is the other half of the manifest-check guard.
 //
-// `go get ./...` resolves and can WRITE the manifests: it upgrades a requirement to a newer
-// version satisfying the same import and rewrites go.mod and go.sum as a side effect of what
-// reads like a fetch. So the first command a new contributor ran was the one able to change the
-// dependency contract, and a bumped version arriving in an unrelated pull request is
-// indistinguishable from a deliberate upgrade.
+// `go get ./...` resolves and can WRITE the manifests: it upgrades a requirement to a
+// newer version satisfying the same import and rewrites go.mod and go.sum as a side
+// effect of what reads like a fetch.
 func TestMakeInit_DownloadsAndVerifiesRatherThanResolving(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(moduleRootDir(t), "makefile"))
 	require.NoError(t, err)

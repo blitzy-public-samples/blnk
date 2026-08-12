@@ -14,25 +14,15 @@
 	limitations under the License.
 */
 
-// Tests for the LOCAL STACK's event-streaming configuration: the two compose projections,
-// the bring-up script and the provisioning script.
+// Tests for the LOCAL STACK's event-streaming configuration: the two compose
+// projections, the bring-up script and the provisioning script.
 //
-// # Why a Go test asserts on YAML and shell
+// These files are the only part of the event pipeline with no compiler and no type
+// system behind them.
 //
-// These files are the only part of the event pipeline with no compiler and no type system
-// behind them. A stray `depends_on` entry, a credential default that creeps back in, or a
-// published port that loses its host binding are all silent: the stack still comes up, and
-// the defect shows itself as a sixty-second delay on a laptop, or not at all until the
-// broker is on a shared network. Every assertion below encodes a specific defect that was
-// present and is now fixed, so that the fix cannot be undone by an edit that looks
-// harmless.
-//
-// The compose files are PARSED rather than grepped wherever the property is structural — a
-// dependency is a map entry, not a line of text — and read as text only where the property
-// genuinely is textual, such as an interpolation default. Both projections are checked in
-// every case, because docker-compose.dev.yaml differs from docker-compose.yaml only in
-// building from source and is otherwise expected to be identical: a fix applied to one and
-// not the other leaves half the developers on the defect.
+// The compose files are PARSED rather than grepped wherever the property is structural
+// — a dependency is a map entry, not a line of text — and read as text only where the
+// property genuinely is textual, such as an interpolation default.
 package blnk
 
 import (
@@ -138,32 +128,11 @@ func readRepoFile(t *testing.T, relative string) string {
 // F16 — a stack with no broker must still start
 // ---------------------------------------------------------------------------
 
-// TestCompose_ApplicationServicesDoNotWaitOnTheBroker is the anti-regression guard for the
-// no-broker startup path.
+// TestCompose_ApplicationServicesDoNotWaitOnTheBroker is the anti-regression guard for
+// the no-broker startup path.
 //
-// Both application services used to carry "kafka: condition: service_healthy" and
-// "kafka-init: condition: service_completed_successfully" UNCONDITIONALLY. KAFKA_BROKERS is
-// EMPTY in the shipped configuration — a supported steady state in which the publisher
-// resolves to its no-op and Blnk behaves exactly as it did before Kafka existed — so the
-// shipped stack made the API wait out the broker's sixty-second start period for a JVM it had
-// been told to ignore, and a broker that could not bootstrap at all left the API permanently
-// unstarted rather than merely un-Kafka'd. An optional dependency was manufacturing an outage.
-//
-// # Why the dependency is made OPTIONAL rather than deleted
-//
-// Deleting the two entries fixes the outage and loses something real with it: when the
-// operator HAS asked for Kafka, starting the relay against a broker that is merely created —
-// not listening, not authenticating, with no topics — is the failure the conditions were
-// added for. So the entries stay, and what changes is that they become non-required
-// dependencies on services that sit behind a Compose profile:
-//
-//	docker compose up                  -> kafka is outside the enabled set, `required: false`
-//	                                      makes that not an error, nothing is waited on
-//	docker compose --profile kafka up  -> both conditions apply, unweakened
-//
-// Each half is inert without the other, which is why this test asserts the pair and
-// TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts asserts the conditions survive.
-// What must never hold again is an UNCONDITIONAL wait, and that is the assertion here.
+// Neither application service may carry "kafka: condition: service_healthy" or
+// "kafka-init: condition: service_completed_successfully" UNCONDITIONALLY.
 func TestCompose_ApplicationServicesDoNotWaitOnTheBroker(t *testing.T) {
 	for _, file := range composeProjections {
 		// The gate is only optional because the services it names are outside the default
@@ -206,8 +175,8 @@ func TestCompose_ApplicationServicesDoNotWaitOnTheBroker(t *testing.T) {
 			}
 
 			// The three that remain are load-bearing and must not be lost while the Kafka
-			// entries are being made optional: Blnk cannot serve a request without its
-			// database or its queue.
+			// entries are being made optional: Blnk cannot serve a request without its database
+			// or its queue.
 			assert.Containsf(t, dependencies, "postgres", "%s: %q must still depend on postgres", file, service)
 			assert.Containsf(t, dependencies, "redis", "%s: %q must still depend on redis", file, service)
 		}
@@ -226,11 +195,11 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-// TestCompose_ProvisioningStillWaitsForTheBroker asserts the gate that IS correct was kept.
+// TestCompose_ProvisioningStillWaitsForTheBroker asserts the gate that IS correct was
+// kept.
 //
-// kafka-init speaks an authenticated SASL protocol to a broker that must already have loaded
-// its metadata. Removing the application gate is right; removing this one would make
-// provisioning fail against a merely-started broker in a way that reads as a wrong password.
+// kafka-init speaks an authenticated SASL protocol to a broker that must already have
+// loaded its metadata.
 func TestCompose_ProvisioningStillWaitsForTheBroker(t *testing.T) {
 	for _, file := range composeProjections {
 		service := composeService(t, file, "kafka-init")
@@ -252,15 +221,11 @@ func TestCompose_ProvisioningStillWaitsForTheBroker(t *testing.T) {
 // F17 — provisioning happens before the relay is admitted
 // ---------------------------------------------------------------------------
 
-// TestStackScript_ProvisionsKafkaBeforeStartingTheApplication asserts the ordering moved into
-// stack.sh, and that its outcome is no longer discarded.
+// TestStackScript_ProvisionsKafkaBeforeStartingTheApplication asserts the ordering
+// moved into stack.sh, and that its outcome is no longer discarded.
 //
-// The bring-up used to run "compose up -d" for everything at once and verify the broker
-// afterwards, with every call site written as "ensure_kafka || true". So the ledger was already
-// accepting writes and the relay already polling while the topics were being created — and the
-// script printed a success line over it. Nothing was lost, because capture is transactional, but
-// a publish into a topic that does not exist burns an attempt against the row's retry budget, so
-// a cold start could dead-letter a backlog over a condition that would have cleared by itself.
+// So the ledger was already accepting writes and the relay already polling while the
+// topics were being created — and the script printed a success line over it.
 func TestStackScript_ProvisionsKafkaBeforeStartingTheApplication(t *testing.T) {
 	script := readRepoFile(t, "stack.sh")
 
@@ -270,9 +235,9 @@ func TestStackScript_ProvisionsKafkaBeforeStartingTheApplication(t *testing.T) {
 	require.Contains(t, script, "staged_up",
 		"and the bring-up paths must route through it rather than calling compose up directly")
 
-	// The three paths that start the stack. Each must go through the staged bring-up, and none
-	// may reach compose's own up directly — which is what would put the ledger and the topics
-	// back in a race.
+	// The three paths that start the stack. Each must go through the staged bring-up, and
+	// none may reach compose's own up directly — which is what would put the ledger and
+	// the topics back in a race.
 	for _, invocation := range []string{
 		`--up | -u )
             staged_up "${@:2}"`,
@@ -294,22 +259,11 @@ func TestStackScript_ProvisionsKafkaBeforeStartingTheApplication(t *testing.T) {
 			"database, the queue and the API as well")
 }
 
-// TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation is the M-3 guard: the
-// script and the containers must not disagree about the one value that decides whether Blnk
-// publishes.
+// TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation is the guard: the
+// script and the containers must not disagree about the one value that decides whether
+// Blnk publishes.
 //
-// THE CASCADE. showenv() sources ${env} before main() runs. If the caller had already EXPORTED
-// KAFKA_BROKERS, that source does not shadow it — assigning to an exported name keeps the export
-// attribute and replaces the value — so every later child process inherits ${env}'s value. The
-// script meanwhile decides with KAFKA_BROKERS_FROM_SHELL, captured before the source, which is
-// correct because compose resolves the shell environment ahead of --env-file. The two then
-// differ, and "KAFKA_BROKERS=broker-a ./stack.sh -u" against a .env naming broker-b had the
-// script wait for, authenticate to and verify the catalogue on broker-a while the server and
-// worker published to broker-b — with the bring-up reporting success.
-//
-// The fix is structural: one `compose` function pins the effective value on every invocation, so
-// there is no second place for the precedence rule to be re-derived. This asserts the structure,
-// because that is what makes it hold for a compose call added later.
+// THE CASCADE. showenv() sources ${env} before main() runs.
 func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *testing.T) {
 	stack := readRepoFile(t, "stack.sh")
 
@@ -318,9 +272,10 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 		"the compose helper must pin the EFFECTIVE broker list on the invocation, so what compose "+
 			"interpolates is what this script decided rather than whatever survived sourcing .env")
 
-	// EVERY invocation goes through it. Counting raw ${COMPOSE_CL} uses is the assertion that
-	// keeps this true: one is the helper's own, and the rest must be printed advice rather than
-	// executed commands, because an executed one would be a call that skipped the pin.
+	// EVERY invocation goes through it. Counting raw ${COMPOSE_CL} uses is the assertion
+	// that keeps this true: one is the helper's own, and the rest must be printed advice
+	// rather than executed commands, because an executed one would be a call that skipped
+	// the pin.
 	for _, line := range strings.Split(stack, "\n") {
 		if !strings.Contains(line, "${COMPOSE_CL}") {
 			continue
@@ -334,37 +289,29 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 		}
 
 		// A TEST of the variable, not an invocation of it. resolve_compose_cl has to read
-		// COMPOSE_CL to honour an explicit pin — exported by the caller or set in ${env} — before
-		// it probes the host for a Compose implementation, and COMPOSE_CL now starts EMPTY rather
-		// than assuming the legacy "docker-compose" binary. Reading the variable interpolates no
-		// command and so cannot skip the broker pin; an executed call still fails below.
+		// COMPOSE_CL to honour an explicit pin — exported by the caller or set in ${env} —
+		// before it probes the host for a Compose implementation, and COMPOSE_CL now starts
+		// EMPTY rather than assuming the legacy "docker-compose" binary. Reading the variable
+		// interpolates no command and so cannot skip the broker pin; an executed call still
+		// fails below.
 		if strings.HasPrefix(trimmed, `if [ -n "${COMPOSE_CL}" ]`) ||
 			strings.HasPrefix(trimmed, `if [ -z "${COMPOSE_CL}" ]`) {
 			continue
 		}
 
 		// THE VERSION PROBE, and it is the one function allowed to receive the variable.
-		//
-		// resolve_compose_cl must know which Compose it is about to use, because the compose files
-		// need depends_on.required and that field arrived in 2.20.0 — a host below it cannot parse
-		// them at all. compose_version_of runs `<invocation> version --short`, which reads no
-		// compose file, interpolates no service and consults no KAFKA_BROKERS, so it is outside
-		// the precedence problem this guard exists for rather than an exception to it.
-		//
-		// Named explicitly rather than allowing "any function call", so a helper added later that
-		// runs a REAL compose command on the side still fails here.
 		if strings.Contains(trimmed, `compose_version_of "${COMPOSE_CL}"`) {
 			continue
 		}
 
-		// Everything that survives to here must be a READ of the variable's value rather than an
-		// execution of it: printed advice, a message argument, a comparison. What fails is
+		// Everything that survives to here must be a READ of the variable's value rather than
+		// an execution of it: printed advice, a message argument, a comparison. What fails is
 		// COMMAND POSITION — the only place an invocation can skip the pin.
 		//
-		// Tested by position rather than by "the line starts with a quote", which was the earlier
-		// rule and was wrong in both directions: it rejected a printf whose message merely names
-		// the variable, and it accepted a continuation line that began with a quote and went on to
-		// execute one.
+		// Tested by position rather than by "the line starts with a quote", which was the
+		// earlier rule and was wrong in both directions: it rejected a printf whose message
+		// merely names the variable, and it accepted a continuation line that began with a
+		// quote and went on to execute one.
 		commandPositions := []string{
 			`${COMPOSE_CL} `,
 			`${COMPOSE_CL}"`,
@@ -388,8 +335,8 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 				"instead of the effective one", trimmed)
 	}
 
-	// THE VERSION FLOOR ITSELF, asserted here because the resolver is the only thing that enforces
-	// it and a silent removal would reintroduce F-33: a Compose v1 host that fails on
+	// THE VERSION FLOOR ITSELF, asserted here because the resolver is the only thing that
+	// enforces it and a silent removal would reintroduce a Compose v1 host that fails on
 	// depends_on.required rather than on a version check, with an error naming a field.
 	assert.Contains(t, stack, `COMPOSE_MINIMUM_VERSION="2.20.0"`,
 		"the resolver must state the version floor the compose files require, because "+
@@ -406,24 +353,17 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 		"resolve_compose_cl must be defined exactly once; a duplicate definition shadows the "+
 			"first and makes an edit to it a no-op")
 
-	// The two-variable capture that makes the precedence reproducible must survive: "unset" and
-	// "set to empty" are different answers, and compose treats an explicitly empty shell value as
-	// a real value that overrides --env-file.
+	// The two-variable capture that makes the precedence reproducible must survive:
+	// "unset" and "set to empty" are different answers, and compose treats an explicitly
+	// empty shell value as a real value that overrides --env-file.
 	assert.Contains(t, stack, `declare KAFKA_BROKERS_DECLARED_IN_SHELL="${KAFKA_BROKERS+yes}"`,
 		"declaration must be captured separately from value, so an explicit KAFKA_BROKERS= is "+
 			"honoured as 'no brokers for this run' rather than falling back to .env")
 	assert.Contains(t, stack, `declare KAFKA_BROKERS_FROM_SHELL="${KAFKA_BROKERS-}"`,
 		"and the pre-source value must be captured before sourcing .env can replace it")
 
-	// The host fallback pins it too, and did already — it is the precedent this generalises.
-	//
-	// Asserted on the export rather than on a line continuation. This used to read
-	// `KAFKA_BROKERS="${brokers}" \`, which was the middle of an `env KEY=value ... script`
-	// invocation. That invocation was replaced by a subshell that exports instead, because
-	// `env KEY=value` puts the Kafka superuser password in argv and /proc/<pid>/cmdline is
-	// world-readable. The GUARANTEE this line exists to protect is unchanged — the effective
-	// broker list is still pinned explicitly — so the assertion follows it to its new spelling
-	// rather than being deleted.
+	// The host fallback pins it too, and did already — it is the precedent this
+	// generalises.
 	assert.Contains(t, stack, `export KAFKA_BROKERS="${brokers}"`,
 		"provision_kafka must keep passing the effective list explicitly, so the broker the "+
 			"catalogue is created on is the broker the application publishes to")
@@ -432,13 +372,6 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 			"passthrough loop, so it wins over any .env entry of the same name")
 
 	// AND THE CREDENTIALS MUST NOT GO BACK INTO ARGV.
-	//
-	// provision_kafka forwards KAFKA_SASL_ADMIN_SECRET and KAFKA_PRODUCER_SECRET to the
-	// provisioning script. `env NAME=value cmd` places both in the command line of a real
-	// process, and on Linux /proc/<pid>/cmdline is mode 444 — readable by every account on the
-	// host for as long as provisioning runs. The `export` builtin is executed by the shell
-	// itself, so no command line is created and the values reach the child through its
-	// environment, /proc/<pid>/environ, which is mode 400.
 	assert.NotContains(t, stack, `env "${assignments[@]}"`,
 		"provisioning credentials must not be forwarded as `env NAME=value` arguments: argv is "+
 			"world-readable through /proc, so that publishes the broker superuser password to "+
@@ -448,11 +381,11 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 			"creates no command line, rather than as an argument to env")
 }
 
-// TestStackScript_LeavesTheNonApplicableCasesUnfailed asserts the gate does not invent work.
+// TestStackScript_LeavesTheNonApplicableCasesUnfailed asserts the gate does not invent
+// work.
 //
-// Three situations are not problems and must not be reported as any: no broker list, a compose
-// file that declares no broker, and a caller who named specific services. Failing on those would
-// make "./stack.sh --up postgres" fail because Kafka was not provisioned.
+// Three situations are not problems and must not be reported as any: no broker list, a
+// compose file that declares no broker, and a caller who named specific services.
 func TestStackScript_LeavesTheNonApplicableCasesUnfailed(t *testing.T) {
 	script := readRepoFile(t, "stack.sh")
 
@@ -476,14 +409,8 @@ func TestStackScript_LeavesTheNonApplicableCasesUnfailed(t *testing.T) {
 
 // TestCompose_ShipsNoDefaultKafkaAdminCredential is the CWE-798 guard.
 //
-// Every service that needs the administrative pair used to default it to "admin" and a fixed
-// placeholder secret. That principal is in the broker's super.users: it can create topics, mint
-// a SCRAM credential for any subscriber and rewrite every ACL on the cluster — so a published
-// default for it is not one weak local password but the key from which every other credential on
-// the broker can be minted, shared by every deployment that never overrode it.
-//
-// The assertion is textual because the property is textual: what must not exist is an
-// interpolation DEFAULT, and a parsed document shows only the resolved value.
+// No service that needs the administrative pair may default it to "admin" and a fixed
+// placeholder secret.
 func TestCompose_ShipsNoDefaultKafkaAdminCredential(t *testing.T) {
 	for _, file := range composeProjections {
 		contents := readRepoFile(t, file)
@@ -517,10 +444,7 @@ func TestCompose_ShipsNoDefaultKafkaAdminCredential(t *testing.T) {
 
 // TestCompose_PublishesTheBrokerOnLoopbackByDefault asserts the host binding.
 //
-// A bare "9092:29092" publishes on 0.0.0.0. On a laptop on a café or office network that exposes
-// a broker holding ledger events, and a SASL listener guarding them, to every machine on that
-// network. Nothing in the stack needs it: server, worker and kafka-init all reach the broker over
-// the compose network's own listener, which is never published.
+// A bare "9092:29092" publishes on 0.0.0.0.
 func TestCompose_PublishesTheBrokerOnLoopbackByDefault(t *testing.T) {
 	for _, file := range composeProjections {
 		ports, ok := composeService(t, file, "kafka")["ports"].([]interface{})
@@ -534,10 +458,11 @@ func TestCompose_PublishesTheBrokerOnLoopbackByDefault(t *testing.T) {
 			"%s: the broker's published port must be bound to a host address defaulting to LOOPBACK. "+
 				"Got %q", file, mapping)
 
-		// The advertised host has to be overridable alongside the binding. Kafka answers every
-		// client with the ADVERTISED address, so a broker exposed on a LAN address while still
-		// advertising "localhost" completes the handshake and then hands the client its own
-		// loopback — a failure that reads as a broker fault rather than as a configuration one.
+		// The advertised host has to be overridable alongside the binding. Kafka answers
+		// every client with the ADVERTISED address, so a broker exposed on a LAN address
+		// while still advertising "localhost" completes the handshake and then hands the
+		// client its own loopback — a failure that reads as a broker fault rather than as a
+		// configuration one.
 		assert.Containsf(t, readRepoFile(t, file), "${KAFKA_OUTER_ADVERTISED_HOST:-localhost}",
 			"%s: the advertised host must be overridable with the binding, or exposing the broker "+
 				"deliberately produces a broker that authenticates and then cannot be read", file)
@@ -547,25 +472,11 @@ func TestCompose_PublishesTheBrokerOnLoopbackByDefault(t *testing.T) {
 // TestCompose_ShipsNoSampleSubscriberGroupPrefix asserts the shipped stack can actually
 // provision itself.
 //
-// # The defect
-//
 // The sample subscriber's consumer-group namespace is DERIVED by kafka-provision.sh as
 // "<principal>." — terminated, because a PREFIXED group grant on an unterminated
-// "blnk-sample-subscriber" also matches "blnk-sample-subscriber-evil" — and the script refuses
-// any override that disagrees with the derivation, printing what it derived and provisioning
-// nothing.
-//
-// Both compose files defaulted the variable to the unterminated "blnk-sample-subscriber", which
-// is precisely the value the guard rejects, and .env.example shipped the same. So a stock
-// `docker compose --profile kafka up kafka kafka-init` — the exact command the isolation test's
-// own skip message tells an operator to run — exited 1 with nothing provisioned: no topics, no
-// principals, and therefore a broker against which the V-5 acceptance suite can only skip. The
-// remedy the script printed, "unset the variable", could not be applied through Compose either,
-// because `:-` re-supplied the default on every run.
-//
-// The trailing-terminator rule is CORRECT security behaviour and must not be relaxed to make
-// the default work. The defaults are what change, and this test is what keeps them changed: the
-// only acceptable shipped value is empty, which is how the script is told to derive.
+// "blnk-sample-subscriber" also matches "blnk-sample-subscriber-evil" — and the script
+// refuses any override that disagrees with the derivation, printing what it derived and
+// provisioning nothing.
 func TestCompose_ShipsNoSampleSubscriberGroupPrefix(t *testing.T) {
 	const variable = "KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX"
 
@@ -655,11 +566,8 @@ func TestEnvExample_ShipsTheKafkaCredentialsEmpty(t *testing.T) {
 		"with an advertised host that resolves to the same endpoint")
 }
 
-// TestStackScript_GeneratesBothKafkaPrincipals asserts --init produces the pair the compose
-// files no longer default, AND the least-privileged producer identity.
-//
-// Removing the compose defaults without this would trade a security defect for a usability one:
-// the operator would be told to supply a credential with no supported way to obtain it.
+// TestStackScript_GeneratesBothKafkaPrincipals asserts --init produces the pair the
+// compose files no longer default, AND the least-privileged producer identity.
 func TestStackScript_GeneratesBothKafkaPrincipals(t *testing.T) {
 	script := readRepoFile(t, "stack.sh")
 
@@ -679,25 +587,10 @@ func TestStackScript_GeneratesBothKafkaPrincipals(t *testing.T) {
 			"identity kafka-provision.sh mints are the same")
 }
 
-// TestStackScript_DefinesEachFunctionExactlyOnce is Q-02.
+// TestStackScript_DefinesEachFunctionExactlyOnce is the single-definition rule.
 //
-// # What was wrong
-//
-// resolve_compose_cl was defined TWICE, sixty-five lines apart, together with a duplicated
-// section banner and a duplicated block of documentation. The two bodies were byte-identical,
-// so nothing misbehaved — which is exactly what makes it worth a guard. In a shell script the
-// LAST definition silently replaces the earlier one, so the copy a reader finds first, edits,
-// and satisfies themselves about is not necessarily the copy that runs. The next divergent
-// edit to the wrong copy would change nothing at all and would be indistinguishable from a
-// change that did not work, on the function that decides whether the whole stack can talk to
-// Docker.
-//
-// # Why the assertion is over EVERY function rather than that one
-//
-// The defect is a property of the file — 1,500 lines of shell with no compiler, where a
-// redefinition is not an error and not a warning — so pinning the single function that
-// happened to be duplicated would leave the next one unguarded. Counting every definition
-// costs nothing and states the invariant that actually matters: one name, one body.
+// resolve_compose_cl was defined TWICE, sixty-five lines apart, together with a
+// duplicated section banner and a duplicated block of documentation.
 func TestStackScript_DefinesEachFunctionExactlyOnce(t *testing.T) {
 	script := readRepoFile(t, "stack.sh")
 
@@ -720,8 +613,8 @@ func TestStackScript_DefinesEachFunctionExactlyOnce(t *testing.T) {
 			name, count)
 	}
 
-	// The function the finding named, asserted by name as well as by count, so the regression
-	// this test exists for is legible without decoding the loop above.
+	// The function most at risk of a second definition, asserted by name as well as by count,
+	// so what this test protects is legible without decoding the loop above.
 	assert.Equal(t, 1, counts["resolve_compose_cl"],
 		"resolve_compose_cl must be defined exactly once")
 
@@ -736,13 +629,8 @@ func TestStackScript_DefinesEachFunctionExactlyOnce(t *testing.T) {
 // F20 — the publisher is a separate, least-privileged identity
 // ---------------------------------------------------------------------------
 
-// TestKafkaProvisionScript_MintsALeastPrivilegedProducer asserts the provisioning script creates
-// the producer principal and grants it only what publishing needs.
-//
-// Before it did, .env.example documented a "blnk-producer" principal that nothing anywhere
-// created — so an operator who followed the documentation got an authentication failure, and the
-// realistic response was to leave KAFKA_SASL_USER empty and publish as the administrator. A
-// documented identity with no way to obtain it is not privilege separation.
+// TestKafkaProvisionScript_MintsALeastPrivilegedProducer asserts the provisioning
+// script creates the producer principal and grants it only what publishing needs.
 func TestKafkaProvisionScript_MintsALeastPrivilegedProducer(t *testing.T) {
 	script := readRepoFile(t, filepath.Join("scripts", "kafka-provision.sh"))
 
@@ -757,26 +645,29 @@ func TestKafkaProvisionScript_MintsALeastPrivilegedProducer(t *testing.T) {
 	assert.Contains(t, main, "ensure_producer_principal",
 		"main must invoke it; a function nothing calls provisions nothing")
 
-	// The grant, and the absence of everything else. The producer path must never acquire the
-	// authority the administrative principal has, because the whole point of the second identity
-	// is that a compromise of the publish path is not a compromise of the cluster.
+	// The grant, and the absence of everything else. The producer path must never acquire
+	// the authority the administrative principal has, because the whole point of the
+	// second identity is that a compromise of the publish path is not a compromise of the
+	// cluster.
 	grant := script[strings.Index(script, "grant_producer_acls() {"):]
 	grant = grant[:strings.Index(grant, "\n}\n")]
 
 	// The grant is expressed as a DESIRED SET of canonical descriptors rather than as a
-	// sequence of "kafka-acls --add" invocations, because the script reconciles the principal's
-	// bindings to it instead of only appending to whatever is already there. So the assertions
-	// below read the descriptors, which are where the operations and the pattern type now live.
+	// sequence of "kafka-acls --add" invocations, because the script reconciles the
+	// principal's bindings to it instead of only appending to whatever is already there.
+	// So the assertions below read the descriptors, which are where the operations and the
+	// pattern type now live.
 	assert.Contains(t, grant, `acl_descriptor TOPIC "$topic" LITERAL WRITE`,
 		"the producer must be granted Write on a LITERAL topic pattern: that is what publishing "+
 			"is, and a wildcard pattern would be indistinguishable from no privilege separation")
 	assert.Contains(t, grant, `acl_descriptor TOPIC "$topic" LITERAL DESCRIBE`,
 		"and Describe, so the writer can see a topic's partitions")
 
-	// The owned shapes are what the reconciler is allowed to REMOVE, so they bound the damage a
-	// reconciliation can do as tightly as the desired set bounds the grant. Write and Describe
-	// on a literal topic, and nothing else: a producer principal carrying anything further is
-	// refused rather than silently narrowed, because the script did not create it.
+	// The owned shapes are what the reconciler is allowed to REMOVE, so they bound the
+	// damage a reconciliation can do as tightly as the desired set bounds the grant. Write
+	// and Describe on a literal topic, and nothing else: a producer principal carrying
+	// anything further is refused rather than silently narrowed, because the script did
+	// not create it.
 	assert.Contains(t, grant, `ACL_OWNED_SHAPES=(
         "TOPIC|LITERAL|WRITE"
         "TOPIC|LITERAL|DESCRIBE"
@@ -807,22 +698,24 @@ func TestKafkaProvisionScript_MintsALeastPrivilegedProducer(t *testing.T) {
 	}
 }
 
-// TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem asserts the provisioning
-// script CONVERGES a principal's bindings on the configured set, in both directions.
+// TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem asserts the
+// provisioning script CONVERGES a principal's bindings on the configured set, in both
+// directions.
 //
-// Every grant in the script used to be a bare "kafka-acls --add", justified as idempotent. It is
-// idempotent and it is not convergent: --add can only widen. Three ordinary configuration
-// changes therefore did not take effect, and each left the broker serving MORE than the
-// configuration described while the run reported success and the summary printed the smaller set:
+// It is idempotent and it is not convergent: --add can only widen. Three ordinary
+// configuration changes therefore did not take effect, and each left the broker serving
+// MORE than the configuration described while the run reported success and the summary
+// printed the smaller set:
 //
 //   - removing a category from KAFKA_SAMPLE_SUBSCRIBER_TOPICS,
-//   - changing KAFKA_TOPIC_PREFIX, which left both principals fully granted on the whole
-//     previous namespace,
+//   - changing KAFKA_TOPIC_PREFIX, which left both principals fully granted on the
+//     whole previous namespace,
 //   - renaming the sample subscriber or its consumer group, which left a reserved group
 //     namespace nothing owned.
 //
-// The reconciler's shape is asserted here rather than only its existence, because two of its
-// properties are what make it safe to let a provisioning script DELETE an ACL at all.
+// The reconciler's shape is asserted here rather than only its existence, because two
+// of its properties are what make it safe to let a provisioning script DELETE an ACL at
+// all.
 func TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem(t *testing.T) {
 	script := readRepoFile(t, filepath.Join("scripts", "kafka-provision.sh"))
 
@@ -832,8 +725,8 @@ func TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem(t *testing.
 	reconciler := script[strings.Index(script, "reconcile_principal_acls() {"):]
 	reconciler = reconciler[:strings.Index(reconciler, "\n}\n")]
 
-	// DELETE BEFORE CREATE. Every partial failure must leave the principal narrower than the
-	// configuration, never broader — the same order, for the same reason, as
+	// DELETE BEFORE CREATE. Every partial failure must leave the principal narrower than
+	// the configuration, never broader — the same order, for the same reason, as
 	// reconcileSubscriberACLs in event_admin.go.
 	removeAt := strings.Index(reconciler, "apply_acl_binding --remove")
 	addAt := strings.Index(reconciler, "apply_acl_binding --add")
@@ -844,8 +737,8 @@ func TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem(t *testing.
 			"taken access away it was about to re-grant rather than left access nothing describes")
 
 	// FAIL CLOSED ON A FOREIGN GRANT. A binding the script does not own and that can GRANT
-	// makes the effective access broader than the configuration by an amount the script cannot
-	// bound, so it refuses rather than reporting a grant it cannot state.
+	// makes the effective access broader than the configuration by an amount the script
+	// cannot bound, so it refuses rather than reporting a grant it cannot state.
 	assert.Contains(t, reconciler, "foreign_allow",
 		"a foreign ALLOW binding must be recognised rather than silently tolerated")
 	foreignRefusal := strings.Index(reconciler, "${#foreign_allow[@]} > 0")
@@ -867,10 +760,11 @@ func TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem(t *testing.
 		"kafka-acls --remove prompts for confirmation; without --force the compose one-shot "+
 			"reads EOF and abandons the removal")
 
-	// VERIFIED, not assumed. The success claim has to be a statement about the broker, and the
-	// two divergences are not symmetric: a revoked binding that is still there means the grant
-	// is still too BROAD and is fatal, while a granted binding that is still missing means it is
-	// too NARROW, which fails safe and announces itself at the client's next connect.
+	// VERIFIED, not assumed. The success claim has to be a statement about the broker, and
+	// the two divergences are not symmetric: a revoked binding that is still there means
+	// the grant is still too BROAD and is fatal, while a granted binding that is still
+	// missing means it is too NARROW, which fails safe and announces itself at the
+	// client's next connect.
 	assert.Contains(t, reconciler, "still_present",
 		"the end state must be re-read and compared, so 'reconciled' means the broker holds "+
 			"exactly the desired set and not merely that every command exited zero")
@@ -901,12 +795,8 @@ func TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem(t *testing.
 	}
 }
 
-// TestKafkaProvisionScript_ReadsTheProducerIdentityTheApplicationUses asserts the script and the
-// application resolve the SAME two variables.
-//
-// A separate KAFKA_PRODUCER_* pair would have been the obvious shape and the wrong one: the
-// script would then mint one identity while the server and worker authenticated as another, and
-// the symptom would be an authentication failure with two correct-looking configurations.
+// TestKafkaProvisionScript_ReadsTheProducerIdentityTheApplicationUses asserts the
+// script and the application resolve the SAME two variables.
 func TestKafkaProvisionScript_ReadsTheProducerIdentityTheApplicationUses(t *testing.T) {
 	script := readRepoFile(t, filepath.Join("scripts", "kafka-provision.sh"))
 
@@ -916,9 +806,10 @@ func TestKafkaProvisionScript_ReadsTheProducerIdentityTheApplicationUses(t *test
 	assert.Contains(t, script, `KAFKA_SASL_SECRET="${KAFKA_SASL_SECRET:-}"`,
 		"and KAFKA_SASL_SECRET, for the same reason")
 
-	// Both must survive delegation into the broker container, which is how the compose one-shot
-	// runs. A variable left out of the interface is silently replaced by the script's own
-	// default — here, "not configured" — so the producer would be skipped with no diagnosis.
+	// Both must survive delegation into the broker container, which is how the compose
+	// one-shot runs. A variable left out of the interface is silently replaced by the
+	// script's own default — here, "not configured" — so the producer would be skipped
+	// with no diagnosis.
 	interface_ := kafkaProvisionInterface(t)
 
 	for _, variable := range []string{
@@ -933,18 +824,8 @@ func TestKafkaProvisionScript_ReadsTheProducerIdentityTheApplicationUses(t *test
 	}
 }
 
-// kafkaProvisionInterface returns the provisioning script's own canonical variable list, by
-// asking the script for it.
-//
-// IT EXECUTES THE SCRIPT rather than parsing it, and that is the point: "--print-interface" is
-// the contract ./stack.sh reads at bring-up, so a test that read the array declaration by regex
-// could pass while the flag printed something else entirely — and it is the flag's output that
-// governs what a real run forwards.
-//
-// The call is safe to make from a unit test because parse_arguments runs before every side
-// effect: nothing is read from configuration, no broker is contacted and nothing is provisioned.
-// A pruned environment is passed anyway, so a developer with real Kafka variables exported runs
-// the same test CI does.
+// kafkaProvisionInterface returns the provisioning script's own canonical variable
+// list, by asking the script for it.
 func kafkaProvisionInterface(t *testing.T, flags ...string) []string {
 	t.Helper()
 
@@ -977,25 +858,18 @@ func kafkaProvisionInterface(t *testing.T, flags ...string) []string {
 	return names
 }
 
-// TestKafkaProvisionScript_HandsOffEverySupportedSetting is the static equality assertion the
-// three invocation paths are held to.
+// TestKafkaProvisionScript_HandsOffEverySupportedSetting is the static equality
+// assertion the three invocation paths are held to.
 //
-// FOUR PATHS PROVISION THE SAME BROKER: the script run directly, the script re-executing itself
-// inside the broker container, ./stack.sh's host fallback, and the compose kafka-init one-shot.
-// Each used to carry its own hand-written list of variables to forward, and they had drifted in
-// every direction at once — stack.sh omitted the CLI timeout pair, the producer secret file and
-// the real skip flag; both compose blocks omitted those plus partition growth, the readiness
-// budget, the subscriber skip and rotation flags, and the client configuration.
+// FOUR PATHS PROVISION THE SAME BROKER: the script run directly, the script
+// re-executing itself inside the broker container, ./stack.sh's host fallback, and the
+// compose kafka-init one-shot.
 //
-// A MISSING NAME DOES NOT ERROR, WHICH IS WHY THIS TEST EXISTS. The receiving run defaults the
-// variable and reports success, so the same .env provisioned differently depending on which path
-// ran — and which ran depended on nothing more than whether the host happened to have the Kafka
-// CLI. Invisible, and unreproducible.
+// A MISSING NAME DOES NOT ERROR, WHICH IS WHY THIS TEST EXISTS.
 //
-// stack.sh no longer restates the list at all: it reads "--print-interface-host" at startup, so
-// it cannot drift and there is nothing to assert but the absence of a literal copy. The compose
-// files cannot execute anything at parse time, so they must restate — and this is what holds the
-// restatement to the declaration.
+// stack.sh no longer restates the list at all: it reads "--print-interface-host" at
+// startup, so it cannot drift and there is nothing to assert but the absence of a
+// literal copy.
 func TestKafkaProvisionScript_HandsOffEverySupportedSetting(t *testing.T) {
 	declared := kafkaProvisionInterface(t)
 
@@ -1012,9 +886,9 @@ func TestKafkaProvisionScript_HandsOffEverySupportedSetting(t *testing.T) {
 				}
 			}
 
-			// EQUALITY, in both directions. A missing name is a setting silently lost; an
-			// EXTRA name is a setting compose believes it is passing and the script never
-			// reads, which is just as misleading to whoever maintains the .env.
+			// EQUALITY, in both directions. A missing name is a setting silently lost; an EXTRA
+			// name is a setting compose believes it is passing and the script never reads, which
+			// is just as misleading to whoever maintains the .env.
 			assert.ElementsMatchf(t, declared, set,
 				"%s: kafka-init's environment must be exactly the interface "+
 					"'scripts/kafka-provision.sh --print-interface' declares. A name the script "+
@@ -1060,10 +934,10 @@ func TestKafkaProvisionScript_HandsOffEverySupportedSetting(t *testing.T) {
 			"the retired flag must not be forwarded anywhere")
 
 		// It is READ in exactly one place — the retired-variable refusal — and nowhere else.
-		// Two variables used to gate different halves of one decision: one skipped the
-		// producer's VALIDATION and the other skipped the broker MUTATION, and the forwarding
-		// was split the same way, so neither entry point could express "skip the producer"
-		// completely and each half looked like a bug in the other.
+		// Two variables gating different halves of one decision — one skipping the producer's
+		// VALIDATION, the other the broker MUTATION, with the forwarding split the same way —
+		// leave neither entry point able to express "skip the producer" completely, and each
+		// half then looks like a bug in the other.
 		assert.Contains(t, script, `"KAFKA_SKIP_PRODUCER_PRINCIPAL=KAFKA_SKIP_PRODUCER"`,
 			"the retired name must be declared as retired, with its replacement, so a stack still "+
 				"setting it is told rather than silently losing the skip it asked for")
@@ -1112,31 +986,28 @@ func TestCompose_PassesTheProducerIdentityToProvisioning(t *testing.T) {
 	}
 }
 
-// TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt closes the gap between an
-// instruction and the deployments it is given to.
+// TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt closes the gap between
+// an instruction and the deployments it is given to.
 //
 // The event pipeline's per-event diagnostics are emitted at DEBUG on purpose — the
-// successful-publish lines in the relay and the publisher, the metrics collector's per-tick
-// summary, and the notice that a consumer-lag series has been retired — because at the 500
-// events per second this pipeline targets, a line per published event saying "it worked" is
-// volume rather than observability. .env.example therefore tells an operator to raise the
-// level to investigate event delivery, and docs/metrics.md repeats it.
+// successful-publish lines in the relay and the publisher, the metrics collector's
+// per-tick summary, and the notice that a consumer-lag series has been retired —
+// because at the 500 events per second this pipeline targets, a line per published
+// event saying "it worked" is volume rather than observability. .env.example therefore
+// tells an operator to raise the level to investigate event delivery, and
+// docs/metrics.md repeats it.
 //
-// That instruction is only true where the variable actually reaches the process. It reached a
-// binary started by hand and NOTHING ELSE: no compose service forwarded it and no Deployment
-// projected it, so an operator following the documentation on the two deployments Blnk ships
-// changed the level and saw no additional line, with nothing to explain why. The failure is
-// silent in both directions — the pipeline looks quiet and the setting looks ineffective.
+// That instruction is only true where the variable actually reaches the process.
 //
-// Every surface is asserted here rather than one per file so the four projections cannot drift
-// apart: a key added to the compose files and forgotten in the manifests leaves the same gap
-// on the deployment that is hardest to debug.
+// Every surface is asserted here rather than one per file so the four projections
+// cannot drift apart: a key added to the compose files and forgotten in the manifests
+// leaves the same gap on the deployment that is hardest to debug.
 func TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt(t *testing.T) {
 	const variable = "BLNK_LOG_LEVEL"
 
-	// The template advertises it. This is the claim the projections below have to honour, so
-	// it is asserted rather than assumed: were the key ever removed from the template, the
-	// rest of this test would be enforcing a contract nobody had published.
+	// The template advertises it. This is the claim the projections below have to honour,
+	// so it is asserted rather than assumed: were the key ever removed from the template,
+	// the rest of this test would be enforcing a contract nobody had published.
 	assert.Containsf(t, readRepoFile(t, ".env.example"), variable+"=",
 		".env.example must declare %s: it is where the instruction to raise the level for an "+
 			"event-delivery investigation is published", variable)
@@ -1153,10 +1024,10 @@ func TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt(t *testing.T)
 						"compose stack — which is the deployment an operator is most likely to be "+
 						"debugging", file, service, variable)
 
-				// Compose's PASS-THROUGH form: a key with no value copies the variable when it
-				// is set and leaves it ENTIRELY ABSENT when it is not. `${NAME:-}` would set an
-				// empty string instead, which is the shape that silently defeats the
-				// BLNK_-prefixed alias block this key belongs to.
+				// Compose's PASS-THROUGH form: a key with no value copies the variable when it is
+				// set and leaves it ENTIRELY ABSENT when it is not. `${NAME:-}` would set an empty
+				// string instead, which is the shape that silently defeats the BLNK_-prefixed alias
+				// block this key belongs to.
 				assert.Emptyf(t, toStringValue(value),
 					"%s: %s must use compose's pass-through form — the key with nothing after the "+
 						"colon — so an unset variable is absent from the container rather than "+
@@ -1195,11 +1066,6 @@ func TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt(t *testing.T)
 }
 
 // deploymentEnvConfigMapKey returns one Deployment env entry's configMapKeyRef.
-//
-// It walks the parsed manifest rather than grepping because the property is structural: the
-// entry has to be a valueFrom.configMapKeyRef, and a `value:` carrying a literal — which a
-// grep for the name would accept — would hard-code the level into the manifest and take a
-// rollout to change either way.
 //
 // Parameters:
 //   - t *testing.T: for the fatal on a manifest that does not have the expected shape.
@@ -1253,12 +1119,8 @@ func deploymentEnvConfigMapKey(
 }
 
 // ---------------------------------------------------------------------------
-// The production broker workload
-//
-// Both assertions below cover failures that a `kubectl apply` reports as SUCCESS. The
-// manifest is accepted, the objects are created, and what goes wrong goes wrong minutes
-// later inside a container or not at all until a Kafka upgrade — so neither is catchable by
-// review of a diff or by any dry run, and each is asserted here instead.
+// The production broker workload. Both assertions below cover failures that a `kubectl
+// apply` reports as SUCCESS.
 // ---------------------------------------------------------------------------
 
 // kafkaStatefulSet returns the parsed broker StatefulSet.
@@ -1297,10 +1159,8 @@ func kafkaBootstrapScript(t *testing.T) string {
 // assertValidKafkaClusterID holds a value to what a Kafka cluster ID actually is.
 //
 // It is the base64url encoding of a 16-byte UUID: exactly 22 characters from
-// [A-Za-z0-9_-], which is what `kafka-storage random-uuid` emits and what Uuid.fromString
-// accepts — it rejects anything longer than 22 outright. Kafka's two reserved IDs are
-// excluded as well, because a cluster claiming the zero UUID or the metadata topic ID is
-// not a cluster anyone should be running.
+// [A-Za-z0-9_-], which is what `kafka-storage random-uuid` emits and what
+// Uuid.fromString accepts — it rejects anything longer than 22 outright.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -1333,20 +1193,8 @@ func assertValidKafkaClusterID(t *testing.T, source, id string) {
 // TestKafkaStatefulSet_ComesUpInParallelBecauseOrderedReadyDeadlocksAQuorum covers a
 // permanent cold-start deadlock that reports itself as a slow broker.
 //
-// Three combined broker+controller replicas are all KRaft voters, so committing metadata
-// needs 2 of 3. Readiness is an authenticated, authorized `kafka-topics --list`, which
-// cannot answer until the quorum has elected a leader. OrderedReady creates pod N+1 only
-// once pod N is Ready. So kafka-0 waits for a quorum that needs kafka-1, and Kubernetes will
-// not create kafka-1 until kafka-0 is Ready.
-//
-// Nothing breaks the cycle on its own: a failing readiness probe does not restart a pod, the
-// startup probe is a TCP check that passes regardless, and no timeout applies. The set sits
-// at 1/3 for ever.
-//
-// The policy is asserted together with the two facts that make it necessary, so the
-// assertion cannot outlive its reason: were the set ever reduced to a single replica, or its
-// readiness reduced to something that does not need the quorum, this test says so instead of
-// enforcing a policy nobody can explain.
+// Three combined broker+controller replicas are all KRaft voters, so committing
+// metadata needs 2 of 3.
 func TestKafkaStatefulSet_ComesUpInParallelBecauseOrderedReadyDeadlocksAQuorum(t *testing.T) {
 	spec, ok := kafkaStatefulSet(t)["spec"].(map[string]interface{})
 	require.True(t, ok, "kafka-statefulset.yaml must declare a spec")
@@ -1394,20 +1242,16 @@ func TestKafkaStatefulSet_ComesUpInParallelBecauseOrderedReadyDeadlocksAQuorum(t
 		"the readiness check must authenticate, which is what makes it depend on the quorum")
 }
 
-// TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID covers the one step in this
-// deployment that cannot be corrected afterwards.
+// TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID covers the one step in
+// this deployment that cannot be corrected afterwards.
 //
 // The cluster ID is written into meta.properties, and a broker refuses a log whose ID
-// disagrees with its configuration — so a wrong value is fixed by destroying the volume. The
-// manifest once carried a 26-character fallback, which is not a cluster ID at all: it
-// exceeds the 22 characters Uuid.fromString accepts and decodes to 19 bytes rather than 16.
-// apache/kafka 3.9 formatted with it anyway and the broker started, which is what made the
-// value dangerous rather than harmless — it would have survived until something parsed it as
-// a UUID, with every volume already carrying it.
-//
-// So: no fallback in the format command, the shape enforced before the format runs, and any
-// value actually configured — in the ConfigMap or in the compose files — held to the same
-// shape here.
+// disagrees with its configuration — so a wrong value is fixed by destroying the
+// volume. The manifest once carried a 26-character fallback, which is not a cluster ID
+// at all: it exceeds the 22 characters Uuid.fromString accepts and decodes to 19 bytes
+// rather than 16. apache/kafka 3.9 formatted with it anyway and the broker started,
+// which is what made the value dangerous rather than harmless — it would have survived
+// until something parsed it as a UUID, with every volume already carrying it.
 func TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID(t *testing.T) {
 	script := kafkaBootstrapScript(t)
 
@@ -1417,10 +1261,7 @@ func TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID(t *testing.T) {
 
 		// No DEFAULTING expansion anywhere in the script. `${KAFKA_CLUSTER_ID:-}` with an
 		// empty default is fine and is what the emptiness check below uses — under `set -u`
-		// it is how an unset variable is tested without aborting. `${KAFKA_CLUSTER_ID:-X}`
-		// for any non-empty X is the defect: it formats the volume with an ID nobody chose,
-		// and every deployment that left it unset would share that ID, which defeats the one
-		// check Kafka does make — a broker refusing to join a cluster whose ID is not its own.
+		// it is how an unset variable is tested without aborting.
 		const expansion = "${KAFKA_CLUSTER_ID:-"
 		for offset := 0; ; {
 			index := strings.Index(script[offset:], expansion)
@@ -1497,54 +1338,28 @@ func TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID(t *testing.T) {
 	})
 }
 
-// measuredEventOutboxRowBytes is the storage cost of one blnk.event_outbox row, MEASURED.
+// measuredEventOutboxRowBytes is the storage cost of one blnk.event_outbox row,
+// MEASURED, for a FULLY POPULATED transaction.applied body — the shape that has to fit.
 //
-// 2,372 bytes: heap 2,048 including page overhead, plus 323 across all seventeen indexes, with
-// no TOAST because the tuple is 1,888 bytes and the threshold is 2 KiB. Taken on PostgreSQL 16
-// over 500,000 rows in a table created with `CREATE TABLE ... (LIKE blnk.event_outbox INCLUDING
-// ALL)`, shaped like a real transaction.applied event read out of a running deployment. Roughly
-// 88% of it is the event body, held three times over — the queryable JSONB projection, the
-// byte-exact webhook body and the byte-exact envelope, each with its reason stated at the column
-// in sql/1781248800.sql.
-//
-// It is a CONSTANT here rather than a comment because the assertions below are arithmetic on it,
-// and the whole substance of PERF-C03 is that a retention period and a volume size were chosen
-// without this number between them.
-const measuredEventOutboxRowBytes = 2372
+// 3,619 bytes on disk: heap 2,048 including page overhead, TOAST 1,194, and 377 across
+// all seventeen indexes.
+const measuredEventOutboxRowBytes = 3619
 
 // eventRetentionBloatFactor is the multiplier for dead tuples and autovacuum headroom.
 //
-// Every row is UPDATEd at least twice on its way to a terminal state — claimed, then dispatched —
-// and `status` is indexed, so neither update can be HOT: each leaves a dead tuple and rewrites
-// index entries. 1.5 is a planning allowance, not padding.
+// Every row is UPDATEd at least twice on its way to a terminal state — claimed, then
+// dispatched — and `status` is indexed, so neither update can be HOT: each leaves a
+// dead tuple and rewrites index entries. 1.5 is a planning allowance, not padding.
 const eventRetentionBloatFactor = 1.5
 
-// validatedEventsPerSecond is the throughput acceptance criterion V-1 states the pipeline is
-// validated at, and therefore the rate every capacity number in the manifests must hold at.
+// validatedEventsPerSecond is the throughput the pipeline is load-tested at, and therefore the
+// rate every capacity number in the manifests must hold at.
 const validatedEventsPerSecond = 500
 
-// TestManifests_RetentionStorageAndBrokerRetentionAgree is the PERF-C03 guard, and it exists
-// because nothing was checking three numbers that have to be chosen together.
-//
-// # What went wrong, and why no single file was obviously incorrect
-//
-// blnk-config.yaml shipped ninety days of event-outbox retention, reasoned entirely from data
-// protection and perfectly defensible on that basis alone. postgres-statefulset.yaml shipped a
-// 10Gi volume, which is an unremarkable size for a reference manifest. kafka-statefulset.yaml
-// documented, at its own log.retention.hours, that broker retention must stay LONGER than the
-// outbox's — and asserted that nothing was in tension because retention "ships disabled".
-//
-// Every one of those three statements read correctly on its own. Together they were: ninety days
-// at the validated rate is 8.4 TiB against a 10Gi volume, 858x apart and on the volume the
-// LEDGER lives on; and ninety days is nearly thirteen times the broker's seven, so the coupling
-// the third file documented was violated by the first.
-//
-// # Why the assertions are arithmetic rather than fixed numbers
-//
-// Pinning "3" and "600Gi" would fail the moment someone legitimately changed either, and would
-// teach them nothing about what else had to move. These assert the RELATIONSHIPS, so a future
-// change to any one number is accepted exactly when the others were changed with it — and the
-// failure message says which one is short and by how much.
+// TestManifests_RetentionStorageAndBrokerRetentionAgree holds three manifest numbers
+// that have to be chosen together: the event-outbox retention period in
+// blnk-config.yaml, the pg-data volume in postgres-statefulset.yaml, and
+// log.retention.hours in kafka-statefulset.yaml.
 func TestManifests_RetentionStorageAndBrokerRetentionAgree(t *testing.T) {
 	retentionDays := manifestRetentionDays(t)
 	if retentionDays == 0 {
@@ -1585,10 +1400,10 @@ func TestManifests_RetentionStorageAndBrokerRetentionAgree(t *testing.T) {
 			steadyState/(1<<30), perDay/(1<<30), retentionDays, eventRetentionBloatFactor,
 			measuredEventOutboxRowBytes)
 
-		// AND WITH ROOM FOR EVERYTHING ELSE ON IT. The ledger's own tables are never purged, so
-		// their growth is unbounded and no assertion can size them — but a volume that fits the
-		// outbox and nothing else is a volume that fills, so a margin is required rather than
-		// merely advisable. A fifth is the smallest share that is honestly an allowance.
+		// AND WITH ROOM FOR EVERYTHING ELSE ON IT. The ledger's own tables are never purged,
+		// so their growth is unbounded and no assertion can size them — but a volume that
+		// fits the outbox and nothing else is a volume that fills, so a margin is required
+		// rather than merely advisable.
 		assert.Greaterf(t, float64(volumeBytes)*0.8, steadyState,
 			"the outbox's %.1f GiB steady state must leave at least a fifth of the %.1f GiB volume "+
 				"for the ledger's own tables, WAL up to max_wal_size, and the filesystem reserve",
@@ -1619,30 +1434,11 @@ func TestManifests_RetentionStorageAndBrokerRetentionAgree(t *testing.T) {
 	})
 }
 
-// TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate pins the broker's storage claims
-// to the workload that adopts them (AAP-M03).
-//
-// # The failure this catches, and why nothing else catches it
+// TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate pins the broker's storage
+// claims to the workload that adopts them.
 //
 // kafka-data-persistentvolumeclaim.yaml pre-provisions the three claims the StatefulSet
-// would otherwise create for itself. Adoption is by NAME and nothing else: Kubernetes
-// looks for `<template>-<set>-<ordinal>`, and if it finds a claim there it uses it AS IT
-// FINDS IT. It does not reconcile the claim against the template.
-//
-// That makes every property below a silent-divergence hazard rather than a validation
-// error. A claim requesting less than the template is adopted at the smaller size, and the
-// broker starts, and runs, and fills a disk that the retention arithmetic said had room. A
-// renamed set or template orphans all three: new claims appear under the new names and
-// these sit unbound, which is exactly the idle-volume defect that had this file deleted
-// once already. A missing ordinal after a replica increase leaves one broker provisioned
-// from the template and its siblings from this file, differing in whatever the two
-// disagree on. `kubectl apply` reports success in all four cases.
-//
-// So the assertions DERIVE what they expect from the StatefulSet rather than restating it.
-// Nothing here is a literal that a geometry change would have to remember to update — the
-// count comes from `replicas`, the names from the template name and the set name, the size
-// and access mode from the template itself. Change the workload and this test follows it;
-// change one side only and it fails.
+// would otherwise create for itself.
 func TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate(t *testing.T) {
 	statefulSet := kafkaStatefulSet(t)
 
@@ -1765,23 +1561,10 @@ func TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate(t *testing.T) {
 	})
 }
 
-// TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor pins the broker volume to the
-// partition count the application actually creates (DOC-m02).
+// TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor pins the broker volume to
+// the partition count the application actually creates.
 //
-// # Why the arithmetic is asserted and the prose is asserted with it
-//
-// The volume size, `log.retention.bytes`, the topic count and the partition count are one
-// derivation split across three files: the category list lives in Go, KAFKA_MIN_PARTITIONS
-// in the ConfigMap, and the retention bytes and volume size in the StatefulSet. Nothing
-// links them, so the manifests once documented a cluster of 10 topics and 60 partitions on
-// a 200Gi volume while shipping 8 topics and 48 on 160Gi. The VALUE was right and the
-// justification was wrong, which is the durable kind of wrong: an operator sizing the next
-// change reads the prose, and every number in it was off.
-//
-// The first subtest derives the geometry from the code and asserts the volume holds it. The
-// second asserts the manifests' own prose states the derived numbers — unusual for a test,
-// and correct here, because a stale explanation beside a correct value is precisely the
-// defect and there is no other mechanism that would ever notice it.
+// The first subtest derives the geometry from the code and asserts the volume holds it.
 func TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor(t *testing.T) {
 	categories := model.AllEventCategories()
 	require.NotEmpty(t, categories, "the event catalogue must resolve at least one category")
@@ -1876,9 +1659,6 @@ func TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor(t *testing.T) {
 
 // kafkaBrokerRetentionBytes extracts log.retention.bytes from the broker's rendered
 // server.properties in kafka-statefulset.yaml.
-//
-// The setting lives inside a shell heredoc rather than in a structured field, so it is read
-// as text — the same approach manifestBrokerRetentionHours takes for log.retention.hours.
 func kafkaBrokerRetentionBytes(t *testing.T) int64 {
 	t.Helper()
 
@@ -1978,10 +1758,6 @@ func manifestRetentionDays(t *testing.T) int {
 
 // manifestBrokerRetentionHours extracts log.retention.hours from the broker's rendered
 // server.properties in kafka-statefulset.yaml.
-//
-// It is read out of the manifest text rather than from a structured field because that is where
-// it lives — the property block is a shell heredoc inside an init container — and reading it
-// from anywhere else would let the two drift.
 func manifestBrokerRetentionHours(t *testing.T) int {
 	t.Helper()
 
@@ -2037,10 +1813,6 @@ func manifestPostgresVolumeBytes(t *testing.T) int64 {
 }
 
 // parseKubernetesQuantityBytes converts a Kubernetes storage quantity to bytes.
-//
-// Only the binary suffixes are handled, and an unrecognised one FAILS rather than being read as
-// bytes: silently treating "600G" as 600 bytes would make the capacity assertions above pass on a
-// manifest that provisions nothing, which is the opposite of what they are for.
 func parseKubernetesQuantityBytes(t *testing.T, quantity string) int64 {
 	t.Helper()
 
@@ -2085,36 +1857,10 @@ const makefilePath = "makefile"
 // relayTargetName is the target that starts the role hosting the event outbox relay.
 const relayTargetName = "run_server_relay"
 
-// TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication pins the boundary between what
-// make may decide and what only the application can.
+// TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication pins the boundary
+// between what make may decide and what only the application can.
 //
-// # What make legitimately does
-//
-// It sources .env with the caller's environment replayed on top, because `./stack.sh --init`
-// writes KAFKA_BROKERS into a mode-0600 .env whose assignments are exported into nobody's shell —
-// so a target that read only the process environment refused the operator who had just run the
-// setup instruction it recommends. That layering is make's business and stays.
-//
-// # What it must NOT do
-//
-// Decide whether brokers are configured. The recipe used to resolve the list itself, and a shell
-// reimplementation of the loader's resolution cannot agree with it — it did not, in three ways,
-// every one of which made the target ANNOUNCE a relay that would not start:
-//
-//	it took the first non-empty of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and BLNK_KAFKA_BROKERS
-//	in that order, while the loader ranks them the other way at the top — BLNK_KAFKA_BROKERS wins,
-//	then KAFKA_BROKERS, then the derived key, then the file (config.eventStreamingEnvOverride);
-//
-//	it tested the config file with `grep '"brokers"'`, which reads `"brokers": []` as configured;
-//
-//	and no first-non-empty scan can express that an explicitly EMPTY higher-precedence name CLEARS
-//	what a lower one supplied — `BLNK_KAFKA_BROKERS= KAFKA_BROKERS=host:9092` is no brokers to the
-//	application and a configured deployment to the scan.
-//
-// The replacement is `--require-kafka`, which asks the question after the same load, of the same
-// struct, with the same predicate startEventRelay gates on. This test asserts the shell
-// resolution is GONE rather than merely that the flag is present, because a target that did both
-// would still be able to refuse a deployment the application would have admitted.
+// Decide whether brokers are configured.
 func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T) {
 	makefile := readRepoFile(t, makefilePath)
 
@@ -2141,15 +1887,10 @@ func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T)
 		"%s: the %s recipe must exec the server with --require-kafka, so the APPLICATION decides "+
 			"whether brokers are configured", makefilePath, relayTargetName)
 
-	// THE SHELL RESOLUTION, in every form it took. Each of these RANKS or TESTS the sources —
-	// picks a winner, reads a value, or inspects the config file — and ranking is the application's
-	// job, done after the same load, of the same struct, with the same predicate.
-	//
-	// What is forbidden is deciding, not mentioning. Scoping .env's defaults by SET-NESS (below)
-	// names the aliases without ordering them: it removes contributions the caller did not ask
-	// for and then lets the loader rank whatever is left, so it cannot disagree with the loader
-	// about which one wins — it makes no claim about that at all. Announcing a winner is the form
-	// that can disagree, and the announcement assertion further down is what forbids it.
+	// THE SHELL RESOLUTION, in every form it took. Each of these RANKS or TESTS the
+	// sources — picks a winner, reads a value, or inspects the config file — and ranking
+	// is the application's job, done after the same load, of the same struct, with the
+	// same predicate.
 	for _, resolution := range []string{
 		`grep -q '"brokers"'`,
 		"caller_brokers",
@@ -2164,11 +1905,10 @@ func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T)
 			makefilePath, relayTargetName, resolution)
 	}
 
-	// AND IT MUST NOT NAME A SOURCE IN ITS OUTPUT. This is the assertion that actually closes the
-	// finding: the recipe announced "brokers from KAFKA_BROKERS" while the application resolved
-	// BLNK_KAFKA_BROKERS, so an operator was told about a deployment other than the one that came
-	// up. The application's own refusal names every source it read, which is the only description
-	// that cannot drift from the resolution.
+	// AND IT MUST NOT NAME A SOURCE IN ITS OUTPUT. This is the assertion that actually
+	// matters: a recipe announcing "brokers from KAFKA_BROKERS" while the application
+	// resolves BLNK_KAFKA_BROKERS tells an operator about a deployment other than the one
+	// that came up.
 	for _, line := range strings.Split(recipe, "\n") {
 		if !strings.Contains(line, "echo") {
 			continue
@@ -2183,13 +1923,11 @@ func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T)
 		}
 	}
 
-	// THE SET-NESS SCOPING STAYS, because it fixes the defect the layering alone leaves open. With
-	// .env sourced under the caller's environment, an alias present only in .env survives the
-	// replay — so `.env` declaring BLNK_KAFKA_BROKERS outranks a caller who ran
-	// `KAFKA_BROKERS=host:9092 make run_relay`, and a DEFAULT file outvotes an explicit override.
-	// A caller who named any alias therefore suppresses the ones they did not name. Note what this
-	// does NOT do: it never chooses between the caller's own aliases, which is the loader's to
-	// decide and is left entirely to it.
+	// THE SET-NESS SCOPING STAYS, because it fixes the defect the layering alone leaves
+	// open. With .env sourced under the caller's environment, an alias present only in
+	// .env survives the replay — so `.env` declaring BLNK_KAFKA_BROKERS outranks a caller
+	// who ran `KAFKA_BROKERS=host:9092 make run_relay`, and a DEFAULT file outvotes an
+	// explicit override.
 	for _, scoping := range []string{
 		`prefixed_set="$${BLNK_KAFKA_BROKERS+set}"`,
 		`bare_set="$${KAFKA_BROKERS+set}"`,
@@ -2215,13 +1953,11 @@ func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T)
 				"refuses", makefilePath, relayTargetName, layering)
 	}
 
-	// The exec must be in the SAME shell as the sourcing. Each LINE of a recipe is its own shell,
-	// so an exec standing on its own would run with make's environment and see none of .env — the
-	// application would then resolve no brokers and refuse a correctly configured deployment,
-	// which is the same silent-failure shape from the other direction.
-	//
-	// A continuation line is also tab-indented, so what distinguishes the two is whether the
-	// PRECEDING line ends in a backslash. That is what is asserted.
+	// The exec must be in the SAME shell as the sourcing. Each LINE of a recipe is its own
+	// shell, so an exec standing on its own would run with make's environment and see none
+	// of .env — the application would then resolve no brokers and refuse a correctly
+	// configured deployment, which is the same silent-failure shape from the other
+	// direction.
 	execAt := strings.Index(recipe, "exec ./${PROJECT}")
 	require.Positivef(t, execAt, "%s: the %s recipe must exec the server", makefilePath, relayTargetName)
 	assert.Truef(t, strings.HasSuffix(recipe[:execAt], "\\\n\t"),
@@ -2230,37 +1966,25 @@ func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T)
 			"nothing that was sourced", makefilePath)
 }
 
-// TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv pins the mechanism by which
-// --init fills .env, because the mechanism was the defect.
+// TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv pins the mechanism by
+// which --init fills .env, because the mechanism was the defect.
 //
-// stack.sh generates and writes three credentials: the PostgreSQL password, the Kafka
-// administrative password whose principal is in the broker's super.users, and the producer
-// password. Each was written with `sed -i "s|{KEY}|${value}|g" .env`, which is wrong in three
-// independent ways, and this test pins the fix for each.
+//  1. SECRECY. `sed` is a real process, and on Linux /proc/<pid>/cmdline is mode 444 —
+//     readable by every account on the host — while /proc/<pid>/environ is mode 400,
+//     readable only by the owner.
 //
-//  1. SECRECY. `sed` is a real process, and on Linux /proc/<pid>/cmdline is mode 444 — readable
-//     by every account on the host — while /proc/<pid>/environ is mode 400, readable only by the
-//     owner. The old form published all three credentials to any local user who ran `ps` during
-//     the fraction of a second sed lived. It did so inside a function whose own comment promises
-//     that values are reported "by KEY NAME and never by value".
+//  2. CORRECTNESS. A value reaching a sed replacement is not literal: `&` means the
+//     whole match and `\1` a backreference.
 //
-//  2. CORRECTNESS. A value reaching a sed replacement is not literal: `&` means the whole match
-//     and `\1` a backreference. A generated secret containing either was written altered, and the
-//     service then failed to authenticate with a credential nobody had mistyped.
-//
-//  3. PORTABILITY. `sed -i` with no suffix is a GNU extension. BSD and macOS sed read the next
-//     argument as a backup suffix, so on those platforms the form consumed the filename as a
-//     suffix and edited nothing.
-//
-// The replacement is write_env_substitution: the value crosses into awk through ENVIRON, the
-// substitution is a literal index()/substr() splice, and the file is replaced by an atomic
-// rename of a temporary file created under umask 077.
+//  3. PORTABILITY. `sed -i` with no suffix is a GNU extension. BSD and macOS sed read
+//     the next argument as a backup suffix, so on those platforms the form consumed the
+//     filename as a suffix and edited nothing.
 func TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv(t *testing.T) {
 	stack := readRepoFile(t, "stack.sh")
 
-	// NO EXECUTABLE `sed -i` ANYWHERE. Comments explaining the removal are expected and are
-	// excluded by requiring the line not to be a comment, so the prose that documents this fix
-	// does not defeat the assertion that enforces it.
+	// NO EXECUTABLE `sed -i` ANYWHERE. Comments explaining the removal are expected and
+	// are excluded by requiring the line not to be a comment, so the prose that documents
+	// this fix does not defeat the assertion that enforces it.
 	for i, line := range strings.Split(stack, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
@@ -2303,17 +2027,16 @@ func TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv(t *testing.T) 
 		"the file must be replaced by a rename, which is atomic: a concurrent reader sees the "+
 			"old content or the new, never a partial write")
 
-	// EVERY SECRET GOES THROUGH THE ONE WRITER. The PostgreSQL password used to bypass
-	// set_env_value with its own bare sed -i, so the fix applied to the shared writer did not
-	// reach it.
+	// EVERY SECRET GOES THROUGH THE ONE WRITER. A password written with its own bare sed -i
+	// bypasses set_env_value, so nothing the shared writer guarantees reaches it.
 	assert.Contains(t, stack, `set_env_value "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD"`,
 		"the PostgreSQL password must be written through set_env_value like every other "+
 			"credential, so there is one place where the writing mechanism is correct")
 
-	// THE KEY IS VALIDATED BEFORE A BRANCH IS CHOSEN, which is what covers the append arm. A
-	// check living only inside write_env_substitution left `set_env_value` free to append a
-	// malformed key — including one containing a newline, which would inject whole lines into a
-	// file full of credentials — and to report it as a success.
+	// THE KEY IS VALIDATED BEFORE A BRANCH IS CHOSEN, which is what covers the append arm.
+	// A check living only inside write_env_substitution left `set_env_value` free to
+	// append a malformed key — including one containing a newline, which would inject
+	// whole lines into a file full of credentials — and to report it as a success.
 	require.Contains(t, stack, "require_env_key_name() {",
 		"stack.sh must define a key-name check")
 	setEnvStart := strings.Index(stack, "set_env_value() {")
@@ -2331,19 +2054,11 @@ func TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv(t *testing.T) 
 		"the key must be validated BEFORE the branch is chosen, so the append arm is covered too")
 }
 
-// TestStackScript_ReadsFileModesPortably pins the loss-free removal of a dead security control.
+// TestStackScript_ReadsFileModesPortably pins the loss-free removal of a dead security
+// control.
 //
-// Two implementations of one control stood in this script: enforce_env_permissions, which is
-// called from three places, and require_private_env_file, which was defined and never called.
-// Two competing copies is worse than one, because a reader cannot tell which is authoritative and
-// a fix applied to the wrong copy looks applied while changing nothing.
-//
-// The dead one was deleted — but it had one genuine advantage over the live one: it tried BSD's
-// `stat -f '%Lp'` as well as GNU's `stat -c '%a'`. Without that, enforce_env_permissions could
-// not read a mode on macOS, fell into its unverifiable branch on every call, and re-chmod'd a
-// file that was already correct while announcing a permission change that had not happened.
-// So the advantage was carried across first. This test pins both halves: the duplicate is gone,
-// and what made it worth keeping is not.
+// The dead one was deleted — but it had one genuine advantage over the live one: it
+// tried BSD's `stat -f '%Lp'` as well as GNU's `stat -c '%a'`.
 func TestStackScript_ReadsFileModesPortably(t *testing.T) {
 	stack := readRepoFile(t, "stack.sh")
 
@@ -2372,36 +2087,13 @@ func copyIntoSandbox(t *testing.T, from, to string, mode os.FileMode) {
 // runStackScript executes the real stack.sh in a disposable sandbox with every external
 // command it can reach replaced by a recording stub, and returns what happened.
 //
-// # Why the script is EXECUTED rather than read
-//
-// The property under test is a control-flow OUTCOME — which case arm a word lands on, and
-// what exit status that arm leaves — and no amount of text matching can establish it. The
-// arm being guarded here used to read `* ) help`, so `./stack.sh --buld` printed the usage
-// banner and exited 0: nothing was started, nothing was torn down, and every caller was told
-// it had worked. A grep for the word `exit` in that file finds thirty of them and says
-// nothing about whether a typo reaches one.
-//
-// # Why it is safe to run
-//
-// The sandbox is a temporary directory holding a copy of stack.sh, a copy of .env.example
-// and a copy of the compose projection, so every relative path the script resolves —
-// `.env`, `.env.example`, `scripts/kafka-provision.sh`, `${COMPOSE_FILE}` — lands inside it
-// and never in the repository. The environment is built from scratch rather than inherited,
-// so an ambient .env, a developer's KAFKA_BROKERS or an exported COMPOSE_CL cannot change
-// what is being tested. PATH puts the stub directory first, and the only names the script
-// reaches for that could touch a real host — `docker` and the provisioning script — are
-// both stubs that record their arguments and do nothing.
-//
 // The stubs are deliberately PERMISSIVE: docker exits 0 for everything and answers the
-// version probe with a Compose new enough to satisfy COMPOSE_MINIMUM_VERSION. That matters,
-// because a stub that failed would let a dispatch test pass for the wrong reason — the run
-// would abort before reaching the arm under test, and `exit 1` would look like the
-// unknown-argument refusal.
+// version probe with a Compose new enough to satisfy COMPOSE_MINIMUM_VERSION.
 //
 // Parameters:
 //   - t *testing.T: owns the sandbox's lifetime.
-//   - argv []string: the arguments to invoke with. An empty slice is the bare invocation,
-//     which is a case in its own right.
+//   - argv []string: the arguments to invoke with. An empty slice is the bare
+//     invocation, which is a case in its own right.
 //
 // Returns:
 //   - stackDispatchOutcome: the exit status, the operator-visible output, the recorded
@@ -2420,8 +2112,8 @@ func runStackScript(t *testing.T, argv []string) stackDispatchOutcome {
 	copyIntoSandbox(t, filepath.Join(root, "stack.sh"), filepath.Join(sandbox, "stack.sh"), 0o700)
 	// .env.example and the compose projection are present so that a REGRESSION IS VISIBLE.
 	// Without .env.example an accidental fall-through into the --init arm would fail for a
-	// missing template instead of creating a .env, and "no .env was created" would hold for
-	// the wrong reason.
+	// missing template instead of creating a .env, and "no .env was created" would hold
+	// for the wrong reason.
 	copyIntoSandbox(t, filepath.Join(root, ".env.example"), filepath.Join(sandbox, ".env.example"), 0o644)
 	copyIntoSandbox(t,
 		filepath.Join(root, "docker-compose.yaml"),
@@ -2435,9 +2127,9 @@ func runStackScript(t *testing.T, argv []string) stackDispatchOutcome {
 		"for arg in \"$@\"; do printf ' %s' \"$arg\" >> " + shellQuote(log) + "; done\n" +
 		"printf '\\n' >> " + shellQuote(log) + "\n"
 
-	// docker: records, answers the Compose version probe with a version above the floor, and
-	// succeeds at everything else. `basename $0` is `docker`, so the recorded line reads as
-	// the command an operator would have typed.
+	// docker: records, answers the Compose version probe with a version above the floor,
+	// and succeeds at everything else. `basename $0` is `docker`, so the recorded line
+	// reads as the command an operator would have typed.
 	dockerStub := recorder +
 		"if [ \"${1:-}\" = compose ] && [ \"${2:-}\" = version ]\n" +
 		"then\n" +
@@ -2448,9 +2140,9 @@ func runStackScript(t *testing.T, argv []string) stackDispatchOutcome {
 	require.NoError(t,
 		os.WriteFile(filepath.Join(sandbox, "bin", "docker"), []byte(dockerStub), 0o700))
 
-	// The provisioning script: records, and answers --print-interface-host with a plausible
-	// variable list so resolve_kafka_provision_interface succeeds. Any OTHER invocation is a
-	// side effect, and the assertions below say so.
+	// The provisioning script: records, and answers --print-interface-host with a
+	// plausible variable list so resolve_kafka_provision_interface succeeds. Any OTHER
+	// invocation is a side effect, and the assertions below say so.
 	provisionStub := recorder +
 		"if [ \"${1:-}\" = --print-interface-host ]\n" +
 		"then\n" +
@@ -2467,8 +2159,8 @@ func runStackScript(t *testing.T, argv []string) stackDispatchOutcome {
 	command.Dir = sandbox
 	// Built from scratch rather than inherited. An ambient KAFKA_BROKERS, an exported
 	// COMPOSE_CL or a COMPOSE_PROFILES from the developer's shell would each change which
-	// branch the script takes, and the dispatcher's contract must hold without reference to
-	// any of them.
+	// branch the script takes, and the dispatcher's contract must hold without reference
+	// to any of them.
 	command.Env = []string{
 		"PATH=" + filepath.Join(sandbox, "bin") +
 			":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -2505,21 +2197,18 @@ func runStackScript(t *testing.T, argv []string) stackDispatchOutcome {
 
 // assertStackChangedNothing is the zero-side-effect half of the dispatch contract.
 //
-// "Nothing was started, stopped or changed" is a claim the script PRINTS, and a printed claim
-// is worth exactly as much as the check behind it. Three things are asserted, each of which
-// the sandbox is arranged to make observable:
+// "Nothing was started, stopped or changed" is a claim the script PRINTS, and a printed
+// claim is worth exactly as much as the check behind it. Three things are asserted,
+// each of which the sandbox is arranged to make observable:
 //
-//   - No Compose subcommand ran. The version probes are excluded because they are read-only
-//     and happen before any arm is chosen; anything else — `up`, `down`, `pull`, `ps` — is an
-//     action on the host.
-//   - The provisioning script was not RUN, only interrogated. `--print-interface-host` prints
-//     a variable list and exits; any other invocation creates topics, mints SCRAM credentials
-//     and rewrites ACLs.
-//   - No .env was created. The sandbox holds a .env.example precisely so that a fall-through
-//     into the --init arm would produce one.
-//
-// TestStackScript_TheDispatchHarnessCanSeeSideEffects proves all three are observable, so a
-// failure of this helper means the dispatcher acted rather than that the harness went blind.
+//   - No Compose subcommand ran. The version probes are excluded because they are
+//     read-only and happen before any arm is chosen; anything else — `up`, `down`,
+//     `pull`, `ps` — is an action on the host.
+//   - The provisioning script was not RUN, only interrogated. `--print-interface-host`
+//     prints a variable list and exits; any other invocation creates topics, mints
+//     SCRAM credentials and rewrites ACLs.
+//   - No .env was created. The sandbox holds a .env.example precisely so that a
+//     fall-through into the --init arm would produce one.
 func assertStackChangedNothing(t *testing.T, outcome stackDispatchOutcome) {
 	t.Helper()
 
@@ -2542,21 +2231,19 @@ func assertStackChangedNothing(t *testing.T, outcome stackDispatchOutcome) {
 			"and two Kafka credentials in it")
 }
 
-// TestStackScript_TheDispatchHarnessCanSeeSideEffects is the non-vacuity guard for the two
-// tests above, and it is not optional.
+// TestStackScript_TheDispatchHarnessCanSeeSideEffects is the non-vacuity guard for the
+// two tests above, and it is not optional.
 //
-// Every assertion in assertStackChangedNothing is an assertion that something did NOT happen,
-// and such an assertion passes just as readily against a harness that cannot see the thing at
-// all — a stub that was never on PATH, a log that was never written, a sandbox the script
-// never ran in. So the same harness is pointed at two subcommands whose side effects are not
-// in question, and required to observe them:
+// Every assertion in assertStackChangedNothing is an assertion that something did NOT
+// happen, and such an assertion passes just as readily against a harness that cannot
+// see the thing at all — a stub that was never on PATH, a log that was never written, a
+// sandbox the script never ran in. So the same harness is pointed at two subcommands
+// whose side effects are not in question, and required to observe them:
 //
-//   - `--down` must reach Compose. It is one line in the dispatcher and touches nothing else.
-//   - `--init` must create a .env. It is the one subcommand whose entire purpose is to write
-//     that file.
-//
-// If either of these stops being observed, the "changed nothing" assertions above have become
-// vacuous and this test is what says so.
+//   - `--down` must reach Compose. It is one line in the dispatcher and touches nothing
+//     else.
+//   - `--init` must create a .env. It is the one subcommand whose entire purpose is to
+//     write that file.
 func TestStackScript_TheDispatchHarnessCanSeeSideEffects(t *testing.T) {
 	t.Run("a teardown reaches Compose", func(t *testing.T) {
 		outcome := runStackScript(t, []string{"--down"})
@@ -2595,14 +2282,8 @@ func TestStackScript_TheDispatchHarnessCanSeeSideEffects(t *testing.T) {
 	})
 }
 
-// TestStackScript_TheUsageBannerSucceeds is the other half of MIN-12: the three invocations
+// TestStackScript_TheUsageBannerSucceeds is the other half of the three invocations
 // that ask for the banner must SUCCEED, and must equally change nothing.
-//
-// A bare invocation is read as a request for help, which is why the script's own comment
-// calls it out: a wrapper that runs `./stack.sh --help` to check the script is present must
-// not see a failure. Making the unknown-argument arm exit 1 is only correct if these three
-// stay at 0 — otherwise the fix trades a silent success for a spurious failure, and the
-// dispatcher would have to be read to know which.
 func TestStackScript_TheUsageBannerSucceeds(t *testing.T) {
 	requests := []struct {
 		name string
@@ -2615,8 +2296,8 @@ func TestStackScript_TheUsageBannerSucceeds(t *testing.T) {
 	}
 
 	// Every subcommand the banner advertises, so that a flag deleted from the dispatcher
-	// without being deleted from the banner — or the reverse — is caught here rather than by
-	// an operator following documentation into the unknown-argument arm.
+	// without being deleted from the banner — or the reverse — is caught here rather than
+	// by an operator following documentation into the unknown-argument arm.
 	advertised := []string{
 		"--pull, -p", "--up,-u", "--build,-b", "--down,-d",
 		"--purge", "--restart,-r", "--init,-i",
@@ -2649,31 +2330,17 @@ func TestStackScript_TheUsageBannerSucceeds(t *testing.T) {
 	}
 }
 
-// TestStackScript_AnUnrecognisedArgumentFailsAndChangesNothing is MIN-12, and it is the
+// TestStackScript_AnUnrecognisedArgumentFailsAndChangesNothing is the unrecognised-argument refusal, and it is the
 // executable half of a fix that until now existed only as a case arm and a comment.
 //
-// # The defect
+// The catch-all arm read `* ) help`, sharing the SUCCESS path with `--help`.
 //
-// The catch-all arm read `* ) help`, sharing the SUCCESS path with `--help`. So
-// `./stack.sh --buld` printed the usage banner and exited 0. Nothing was pulled, built,
-// started, stopped or purged, and the caller was told it had worked. A CI job or a
-// provisioning wrapper that mistyped a subcommand recorded success against a stack that had
-// never started — and every other failure in this script is loud: `--down` without an
-// environment file exits 1, a broker that never becomes healthy exits non-zero, a purge
-// without consent refuses. The typo was the sole silent one.
+// The fix is four lines of shell inside a `case`, which is exactly the kind of edit
+// that a later refactor merges back into the arm above it without anyone noticing.
 //
-// # Why this test exists
-//
-// The fix is four lines of shell inside a `case`, which is exactly the kind of edit that a
-// later refactor merges back into the arm above it without anyone noticing. The finding is
-// blunt about the consequence: "a typo can regress to green/no-op". So the contract is
-// pinned by running the script, on a sandbox where a side effect WOULD be observable, and
-// asserting all three halves of it — the status, the diagnostic that names the argument, and
-// the absence of any action.
-//
-// The typos are chosen to be the ones an operator actually makes: a transposed character, a
-// missing pair of dashes, the wrong case, a single-letter flag that was never defined, and a
-// value-looking word. Each one lands on the same arm, and each must fail.
+// The typos are chosen to be the ones an operator actually makes: a transposed
+// character, a missing pair of dashes, the wrong case, a single-letter flag that was
+// never defined, and a value-looking word.
 func TestStackScript_AnUnrecognisedArgumentFailsAndChangesNothing(t *testing.T) {
 	mistakes := []struct {
 		name string
@@ -2699,8 +2366,8 @@ func TestStackScript_AnUnrecognisedArgumentFailsAndChangesNothing(t *testing.T) 
 				mistake.argv, outcome.output)
 
 			// The argument is named back, because the mistake is usually one transposed
-			// character and an operator reading a wall of usage text does not always see
-			// which word of theirs was not understood.
+			// character and an operator reading a wall of usage text does not always see which
+			// word of theirs was not understood.
 			assert.Containsf(t, outcome.output, mistake.argv[0],
 				"the refusal must NAME the argument that was not understood; the usage banner "+
 					"alone leaves the operator to spot their own typo in it")
@@ -2740,11 +2407,7 @@ type stackDispatchOutcome struct {
 // something, discarding the two version probes resolve_compose_cl makes before any
 // subcommand runs.
 //
-// The distinction is the whole point of the dispatch tests. `docker compose version` is
-// read-only and unavoidable — it is how the script decides whether Compose is usable at all
-// — while `docker compose ... down` or `... up -d` changes the host. Filtering the probes
-// here rather than in each caller keeps "nothing was started, stopped or changed" a single
-// readable assertion.
+// The distinction is the whole point of the dispatch tests.
 func (outcome stackDispatchOutcome) composeSubcommands() []string {
 	acting := make([]string, 0, len(outcome.invocations))
 

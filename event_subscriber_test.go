@@ -16,40 +16,25 @@ limitations under the License.
 
 package blnk
 
-// This file owns the SUBSCRIBER SECURITY LIFECYCLE — the five properties that decide whether
-// what the registry says about a subscriber's access is what the broker actually enforces.
+// This file owns the SUBSCRIBER SECURITY LIFECYCLE — the five properties that decide
+// whether what the registry says about a subscriber's access is what the broker
+// actually enforces.
 //
-//	C-02    An authorization Kafka cannot enforce is STATED, not refused. A subscriber carrying
+//	STATED SCOPE         An authorization Kafka cannot enforce is STATED, not refused. A subscriber carrying
 //	        a partition key prefix is still provisionable — Kafka's authorizer has no
 //	        message-key dimension, so there is no narrower grant to insist upon and refusing
 //	        withdraws a required capability — and every credential response and subscriber read
 //	        declares that the narrowing is the holder's own to apply.
-//	AUTH-02 A subscriber's grant is RECONCILED on every change, never accumulated. (The broker
+//	RECONCILED GRANT     A subscriber's grant is RECONCILED on every change, never accumulated. (The broker
 //	        half is in event_admin_test.go; the three-step ordering an authorization change
 //	        follows is here.)
-//	AUTH-01 Deregistration REVOKES BEFORE IT DELETES, behind a tombstone, so a failed
+//	REVOKE BEFORE DELETE Deregistration REVOKES BEFORE IT DELETES, behind a tombstone, so a failed
 //	        revocation leaves a durable to-do item rather than live access nothing records.
-//	CONC-01 Every operation that touches the broker for a subscriber holds that subscriber's
+//	FENCE FIRST          Every operation that touches the broker for a subscriber holds that subscriber's
 //	        FENCE first, so two overlapping issuances cannot leave the broker holding one
 //	        password while the registry records another.
-//	CLEAN-01 Compensating writes run on a FRESH bounded context, because the deadline that
+//	FRESH CONTEXT        Compensating writes run on a FRESH bounded context, because the deadline that
 //	        failed is one of the commonest reasons they are needed at all.
-//
-// # What is a double here and what is real
-//
-// The registry is a faithful in-memory mirror (subscriberTestStore) and the broker is a
-// scriptable double (subscriberTestAdmin). Both are doubles deliberately: every property above
-// is a property of the ORDER AND CONDITIONS under which this service calls its two
-// collaborators, and the only way to assert an order is to record it. The broker's own
-// behaviour — that reconciliation converges, that revocation removes bindings before the
-// credential — is asserted against the real KafkaAdminClient in event_admin_test.go, and
-// end-to-end against a real broker in event_isolation_integration_test.go.
-//
-// The store mirrors the repository's CONTRACT rather than approximating it, because the service
-// branches on it: a missing row must report apierror.ErrSubscriberNotFound, a superseded
-// conditional write and a contested fence must both report apierror.ErrConflict, and an expired
-// fence must NOT be a conflict. Those are the same codes database/event_subscriber.go returns
-// and database/event_subscriber_test.go pins.
 
 import (
 	"context"
@@ -87,12 +72,6 @@ import (
 
 // subscriberCallLog is ONE recorder shared by both doubles.
 //
-// It exists because the properties this file asserts are interleavings ACROSS the two
-// collaborators: "the row was persisted BETWEEN the prune and the grant" cannot be read from two
-// independent sequences, and reconstructing it from a rule about which order the code is
-// supposed to use would make the assertion agree with the implementation by construction — it
-// would pass even against a persist-first ordering, which is the fail-open this exists to catch.
-//
 // One log, appended to by whichever double is called, makes the real order observable.
 type subscriberCallLog struct {
 	mu sync.Mutex
@@ -101,27 +80,16 @@ type subscriberCallLog struct {
 	calls []string
 
 	// expiredOn records, per method, whether the context that call arrived on had already
-	// expired. It is how CLEAN-01 is proved: a cleanup running on the caller's spent budget
-	// arrives with an expired context, and one running on a fresh budget does not.
+	// expired. It is how FRESH CONTEXT is proved: a cleanup running on the caller's spent
+	// budget arrives with an expired context, and one running on a fresh budget does not.
 	expiredOn map[string]bool
 
-	// budgetOn records, per method, how much time the arriving context had left, and -1 when it
-	// carried NO DEADLINE AT ALL.
-	//
-	// The -1 is the interesting value. Every registry mutation except issuance used to arrive
-	// with the caller's own bare context, so each Kafka round trip fell back to the admin
-	// client's per-request cap and a phase made of several of them was unbounded — which is what
-	// made the fence lease impossible to size. A broker call that arrives with no deadline is
-	// therefore a failure to assert, not an implementation detail.
+	// budgetOn records, per method, how much time the arriving context had left, and -1
+	// when it carried NO DEADLINE AT ALL.
 	budgetOn map[string]time.Duration
 
-	// deadlineOn records, per method, the absolute instant the arriving context expires at,
-	// and is absent when that context carried no deadline.
-	//
-	// It exists ALONGSIDE budgetOn rather than instead of it because the two answer different
-	// questions: budgetOn says how much of the SLA a phase was handed, which is what proves a
-	// phase is bounded at all, while this says WHICH deadline it was handed — the only way to
-	// prove two calls share one budget rather than each starting a fresh one.
+	// deadlineOn records, per method, the absolute instant the arriving context expires
+	// at, and is absent when that context carried no deadline.
 	deadlineOn map[string]time.Time
 }
 
@@ -203,8 +171,9 @@ func (l *subscriberCallLog) arrivedExpired(method string) bool {
 //
 // Returns:
 //   - time.Time: the deadline.
-//   - bool: false when the call was never made, or arrived on a context with no deadline at all
-//     — a distinction worth keeping, because "unbounded" is a failure mode of its own here.
+//   - bool: false when the call was never made, or arrived on a context with no
+//     deadline at all — a distinction worth keeping, because "unbounded" is a failure
+//     mode of its own here.
 func (l *subscriberCallLog) arrivedWithDeadline(method string) (time.Time, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -232,9 +201,9 @@ func (l *subscriberCallLog) count(method string) int {
 
 // subscriberTestStore is an in-memory mirror of the subscriber registry.
 //
-// It records the sequence of operations as well as their effects, because most of what this
-// file asserts is ORDER: "the tombstone was stamped before the broker was asked to revoke" is
-// not observable from final state, only from the sequence.
+// It records the sequence of operations as well as their effects, because most of what
+// this file asserts is ORDER: "the tombstone was stamped before the broker was asked to
+// revoke" is not observable from final state, only from the sequence.
 type subscriberTestStore struct {
 	mu sync.Mutex
 
@@ -249,10 +218,6 @@ type subscriberTestStore struct {
 	failures map[string]error
 
 	// obligations is the settlement bookkeeping the row itself does not carry.
-	//
-	// It is a SEPARATE map for the same reason model.EventSubscriber has no obligation fields:
-	// the columns are operational bookkeeping for one background worker, and putting them on the
-	// row would place them in every registry response, fixture and wire-contract assertion.
 	obligations map[string]subscriberTestObligation
 }
 
@@ -465,16 +430,11 @@ func (s *subscriberTestStore) ListEventSubscribers(
 	return page, nil
 }
 
-// ListAndCountEventSubscribers answers the page and the total from ONE observation of the
-// fake's state, which is what the repository's read-only REPEATABLE READ transaction gives the
-// real store.
+// ListAndCountEventSubscribers answers the page and the total from ONE observation of
+// the fake's state, which is what the repository's read-only REPEATABLE READ
+// transaction gives the real store.
 //
-// One lock acquisition covers both answers. Calling the two single-purpose methods in turn would
-// release the mutex between them and reproduce the very two-snapshot defect this method closes,
-// so a test asserting coherence would pass against a store that does not hold the property.
-//
-// The call is recorded under its own name so a test can assert that a listing which asked for a
-// total made ONE call rather than two.
+// One lock acquisition covers both answers.
 func (s *subscriberTestStore) ListAndCountEventSubscribers(
 	ctx context.Context,
 	query model.SubscriberPageQuery,
@@ -527,17 +487,19 @@ func (s *subscriberTestStore) UpdateEventSubscriber(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Mirrors the repository's WHERE clause exactly: the key, the claim, AND the absence of a
-	// revocation tombstone. A fake that skipped the last two would let the fenced-write tests
-	// pass against a store that does not enforce what production enforces.
+	// Mirrors the repository's WHERE clause exactly: the key, the claim, AND the absence
+	// of a revocation tombstone. A fake that skipped the last two would let the
+	// fenced-write tests pass against a store that does not enforce what production
+	// enforces.
 	if err := s.fencedWriteGuardLocked(subscriber.SubscriberID, fenceToken, true); err != nil {
 		return nil, err
 	}
 
 	stored := *subscriber
-	// STAMPED HERE, exactly as the statement's `updated_at = $7` does — and returned, because the
-	// caller must answer with the stored instant rather than the one it read on the way in. A fake
-	// that returned the caller's own copy would let the staleness defect pass unnoticed.
+	// STAMPED HERE, exactly as the statement's `updated_at = $7` does — and returned,
+	// because the caller must answer with the stored instant rather than the one it read
+	// on the way in. A fake that returned the caller's own copy would let the staleness
+	// defect pass unnoticed.
 	stored.UpdatedAt = time.Now().UTC()
 	s.rows[stored.SubscriberID] = stored
 
@@ -567,9 +529,9 @@ func (s *subscriberTestStore) TakeEventSubscriber(
 
 	delete(s.rows, key)
 
-	// The provisioning columns live ON the row, so deleting it takes the claim with it. Keeping
-	// a fence entry for a row that no longer exists would let a test assert a fence state the
-	// real schema cannot represent.
+	// The provisioning columns live ON the row, so deleting it takes the claim with it.
+	// Keeping a fence entry for a row that no longer exists would let a test assert a
+	// fence state the real schema cannot represent.
 	delete(s.fences, key)
 
 	return s.clone(row), nil
@@ -612,10 +574,10 @@ func (s *subscriberTestStore) RecordSubscriberCredentialIfUnchanged(
 	row.UpdatedAt = time.Now().UTC()
 	s.rows[key] = row
 
-	// SAME STATEMENT, same effect: a successful issuance REPLACES whatever credential a pending
-	// cleanup was about, because provisioning upserts. Mirroring it here is what lets a test
-	// prove that re-issuing does not leave settlement holding a marker that would destroy the
-	// credential it just recorded.
+	// SAME STATEMENT, same effect: a successful issuance REPLACES whatever credential a
+	// pending cleanup was about, because provisioning upserts. Mirroring it here is what
+	// lets a test prove that re-issuing does not leave settlement holding a marker that
+	// would destroy the credential it just recorded.
 	s.dischargeCredentialCleanupLocked(key)
 
 	// And the ORPHAN marker, which the same statement clears for the same reason: one SCRAM
@@ -666,9 +628,10 @@ func (s *subscriberTestStore) ClearSubscriberCredential(
 	row.CredentialReference = nil
 	row.CredentialIssuedAt = nil
 
-	// AND THE REVOCATION MARKERS, mirroring the repository's single statement. Every caller
-	// reaches this only once the broker has confirmed the revocation, so "a principal may still
-	// authenticate" is false and the tombstone must not keep asserting it.
+	// AND THE REVOCATION MARKERS, mirroring the repository's single statement. Every
+	// caller reaches this only once the broker has confirmed the revocation, so "a
+	// principal may still authenticate" is false and the tombstone must not keep asserting
+	// it.
 	row.RevocationPendingAt = nil
 	row.RevocationFailedAt = nil
 	row.UpdatedAt = time.Now().UTC()
@@ -751,19 +714,10 @@ func (s *subscriberTestStore) MarkSubscriberMigrated(
 		return s.notFound(subscriberID)
 	}
 
-	// THE REPOSITORY'S REFUSAL, mirrored. Datasource.MarkSubscriberMigrated carries
-	// `AND webhook_url IS NULL` in its statement and answers ErrGenConflict when the row
-	// still holds one, because stamping alone there would assert that the subscriber both
-	// has and has not stopped receiving legacy pushes. The double refuses identically —
-	// same code, same steering — so a test cannot prove a call path works that the real
-	// repository rejects, and cannot prove one is rejected more harshly than it is.
-	//
-	// This used to cite a schema CHECK named event_subscribers_webhook_migration_chk. No
-	// such constraint exists, and none is wanted: the RETAIN-01 retention purge selects
-	// exactly the pair a CHECK would forbid. The double was therefore STRICTER than
-	// production — it refused what PostgreSQL happily wrote — which is the one way a fake
-	// can turn a green test into a false one. The refusal now lives in the repository, so
-	// this mirrors something real.
+	// THE REPOSITORY'S REFUSAL, mirrored. Datasource.MarkSubscriberMigrated carries `AND
+	// webhook_url IS NULL` in its statement and answers ErrGenConflict when the row still
+	// holds one, because stamping alone there would assert that the subscriber both has
+	// and has not stopped receiving legacy pushes.
 	if row.WebhookURL != nil && strings.TrimSpace(*row.WebhookURL) != "" {
 		return apierror.NewAPIError(
 			apierror.ErrGenConflict,
@@ -810,9 +764,10 @@ func (s *subscriberTestStore) CompleteSubscriberWebhookMigration(
 	// broker counterpart, and the erasure of third-party data does not wait on another
 	// operation's state.
 	row.WebhookURL = nil
-	// COALESCE, mirroring the statement: the FIRST transition is kept, so a repeat call cannot
-	// move a long-migrated subscriber's migration instant forward to today. A fake that
-	// overwrote it would let the defect pass here while the repository's own test caught it.
+	// COALESCE, mirroring the statement: the FIRST transition is kept, so a repeat call
+	// cannot move a long-migrated subscriber's migration instant forward to today. A fake
+	// that overwrote it would let the defect pass here while the repository's own test
+	// caught it.
 	if row.MigratedAt == nil {
 		stamped := migratedAt
 		row.MigratedAt = &stamped
@@ -934,12 +889,10 @@ func (s *subscriberTestStore) ReleaseSubscriberProvisioningFence(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// THE SHARED PREDICATE, which is token AND LEASE. Each of these three sites tested the token
-	// alone, so an EXPIRED claim was accepted as held — and the production statements carry
-	// `provisioning_until > NOW()` in the write itself, so the double was modelling a permission
-	// the database does not grant. The helper also produces the conflict carrying the phrase
-	// subscriberFenceWasLost matches on, which is what routes the service to its abandon-and-
-	// compensate branch instead of to the generic-conflict one.
+	// THE SHARED PREDICATE, which is token AND LEASE. Each of these three sites tested the
+	// token alone, so an EXPIRED claim was accepted as held — and the production
+	// statements carry `provisioning_until > NOW()` in the write itself, so the double was
+	// modelling a permission the database does not grant.
 	key := strings.TrimSpace(subscriberID)
 	if err := s.requireFenceLocked(subscriberID, token, "releasing the provisioning claim"); err != nil {
 		return err
@@ -972,9 +925,10 @@ func (s *subscriberTestStore) RenewSubscriberProvisioningFence(
 		return s.notFound(subscriberID)
 	}
 
-	// Conditional, and it does NOT re-claim: a caller whose lease was taken over must learn that
-	// it no longer owns the subscriber, not be handed it back. The predicate is the shared one,
-	// so an expired lease is a refusal here exactly as it is in the statement.
+	// Conditional, and it does NOT re-claim: a caller whose lease was taken over must
+	// learn that it no longer owns the subscriber, not be handed it back. The predicate is
+	// the shared one, so an expired lease is a refusal here exactly as it is in the
+	// statement.
 	if err := s.requireFenceLocked(subscriberID, token, "renewing the provisioning claim"); err != nil {
 		return err
 	}
@@ -994,11 +948,6 @@ func (s *subscriberTestStore) RenewSubscriberProvisioningFence(
 }
 
 // fencedWriteGuardLocked reproduces the WHERE clause every fenced write carries.
-//
-// The three outcomes it distinguishes are the three the repository distinguishes, and they are
-// kept apart here for the same reason: a test asserting "the stale owner was refused" must fail
-// if the fake answers "not found", because that is what the production code did before the
-// claim predicate existed.
 //
 // s.mu must already be held.
 //
@@ -1157,9 +1106,9 @@ func (s *subscriberTestStore) ListSubscriberSettlementObligations(
 			continue
 		}
 
-		// A row never attempted is ALWAYS eligible, and a zero bound means "no pacing" — the two
-		// arms the statement spells out explicitly because `last_attempt < NULL` is NULL rather
-		// than true.
+		// A row never attempted is ALWAYS eligible, and a zero bound means "no pacing" — the
+		// two arms the statement spells out explicitly because `last_attempt < NULL` is NULL
+		// rather than true.
 		if !notBefore.IsZero() && !obligation.lastAttemptAt.IsZero() &&
 			!obligation.lastAttemptAt.Before(notBefore) {
 			continue
@@ -1320,11 +1269,6 @@ func subscriberTestReferencesMatch(stored, expected *string) bool {
 var _ eventSubscriberStore = (*subscriberTestStore)(nil)
 
 // subscriberProvisionedRow builds a subscriber that already holds a credential.
-//
-// The credential record is TWO columns written together — the schema's
-// event_subscribers_credential_pair_chk enforces it — so a helper is used rather than letting
-// each test set one and forget the other, which would seed a row the real registry could not
-// hold and quietly change what IsProvisioned answers.
 func subscriberProvisionedRow(t *testing.T) model.EventSubscriber {
 	t.Helper()
 
@@ -1346,7 +1290,7 @@ func subscriberProvisionedRow(t *testing.T) model.EventSubscriber {
 // subscriberTestAdmin is a scriptable administrative client.
 //
 // Like the store it records the sequence and whether each call arrived on a live context, so
-// ordering and CLEAN-01 are both observable.
+// ordering and FRESH CONTEXT are both observable.
 type subscriberTestAdmin struct {
 	mu sync.Mutex
 
@@ -1373,22 +1317,16 @@ type subscriberTestAdmin struct {
 	// issuance is mid-flight.
 	onProvision func()
 
-	// onPrune and onRevoke are the same hook for the other two broker phases. They exist so a
-	// test can take the provisioning claim over WHILE a phase is in flight, which is the only
-	// way to drive the fail-open path the token predicates close: an operation that keeps going
-	// after its lease has been lost.
+	// onPrune and onRevoke are the same hook for the other two broker phases. They exist
+	// so a test can take the provisioning claim over WHILE a phase is in flight, which is
+	// the only way to drive the fail-open path the token predicates close: an operation
+	// that keeps going after its lease has been lost.
 	onPrune  func()
 	onRevoke func()
 
-	// provisionErr makes provisioning fail while STILL returning result, which is a different
-	// shape from failures["ProvisionSubscriberPrincipal"] and models a different broker.
-	//
-	// failures models a call that did not complete, so it yields a zero result: nothing is
-	// known about what reached the broker. The refusals yield a POPULATED result alongside the
-	// error — the credential was written, compensation ran, and the flags say whether it was
-	// confirmed — and those flags are what provisioningFailure branches on. Without this seam
-	// the compensated and compensation-failed branches are unreachable from a test, which is
-	// exactly where the difference between "retry safely" and "revoke by hand" lives.
+	// provisionErr makes provisioning fail while STILL returning result, which is a
+	// different shape from failures["ProvisionSubscriberPrincipal"] and models a different
+	// broker.
 	provisionErr error
 
 	// requests records every provisioning request, so the flags the service SENDS —
@@ -1397,12 +1335,6 @@ type subscriberTestAdmin struct {
 	requests []SubscriberProvisioningRequest
 
 	// failureResult is what a FAILED provisioning reports, when a test sets one.
-	//
-	// The zero value is returned otherwise, which is what a provisioning that never reached
-	// the broker looks like. A test drives the deferred-compensation path (PERF-P09) by
-	// setting a result whose CompensationOwed is true alongside the failure, which is exactly
-	// the pair the real client returns for an ACL grant that failed after the credential was
-	// written.
 	failureResult SubscriberProvisioningResult
 
 	// compensated records every deferred compensation the service handed back.
@@ -1624,15 +1556,8 @@ type subscriberLifecycle struct {
 	service *EventSubscriberService
 }
 
-// newSubscriberLifecycle builds a run seeded with one registered, provisionable subscriber.
-//
-// Everything shares ONE call log, which is what makes an interleaving across the registry and
-// the broker observable rather than reconstructed.
-// subscriberLifecycleSubscriberBrokers is the EXTERNALLY ADVERTISED list a subscriber is told
-// to connect to, and it is intentionally not the admin client's internal list
-// ("broker-1:9092", "broker-2:9092"). Two different values are what make it possible to prove
-// which one the response carries — with one shared value every assertion would pass whichever
-// list the code read.
+// newSubscriberLifecycle builds a run seeded with one registered, provisionable
+// subscriber.
 var subscriberLifecycleSubscriberBrokers = []string{"kafka.example.com:9094"}
 
 // subscriberLifecycleConfiguration publishes a configuration with Kafka and the
@@ -1652,38 +1577,26 @@ func subscriberLifecycleConfiguration(t *testing.T) *config.Configuration {
 	return cnf
 }
 
-// subscriberLifecycleKeyScopeGatewayBrokers is the ENFORCING endpoint a key-scoped subscriber is
-// told to dial.
-//
-// Deliberately different from both the internal broker list and the advertised subscriber list,
-// so an assertion that the gateway was reported cannot pass by accident on either.
+// subscriberLifecycleKeyScopeGatewayBrokers is the ENFORCING endpoint a key-scoped
+// subscriber is told to dial.
 var subscriberLifecycleKeyScopeGatewayBrokers = []string{"keyscope-gateway.example.com:9095"}
 
-// enforceKeyScopeGateway republishes the lifecycle configuration with key-scope enforcement
-// ACTIVE, and returns the gateway list it declared.
+// enforceKeyScopeGateway republishes the lifecycle configuration with key-scope
+// enforcement ACTIVE, and returns the gateway list it declared.
 //
-// IT IS A PRECONDITION OF EVERY KEY-SCOPED ISSUANCE, not a variation on one. Blnk ships no
-// component that authorises record keys and serves no records itself, so without this call the
-// shipped default applies and issuance for a prefix-recording row REFUSES with
-// SUBSCRIBER_KEY_SCOPE_UNENFORCED — see
-// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway, which asserts
-// exactly that and therefore must NOT call this, as must the undeclared-deployment subtest of
-// TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDeclares.
+// IT IS A PRECONDITION OF EVERY KEY-SCOPED ISSUANCE, not a variation on one.
 //
-// It is ALSO a precondition of the prefix-LESS refusals, from the other direction: under a
-// declared model a subscriber recording no key scope is refused with
+// It is ALSO a precondition of the prefix-LESS refusals, from the other direction:
+// under a declared model a subscriber recording no key scope is refused with
 // SUBSCRIBER_KEY_SCOPE_REQUIRED — see
 // TestIssueSubscriberCredential_RefusesAPrefixLessSubscriberUnderADeclaredKeyScopedModel.
-//
-// Declaring it also changes the endpoint a key-scoped credential names: the gateway list rather
-// than the subscriber-facing broker list, because that subscriber's connection is terminated by
-// the declared component.
 //
 // Parameters:
 //   - t *testing.T: for the helper marker and the configuration restore.
 //
 // Returns:
-//   - []string: the declared gateway bootstrap list, which is what issuance must report.
+//   - []string: the declared gateway bootstrap list, which is what issuance must
+//     report.
 func enforceKeyScopeGateway(t *testing.T) []string {
 	t.Helper()
 
@@ -1692,24 +1605,18 @@ func enforceKeyScopeGateway(t *testing.T) []string {
 	return gateway
 }
 
-// enforceKeyScopeGatewayWithDouble is enforceKeyScopeGateway plus the CONFORMANCE DOUBLE standing
-// in for the declared component, returned so a test can assert what reached it.
+// enforceKeyScopeGatewayWithDouble is enforceKeyScopeGateway plus the CONFORMANCE
+// DOUBLE standing in for the declared component, returned so a test can assert what
+// reached it.
 //
-// # Why a double is part of "enforcement is active" now
-//
-// A mode and a distinct bootstrap list used to be the whole declaration, and neither is something
-// Blnk can verify: any address satisfied them. Enforcement is therefore active only when a usable
-// CONTROL endpoint is declared as well, and issuance calls it — so a harness that published a mode
-// and an address alone would now be a harness in which every key-scoped issuance is refused with
+// Enforcement is therefore active only when a usable CONTROL endpoint is declared as
+// well, and issuance calls it — so a harness that published a mode and an address alone
+// would now be a harness in which every key-scoped issuance is refused with
 // SUBSCRIBER_KEY_SCOPE_UNATTESTED, which is not the behaviour these tests are about.
 //
-// The double implements the published contract literally: it stores what it is told and attests
-// from what it stored. That is what makes it usable as a precondition here AND as the subject of
-// the attestation tests in event_keyscope_gateway_test.go, where its overrides drive the
-// mismatch cases.
-//
 // Returns:
-//   - []string: the declared gateway bootstrap list, which is what issuance must report.
+//   - []string: the declared gateway bootstrap list, which is what issuance must
+//     report.
 //   - *keyScopeGatewayDouble: the component, for assertions about the binding it holds.
 func enforceKeyScopeGatewayWithDouble(t *testing.T) ([]string, *keyScopeGatewayDouble) {
 	t.Helper()
@@ -1764,25 +1671,21 @@ func (l *subscriberLifecycle) seeded(row model.EventSubscriber) *subscriberLifec
 func stringPointer(value string) *string { return &value }
 
 // ---------------------------------------------------------------------------------------
-// SEC-05 — an authorization Kafka cannot enforce is refused
+// An authorization Kafka cannot enforce is refused
 // ---------------------------------------------------------------------------------------
 
-// TestIssueSubscriberCredential_RefusesAPrincipalHoldingAccessBeyondItsAuthorization is the
-// service half of SEC-06: the admin layer's refusal must reach the caller as a typed error with
-// no secret and no recorded issuance.
+// TestIssueSubscriberCredential_RefusesAPrincipalHoldingAccessBeyondItsAuthorization is
+// the service half of the admin layer's refusal must reach the caller as a typed error
+// with no secret and no recorded issuance.
 //
-// The two halves are tested separately because they can fail independently. The admin layer can
-// refuse correctly while the service records the issuance anyway — which would leave the
-// registry claiming a subscriber is provisioned when its credential was deliberately destroyed —
-// and the service can classify the refusal as a retryable timeout, which would send a client
-// into a retry loop against a condition only a human can clear.
+// The two halves are tested separately because they can fail independently.
 func TestIssueSubscriberCredential_RefusesAPrincipalHoldingAccessBeyondItsAuthorization(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberFixtureRow(t))
 	store, service := run.store, run.service
 
 	// The broker's own refusal: the credential was written, then compensated away once
-	// reconciliation revealed the foreign grant. Both flags matter — they are what the service
-	// reports to the caller about what is left behind.
+	// reconciliation revealed the foreign grant. Both flags matter — they are what the
+	// service reports to the caller about what is left behind.
 	run.admin.result = SubscriberProvisioningResult{
 		Topics:                     []string{"blnk.transactions"},
 		CredentialWritten:          false,
@@ -1809,9 +1712,9 @@ func TestIssueSubscriberCredential_RefusesAPrincipalHoldingAccessBeyondItsAuthor
 		"NO SECRET MAY BE RETURNED: the credential it belonged to was destroyed at the broker")
 	assert.Zero(t, credential.IssuedAt)
 
-	// The decisive assertion. Recording the issuance here would leave the registry asserting
-	// that this subscriber holds a working credential when the broker holds none, which is the
-	// false-provisioned state reads cannot distinguish from a real one.
+	// The decisive assertion. Recording the issuance here would leave the registry
+	// asserting that this subscriber holds a working credential when the broker holds
+	// none, which is the false-provisioned state reads cannot distinguish from a real one.
 	assert.Zero(t, run.log.count("RecordSubscriberCredentialIfUnchanged"),
 		"a refused issuance must not be recorded")
 
@@ -1827,14 +1730,8 @@ func TestIssueSubscriberCredential_RefusesAPrincipalHoldingAccessBeyondItsAuthor
 		"the provisioning fence must be released even on a refusal")
 }
 
-// TestIssueSubscriberCredential_ReportsAForeignGrantRefusalAsNotRetryable pins the classification
-// rather than the outcome.
-//
-// A refusal caused by an operator's ACL binding cannot be cleared by repeating the request, so
-// reporting it as retryable would invite a client to loop against a condition no retry can
-// change. This is the distinction that made the dedicated branch necessary: without it the cause
-// fell through to the state-based branches, which describe a failed ACL grant — a broker fault an
-// operator would look for and never find, because the grant succeeded.
+// TestIssueSubscriberCredential_ReportsAForeignGrantRefusalAsNotRetryable pins the
+// classification rather than the outcome.
 func TestIssueSubscriberCredential_ReportsAForeignGrantRefusalAsNotRetryable(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberFixtureRow(t))
 
@@ -1858,48 +1755,38 @@ func TestIssueSubscriberCredential_ReportsAForeignGrantRefusalAsNotRetryable(t *
 		"the reason must name the actual cause, so an operator does not hunt a broker fault")
 }
 
-// THE FIVE KEY-SCOPE REFUSAL TESTS ARE GONE, and their absence is deliberate.
+// WHERE KEY-SCOPE BEHAVIOUR IS COVERED.
 //
-// They pinned SUBSCRIBER_ISOLATION_UNENFORCEABLE: recording a partition_key_prefix was
-// refused at registration and at update, and issuance was refused for any row that held
-// one. That refusal implemented no part of AAP R-7's third scope — it withheld the
-// CREDENTIAL instead, so a key-scoped subscriber could not consume at all. The typed code
-// is retired.
-//
-// WHAT REPLACED IT HAS ITSELF MOVED ON, and this note records the current position rather
-// than the first attempt at one. The intermediate posture was to issue the credential and
-// DECLARE in the response that the broker does not enforce the prefix, which was accurate
-// prose about an absent boundary: the party asked to apply the filter was the party holding
-// whole-topic Read. What ships now is a narrowed GRANT (Describe, no Read) plus a
-// CONDITIONAL refusal — issuance proceeds only where the deployment declares a component
-// that authorises record keys AND that component attests this principal's exact prefix.
-//
-// What covers the behaviour now: TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope
-// and TestIssueSubscriberCredential_AttestsTheExactBindingBeforeMintingASecret for the
-// positive path, TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway
-// and TestIssueSubscriberCredential_RefusesAKeyScopeTheDeclaredGatewayWillNotConfirm for the
-// two refusals, TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber and
-// TestEventSubscriber_DeclaresKeyScope* for the registry side, plus the api/model validation
-// tests for the values a prefix may not take (surrounding whitespace, over-length, control
-// characters) — which are still refused, with ErrGenValidation rather than a state code.
+// A partition_key_prefix is RECORDABLE and ISSUABLE; what a subscriber may hold is
+// decided by the declared gateway rather than refused outright. The coverage is spread
+// over the tests named below rather than gathered here:
+// TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope and
+// TestIssueSubscriberCredential_AttestsTheExactBindingBeforeMintingASecret for the
+// positive path,
+// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway and
+// TestIssueSubscriberCredential_RefusesAKeyScopeTheDeclaredGatewayWillNotConfirm for
+// the two refusals, TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber and
+// TestEventSubscriber_DeclaresKeyScope* for the registry side, plus the api/model
+// validation tests for the values a prefix may not take (surrounding whitespace,
+// over-length, control characters) — which are still refused, with ErrGenValidation
+// rather than a state code.
 
-// TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate is the other side of the
-// refusal, and it is what stops the fix becoming a trap.
+// TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate is the other side of
+// the refusal, and it is what stops the fix becoming a trap.
 //
 // Three states must survive, and each matters for a different reason:
 //
-//   - CLEARING a prefix on a legacy row that also holds a credential. It is the documented
-//     remedy for a legacy row, so refusing it would leave no way out of one. WHERE NOTHING
-//     ENFORCES THE SCOPE — this harness, and the shipped default — that is unconditional;
-//     under a declared key-scoped model the same clearing is refused with
-//     SUBSCRIBER_KEY_SCOPE_REQUIRED, because there it widens a live principal back to
-//     whole-topic Read. Both halves are
-//     TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDeclares.
-//   - CLEARING on a row that holds no credential, which is the same repair on the other legacy
-//     shape — and it must restore provisionability, or the repair is only cosmetic.
-//   - An unrelated edit on a row with NO prefix. The refusals read the row as it would be
-//     written, so an update that mentions no prefix against a row that carries none must be
-//     entirely unaffected by any of them.
+//   - CLEARING a prefix on a legacy row that also holds a credential. WHERE NOTHING
+//     ENFORCES THE SCOPE — this harness, and the shipped default — that is
+//     unconditional; under a declared key-scoped model the same clearing is refused
+//     with SUBSCRIBER_KEY_SCOPE_REQUIRED, because there it widens a live principal back
+//     to whole-topic Read.
+//   - CLEARING on a row that holds no credential, which is the same repair on the other
+//     legacy shape — and it must restore provisionability, or the repair is only
+//     cosmetic.
+//   - An unrelated edit on a row with NO prefix. The refusals read the row as it would
+//     be written, so an update that mentions no prefix against a row that carries none
+//     must be entirely unaffected by any of them.
 func TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate(t *testing.T) {
 	t.Run("clearing a key scope on a provisioned subscriber is accepted", func(t *testing.T) {
 		row := subscriberProvisionedRow(t)
@@ -1960,11 +1847,9 @@ func TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate(t *testing.
 	})
 
 	t.Run("an unrelated edit to a legacy row that carries a prefix is accepted", func(t *testing.T) {
-		// The case that decides whether the refusal reads the REQUEST or the RESULTING ROW. A row
-		// predating the refusal carries a prefix; the operator renaming it while deciding what to
-		// do has said nothing about that value. Reading the resulting row would refuse them and
-		// leave the row uneditable — including uneditable by the very edit that documents the
-		// decision.
+		// The case that decides whether the refusal reads the REQUEST or the RESULTING ROW. A
+		// row predating the refusal carries a prefix; the operator renaming it while deciding
+		// what to do has said nothing about that value.
 		row := subscriberFixtureRow(t)
 		row.PartitionKeyPrefix = stringPointer("ldg_legacy_row")
 
@@ -1984,12 +1869,8 @@ func TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate(t *testing.
 	})
 }
 
-// TestRegisterSubscriber_AcceptsARegistrationThatRecordsNoKeyScope is the other side of the same
-// guard, and it is what keeps the fix from becoming a trap.
-//
-// An absent prefix and a present empty string are both "no key scope", and both must register
-// normally — the empty string especially, because a client that models the field as a plain string
-// sends "" for "unset" and would otherwise be refused for expressing the supported case.
+// TestRegisterSubscriber_AcceptsARegistrationThatRecordsNoKeyScope is the other side of
+// the same guard, and it is what keeps the fix from becoming a trap.
 func TestRegisterSubscriber_AcceptsARegistrationThatRecordsNoKeyScope(t *testing.T) {
 	for name, prefix := range map[string]*string{
 		"absent":       nil,
@@ -2015,16 +1896,18 @@ func TestRegisterSubscriber_AcceptsARegistrationThatRecordsNoKeyScope(t *testing
 	}
 }
 
-// TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing covers the empty grant.
+// TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing covers the empty
+// grant.
 //
-// An empty authorized_topics list is a legitimate registry state — the fail-closed default of a
-// new subscriber, and the only way to say "authorised for nothing" about a row that holds
-// topics — and neither registration nor update is changed by this. Issuing against it is what is
-// refused, because the credential minted is inert and the response is not: a secret returned
-// once, a broker endpoint and a consumer group are indistinguishable at a glance from working
-// access, so whoever receives it hands it to a consumer and diagnoses the resulting silence as a
-// delivery fault. Meanwhile the broker holds a live principal that no ACL describes and somebody
-// must remember to revoke.
+// An empty authorized_topics list is a legitimate registry state — the fail-closed
+// default of a new subscriber, and the only way to say "authorised for nothing" about a
+// row that holds topics — and neither registration nor update is changed by this.
+// Issuing against it is what is refused, because the credential minted is inert and the
+// response is not: a secret returned once, a broker endpoint and a consumer group are
+// indistinguishable at a glance from working access, so whoever receives it hands it to
+// a consumer and diagnoses the resulting silence as a delivery fault. Meanwhile the
+// broker holds a live principal that no ACL describes and somebody must remember to
+// revoke.
 func TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.AuthorizedTopics = nil
@@ -2069,24 +1952,11 @@ func TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing(t *tes
 	assert.Equal(t, []string{"blnk.transactions"}, granted.AuthorizedTopics)
 }
 
-// TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServerFault covers the
-// error SEMANTICS of a deadline, which decide whether a client retries.
+// TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServerFault
+// covers the error SEMANTICS of a deadline, which decide whether a client retries.
 //
-// Issuance shares one deadline across the fence claim, the row read, the broker round trips and
-// the issuance record. The broker half already reported a spent deadline as the retryable
-// provisioning failure. The registry half did not: both reads report through the repository's
-// generic internal-server code, so a budget spent waiting on a slow database arrived as HTTP
-// 500 — indistinguishable from a defect in Blnk, and the correct reaction to the two is
-// opposite. A defect must not be retried into a loop; this must be retried, and safely can be,
-// because nothing has been written when it happens here.
-//
-// The answer is SUBSCRIBER_PROVISIONING_FAILED and its 503 at every layer, which is the
-// approved retryable code for the condition; the published taxonomy carries no separate
-// timeout code, so the spent budget is named in the message and in the detail's retryable flag.
-//
-// The context is what is consulted, not the error, and that is forced rather than chosen:
-// loggedDatabaseError deliberately does not carry the driver's error, so
-// errors.Is(err, context.DeadlineExceeded) cannot answer at this layer.
+// Issuance shares one deadline across the fence claim, the row read, the broker round
+// trips and the issuance record.
 func TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServerFault(t *testing.T) {
 	// The two registry steps that run before the broker is touched, each failing the way the
 	// real repository fails when its query runs on a dead context.
@@ -2107,8 +1977,8 @@ func TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServ
 
 			// A budget this small is spent before the first call arrives, which is what the
 			// classification reads. QA reproduced the defect with a one-millisecond budget
-			// against a real database and with a caller that cancelled mid-flight; both land
-			// on the same two paths.
+			// against a real database and with a caller that cancelled mid-flight; both land on
+			// the same two paths.
 			service := run.service.WithIssuanceBudget(time.Nanosecond)
 
 			credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
@@ -2141,15 +2011,10 @@ func TestIssueSubscriberCredential_ReportsASpentBudgetAsRetryableRatherThanAServ
 	}
 }
 
-// TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired is the limit of the
-// reclassification, and it matters as much as the reclassification itself.
+// TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired is the limit
+// of the reclassification, and it matters as much as the reclassification itself.
 //
-// Only a GENERIC internal-server failure becomes a timeout. A conflict — another operation holds
-// the provisioning claim — remains true whether or not the deadline also expired: the fence WAS
-// held, and it will be held again on the next attempt until that operation finishes. Rewriting
-// it to a timeout would send a client to retry immediately against a state that has not
-// changed, which is the same class of mistake as reporting a timeout as a server fault, pointing
-// the other way.
+// Only a GENERIC internal-server failure becomes a timeout.
 func TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.holdFence(subscriberFixtureID, SubscriberProvisioningFenceLease)
@@ -2167,16 +2032,11 @@ func TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired(t 
 	assert.NotEqual(t, apierror.ErrSubscriberProvisioningFailed, apiErr.Code)
 }
 
-// TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers is the guard on the one
-// field that decides whether everything else in the response is usable.
+// TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers is the guard on the
+// one field that decides whether everything else in the response is usable.
 //
 // Blnk dials internal addresses — "kafka:9092" on a compose network, a ClusterIP in
-// Kubernetes — and a subscriber outside the deployment cannot resolve them. Kafka compounds
-// it: a broker answers every client with the ADVERTISED address of the listener the connection
-// arrived on, so bootstrapping against an internal name yields internal names for the
-// partition leaders as well. The response must therefore carry the externally advertised list
-// from KAFKA_SUBSCRIBER_BROKERS, and the two lists in this harness differ so that reading the
-// wrong one cannot pass.
+// Kubernetes — and a subscriber outside the deployment cannot resolve them.
 func TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -2193,13 +2053,9 @@ func TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers(t *testing.
 			"resolve for it, and publishing them discloses internal topology")
 }
 
-// TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll is the fail-closed
-// remainder: with neither list set there is no Kafka, so no endpoint could be reported and no
-// credential could work.
-//
-// The refusal must come BEFORE anything is minted: a credential created at the broker and
-// recorded in the registry for a response that cannot be returned is worse than either
-// outcome, because the registry then records a credential nobody holds.
+// TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll is the
+// fail-closed remainder: with neither list set there is no Kafka, so no endpoint could
+// be reported and no credential could work.
 func TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -2233,10 +2089,8 @@ func TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll(t *t
 
 // TestSubscriberFacingBrokers_ReadsAnUnusableListAsAbsent pins the normalisation.
 //
-// envconfig parses KAFKA_SUBSCRIBER_BROKERS as a comma-separated list, so "" and "," both
-// yield a NON-EMPTY slice carrying nothing usable. Treating either as an advertised list would
-// report blank endpoints to a subscriber — strictly worse than refusing, because it looks
-// like a successful answer.
+// envconfig parses KAFKA_SUBSCRIBER_BROKERS as a comma-separated list, so "" and ","
+// both yield a NON-EMPTY slice carrying nothing usable.
 func TestSubscriberFacingBrokers_ReadsAnUnusableListAsAbsent(t *testing.T) {
 	for name, configured := range map[string][]string{
 		"nil":             nil,
@@ -2253,11 +2107,11 @@ func TestSubscriberFacingBrokers_ReadsAnUnusableListAsAbsent(t *testing.T) {
 		})
 	}
 
-	// NO FALLBACK TO THE INTERNAL LIST. A deployment with brokers but no advertised list has
-	// nothing to report: KAFKA_BROKERS is what Blnk dials, and inside a deployment that is an
-	// internal address which does not resolve for a subscriber outside it — so substituting it
-	// would answer a credential request with an endpoint the holder cannot reach, together with
-	// a secret shown exactly once.
+	// NO FALLBACK TO THE INTERNAL LIST. A deployment with brokers but no advertised list
+	// has nothing to report: KAFKA_BROKERS is what Blnk dials, and inside a deployment
+	// that is an internal address which does not resolve for a subscriber outside it — so
+	// substituting it would answer a credential request with an endpoint the holder cannot
+	// reach, together with a secret shown exactly once.
 	fallback, advertised := config.KafkaConfig{
 		SubscriberBrokers: []string{" ", ""},
 		Brokers:           []string{"internal-1:9092", " internal-2:9092 "},
@@ -2275,11 +2129,8 @@ func TestSubscriberFacingBrokers_ReadsAnUnusableListAsAbsent(t *testing.T) {
 			"cannot become an endpoint")
 }
 
-// TestSubscriberFacingBrokers_ReturnsACopy keeps a caller from mutating shared configuration.
-//
-// The configuration is published through an atomic.Value and read concurrently by every
-// request, so handing out the backing array would let one issuance's caller change what every
-// later one reports.
+// TestSubscriberFacingBrokers_ReturnsACopy keeps a caller from mutating shared
+// configuration.
 func TestSubscriberFacingBrokers_ReturnsACopy(t *testing.T) {
 	cnf := config.KafkaConfig{SubscriberBrokers: []string{"kafka.example.com:9094"}}
 
@@ -2294,19 +2145,15 @@ func TestSubscriberFacingBrokers_ReturnsACopy(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// AUTH-01 — deregistration revokes before it deletes
+// Deregistration revokes before it deletes
 // ---------------------------------------------------------------------------------------
 
-// TestDeregisterSubscriber_TombstonesThenRevokesThenDeletes is the AUTH-01 guard.
+// TestDeregisterSubscriber_TombstonesThenRevokesThenDeletes is the guard.
 //
-// # The defect
+// Deregistration deleted the row and THEN revoked.
 //
-// Deregistration deleted the row and THEN revoked. When the revocation failed, the principal
-// kept authenticating and kept reading — and the only record of which principal that was had
-// just been deleted. The residue was live access nothing in Blnk could see, recoverable only
-// from a log line if anybody read it.
-//
-// The ORDER is the fix, so the order is what is asserted: mark, then revoke, then delete.
+// The ORDER is the fix, so the order is what is asserted: mark, then revoke, then
+// delete.
 func TestDeregisterSubscriber_TombstonesThenRevokesThenDeletes(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin, service := run.store, run.admin, run.service
@@ -2340,12 +2187,8 @@ func TestDeregisterSubscriber_TombstonesThenRevokesThenDeletes(t *testing.T) {
 		"the fence must be released once the operation finishes")
 }
 
-// TestDeregisterSubscriber_KeepsTheRowTombstonedWhenRevocationFails is the failure this whole
-// ordering exists for.
-//
-// The row must SURVIVE, still naming the principal and the topics revocation needs, still
-// marked pending — and the caller must be told the removal did not happen, because a caller
-// told "deleted" would stop retrying and the live principal would never be cleaned up.
+// TestDeregisterSubscriber_KeepsTheRowTombstonedWhenRevocationFails is the failure this
+// whole ordering exists for.
 func TestDeregisterSubscriber_KeepsTheRowTombstonedWhenRevocationFails(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin, service := run.store, run.admin, run.service
@@ -2377,11 +2220,8 @@ func TestDeregisterSubscriber_KeepsTheRowTombstonedWhenRevocationFails(t *testin
 
 // TestDeregisterSubscriber_ATombstonedRowIsRecoverableByRetrying closes the loop.
 //
-// A durable to-do item is only useful if working through it finishes the job, so the retry must
-// find the tombstoned row, revoke successfully, and delete. And the tombstone's timestamp must
-// not move: the value an operator needs is how long this revocation has been outstanding, and a
-// timestamp refreshed on every attempt would report the age of the last attempt instead —
-// always small, however long the row had been stuck.
+// A durable to-do item is only useful if working through it finishes the job, so the
+// retry must find the tombstoned row, revoke successfully, and delete.
 func TestDeregisterSubscriber_ATombstonedRowIsRecoverableByRetrying(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin, service := run.store, run.admin, run.service
@@ -2413,29 +2253,11 @@ func TestDeregisterSubscriber_ATombstonedRowIsRecoverableByRetrying(t *testing.T
 		"only the successful revocation counts; the failed one recorded nothing")
 }
 
-// TestDeregisterSubscriber_KeepsTheRowWhenTheDeleteFailsAfterRevocation covers the other
-// partial failure, which is the HARMLESS direction.
+// TestDeregisterSubscriber_KeepsTheRowWhenTheDeleteFailsAfterRevocation covers the
+// other partial failure, which is the HARMLESS direction.
 //
-// Access is already gone, so the residue is a registry row describing a subscriber that can no
-// longer authenticate — over-reporting rather than under-reporting.
-//
-// # REVERSED, and deliberately: the tombstone must NOT survive here
-//
-// This used to assert that the tombstone remained, on the reasoning that it is "what makes that
-// row identifiable as needing a retry". F14 withdrew that reasoning, and
-// TestDeregisterSubscriber_ClearsTheTombstoneOnceTheBrokerIsConfirmedClean is its guard.
-// revocation_pending_at is stamped BEFORE the broker is touched, so it means "a principal may
-// still authenticate" — and once the revocation is CONFIRMED that sentence is false. Keeping the
-// stamp made the column mean two opposite things depending on how far the operation got.
-//
-// It is not a labelling nicety. CountSubscriberRevocationsPending counts tombstoned rows and
-// blnk_subscribers_oldest_revocation_age_seconds raises a CRITICAL alert whose runbook tells an
-// operator to delete a SCRAM credential by hand. A confirmed-clean row sent them after a
-// principal that no longer exists, and — the direction that actually costs something — made a
-// row where a live credential really was unaccounted for indistinguishable from this residue.
-//
-// What is left is an INERT row: no credential, no broker access, no tombstone. Retrying the
-// deregistration removes it, and nothing alerts on it because nothing is exposed by it.
+// Access is already gone, so the residue is a registry row describing a subscriber that
+// can no longer authenticate — over-reporting rather than under-reporting.
 func TestDeregisterSubscriber_KeepsTheRowWhenTheDeleteFailsAfterRevocation(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin, service := run.store, run.admin, run.service
@@ -2459,12 +2281,11 @@ func TestDeregisterSubscriber_KeepsTheRowWhenTheDeleteFailsAfterRevocation(t *te
 		"nor a credential the broker has confirmed it does not hold")
 }
 
-// TestDeregisterSubscriber_WithoutABrokerDeletesDirectly keeps the no-Kafka steady state
-// working.
+// TestDeregisterSubscriber_WithoutABrokerDeletesDirectly keeps the no-Kafka steady
+// state working.
 //
-// A deployment that never configured Kafka has no broker-side access, so there is nothing to
-// confirm and the row is removed straight away. Requiring a revocation here would make the
-// registry unusable without Kafka, which is the documented supported configuration.
+// A deployment that never configured Kafka has no broker-side access, so there is
+// nothing to confirm and the row is removed straight away.
 func TestDeregisterSubscriber_WithoutABrokerDeletesDirectly(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin, service := run.store, run.admin, run.service
@@ -2483,13 +2304,11 @@ func TestDeregisterSubscriber_WithoutABrokerDeletesDirectly(t *testing.T) {
 	assert.NotZero(t, run.log.count("MarkSubscriberRevocationPending"))
 }
 
-// TestIssueSubscriberCredential_RefusesASubscriberBeingDeregistered stops the tombstone being
-// undone from the other side.
+// TestIssueSubscriberCredential_RefusesASubscriberBeingDeregistered stops the tombstone
+// being undone from the other side.
 //
-// A row carrying the tombstone is on its way out and its broker-side access may still be live.
-// Minting a credential for it would re-arm a principal mid-removal, and the deregistration
-// already in flight would then delete the row recording the credential just issued — leaving
-// exactly the orphaned live principal the tombstone exists to prevent.
+// A row carrying the tombstone is on its way out and its broker-side access may still
+// be live.
 func TestIssueSubscriberCredential_RefusesASubscriberBeingDeregistered(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	pending := time.Now().UTC().Add(-time.Minute)
@@ -2510,23 +2329,16 @@ func TestIssueSubscriberCredential_RefusesASubscriberBeingDeregistered(t *testin
 }
 
 // ---------------------------------------------------------------------------------------
-// CONC-01 — the provisioning fence
+// The provisioning fence
 // ---------------------------------------------------------------------------------------
 
-// TestIssueSubscriberCredential_IsFencedBeforeTheBrokerIsTouched is the CONC-01 guard.
+// TestIssueSubscriberCredential_IsFencedBeforeTheBrokerIsTouched is the guard.
 //
-// # The defect
+// Kafka stores ONE SCRAM credential per principal.
 //
-// Kafka stores ONE SCRAM credential per principal. Two overlapping issuances therefore both
-// wrote a credential and the second replaced the first, so the broker held one password while
-// the registry could hold the reference derived from the other — and the caller holding the
-// RECORDED one could not authenticate, with no way to discover it, because its request had
-// returned 200 with a password in it. The conditional write detects the DATABASE half of that
-// race; it cannot decide which password the BROKER kept, because that is settled by whichever
-// call reached the broker last, independently of who won the write.
-//
-// So the second caller is refused with a conflict BEFORE a secret exists, and the claim is
-// taken before the row is read so that everything the call decides from is read under it.
+// So the second caller is refused with a conflict BEFORE a secret exists, and the claim
+// is taken before the row is read so that everything the call decides from is read
+// under it.
 func TestIssueSubscriberCredential_IsFencedBeforeTheBrokerIsTouched(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, service := run.store, run.service
@@ -2545,11 +2357,8 @@ func TestIssueSubscriberCredential_IsFencedBeforeTheBrokerIsTouched(t *testing.T
 			"out the lease")
 }
 
-// TestIssueSubscriberCredential_RefusesWhileAnotherOperationHoldsTheFence is the refusal
-// itself.
-//
-// It must arrive as a CONFLICT and before any secret is generated: a refused issuance costs the
-// caller one retry, whereas an interleaved one costs it a credential that does not work.
+// TestIssueSubscriberCredential_RefusesWhileAnotherOperationHoldsTheFence is the
+// refusal itself.
 func TestIssueSubscriberCredential_RefusesWhileAnotherOperationHoldsTheFence(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, service := run.store, run.service
@@ -2571,12 +2380,10 @@ func TestIssueSubscriberCredential_RefusesWhileAnotherOperationHoldsTheFence(t *
 		"not even the read happens outside the claim")
 }
 
-// TestIssueSubscriberCredential_OnlyOneOfTwoConcurrentIssuancesReachesTheBroker is the property
-// stated as a race rather than as a sequence.
+// TestIssueSubscriberCredential_OnlyOneOfTwoConcurrentIssuancesReachesTheBroker is the
+// property stated as a race rather than as a sequence.
 //
-// Two callers issue at the same time for the same subscriber. Exactly one must reach the broker
-// and exactly one must be refused — because the outcome the fence prevents is precisely two
-// credential writes whose winner is decided by network timing.
+// Two callers issue at the same time for the same subscriber.
 func TestIssueSubscriberCredential_OnlyOneOfTwoConcurrentIssuancesReachesTheBroker(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	admin, service := run.admin, run.service
@@ -2629,14 +2436,11 @@ func TestIssueSubscriberCredential_OnlyOneOfTwoConcurrentIssuancesReachesTheBrok
 			"second write silently invalidates the first caller's secret")
 }
 
-// TestSubscriberFence_AnExpiredClaimDoesNotBlockTheNextAttempt is what stops the fence becoming
-// a denial of service.
+// TestSubscriberFence_AnExpiredClaimDoesNotBlockTheNextAttempt is what stops the fence
+// becoming a denial of service.
 //
-// A process killed while holding a claim must not fence the subscriber forever, so the claim is
-// LEASED. This asserts the lease is honoured — an expired claim is not a conflict — which is
-// also why the conditional credential write is retained underneath it: an issuance whose
-// process stalled past its lease can find itself superseded, and the conditional write makes
-// that a reported conflict rather than a silent overwrite.
+// A process killed while holding a claim must not fence the subscriber forever, so the
+// claim is LEASED.
 func TestSubscriberFence_AnExpiredClaimDoesNotBlockTheNextAttempt(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, service := run.store, run.service
@@ -2651,13 +2455,10 @@ func TestSubscriberFence_AnExpiredClaimDoesNotBlockTheNextAttempt(t *testing.T) 
 	assert.NotEmpty(t, credential.Password())
 }
 
-// TestSubscriberFence_IsHeldByEveryOperationThatTouchesTheBroker is the completeness half of
-// CONC-01.
+// TestSubscriberFence_IsHeldByEveryOperationThatTouchesTheBroker is the completeness
+// half of the fence contract: every operation that reaches the broker takes it.
 //
-// A fence only excludes what actually takes it. Issuance, revocation, an authorization update
-// and deregistration all mutate broker state for one subscriber, so all four must claim it —
-// otherwise the one that does not can interleave with any of the others and the guarantee is
-// worth nothing.
+// A fence only excludes what actually takes it.
 func TestSubscriberFence_IsHeldByEveryOperationThatTouchesTheBroker(t *testing.T) {
 	operations := map[string]func(*EventSubscriberService) error{
 		"IssueSubscriberCredential": func(service *EventSubscriberService) error {
@@ -2711,17 +2512,16 @@ func TestSubscriberFence_IsHeldByEveryOperationThatTouchesTheBroker(t *testing.T
 }
 
 // ---------------------------------------------------------------------------------------
-// AUTH-02 — the three-step authorization update
+// The three-step authorization update
 // ---------------------------------------------------------------------------------------
 
-// TestUpdateSubscriber_PrunesBeforeItPersistsAndGrantsAfter is the ordering AUTH-02 needs at
-// the service tier.
+// TestUpdateSubscriber_PrunesBeforeItPersistsAndGrantsAfter is the ordering RECONCILED GRANT
+// needs at the service tier.
 //
-// There is no transaction spanning Blnk and Kafka, so the only order in which every partial
-// failure is fail-closed is prune -> persist -> grant. Pruning first puts a NARROWING in force
-// before the row claims it; granting last lets a WIDENING reach the broker only once the row
-// records it. Doing both around a single persist, or persisting first, makes one of the two
-// cases fail-OPEN — live broker access the registry says was revoked.
+// There is no transaction spanning Blnk and Kafka, so the only order in which every
+// partial failure is fail-closed is prune -> persist -> grant. Pruning first puts a
+// NARROWING in force before the row claims it; granting last lets a WIDENING reach the
+// broker only once the row records it.
 func TestUpdateSubscriber_PrunesBeforeItPersistsAndGrantsAfter(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	service := run.service
@@ -2732,9 +2532,9 @@ func TestUpdateSubscriber_PrunesBeforeItPersistsAndGrantsAfter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"blnk.transactions"}, updated.AuthorizedTopics)
 
-	// The persist has to sit BETWEEN the two broker calls, and that is only observable on one
-	// shared log — two independent sequences can each be in the right order while the write sits
-	// on the wrong side of both.
+	// The persist has to sit BETWEEN the two broker calls, and that is only observable on
+	// one shared log — two independent sequences can each be in the right order while the
+	// write sits on the wrong side of both.
 	require.Equal(t, []string{
 		"ClaimSubscriberForProvisioning",
 		"PruneSubscriberAccess",
@@ -2755,11 +2555,8 @@ func TestUpdateSubscriber_PrunesBeforeItPersistsAndGrantsAfter(t *testing.T) {
 		"nothing else may touch the broker: an update must not mint or revoke a credential")
 }
 
-// TestUpdateSubscriber_DoesNotPersistWhenTheNarrowingCouldNotBeApplied keeps step one binding.
-//
-// An update that could not narrow the boundary at the broker must not be recorded as having
-// narrowed it: the row would then describe less access than exists, which is the exact
-// fail-open AUTH-02 removes.
+// TestUpdateSubscriber_DoesNotPersistWhenTheNarrowingCouldNotBeApplied keeps step one
+// binding.
 func TestUpdateSubscriber_DoesNotPersistWhenTheNarrowingCouldNotBeApplied(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin, service := run.store, run.admin, run.service
@@ -2783,11 +2580,12 @@ func TestUpdateSubscriber_DoesNotPersistWhenTheNarrowingCouldNotBeApplied(t *tes
 	assert.Equal(t, []string{"blnk.transactions", "blnk.balances"}, stored.AuthorizedTopics)
 }
 
-// TestUpdateSubscriber_ReportsAFailedWideningRatherThanClaimingSuccess covers step three.
+// TestUpdateSubscriber_ReportsAFailedWideningRatherThanClaimingSuccess covers step
+// three.
 //
-// The row already records the wider authorization, so the residue is fail-closed — fewer rights
-// than recorded. But a caller told the update succeeded would believe a grant exists that does
-// not, so the error is returned rather than logged.
+// The row already records the wider authorization, so the residue is fail-closed —
+// fewer rights than recorded. But a caller told the update succeeded would believe a
+// grant exists that does not, so the error is returned rather than logged.
 func TestUpdateSubscriber_ReportsAFailedWideningRatherThanClaimingSuccess(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	admin, service := run.admin, run.service
@@ -2806,11 +2604,8 @@ func TestUpdateSubscriber_ReportsAFailedWideningRatherThanClaimingSuccess(t *tes
 		"the persist happened, which is why the residue is fail-closed and recoverable by retrying")
 }
 
-// TestUpdateSubscriber_WithoutABrokerReconcilesNothingAndStillPersists keeps the no-Kafka
-// steady state working.
-//
-// A deployment with no broker has no broker-side grant to reconcile, so both reconciliation
-// steps are no-ops and the registry behaves exactly as it would without this feature.
+// TestUpdateSubscriber_WithoutABrokerReconcilesNothingAndStillPersists keeps the
+// no-Kafka steady state working.
 func TestUpdateSubscriber_WithoutABrokerReconcilesNothingAndStillPersists(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	admin, service := run.admin, run.service
@@ -2828,30 +2623,19 @@ func TestUpdateSubscriber_WithoutABrokerReconcilesNothingAndStillPersists(t *tes
 }
 
 // ---------------------------------------------------------------------------------------
-// CLEAN-01 — compensation runs on a fresh bounded context
+// Compensation runs on a fresh bounded context
 // ---------------------------------------------------------------------------------------
 
-// TestIssueSubscriberCredential_CompensatesOnAFreshContextWhenTheIssuanceBudgetIsSpent is the
-// CLEAN-01 guard.
+// TestIssueSubscriberCredential_CompensatesOnAFreshContextWhenTheIssuanceBudgetIsSpent
+// is the FRESH CONTEXT guard.
 //
-// # The defect
-//
-// Every cleanup on this path — revoking a credential the registry could not record, clearing a
-// reference that no longer describes anything, releasing the fence — used to run on the
-// ISSUANCE context. That context carries the five-second budget, and its EXPIRY is one of the
-// commonest reasons issuance fails at all. So the cleanups were attempted with an
-// already-cancelled context, returned immediately, and left exactly the residue they exist to
-// remove: a live credential nothing records.
-//
-// The test drives it directly. The budget is set so small that it is spent by the time the
-// record is attempted, the record fails, and the compensating revocation must still ARRIVE ON A
-// LIVE CONTEXT and must still happen.
+// The test drives it directly.
 func TestIssueSubscriberCredential_CompensatesOnAFreshContextWhenTheIssuanceBudgetIsSpent(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	store, admin := run.store, run.admin
 	// The record fails for a reason that is NOT a conflict, which is the branch that
-	// compensates. A conflict deliberately does not revoke, because one SCRAM credential exists
-	// per principal and revoking would destroy the other issuance's secret too.
+	// compensates. A conflict deliberately does not revoke, because one SCRAM credential
+	// exists per principal and revoking would destroy the other issuance's secret too.
 	store.failing("RecordSubscriberCredentialIfUnchanged", errors.New("write path unavailable"))
 
 	service := run.service.WithIssuanceBudget(30 * time.Millisecond)
@@ -2881,12 +2665,11 @@ func TestIssueSubscriberCredential_CompensatesOnAFreshContextWhenTheIssuanceBudg
 		"the subscriber must not stay fenced after a failed issuance")
 }
 
-// TestIssueSubscriberCredential_DoesNotRevokeWhenAConcurrentIssuanceWon is the one case where
-// NOT compensating is correct, and it is worth pinning because it looks like a missing cleanup.
+// TestIssueSubscriberCredential_DoesNotRevokeWhenAConcurrentIssuanceWon is the one case
+// where NOT compensating is correct, and it is worth pinning because it looks like a
+// missing cleanup.
 //
-// One SCRAM credential exists per principal. If a concurrent issuance superseded this one, the
-// credential now at the broker may be the OTHER caller's — and revoking would destroy a secret
-// that caller has already been handed and believes works.
+// One SCRAM credential exists per principal.
 func TestIssueSubscriberCredential_DoesNotRevokeWhenAConcurrentIssuanceWon(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	run := newSubscriberLifecycle(t).seeded(row)
@@ -2916,12 +2699,11 @@ func TestIssueSubscriberCredential_DoesNotRevokeWhenAConcurrentIssuanceWon(t *te
 		"and clearing the record would erase the reference that issuance recorded")
 }
 
-// TestRevokeSubscriberCredential_LeavesTheRecordAloneWhenTheBrokerRefuses keeps revocation
-// fail-closed.
+// TestRevokeSubscriberCredential_LeavesTheRecordAloneWhenTheBrokerRefuses keeps
+// revocation fail-closed.
 //
 // Clearing the registry record while the credential still works would make the registry
-// under-report live access, which is the direction that hides a problem. So the record survives
-// and the caller is told to retry.
+// under-report live access, which is the direction that hides a problem.
 func TestRevokeSubscriberCredential_LeavesTheRecordAloneWhenTheBrokerRefuses(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.CredentialReference = stringPointer("reference-in-place")
@@ -2954,16 +2736,11 @@ func TestRevokeSubscriberCredential_LeavesTheRecordAloneWhenTheBrokerRefuses(t *
 // The administrative-client lifetime guarantee
 // ---------------------------------------------------------------------------------------
 
-// TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns is the runtime half of the
-// lifetime guarantee: Close releases a client the service resolved for itself, and never one
-// that was handed to it.
+// TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns is the runtime half of
+// the lifetime guarantee: Close releases a client the service resolved for itself, and
+// never one that was handed to it.
 //
-// Both halves matter, and they fail in opposite directions. A Close that released nothing would
-// leak every administrative client the subscriber surface ever resolves — one per update, one
-// per issuance — until the process ended. A Close that released an INJECTED client would tear
-// down something owned by whoever built it and usually outlives this service, so the next
-// caller would find a closed client. That second failure mode is why the wrappers can close
-// unconditionally without knowing where the client came from.
+// Both halves matter, and they fail in opposite directions.
 func TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns(t *testing.T) {
 	t.Run("an injected client is never closed", func(t *testing.T) {
 		log := newSubscriberCallLog()
@@ -2985,10 +2762,10 @@ func TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns(t *testing.T) {
 		// Resolution reads live configuration, so a Kafka-configured one is installed for the
 		// duration. NewKafkaAdmin performs no I/O at construction, so nothing dials a broker.
 		//
-		// InsecureLocalDev is the acknowledgement the transport requires before it will build a
-		// plaintext client at all; without it construction is refused as a misconfiguration and
-		// nothing would ever be resolved to close. Enabling it here is what makes the test about
-		// LIFETIME rather than about the TLS refusal, which has its own coverage.
+		// InsecureLocalDev is the acknowledgement the transport requires before it will build
+		// a plaintext client at all; without it construction is refused as a misconfiguration
+		// and nothing would ever be resolved to close. Enabling it here is what makes the
+		// test about LIFETIME rather than about the TLS refusal, which has its own coverage.
 		cnf := subscriberLifecycleConfiguration(t)
 		cnf.Kafka.InsecureLocalDev = true
 		config.MockConfig(cnf)
@@ -3018,22 +2795,10 @@ func TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns(t *testing.T) {
 	})
 }
 
-// TestBlnkSubscriberWrappers_EveryOneClosesTheServiceItBuilds is the STRUCTURAL half, and it is
-// the half that keeps the guarantee true.
+// TestBlnkSubscriberWrappers_EveryOneClosesTheServiceItBuilds is the STRUCTURAL half,
+// and it is the half that keeps the guarantee true.
 //
-// The runtime test above proves Close works. It cannot prove Close is CALLED, and that is where
-// the leak actually was: UpdateEventSubscriber built a service, reconciled a subscriber's ACL
-// bindings through it — resolving an administrative client twice, once to prune and once to
-// grant — and returned without closing, so every update held those connections for the
-// remaining life of the process.
-//
-// A per-wrapper assertion, rather than a comment saying which wrappers need it, is the only
-// form that survives the next edit. The rule that produced the bug was "close where the broker
-// is touched", which made each wrapper's correctness depend on a fact about a service method
-// hundreds of lines away that no compiler checks: a registry-only operation that later grew a
-// broker touch would start leaking with its own wrapper untouched in the diff. Close is
-// idempotent, nil-safe and a no-op when nothing was resolved, so requiring it everywhere costs
-// nothing and cannot be wrong.
+// The runtime test above proves Close works.
 func TestBlnkSubscriberWrappers_EveryOneClosesTheServiceItBuilds(t *testing.T) {
 	fileSet := token.NewFileSet()
 	path := filepath.Join(moduleRootDir(t), "event_subscriber.go")
@@ -3135,11 +2900,6 @@ func isBlnkReceiver(receiver *ast.FieldList) bool {
 
 // requireSubscriberAPIError asserts the typed code an error carries.
 //
-// The code is the assertion that matters rather than the message: the HTTP status the handler
-// returns is derived from it, and the difference between a 404 and a 409 on these paths is the
-// difference between "re-register this subscriber" and "your operation was overtaken and its
-// write was correctly discarded".
-//
 // Parameters:
 //   - t *testing.T: the test.
 //   - err error: the error under assertion. Must be non-nil.
@@ -3154,26 +2914,11 @@ func requireSubscriberAPIError(t *testing.T, err error, want apierror.ErrorCode)
 	assert.Equal(t, want, apiErr.Code)
 }
 
-// TestUpdateSubscriber_RefusesASubscriberBeingDeregistered is the tombstone guard on the one
-// mutation that never asked.
+// TestUpdateSubscriber_RefusesASubscriberBeingDeregistered is the tombstone guard on
+// the one mutation that never asked.
 //
-// # The defect
-//
-// A row carrying the revocation tombstone is being deregistered: its principal is on its way out
-// and its ACL bindings are being removed. IssueSubscriberCredential refused such a row.
-// UpdateSubscriber did not — it fenced, read, mutated in memory and went straight to the broker.
-//
-// That mattered because a non-nil AuthorizedTopics REPLACES the whole set, so the call could
-// WIDEN the authorization, and STEP 3 then created broker bindings for a principal whose
-// revocation was already in flight. A subscriber regained access while it was being removed, and
-// the registry recorded it as an ordinary edit — nothing failed and nothing was logged as wrong.
-//
-// # What the refusal has to prove
-//
-// Not merely that an error comes back, but that NOTHING HAPPENED: no prune, no write, no grant.
-// A refusal issued after the prune would still have narrowed the broker; one issued after the
-// write would still have changed the recorded boundary. So the assertion is on the whole
-// collaborator sequence, not on the returned error alone.
+// A row carrying the revocation tombstone is being deregistered: its principal is on
+// its way out and its ACL bindings are being removed.
 func TestUpdateSubscriber_RefusesASubscriberBeingDeregistered(t *testing.T) {
 	tombstoned := subscriberFixtureRow(t)
 	pendingAt := time.Now().Add(-3 * time.Minute)
@@ -3190,17 +2935,17 @@ func TestUpdateSubscriber_RefusesASubscriberBeingDeregistered(t *testing.T) {
 	assert.Nil(t, updated)
 	requireSubscriberAPIError(t, err, apierror.ErrConflict)
 
-	// THE MESSAGE NAMES THE OPERATION THAT WAS REFUSED. The guard is shared with issuance, and
-	// reusing issuance's wording here would answer an authorization change with "no credential
-	// will be issued for it" — a 409 describing an operation the caller never asked for, which
-	// sends an operator looking in the wrong place.
+	// THE MESSAGE NAMES THE OPERATION THAT WAS REFUSED. The guard is shared with issuance,
+	// and reusing issuance's wording here would answer an authorization change with "no
+	// credential will be issued for it" — a 409 describing an operation the caller never
+	// asked for, which sends an operator looking in the wrong place.
 	assert.Contains(t, err.Error(), "access model can no longer be changed")
 	assert.NotContains(t, err.Error(), "credential will be issued",
 		"an update must not be refused in issuance's words")
 
-	// THE BROKER WAS NEVER TOUCHED. This is the half that matters: the grant is what would have
-	// re-armed a principal mid-removal, and the prune would have narrowed a boundary the
-	// deregistration is about to remove entirely.
+	// THE BROKER WAS NEVER TOUCHED. This is the half that matters: the grant is what would
+	// have re-armed a principal mid-removal, and the prune would have narrowed a boundary
+	// the deregistration is about to remove entirely.
 	assert.Empty(t, run.log.only("PruneSubscriberAccess", "GrantSubscriberAccess"),
 		"a tombstoned subscriber must not reach the broker at all")
 
@@ -3219,13 +2964,11 @@ func TestUpdateSubscriber_RefusesASubscriberBeingDeregistered(t *testing.T) {
 		"a refused update must not leave the subscriber fenced")
 }
 
-// TestUpdateSubscriber_RefusesTheTombstonedRowAtThePersistenceBoundaryToo covers the case the
-// in-memory guard cannot: the tombstone arriving BETWEEN the read and the write.
+// TestUpdateSubscriber_RefusesTheTombstonedRowAtThePersistenceBoundaryToo covers the
+// case the in-memory guard cannot: the tombstone arriving BETWEEN the read and the
+// write.
 //
-// The service check and the SQL predicate are not redundant. The check answers with a reason and
-// stops the broker work, which no database predicate can do; the predicate holds when the row is
-// tombstoned after the read, which no in-memory check can see. Removing either one leaves a
-// window open.
+// The service check and the SQL predicate are not redundant.
 func TestUpdateSubscriber_RefusesTheTombstonedRowAtThePersistenceBoundaryToo(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -3262,18 +3005,10 @@ func TestUpdateSubscriber_RefusesTheTombstonedRowAtThePersistenceBoundaryToo(t *
 // The fence is RENEWED around broker work and CHECKED by every durable write
 // ---------------------------------------------------------------------------------------
 
-// TestSubscriberProvisioningFenceLease_IsDerivedFromTheWorkItCovers pins the arithmetic rather
-// than the number.
+// TestSubscriberProvisioningFenceLease_IsDerivedFromTheWorkItCovers pins the arithmetic
+// rather than the number.
 //
-// The lease used to be a chosen multiple of the issuance budget, and it could not be right at any
-// value: the work under it was a variable-length sequence of Kafka round trips, each capped
-// independently, so a lease long enough for the worst case would fence a subscriber for a minute
-// after a crash and a lease short enough to recover from a crash expired mid-operation.
-//
-// The relationship below is the fix. One renewal has to span exactly one broker phase, the
-// durable write after it and the compensating write after a failure — so the lease is the sum of
-// those three budgets, and renewal rather than a longer lease is what covers an operation that
-// legitimately needs more time.
+// The relationship below is the fix.
 func TestSubscriberProvisioningFenceLease_IsDerivedFromTheWorkItCovers(t *testing.T) {
 	assert.Equal(t,
 		subscriberBrokerPhaseBudget+subscriberCleanupBudget+SubscriberCredentialIssuanceBudget,
@@ -3289,23 +3024,13 @@ func TestSubscriberProvisioningFenceLease_IsDerivedFromTheWorkItCovers(t *testin
 
 // TestUpdateSubscriber_RenewsTheClaimBeforeEachBrokerPhaseAndBoundsIt is the F10 core.
 //
-// # The defect
-//
 // UpdateSubscriber took one leased claim and then made TWO independent sequences of
-// administrative round trips — prune, then grant. It arrived with no deadline of its own, so each
-// round trip fell back to the admin client's 10-second per-request cap; a prune of three and a
-// grant of four could therefore run far past the 15-second lease. Past it, the operation simply
-// carried on: the claim was gone, and the durable write in between matched on subscriber_id
-// alone, so it landed anyway — over the top of whatever the new owner had just reconciled with
-// the broker, and reported success.
+// administrative round trips — prune, then grant.
 //
-// # The two halves of the fix, both asserted here
-//
-//   - RENEWED IMMEDIATELY BEFORE each phase, so a successful renewal is proof of ownership at
-//     that instant. Renewing afterwards would prove only that nobody took over while the broker
-//     was being changed, which is the thing already too late to learn.
-//   - BOUNDED, so the phase's worst case is knowable. A phase arriving with no deadline is the
-//     unbounded case, and budget() reports -1 for exactly that.
+//   - RENEWED IMMEDIATELY BEFORE each phase, so a successful renewal is proof of
+//     ownership at that instant.
+//   - BOUNDED, so the phase's worst case is knowable. A phase arriving with no deadline
+//     is the unbounded case, and budget() reports -1 for exactly that.
 func TestUpdateSubscriber_RenewsTheClaimBeforeEachBrokerPhaseAndBoundsIt(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -3342,12 +3067,10 @@ func TestUpdateSubscriber_RenewsTheClaimBeforeEachBrokerPhaseAndBoundsIt(t *test
 	}
 }
 
-// TestUpdateSubscriber_AbandonsTheOperationWhenTheClaimWasTakenOver proves a refused renewal
-// STOPS the operation rather than being logged and passed over.
+// TestUpdateSubscriber_AbandonsTheOperationWhenTheClaimWasTakenOver proves a refused
+// renewal STOPS the operation rather than being logged and passed over.
 //
-// A caller whose renewal fails has learned that it does not own the subscriber. Continuing is
-// precisely how a stale owner comes to overwrite the state a new owner established, so the error
-// is returned and the phase never runs.
+// A caller whose renewal fails has learned that it does not own the subscriber.
 func TestUpdateSubscriber_AbandonsTheOperationWhenTheClaimWasTakenOver(t *testing.T) {
 	t.Run("before the first phase", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -3398,15 +3121,13 @@ func TestUpdateSubscriber_AbandonsTheOperationWhenTheClaimWasTakenOver(t *testin
 	})
 }
 
-// TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsUnderIt covers the
-// same two properties on the issuance path, where the consequence is a credential rather than an
-// ACL binding.
+// TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsUnderIt
+// covers the same two properties on the issuance path, where the consequence is a
+// credential rather than an ACL binding.
 //
-// The reference CAS alone could not detect a caller whose lease expired: while the rightful new
-// owner is still provisioning it has recorded nothing, so the stored reference is STILL the one
-// the stale caller observed. Its write matched, landed, and the winner was then refused — the
-// fence inverted, with the loser owning the registry and the broker holding the winner's
-// password.
+// The reference CAS alone could not detect a caller whose lease expired: while the
+// rightful new owner is still provisioning it has recorded nothing, so the stored
+// reference is STILL the one the stale caller observed.
 func TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsUnderIt(t *testing.T) {
 	t.Run("renews before the broker phase and records under the claim", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -3416,17 +3137,15 @@ func TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsU
 		require.NoError(t, err)
 		assert.NotEmpty(t, credential.Password())
 
-		// TWO RENEWALS, and neither is redundant. This assertion named only the first, and its
-		// sibling TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance named
-		// only the second; the two windows they guard are different, so the sequence carries
-		// both.
+		// TWO RENEWALS, and neither is redundant. This assertion named only the first, and
+		// its sibling TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance
+		// named only the second; the two windows they guard are different, so the sequence
+		// carries both.
 		//
-		//   - BEFORE the broker phase, which is what this subtest is about: a secret must not be
-		//     written at the broker under a lease that has already lapsed.
+		//   - BEFORE the broker phase, which is what this subtest is about: a secret must not
+		//     be written at the broker under a lease that has already lapsed.
 		//   - AFTER it and before the registry write, which is the only position from which a
-		//     write that is about to race a new owner can be refused. Provisioning is up to four
-		//     round trips with their own timeouts, so the claim confirmed on the way in can be
-		//     gone by the time the write happens.
+		//     write that is about to race a new owner can be refused.
 		assert.Equal(t, []string{
 			"ClaimSubscriberForProvisioning",
 			"RenewSubscriberProvisioningFence",
@@ -3470,12 +3189,10 @@ func TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsU
 }
 
 // TestDeregisterSubscriber_ConfirmsTheClaimBeforeRevokingAndDeletesUnderIt covers the
-// deregistration path, where an unfenced final delete was the most damaging of the three.
+// deregistration path, where an unfenced final delete was the most damaging of the
+// three.
 //
-// STEP 4 deletes the row after a broker revocation whose duration the broker decides. Under an
-// expired lease an unconditional delete removed a row another operation was working on — most
-// damagingly an issuance, which then left a live broker principal with no registry row naming
-// it: exactly the orphaned access the tombstone-first ordering exists to make impossible.
+// STEP 4 deletes the row after a broker revocation whose duration the broker decides.
 func TestDeregisterSubscriber_ConfirmsTheClaimBeforeRevokingAndDeletesUnderIt(t *testing.T) {
 	t.Run("renews before revoking and bounds the phase", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -3545,13 +3262,10 @@ func TestDeregisterSubscriber_ConfirmsTheClaimBeforeRevokingAndDeletesUnderIt(t 
 	})
 
 	t.Run("a completed deregistration does not report a lost fence", func(t *testing.T) {
-		// The provisioning columns live ON the row, so deleting it takes the claim with it. The
-		// deferred release then matched nothing and reported "the claim expired or was taken
-		// over" — on the one path where the claim's disappearance is the INTENDED outcome.
-		//
-		// That false alarm mattered because the lost-fence signal is the observable half of the
-		// fence: it is how an operator learns an operation ran past its lease. Firing it on
-		// every success is how it stops being read.
+		// The provisioning columns live ON the row, so deleting it takes the claim with it.
+		// The deferred release then matched nothing and reported "the claim expired or was
+		// taken over" — on the one path where the claim's disappearance is the INTENDED
+		// outcome.
 		run := newSubscriberLifecycle(t)
 
 		_, err := run.service.DeregisterSubscriber(context.Background(), subscriberFixtureID)
@@ -3562,16 +3276,8 @@ func TestDeregisterSubscriber_ConfirmsTheClaimBeforeRevokingAndDeletesUnderIt(t 
 	})
 }
 
-// TestRevokeSubscriberCredential_ConfirmsTheClaimAndClearsUnderIt covers the last fenced path.
-//
-// Clearing under an expired lease would blank the record a NEWER issuance had just written,
-// leaving the registry reporting "registered, not yet provisioned" for a subscriber holding a
-// working credential. That is the one direction the clear must never move in: it UNDER-reports
-// access, so nothing downstream has any reason to look at it.
-//
-// It is also the one operation that DELIBERATELY accepts a tombstoned row — revocation takes
-// access away, which is what the tombstone wants, and refusing it would block the only manual
-// remedy for a deregistration whose broker step keeps failing.
+// TestRevokeSubscriberCredential_ConfirmsTheClaimAndClearsUnderIt covers the last
+// fenced path.
 func TestRevokeSubscriberCredential_ConfirmsTheClaimAndClearsUnderIt(t *testing.T) {
 	t.Run("renews before revoking, then clears under the claim", func(t *testing.T) {
 		provisioned := subscriberFixtureRow(t)
@@ -3628,19 +3334,11 @@ func TestRevokeSubscriberCredential_ConfirmsTheClaimAndClearsUnderIt(t *testing.
 // The webhook cutover records both facts or neither
 // ---------------------------------------------------------------------------------------
 
-// TestCompleteWebhookMigration_RecordsBothFactsInOneWrite is the cutover atomicity guard.
+// TestCompleteWebhookMigration_RecordsBothFactsInOneWrite is the cutover atomicity
+// guard.
 //
-// # The stranded row this prevents
-//
-// The cutover used to be two writes with nothing spanning them: clear webhook_url, then stamp
-// migrated_at. The ordering was chosen so a partial failure could not OVER-claim progress, and it
-// did not. What it did was strand the row in a state belonging to NEITHER side of the migration
-// report — no endpoint, so nothing still to migrate from; no instant, so not counted as migrated.
-// The dual-run window then under-reported for as long as it lasted, and the caller was given no
-// way to learn that repeating the request was the remedy.
-//
-// One write is the fix, and the property to assert is not "it succeeds" but that there is no
-// intermediate state to observe: exactly one collaborator call carries the whole cutover.
+// The ordering was chosen so a partial failure could not OVER-claim progress, and it
+// did not.
 func TestCompleteWebhookMigration_RecordsBothFactsInOneWrite(t *testing.T) {
 	legacy := subscriberFixtureRow(t)
 	legacy.WebhookURL = stringPointer("https://acme.example.com/blnk-events")
@@ -3661,18 +3359,19 @@ func TestCompleteWebhookMigration_RecordsBothFactsInOneWrite(t *testing.T) {
 	assert.Nil(t, stored.WebhookURL)
 	require.NotNil(t, stored.MigratedAt)
 
-	// ONE WRITE. This is the assertion the finding is about: two writes with no transaction
-	// between them is exactly the window that stranded the row, so a second write here — of any
-	// kind — reintroduces it.
+	// ONE WRITE. This is the assertion that matters: two writes with no
+	// transaction between them is exactly the window that stranded the row, so a second
+	// write here — of any kind — reintroduces it.
 	assert.Equal(t, []string{"CompleteSubscriberWebhookMigration"}, run.log.only(
 		"CompleteSubscriberWebhookMigration",
 		"UpdateEventSubscriber",
 		"MarkSubscriberMigrated",
 	), "the cutover must be one write, not a clear followed by a stamp")
 
-	// AND NO BROKER WORK, AND NO FENCE. Routing the clear through the authorization update used
-	// to take a provisioning claim and make two Kafka administrative round trips to erase a URL —
-	// neither column it writes has a broker counterpart, so there was nothing to reconcile.
+	// AND NO BROKER WORK, AND NO FENCE. Routing the clear through the authorization update
+	// would take a provisioning claim and make two Kafka administrative round trips to erase
+	// a URL — neither column it writes has a broker counterpart, so there is nothing to
+	// reconcile.
 	assert.Empty(t, run.log.only(
 		"ClaimSubscriberForProvisioning",
 		"RenewSubscriberProvisioningFence",
@@ -3681,12 +3380,11 @@ func TestCompleteWebhookMigration_RecordsBothFactsInOneWrite(t *testing.T) {
 	), "erasing a URL must not fence the subscriber or reach the broker")
 }
 
-// TestCompleteWebhookMigration_LeavesNothingBehindWhenTheWriteFails is the other half: a failed
-// cutover must leave the row on the side it started on.
+// TestCompleteWebhookMigration_LeavesNothingBehindWhenTheWriteFails is the other half:
+// a failed cutover must leave the row on the side it started on.
 //
-// With two writes the failure modes were asymmetric — the first could succeed while the second
-// failed. With one there is only one outcome to check, and checking it is what proves the
-// asymmetry is gone.
+// With two writes the failure modes were asymmetric — the first could succeed while the
+// second failed.
 func TestCompleteWebhookMigration_LeavesNothingBehindWhenTheWriteFails(t *testing.T) {
 	legacy := subscriberFixtureRow(t)
 	legacy.WebhookURL = stringPointer("https://acme.example.com/blnk-events")
@@ -3710,13 +3408,11 @@ func TestCompleteWebhookMigration_LeavesNothingBehindWhenTheWriteFails(t *testin
 	assert.Nil(t, stored.MigratedAt, "and must not claim a migration that did not happen")
 }
 
-// TestCompleteWebhookMigration_IsNotTheSameOperationAsClearingAURL pins the distinction the two
-// operations must keep.
+// TestCompleteWebhookMigration_IsNotTheSameOperationAsClearingAURL pins the distinction
+// the two operations must keep.
 //
-// migrated_at is an AUDIT FACT, so stamping it for a subscriber that has not moved records a
-// false one. An operator correcting a mis-recorded endpoint therefore needs a clear that asserts
-// nothing, and that is what ClearLegacyWebhookSubscription remains — collapsing the two into one
-// operation would make every correction claim a migration.
+// migrated_at is an AUDIT FACT, so stamping it for a subscriber that has not moved
+// records a false one.
 func TestCompleteWebhookMigration_IsNotTheSameOperationAsClearingAURL(t *testing.T) {
 	legacy := subscriberFixtureRow(t)
 	legacy.WebhookURL = stringPointer("https://acme.example.com/mistyped")
@@ -3745,26 +3441,17 @@ func TestCompleteWebhookMigration_RejectsABlankIdentifierBeforeWriting(t *testin
 }
 
 // ---------------------------------------------------------------------------------------
-// SETTLE-01 — a broker-side obligation is DURABLE, not a log line
+// A broker-side obligation is DURABLE, not a log line
 //
-// A subscriber's state lives in two systems that cannot be written atomically. Every
-// intermediate state of the three operations that span both is reachable, and each one used to
-// be recorded as nothing more than a returned error and a log line — some ending in the words
-// "revoke it by hand immediately". A log line is not queryable per subscriber, is not retried,
-// and cannot be alerted on, so the divergence persisted until somebody read the right line.
+// A subscriber's state lives in two systems that cannot be written atomically.
 //
-// The tests below pin the three properties that replace it: the obligation is recorded BEFORE
-// the work that may fail, it is discharged only once the two systems demonstrably agree, and a
-// settlement pass that finds nothing owed does nothing.
+// The tests below pin the three properties that replace it: the obligation is recorded
+// BEFORE the work that may fail, it is discharged only once the two systems
+// demonstrably agree, and a settlement pass that finds nothing owed does nothing.
 // ---------------------------------------------------------------------------------------
 
-// TestUpdateSubscriber_RecordsTheReconciliationObligationBeforeItTouchesTheBroker is the
-// ordering the durability of F5 rests on.
-//
-// The marker must be written FIRST because the failure that matters most cannot write anything:
-// a process that disappears between the prune and the persist leaves nothing behind to record
-// that it was mid-change. Recording after a failure is absent from exactly the case an operator
-// cannot detect any other way.
+// TestUpdateSubscriber_RecordsTheReconciliationObligationBeforeItTouchesTheBroker is
+// the ordering the durability of F5 rests on.
 func TestUpdateSubscriber_RecordsTheReconciliationObligationBeforeItTouchesTheBroker(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -3817,9 +3504,9 @@ func TestUpdateSubscriber_LeavesTheObligationOutstandingWhenTheNarrowingFailed(t
 // TestUpdateSubscriber_LeavesTheObligationOutstandingWhenTheWideningFailed is the other
 // boundary of the same sequence.
 //
-// The row already records the wider authorization here, so the residue is fail-closed — but it
-// is still a divergence, and the marker covers it with the same remedy because the ROW is the
-// source of truth whichever step failed.
+// The row already records the wider authorization here, so the residue is fail-closed —
+// but it is still a divergence, and the marker covers it with the same remedy because
+// the ROW is the source of truth whichever step failed.
 func TestUpdateSubscriber_LeavesTheObligationOutstandingWhenTheWideningFailed(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.admin.failing("GrantSubscriberAccess", errors.New("broker unreachable"))
@@ -3840,8 +3527,8 @@ func TestUpdateSubscriber_LeavesTheObligationOutstandingWhenTheWideningFailed(t 
 // fail-closed half.
 //
 // Proceeding without the marker would produce exactly the state the mechanism exists to
-// prevent — broker work in flight with no durable record that it is — so it is refused rather
-// than logged and continued.
+// prevent — broker work in flight with no durable record that it is — so it is refused
+// rather than logged and continued.
 func TestUpdateSubscriber_RefusesToTouchTheBrokerWhenTheObligationCannotBeRecorded(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.failing("RecordSubscriberGrantReconcilePending",
@@ -3859,9 +3546,8 @@ func TestUpdateSubscriber_RefusesToTouchTheBrokerWhenTheObligationCannotBeRecord
 
 // TestIssueSubscriberCredential_RecordsACleanupObligationWhenCompensationFailed is F6.
 //
-// The credential is live at the broker and its revocation failed, so a principal exists that can
-// authenticate with no authorization boundary. That was previously an ERROR log line and nothing
-// else. It is now a durable obligation a settlement pass will discharge.
+// The credential is live at the broker and its revocation failed, so a principal exists
+// that can authenticate with no authorization boundary.
 func TestIssueSubscriberCredential_RecordsACleanupObligationWhenCompensationFailed(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -3882,12 +3568,8 @@ func TestIssueSubscriberCredential_RecordsACleanupObligationWhenCompensationFail
 		"no issuance was recorded, so the row must not claim one")
 }
 
-// TestIssueSubscriberCredential_ClearsTheRegistryRecordWhenCompensationSucceeded is F13.
-//
-// Provisioning UPSERTS the principal's SCRAM credential, so a re-issue that then failed and
-// compensated destroyed the credential the row named as well as the one it had just written. The
-// row must therefore stop claiming a credential — otherwise the registry reports a provisioned
-// subscriber whose credential authenticates nothing at all.
+// TestIssueSubscriberCredential_ClearsTheRegistryRecordWhenCompensationSucceeded is
+// F13.
 func TestIssueSubscriberCredential_ClearsTheRegistryRecordWhenCompensationSucceeded(t *testing.T) {
 	existing := subscriberFixtureRow(t)
 	reference := "blnk-cred-ref-000000000000000000000000000000000000000000000000000000000000"
@@ -3935,12 +3617,10 @@ func TestIssueSubscriberCredential_RecordsACleanupObligationWhenTheRecordCannotB
 			"rather than a warning waiting to be read")
 }
 
-// TestIssueSubscriberCredential_RecordsNothingWhenTheBrokerWasNotTouched keeps the marker
-// meaningful.
+// TestIssueSubscriberCredential_RecordsNothingWhenTheBrokerWasNotTouched keeps the
+// marker meaningful.
 //
-// A failure that changed no broker state owes nothing. Raising an obligation for every rejected
-// request would put the whole registry into the settlement backlog and drown the two states the
-// marker exists for.
+// A failure that changed no broker state owes nothing.
 func TestIssueSubscriberCredential_RecordsNothingWhenTheBrokerWasNotTouched(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.admin.result = SubscriberProvisioningResult{}
@@ -3957,10 +3637,8 @@ func TestIssueSubscriberCredential_RecordsNothingWhenTheBrokerWasNotTouched(t *t
 // TestIssueSubscriberCredential_DischargesAPendingCleanupOnASuccessfulReissue is the
 // self-satisfying case, and it is the one that would be dangerous to get wrong.
 //
-// Provisioning upserts, so a successful issuance REPLACES whatever credential a pending cleanup
-// was about. Left outstanding, the next settlement pass would revoke the credential that had
-// just been issued and handed to a subscriber — destroying working access on the strength of a
-// marker for a credential that no longer exists.
+// Provisioning upserts, so a successful issuance REPLACES whatever credential a pending
+// cleanup was about.
 func TestIssueSubscriberCredential_DischargesAPendingCleanupOnASuccessfulReissue(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.owing(subscriberFixtureID, false, true)
@@ -4013,12 +3691,8 @@ func TestSettleSubscriber_RevokesAndClearsForACredentialCleanup(t *testing.T) {
 	assert.False(t, run.store.obligationOf(subscriberFixtureID).outstanding())
 }
 
-// TestSettleSubscriber_CleansTheCredentialBeforeItReconcilesTheGrant pins the order between the
-// two remedies.
-//
-// Revocation removes every binding the principal holds — by principal, because the broker's
-// bindings are the union of every grant it has ever held — so reconciling first and revoking
-// second would undo the reconciliation that had just completed.
+// TestSettleSubscriber_CleansTheCredentialBeforeItReconcilesTheGrant pins the order
+// between the two remedies.
 func TestSettleSubscriber_CleansTheCredentialBeforeItReconcilesTheGrant(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.owing(subscriberFixtureID, true, true)
@@ -4037,12 +3711,10 @@ func TestSettleSubscriber_CleansTheCredentialBeforeItReconcilesTheGrant(t *testi
 		"both obligations are discharged when both remedies succeed")
 }
 
-// TestSettleSubscriber_DoesNothingWhenNothingIsOwedAnyMore is why the flags are re-read under
-// the claim.
+// TestSettleSubscriber_DoesNothingWhenNothingIsOwedAnyMore is why the flags are re-read
+// under the claim.
 //
-// A pass finds an obligation, then takes the claim, and time passes in between. A successful
-// re-issuance in that window discharges the cleanup obligation, and acting on the flag the scan
-// returned would revoke a credential that had just been issued.
+// A pass finds an obligation, then takes the claim, and time passes in between.
 func TestSettleSubscriber_DoesNothingWhenNothingIsOwedAnyMore(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -4054,9 +3726,8 @@ func TestSettleSubscriber_DoesNothingWhenNothingIsOwedAnyMore(t *testing.T) {
 
 // TestSettleSubscriber_IsIdempotent is the property retrying rests on.
 //
-// An obligation is discharged only AFTER its remedy returned, so a pass that crashed in between
-// leaves the marker set and this runs again. That is only safe if running it twice produces the
-// same result as running it once.
+// An obligation is discharged only AFTER its remedy returned, so a pass that crashed in
+// between leaves the marker set and this runs again.
 func TestSettleSubscriber_IsIdempotent(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.owing(subscriberFixtureID, true, false)
@@ -4072,12 +3743,7 @@ func TestSettleSubscriber_IsIdempotent(t *testing.T) {
 }
 
 // TestSettleSubscriber_DischargesWithoutReGrantingASubscriberBeingDeregistered is the
-// interaction with AUTH-01.
-//
-// Reconciling the broker TO a tombstoned row would re-create the very grants its deregistration
-// is removing — the exact widening the tombstone predicate exists to prevent. The marker is
-// discharged instead, because the tombstone is itself a durable indexed to-do item; leaving it
-// set would create an obligation no pass could ever satisfy.
+// interaction with REVOKE BEFORE DELETE.
 func TestSettleSubscriber_DischargesWithoutReGrantingASubscriberBeingDeregistered(t *testing.T) {
 	tombstoned := subscriberFixtureRow(t)
 	pending := time.Now().UTC().Add(-time.Minute)
@@ -4107,11 +3773,9 @@ func TestSettleSubscriber_KeepsTheObligationWhenTheRemedyFailed(t *testing.T) {
 		"nothing is discharged on a guess; the obligation survives for the next pass")
 }
 
-// TestSettleSubscriber_TakesTheClaimBeforeItTouchesTheBroker keeps CONC-01 intact.
+// TestSettleSubscriber_TakesTheClaimBeforeItTouchesTheBroker keeps FENCE FIRST intact.
 //
-// Settlement changes broker state, so it must hold the subscriber's claim. A subscriber somebody
-// is actively issuing for is SKIPPED rather than fought over: settling underneath a live
-// issuance would revoke the credential it is in the middle of writing.
+// Settlement changes broker state, so it must hold the subscriber's claim.
 func TestSettleSubscriber_TakesTheClaimBeforeItTouchesTheBroker(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.owing(subscriberFixtureID, true, false)
@@ -4149,31 +3813,14 @@ func TestSettleSubscriber_SkipsASubscriberAnotherOperationHolds(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// C-03 / C-08 / C-22 — the legacy webhook record is one transition, and it touches no broker
+// The legacy webhook record is one transition, and it touches no broker
 // ---------------------------------------------------------------------------------------
 
 // TestRecordLegacyWebhookSubscription_ClearsTheMigrationAndTouchesNoBroker covers both
 // halves of what changed about recording a URL.
 //
-// # C-03: the two columns are one fact
-//
-// webhook_url says "receives legacy pushes at this address"; migrated_at says "no longer
-// receives legacy pushes". A row holding both asserts the opposite of itself, and every
-// reader of the registry then disagrees about it — the migration report counts it done, the
-// retention purge treats the address as forgettable, and an operator sees a live endpoint on
-// a subscriber that has supposedly finished.
-//
-// Recording used to go through UpdateSubscriber, which writes webhook_url and leaves
-// migrated_at exactly as it was. So correcting an already-migrated subscriber's endpoint —
-// the very thing the column exists to allow — produced that row silently.
-//
-// # C-22: it changes no authorization, so it must contact no broker
-//
-// UpdateSubscriber also reconciles ACL bindings around its write. Recording a URL changes no
-// authorization, so every one of those round trips was work with no possible effect and each
-// was a way for the call to fail for an unrelated reason: a broker outage answered 503 and a
-// concurrent issuance holding the fence answered 409, neither documented, for a request that
-// only ever wanted to write migration metadata.
+// webhook_url says "receives legacy pushes at this address"; migrated_at says "no
+// longer receives legacy pushes".
 func TestRecordLegacyWebhookSubscription_ClearsTheMigrationAndTouchesNoBroker(t *testing.T) {
 	migrated := time.Now().UTC().Add(-24 * time.Hour)
 
@@ -4183,11 +3830,11 @@ func TestRecordLegacyWebhookSubscription_ClearsTheMigrationAndTouchesNoBroker(t 
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
-	// INSIDE THE DUAL-RUN WINDOW. Recording an endpoint is refused past the retirement instant
-	// — TestRecordLegacyWebhookSubscription_IsRefusedAfterTheSunset is that half — and the
-	// fixture's configuration carries a transport with no sunset date, which resolves
-	// fail-closed to "retired". A future instant is what makes this subtest about the row it
-	// writes rather than about the sunset.
+	// INSIDE THE DUAL-RUN WINDOW. Recording an endpoint is refused past the retirement
+	// instant — TestRecordLegacyWebhookSubscription_IsRefusedAfterTheSunset is that half —
+	// and the fixture's configuration carries a transport with no sunset date, which
+	// resolves fail-closed to "retired". A future instant is what makes this subtest about
+	// the row it writes rather than about the sunset.
 	subscriberSunsetConfiguration(t, time.Now().Add(24*time.Hour))
 
 	updated, err := service.RecordLegacyWebhookSubscription(
@@ -4250,19 +3897,10 @@ func TestRecordLegacyWebhookSubscription_RefusesABlankURL(t *testing.T) {
 	}
 }
 
-// TestCompleteWebhookMigration_RetiresTheURLAndStampsTheInstantTogether is C-08.
+// TestCompleteWebhookMigration_RetiresTheURLAndStampsTheInstantTogether is the migration-stamp pairing.
 //
-// # The defect
-//
-// DELETE /subscribers/:id/webhook-subscription made TWO service calls: clear the URL, then
-// stamp the instant. No transaction spans two service calls, so between them the row is
-// either migrated with a live URL or unmigrated with none — and a failure landing in that gap
-// makes the wrong state PERMANENT, with nothing to indicate a row needs repairing. Choosing
-// the ordering only decided which wrong state was left behind.
-//
-// The first of the two also went through UpdateSubscriber, so a broker outage or a
-// provisioning fence conflict could fail it and leave exactly that residue for reasons with
-// nothing to do with migration.
+// DELETE /subscribers/:id/webhook-subscription made TWO service calls: clear the URL,
+// then stamp the instant.
 func TestCompleteWebhookMigration_RetiresTheURLAndStampsTheInstantTogether(t *testing.T) {
 	endpoint := "https://hooks.example.com/blnk"
 
@@ -4289,7 +3927,7 @@ func TestCompleteWebhookMigration_RetiresTheURLAndStampsTheInstantTogether(t *te
 	assert.Equal(t, *migrated.MigratedAt, *stored.MigratedAt,
 		"the instant recorded is the instant reported, so a caller's log and the row agree")
 
-	// ONE call. This is the assertion the finding is about: two calls cannot be atomic
+	// ONE call. This is the assertion that matters: two calls cannot be atomic
 	// however they are ordered.
 	assert.Equal(t, 1, run.log.count("CompleteSubscriberWebhookMigration"))
 	assert.Zero(t, run.log.count("ClearSubscriberWebhookURL"),
@@ -4303,13 +3941,10 @@ func TestCompleteWebhookMigration_RetiresTheURLAndStampsTheInstantTogether(t *te
 	assert.Zero(t, run.log.count("ClaimSubscriberForProvisioning"))
 }
 
-// TestCompleteWebhookMigration_IsSafeToRepeat is what makes the atomic form usable after a
-// failure.
+// TestCompleteWebhookMigration_IsSafeToRepeat is what makes the atomic form usable
+// after a failure.
 //
-// A caller whose request failed for any reason must be able to repeat it. Re-completing an
-// already-migrated subscriber moves the timestamp forward rather than failing, so "retry the
-// same request" is always the correct advice — which it could not be if the second attempt
-// reported a conflict.
+// A caller whose request failed for any reason must be able to repeat it.
 func TestCompleteWebhookMigration_IsSafeToRepeat(t *testing.T) {
 	endpoint := "https://hooks.example.com/blnk"
 
@@ -4331,13 +3966,11 @@ func TestCompleteWebhookMigration_IsSafeToRepeat(t *testing.T) {
 		"and it moves the instant forward rather than back")
 }
 
-// TestClearLegacyWebhookSubscription_ForgetsTheURLWithoutClaimingAMigration keeps the two
-// erasures distinct.
+// TestClearLegacyWebhookSubscription_ForgetsTheURLWithoutClaimingAMigration keeps the
+// two erasures distinct.
 //
-// Forgetting an address — for an erasure request, or ahead of the retention purge — is NOT
-// evidence that a subscriber moved to Kafka. Conflating the two would have migration-progress
-// reports counting migrations that never happened, which is the reporting error hardest to
-// notice because it makes the numbers look better.
+// Forgetting an address — for an erasure request, or ahead of the retention purge — is
+// NOT evidence that a subscriber moved to Kafka.
 func TestClearLegacyWebhookSubscription_ForgetsTheURLWithoutClaimingAMigration(t *testing.T) {
 	endpoint := "https://hooks.example.com/blnk"
 
@@ -4367,12 +4000,11 @@ func TestClearLegacyWebhookSubscription_ForgetsTheURLWithoutClaimingAMigration(t
 	assert.Zero(t, run.log.count("GrantSubscriberAccess"))
 }
 
-// TestClearLegacyWebhookSubscription_PreservesAnExistingMigrationInstant is the other side of
-// the same distinction.
+// TestClearLegacyWebhookSubscription_PreservesAnExistingMigrationInstant is the other
+// side of the same distinction.
 //
-// migrated_at is an audit fact about this deployment, and forgetting a third-party address
-// does not change whether the subscriber migrated. It is also never purged, so a clear that
-// erased it would destroy the only record of a completed migration.
+// migrated_at is an audit fact about this deployment, and forgetting a third-party
+// address does not change whether the subscriber migrated.
 func TestClearLegacyWebhookSubscription_PreservesAnExistingMigrationInstant(t *testing.T) {
 	migrated := time.Now().UTC().Add(-48 * time.Hour)
 
@@ -4390,23 +4022,10 @@ func TestClearLegacyWebhookSubscription_PreservesAnExistingMigrationInstant(t *t
 	assert.Equal(t, migrated, *updated.MigratedAt)
 }
 
-// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURL pins the narrow form's boundary.
+// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURL pins the narrow form's
+// boundary.
 //
-// MarkSubscriberMigrated stamps migrated_at ALONE, which is correct for a subscriber that
-// never had an endpoint recorded — an onboarding completed entirely on Kafka, the ordinary
-// case after the cutover. On a row that still holds a URL it would write the
-// self-contradicting state, so the repository's statement refuses it — `AND webhook_url IS
-// NULL`, answered as ErrGenConflict — and the registry double mirrors that refusal.
-//
-// The point of asserting the refusal rather than avoiding the call: this method remains
-// exported and reachable, so what stops it corrupting a row is the refusal at the write, not
-// a convention about which method to call.
-//
-// The refusal is enforced in the repository and NOT by a schema CHECK. That matters to this
-// test's honesty: the double used to cite a constraint that does not exist, which made this
-// assertion pass against a fake stricter than PostgreSQL. See
-// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository in
-// database/event_subscriber_test.go, which pins the statement itself.
+// The refusal is enforced in the repository and NOT by a schema CHECK.
 func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURL(t *testing.T) {
 	endpoint := "https://hooks.example.com/blnk"
 
@@ -4435,8 +4054,8 @@ func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURL(t *testing.T) {
 // TestMarkSubscriberMigrated_StampsASubscriberThatNeverHadAURL is the narrow form's
 // legitimate use, and it must keep working.
 //
-// After the cutover this is the ordinary case: a subscriber onboarded directly onto Kafka has
-// nothing to retire, and stamping alone is the whole transition.
+// After the cutover this is the ordinary case: a subscriber onboarded directly onto
+// Kafka has nothing to retire, and stamping alone is the whole transition.
 func TestMarkSubscriberMigrated_StampsASubscriberThatNeverHadAURL(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -4450,13 +4069,10 @@ func TestMarkSubscriberMigrated_StampsASubscriberThatNeverHadAURL(t *testing.T) 
 	assert.Nil(t, stored.WebhookURL)
 }
 
-// reconciliation reports the authorization each half of every reconciliation OBSERVED, oldest
-// first.
+// reconciliation reports the authorization each half of every reconciliation OBSERVED,
+// oldest first.
 //
-// It is how "the boundary did not move" is asserted. The double returns fixed binding counts, so
-// counting calls proves nothing about the grant; what does prove it is that both halves saw the
-// same topic set the row already held, which means the broker was asked for the boundary it
-// already had.
+// It is how "the boundary did not move" is asserted.
 //
 // Returns:
 //   - pruned [][]string: the topic set PruneSubscriberAccess saw on each call.
@@ -4468,15 +4084,11 @@ func (a *subscriberTestAdmin) reconciliation() (pruned, granted [][]string) {
 	return append([][]string(nil), a.pruned...), append([][]string(nil), a.granted...)
 }
 
-// TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNotEnforced is the
-// first half of C-02: the mandatory capability is available for every registry state the schema
-// can hold.
+// TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNotEnforced
+// is the first half of STATED SCOPE: the mandatory capability is available for every registry
+// state the schema can hold.
 //
-// The assertions divide in two, and both halves matter. The credential must be REAL — a password,
-// an issuance instant, a broker round trip, a recorded reference — because a response that looks
-// like a credential but carries no secret is the dead end this replaced. And it must be
-// ACCOMPANIED by the prefix it does not enforce, because a credential handed over with the prefix
-// silently dropped would let its holder infer that the broker applied the narrowing for it.
+// The assertions divide in two, and both halves matter.
 func TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNotEnforced(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -4484,8 +4096,8 @@ func TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNo
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
-	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
-	// without one, issuance and a prefix-recording update both fail closed with
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record
+	// keys: without one, issuance and a prefix-recording update both fail closed with
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
 	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
 	enforceKeyScopeGateway(t)
@@ -4519,14 +4131,8 @@ func TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNo
 			"nor pretends the broker adopted it")
 }
 
-// TestIssueSubscriberCredential_CarriesNoPrefixWhenTheRowRecordsNone is the negative half, and
-// the mutant it kills is the one that matters most.
-//
-// The response's transport fields are DERIVED from this one — gateway_delivery_required,
-// broker_record_access and partition_key_scope_state all read it — so a credential that carried a
-// prefix unconditionally would tell every subscriber to dial a key-authorising component instead of
-// the broker, and a client that always has to be redirected learns nothing from the field and stops
-// reading it. The instruction is only worth stating because it is sometimes absent.
+// TestIssueSubscriberCredential_CarriesNoPrefixWhenTheRowRecordsNone is the negative
+// half, and the mutant it kills is the one that matters most.
 func TestIssueSubscriberCredential_CarriesNoPrefixWhenTheRowRecordsNone(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -4539,30 +4145,9 @@ func TestIssueSubscriberCredential_CarriesNoPrefixWhenTheRowRecordsNone(t *testi
 			"an obligation the registry never recorded")
 }
 
-// TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDeclares is the
-// CANONICAL test for the clearing transition, and it exists because clearing means two different
-// things in the two deployments Blnk supports.
-//
-// # Where nothing enforces the scope, clearing is the documented remedy
-//
-// A row recording a prefix in a deployment with no key-authorising component cannot be issued to
-// at all: SUBSCRIBER_KEY_SCOPE_UNENFORCED, whose first named remedy is to clear the prefix. So
-// clearing has to work there, and issuance has to work after it — otherwise the refusal names a
-// remedy that does not resolve it, which is a dead end dressed as guidance.
-//
-// # Where the deployment declares a key-scoped model, clearing is REFUSED (SEC-01)
-//
-// This is the third order the unscoped-credential state is reachable from, and the only one the
-// issuance guard cannot see: record a prefix, take a credential, clear the prefix. Issuance never
-// runs again, and the update's own reconciliation WIDENS the live principal from Describe to
-// whole-topic Read — a subscriber in a tenant-scoped deployment reading every ledger, reached by
-// three ordinary API calls with nothing refusing any of them.
-//
-// Both halves are asserted here rather than in two tests because the interesting failure is the
-// ASYMMETRY: a guard that refused clearing everywhere would break the remedy above, and one that
-// permitted it everywhere is the hole. The state after each is asserted too — the row and the
-// credential — since a refusal that half-applied the update would leave the registry describing
-// something the broker does not.
+// TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDeclares is
+// the CANONICAL test for the clearing transition, and it exists because clearing means
+// two different things in the two deployments Blnk supports.
 func TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDeclares(t *testing.T) {
 	t.Run("cleared where nothing enforces the scope, and issuance works after it", func(t *testing.T) {
 		row := subscriberFixtureRow(t)
@@ -4652,32 +4237,20 @@ func TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDe
 }
 
 // ---------------------------------------------------------------------------------------
-// SEC-01 — a declared key-scoped model must hold for EVERY credential, and the component
-// that enforces it must be verified rather than trusted
+// A declared key-scoped model must hold for EVERY credential, and the component that
+// enforces it must be verified rather than trusted
 // ---------------------------------------------------------------------------------------
 
-// TestIssueSubscriberCredential_RefusesAPrefixLessSubscriberUnderADeclaredKeyScopedModel is the
-// hole SEC-01 named, closed.
+// TestIssueSubscriberCredential_RefusesAPrefixLessSubscriberUnderADeclaredKeyScopedModel
+// closes the hole a declared-but-unattested key scope leaves.
 //
-// # The hole
+// Withholding topic Read from key-scoped principals made THOSE subscribers safe and
+// said nothing about the subscriber registered without a prefix.
 //
-// Withholding topic Read from key-scoped principals made THOSE subscribers safe and said nothing
-// about the subscriber registered without a prefix. That one is granted literal topic Read on
-// every topic it is authorised for — every ledger's records on a shared category topic — in a
-// deployment whose entire declared model is that a subscriber sees only its own. One prefix-less
-// registration was the single credential that escaped the model, and it is the DEFAULT shape of
-// the DTO, where partition_key_prefix is optional. Nothing refused it and nothing recorded that
-// anything unusual had happened.
-//
-// # What the refusal has to be
-//
-// Typed, 409, and carrying every remedy — record the prefix, provision a whole-topic consumer as
-// an operator-managed principal outside the registry, or stop declaring the key-scoped model. A
-// per-subscriber opt-out is deliberately NOT among them: that is the same hole with a field name.
-//
-// And free of residue. The assertions below check the broker was never asked and nothing was
-// recorded, because a refusal that minted a SCRAM credential on its way out has already created
-// the access it declined to hand over.
+// Typed, 409, and carrying every remedy — record the prefix, provision a whole-topic
+// consumer as an operator-managed principal outside the registry, or stop declaring the
+// key-scoped model. A per-subscriber opt-out is deliberately NOT among them: that is
+// the same hole with a field name.
 func TestIssueSubscriberCredential_RefusesAPrefixLessSubscriberUnderADeclaredKeyScopedModel(
 	t *testing.T,
 ) {
@@ -4725,26 +4298,11 @@ func TestIssueSubscriberCredential_RefusesAPrefixLessSubscriberUnderADeclaredKey
 		"the row must be exactly as it was: the refusal is a decision, not a partial issuance")
 }
 
-// TestIssueSubscriberCredential_RequiresASecureDeploymentToDeclareItsAccessModel pins the second
-// half of SEC-01: whole-topic subscriber access is legitimate, and being the DEFAULT is not.
+// TestIssueSubscriberCredential_RequiresASecureDeploymentToDeclareItsAccessModel pins
+// the second half of whole-topic subscriber access is legitimate, and being the DEFAULT
+// is not.
 //
-// # Why this is not a claim that whole-topic access is a defect
-//
-// It is the access model the requirement mandates — category topics, no per-tenant topics, an
-// authorizer with no message-key dimension. For a single-tenant ledger or a trusted internal
-// consumer, a credential that reads every record on `blnk.transactions` is exactly right.
-//
-// What was wrong is that it was reached by configuring NOTHING. A deployment that had never
-// considered tenancy got the widest credential Blnk can issue, and every artefact described that
-// accurately — the row, the response, the runbook — while no human had decided it. Documented is
-// not decided.
-//
-// # Why only in secure mode, asserted here rather than assumed
-//
-// Server.Secure is this repository's production signal, and the third subtest is what keeps the
-// local stack, both compose files and this entire suite working: outside secure mode nothing
-// changes. Without that subtest the declaration would be indistinguishable from a hard
-// requirement, which is the version of this change that breaks `make run`.
+// What was wrong is that it was reached by configuring NOTHING.
 func TestIssueSubscriberCredential_RequiresASecureDeploymentToDeclareItsAccessModel(t *testing.T) {
 	secureConfiguration := func(t *testing.T, acknowledged bool) {
 		t.Helper()
@@ -4816,26 +4374,10 @@ func TestIssueSubscriberCredential_RequiresASecureDeploymentToDeclareItsAccessMo
 	})
 }
 
-// TestIssueSubscriberCredential_RefusesAKeyScopeTheDeclaredGatewayWillNotConfirm is the third half
-// of SEC-01, and the one that turns a declaration into a verified fact.
+// TestIssueSubscriberCredential_RefusesAKeyScopeTheDeclaredGatewayWillNotConfirm is the
+// third half of the attestation rule, and the one that turns a declaration into a verified fact.
 //
-// # What "declared" used to mean
-//
-// Two configuration values: a mode, and a bootstrap list different from the brokers. Blnk can
-// verify neither. Any address satisfied them, so a deployment could name a component that did not
-// exist, was unreachable, enforced a WIDER prefix than the registry recorded, or enforced nothing
-// at all — and Blnk would mint a credential whose response declared an enforced key boundary and
-// whose ACLs deliberately withheld topic Read on the strength of it. The subscriber would then be
-// unable to read anything while believing itself isolated, or reading everything while believing
-// itself scoped, depending on which way the component was wrong.
-//
-// # What it means now
-//
-// Issuance BINDS the exact recorded prefix at the component's control endpoint over an
-// authenticated call and requires the component to attest that exact binding back. The subtests
-// below are the ways a component can be wrong, and each must produce a refusal with no residue —
-// asserted at the SERVICE layer here, because the client-level conformance cases live in
-// event_keyscope_gateway_test.go and cannot see whether a secret was minted or a row was written.
+// Two configuration values: a mode, and a bootstrap list different from the brokers.
 func TestIssueSubscriberCredential_RefusesAKeyScopeTheDeclaredGatewayWillNotConfirm(t *testing.T) {
 	keyScopedRun := func(t *testing.T) (*subscriberLifecycle, *keyScopeGatewayDouble) {
 		t.Helper()
@@ -4898,16 +4440,14 @@ func TestIssueSubscriberCredential_RefusesAKeyScopeTheDeclaredGatewayWillNotConf
 	})
 }
 
-// TestIssueSubscriberCredential_AttestsTheExactBindingBeforeMintingASecret is the positive case,
-// and it asserts the two properties the refusals above cannot: WHAT was bound, and WHEN.
+// TestIssueSubscriberCredential_AttestsTheExactBindingBeforeMintingASecret is the
+// positive case, and it asserts the two properties the refusals above cannot: WHAT was
+// bound, and WHEN.
 //
-// What: the component must be told the principal, the exact stored prefix, the authorised topics
-// and the consumer group. A bind carrying less than that cannot be enforced against — a component
-// that knows a prefix but not which principal it belongs to enforces it for everybody or nobody.
+// What: the component must be told the principal, the exact stored prefix, the
+// authorised topics and the consumer group.
 //
-// When: BEFORE the secret is generated and before the broker is asked for anything. That ordering
-// is the whole reason the refusals leave no residue, and it is invisible in a test that only
-// checks the happy path succeeded.
+// When: BEFORE the secret is generated and before the broker is asked for anything.
 func TestIssueSubscriberCredential_AttestsTheExactBindingBeforeMintingASecret(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -4938,19 +4478,10 @@ func TestIssueSubscriberCredential_AttestsTheExactBindingBeforeMintingASecret(t 
 	assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement)
 }
 
-// TestDeregisterSubscriber_WithdrawsTheKeyScopeBindingItRegistered closes the lifecycle.
+// TestDeregisterSubscriber_WithdrawsTheKeyScopeBindingItRegistered closes the
+// lifecycle.
 //
-// A bind with no withdrawal accumulates entries for principals that no longer exist, and the next
-// subscriber to be issued the same principal name — which is derived from the subscriber ID, so
-// re-registering one reuses it — would inherit a stale prefix nobody chose. Revocation is what
-// makes the binding table a description of the present rather than of everything that ever
-// happened.
-//
-// It runs AFTER the broker revocation and it is NOT allowed to fail the deregistration. By the
-// time it runs the principal can no longer authenticate anywhere the credential was accepted, the
-// component included, so a failure here leaves no access behind — only a stale row in a table. An
-// operator blocked from removing a subscriber because a component is unreachable would be paying
-// a real cost for a hygiene task.
+// It runs AFTER the broker revocation and it is NOT allowed to fail the deregistration.
 func TestDeregisterSubscriber_WithdrawsTheKeyScopeBindingItRegistered(t *testing.T) {
 	t.Run("the binding is withdrawn", func(t *testing.T) {
 		row := subscriberProvisionedRow(t)
@@ -5003,33 +4534,16 @@ func TestDeregisterSubscriber_WithdrawsTheKeyScopeBindingItRegistered(t *testing
 	})
 }
 
-// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant is the reverse
-// ordering, and it is the one that used to be refused outright.
+// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant is
+// the reverse ordering, and it is accepted rather than refused outright.
 //
-// # Why acceptance is correct here, and what acceptance now has to DO
-//
-// The refusal existed to prevent a state it described as dangerous, and it was right about the
-// danger: a live credential holding record-level Read on whole topics beneath a row announcing a
-// narrower boundary. Refusing the update did not remove that credential's Read, though — it only
-// stopped the registry from recording the operator's intent, leaving the wide grant in place and
-// undocumented.
-//
-// Accepting the update is correct BECAUSE it is the act that narrows the grant. Crossing from
-// "no prefix" to "a prefix" moves every authorised topic from Read+Describe to Describe alone,
-// so the update has to reach the broker and reconcile, and when it does the existing credential
-// loses exactly the access the row no longer describes.
-//
-// What this test pins is that both halves happen: the registry records the prefix AND the broker
-// is brought to the narrower binding set. A test that only asserted "no error" would not
-// distinguish this from the update recording an intent nothing acts on — which is the state the
-// original refusal was written against, and which acceptance without reconciliation would
-// recreate exactly.
+// Accepting the update is correct BECAUSE it is the act that narrows the grant.
 func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	store, service := run.store, run.service
 
-	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
-	// without one, issuance and a prefix-recording update both fail closed with
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record
+	// keys: without one, issuance and a prefix-recording update both fail closed with
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
 	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
 	enforceKeyScopeGateway(t)
@@ -5059,14 +4573,8 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheG
 
 	assert.Positive(t, run.log.count("UpdateEventSubscriber"), "the registry row changes")
 
-	// THE BOUNDARY MOVED, so the broker was asked — and it was asked for the topics the row
-	// holds, on both halves.
-	//
-	// This is the assertion the acceptance path turns on. A key scope has no ACL of its own, but
-	// its PRESENCE decides the shape of every topic binding, so an update that crossed into it
-	// without reconciling would record a narrowing that never happened. Prune-then-grant is how
-	// the withdrawal is applied: the prune removes the bindings the wide grant held, the grant
-	// re-creates the Describe-only set (ADMIN-02).
+	// THE BOUNDARY MOVED, so the broker was asked — and it was asked for the topics the
+	// row holds, on both halves.
 	pruned, granted := run.admin.reconciliation()
 	require.Len(t, pruned, 1, "recording a key scope must reach the broker exactly once")
 	require.Len(t, granted, 1)
@@ -5082,10 +4590,10 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheG
 	assert.False(t, store.fenced(subscriberFixtureID),
 		"and the provisioning claim it took to reconcile the broker is released")
 
-	// REVOCATION IS STILL AVAILABLE, and recording the prefix again afterwards still works. This
-	// is not a remedy for a refusal — there is none to remedy — but it is the transition an
-	// operator who would rather drop the credential than narrow it takes, and a row carrying a
-	// prefix must not become a state that can only be left.
+	// REVOCATION IS STILL AVAILABLE, and recording the prefix again afterwards still
+	// works. This is not a remedy for a refusal — there is none to remedy — but it is the
+	// transition an operator who would rather drop the credential than narrow it takes,
+	// and a row carrying a prefix must not become a state that can only be left.
 	require.NoError(t, service.RevokeSubscriberCredential(context.Background(), subscriberFixtureID),
 		"a key-scoped row must still be able to give up its credential")
 
@@ -5097,25 +4605,11 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheG
 	assert.Equal(t, prefix, *revoked.PartitionKeyPrefix)
 }
 
-// TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable is the completeness check on the state
-// space: which transitions are open, and that no state is a dead end.
+// TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable is the completeness check on
+// the state space: which transitions are open, and that no state is a dead end.
 //
-// Enumerating them in one place is what stops the two guards drifting into either of the failures
-// this area has already had. One is a HOLE: a decision taken at issuance and not at update, so a
-// state is reachable by approaching it from the far side — which is why requireProvisionableKeyScope
-// and requireRecordableKeyScope must answer the same question the same way, and why they are given
-// the SAME enforcement fact, read once. The other is a DEAD END: a row that can neither obtain a
-// credential nor be edited back into a state that can, which is what a blanket refusal of the
-// prefix-plus-credential combination produced — it made requirement R-7's credential endpoint
-// permanently unusable for exactly the subscribers the key scope exists for.
-//
-// The rule the four cases below establish, for THIS binary, which links the subscriber stream
-// gateway in: a partition key prefix and a credential MAY coexist, because the prefix is enforced
-// — the credential holds Describe and no Read on its topics and the gateway delivers the records
-// key-filtered — so both orderings are open and either half can still be given up. The fail-closed
-// floor beneath it, for a deployment where nothing enforces the scope, is asserted separately by
-// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope and
-// TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard.
+// Enumerating them in one place is what stops the two guards drifting into either of
+// the failures this area has already had.
 func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 	t.Run("a key scope on a subscriber with no credential is accepted", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -5132,11 +4626,10 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 		require.NotNil(t, updated.PartitionKeyPrefix)
 		assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
 
-		// And the state it produces IS ISSUABLE, because a component is declared above. This is the
-		// half a blanket refusal got wrong: it withheld the credential unconditionally, so the third
-		// dimension of requirement R-7's access model had no working path even where an operator had
-		// stood up something to keep it. What makes issuance safe here is that the credential is not
-		// topic-wide — record-level Read is withheld, and the declared component is the only path.
+		// And the state it produces IS ISSUABLE, because a component is declared above. This
+		// is the half a blanket refusal got wrong: it withheld the credential
+		// unconditionally, so the third dimension of the requirement access model had no
+		// working path even where an operator had stood up something to keep it.
 		credential, issueErr := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 		require.NoError(t, issueErr,
 			"a key-scoped row must be issuable: the credential is narrowed rather than withheld")
@@ -5221,44 +4714,34 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 	})
 }
 
-// THE SUBSCRIBER-FACING BROKER LIST IS REQUIRED FOR ISSUANCE, AND IT HAS BEEN BOTH THINGS.
+// THE SUBSCRIBER-FACING BROKER LIST IS REQUIRED FOR ISSUANCE, AND IT HAS BEEN BOTH
+// THINGS.
 //
 // A test asserting the 503 sat here, was replaced by one asserting a warned FALLBACK to
-// KAFKA_BROKERS, and the refusal has now been restored. The reasoning that produced each turn is
-// worth keeping, because both objections are real:
+// KAFKA_BROKERS, and the refusal has now been restored. The reasoning that produced
+// each turn is worth keeping, because both objections are real:
 //
-//   - AGAINST REQUIRING IT: requirement R-10 describes EIGHT configuration variables, so a ninth
-//     prerequisite means a deployment configured exactly as documented can publish every event and
-//     still be refused every credential.
-//   - AGAINST THE FALLBACK: KAFKA_BROKERS holds the addresses BLNK dials, which inside a deployment
-//     do not resolve for a subscriber outside it. The warning landed in Blnk's log while the
-//     consequence landed on the subscriber, and because the secret is shown once, diagnosing it
-//     costs a reissue.
-//
-// What resolves both: the refusal, plus a documented one-line remedy for the in-cluster case — set
-// KAFKA_SUBSCRIBER_BROKERS to the same value as KAFKA_BROKERS, which makes the claim explicit
-// rather than implicit in a substitution nobody reads. R-10's eight variables remain sufficient to
-// PUBLISH; only the endpoint whose entire output is a third-party address needs the ninth.
+//   - AGAINST REQUIRING IT: the requirement describes EIGHT configuration variables, so
+//     a ninth prerequisite means a deployment configured exactly as documented can
+//     publish every event and still be refused every credential.
+//   - AGAINST THE FALLBACK: KAFKA_BROKERS holds the addresses BLNK dials, which inside
+//     a deployment do not resolve for a subscriber outside it.
 //
 // The behaviour now lives in three tests, none of them contradicting another:
 //
-//   - TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList, below, for the
-//     refusal, the variable named in the message, the absence of residue, and the remedy working.
-//   - TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll, above, for the case
-//     where NEITHER list is set, meaning no Kafka at all.
-//   - TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers, above, for the success case
-//     and for the two lists being held apart.
+//   - TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList, below,
+//     for the refusal, the variable named in the message, the absence of residue, and
+//     the remedy working.
+//   - TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll, above,
+//     for the case where NEITHER list is set, meaning no Kafka at all.
+//   - TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers, above, for the
+//     success case and for the two lists being held apart.
 
-// TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent pins the two functions that decide, together,
-// what a credential response says about the key boundary.
+// TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent pins the two functions that decide,
+// together, what a credential response says about the key boundary.
 //
 // subscriberKeyPrefix resolves the value the response carries and
-// RequiresGatewayDelivery decides whether an obligation is declared at all. They must
-// agree on every representation of "nothing recorded", because a column holding only spaces is
-// not a recorded intent: reading it as present would tell a subscriber it owns a filtering
-// obligation over a value that means nothing, and it would put that whitespace in the response as
-// the prefix to filter on. NULL, the empty string and whitespace therefore all have to answer the
-// same way.
+// RequiresGatewayDelivery decides whether an obligation is declared at all.
 func TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent(t *testing.T) {
 	for name, prefix := range map[string]*string{
 		"null":       nil,
@@ -5306,12 +4789,11 @@ func TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent(t *testing.T) {
 	})
 }
 
-// requireFenceLocked reproduces the ownership predicate every fenced write carries in SQL.
+// requireFenceLocked reproduces the ownership predicate every fenced write carries in
+// SQL.
 //
-// The production statements test `provisioning_token = $n AND provisioning_until > NOW()` inside
-// the write itself. A double that ignored the token would let every fence assertion pass whether
-// or not the predicate existed, which is precisely what these tests are for. The caller must
-// already hold s.mu.
+// The production statements test `provisioning_token = $n AND provisioning_until >
+// NOW()` inside the write itself.
 func (s *subscriberTestStore) requireFenceLocked(subscriberID, token, operation string) error {
 	trimmed := strings.TrimSpace(token)
 	if trimmed == "" {
@@ -5325,10 +4807,10 @@ func (s *subscriberTestStore) requireFenceLocked(subscriberID, token, operation 
 	if !ok || held.token != trimmed || !held.until.After(time.Now()) {
 		// THE CLIENT MESSAGE database.fencedWriteMissError produces, and the DETAIL carries
 		// subscriberFenceLostMarker because subscriberFenceWasLost matches on it — a generic
-		// conflict here would exercise the wrong branch, and a message the repository no longer
-		// returns would make a test that reads the message pass against a double and fail against
-		// the database. The release and renewal statements answer with the same sentence up to
-		// its final clause, so this one string serves all three sites.
+		// conflict here would exercise the wrong branch, and a message the repository no
+		// longer returns would make a test that reads the message pass against a double and
+		// fail against the database. The release and renewal statements answer with the same
+		// sentence up to its final clause, so this one string serves all three sites.
 		return apierror.NewAPIError(apierror.ErrConflict,
 			"The subscriber provisioning claim is no longer held by this caller, so the change was not applied",
 			fmt.Errorf("subscriber %q: the provisioning claim was no longer held while %s, so the "+
@@ -5397,37 +4879,15 @@ func (s *subscriberTestStore) MarkSubscriberRevocationFailed(
 // TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved pins the
 // availability property of an authorization-preserving edit.
 //
-// Every update made two administrative round trips — prune, then grant — regardless of what it
-// changed, and FAILED when they did not answer. Prune and grant exist to move the broker-side
-// boundary; a rename cannot move it, and neither can recording or clearing the legacy webhook URL
-// the dual-run window exists to migrate away from. So a piece of deprecated migration metadata
-// was coupled to Kafka's availability: an operator recording where a subscriber's webhook used to
-// point could not do so while the broker was down, for no reason the data justified.
+// Every update made two administrative round trips — prune, then grant — regardless of
+// what it changed, and FAILED when they did not answer.
 //
-// # Why the failing broker is the assertion
+// Both administrative methods are made to fail.
 //
-// Both administrative methods are made to fail. A skip is then not a matter of counting calls
-// that might be optimised away later — the update either does not touch the broker, or it fails.
-// The call log is asserted as well, so a change that started making the calls again but tolerated
-// their failure would still be caught.
+// A comparison alone would call that "unchanged" and skip.
 //
-// # Why an explicitly supplied topic list ALWAYS reconciles, even when it is identical
-//
-// A comparison alone would call that "unchanged" and skip. That breaks the documented recovery:
-// when an earlier update persisted the row and then failed at the grant step, the stored
-// authorization already EQUALS the desired one while the broker is still missing the widening, so
-// skipping would strand the subscriber permanently one step short of correct. An explicit field
-// is a re-apply instruction, not a no-op.
-//
-// # Why a key scope is on the OTHER side of this line, and its value is not
-//
-// The saving this test protects has one boundary that is easy to draw in the wrong place. A
-// prefix has no ACL of its own, so REPLACING one prefix with another is genuinely inert and is
-// skipped. But its PRESENCE decides whether each authorised topic carries Read: a key-scoped
-// subscriber holds Describe alone. Crossing the line in either direction therefore moves real
-// bindings, and the subtests below pin both directions — including that clearing a scope, which
-// re-grants record access, FAILS when the broker cannot be reached, so the registry never records
-// a widening that was not applied.
+// The saving this test protects has one boundary that is easy to draw in the wrong
+// place.
 func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved(t *testing.T) {
 	renamed := "renamed by an operator"
 	legacyURL := "https://subscriber.example.com/blnk-events"
@@ -5475,8 +4935,8 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 
 	t.Run("an explicitly supplied identical grant still reconciles", func(t *testing.T) {
 		// This is the retry that completes an update which persisted and then failed at the
-		// grant step. The stored authorization already equals the desired one, so a comparison
-		// would skip the very grant that finishes the job.
+		// grant step. The stored authorization already equals the desired one, so a
+		// comparison would skip the very grant that finishes the job.
 		run := newSubscriberLifecycle(t)
 		stored := subscriberFixtureRow(t)
 
@@ -5504,11 +4964,7 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 
 	t.Run("replacing one key scope with another does not reach the broker", func(t *testing.T) {
 		// THE INERT EDIT. Kafka's authorizer has no message-key dimension, so one prefix is
-		// worth exactly as many bindings as another: none. The subscriber stays key-scoped, so
-		// its topics stay Describe-only, so the desired binding set is byte-identical before and
-		// after. Reconciling would be two administrative round trips that cannot change
-		// anything, and — as the failing broker below proves — would couple an edit that moves
-		// no access to Kafka's availability.
+		// worth exactly as many bindings as another: none.
 		scoped := subscriberFixtureRow(t)
 		scoped.PartitionKeyPrefix = stringPointer("ldg_acme")
 
@@ -5533,8 +4989,7 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 		func(t *testing.T) {
 			// THE WIDENING DIRECTION. A key-scoped subscriber holds Describe and no Read;
 			// removing its prefix grants Read on every topic it already had, so the credential
-			// it holds gains record-level access to all of them. That is a binding change and
-			// the broker has to be brought to it.
+			// it holds gains record-level access to all of them.
 			scoped := subscriberFixtureRow(t)
 			scoped.PartitionKeyPrefix = stringPointer("ldg_acme")
 
@@ -5555,12 +5010,10 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 		})
 
 	t.Run("clearing the key scope FAILS when the broker cannot be reached", func(t *testing.T) {
-		// FAIL-CLOSED, and this is the assertion that makes the reconciliation real rather than
-		// best-effort. If an unreachable broker were tolerated here, the registry would record a
-		// subscriber as holding direct record access — and every response would declare it —
-		// while the broker still refused its fetches. The subscriber would be told it may
-		// consume directly and would find that it cannot, with nothing in the registry to
-		// indicate which of the two was wrong.
+		// FAIL-CLOSED, and this is the assertion that makes the reconciliation real rather
+		// than best-effort. If an unreachable broker were tolerated here, the registry would
+		// record a subscriber as holding direct record access — and every response would
+		// declare it — while the broker still refused its fetches.
 		scoped := subscriberFixtureRow(t)
 		scoped.PartitionKeyPrefix = stringPointer("ldg_acme")
 
@@ -5582,23 +5035,11 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 	})
 }
 
-// TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance is the first half of the
-// fence finding.
+// TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance is the first
+// half of the fence finding.
 //
-// # The defect
-//
-// The fence was a fixed lease taken before the row was read, and nothing afterwards either
-// renewed it or CARRIED it. Provisioning is up to four broker round trips with their own
-// timeouts, so an issuance could legitimately still be working when its lease expired — at which
-// point another operation could claim the subscriber and both would proceed. The first one's
-// write then landed anyway, because it re-read nothing and its UPDATE was unconditional.
-//
-// # What is asserted, and why the ORDER is the assertion
-//
-// A renewal that happened before the broker work would prove nothing: the claim was fresh then.
-// The renewal has to sit BETWEEN the last broker round trip and the registry write, which is the
-// only position from which it can refuse a write that is about to race. So the sequence is
-// asserted rather than the mere presence of the call.
+// The fence was a fixed lease taken before the row was read, and nothing afterwards
+// either renewed it or CARRIED it.
 func TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -5606,11 +5047,11 @@ func TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance(t *te
 	require.NoError(t, err)
 	assert.NotEmpty(t, credential.Username)
 
-	// The renewal this test is about is the SECOND one. The first, before the broker phase, is
-	// what TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsUnderIt
-	// asserts, and it guards a different window: a secret must not be written at the broker
-	// under a lapsed lease. Only this one can refuse a registry write that is about to race,
-	// because only this one happens after the round trips whose duration the broker decides.
+	// The renewal this test is about is the SECOND one. The first, before the broker
+	// phase, is what
+	// TestIssueSubscriberCredential_ConfirmsTheClaimBeforeProvisioningAndRecordsUnderIt
+	// asserts, and it guards a different window: a secret must not be written at the
+	// broker under a lapsed lease.
 	assert.Equal(t,
 		[]string{
 			"ClaimSubscriberForProvisioning",
@@ -5632,37 +5073,15 @@ func TestIssueSubscriberCredential_RenewsTheClaimBeforeItWritesTheIssuance(t *te
 
 // TestIssueSubscriberCredential_CompensatesWhenItLosesTheClaim is the second half.
 //
-// # What the right compensation actually is, and why it is NOT a revocation
-//
-// By the time the claim is known to be lost, the credential exists at the broker: provisioning
-// writes the SCRAM credential before its ACL bindings, because a binding for a principal that does
-// not exist is inert while a credential with none still AUTHENTICATES. The tempting compensation
-// is therefore to revoke it — and that would be wrong, for the same reason a superseded issuance
-// is not revoked. Kafka stores ONE SCRAM credential per principal, so the operation that took the
-// claim over may already have written ITS password over this one. Revoking would destroy a
-// credential that works, for a subscriber that has been handed it and is about to connect.
-//
-// What the situation genuinely is, is UNCERTAIN: the registry's reference may or may not describe
-// what authenticates. So the compensation is to make that uncertainty VISIBLE rather than to
-// gamble on removing it — the row is marked credential_orphaned_at, which the orphaned-credential
-// gauge and its alert read, and which the documented remedy (issue once more, serially) settles by
-// replacing whatever is live.
-//
-// Both halves are asserted, because the caller sees a conflict either way and only the durable
-// state distinguishes "abandoned with the ambiguity recorded" from "abandoned silently".
+// What the situation genuinely is, is UNCERTAIN: the registry's reference may or may
+// not describe what authenticates.
 func TestIssueSubscriberCredential_CompensatesWhenItLosesTheClaim(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
-	// The renewal is what discovers the loss, so failing it is how a lapsed lease is expressed
-	// without waiting one out. The marker phrase is the one database.subscriberFenceLost
-	// produces — TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker pins that agreement.
-	//
-	// INSTALLED DURING PROVISIONING, which is what makes this the window the test is about.
-	// Issuance renews TWICE — once on the way into the broker, so no secret is written under a
-	// lapsed lease, and once after it, so a registry write that is about to race a new owner is
-	// refused. Failing every renewal from the start would fail the FIRST one, and a claim lost
-	// before the broker was touched leaves nothing at the broker and therefore no orphan to
-	// record. The state this test exists for only arises once the credential is already written.
+	// The renewal is what discovers the loss, so failing it is how a lapsed lease is
+	// expressed without waiting one out. The marker phrase is the one
+	// database.subscriberFenceLost produces —
+	// TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker pins that agreement.
 	run.admin.onProvision = func() {
 		run.store.failing("RenewSubscriberProvisioningFence", apierror.NewAPIError(
 			apierror.ErrConflict,
@@ -5694,22 +5113,11 @@ func TestIssueSubscriberCredential_CompensatesWhenItLosesTheClaim(t *testing.T) 
 			"recorded durably, or it is visible only in a log line and no gauge can see it")
 }
 
-// TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker pins the agreement between the two
-// packages that decide whether compensation happens.
+// TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker pins the agreement between
+// the two packages that decide whether compensation happens.
 //
-// # Why this test exists at all
-//
-// database.subscriberFenceLost produces a lost-fence error whose CODE is the generic conflict —
-// deliberately, because the API layer already maps that to 409 and introducing a second conflict
-// code would change the wire contract for every existing caller to communicate something only the
-// service acts on. The distinguishing mark is therefore a PHRASE in the detail, and
-// subscriberFenceWasLost matches on it.
-//
-// A phrase agreed across two packages by convention is a phrase that can be reworded in one of
-// them. If that happened, every compensation path in the service would silently stop running: a
-// lost fence would read as an ordinary conflict, the operation would be abandoned as superseded,
-// and the credential it had already written at the broker would be left live. This test is what
-// makes that rewording fail the build's tests instead.
+// A phrase agreed across two packages by convention is a phrase that can be reworded in
+// one of them.
 func TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker(t *testing.T) {
 	t.Run("the marker phrase is present in the repository's error", func(t *testing.T) {
 		// Provoked through the real repository so the phrase is read from the producer rather
@@ -5717,15 +5125,9 @@ func TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker(t *testing.T) {
 		datasource, mock := newSubscriberFenceMock(t)
 
 		// The follow-up read is the ONE two-column answer describeFencedWriteMiss issues:
-		// (holds_claim, revocation_pending). An earlier generation of the repository asked
-		// (exists, held) instead, and this stanza still answered that shape — so `true, false`
-		// was read as "the claim IS still held, and no revocation is pending", which is the
-		// subscriberFenceMissOther branch and NOT a lost fence. The stanza was therefore
-		// provoking the one miss reason whose error deliberately omits the marker, while
-		// asserting the marker was present.
-		//
-		// holds_claim = false is what a LOST claim is, and it is the only reading that reaches
-		// subscriberFenceMissClaimLost — the branch whose detail carries the phrase.
+		// (holds_claim, revocation_pending). The stanza was therefore provoking the one miss
+		// reason whose error deliberately omits the marker, while asserting the marker was
+		// present.
 		mock.ExpectExec("provisioning_token").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("provisioning_token").
 			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
@@ -5757,26 +5159,10 @@ func TestSubscriberFenceWasLost_MatchesTheRepositorysOwnMarker(t *testing.T) {
 	})
 }
 
-// TestIssueSubscriberCredential_KeepsTheWholeResponseInsideTheWallClock is the SLA finding.
+// TestIssueSubscriberCredential_KeepsTheWholeResponseInsideTheWallClock is the SLA
+// finding.
 //
-// # The defect
-//
-// The budget bounded the WORK. The compensation that follows a failure then ran on budgets of its
-// own — a fresh ten-second broker cleanup, a fresh five-second registry cleanup and a fresh
-// five-second fence release — each individually justified, because a cleanup must not inherit the
-// deadline whose expiry it is compensating for. Together they made a worst case of roughly
-// twenty-five seconds against a five-second requirement, and none of it was visible from the
-// budget the code appeared to declare.
-//
-// # Why the test drives the WORST path
-//
-// The failing paths are the ones the reserves exist for: the registry write fails, so the
-// credential must be revoked, and the revocation fails too, so the orphan must be recorded. That
-// is every phase exercised in one request. A happy-path timing assertion would prove nothing,
-// since the compensation never runs.
-//
-// The slack is generous because this is a wall-clock assertion on shared CI hardware; what it
-// rules out is the multiple-of-the-budget overrun, not scheduling noise.
+// The budget bounded the WORK.
 func TestIssueSubscriberCredential_KeepsTheWholeResponseInsideTheWallClock(t *testing.T) {
 	budget := 900 * time.Millisecond
 
@@ -5816,7 +5202,7 @@ func TestSubscriberCleanupContext_StaysInsideTheWallClockButSurvivesCancellation
 	t.Run("it survives the work phase being cancelled", func(t *testing.T) {
 		// The commonest reason a compensation is needed is the work context expiring, so a
 		// cleanup that inherited that cancellation could never run on the occasion it exists
-		// for. That was CLEAN-01.
+		// for, which is what FRESH CONTEXT prevents.
 		sla := time.Now().Add(2 * time.Second)
 		work, cancelWork := context.WithCancel(withSubscriberSLA(context.Background(), sla))
 		cancelWork()
@@ -5856,13 +5242,8 @@ func TestSubscriberCleanupContext_StaysInsideTheWallClockButSurvivesCancellation
 		compensationDeadline, ok := compensation.Deadline()
 		require.True(t, ok)
 
-		// ASSERTED AS THE ARITHMETIC, not by comparing two windows opened at the same instant.
-		//
-		// That comparison is what this used to do, and it cannot mean what it says: the durable
-		// record is written AFTER the compensation returns, so a durability window opened now
-		// is measured from a clock the record will never see. What actually encodes the reserve
-		// is that the compensation ends at least one reserve before the wall clock — whenever
-		// the record is written, that slice has not been spent by the compensation.
+		// ASSERTED AS THE ARITHMETIC, not by comparing two windows opened at the same
+		// instant.
 		assert.False(t, compensationDeadline.After(sla.Add(-subscriberDurabilityReserve)),
 			"the durable record gets the LAST slice, so a compensation that overruns cannot "+
 				"consume the time the record needs")
@@ -5892,17 +5273,8 @@ func TestSubscriberCleanupContext_StaysInsideTheWallClockButSurvivesCancellation
 	})
 }
 
-// TestIssueSubscriberCredential_RecordsAnOrphanedCredentialDurably is the first half of the
-// orphan finding.
-//
-// # The defect
-//
-// When an issuance could neither record its credential nor revoke it, a means of authenticating
-// to the event bus existed at the broker for a principal the registry recorded no issuance for —
-// and the only trace was a log line. Nothing counted it, so the outstanding-revocation alert
-// could not fire on it: that rule reads the revocation tombstone, which the issuance path never
-// stamps. An exposure whose only representation is a log line is an exposure nobody is watching,
-// and it is indistinguishable from a healthy system.
+// TestIssueSubscriberCredential_RecordsAnOrphanedCredentialDurably is the first half of
+// the orphan finding.
 func TestIssueSubscriberCredential_RecordsAnOrphanedCredentialDurably(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.store.failing("RecordSubscriberCredentialIfUnchanged", errors.New("registry write failed"))
@@ -5923,13 +5295,8 @@ func TestIssueSubscriberCredential_RecordsAnOrphanedCredentialDurably(t *testing
 			"— the one that settles an orphan by replacing it — unreachable")
 }
 
-// TestIssueSubscriberCredential_SettlesAnOrphanOnTheNextSuccessfulIssuance is what makes the
-// documented remedy true rather than advisory.
-//
-// Kafka stores one SCRAM credential per principal, so a successful issuance REPLACES whatever was
-// orphaned: the orphaned secret stops authenticating the moment the new one is written. A marker
-// left standing after that would keep a critical alert firing on an exposure that no longer
-// exists, which is how an alert stops being believed.
+// TestIssueSubscriberCredential_SettlesAnOrphanOnTheNextSuccessfulIssuance is what
+// makes the documented remedy true rather than advisory.
 func TestIssueSubscriberCredential_SettlesAnOrphanOnTheNextSuccessfulIssuance(t *testing.T) {
 	orphaned := subscriberFixtureRow(t)
 	orphanedAt := time.Now().Add(-time.Hour).UTC()
@@ -5947,16 +5314,8 @@ func TestIssueSubscriberCredential_SettlesAnOrphanOnTheNextSuccessfulIssuance(t 
 			"same write rather than left for an operator to clear by hand")
 }
 
-// TestDeregisterSubscriber_DistinguishesARefusedRevocationFromOneThatMerelyBegan is the second
-// half.
-//
-// # Why one marker was not enough
-//
-// The tombstone is stamped BEFORE the broker is touched, so on its own it covers two situations
-// that need different work: the broker REFUSED the revocation, or the process died between the
-// stamp and the attempt. The first needs the administrative principal's grants or the broker's
-// reachability fixed before ANY retry can succeed; the second needs nothing but the retry. One
-// count cannot tell an operator which they are looking at, so they would retry into a refusal.
+// TestDeregisterSubscriber_DistinguishesARefusedRevocationFromOneThatMerelyBegan is the
+// second half.
 func TestDeregisterSubscriber_DistinguishesARefusedRevocationFromOneThatMerelyBegan(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	run.admin.failing("RevokeSubscriber", errors.New("CLUSTER_AUTHORIZATION_FAILED"))
@@ -5975,14 +5334,11 @@ func TestDeregisterSubscriber_DistinguishesARefusedRevocationFromOneThatMerelyBe
 			"retrying alone will not help")
 }
 
-// TestDeregisterSubscriber_ClearsTheFailureMarkerOnEachNewAttempt pins the semantics that make
-// the two markers readable together.
+// TestDeregisterSubscriber_ClearsTheFailureMarkerOnEachNewAttempt pins the semantics
+// that make the two markers readable together.
 //
-// The tombstone keeps its FIRST instant, because the quantity an operator alerts on is the age of
-// the exposure. The failure marker is reset at the start of every attempt, because it describes
-// the LATEST attempt — so "pending set, failed NULL" means in flight or awaiting deletion, and
-// "pending set, failed set" means the broker refused. A failure marker that accumulated would
-// make the second reading permanent.
+// The tombstone keeps its FIRST instant, because the quantity an operator alerts on is
+// the age of the exposure.
 func TestDeregisterSubscriber_ClearsTheFailureMarkerOnEachNewAttempt(t *testing.T) {
 	failed := subscriberFixtureRow(t)
 	firstPending := time.Now().Add(-2 * time.Hour).UTC()
@@ -6005,18 +5361,10 @@ func TestDeregisterSubscriber_ClearsTheFailureMarkerOnEachNewAttempt(t *testing.
 		"nothing failed this time, so no failure may be recorded")
 }
 
-// TestSubscriberName_IsBoundedAtTheServiceLayer covers the bound the DTO cannot enforce.
+// TestSubscriberName_IsBoundedAtTheServiceLayer covers the bound the DTO cannot
+// enforce.
 //
-// # Why the service bounds it too
-//
-// Nothing bounded the name, so the effective limit was the global 5 MiB body cap — and the value
-// is stored, returned in every registry response, and written into log fields on every issuance,
-// revocation and provisioning failure. An unbounded one is amplified by every read of the
-// registry and by every log line naming the subscriber.
-//
-// The DTO bound covers HTTP. It does not cover a CLI caller, a migration or a fixture, all of
-// which reach this service directly — and the row outlives any single request. The schema CHECK
-// covers what neither sees. Each layer bounds callers the layer above cannot observe.
+// The DTO bound covers HTTP.
 func TestSubscriberName_IsBoundedAtTheServiceLayer(t *testing.T) {
 	t.Run("an over-long name is refused on registration", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -6040,8 +5388,8 @@ func TestSubscriberName_IsBoundedAtTheServiceLayer(t *testing.T) {
 	})
 
 	t.Run("the bound is measured in runes, matching the schema CHECK", func(t *testing.T) {
-		// char_length(btrim(name)) counts CHARACTERS, so a byte-based bound here would accept a
-		// value the database then refuses — or refuse a multi-byte script a quarter of the
+		// char_length(btrim(name)) counts CHARACTERS, so a byte-based bound here would accept
+		// a value the database then refuses — or refuse a multi-byte script a quarter of the
 		// length a Latin one is allowed.
 		run := newSubscriberLifecycle(t)
 
@@ -6053,9 +5401,9 @@ func TestSubscriberName_IsBoundedAtTheServiceLayer(t *testing.T) {
 	})
 
 	t.Run("a control character is refused rather than stripped", func(t *testing.T) {
-		// The value is echoed into responses, log lines and trace attributes: a newline splits a
-		// log line in two and forges a second entry. Stripping would silently store something
-		// other than what the caller asked for.
+		// The value is echoed into responses, log lines and trace attributes: a newline
+		// splits a log line in two and forges a second entry. Stripping would silently store
+		// something other than what the caller asked for.
 		run := newSubscriberLifecycle(t)
 
 		_, err := run.service.RegisterSubscriber(context.Background(), SubscriberRegistration{
@@ -6065,21 +5413,11 @@ func TestSubscriberName_IsBoundedAtTheServiceLayer(t *testing.T) {
 	})
 }
 
-// TestCompleteLegacyWebhookMigration_WritesBothColumnsInOneOperation pins the atomicity the
-// migration endpoint now has.
+// TestCompleteLegacyWebhookMigration_WritesBothColumnsInOneOperation pins the atomicity
+// the migration endpoint now has.
 //
-// # The defect
-//
-// "This subscriber has completed its move to Kafka" is a single change of state, and it was
-// expressed as two calls with no transaction spanning them. Every outcome of the window between
-// them was wrong in some way: clearing first destroys the endpoint the migration was FROM while
-// the row still reports the subscriber as unmigrated, and stamping first reports a migration
-// complete while its legacy endpoint is still recorded — the state progress reporting exists to
-// rule out.
-//
-// It also removes a second cost: the clear used to route through the registry update, which takes
-// the provisioning fence and rewrites every mutable column, so a piece of dual-run bookkeeping
-// could be refused because a credential issuance happened to hold the claim.
+// "This subscriber has completed its move to Kafka" is a single change of state, and it
+// was expressed as two calls with no transaction spanning them.
 func TestCompleteLegacyWebhookMigration_WritesBothColumnsInOneOperation(t *testing.T) {
 	migrating := subscriberFixtureRow(t)
 	migrating.WebhookURL = stringPointer("https://subscriber.example.com/blnk-events")
@@ -6101,13 +5439,15 @@ func TestCompleteLegacyWebhookMigration_WritesBothColumnsInOneOperation(t *testi
 			"so fencing this would make migration bookkeeping fail while an issuance was in flight")
 }
 
-// newSubscriberFenceMock builds a sqlmock-backed datasource for the marker-agreement assertion.
+// newSubscriberFenceMock builds a sqlmock-backed datasource for the marker-agreement
+// assertion.
 //
-// The real repository is used rather than a double precisely because the phrase under test is
-// produced there: a restated copy would agree with itself for ever.
+// The real repository is used rather than a double precisely because the phrase under
+// test is produced there: a restated copy would agree with itself for ever.
 //
 // Parameters:
-//   - t *testing.T: for the fatal on a mock construction failure and the deferred close.
+//   - t *testing.T: for the fatal on a mock construction failure and the deferred
+//     close.
 //
 // Returns:
 //   - database.Datasource: the datasource under test.
@@ -6122,30 +5462,8 @@ func newSubscriberFenceMock(t *testing.T) (database.Datasource, sqlmock.Sqlmock)
 	return database.Datasource{Conn: db}, mock
 }
 
-// TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared HAS BEEN REMOVED, twice, and the
-// second removal is the one that reads correctly.
-//
-// It asserted that clearing a prefix changed nothing about issuance — true only while clearing was
-// unconditional. It is not: under a declared key-scoped deployment clearing is REFUSED, because it
-// is the one path that turns a live key-scoped principal into a whole-topic reader without
-// issuance ever running again (SEC-01).
-//
-// Its successor is TestIssueSubscriberCredential_ClearingAKeyScopeDependsOnWhatTheDeploymentDeclares,
-// which walks the same sequence in BOTH deployments and asserts each outcome — the clearing that
-// resolves SUBSCRIBER_KEY_SCOPE_UNENFORCED, and the refusal that keeps the declared model true.
-
-// TestDeclaresKeyScope_ReadsWhitespaceAsAbsent pins the boundary between "no key scope" and "a
-// key scope", which is the input every key-scope decision is taken on.
-//
-// A column holding only spaces is not a recorded intent, and reading it as one would attach an
-// authorization boundary to a subscriber that asked for none — then deliver that boundary to its
-// consumer, which would silently discard every record. NULL, the empty string and whitespace
-// therefore all have to answer the same way.
-//
-// EffectiveKeyScope is asserted alongside the predicate rather than separately, because the pair
-// is what reaches a subscriber: absent must report every-key AND broker-enforced, present must
-// report the prefix AND not-broker-enforced. A predicate that agreed while the contract disagreed
-// would still be a disclosure bug.
+// TestDeclaresKeyScope_ReadsWhitespaceAsAbsent pins the boundary between "no key scope"
+// and "a key scope", which is the input every key-scope decision is taken on.
 func TestDeclaresKeyScope_ReadsWhitespaceAsAbsent(t *testing.T) {
 	for name, prefix := range map[string]*string{
 		"null":       nil,
@@ -6170,15 +5488,8 @@ func TestDeclaresKeyScope_ReadsWhitespaceAsAbsent(t *testing.T) {
 		})
 	}
 
-	// The delivered scope is the recorded prefix with SURROUNDING WHITESPACE REMOVED, and the
-	// padded case is here to pin that one normalisation rather than to permit padding.
-	//
-	// Registration and update REFUSE a prefix carrying surrounding whitespace outright, so the
-	// only way to hold one is a row written before that check existed. Trimming it is therefore a
-	// repair of a legacy value, not an alteration of a live one — and it is the same rule
-	// api/model.NewSubscriberEnforcedAccess applies to the value it echoes, which is what stops
-	// the domain accessor and the wire contract describing two different keys. Padding cannot be
-	// part of a Blnk partition key: keys are ledger identifiers.
+	// The delivered scope is the recorded prefix with SURROUNDING WHITESPACE REMOVED, and
+	// the padded case is here to pin that one normalisation rather than to permit padding.
 	for name, expected := range map[string]string{
 		"a ledger fragment": "ldg_9f1c",
 		"padded":            "ldg_9f1c",
@@ -6208,12 +5519,10 @@ func TestDeclaresKeyScope_ReadsWhitespaceAsAbsent(t *testing.T) {
 	}
 
 	t.Run("a nil subscriber answers rather than panicking", func(t *testing.T) {
-		// Nil is the repository's not-found, so every predicate that reads a row can hold one.
-		// BOTH surviving spellings are exercised because both are called on rows a repository
-		// read produced, and one of them tolerating nil while another panics is exactly the kind
-		// of disagreement having several names for one question invites. There were four such
-		// names; the two whose names asserted a policy this package no longer performs —
-		// unenforceability and required enforcement — have been deleted rather than re-documented.
+		// Nil is the repository's not-found, so every predicate that reads a row can hold
+		// one. BOTH surviving spellings are exercised because both are called on rows a
+		// repository read produced, and one of them tolerating nil while another panics is
+		// exactly the kind of disagreement having several names for one question invites.
 		var subscriber *model.EventSubscriber
 		assert.False(t, subscriber.RequiresGatewayDelivery())
 		assert.False(t, subscriber.DeclaresKeyScope())
@@ -6226,14 +5535,10 @@ func TestDeclaresKeyScope_ReadsWhitespaceAsAbsent(t *testing.T) {
 	})
 }
 
-// subscriberFenceStore is a store that only implements the fence, for the heartbeat's own tests.
+// subscriberFenceStore is a store that only implements the fence, for the heartbeat's
+// own tests.
 //
-// It exists so a fence can be exercised with a SHORT lease. The production lease is a package
-// constant — fifteen seconds, renewed at a third of it — so a behavioural test driven through
-// the service would have to wait five seconds to see one renewal. Building the fence directly
-// with a sub-second lease observes the same loop in milliseconds, and
-// TestFenceSubscriber_StartsTheHeartbeatWithTheProductionLease is what ties that loop to the
-// value production uses.
+// It exists so a fence can be exercised with a SHORT lease.
 type subscriberFenceStore struct {
 	eventSubscriberStore
 
@@ -6315,33 +5620,21 @@ func newTestSubscriberFence(t *testing.T, store eventSubscriberStore, lease time
 	return fence
 }
 
-// TestSubscriberFence_RenewsTheClaimWhileTheOperationRuns is the PERF-P16 guard.
+// TestSubscriberFence_RenewsTheClaimWhileTheOperationRuns is the guard.
 //
-// # The defect
+// The fence was claimed for a fixed fifteen seconds and could not be extended.
 //
-// The fence was claimed for a fixed fifteen seconds and could not be extended. Credential
-// issuance makes up to four administrative round trips, each capped at ten seconds against a
-// broker that is refusing rather than answering, and a failure adds two more for the
-// compensation — so the claim could expire while the operation holding it was still working.
-// What happens then is the exact race the fence exists to prevent: a second issuance finds the
-// subscriber unfenced, writes its own SCRAM credential over the first, and the two callers hold
-// two secrets of which the broker keeps one. The loser's password authenticates against nothing
-// and its request returned 200 with that password in it.
-//
-// # What the heartbeat has to do
-//
-// Renew REPEATEDLY, at a fraction of the lease, with the lease's own duration each time. A single
-// renewal, or one that renewed for a shorter period than it waits between renewals, would move
-// the expiry without removing it.
+// Renew REPEATEDLY, at a fraction of the lease, with the lease's own duration each
+// time.
 func TestSubscriberFence_RenewsTheClaimWhileTheOperationRuns(t *testing.T) {
 	const lease = 900 * time.Millisecond
 
 	store := &subscriberFenceStore{}
 	fence := newTestSubscriberFence(t, store, lease)
 
-	// The interval is a third of the lease, so three intervals is a second's worth of renewals
-	// with room for scheduling. Polled rather than slept on, so the test is as fast as the
-	// machine allows it to be.
+	// The interval is a third of the lease, so three intervals is a second's worth of
+	// renewals with room for scheduling. Polled rather than slept on, so the test is as
+	// fast as the machine allows it to be.
 	require.Eventually(t, func() bool { return store.renewalCount() >= 2 },
 		2*time.Second, 20*time.Millisecond,
 		"the claim must be renewed repeatedly while the operation holds it; a fence that is "+
@@ -6368,11 +5661,8 @@ func TestSubscriberFence_RenewsTheClaimWhileTheOperationRuns(t *testing.T) {
 
 // TestSubscriberFence_RetiresLoudlyWhenTheClaimIsLost pins the failure branch.
 //
-// A renewal is conditional on the token, so it fails once the claim has expired or been taken
-// over. There is nothing useful to do with that discovery mid-operation — abandoning the work
-// would leave more residue than finishing it — so the heartbeat stops and says so. Continuing to
-// renew would be worse than useless: it would either keep failing every interval, filling the log
-// during an incident, or start succeeding again against a token somebody else now owns.
+// A renewal is conditional on the token, so it fails once the claim has expired or been
+// taken over.
 func TestSubscriberFence_RetiresLoudlyWhenTheClaimIsLost(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -6423,12 +5713,8 @@ func TestSubscriberFence_ReleaseIsIdempotentAndNilSafe(t *testing.T) {
 			"whether the claim succeeded")
 }
 
-// TestFenceSubscriber_StartsTheHeartbeatWithTheProductionLease ties the loop the tests above
-// exercise to the values production actually uses.
-//
-// Without this, every assertion above would hold for a fence that production never builds: the
-// lease could be zero, the heartbeat could not be started at all, and only a five-second
-// behavioural test would notice.
+// TestFenceSubscriber_StartsTheHeartbeatWithTheProductionLease ties the loop the tests
+// above exercise to the values production actually uses.
 func TestFenceSubscriber_StartsTheHeartbeatWithTheProductionLease(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -6456,10 +5742,7 @@ func TestFenceSubscriber_StartsTheHeartbeatWithTheProductionLease(t *testing.T) 
 
 // subscriberDeferredWork is a scheduler that HOLDS the tasks it is given.
 //
-// Holding rather than running is what makes the finding assertable. The question is not whether
-// the cleanup happens — it does, on either design — but whether the caller waited for it, and the
-// only way to observe that is to have a scheduler that has demonstrably not run anything by the
-// time the call returns.
+// Holding rather than running is what makes the scheduling assertable.
 type subscriberDeferredWork struct {
 	mu    sync.Mutex
 	tasks []func()
@@ -6509,24 +5792,11 @@ func (l *subscriberLifecycle) deferring() *subscriberDeferredWork {
 	return deferred
 }
 
-// TestIssueSubscriberCredential_AnswersWithoutWaitingForItsCleanups is the PERF-P09 guard on the
+// TestIssueSubscriberCredential_AnswersWithoutWaitingForItsCleanups is the guard on the
 // SUCCESS path.
 //
-// # The defect
-//
-// Requirement R-7 gives credential provisioning five seconds, and the service applies that budget
-// to the operation. It then exceeded it: the provisioning fence was released in a deferred call
-// that ran on its OWN five-second budget, synchronously, after the operation had finished. So the
-// documented five-second endpoint could take ten, and it did so on the SUCCESS path — the ordinary
-// one, the one an SLA is written about. A failed issuance was worse still, adding a ten-second
-// broker compensation and another five-second registry write to a response that had already run
-// out of time.
-//
-// # What the fix has to preserve
-//
-// The cleanup still has to happen. So the assertion is not "the release is gone" but "the release
-// had not run when the caller was answered, and it runs afterwards" — which is exactly the
-// difference between deferring work and dropping it.
+// Credential provisioning is given five seconds, and the service applies
+// that budget to the operation.
 func TestIssueSubscriberCredential_AnswersWithoutWaitingForItsCleanups(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	deferred := run.deferring()
@@ -6548,21 +5818,11 @@ func TestIssueSubscriberCredential_AnswersWithoutWaitingForItsCleanups(t *testin
 			"every retry waits out")
 }
 
-// TestIssueSubscriberCredential_SchedulesTheBrokerCompensationAndHoldsTheFenceUntilItIsDone is the
-// PERF-P09 guard on the FAILURE path, and the ordering assertion is the important half.
+// TestIssueSubscriberCredential_SchedulesTheBrokerCompensationAndHoldsTheFenceUntilItIsDone
+// is the background-work guard on the FAILURE path, and the ordering assertion is the
+// important half.
 //
-// # The two things that must both be true
-//
-// The response must not wait for the compensation — two administrative round trips on their own
-// ten-second budget, reached most often because a five-second budget has just expired — and the
-// compensation must still run BEFORE the fence is released.
-//
-// The ordering is not tidiness. The compensation revokes the credential this attempt wrote, and
-// Kafka stores one SCRAM credential per principal. Release the fence first and a caller retrying
-// immediately — which is what a retryable error invites — can mint a working credential and have
-// this attempt's cleanup delete it moments later. The caller then holds a 200 with a password that
-// stops working, and nothing anywhere records why. Holding the claim makes that retry a conflict:
-// a refusal the caller can act on.
+// The ordering is not tidiness.
 func TestIssueSubscriberCredential_SchedulesTheBrokerCompensationAndHoldsTheFenceUntilItIsDone(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	deferred := run.deferring()
@@ -6623,12 +5883,8 @@ func TestIssueSubscriberCredential_SchedulesTheBrokerCompensationAndHoldsTheFenc
 			"credential can be revoked by this attempt's cleanup")
 }
 
-// TestIssueSubscriberCredential_SchedulesTheRegistryCompensationToo covers the second failure
-// path: the broker wrote the credential and the REGISTRY could not record it.
-//
-// Both of its writes — revoking at the broker, clearing the registry's credential reference —
-// used to run inline on fresh budgets after the issuance budget was already spent. Neither
-// changes the caller's answer.
+// TestIssueSubscriberCredential_SchedulesTheRegistryCompensationToo covers the second
+// failure path: the broker wrote the credential and the REGISTRY could not record it.
 func TestIssueSubscriberCredential_SchedulesTheRegistryCompensationToo(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	deferred := run.deferring()
@@ -6657,14 +5913,11 @@ func TestIssueSubscriberCredential_SchedulesTheRegistryCompensationToo(t *testin
 			"off the response path rather than reshuffled")
 }
 
-// TestIssueSubscriberCredential_ASupersededIssuanceSchedulesNoRevocation is the arm that must owe
-// NOTHING, and it is a correctness rule rather than an optimisation.
+// TestIssueSubscriberCredential_ASupersededIssuanceSchedulesNoRevocation is the arm
+// that must owe NOTHING, and it is a correctness rule rather than an optimisation.
 //
-// A concurrent issuance committed while this one was at the broker, so the registry records ITS
-// reference. Kafka stores one credential per principal, so revoking here would destroy the
-// winner's working secret as well as this one's dead one. The conflict is returned and the broker
-// is left alone — and moving the cleanup to a background task must not quietly turn "deliberately
-// nothing" into "the same cleanup, later".
+// A concurrent issuance committed while this one was at the broker, so the registry
+// records ITS reference.
 func TestIssueSubscriberCredential_ASupersededIssuanceSchedulesNoRevocation(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 	deferred := run.deferring()
@@ -6690,13 +5943,8 @@ func TestIssueSubscriberCredential_ASupersededIssuanceSchedulesNoRevocation(t *t
 		"the fence is still released, because the operation is over")
 }
 
-// TestIssueSubscriberCredential_WithoutASchedulerKeepsTheInlineBehaviour pins the default.
-//
-// A hand-built service — a CLI, a test, anything that is not a request path — has nowhere to
-// defer work to, and for it the inline behaviour is correct: the cleanup must be finished when the
-// call returns, because there may be no process left a moment later. So the service asks the
-// broker for the inline compensation it is actually going to perform, and the result then reports
-// what really happened rather than a pending state that was never pending.
+// TestIssueSubscriberCredential_WithoutASchedulerKeepsTheInlineBehaviour pins the
+// default.
 func TestIssueSubscriberCredential_WithoutASchedulerKeepsTheInlineBehaviour(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -6714,23 +5962,10 @@ func TestIssueSubscriberCredential_WithoutASchedulerKeepsTheInlineBehaviour(t *t
 			"afterwards needs")
 }
 
-// TestSubscriberService_PrefersTheProcessAdministrativeClient is the PERF-P10 guard.
+// TestSubscriberService_PrefersTheProcessAdministrativeClient is the guard.
 //
-// # The defect
-//
-// Every Blnk wrapper builds a subscriber service per request and closes it afterwards, and the
-// service built its own administrative client on first use. So each broker-touching request paid
-// for a transport, a TCP connection per broker, a SASL/SCRAM handshake whose proof is
-// PBKDF2-derived over two round trips, and a metadata cache that starts empty — and then threw all
-// of it away. Credential issuance has a five-second budget and was spending a measurable part of
-// it on setup this process had already done, while the broker re-evaluated the connection's
-// authorization from cold each time.
-//
-// # What the resolver has to guarantee
-//
-// The shared client is used, it is resolved AT MOST ONCE per service however many times an
-// operation reaches the broker, and it is never closed by a service that merely borrowed it —
-// because closing it would take the transport away from every later request in the process.
+// Every Blnk wrapper builds a subscriber service per request and closes it afterwards,
+// and the service built its own administrative client on first use.
 func TestSubscriberService_PrefersTheProcessAdministrativeClient(t *testing.T) {
 	t.Run("the shared client is used and resolved once per service", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -6777,10 +6012,10 @@ func TestSubscriberService_PrefersTheProcessAdministrativeClient(t *testing.T) {
 	})
 
 	t.Run("a resolver that fails falls back to building a client", func(t *testing.T) {
-		// The fallback matters because the resolver's failure modes ARE the constructor's — an
-		// unreadable CA bundle, a SASL pair that is half-configured — so falling through produces
-		// the same typed error with the same log line. A caller must not get a worse diagnosis
-		// because a shared client happened to be unavailable.
+		// The fallback matters because the resolver's failure modes ARE the constructor's —
+		// an unreadable CA bundle, a SASL pair that is half-configured — so falling through
+		// produces the same typed error with the same log line. A caller must not get a worse
+		// diagnosis because a shared client happened to be unavailable.
 		run := newSubscriberLifecycle(t)
 
 		service := NewEventSubscriberService(run.store, nil).
@@ -6819,14 +6054,8 @@ func TestSubscriberService_PrefersTheProcessAdministrativeClient(t *testing.T) {
 	})
 }
 
-// subscriberBuildableKafkaConfiguration publishes a configuration a real administrative client
-// can be built from.
-//
-// The lifecycle harness's configuration deliberately cannot: it leaves TLS disabled without the
-// local-development acknowledgement, which is what makes the resolver-fallback assertion above
-// meaningful. The accessor's own tests need the opposite, so they state the acknowledgement the
-// local stack states — the same posture scripts/kafka-bootstrap.sh sets up — rather than reaching
-// for TLS material no unit test should need.
+// subscriberBuildableKafkaConfiguration publishes a configuration a real administrative
+// client can be built from.
 func subscriberBuildableKafkaConfiguration(t *testing.T) *config.Configuration {
 	t.Helper()
 
@@ -6844,43 +6073,23 @@ func subscriberBuildableKafkaConfiguration(t *testing.T) *config.Configuration {
 }
 
 // ---------------------------------------------------------------------------------------
-// AAP-02 — one absolute wall-clock deadline bounds the request, compensation included
+// One absolute wall-clock deadline bounds the request, compensation included
 // ---------------------------------------------------------------------------------------
 
-// TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget is the AAP-02 guard.
+// TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget is the guard.
 //
-// # The defect
-//
-// CLEAN-01 fixed compensation by detaching it from the caller's cancellation, and
-// context.WithoutCancel strips the DEADLINE along with the cancellation because they are the same
-// mechanism. So each cleanup then ran on a budget of its own: five seconds for the registry
-// writes, ten for the broker round trips nested underneath them. A five-second endpoint could
-// therefore answer in twenty — five of forward work, fifteen of stacked cleanup — and the
-// requirement AAP-02 states is a bound on the ENDPOINT, which an endpoint answering in twenty
-// seconds has not met however tidy its cleanup was.
-//
-// # Why this asserts on DEADLINES and not on elapsed time
-//
-// The doubles return instantly, so the stacked budgets cost no wall clock here and elapsed time
-// cannot see the defect at all. What the defect IS, precisely, is a cleanup context carrying a
-// deadline later than the request's own bound — so that is what is read. Elapsed time is asserted
-// too, as the property an operator actually experiences, but the deadline is the discriminating
-// assertion: it fails against the old code and passes against the new one.
+// FRESH CONTEXT detaches compensation from the caller's cancellation, and
+// context.WithoutCancel strips the DEADLINE along with the cancellation because they
+// are the same mechanism.
 func TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget(t *testing.T) {
 	// The two regimes the arithmetic distinguishes, and they are genuinely different cases
 	// rather than one case tested twice.
 	//
-	//   - forward overran its SLICE: the forward path is bounded at absolute-minus-reserve, so
-	//     overrunning that while leaving the absolute instant in the future is the ORDINARY
-	//     failure. The reserve is what compensation spends, and the request stays inside its
-	//     bound with nothing to explain.
-	//   - forward overran the ABSOLUTE instant: only reachable when a step did not honour its
-	//     context, since a step that does honour it returns at the slice. There is no reserve
-	//     left, so the floor applies — one bounded window, named, granted once.
-	//
-	// 400ms rather than the production five seconds: the reserve scales with the budget (a
-	// quarter of it, see compensationReserve), so the arithmetic under test is the same shape at
-	// any size and the suite does not pay five seconds to observe it.
+	//   - forward overran its SLICE: the forward path is bounded at
+	//     absolute-minus-reserve, so overrunning that while leaving the absolute instant
+	//     in the future is the ORDINARY failure.
+	//   - forward overran the ABSOLUTE instant: only reachable when a step did not honour
+	//     its context, since a step that does honour it returns at the slice.
 	const budget = 400 * time.Millisecond
 
 	// measurementSlack absorbs the gap between the test reading the clock and the service
@@ -6937,10 +6146,10 @@ func TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget(t *te
 			service := run.service.WithIssuanceBudget(budget)
 
 			// The instant the forward call actually returned, captured rather than computed.
-			// time.Sleep guarantees AT LEAST its duration, so on a loaded machine it
-			// overshoots by tens of milliseconds — and in the overrun case the compensation
-			// window is measured from when compensation starts, so a computed instant would
-			// make this assertion fail for scheduling noise instead of for the property.
+			// time.Sleep guarantees AT LEAST its duration, so on a loaded machine it overshoots
+			// by tens of milliseconds — and in the overrun case the compensation window is
+			// measured from when compensation starts, so a computed instant would make this
+			// assertion fail for scheduling noise instead of for the property.
 			var provisionEnded time.Time
 			admin.onProvision = func() {
 				time.Sleep(tt.provisionFor)
@@ -6953,9 +6162,9 @@ func TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget(t *te
 			require.Error(t, err)
 			require.False(t, provisionEnded.IsZero(), "the broker call must have been made")
 
-			// The absolute instant bounds the request. In the overrun case it is already
-			// past when compensation begins, so the ceiling is one floor past that moment —
-			// bounded, named, and granted once because the cleanup helpers rebase.
+			// The absolute instant bounds the request. In the overrun case it is already past
+			// when compensation begins, so the ceiling is one floor past that moment — bounded,
+			// named, and granted once because the cleanup helpers rebase.
 			ceiling := started.Add(budget)
 			if tt.floorApplies {
 				if floored := provisionEnded.Add(subscriberCompensationFloor); floored.After(ceiling) {
@@ -6964,15 +6173,15 @@ func TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget(t *te
 			}
 			ceiling = ceiling.Add(measurementSlack)
 
-			// Compensation happened at all — the CLEAN-01 property, restated here because a
+			// Compensation happened at all — the property, restated here because a
 			// deadline assertion on a call that never occurred would pass vacuously.
 			require.NotZero(t, run.log.count("RevokeSubscriber"))
 			require.NotZero(t, run.log.count("ClearSubscriberCredential"))
 			assert.False(t, run.log.arrivedExpired("RevokeSubscriber"))
 			assert.False(t, run.log.arrivedExpired("ClearSubscriberCredential"))
 
-			// AAP-02 proper: every compensating call is bounded, and bounded by THIS request's
-			// instant rather than by a budget of its own.
+			// Every compensation must arrive BOUNDED, and bounded by THIS request's instant rather
+			// than by a budget of its own.
 			for _, method := range []string{
 				"RevokeSubscriber",
 				"ClearSubscriberCredential",
@@ -6989,8 +6198,8 @@ func TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget(t *te
 
 			// And the property an operator experiences. The bound is derived from the same
 			// ceiling, so the two assertions cannot disagree about what this request was
-			// allowed; the extra slack absorbs scheduling only, and is far below the seconds
-			// the stacked budgets would have added.
+			// allowed; the extra slack absorbs scheduling only, and is far below the seconds the
+			// stacked budgets would have added.
 			assert.Less(t, elapsed, ceiling.Sub(started)+250*time.Millisecond,
 				"the endpoint must answer inside its own budget, not inside its budget plus a "+
 					"fresh one for each level of cleanup")
@@ -6998,15 +6207,11 @@ func TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget(t *te
 	}
 }
 
-// TestCompensationDeadline_IsOneWindowPerRequestHoweverDeeplyNested pins the helper arithmetic
-// directly, including the case the end-to-end test cannot reach.
+// TestCompensationDeadline_IsOneWindowPerRequestHoweverDeeplyNested pins the helper
+// arithmetic directly, including the case the end-to-end test cannot reach.
 //
 // Compensation nests: the registry-side cleanup calls RevokeSubscriber, which derives a
-// broker-side cleanup of its own. Through the doubles only the outer context is observable, so
-// the property that matters most — that nesting does NOT open a second window — has to be
-// asserted on the helpers. It is the property that keeps the floor a floor: resolved afresh at
-// each level against each level's own clock, the windows would stack, which is the shape of the
-// defect AAP-02 reported, only smaller.
+// broker-side cleanup of its own.
 func TestCompensationDeadline_IsOneWindowPerRequestHoweverDeeplyNested(t *testing.T) {
 	t.Run("no issuance deadline in force yields the caller's own budget", func(t *testing.T) {
 		// Deregistration, revocation and the migration sweeps have no endpoint bound to respect,
@@ -7041,9 +6246,9 @@ func TestCompensationDeadline_IsOneWindowPerRequestHoweverDeeplyNested(t *testin
 	})
 
 	t.Run("nesting a broker cleanup inside a registry cleanup does not extend it", func(t *testing.T) {
-		// The realistic worst case: the absolute instant is already spent, so the outer cleanup
-		// takes the floor. The inner one must inherit that instant rather than take a floor of
-		// its own measured from a later clock.
+		// The realistic worst case: the absolute instant is already spent, so the outer
+		// cleanup takes the floor. The inner one must inherit that instant rather than take a
+		// floor of its own measured from a later clock.
 		ctx := withSubscriberIssuanceDeadline(context.Background(), time.Now().Add(-time.Second))
 
 		outer, cancelOuter := subscriberCleanupContext(ctx)
@@ -7087,15 +6292,12 @@ func TestCompensationDeadline_IsOneWindowPerRequestHoweverDeeplyNested(t *testin
 	})
 }
 
-// TestSubscriberLifecycle_NoDetachedContextEscapesTheCleanupHelpers is the source-level guard on
-// AAP-02, and it exists because the defect is trivially reintroduced.
+// TestSubscriberLifecycle_NoDetachedContextEscapesTheCleanupHelpers is the STRUCTURAL
+// guard, and it exists because an unbounded detached context is trivially reintroduced.
 //
-// The whole bound rests on two choke points: subscriberCleanupContext and kafkaCleanupContext are
-// the only places context.WithoutCancel is called in the subscriber lifecycle, and both re-impose
-// the request's deadline. A new cleanup path that reaches for WithoutCancel directly — the
-// obvious thing to write, and what both of these used to be — silently restores a compensation
-// with no bound at all, which is worse than the fresh budget the report found. Behavioural tests
-// cannot see a path they do not exercise, so the constraint is asserted on the source.
+// The whole bound rests on two choke points: subscriberCleanupContext and
+// kafkaCleanupContext are the only places context.WithoutCancel is called in the
+// subscriber lifecycle, and both re-impose the request's deadline.
 func TestSubscriberLifecycle_NoDetachedContextEscapesTheCleanupHelpers(t *testing.T) {
 	// The two files the subscriber issuance path spans, and the line each is allowed to detach on.
 	allowed := map[string]string{
@@ -7127,13 +6329,9 @@ func TestSubscriberLifecycle_NoDetachedContextEscapesTheCleanupHelpers(t *testin
 	}
 }
 
-// TestIssueSubscriberCredential_DoesNotRevokeWhenAConcurrentIssuanceWon is the one case where
-// NOT compensating is correct, and it is worth pinning because it looks like a missing cleanup.
-//
-// The accessor is what makes "one client for the process" true rather than aspirational, and three
-// of its properties are load-bearing: the same client comes back every time, a failure is NOT
-// remembered — the causes are external and fixable, and a permanently poisoned accessor would
-// need a restart to recover from a secret that has since been mounted — and Close releases it.
+// TestIssueSubscriberCredential_DoesNotRevokeWhenAConcurrentIssuanceWon is the one case
+// where NOT compensating is correct, and it is worth pinning because it looks like a
+// missing cleanup.
 func TestBlnk_KafkaAdminIsResolvedOncePerProcess(t *testing.T) {
 	instance := &Blnk{config: subscriberBuildableKafkaConfiguration(t)}
 
@@ -7187,13 +6385,9 @@ func TestBlnk_KafkaAdminIsResolvedOncePerProcess(t *testing.T) {
 	})
 }
 
-// TestBlnk_EventSubscribersInstallsBothProcessSeams is the wiring assertion, and without it every
-// test above could hold while production still built a client per request and blocked on its
-// cleanups.
-//
-// It is structural because there is nothing to observe from outside: a service that resolves its
-// own client and one that borrows the process's behave identically apart from the cost, and cost
-// is exactly what a unit test cannot see.
+// TestBlnk_EventSubscribersInstallsBothProcessSeams is the wiring assertion, and
+// without it every test above could hold while production still built a client per
+// request and blocked on its cleanups.
 func TestBlnk_EventSubscribersInstallsBothProcessSeams(t *testing.T) {
 	instance := &Blnk{config: subscriberBuildableKafkaConfiguration(t)}
 	service := instance.EventSubscribers()
@@ -7236,22 +6430,12 @@ func TestBlnk_EventSubscribersInstallsBothProcessSeams(t *testing.T) {
 	require.NoError(t, instance.Close())
 }
 
-// TestUpdateSubscriber_TouchesTheBrokerOnlyForAnAuthorizationChange is the PERF-P15 guard.
+// TestUpdateSubscriber_TouchesTheBrokerOnlyForAnAuthorizationChange is the guard.
 //
-// # The defect
+// Reconciliation is two DescribeACLs round trips before it can conclude there is
+// nothing to change, and it ran on EVERY update.
 //
-// Reconciliation is two DescribeACLs round trips before it can conclude there is nothing to
-// change, and it ran on EVERY update. Renaming a subscriber, or recording the legacy webhook URL
-// of one migrating off HTTP, therefore paid the full broker cost of an authorization change that
-// was not being made — and those are the common updates during the migration window.
-//
-// # Why the gate is what the request NAMES rather than a comparison of values
-//
-// A value comparison would be wrong in the case that matters most. When a grant fails halfway, the
-// row is already persisted, so the caller retrying the same update would find the boundary
-// "unchanged" and skip the very repair it is retrying. Gating on the presence of the field instead
-// means a caller can always ask for reconciliation by naming the topic list, whether or not the
-// value differs — which is also how drift is repaired.
+// A value comparison would be wrong in the case that matters most.
 func TestUpdateSubscriber_TouchesTheBrokerOnlyForAnAuthorizationChange(t *testing.T) {
 	brokerCalls := []string{"PruneSubscriberAccess", "GrantSubscriberAccess"}
 	renamed := "renamed subscriber"
@@ -7304,16 +6488,9 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyForAnAuthorizationChange(t *testin
 
 	t.Run("naming only the key scope touches nothing at the broker", func(t *testing.T) {
 		// REVERSED, and worth saying so explicitly. This read "naming the key scope
-		// reconciles", which contradicts the very finding the test exists for: Kafka ACLs have
-		// no message-key dimension, so a partition-key prefix has NO broker-side representation
-		// and an edit to one cannot move a single binding. Reconciling for it is exactly the two
-		// DescribeACLs round trips this guard removes — and it made an edit whose whole purpose
-		// is consumer-side filtering fail whenever the broker was unreachable.
-		//
-		// The prefix's own contract says the same from the other side: every subscriber read and
-		// every credential response declares that the narrowing is the subscriber's to apply.
-		// subscriberAuthorization therefore snapshots only the three fields a binding is derived
-		// from — principal, consumer group and topics.
+		// reconciles", which contradicts the very finding the test exists for: Kafka ACLs
+		// have no message-key dimension, so a partition-key prefix has NO broker-side
+		// representation and an edit to one cannot move a single binding.
 		run := newSubscriberLifecycle(t)
 
 		_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
@@ -7347,12 +6524,8 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyForAnAuthorizationChange(t *testin
 // The legacy webhook_url is retired at the sunset, on the generic routes too
 // ---------------------------------------------------------------------------------------
 
-// subscriberSunsetConfiguration publishes a Kafka-configured deployment whose retirement
-// instant is the one supplied, and restores whatever was published before.
-//
-// The sunset is published as an RFC3339 string, exactly as an operator sets it, so the
-// resolution under test is the real one — parse included — rather than a pre-parsed instant
-// no deployment could produce.
+// subscriberSunsetConfiguration publishes a Kafka-configured deployment whose
+// retirement instant is the one supplied, and restores whatever was published before.
 func subscriberSunsetConfiguration(t *testing.T, sunset time.Time) {
 	t.Helper()
 
@@ -7361,12 +6534,8 @@ func subscriberSunsetConfiguration(t *testing.T, sunset time.Time) {
 	config.MockConfig(cnf)
 }
 
-// apiErrorCode extracts the typed error code from a service error, failing the test when the
-// error is not a typed one.
-//
-// Asserting on the CODE rather than on message text is what makes these assertions about the
-// contract: the status a route answers with is derived from the code through the catalogue, so
-// the code is the thing a client sees consequences of.
+// apiErrorCode extracts the typed error code from a service error, failing the test
+// when the error is not a typed one.
 func apiErrorCode(t *testing.T, err error) apierror.ErrorCode {
 	t.Helper()
 
@@ -7377,22 +6546,14 @@ func apiErrorCode(t *testing.T, err error) apierror.ErrorCode {
 	return apiErr.Code
 }
 
-// TestRegisterSubscriber_RefusesALegacyWebhookURLAfterTheSunset is R-12's write half on the
-// route the sunset middleware does not guard.
+// TestRegisterSubscriber_RefusesALegacyWebhookURLAfterTheSunset is the sunset's write half on
+// the route the sunset middleware does not guard.
 //
-// # The defect this closes
-//
-// The four /webhook-subscription routes answer 410 Gone past the retirement instant, because
-// middleware.WebhookSunsetGuard is attached to them. POST /subscribers and PUT
-// /subscribers/{subscriber_id} are NOT guarded and must not be — registering a subscriber and
-// granting it topics are Kafka-era operations that outlive the webhook transport entirely — yet
-// both carry an optional webhook_url. So the one field the sunset retires stayed writable
-// through an unguarded route, and "nothing accepts a webhook URL after the sunset" held for
-// three of the four ways in.
-//
-// The guard therefore lives in the SERVICE, which every writer of the column reaches, rather
-// than in the request layer where it would have to be repeated per route and would put a second
-// copy of the retirement decision in the HTTP path.
+// The four /webhook-subscription routes answer 410 Gone past the retirement instant,
+// because middleware.WebhookSunsetGuard is attached to them. POST /subscribers and PUT
+// /subscribers/{subscriber_id} are NOT guarded and must not be — registering a
+// subscriber and granting it topics are Kafka-era operations that outlive the webhook
+// transport entirely — yet both carry an optional webhook_url.
 func TestRegisterSubscriber_RefusesALegacyWebhookURLAfterTheSunset(t *testing.T) {
 	lifecycle := newSubscriberLifecycle(t)
 	subscriberSunsetConfiguration(t, time.Now().Add(-time.Minute))
@@ -7410,18 +6571,18 @@ func TestRegisterSubscriber_RefusesALegacyWebhookURLAfterTheSunset(t *testing.T)
 		"the refusal must carry the code the catalogue maps to 410 Gone, so the generic route answers "+
 			"the same status the deprecated routes do")
 
-	// The whole registration is refused rather than the field being dropped, because a caller
-	// that asked to record an endpoint and got 201 with no endpoint recorded has been told
-	// something untrue about the state of the registry.
+	// The whole registration is refused rather than the field being dropped, because a
+	// caller that asked to record an endpoint and got 201 with no endpoint recorded has
+	// been told something untrue about the state of the registry.
 	assert.Zero(t, lifecycle.log.count("CreateEventSubscriber"),
 		"the refusal must happen before the write, so no row is created at all")
 }
 
-// TestRegisterSubscriber_AcceptsALegacyWebhookURLBeforeTheSunset is the complement, and it is
-// what stops the guard above from being a blanket refusal.
+// TestRegisterSubscriber_AcceptsALegacyWebhookURLBeforeTheSunset is the complement, and
+// it is what stops the guard above from being a blanket refusal.
 //
-// Recording an endpoint is the whole point of the column during the dual-delivery window: it is
-// how an operator tracks which subscribers still have to be migrated.
+// Recording an endpoint is the whole point of the column during the dual-delivery
+// window: it is how an operator tracks which subscribers still have to be migrated.
 func TestRegisterSubscriber_AcceptsALegacyWebhookURLBeforeTheSunset(t *testing.T) {
 	lifecycle := newSubscriberLifecycle(t)
 	subscriberSunsetConfiguration(t, time.Now().Add(72*time.Hour))
@@ -7439,13 +6600,13 @@ func TestRegisterSubscriber_AcceptsALegacyWebhookURLBeforeTheSunset(t *testing.T
 	assert.Equal(t, url, *stored.WebhookURL)
 }
 
-// TestUpdateSubscriber_WebhookURLIsWriteRetiredButStillClearable is the asymmetry that makes the
-// retirement survivable.
+// TestUpdateSubscriber_WebhookURLIsWriteRetiredButStillClearable is the asymmetry that
+// makes the retirement survivable.
 //
-// Past the sunset a non-empty URL is refused, and CLEARING one is not. The rows written during
-// the window still hold third-party endpoints, and clearing them one at a time is how an
-// operator honours a deletion request before the bulk retention sweep reaches it. A guard that
-// refused every mention of the field would retire the only means of cleaning up after it.
+// Past the sunset a non-empty URL is refused, and CLEARING one is not. The rows written
+// during the window still hold third-party endpoints, and clearing them one at a time
+// is how an operator honours a deletion request before the bulk retention sweep reaches
+// it.
 func TestUpdateSubscriber_WebhookURLIsWriteRetiredButStillClearable(t *testing.T) {
 	recorded := "https://subscriber.example.com/hooks"
 	seed := subscriberFixtureRow(t)
@@ -7478,12 +6639,8 @@ func TestUpdateSubscriber_WebhookURLIsWriteRetiredButStillClearable(t *testing.T
 	assert.Nil(t, updated.WebhookURL)
 }
 
-// TestRecordLegacyWebhookSubscription_IsRefusedAfterTheSunset proves the deprecated surface's
-// service entry point is covered by the same guard as the generic one.
-//
-// Its HTTP route is already 410 by middleware, so this is defence in depth rather than the only
-// barrier — but the method is exported and reachable from any caller inside the process, and a
-// guard that only the middleware applied would be one route registration away from being lost.
+// TestRecordLegacyWebhookSubscription_IsRefusedAfterTheSunset proves the deprecated
+// surface's service entry point is covered by the same guard as the generic one.
 func TestRecordLegacyWebhookSubscription_IsRefusedAfterTheSunset(t *testing.T) {
 	lifecycle := newSubscriberLifecycle(t)
 	subscriberSunsetConfiguration(t, time.Now().Add(-time.Minute))
@@ -7496,14 +6653,15 @@ func TestRecordLegacyWebhookSubscription_IsRefusedAfterTheSunset(t *testing.T) {
 	assert.Equal(t, apierror.ErrGenGone, apiErrorCode(t, err))
 }
 
-// TestNormalizeSubscriberName_BoundsTheLabelAtTheService is the SEC-16 guard at the layer that
+// TestNormalizeSubscriberName_BoundsTheLabelAtTheService is the guard at the layer that
 // api/model cannot cover.
 //
-// api/model.validateSubscriberName refuses the same three things at the request boundary, and
-// that is where a caller gets the clearest message. This asserts the SERVICE's own check,
-// which is what holds when the boundary is not in the path: the registry is reachable from the
-// CLI, from a test and from any future caller that builds a registration directly, and the
-// name column is TEXT, which bounds nothing at all.
+// api/model.validateSubscriberName refuses the same three things at the request
+// boundary, and that is where a caller gets the clearest message. This asserts the
+// SERVICE's own check, which is what holds when the boundary is not in the path: the
+// registry is reachable from the CLI, from a test and from any future caller that
+// builds a registration directly, and the name column is TEXT, which bounds nothing at
+// all.
 func TestNormalizeSubscriberName_BoundsTheLabelAtTheService(t *testing.T) {
 	t.Run("an ordinary label is accepted and trimmed", func(t *testing.T) {
 		name, err := normalizeSubscriberName("  ledger-ops  ")
@@ -7556,31 +6714,11 @@ func TestNormalizeSubscriberName_BoundsTheLabelAtTheService(t *testing.T) {
 	})
 }
 
-// TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope is the F-05 guard, and it
-// is the whole of that finding's resolution.
+// TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope is the guard on the
+// whole of the recorded key scope.
 //
-// # The defect
-//
-// The access model scopes a subscriber's credential by three things: its authorised topics, its
-// consumer group, and its partition-key prefix. Issuance REFUSED any row recording a prefix, so
-// the third scope existed only on rows that could not consume — which is not an implementation
-// of it, it is a declination of it. A subscriber that recorded a ledger boundary got no
-// credential at all, and the registry still described the boundary either way, so the refusal
-// bought nothing a reader could see.
-//
-// The premise behind the refusal was and remains true: Kafka's authorizer has no message-key
-// dimension, so a principal granted Read on a shared category topic reads every record on it.
-// What was wrong was the conclusion. The two designs that could move the boundary to the broker
-// are both closed off — a topic per key scope contradicts the model's own no-per-tenant-topics
-// rule, and a filtering gateway is subscriber-side consumer machinery Blnk does not build — so
-// what is left is to DELIVER the scope to the one party that can apply it.
-//
-// # What is asserted
-//
-// That the credential is issued at all, which is the finding; that it carries the recorded
-// scope, so the consumer can apply it; and that it carries the flag saying the broker does not,
-// so the scope cannot be mistaken for a limit on the credential's reach. The third assertion is
-// the one that makes the first two safe.
+// The access model scopes a subscriber's credential by three things: its authorised
+// topics, its consumer group, and its partition-key prefix.
 func TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope(t *testing.T) {
 	const scope = "ldg_9f1c8a72"
 
@@ -7590,8 +6728,8 @@ func TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope(t *testi
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
-	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
-	// without one, issuance and a prefix-recording update both fail closed with
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record
+	// keys: without one, issuance and a prefix-recording update both fail closed with
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
 	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
 	enforceKeyScopeGateway(t)
@@ -7629,14 +6767,11 @@ func TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope(t *testi
 	assert.Equal(t, scope, *stored.PartitionKeyPrefix)
 }
 
-// TestIssueSubscriberCredential_ReportsAllKeysWhenNoScopeIsRecorded is the other arm, and it
-// exists because the absent case is the one a client is most likely to misread.
+// TestIssueSubscriberCredential_ReportsAllKeysWhenNoScopeIsRecorded is the other arm,
+// and it exists because the absent case is the one a client is most likely to misread.
 //
-// A blank key-scope field beside a working credential invites exactly the wrong inference — that
-// some restriction applies and was not named. The contract therefore states the scope positively
-// in both cases: a recorded prefix, or the word for "every key", and the enforcement flag is
-// TRUE here because the topic grant is then the whole boundary and the consumer has nothing left
-// to apply.
+// A blank key-scope field beside a working credential invites exactly the wrong
+// inference — that some restriction applies and was not named.
 func TestIssueSubscriberCredential_ReportsAllKeysWhenNoScopeIsRecorded(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
@@ -7651,21 +6786,15 @@ func TestIssueSubscriberCredential_ReportsAllKeysWhenNoScopeIsRecorded(t *testin
 		"and here the broker IS the whole boundary: nothing is delegated to the consumer")
 }
 
-// TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding guards against the tempting
-// wrong fix, which is the same one whether issuance refuses a key-scoped row or not.
+// TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding guards against the
+// tempting wrong fix, which is the same one whether issuance refuses a key-scoped row
+// or not.
 //
-// Faced with a prefix the broker cannot evaluate, the plausible next step is to make it "do
-// something" at the broker — most obviously by binding the TOPIC pattern as PREFIXED instead of
-// LITERAL, since Kafka does have a prefixed pattern type. That is strictly worse than not
-// enforcing it: topic-name prefixes and message-key prefixes are unrelated, so it would WIDEN the
-// grant to every topic sharing a name prefix while appearing to narrow it.
-//
-// A request carrying a declared key scope is refused by validate and never reaches the broker at
-// all, so these bindings are never sent — but the binding SHAPE is asserted here anyway, because
-// the shape is what a future change would reach for, and this is the assertion that would fail.
-// The ACL set must stay exactly the two dimensions the access model specifies, and the prefix must
-// appear in NO binding. It asserts the shape rather than a count, because a count passes for the
-// wrong reasons.
+// A request carrying a declared key scope is refused by validate and never reaches the
+// broker at all, so these bindings are never sent — but the binding SHAPE is asserted
+// here anyway, because the shape is what a future change would reach for, and this is
+// the assertion that would fail. The ACL set must stay exactly the two dimensions the
+// access model specifies, and the prefix must appear in NO binding.
 func TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding(t *testing.T) {
 	const scope = "ldg_9f1c8a72"
 
@@ -7701,48 +6830,22 @@ func TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding(t *testing.T
 	assert.True(t, sawGroup, "the group namespace binding must be present")
 }
 
-// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber SURVIVED, and its RATIONALE did
-// not. The test is below; this note records what its reasoning used to be, because a reader
-// finding the old wording elsewhere needs to know it was retired.
-//
-// It asserted that recording a prefix on a row already holding a credential was accepted, on the
-// reasoning that the scope is delivered to the consumer at issuance and the remedy for a stale
-// delivery is a re-issue. That reasoning is what was wrong: the consumer is the party the boundary
-// is meant to constrain, so delivering the prefix to it is not enforcement at all.
-//
-// The ACCEPTANCE stands, on a stronger footing — the update NARROWS the live grant. Its companions
-// are
-// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant, which asserts
-// that the update PRUNES record Read from the live principal so the broker refuses its next fetch,
-// and TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential, which asserts that
-// the decision is persisted, that the row reports its enforcement point, and that the working
-// credential is not revoked as a side effect.
+// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber SURVIVED, and its
+// RATIONALE did not.
 
-// TestIssueSubscriberCredential_ReportsBrokerResidueWhenTheIssuanceRecordTimesOut is the F-10
-// guard, and what it protects is the ONE fact a caller cannot learn any other way.
+// TestIssueSubscriberCredential_ReportsBrokerResidueWhenTheIssuanceRecordTimesOut is
+// the fingerprint guard, and what it protects is the ONE fact a caller cannot learn any other
+// way.
 //
-// # The defect
+// The issuance-record write is the last step of issuance, and by the time it runs the
+// broker HAS been written to.
 //
-// The issuance-record write is the last step of issuance, and by the time it runs the broker HAS
-// been written to. It shared its timeout classification with the two registry steps that run
-// BEFORE provisioning, and that classifier's whole contract is that no credential can exist yet
-// — so it reports no broker state at all, deliberately. Applied after provisioning, that silence
-// stops being accurate and becomes a false statement: a registry write that timed out and whose
-// compensating revocation ALSO failed was answered with credential_written=false,
-// compensated=false, retryable=true. A caller was told the retry starts from the state the first
-// attempt found, while a principal it holds no secret for could authenticate against the broker.
-// Nobody would go looking for residue they had just been told could not exist.
+// They are the two states the flags exist to distinguish, and a fix that hardcoded
+// either one would pass a test that only checked the other.
 //
-// # Why BOTH cleanup outcomes are asserted
-//
-// They are the two states the flags exist to distinguish, and a fix that hardcoded either one
-// would pass a test that only checked the other. Successful revocation leaves the broker clean
-// and the subscriber with NO access until credentials are re-issued; failed revocation leaves a
-// live principal that a human has to revoke. Same error code, same retryability, opposite
-// operational consequence.
-//
-// The premise in both cases is a GENERIC internal-server failure on a spent budget, because that
-// is the only combination the classifier rewrites — a typed conflict or not-found stays itself.
+// The premise in both cases is a GENERIC internal-server failure on a spent budget,
+// because that is the only combination the classifier rewrites — a typed conflict or
+// not-found stays itself.
 func TestIssueSubscriberCredential_ReportsBrokerResidueWhenTheIssuanceRecordTimesOut(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -7849,14 +6952,9 @@ func TestIssueSubscriberCredential_ReportsBrokerResidueWhenTheIssuanceRecordTime
 	}
 }
 
-// TestIssueSubscriberCredential_KeepsATypedRecordOutcomeAfterTheBrokerWasWrittenTo is the limit
-// of the post-broker reclassification, and it is the same limit the pre-broker one has.
-//
-// A superseded issuance is a CONFLICT, and it stays a conflict whether or not the budget also
-// expired: another issuance did commit, and the remedy is to issue once more serially rather than
-// to treat the answer as a timeout. Rewriting it would also lose the one thing that distinguishes
-// it from a failed revocation — both leave a credential at the broker, and only the code says
-// which of them left somebody else's.
+// TestIssueSubscriberCredential_KeepsATypedRecordOutcomeAfterTheBrokerWasWrittenTo is
+// the limit of the post-broker reclassification, and it is the same limit the
+// pre-broker one has.
 func TestIssueSubscriberCredential_KeepsATypedRecordOutcomeAfterTheBrokerWasWrittenTo(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	run := newSubscriberLifecycle(t).seeded(row)
@@ -7890,36 +6988,12 @@ func TestIssueSubscriberCredential_KeepsATypedRecordOutcomeAfterTheBrokerWasWrit
 }
 
 // ---------------------------------------------------------------------------------------
-// AUTH-02 — "no broker is configured" is not a fact about the world
+// "no broker is configured" is not a fact about the world
 // ---------------------------------------------------------------------------------------
 
-// TestSubscriberLifecycle_FailsClosedWhenAProvisionedRowCannotHaveItsRevocationConfirmed is the
-// AUTH-02 guard, and it covers the three lifecycle paths that reached for the registry while
-// broker cleanup was skipped.
-//
-// # The defect, and why it was unrecoverable rather than merely wrong
-//
-// Each of these three paths branched on admin.IsConfigured() and, finding no broker, concluded
-// that there was no broker-side access. That inference reads the configuration of THIS PROCESS
-// as a fact about the world, and the two differ in exactly the case that matters: a subscriber
-// provisioned while Kafka was configured, then deregistered after a config change, a deploy that
-// dropped KAFKA_BROKERS, or a replica reading a different environment.
-//
-// Deregistration was the worst of the three because its residue could not be repaired.
-// credential_reference is the ONLY record of which principal still has to be revoked, and
-// deleting the row destroyed it — so a live SASL credential with live ACL bindings was left at
-// the broker with nothing anywhere naming it, and no retry could find it because there was no
-// longer a row to retry from. Narrowing made the registry UNDER-report real access, which is the
-// direction that misleads an operator asking "can this subscriber still see that topic?".
-// Clearing the credential record erased the evidence while the credential kept authenticating.
-//
-// # What decides, now
-//
-// The row's own evidence, not the process's configuration. credential_reference is non-nil
-// exactly when a credential was written for this principal at a broker and has not been
-// confirmed removed. With none, nothing can authenticate as the principal and any ACL bindings
-// are inert, so the registry stays usable without Kafka — which is what those branches exist for
-// and is asserted by the companion tests above.
+// TestSubscriberLifecycle_FailsClosedWhenAProvisionedRowCannotHaveItsRevocationConfirmed
+// is the RECONCILED GRANT guard, and it covers the three lifecycle paths that reached for the
+// registry while broker cleanup was skipped.
 func TestSubscriberLifecycle_FailsClosedWhenAProvisionedRowCannotHaveItsRevocationConfirmed(t *testing.T) {
 	// Each case is one path, and each asserts the same two things: the caller is told, and the
 	// registry still says what the broker still allows.
@@ -7981,13 +7055,10 @@ func TestSubscriberLifecycle_FailsClosedWhenAProvisionedRowCannotHaveItsRevocati
 	}
 }
 
-// subscriberOrphanedRow is a row whose credential is UNACCOUNTED FOR: no reference, but an orphan
-// marker.
+// subscriberOrphanedRow is a row whose credential is UNACCOUNTED FOR: no reference, but
+// an orphan marker.
 //
-// It is the state the reference-only guard read exactly backwards. An issuance wrote the SCRAM
-// credential at the broker and then could neither record it nor revoke it, so credential_reference
-// is nil PRECISELY BECAUSE the recording failed — the absence of the record is the evidence that a
-// credential exists, not its refutation.
+// It is the state the reference-only guard read exactly backwards.
 func subscriberOrphanedRow(t *testing.T) model.EventSubscriber {
 	t.Helper()
 
@@ -8013,25 +7084,17 @@ func subscriberCleanupPendingRow(t *testing.T) model.EventSubscriber {
 	return row
 }
 
-// TestSubscriberLifecycle_FailsClosedForACredentialWithNoRecordedReference is the C-2 guard, and
-// it is the case the AUTH-02 test above could not catch.
+// TestSubscriberLifecycle_FailsClosedForACredentialWithNoRecordedReference is the
+// guard, and it is the case the test above could not catch.
 //
-// # Why a reference-only test was backwards
+// The guard asked IsProvisioned, which reads credential_reference. Two states can
+// coexist with a LIVE broker credential and carry no reference at all:
 //
-// The guard asked IsProvisioned, which reads credential_reference. Two states can coexist with a
-// LIVE broker credential and carry no reference at all:
-//
-//   - ORPHANED. Provisioning writes the SCRAM credential BEFORE the ACL bindings, because a
-//     binding for a principal that does not exist is inert while a credential with no bindings
-//     still authenticates. When recording that issuance fails, the compensation is to revoke —
-//     and when the revocation ALSO fails, a means of authenticating exists for a principal the
-//     registry records no issuance for. credential_reference is nil because the write failed.
-//   - CLEANUP PENDING. A credential Blnk intended to destroy has not been confirmed destroyed.
-//
-// For both, the old guard answered "not provisioned", the caller concluded there was nothing at a
-// broker to act on, and deregistration DELETED the only row naming the principal. There was then
-// nothing anywhere to retry from — the unrecoverable outcome the guard exists to prevent, reached
-// through the guard itself.
+//   - ORPHANED. Provisioning writes the SCRAM credential BEFORE the ACL bindings,
+//     because a binding for a principal that does not exist is inert while a credential
+//     with no bindings still authenticates.
+//   - CLEANUP PENDING. A credential Blnk intended to destroy has not been confirmed
+//     destroyed.
 func TestSubscriberLifecycle_FailsClosedForACredentialWithNoRecordedReference(t *testing.T) {
 	fixtures := map[string]func(*testing.T) model.EventSubscriber{
 		"an orphaned credential":          subscriberOrphanedRow,
@@ -8090,15 +7153,11 @@ func TestSubscriberLifecycle_FailsClosedForACredentialWithNoRecordedReference(t 
 	}
 }
 
-// TestUpdateSubscriber_RefusesToWidenAnUnaccountedForPrincipal is the second half of C-2, and it
-// applies WITH a broker configured.
+// TestUpdateSubscriber_RefusesToWidenAnUnaccountedForPrincipal is the second half of
+// It applies WITH a broker configured.
 //
-// Creating new ACL bindings for a principal whose credential Blnk cannot account for hands that
-// outstanding credential access it did not previously have. Unlike a recorded credential there is
-// no reference to revoke, so the grant cannot be walked back by revoking the thing that uses it.
-//
-// NARROWING must stay allowed, and that is asserted here too: refusing every edit would freeze the
-// row at its widest, which is worse than the gap. Re-issuance remains the documented settlement.
+// Unlike a recorded credential there is no reference to revoke, so the grant cannot be
+// walked back by revoking the thing that uses it.
 func TestUpdateSubscriber_RefusesToWidenAnUnaccountedForPrincipal(t *testing.T) {
 	t.Run("widening an orphaned row is refused", func(t *testing.T) {
 		run := newSubscriberLifecycle(t).seeded(subscriberOrphanedRow(t))
@@ -8187,11 +7246,11 @@ func TestMayHaveBrokerCredential_IsTheUnionOfEveryUnconfirmedState(t *testing.T)
 	})
 
 	t.Run("the two markers that are not credential evidence", func(t *testing.T) {
-		// A revocation tombstone is stamped by deregistration BEFORE the broker is touched, so a
-		// predicate that read it would refuse deregistration its own tombstone — making the
-		// operation impossible in a deployment that never configured Kafka. A grant-reconcile
-		// marker means the recorded authorization is WIDER than the broker's, which is the safe
-		// direction: no authentication follows from a missing ACL binding.
+		// A revocation tombstone is stamped by deregistration BEFORE the broker is touched,
+		// so a predicate that read it would refuse deregistration its own tombstone — making
+		// the operation impossible in a deployment that never configured Kafka. A
+		// grant-reconcile marker means the recorded authorization is WIDER than the broker's,
+		// which is the safe direction: no authentication follows from a missing ACL binding.
 		for name, row := range map[string]*model.EventSubscriber{
 			"a revocation tombstone":   {RevocationPendingAt: &stamp},
 			"a grant-reconcile marker": {GrantReconcilePendingAt: &stamp},
@@ -8214,26 +7273,11 @@ func TestMayHaveBrokerCredential_IsTheUnionOfEveryUnconfirmedState(t *testing.T)
 	})
 }
 
-// TestDeregisterSubscriber_ClearsTheTombstoneOnceTheBrokerIsConfirmedClean is the F14 guard: the
-// revocation tombstone must mark ONE obligation, not two.
+// TestDeregisterSubscriber_ClearsTheTombstoneOnceTheBrokerIsConfirmedClean is the F14
+// guard: the revocation tombstone must mark ONE obligation, not two.
 //
-// # The two debts that shared one column
-//
-// revocation_pending_at is stamped before the broker is touched, so it means "a principal may
-// still authenticate". A row whose revocation SUCCEEDED and whose deletion then failed kept the
-// stamp — and from that point it meant the opposite: the broker is clean and a useless row is
-// left over.
-//
-// CountSubscriberRevocationsPending counts tombstoned rows, and
-// blnk_subscribers_oldest_revocation_age_seconds raises a CRITICAL alert whose runbook tells an
-// operator to delete a SCRAM credential by hand. Counting both states sent that operator after a
-// principal that no longer existed, and — the direction that actually costs something — made a
-// row where a live credential really was unaccounted for indistinguishable from this harmless
-// residue.
-//
-// So a confirmed revocation clears the tombstone along with the credential record. What is left
-// is an inert row: no credential, no broker access, no tombstone, removed by retrying the
-// deregistration and deliberately not alerted on, because nothing is exposed by it.
+// revocation_pending_at is stamped before the broker is touched, so it means "a
+// principal may still authenticate".
 func TestDeregisterSubscriber_ClearsTheTombstoneOnceTheBrokerIsConfirmedClean(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	// The broker revocation succeeds; only the row deletion fails. That is the exact state the
@@ -8260,18 +7304,6 @@ func TestDeregisterSubscriber_ClearsTheTombstoneOnceTheBrokerIsConfirmedClean(t 
 }
 
 // TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent is the F23 guard.
-//
-// RegisterSubscriber's contract is that an id is GENERATED only when the caller supplies none,
-// and that a supplied id is judged exactly as given — surrounding whitespace being a rejection
-// rather than something to fold away, because the id derives the principal and the group
-// namespace.
-//
-// The implementation trimmed first, which collapsed the two cases and produced the opposite of
-// that contract twice over: a whitespace-only id became the empty string and took the generation
-// branch, so the caller got a subscriber under an id it never asked for and cannot predict; and
-// " sub_a" and "sub_a" both trimmed to one identifier, so two registrations differing only by
-// whitespace would have raced for one Kafka principal instead of the second being refused —
-// which is the SEC-04 duplicate CanonicalizeSubscriberIdentifier exists to catch.
 func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 	t.Run("an absent identifier is generated", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -8314,23 +7346,10 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 	}
 }
 
-// RETIRED: TestIssueSubscriberCredential_RefusesASubscriberWhoseKeyScopeKafkaCannotEnforce,
-// TestUpdateSubscriber_RefusesAKeyScopeOnASubscriberThatHoldsACredential and a test over the
-// deleted unenforceability predicate stood here.
-//
-// All three asserted the SEC-05 refusal: a subscriber recording a partition key prefix was
-// unprovisionable, and recording a prefix on a subscriber holding a credential was refused. The
-// diagnosis they rest on is correct and unchanged — Kafka's authorizer has no message-key
-// dimension, so a credential holding topic-level Read is wider than a key-scoped row describes —
-// but the REMEDY was replaced. Withholding the credential implemented no part of the key scope;
-// it withdrew a mandatory capability (R-7 makes the credential endpoint required) for a state
-// the registry is explicitly designed to hold, permanently and with no way forward.
-//
-// What replaced it is a NARROWER GRANT plus an enforcement point. A key-scoped subscriber is
-// provisioned with Describe and no Read on its topics, so the broker itself refuses its direct
-// fetches, and its records are delivered by the declared key-authorising component, which applies the
-// prefix per record before anything leaves the process. The prefix is therefore enforced by a
-// component in the path, not requested of the subscriber.
+// RETIRED:
+// TestIssueSubscriberCredential_RefusesASubscriberWhoseKeyScopeKafkaCannotEnforce,
+// TestUpdateSubscriber_RefusesAKeyScopeOnASubscriberThatHoldsACredential and a test
+// over the deleted unenforceability predicate stood here.
 //
 // Their replacements assert that behaviour:
 //
@@ -8338,42 +7357,23 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 //   - TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope
 //   - TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant
 //   - TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable
-//   - TestDeclaresKeyScope_ReadsWhitespaceAsAbsent, which pins the whitespace reading the third
-//     test covered, on the predicate that survived the rename
-//   - TestProvisionSubscriberPrincipal_WithholdsRecordReadFromAKeyScopedSubscriber, which pins
-//     what the refusal used to stand in for: the grant a key-scoped row is actually given
+//   - TestDeclaresKeyScope_ReadsWhitespaceAsAbsent, which pins the whitespace reading
+//     the third test covered, on the predicate that survived the rename
+//   - TestProvisionSubscriberPrincipal_WithholdsRecordReadFromAKeyScopedSubscriber,
+//     which pins what the refusal stands for: the grant a key-scoped row is
+//     actually given
 //
-// requireEnforceableKeyScope was retired with them. requireProvisionableKeyScope,
-// requireRecordableKeyScope and apierror.ErrSubscriberKeyScopeUnenforced were NOT: they take the
-// enforcement fact as a parameter, read once from config.KafkaConfig.KeyScopeGateway, so each
-// refuses whenever the deployment has declared no component that authorises record keys — which
-// is the SHIPPED DEFAULT. The refusals are therefore reachable by an ordinary request, not merely
-// by a hand-passed boolean: see
-// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope for the guard and
-// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway for the endpoint.
-//
-// What changed since this note was first written is the premise, not the guards: an in-binary
-// enforcement point was introduced and then REMOVED, because a Blnk-hosted read path is a second
-// data plane holding Blnk's own wide credential, authenticated by a header the authorization layer
-// does not know about and unaffected by revoking the subscriber's SCRAM credential.
+// The refusals are therefore reachable by an ordinary request, not merely by a
+// hand-passed boolean: see
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope for the
+// guard and
+// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway for
+// the endpoint.
 
-// TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed pins what a successful
-// credential says about its own reach.
+// TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed pins what a
+// successful credential says about its own reach.
 //
-// It began life as TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope,
-// asserting that a recorded partition-key prefix was no reason to withhold a credential. That
-// premise holds on the key-scoped path too, and that is why the fixture here records a prefix: a
-// key-scoped row IS issuable where a component is declared — its credential holds no record-level
-// Read and the declared component delivers, key-filtered — so the narrowed grant has to be
-// reported as faithfully as the ordinary
-// one. The secret exists once, the broker was really asked, the issuance is really recorded, the
-// scope is delivered to the party that applies it together with the component that enforces it,
-// and the reported grant is the BROKER-CONFIRMED one.
-//
-// That last point is the one worth its own test. The response reports the topics provisioning
-// confirmed rather than the topics the row asked for, so a partial grant cannot be reported as a
-// complete one; and no dead-letter sibling is ever carried along with a category grant, because a
-// DLT holds other subscribers' failed events together with Blnk's own failure metadata.
+// That last point is the one worth its own test.
 func TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -8403,9 +7403,9 @@ func TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed(t *testi
 	require.True(t, ok)
 	require.NotNil(t, stored.CredentialReference, "the issuance is recorded")
 
-	// The topic set is compared against the BROKER DOUBLE's result rather than the row, because
-	// that is what the real service reports: the topics provisioning confirms, not the topics
-	// that were asked for.
+	// The topic set is compared against the BROKER DOUBLE's result rather than the row,
+	// because that is what the real service reports: the topics provisioning confirms, not
+	// the topics that were asked for.
 	assert.Equal(t, run.admin.result.Topics, credential.AuthorizedTopics,
 		"the credential reports exactly the grant provisioning confirmed")
 	assert.Equal(t, row.ConsumerGroupID, credential.ConsumerGroupID)
@@ -8413,20 +7413,10 @@ func TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed(t *testi
 		"and no dead-letter sibling is ever carried along with a category grant")
 }
 
-// TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix pins the enforcement
-// field on a credential issued to a row that records no prefix.
+// TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix pins the
+// enforcement field on a credential issued to a row that records no prefix.
 //
-// The field is PRESENT rather than omitted so a client can branch on it without first testing
-// whether the prefix is empty, and on this row it has exactly one correct value: none. Reporting
-// anything else would tell a subscriber to filter by a key scope nothing recorded, and reporting
-// nothing at all would leave a client unable to distinguish "no scope" from an older Blnk that
-// did not send the field.
-//
-// No enforcement point is declared here on purpose. This is the whole-topic deployment — the
-// topic and group ACLs are the entire boundary — and it is the only shape in which a prefix-less
-// credential is issued at all: under a declared key-scoped model the same request is refused with
-// SUBSCRIBER_KEY_SCOPE_REQUIRED, which is
-// TestIssueSubscriberCredential_RefusesAPrefixLessSubscriberUnderADeclaredKeyScopedModel.
+// No enforcement point is declared here on purpose.
 func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberFixtureRow(t))
 	admin, service := run.admin, run.service
@@ -8439,12 +7429,13 @@ func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t 
 		"reported as none rather than omitted: the topic and group ACLs are the whole boundary "+
 			"and a client has nothing of its own to filter")
 
-	// AND THE ACCESSOR PAIR DESCRIBES THE SAME CREDENTIAL, in its own vocabulary: the scope is
-	// "all-keys" rather than an empty string, because that is the honest description of what a
-	// topic ACL grants on its own, and it is BROKER-ENFORCED, because on this row the topic and
-	// group grants are the entire boundary and nothing is left for the consumer to apply. The
-	// empty PartitionKeyPrefix above and this pair are not in tension: one reports what was
-	// recorded, the other what the credential can read.
+	// AND THE ACCESSOR PAIR DESCRIBES THE SAME CREDENTIAL, in its own vocabulary: the
+	// scope is "all-keys" rather than an empty string, because that is the honest
+	// description of what a topic ACL grants on its own, and it is BROKER-ENFORCED,
+	// because on this row the topic and group grants are the entire boundary and nothing
+	// is left for the consumer to apply. The empty PartitionKeyPrefix above and this pair
+	// are not in tension: one reports what was recorded, the other what the credential can
+	// read.
 	scope, brokerEnforced := credential.KeyScope()
 	assert.Equal(t, model.SubscriberKeyScopeAllKeys, scope,
 		"a row that records nothing is described as all-keys, not as an empty boundary a client "+
@@ -8460,29 +7451,15 @@ func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t 
 			"an endpoint that does not resolve for it")
 }
 
-// TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential is the registry half of
-// the reverse order: an operator decides on a key scope AFTER a credential already exists.
-//
-// A revision of this checkpoint refused that combination, on the reading that it left a principal
-// holding Read on whole topics beneath a row describing something narrower — and, because Kafka
-// stores one credential per principal, unable ever to rotate its secret. The diagnosis was right
-// about the old grant and wrong about the remedy: refusing removed the operator's only way to
-// record the decision, and the enforcement it was standing in for does not come from withholding
-// anything. Recording the prefix NARROWS the live grant instead, and the declared component
-// becomes the only path that subscriber's records can take.
-//
-// So what is asserted here is that the decision is recordable, that it is persisted, that the row
-// then reports WHERE the scope is enforced, and — the part a refusal would have destroyed — that
-// the working credential is left untouched. The broker-side narrowing that accompanies it is
-// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant, and the
-// diagnostic the transition emits is warnOnKeyScopeRecordedAfterIssuance, found through
-// keyScopeOnLivePrincipalWarning below.
+// TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential is the
+// registry half of the reverse order: an operator decides on a key scope AFTER a
+// credential already exists.
 func TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	store, service := run.store, run.service
 
-	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
-	// without one, issuance and a prefix-recording update both fail closed with
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record
+	// keys: without one, issuance and a prefix-recording update both fail closed with
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
 	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
 	enforceKeyScopeGateway(t)
@@ -8513,16 +7490,11 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential(t *t
 		"and the provisioning claim is released either way")
 }
 
-// keyScopeOnLivePrincipalWarning finds the disclosure emitted when a key scope is recorded onto a
-// subscriber that already holds a credential, or reports that nothing was emitted.
-//
-// It matches on the message rather than on a field, because the field set is shared with the
-// issuance-time disclosure and matching a field would make this helper answer "some key scope was
-// disclosed somewhere" — which is not the question either caller is asking.
+// keyScopeOnLivePrincipalWarning finds the disclosure emitted when a key scope is
+// recorded onto a subscriber that already holds a credential, or reports that nothing
+// was emitted.
 func keyScopeOnLivePrincipalWarning(hook *logtest.Hook) *logrus.Entry {
-	// Matched on the DISCLOSURE's own wording. An earlier revision refused this combination and
-	// this helper looked for "REFUSED a Kafka credential"; the combination is accepted now — the
-	// grant narrows instead — so the line to find is the one that says the narrowing happened.
+	// Matched on the DISCLOSURE's own wording.
 	for index := range hook.Entries {
 		if strings.Contains(
 			hook.Entries[index].Message,
@@ -8535,25 +7507,11 @@ func keyScopeOnLivePrincipalWarning(hook *logtest.Hook) *logrus.Entry {
 	return nil
 }
 
-// TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal covers the one order of events
-// that nothing else in the service reports.
+// TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal covers the one order
+// of events that nothing else in the service reports.
 //
-// # Why this needs its own coverage
-//
-// Issuance discloses the boundary whenever it mints a credential for a row that already carries a
-// prefix. This is the reverse order, and its consequence reaches BACKWARDS: the credential was
-// issued against a row with no prefix, so its response truthfully said the broker grants records
-// directly. Recording a prefix now withdraws that Read, so the holder's next fetch is refused —
-// and the statement it was given cannot be recalled.
-//
-// Nothing else in UpdateSubscriber would say so in terms an operator can act on. The update's own
-// line reports topic counts and ACL churn, which is the same churn any narrowing produces and says
-// nothing about a credential already in a subscriber's hands. So this line names the prefix, where
-// it is enforced, when the affected credential was issued, and the two ways forward.
-//
-// The issuance instant is the field that makes the line actionable, and the fixture's credential is
-// deliberately an hour old, so a test asserting it cannot pass against a value that is simply
-// "now".
+// Issuance discloses the boundary whenever it mints a credential for a row that already
+// carries a prefix.
 func TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal(t *testing.T) {
 	t.Run("a prefix recorded beside a live credential is disclosed with the issuance instant", func(t *testing.T) {
 		row := subscriberProvisionedRow(t)
@@ -8655,18 +7613,8 @@ func TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal(t *testing.
 	})
 }
 
-// TestKeyScopeEnforcement_ReadsWhitespaceAsAbsent pins the accessor and the disclosure helper
-// together.
-//
-// A column holding only spaces constrains nothing and is not a recorded intent, so reading it as
-// present would make Blnk disclose a filtering contract nobody asked for — and, under the
-// behaviour this replaced, would have refused a credential over noise. NULL, the empty string and
-// whitespace all have to answer the same way.
-//
-// It asserts the SERVICE-LEVEL disclosure alongside the model accessor, because those two are
-// what every surface reads: describeSubscriberKeyScope is the value carried into the credential
-// and the response, so an accessor that agreed while the disclosure disagreed would be a
-// response that misreports the boundary.
+// TestKeyScopeEnforcement_ReadsWhitespaceAsAbsent pins the accessor and the disclosure
+// helper together.
 func TestKeyScopeEnforcement_ReadsWhitespaceAsAbsent(t *testing.T) {
 	for name, prefix := range map[string]*string{
 		"null":       nil,
@@ -8722,39 +7670,20 @@ func TestKeyScopeEnforcement_ReadsWhitespaceAsAbsent(t *testing.T) {
 	})
 }
 
-// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the SHIPPED
-// DEPLOYMENT: a row recording a partition-key prefix, and nothing declared that authorises record
-// keys.
+// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the
+// SHIPPED DEPLOYMENT: a row recording a partition-key prefix, and nothing declared that
+// authorises record keys.
 //
-// # Why a refusal rather than a credential
-//
-// Kafka's authorizer has no message-key dimension, and Blnk ships no component that supplies one.
-// So there are exactly two credentials this service could mint for such a row, and both are wrong:
-// one carrying whole-topic Read, which reads every other ledger's records beside a prefix nothing
-// applies; or one carrying Describe and no Read, which can fetch nothing at all and whose response
-// would name an endpoint that refuses it. The refusal is the third option, and it is the only one
-// that neither over-grants nor hands out a credential that cannot work.
-//
-// A Blnk-hosted read path was the fourth option and was removed. It made Blnk a second data plane
-// holding Blnk's own wide producer credential, authenticated by a bespoke header the platform's
-// authorization layer knows nothing about, and unaffected by revoking the subscriber's SCRAM
-// credential at the broker — so revocation stopped the direct path and left the served one open.
-//
-// # What the refusal has to be, to be usable
-//
-// TYPED, so a client can tell it from an outage; 409 rather than 503, because no retry helps; and
-// carrying BOTH remedies, because a refusal naming none is a dead end. Nothing may be minted or
-// recorded on the way out: the assertions below check the broker was never asked and no issuance
-// was written, which is what makes the refusal free of residue.
+// A Blnk-hosted read path was the fourth option and was removed.
 func TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(
 	t *testing.T,
 ) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
 
-	// DELIBERATELY NOT enforceKeyScopeGateway: this is the shipped deployment, in which nothing
-	// authorises record keys. Every other key-scoped issuance test declares one, so this is the
-	// single test standing between the default and an unasserted refusal.
+	// DELIBERATELY NOT enforceKeyScopeGateway: this is the shipped deployment, in which
+	// nothing authorises record keys. Every other key-scoped issuance test declares one,
+	// so this is the single test standing between the default and an unasserted refusal.
 	run := newSubscriberLifecycle(t).seeded(row)
 	service := run.service
 
@@ -8790,22 +7719,9 @@ func TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGate
 		"nor may an issuance be recorded for a credential that does not exist")
 }
 
-// TestIssueSubscriberCredential_NamesTheDeclaredGatewayForAKeyScopedSubscriber is the other side of
-// the same decision: with a component declared, the credential is issued AND names that component.
-//
-// # The substitution this guards, and why it needs its own test
-//
-// A key-scoped credential must name the declared component rather than the brokers: that
-// subscriber's connection is terminated by it, and reporting a bootstrap address would hand out a
-// credential declaring key-scoped isolation together with an endpoint that bypasses the thing
-// enforcing it. The subscriber-facing broker list is what a PREFIX-LESS subscriber gets, and the
-// assertions below hold the two apart so neither can be reported for the other.
-//
-// The substitution keys on the declared ADDRESS rather than on the enforcement boolean, and the
-// two are separable on purpose: the boolean decides whether issuance happens at all, the address
-// decides which endpoint is named. They agree by construction because both come from one
-// configuration read — but a substitution written against the boolean would hand out a credential
-// naming NOWHERE if that ever stopped being true.
+// TestIssueSubscriberCredential_NamesTheDeclaredGatewayForAKeyScopedSubscriber is the
+// other side of the same decision: with a component declared, the credential is issued
+// AND names that component.
 func TestIssueSubscriberCredential_NamesTheDeclaredGatewayForAKeyScopedSubscriber(
 	t *testing.T,
 ) {
@@ -8842,24 +7758,13 @@ func TestIssueSubscriberCredential_NamesTheDeclaredGatewayForAKeyScopedSubscribe
 		"and the subscriber is told the prefix its records are filtered by")
 }
 
-// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber replaces the second half of the
-// old refusal, and pins the property that replaces it.
-//
-// Recording a prefix on a row that already holds a credential used to be refused, because the
-// live credential kept whole-topic Read while the row began announcing a narrower boundary. The
-// diagnosis was right about the grant and wrong about the remedy: the update is what NARROWS that
-// grant, so refusing it left the wide access in place and removed the operator's only way to
-// record that it should go.
-//
-// What is asserted here is the part its companions do not cover: the edit does NOT revoke a
-// working credential as a side effect of a change nobody asked to make, and the newly recorded
-// scope is what the NEXT issuance delivers. The broker-side narrowing is
-// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant.
+// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber replaces the second
+// half of the old refusal, and pins the property that replaces it.
 func TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 
-	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
-	// without one, issuance and a prefix-recording update both fail closed with
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record
+	// keys: without one, issuance and a prefix-recording update both fail closed with
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
 	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
 	enforceKeyScopeGateway(t)
@@ -8891,13 +7796,8 @@ func TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber(t *testing.T)
 	assert.False(t, brokerEnforced)
 }
 
-// TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope is the core of the
-// change: a recorded prefix is not a reason to withhold a credential.
-//
-// It asserts the whole outcome rather than only the absence of an error, because the previous
-// behaviour failed on every one of these points: a secret exists, the broker was asked to mint
-// it, the issuance is recorded, and the credential carries the prefix together with the fact
-// that its enforcement is consumer-side.
+// TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope is the core
+// of the change: a recorded prefix is not a reason to withhold a credential.
 func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -8905,8 +7805,8 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
-	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record keys:
-	// without one, issuance and a prefix-recording update both fail closed with
+	// A DECLARED ENFORCEMENT POINT, because Blnk ships no component that authorises record
+	// keys: without one, issuance and a prefix-recording update both fail closed with
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED. The shipped default is asserted by
 	// TestIssueSubscriberCredential_RefusesAKeyScopedSubscriberWithNoDeclaredGateway.
 	enforceKeyScopeGateway(t)
@@ -8936,12 +7836,10 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 		"and the recorded scope survives issuance: it is a statement of intent, not a blocker")
 	assert.Equal(t, "ldg_9f1c8a72", *stored.PartitionKeyPrefix)
 
-	// THE BROKER-ENFORCED BOUNDARY IS UNCHANGED BY ANY OF THIS. The grant reported is the one
-	// the provisioning call returned, and the group is the subscriber's own — nothing was
-	// widened to compensate for the key scope, which is the mistake a prefixed TOPIC pattern
-	// would have been. The topic set is compared against the BROKER DOUBLE's result rather
-	// than the row, because that is what the real service reports: the topics provisioning
-	// confirms, not the topics that were asked for.
+	// THE BROKER-ENFORCED BOUNDARY IS UNCHANGED BY ANY OF THIS. The grant reported is the
+	// one the provisioning call returned, and the group is the subscriber's own — nothing
+	// was widened to compensate for the key scope, which is the mistake a prefixed TOPIC
+	// pattern would have been.
 	assert.Equal(t, run.admin.result.Topics, credential.AuthorizedTopics,
 		"the credential reports exactly the grant provisioning confirmed")
 	assert.Equal(t, row.ConsumerGroupID, credential.ConsumerGroupID)
@@ -8949,42 +7847,17 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 		"and no dead-letter sibling is ever carried along with a category grant")
 }
 
-// TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList is the R-10 half, and
-// the behaviour it pins reversed once: a fallback to KAFKA_BROKERS was tried, warned about, and
-// withdrawn.
+// TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList is the
+// half, and the behaviour it pins reversed once: a fallback to KAFKA_BROKERS was tried,
+// warned about, and withdrawn.
 //
-// # Why the fallback was not acceptable, even warned
-//
-// KAFKA_BROKERS is what BLNK dials. Inside a deployment that is "kafka:9092", a ClusterIP or a
-// headless Service, and none of those resolve for a subscriber outside it — and Kafka compounds it,
-// because a broker answers every client with the ADVERTISED address of the listener the connection
-// arrived on, so even a reachable bootstrap hands back internal names for the partition leaders.
-//
-// The fallback logged a warning, and the warning was not a control: it landed in Blnk's log while
-// the consequence landed on the subscriber, as an unexplained connection timeout days later. And
-// because the SASL secret is shown exactly once, diagnosing it costs a reissue — which invalidates
-// the credential the subscriber is already holding. A 200 that cannot be used is the worst of the
-// three available answers.
-//
-// The R-10 objection to requiring it — that the configuration contract names eight variables and a
-// ninth prerequisite makes a documented deployment unable to issue — is answered without a
-// fallback: a deployment whose subscribers really are in-cluster sets KAFKA_SUBSCRIBER_BROKERS to
-// the same value as KAFKA_BROKERS. One line, and the claim is explicit rather than implicit in a
-// substitution nobody reads.
-//
-// # What is asserted
-//
-// The refusal is typed, it is 503 rather than a 400-class answer because only an operator can
-// supply the list, it NAMES the variable, and it leaves no residue: no secret generated, no broker
-// call made, no issuance recorded. The complementary case — the whole list absent, meaning no Kafka
-// at all — is TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll, and the
-// success case is TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers.
+// KAFKA_BROKERS is what BLNK dials.
 func TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList(t *testing.T) {
 	run := newSubscriberLifecycle(t)
 
-	// Republished WITHOUT the subscriber-facing list, and with Kafka still configured: this is
-	// a deployment that publishes events perfectly well and has simply never been told what to
-	// tell a subscriber. It is the exact input the fallback used to accept.
+	// Republished WITHOUT the subscriber-facing list, and with Kafka still configured:
+	// this is a deployment that publishes events perfectly well and has simply never been
+	// told what to tell a subscriber.
 	outboxStoreConfiguration(t, &config.Configuration{
 		Kafka: config.KafkaConfig{
 			Brokers:     []string{"broker-1:9092"},
@@ -9046,27 +7919,11 @@ func TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList(t
 	assert.NotEmpty(t, issued.Password())
 }
 
-// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope is the guard that
-// makes a key scope unprovisionable unless something is DECLARED to enforce it.
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope is the guard
+// that makes a key scope unprovisionable unless something is DECLARED to enforce it.
 //
-// # The refusal is the shipped behaviour, not a floor beneath one
-//
-// A row recording a partition_key_prefix describes a boundary Kafka's authorizer has no dimension
-// for. Blnk narrows what it can — aclEntries withholds topic Read from a key-scoped principal and
-// verifyKeyScopeBoundary proves the withholding before the password becomes returnable — but
-// nothing in Blnk applies the prefix to a record, because BLNK SERVES NO RECORDS. On the shipped
-// default (KAFKA_KEY_SCOPE_ENFORCEMENT=none) the only credential this service could mint would
-// either read every record on every authorised topic, other ledgers' and other subscribers'
-// included, or be able to fetch nothing at all. So issuance REFUSES.
-//
-// Disclosing the gap in the response was tried and is not a boundary: the party asked to apply
-// the filter is the party holding the credential. So the refusal has to be actionable — a caller
-// must be able to tell it from an outage and know what to change — which is why it is typed and
-// names both remedies.
-//
-// The guard takes the enforcement fact as a PARAMETER, read once by its caller from
-// config.KafkaConfig.KeyScopeGateway, so the refusal and the credential's reported enforcement
-// point cannot disagree and NEITHER branch is dead by construction.
+// A row recording a partition_key_prefix describes a boundary Kafka's authorizer has no
+// dimension for.
 func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t *testing.T) {
 	scoped := subscriberFixtureRow(t)
 	scoped.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -9097,9 +7954,10 @@ func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t 
 	})
 
 	t.Run("refused on the SHIPPED default, read from configuration", func(t *testing.T) {
-		// THE DEFAULT ITSELF, resolved the way issuance resolves it, so this asserts the shipped
-		// behaviour rather than a hand-passed boolean. A build that grew an in-binary enforcement
-		// point would make this true and this assertion would fail — which is the point.
+		// THE DEFAULT ITSELF, resolved the way issuance resolves it, so this asserts the
+		// shipped behaviour rather than a hand-passed boolean. A build that grew an in-binary
+		// enforcement point would make this true and this assertion would fail — which is the
+		// point.
 		_, active := config.KafkaConfig{}.KeyScopeGateway()
 		require.False(t, active,
 			"the zero configuration must not report an active enforcement point: Blnk ships no "+
@@ -9146,15 +8004,16 @@ func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t 
 
 // TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard pins the other half.
 //
-// Guarding only issuance would let "issue, then record" walk around the refusal: a subscriber
-// registered with no prefix is issued a whole-topic credential, and a later update records a
-// prefix onto the live principal. Where nothing enforces the scope that leaves exactly the state
-// the issuance guard exists to prevent, reached in two steps instead of one — so the same typed
-// code answers both orderings, and a client handling it from one endpoint needs no second case.
+// Guarding only issuance would let "issue, then record" walk around the refusal: a
+// subscriber registered with no prefix is issued a whole-topic credential, and a later
+// update records a prefix onto the live principal. Where nothing enforces the scope
+// that leaves exactly the state the issuance guard exists to prevent, reached in two
+// steps instead of one — so the same typed code answers both orderings, and a client
+// handling it from one endpoint needs no second case.
 //
-// Where the scope IS enforced the update is ACCEPTED and narrows the grant, which is asserted by
-// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant. Clearing a
-// prefix is never refused on either path, because it is the remedy the refusal names.
+// Where the scope IS enforced the update is ACCEPTED and narrows the grant, which is
+// asserted by
+// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant.
 func TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard(t *testing.T) {
 	provisioned := subscriberFixtureRow(t)
 	provisioned.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -9188,23 +8047,11 @@ func TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard(t *testing.T) {
 		"clearing a prefix must never be refused: it is the remedy the refusal itself names")
 }
 
-// TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies is the anti-drift
-// assertion behind MAJ-1, and it is the only thing standing between the fix and the defect coming
-// back.
+// TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies is the
+// anti-drift assertion behind the two-contract split, and it is the only thing standing between the fix
+// and the defect coming back.
 //
-// # The defect it guards
-//
-// The registry projection used to answer its enforcement claims from the row alone. A subscriber
-// recording a partition_key_prefix reported partition_key_prefix_enforced=true with broker_gateway
-// named and issuance unblocked — on a deployment that had declared no such component and would
-// refuse the very next credential call for precisely that reason. The API told operators and
-// clients that a verified isolation boundary existed when none did.
-//
-// The fix is that one function resolves the deployment and both readers consult it. That property
-// is not enforced by the type system: somebody adding a fourth precondition to issuance, or
-// deriving one of these three differently in the resolver, restores the disagreement silently and
-// every existing test still passes. So each field is asserted against THE SAME EXPRESSION the
-// issuance path evaluates, rather than against a literal.
+// The fix is that one function resolves the deployment and both readers consult it.
 func TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies(t *testing.T) {
 	t.Run("the shipped default, resolved the way issuance resolves it", func(t *testing.T) {
 		// The lifecycle configuration: brokers and an advertised subscriber list, no key-scope
@@ -9271,9 +8118,9 @@ func TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies(t
 
 	t.Run("an unresolvable configuration fails closed", func(t *testing.T) {
 		// A configuration carrying nothing: no brokers, no subscriber list, no mode. Every
-		// capability must be reported OFF, because understating a deployment costs an operator a
-		// spurious remedy while overstating one publishes an isolation guarantee that does not
-		// exist.
+		// capability must be reported OFF, because understating a deployment costs an
+		// operator a spurious remedy while overstating one publishes an isolation guarantee
+		// that does not exist.
 		outboxStoreConfiguration(t, &config.Configuration{})
 
 		deployment := SubscriberAccessDeployment()

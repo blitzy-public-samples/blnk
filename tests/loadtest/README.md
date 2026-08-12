@@ -48,7 +48,7 @@ These are the main flow tests to compare:
 - `cold-to-hot-shard`
   - same as above, but the hot destination is split into destination buckets first
 - `event-streaming`
-  - offers event publication at 550 events/sec for 30 minutes, judged against V-1's 500/s,
+  - offers event publication at 550 events/sec for 30 minutes, judged against the 500/s
     and measures throughput, p99
     capture-to-dispatch latency and dead-letter rate from the server's own instruments — the
     `/metrics` exposition, plus the `GET /events/stats` census where the dead-letter counter is
@@ -103,26 +103,27 @@ the authoritative inventory, since a count repeated here goes stale the first ti
 `grep -o '__ENV\.[A-Z_0-9]*' tests/loadtest/events.js | sort -u` lists them all.
 
 **Load shape** — every default here is the criterion's own figure, so overriding any of them
-produces a run whose numbers are real for the load it offered and not for the load V-1 is stated
-over.
+produces a run whose numbers are real for the load it offered and not for the load the
+throughput target is stated over.
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `TARGET_EVENTS_PER_SEC` | `500` | The rate the throughput verdict is judged against |
 | `LOAD_HEADROOM_RATIO` | `1.1` | Multiplier applied to the target to get the offered rate |
 | `RATE` | `550` (derived) | Offered arrival rate; `ceil(TARGET × HEADROOM)` unless set |
-| `DURATION` | `30m` | V-1 and V-3 are both stated over this window |
+| `DURATION` | `30m` | Every verdict below is stated over this window |
 | `VUS` / `MAX_VUS` | `400` / `1600` | Executor pool; too low and arrivals are dropped rather than slow |
 | `LEDGER_SPREAD` | `128` | Independent aggregates the load is spread over. Replaces `SOURCE_BUCKETS`/`DESTINATION_BUCKETS`, which mean nothing here |
 | `MIN_LEDGER_SPREAD` | see file | Floor below which acceptance mode refuses to measure |
 
 **Verdict thresholds** — the pass/fail bars. Relaxing one does not make a run invalid, but the
-summary records that you did, and a figure quoted against V-1 or V-3 must come from the defaults.
+summary records that you did, and a figure quoted against the acceptance criteria must come from
+the defaults.
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
-| `MAX_P99_PUBLISH_SECONDS` | `2` | V-1's latency ceiling |
-| `MAX_DEAD_LETTER_RATIO` | `0.001` | V-3's ceiling, i.e. 0.1% |
+| `MAX_P99_PUBLISH_SECONDS` | `2` | The capture-to-dispatch latency ceiling |
+| `MAX_DEAD_LETTER_RATIO` | `0.001` | The dead-letter rate ceiling, i.e. 0.1% |
 | `MAX_API_P95_MS`, `MAX_API_P99_MS` | see file | API-acceptance ceilings, separate from the pipeline verdicts |
 | `MIN_CHECK_PASS_RATE`, `MAX_DROPPED_ITERATION_RATIO` | see file | Guard against certifying a run the executor could not actually drive |
 | `REQUIRE_METRICS` | `1` | Fail closed when `/metrics` could not be scraped. `0` keeps the run but withholds verdicts |
@@ -212,14 +213,15 @@ ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 \
 
 # Reusable fixtures: nothing is created, and successive runs are comparable. The list must hold
 # at least LEDGER_SPREAD pairs — 128 by default — so a two-pair list needs the spread narrowed
-# to match it, and a narrowed spread measures less concurrency than V-1 is stated over.
+# to match it, and a narrowed spread measures less concurrency than the throughput target is
+# stated over.
 ISOLATED_INSTANCE=1 LEDGER_SPREAD=2 \
   LEDGER_PAIRS='[{"source":"bln_a1","destination":"bln_b1"},{"source":"bln_a2","destination":"bln_b2"}]' \
   bash tests/loadtest/run_case.sh event-streaming
 ```
 
 The case's defaults are the acceptance criteria's own figures — 550/s offered for 30 minutes,
-judged against V-1's 500/s — so override the load shape for a first attempt. The runner forwards
+judged against the 500/s throughput target — so override the load shape for a first attempt. The runner forwards
 `RATE`, `DURATION`, `VUS` and `MAX_VUS` only when you set them, and prints which of the two shapes
 it used. Override the ceilings too, or a ten-second run at rate 5 is judged against a target
 stated over thirty minutes at 500:
@@ -232,8 +234,8 @@ RATE=5 DURATION=10s VUS=5 MAX_VUS=10 \
 
 `SMOKE=1` is the explicit opt-out from the acceptance contract: it permits the single-aggregate
 fallback so a shakeout does not have to provision fixtures first, and it relaxes the
-dedicated-instance requirement. Never set it for a run whose numbers are quoted against V-1 or
-V-3 — the summary records which mode produced every figure.
+dedicated-instance requirement. Never set it for a run whose numbers are quoted against the
+acceptance criteria — the summary records which mode produced every figure.
 
 ### Why those two variables are not optional, and why neither is in `.env`
 
@@ -244,7 +246,7 @@ process-global counters, so another client's events would be counted as this run
 **`LEDGER_PAIRS` or `ALLOW_FIXTURE_CREATION=1`** decides the fixtures. The scenario spreads its
 load over `LEDGER_SPREAD` independent aggregates (128 by default) because the relay claims at most
 one row per partition key per poll — with one key it would measure a single aggregate's
-serialisation ceiling and report it as V-1. Provisioning those aggregates creates up to
+serialisation ceiling and report it as sustained throughput. Provisioning those aggregates creates up to
 `LEDGER_SPREAD` ledgers and twice as many balances, and **Blnk has no delete endpoint for either**,
 so they are permanent and every later run and benchmark sees them. The scenario therefore refuses
 to create them as a side effect of being run: pass `LEDGER_PAIRS` to reuse existing balance pairs,
@@ -294,11 +296,11 @@ acceptance criteria, and it prints a verdict for each:
 
 | Verdict metric | Criterion |
 |----------------|-----------|
-| `event_publish_window_events_per_second` | V-1 — 500 events/sec sustained, weakest window |
-| `event_publish_subwindow_met_target` | V-1 — the fraction of windows that met the target |
+| `event_publish_window_events_per_second` | throughput — 500 events/sec sustained, weakest window |
+| `event_publish_subwindow_met_target` | throughput — the fraction of windows that met the target |
 | `event_publish_events_per_second` | the whole-run mean. A **diagnostic** while the sampler runs; the verdict only when it is off |
-| `event_publish_p99_seconds` | V-1 — p99 capture-to-dispatch latency under 2s, first attempts only |
-| `event_publish_dead_letter_ratio` | V-3 — under 0.1% of events dead-lettered |
+| `event_publish_p99_seconds` | latency — p99 capture-to-dispatch under 2s, first attempts only |
+| `event_publish_dead_letter_ratio` | dead-letter rate — under 0.1% of events dead-lettered |
 | `event_publish_verdicts_available` | the three above were actually measured |
 
 ### Before the first run: both process roles, and fixtures
@@ -348,7 +350,7 @@ master key as above is appropriate for a local stack; issue a real API key for a
 
 Nothing else is needed: the load shape, the target, the latency ceiling and the dead-letter
 ceiling all default to the criteria's own figures — 550/s offered for 30 minutes and judged
-against V-1's 500/s, p99 under 2 seconds, dead-letter rate under 0.1%.
+against the 500/s throughput target, p99 under 2 seconds, dead-letter rate under 0.1%.
 
 To certify repeatedly without growing the database, reuse the fixtures the first run created —
 Blnk cannot delete them, so reuse is the only way to keep certifying without adding more. The run
@@ -375,7 +377,8 @@ ISOLATED_INSTANCE=1 \
 `LEDGER_SPREAD` must match the number of pairs you supply. Acceptance mode requires that many
 distinct partition keys and refuses to run on fewer — events are keyed by aggregate and the relay
 claims at most one row per key per poll, so a run on too few keys measures one aggregate's
-serialisation ceiling and would report it as V-1. Supplying two pairs while the spread still says
+serialisation ceiling and would report it as sustained throughput. Supplying two pairs while the
+spread still says
 64 aborts in `setup()` saying exactly that.
 
 `SERVER_REPLICAS` declares how many server processes `METRICS_URL` fronts. Every verdict is a
@@ -444,7 +447,7 @@ That is why `ISOLATED_INSTANCE=1` is required and why the run also probes for fo
 before it starts; see "Attribution" below.
 
 **The load shape defaults to the criterion's own figures — 550/s offered for 30 minutes and
-judged against V-1's 500/s — and the
+judged against the 500/s throughput target — and the
 runner does not substitute the transaction cases' defaults for them.** Pass `RATE` or
 `DURATION` explicitly for a shorter run, and the run announces that you did. The two
 prerequisites do not go away with the load shape — a two-minute run is still measured off the
@@ -459,7 +462,7 @@ ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 \
 ```
 
 A shorter run's verdicts are real for the load it offered, which is not the load the criteria are
-stated over. Only a default run certifies V-1 and V-3. `SMOKE=1` is the one form that drops both
+stated over. Only a default run certifies the acceptance criteria. `SMOKE=1` is the one form that drops both
 prerequisites, and it drops the claim with them.
 
 ### Reading the verdict honestly
@@ -477,12 +480,12 @@ the summary names the reason, when any of the following holds:
   see "The settling gates" below;
 - a counter reset or an exporter restart split the window across two processes;
 - no terminal events were seen, or **the first-attempt latency histogram had no observations**;
-- **V-3's numerator could not be measured over the window** at all.
+- **the dead-letter numerator could not be measured over the window** at all.
 
 The p99 verdict is computed from `blnk_events_capture_to_dispatch_duration_seconds` and from
 nothing else. `blnk_events_publish_duration_seconds` is reported beside it as a diagnostic-only
 supporting figure, and so is the difference between the two — neither carries a threshold and
-neither can satisfy V-1: publish duration's clock starts at the relay's claim, so it excludes the
+neither can satisfy the latency target: publish duration's clock starts at the relay's claim, so it excludes the
 time a row spends waiting to be claimed and reports its smallest figures for exactly the backlog
 the criterion exists to catch. The difference of two independently ranked p99 values is **not** a
 queue-wait percentile; read it as an order-of-magnitude indication of where the time goes, and see
@@ -513,7 +516,7 @@ and each of the four is there for a reason:
 |-------|----------------------|
 | `pending` | captured and committed, not yet claimed by the relay |
 | `processing` | claimed under a lease, not yet acknowledged by the broker — and the state a *stalled* relay holds every row in |
-| `failed` | the retry budget is spent and **the dead-letter write is still owed**: the row has reached NO terminal counter, so it is missing from both sides of V-3's ratio |
+| `failed` | the retry budget is spent and **the dead-letter write is still owed**: the row has reached NO terminal counter, so it is missing from both sides of the dead-letter ratio |
 | `replaying` | a dead-lettered row whose republish is in flight, which moves the dead-letter census as it completes |
 
 `webhook_pending` is deliberately **not** in that population: such a row's Kafka leg is

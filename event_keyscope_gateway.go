@@ -13,73 +13,32 @@
 // limitations under the License.
 
 // event_keyscope_gateway.go is the CONTROL-PLANE integration with the key-authorising
-// component a deployment declares in front of its Kafka brokers (SEC-01, requirement R-7).
+// component a deployment declares in front of its Kafka brokers.
 //
-// # The gap this closes
+// A subscriber whose registry row records a partition_key_prefix is entitled only to
+// records whose message key carries that prefix. Kafka cannot express that: its
+// authorizer authorises OPERATIONS ON RESOURCES — topics, groups, the cluster,
+// transactional ids — and a record key is not a resource.
 //
-// A subscriber whose registry row records a partition_key_prefix is entitled only to records
-// whose message key carries that prefix. Kafka cannot express that: its authorizer authorises
-// OPERATIONS ON RESOURCES — topics, groups, the cluster, transactional ids — and a record key
-// is not a resource. No arrangement of ACLs confines a consumer to a slice of a topic, and per
-// tenant topics, the only Kafka-native alternative, are excluded by the requirement.
+// Blnk's answer is to withhold topic Read from such a principal entirely — the broker
+// then refuses every direct fetch — and to route its records through a component the
+// DEPLOYMENT operates, which applies the recorded prefix before returning anything.
+// That component is not Blnk's to ship: it is a custom Kafka authorizer plugin or a
+// protocol-aware proxy, a separate artefact with its own lifecycle.
 //
-// Blnk's answer is to withhold topic Read from such a principal entirely — the broker then
-// refuses every direct fetch — and to route its records through a component the DEPLOYMENT
-// operates, which applies the recorded prefix before returning anything. That component is not
-// Blnk's to ship: it is a custom Kafka authorizer plugin or a protocol-aware proxy, a separate
-// artefact with its own lifecycle.
-//
-// WHAT WAS WRONG IS THAT THE COMPONENT WAS TAKEN ON TRUST. Two configuration values — a mode
-// and a bootstrap list — were the entire basis for believing it existed and applied the right
-// prefix. A deployment could name any distinct address and Blnk would mint a credential, tell
-// the subscriber its key scope was enforced at a gateway, and be wrong. That is the same false
-// assurance as the client-side-filter reading it replaced, moved one layer out: the credential
-// holder was no longer being asked to police itself, but nobody was being asked to prove that
-// anybody else was.
-//
-// So the declaration is now VERIFIED. Before a secret exists and before the broker is touched,
-// Blnk calls the component's control endpoint over an authenticated channel and requires it to
-// confirm three facts:
+// So the declaration is now VERIFIED. Before a secret exists and before the broker is
+// touched, Blnk calls the component's control endpoint over an authenticated channel
+// and requires it to confirm three facts:
 //
 //  1. it enforces key scopes at all;
 //  2. it will do so for THIS principal; and
-//  3. the prefix it holds for that principal is BYTE-FOR-BYTE the prefix the registry recorded.
+//  3. the prefix it holds for that principal is BYTE-FOR-BYTE the prefix the registry
+//     recorded.
 //
-// Anything else — unreachable, unauthorised, a mismatched prefix, a malformed body, an explicit
-// refusal — and issuance fails with SUBSCRIBER_KEY_SCOPE_UNATTESTED. Blnk will not mint a
-// credential describing a boundary it could not get an answer about.
-//
-// # What this file is NOT
-//
-// It is not a data plane. Blnk does not read, filter or serve records, and nothing here
-// inspects a message. The component's own filtering correctness remains the component's
-// responsibility — what Blnk verifies is that a component ANSWERS, that it authenticates Blnk,
-// that it claims enforcement for the exact principal and prefix at issue, and that it is told
-// when a binding is withdrawn. That is the whole of what an integrating service can establish
-// about a peer, and it is strictly more than a configuration string.
-//
-// # The wire contract, published so a component can implement it
-//
-// One endpoint, two methods, JSON both ways, `Authorization: Bearer <token>` on both:
-//
-//	POST <KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL>
-//	  {"principal":"blnk-sub-acme","subscriber_id":"acme","partition_key_prefix":"ldg_9f1c",
-//	   "authorized_topics":["blnk.transactions"],"consumer_group_prefix":"blnk-sub-acme."}
-//	→ 200 {"key_scope_enforced":true,"principal":"blnk-sub-acme","partition_key_prefix":"ldg_9f1c"}
-//
-//	DELETE <KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL>?principal=blnk-sub-acme
-//	→ 200 or 204, body ignored
-//
-//	GET <KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL>
-//	→ 200 {"key_scope_enforced":true}   (health only; no principal is implied)
-//
-// The POST is idempotent by principal: it both REGISTERS the binding and attests it, because a
-// component cannot honestly attest a prefix it has not been told about, and splitting the two
-// into separate calls would leave a window in which Blnk had a confirmation for a binding the
-// component had since dropped.
-//
-// docs/kafka-operations.md carries the same contract in prose, together with the operator
-// runbook for standing such a component up.
+// The POST is idempotent by principal: it both REGISTERS the binding and attests it,
+// because a component cannot honestly attest a prefix it has not been told about, and
+// splitting the two into separate calls would leave a window in which Blnk had a
+// confirmation for a binding the component had since dropped.
 package blnk
 
 import (
@@ -132,11 +91,11 @@ var ErrKeyScopeGatewayNotConfigured = errors.New(
 
 // KeyScopeBinding is what Blnk asks the gateway to hold and confirm for one principal.
 //
-// Every field is derived from the subscriber's registry row rather than from a request body, so
-// a caller cannot widen what is attested. The prefix is the value stored in
-// partition_key_prefix, passed through untouched — not trimmed, not normalised — because the
-// attestation compares it byte-for-byte and a normalisation on this side would make Blnk and
-// the component agree about a value neither of them stored.
+// Every field is derived from the subscriber's registry row rather than from a request
+// body, so a caller cannot widen what is attested. The prefix is the value stored in
+// partition_key_prefix, passed through untouched — not trimmed, not normalised —
+// because the attestation compares it byte-for-byte and a normalisation on this side
+// would make Blnk and the component agree about a value neither of them stored.
 type KeyScopeBinding struct {
 	// Principal is the SASL/SCRAM identity the gateway will see authenticate. It is the
 	// subscriber's derived Kafka principal, which is what ties the gateway's binding to the
@@ -223,34 +182,24 @@ type keyScopeGateway struct {
 	client   *http.Client
 }
 
-// NewKeyScopeGatewayClient builds the client from live configuration, or reports that none is
-// declared.
-//
-// The decision of whether a gateway is usable belongs to config.KafkaConfig.KeyScopeAttestation
-// and is not re-derived here, so the client this returns and the enforcement fact
-// KeyScopeGateway reports can never disagree — a client that existed while enforcement was
-// reported inactive would attest bindings for credentials that were being refused anyway, and
-// the reverse would issue credentials with nothing verified.
-//
-// # Why the HTTP client is built here and not shared
+// NewKeyScopeGatewayClient builds the client from live configuration, or reports that
+// none is declared.
 //
 //   - REDIRECTS ARE REFUSED. A 3xx from the control endpoint would otherwise send an
-//     authenticated request, bearer token included, to whatever host the redirect named. That is
-//     a credential-forwarding primitive, and there is no legitimate reason for a control
-//     endpoint to redirect.
-//   - The TIMEOUT is the configured attestation timeout, which is capped by the issuance
-//     budget. A client-level timeout is belt-and-braces beside the per-call context deadline:
-//     the context bounds the call, and this bounds a client that ignored it.
-//   - Connection reuse is deliberate and small. Issuance is not a hot path, and a large pool
-//     against one endpoint buys nothing.
+//     authenticated request, bearer token included, to whatever host the redirect
+//     named.
+//   - The TIMEOUT is the configured attestation timeout, which is capped by the
+//     issuance budget.
+//   - Connection reuse is deliberate and small. Issuance is not a hot path, and a large
+//     pool against one endpoint buys nothing.
 //
 // Parameters:
-//   - cnf *config.Configuration: the live configuration. A nil configuration declares nothing.
+//   - cnf *config.Configuration: the live configuration. A nil configuration declares
+//     nothing.
 //
 // Returns:
 //   - KeyScopeGatewayClient: the client, nil when no gateway is declared.
-//   - error: ErrKeyScopeGatewayNotConfigured when nothing usable is declared. It is the only
-//     error this returns; a declared endpoint is not dialled here.
+//   - error: ErrKeyScopeGatewayNotConfigured when nothing usable is declared.
 func NewKeyScopeGatewayClient(cnf *config.Configuration) (KeyScopeGatewayClient, error) {
 	if cnf == nil {
 		return nil, ErrKeyScopeGatewayNotConfigured
@@ -296,41 +245,38 @@ func (g *keyScopeGateway) Endpoint() string {
 
 // AttestBinding registers a binding and requires the component to confirm it.
 //
-// # The order matters: register, then believe
-//
 // The POST both registers and attests, in one call, because the two cannot be usefully
-// separated. A component asked to attest a prefix it had never been told about could only
-// guess, and a component told about a prefix in one call and asked about it in another leaves a
-// window in which Blnk holds a confirmation for a binding that has since been dropped.
+// separated. A component asked to attest a prefix it had never been told about could
+// only guess, and a component told about a prefix in one call and asked about it in
+// another leaves a window in which Blnk holds a confirmation for a binding that has
+// since been dropped.
 //
-// # What is checked, and why each check exists
+//   - 2xx. A 401 or 403 means Blnk's own token is wrong, which is a configuration fault
+//     worth distinguishing in the log; a 404 usually means the URL names something that
+//     is not a control endpoint.
+//   - key_scope_enforced == true. A component may legitimately answer that it will not
+//     enforce a scope — a topic it does not front, a prefix shape it cannot apply — and
+//     that is a refusal rather than an error.
+//   - The PRINCIPAL is echoed. A permissive proxy that answered 200 to everything
+//     without reading the body would pass the first two checks and fail this one.
+//   - The PREFIX is echoed BYTE-FOR-BYTE. This is the whole point. A component that
+//     trimmed, lower-cased or truncated the prefix would be enforcing a DIFFERENT
+//     boundary from the one the registry records and the credential response describes,
+//     and a wider one at that.
 //
-//   - 2xx. A 401 or 403 means Blnk's own token is wrong, which is a configuration fault worth
-//     distinguishing in the log; a 404 usually means the URL names something that is not a
-//     control endpoint. Both are refusals here.
-//   - key_scope_enforced == true. A component may legitimately answer that it will not enforce
-//     a scope — a topic it does not front, a prefix shape it cannot apply — and that is a
-//     refusal rather than an error.
-//   - The PRINCIPAL is echoed. A permissive proxy that answered 200 to everything without
-//     reading the body would pass the first two checks and fail this one.
-//   - The PREFIX is echoed BYTE-FOR-BYTE. This is the whole point. A component that trimmed,
-//     lower-cased or truncated the prefix would be enforcing a DIFFERENT boundary from the one
-//     the registry records and the credential response describes, and a wider one at that.
-//
-// # What is never done
-//
-// The bearer token is never logged and never included in an error. The component's `detail` is
-// bounded and sanitised before it reaches a log field and never reaches an API response, on the
-// same reasoning that keeps broker error text out of responses.
+// The bearer token is never logged and never included in an error. The component's
+// `detail` is bounded and sanitised before it reaches a log field and never reaches an
+// API response, on the same reasoning that keeps broker error text out of responses.
 //
 // Parameters:
-//   - ctx context.Context: the caller's context. Bounded further by the attestation timeout.
+//   - ctx context.Context: the caller's context. Bounded further by the attestation
+//     timeout.
 //   - binding KeyScopeBinding: the binding, derived entirely from the registry row.
 //
 // Returns:
 //   - error: nil when the component attested the exact binding; otherwise a typed
-//     ErrSubscriberKeyScopeUnattested carrying a bounded, non-disclosing detail, with the
-//     retryable flag set only for a transport-level failure.
+//     ErrSubscriberKeyScopeUnattested carrying a bounded, non-disclosing detail, with
+//     the retryable flag set only for a transport-level failure.
 func (g *keyScopeGateway) AttestBinding(ctx context.Context, binding KeyScopeBinding) error {
 	if g == nil {
 		return ErrKeyScopeGatewayNotConfigured
@@ -398,31 +344,19 @@ func (g *keyScopeGateway) AttestBinding(ctx context.Context, binding KeyScopeBin
 
 // RevokeBinding withdraws a binding at the gateway.
 //
-// # Why this is called AFTER the broker credential is gone, and why it is not fatal
-//
 // The authoritative revocation is the broker's: deleting the SCRAM credential ends the
-// principal's ability to authenticate anywhere, including at the gateway, since the gateway
-// terminates the same SASL exchange. This call is the gateway's chance to drop state for a
-// principal that no longer exists, which keeps its binding table from accumulating dead
-// entries — a hygiene and audit concern rather than an access one.
-//
-// It is therefore best-effort by CONTRACT: the caller logs a failure and proceeds, because
-// failing a deregistration whose broker half already succeeded would leave the operator with a
-// subscriber that cannot be removed while a component is down, and the access it is trying to
-// remove is already gone.
-//
-// A 404 is SUCCESS. A component that never held a binding for this principal — because
-// issuance never got that far, or because it has already been revoked — is in exactly the state
-// this call is asking for, and treating it as a failure would make a retried deregistration
-// noisier than the first attempt.
+// principal's ability to authenticate anywhere, including at the gateway, since the
+// gateway terminates the same SASL exchange. This call is the gateway's chance to drop
+// state for a principal that no longer exists, which keeps its binding table from
+// accumulating dead entries — a hygiene and audit concern rather than an access one.
 //
 // Parameters:
 //   - ctx context.Context: the caller's context, typically a bounded cleanup context.
 //   - principal string: the subscriber's Kafka principal.
 //
 // Returns:
-//   - error: non-nil when the component answered neither 2xx nor 404, or could not be reached.
-//     The caller decides what to do with it; nothing here is retried.
+//   - error: non-nil when the component answered neither 2xx nor 404, or could not be
+//     reached.
 func (g *keyScopeGateway) RevokeBinding(ctx context.Context, principal string) error {
 	if g == nil {
 		return ErrKeyScopeGatewayNotConfigured
@@ -468,13 +402,15 @@ func (g *keyScopeGateway) RevokeBinding(ctx context.Context, principal string) e
 	return nil
 }
 
-// Health reports whether the declared component answers and asserts key-scope enforcement.
+// Health reports whether the declared component answers and asserts key-scope
+// enforcement.
 //
-// It names no principal, so it establishes only that something is there and claims to do the
-// job — which is exactly what a start-up probe and a runbook check need, and deliberately less
-// than AttestBinding establishes. A deployment whose gateway is unhealthy still refuses
-// key-scoped issuance, because that refusal comes from the attestation call rather than from
-// this one; this exists so an operator learns about it before a subscriber does.
+// It names no principal, so it establishes only that something is there and claims to
+// do the job — which is exactly what a start-up probe and a runbook check need, and
+// deliberately less than AttestBinding establishes. A deployment whose gateway is
+// unhealthy still refuses key-scoped issuance, because that refusal comes from the
+// attestation call rather than from this one; this exists so an operator learns about
+// it before a subscriber does.
 //
 // Parameters:
 //   - ctx context.Context: the caller's context.
@@ -526,18 +462,21 @@ func (g *keyScopeGateway) Health(ctx context.Context) error {
 
 // do issues one authenticated request against the control endpoint.
 //
-// The per-call deadline is the configured attestation timeout applied to the CALLER's context,
-// so whichever of the two is sooner governs: a caller with a nearly spent issuance budget is
-// not given a fresh two seconds, and a caller with no deadline is still bounded.
+// The per-call deadline is the configured attestation timeout applied to the CALLER's
+// context, so whichever of the two is sooner governs: a caller with a nearly spent
+// issuance budget is not given a fresh two seconds, and a caller with no deadline is
+// still bounded.
 //
 // Parameters:
 //   - ctx context.Context: the caller's context.
 //   - method string: the HTTP method.
-//   - target string: the absolute URL, which for a revocation carries the principal query.
+//   - target string: the absolute URL, which for a revocation carries the principal
+//     query.
 //   - body []byte: the request body, nil for GET and DELETE.
 //
 // Returns:
-//   - *http.Response: the response, whose body the caller must read through readBoundedBody.
+//   - *http.Response: the response, whose body the caller must read through
+//     readBoundedBody.
 //   - error: a transport-level failure only. A non-2xx status is a successful call.
 func (g *keyScopeGateway) do(
 	ctx context.Context, method, target string, body []byte,
@@ -570,15 +509,17 @@ func (g *keyScopeGateway) do(
 
 // refusal builds the typed error every attestation failure answers with.
 //
-// One constructor, so every failure path answers with the same code and the same shape. The
-// CAUSE is never returned to the caller: it can carry the component's own error text, a DNS
-// name or an internal address, and this endpoint is reachable by an operator holding the master
-// key rather than by the subscriber. It is logged instead, bounded and classified.
+// One constructor, so every failure path answers with the same code and the same shape.
+// The CAUSE is never returned to the caller: it can carry the component's own error
+// text, a DNS name or an internal address, and this endpoint is reachable by an
+// operator holding the master key rather than by the subscriber. It is logged instead,
+// bounded and classified.
 //
 // Parameters:
 //   - binding KeyScopeBinding: names the subscriber in the log and the detail.
 //   - message string: the operator-facing summary.
-//   - retryable bool: true only for a transport-level failure, where repeating may succeed.
+//   - retryable bool: true only for a transport-level failure, where repeating may
+//     succeed.
 //   - cause error: logged, never returned.
 //
 // Returns:
@@ -618,10 +559,11 @@ const attestationMismatchMessage = "the key-scope enforcement gateway attested a
 
 // validate refuses a binding that could not honestly be attested.
 //
-// It guards the CALLER's construction rather than a request body — every field is derived from
-// a registry row — so a failure here is a defect in Blnk, not a caller error. It exists because
-// an empty principal or an empty prefix would produce an attestation that appeared to succeed
-// while describing nothing: a component echoing two empty strings would satisfy the comparison.
+// It guards the CALLER's construction rather than a request body — every field is
+// derived from a registry row — so a failure here is a defect in Blnk, not a caller
+// error. It exists because an empty principal or an empty prefix would produce an
+// attestation that appeared to succeed while describing nothing: a component echoing
+// two empty strings would satisfy the comparison.
 //
 // Returns:
 //   - error: non-nil when the binding is not attestable.
@@ -642,16 +584,17 @@ func (b KeyScopeBinding) validate() error {
 
 // matches reports whether the component attested THIS binding.
 //
-// All three comparisons are exact. The prefix in particular is compared with ==, not with a
-// case-insensitive or trimmed comparison: a component that returns a normalised form is
-// enforcing a different boundary from the one recorded, and Kafka message keys are bytes.
+// All three comparisons are exact. The prefix in particular is compared with ==, not
+// with a case-insensitive or trimmed comparison: a component that returns a normalised
+// form is enforcing a different boundary from the one recorded, and Kafka message keys
+// are bytes.
 //
 // Parameters:
 //   - binding KeyScopeBinding: what was sent.
 //
 // Returns:
-//   - error: nil on an exact match; otherwise an error naming which of the three failed,
-//     without quoting the prefix values.
+//   - error: nil on an exact match; otherwise an error naming which of the three
+//     failed, without quoting the prefix values.
 func (a keyScopeAttestation) matches(binding KeyScopeBinding) error {
 	if !a.KeyScopeEnforced {
 		return errors.New(
@@ -678,13 +621,8 @@ func (a keyScopeAttestation) matches(binding KeyScopeBinding) error {
 	return nil
 }
 
-// readBoundedBody reads and closes a response body, up to keyScopeAttestationMaxResponseBytes.
-//
-// Closing is unconditional so a connection is always released, and the cap is applied with
-// io.LimitReader so an endless body cannot exhaust memory inside credential issuance. A body
-// that exceeds the cap is TRUNCATED rather than reported: the truncated bytes then fail to
-// decode, which is the same refusal a malformed body gets, and reporting the size separately
-// would add a branch nobody acts on differently.
+// readBoundedBody reads and closes a response body, up to
+// keyScopeAttestationMaxResponseBytes.
 //
 // Parameters:
 //   - response *http.Response: may be nil, which reads as an empty body.
@@ -708,11 +646,11 @@ func readBoundedBody(response *http.Response) ([]byte, error) {
 
 // appendPrincipalQuery adds the principal to the control endpoint's query string.
 //
-// It parses and re-encodes rather than concatenating, so an endpoint that already carries a
-// query keeps it and the principal is escaped by url.Values. A principal containing an
-// ampersand cannot therefore inject a second parameter — Blnk's principals are constrained to a
-// safe alphabet, but a URL builder that relies on its input being safe is one that will be
-// wrong the day the alphabet changes.
+// It parses and re-encodes rather than concatenating, so an endpoint that already
+// carries a query keeps it and the principal is escaped by url.Values. A principal
+// containing an ampersand cannot therefore inject a second parameter — Blnk's
+// principals are constrained to a safe alphabet, but a URL builder that relies on its
+// input being safe is one that will be wrong the day the alphabet changes.
 //
 // Parameters:
 //   - endpoint string: the configured control endpoint.
@@ -720,8 +658,8 @@ func readBoundedBody(response *http.Response) ([]byte, error) {
 //
 // Returns:
 //   - string: the absolute URL to call.
-//   - error: when the configured endpoint does not parse. config.KeyScopeAttestation has
-//     already established that it does, so this cannot fire in practice.
+//   - error: when the configured endpoint does not parse. config.KeyScopeAttestation
+//     has already established that it does, so this cannot fire in practice.
 func appendPrincipalQuery(endpoint, principal string) (string, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
@@ -737,12 +675,12 @@ func appendPrincipalQuery(endpoint, principal string) (string, error) {
 
 // redactedRedirectTarget renders a refused redirect's destination for an error message.
 //
-// Scheme and host only. A redirect target's path or query can carry whatever the redirecting
-// party chose, and this string reaches a log; the host is what an operator needs in order to
-// understand which endpoint tried to hand the request somewhere else.
+// Scheme and host only. A redirect target's path or query can carry whatever the
+// redirecting party chose, and this string reaches a log; the host is what an operator
+// needs in order to understand which endpoint tried to hand the request somewhere else.
 //
 // Parameters:
-//   - request *http.Request: the request the client was about to follow. May be nil.
+//   - request *http.Request: the request the client was about to follow.
 //
 // Returns:
 //   - string: "scheme://host", or "unknown" when there is nothing to render.
@@ -765,16 +703,17 @@ func redactedRedirectTarget(request *http.Request) string {
 
 // keyScopeBindingFor composes the binding for a subscriber row.
 //
-// It exists so the ONE place that decides what is attested is beside the client that sends it:
-// every field is read from the row, the prefix is taken through SubscriberPartitionKeyPrefix so
-// the same accessor the rest of the file uses is the one that reads it, and no caller can pass
-// a value of its own.
+// It exists so the ONE place that decides what is attested is beside the client that
+// sends it: every field is read from the row, the prefix is taken through
+// SubscriberPartitionKeyPrefix so the same accessor the rest of the file uses is the
+// one that reads it, and no caller can pass a value of its own.
 //
 // Parameters:
-//   - subscriber *model.EventSubscriber: the row about to be provisioned. May be nil.
+//   - subscriber *model.EventSubscriber: the row about to be provisioned.
 //
 // Returns:
-//   - KeyScopeBinding: the binding. Zero-valued for a nil subscriber, which validate refuses.
+//   - KeyScopeBinding: the binding. Zero-valued for a nil subscriber, which validate
+//     refuses.
 func keyScopeBindingFor(subscriber *model.EventSubscriber) KeyScopeBinding {
 	if subscriber == nil {
 		return KeyScopeBinding{}

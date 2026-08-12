@@ -36,22 +36,11 @@ import (
 	"github.com/blnkfinance/blnk/internal/apierror"
 )
 
-// This file covers the HTTP boundary of the dead-letter operational surface: which routes
-// exist, which query parameters they accept, and which they refuse.
-//
-// It deliberately does NOT reach a database. Every property asserted here is a property of
-// the boundary — the route table, the master-key gate, the parameter vocabulary — and each is
-// observable before any repository call is made. A test that needed a live outbox to prove
-// "this route is registered" would be a slower test proving less.
+// This file covers the HTTP boundary of the dead-letter operational surface: which
+// routes exist, which query parameters they accept, and which they refuse.
 
-// deadLetterTestRouter builds a router with the real route table, marking every request as
-// carrying — or not carrying — the master key.
-//
-// It follows setupHookRouter, which is the established shape in this package for testing a
-// master-key-gated surface: the middleware that resolves a principal is not installed under
-// test, so the flag the gate reads is set directly. Every property asserted in this file is
-// reached BEFORE any repository call — the route table, the gate, the parameter vocabulary and
-// the request body — so no live outbox is needed to observe any of them.
+// deadLetterTestRouter builds a router with the real route table, marking every request
+// as carrying — or not carrying — the master key.
 //
 // Parameters:
 //   - t *testing.T: the test, for fatal setup failures.
@@ -91,24 +80,11 @@ func deadLetterTestRouter(t *testing.T, isMaster bool) *gin.Engine {
 	return apiInstance.Router()
 }
 
-// TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated pins the route table and the gate.
+// TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated pins the route table and the
+// gate.
 //
-// # Why the route table needs a test of its own
-//
-// A handler with no route is unreachable, compiles cleanly and fails no other test — and the
-// converse matters just as much here: an EXTRA route is a management surface nobody approved.
-// The three routes below are the whole of this file's API. A fourth, POST
-// /events/dead-letter/:event_id/resolve, was registered and has been removed: it took the
-// management surface to fourteen routes where thirteen are approved, and it could not compose
-// with replay, because a resolved row whose re-publish the broker acknowledged could not then
-// be marked dispatched. Retention is modelled through replay alone.
-//
-// # Why the assertion is on the CODE and not the status
-//
-// apierror.ErrAuthMasterKeyRequired and apierror.ErrAuthUnknownResource both resolve to 403.
-// A test asserting only the status would pass just as well against a route prefix that the
-// authorization middleware does not recognise at all — which is the failure that denies every
-// caller including the master key, and the one most worth telling apart.
+// apierror.ErrAuthMasterKeyRequired and apierror.ErrAuthUnknownResource both resolve to
+// 403.
 func TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated(t *testing.T) {
 	router := deadLetterTestRouter(t, false)
 
@@ -127,8 +103,8 @@ func TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated(t *testing.T) {
 	}
 
 	// AND NOTHING ELSE UNDER /events. The retired resolve route must stay retired: it is
-	// unapproved surface, and its write could leave a dead-lettered row in a state from which a
-	// broker-acknowledged replay could not be recorded.
+	// unapproved surface, and its write could leave a dead-lettered row in a state from
+	// which a broker-acknowledged replay could not be recorded.
 	assert.False(t, routes["POST /events/dead-letter/:event_id/resolve"],
 		"the resolve route is retired; retention is modelled through replay, which turns a "+
 			"dead-lettered row into a dispatched receipt")
@@ -157,17 +133,13 @@ func TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated(t *testing.T) {
 	})
 }
 
-// TestListDeadLetterEvents_RefusesAnUnknownQueryParameter covers the closed query vocabulary.
+// TestListDeadLetterEvents_RefusesAnUnknownQueryParameter covers the closed query
+// vocabulary.
 //
 // The endpoint refuses parameters it cannot honour rather than ignoring them, because a
-// silently ignored filter returns MORE rows than the caller asked for while looking like it
-// worked, and on an inventory endpoint a page that is wider than requested reads as less loss
-// than there is.
-//
-// `resolved` is one of the names now refused. It selected the resolved or unresolved subset of
-// the inventory, and both the filter and the resolution it narrowed on are gone: retention
-// spares every dead-lettered row, and a replay the broker acknowledges is what takes one out of
-// the inventory.
+// silently ignored filter returns MORE rows than the caller asked for while looking
+// like it worked, and on an inventory endpoint a page that is wider than requested
+// reads as less loss than there is.
 func TestListDeadLetterEvents_RefusesAnUnknownQueryParameter(t *testing.T) {
 	router := deadLetterTestRouter(t, true)
 
@@ -190,15 +162,7 @@ func TestListDeadLetterEvents_RefusesAnUnknownQueryParameter(t *testing.T) {
 // TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree closes the last silently
 // discarded filter on this endpoint.
 //
-// Both spellings of the topic filter are accepted because both are natural: an operator
-// reading the inventory sees dlt_topic on every item, while one asking "which transaction
-// events are stuck" thinks in category topics. They resolve to one predicate, so naming the
-// same topic in both is one instruction written twice and is honoured.
-//
-// Naming two DIFFERENT topics is not. It used to be resolved by preferring `topic` and
-// dropping `dlt_topic` without a word, which returned a page describing a question the caller
-// did not ask — and on an inventory endpoint a page drawn from the wrong topic reads as a
-// different amount of loss than there is.
+// Naming two DIFFERENT topics is not.
 func TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree(t *testing.T) {
 	router := deadLetterTestRouter(t, true)
 
@@ -225,9 +189,9 @@ func TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree(t *testing.T) {
 			"/events/dead-letter?topic=blnk.transactions&dlt_topic=blnk.transactions.dlt", nil)
 		router.ServeHTTP(recorder, request)
 
-		// The service is unreachable in this harness, so the assertion is that the request got
-		// PAST validation rather than that it succeeded: any code other than 400 proves the
-		// pair was accepted.
+		// The service is unreachable in this harness, so the assertion is that the request
+		// got PAST validation rather than that it succeeded: any code other than 400 proves
+		// the pair was accepted.
 		assert.NotEqual(t, http.StatusBadRequest, recorder.Code,
 			"the two spellings resolve to the same topic, so this is not a contradiction: %s",
 			recorder.Body.String())
@@ -250,9 +214,9 @@ func TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree(t *testing.T) {
 
 // deadLetterErrorCode reads error_detail.code from a refusal.
 //
-// The CODE and not the status is what these tests assert on, for the reason spelled out on
-// TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated: several distinct refusals share one
-// status, and telling them apart is the whole point.
+// The CODE and not the status is what these tests assert on, for the reason spelled out
+// on TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated: several distinct refusals
+// share one status, and telling them apart is the whole point.
 func deadLetterErrorCode(t *testing.T, body []byte) string {
 	t.Helper()
 
@@ -266,11 +230,9 @@ func deadLetterErrorCode(t *testing.T, body []byte) string {
 	return envelope.ErrorDetail.Code
 }
 
-// runbookParameterTableHeader is the header row of the one `| Parameter | Effect |` table in
-// docs/kafka-operations.md, which is the dead-letter listing's published parameter reference.
-//
-// The table is located by its header rather than by the prose around it, so rewording the
-// surrounding paragraphs cannot silently disconnect this guard from the thing it guards.
+// runbookParameterTableHeader is the header row of the one `| Parameter | Effect |`
+// table in docs/kafka-operations.md, which is the dead-letter listing's published
+// parameter reference.
 const runbookParameterTableHeader = "| Parameter | Effect |"
 
 // operationsRunbookParameters reads the documented parameter names out of that table.
@@ -323,23 +285,21 @@ func operationsRunbookParameters(t *testing.T) []string {
 	return documented
 }
 
-// TestDeadLetterQueryParameters_MatchTheOperationsRunbookExactly is the regression guard for a
-// documentation defect that cost an operator a step during an incident.
+// TestDeadLetterQueryParameters_MatchTheOperationsRunbookExactly is the regression
+// guard for a documentation defect that cost an operator a step during an incident.
 //
-// The runbook's parameter table used to advertise an `offset` — "Page offset. A negative value
-// becomes 0." — that this endpoint has never accepted. Because the parameter set is CLOSED,
-// following the runbook did not silently return an unpaged page: it returned `400
-// GEN_VALIDATION_ERROR`, on the surface an operator reaches for when events are already
-// missing. The table's own footer said every unlisted parameter is refused, so the document
-// contradicted itself on the same screen.
+// The runbook's parameter table must name exactly the parameters the endpoint accepts:
+// an advertised `offset` the handler refuses costs a step, and an accepted filter nobody
+// documented is one nobody uses.
 //
-// Prose can drift from a var block, so the two are compared here rather than trusted to stay
-// aligned. The guard runs in BOTH directions on purpose:
+// Prose can drift from a var block, so the two are compared here rather than trusted to
+// stay aligned. The guard runs in BOTH directions on purpose:
 //
-//   - A DOCUMENTED name that the endpoint refuses is the original defect: a step that fails
-//     when followed.
-//   - An ACCEPTED name that is undocumented is the same defect from the other side: a filter
-//     nobody knows exists, which during a loss investigation is a filter nobody uses.
+//   - A DOCUMENTED name that the endpoint refuses is the original defect: a step that
+//     fails when followed.
+//   - An ACCEPTED name that is undocumented is the same defect from the other side: a
+//     filter nobody knows exists, which during a loss investigation is a filter nobody
+//     uses.
 func TestDeadLetterQueryParameters_MatchTheOperationsRunbookExactly(t *testing.T) {
 	documented := operationsRunbookParameters(t)
 	require.NotEmpty(t, documented, "the parameter table must not be empty")
@@ -370,14 +330,11 @@ func TestDeadLetterQueryParameters_MatchTheOperationsRunbookExactly(t *testing.T
 	}
 }
 
-// TestDeadLetterEnvelope_TotalCountIsDocumentedAsConditional is the second half of the same
-// defect class: an envelope key the document promised unconditionally.
+// TestDeadLetterEnvelope_TotalCountIsDocumentedAsConditional is the second half of the
+// same defect class: an envelope key the document promised unconditionally.
 //
-// The `include_count` row used to read "Adds total_count to the envelope, which is present
-// either way". It is not present either way — the field is `omitempty`, so the key is ABSENT
-// unless the option is supplied. A script written against that sentence reads a missing key
-// rather than a number, and on this endpoint the number is the total amount of dead-lettered
-// events, which is exactly the figure an incident is being scoped by.
+// It is not present either way — the field is `omitempty`, so the key is ABSENT unless
+// the option is supplied.
 func TestDeadLetterEnvelope_TotalCountIsDocumentedAsConditional(t *testing.T) {
 	runbook, err := os.ReadFile(filepath.Join("..", "docs", "kafka-operations.md"))
 	require.NoError(t, err)
@@ -397,20 +354,12 @@ func TestDeadLetterEnvelope_TotalCountIsDocumentedAsConditional(t *testing.T) {
 			"dropping it would make the runbook wrong again from the other direction")
 }
 
-// TestCursorRefusals_DescribeADecodeAndNotAnIssuance keeps both paging refusals honest about
-// what they actually check.
+// TestCursorRefusals_DescribeADecodeAndNotAnIssuance keeps both paging refusals honest
+// about what they actually check.
 //
-// Both messages used to read "is not a cursor this endpoint issued". They do not check that. A
-// keyset cursor is a COORDINATE, not a capability: it is unsigned, no issuance is recorded, and
-// any value that decodes to a well-formed position is accepted as one — including a token
-// another listing produced, which returns a page rather than a refusal. That is harmless,
-// because the cursor carries no authorization and both surfaces are master-key gated either
-// way, but a message promising provenance sends a client debugging a rejected cursor to look
-// for an issuance record that does not exist.
+// They do not check that.
 //
-// The two endpoints are asserted TOGETHER because they describe one mechanism. Their wording
-// drifting apart is how a client comes to believe the registry and the inventory page
-// differently.
+// The two endpoints are asserted TOGETHER because they describe one mechanism.
 func TestCursorRefusals_DescribeADecodeAndNotAnIssuance(t *testing.T) {
 	router := deadLetterTestRouter(t, true)
 

@@ -211,39 +211,10 @@ func resetReindexManager() {
 	globalReindexManager.mu.Unlock()
 }
 
-// safeResponseBody renders a response for a FAILURE MESSAGE with every secret-shaped field
-// withheld.
+// safeResponseBody renders a response for a FAILURE MESSAGE with every secret-shaped
+// field withheld.
 //
-// # Why a test diagnostic needs sanitising at all
-//
-// `POST /subscribers/{id}/kafka-credentials` returns a SASL password exactly once and Blnk keeps
-// only a non-reversible reference to it, which is the whole posture of the endpoint. Several
-// assertions about that endpoint passed the response body into their failure message — the
-// idiomatic `"...body: %s", recorder.Body.String()` — and a failure message is only rendered when
-// the assertion FAILS, which is exactly the case where the body is not what the test assumed.
-//
-// The two shapes that leaked are mirror images. `require.Equal(t, http.StatusOK, code, "…body: %s")`
-// renders when the status is NOT 200, so a regression that answered 500 while still marshalling
-// the credential wrote the plaintext password into CI output. And
-// `require.NotEqual(t, http.StatusOK, code, "…body: %s")` renders when the status IS 200 — which
-// means the body is a successful credential response and the password is certain to be there. In
-// both cases the very next line was an assertion that the body carries no password, and it never
-// ran, because a failed require aborts the test.
-//
-// CI output is durable and widely readable, and a secret written to it is disclosed whatever the
-// endpoint does afterwards. So the diagnostic keeps what makes it useful — the status, and the
-// shape of the body — and drops what must not be stored.
-//
-// # What it withholds, and why it errs wide
-//
-// Any object key whose name contains password, secret, token or passphrase, at any depth, in
-// objects nested in arrays included. It errs wide on purpose: withholding a field that was not a
-// secret costs a diagnostic one value, while printing one that was costs a credential rotation.
-// `credential_reference` is deliberately NOT withheld — it is the non-reversible reference the
-// registry stores precisely so it can be shown.
-//
-// A body that is not JSON is withheld entirely and reported as a byte count, because there is no
-// structure to sanitise and a plain-text dump can carry anything.
+// The two shapes that leaked are mirror images.
 func safeResponseBody(w *httptest.ResponseRecorder) string {
 	raw := w.Body.Bytes()
 	if len(raw) == 0 {

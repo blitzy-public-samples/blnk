@@ -17,67 +17,17 @@
 -- blnk.balance_monitor_handoff: the durable intent that a balance moved and its
 -- monitors have not been evaluated yet.
 --
--- # Why this table exists
---
--- Requirement R-2 puts every event in the same database transaction as the ledger
+-- The durability contract puts every event in the same database transaction as the ledger
 -- mutation that produced it. `balance.monitor` was the one event type that could not
 -- honour that, and the reason was structural rather than incidental: a monitor fires
 -- because a CONDITION was met on a balance a transaction has already committed, so by
--- the time the alert exists there is no open transaction left to enrol it in. The
--- capture was therefore a standalone insert taken after the commit, and a process that
--- died in the window between the two — or a database outage that outlasted a small
--- retry budget — destroyed the alert outright. The balance movement stood; the
--- low-balance or overdraft notification an operator relies on simply ceased to exist,
--- and nothing was left to replay because no row had ever been written.
+-- the time the alert exists there is no open transaction left to enrol it in.
 --
 -- A row in this table is written INSIDE the balance's own transaction. That is the
--- whole mechanism. The intent "these balances moved to this state, evaluate their
--- monitors" becomes durable at the same instant as the movement itself, so the two
--- cannot disagree: a committed balance always carries its pending evaluation, and a
--- rolled-back balance carries none.
---
--- The evaluation then happens outside that transaction, and its result — zero or more
--- `balance.monitor` event rows — is written in ONE transaction with this row's
--- transition to a terminal status. So the alert and the record that the evaluation is
--- finished commit together, and a crash anywhere in the sequence leaves the handoff
--- claimable rather than the alert lost. That is at-least-once evaluation feeding a
--- transactional capture, which is the strongest guarantee available for a condition
--- that can only be judged after its balance is durable.
---
--- # Why the balance is SNAPSHOTTED rather than re-read
---
--- balance_snapshot holds the balance exactly as the transaction wrote it. Re-reading
--- the balance at evaluation time would evaluate a DIFFERENT state — later transactions
--- may have moved it again — so a threshold that was crossed by this mutation and
--- uncrossed by the next would produce no alert at all, and a retry after a transient
--- failure could reach a different verdict than the attempt before it. The snapshot
--- makes the evaluation deterministic and makes it describe the movement it belongs to.
+-- whole mechanism.
 --
 -- It is also what lets the evaluator run in a different process from the writer. The
 -- row carries everything the condition needs.
---
--- # Why a row is written only when a monitor exists
---
--- The overwhelming majority of balances carry no monitor at all, and a handoff row per
--- balance per transaction would be pure write amplification on the money path — two
--- rows per transaction at the system's throughput target, every one of them destined to
--- be evaluated to "nothing fired" and deleted. The insert is therefore guarded by an
--- EXISTS against blnk.balance_monitors in the same statement, so a deployment with no
--- monitors configured writes nothing and pays one cheap indexed probe. See
--- insertBalanceMonitorHandoffsInTx.
---
--- That guard is only sound because a monitor cannot be created for a balance
--- retroactively: a monitor registered AFTER a movement was never intended to fire on
--- it, which is the behaviour the post-commit evaluation had as well, so nothing is lost
--- by deciding at write time.
---
--- # Index set
---
--- The columns and index shapes follow blnk.lineage_outbox and blnk.event_outbox rather
--- than inventing a third vocabulary: a unique business key, a partial index per polled
--- status, and a composite claim index restricted to the two statuses a claim can
--- select. The relay-polling shape is what keeps the claim query an index scan over the
--- pending rows alone instead of a scan of the whole table.
 CREATE TABLE IF NOT EXISTS blnk.balance_monitor_handoff
 (
     id               BIGSERIAL PRIMARY KEY,
@@ -129,13 +79,10 @@ CREATE INDEX IF NOT EXISTS idx_balance_monitor_handoff_balance
 
 -- An index on blnk.balance_monitors(balance_id), which has never existed.
 --
--- PostgreSQL does not index a foreign-key column automatically, so every lookup of
--- "the monitors for this balance" has always been a sequential scan. That was tolerable
+-- PostgreSQL does not index a foreign-key column automatically, so every lookup of "the
+-- monitors for this balance" has always been a sequential scan. That was tolerable
 -- while the lookup happened once per balance in a post-commit goroutine and was cached
--- for five minutes. It is not tolerable now: the EXISTS guard described above runs
--- INSIDE the money-path transaction, on every persistence of every transaction, and a
--- sequential scan there would put a table scan on the hot path and hold the balance
--- locks for its duration.
+-- for five minutes.
 --
 -- This is an additive, idempotent index on an existing table. It changes no monitor
 -- semantics, no constraint and no column; it makes an existing access pattern use an

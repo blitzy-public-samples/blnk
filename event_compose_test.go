@@ -33,15 +33,9 @@ import (
 )
 
 // Assertions in this file read the Compose files AS DATA and never spell a line number.
-// Both files are edited in step and both are long, so a line reference is stale the first
-// time either grows — and a test that asserts on a stale line is worse than no test, because
-// it fails for the wrong reason and gets deleted rather than fixed.
-//
-// They are data assertions rather than a real bring-up so they hold in CI with no Docker.
-// The runtime halves — that a bare `docker compose up` starts no broker, that
-// `--profile kafka up` still waits for the broker's health and for provisioning to complete,
-// and that the worker's rendered environment carries no administrative credential — were
-// verified separately against a real Compose.
+// Both files are edited in step and both are long, so a line reference is stale the
+// first time either grows — and a test that asserts on a stale line is worse than no
+// test, because it fails for the wrong reason and gets deleted rather than fixed.
 
 // composeFiles is every Compose projection that carries the event-streaming configuration.
 // docker-compose.dev.yaml builds from source and is otherwise a parallel of the shipped file;
@@ -52,34 +46,16 @@ var composeFiles = []string{"docker-compose.yaml", "docker-compose.dev.yaml"}
 // mechanism that makes Kafka opt-in, and .env.example documents it as COMPOSE_PROFILES=kafka.
 const blnkKafkaProfile = "kafka"
 
-// TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts is the graceful-degradation guard.
+// TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts is the graceful-degradation
+// guard.
 //
-// # What was wrong
+// The server and worker services depended on `kafka: service_healthy` and `kafka-init:
+// service_completed_successfully` UNCONDITIONALLY.
 //
-// The server and worker services depended on `kafka: service_healthy` and
-// `kafka-init: service_completed_successfully` UNCONDITIONALLY. Blnk's documented steady
-// state is an empty KAFKA_BROKERS, in which the publisher resolves to its no-op and the
-// service runs exactly as it did before Kafka existed — but `docker compose up` still refused
-// to start it until a broker it was never going to speak to had passed a SASL healthcheck and
-// a provisioning one-shot had exited zero. A deployment that publishes no events was blocked
-// on infrastructure it does not use, and a broker that failed to bootstrap took the ledger API
-// down with it.
-//
-// # Why both halves are asserted
-//
-// Profiles alone would not fix it: a service outside the enabled set is still a dependency
-// Compose refuses to satisfy unless the dependency is marked `required: false`. And
-// `required: false` alone would not fix it either, because without a profile the Kafka
-// services are in the default set and start regardless. Each half is inert without the other,
-// which is exactly why a test that checked only one would pass over a broken stack.
-//
-// # Why the conditions must SURVIVE
-//
-// The fix must not be "delete the dependency". When the profile IS selected the operator has
-// asked for Kafka, and starting the relay against a broker that is merely created — not
-// listening, not authenticating, with no topics — reproduces the failure the conditions were
-// added for: the first publish fails and retries against nothing. So the conditions are
-// asserted present and unweakened alongside `required: false`.
+// Profiles alone would not fix it: a service outside the enabled set is still a
+// dependency Compose refuses to satisfy unless the dependency is marked `required:
+// false`. And `required: false` alone would not fix it either, because without a
+// profile the Kafka services are in the default set and start regardless.
 func TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -140,16 +116,9 @@ func TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts(t *testing.T) {
 			})
 
 			t.Run("the worker depends on neither", func(t *testing.T) {
-				// THE WORKER NEVER DIALS A BROKER, so gating its start-up on one made an
-				// unrelated dependency into a reason this process could not come up. It writes
-				// outbox rows; the relay in the server role publishes them. While the two
-				// conditions were here, an unhealthy broker or a failed provisioning one-shot
-				// stopped transaction processing, transaction hooks and search indexing — none
-				// of which involve Kafka at all.
-				//
-				// Asserted as an ABSENCE rather than left untested because the previous shape of
-				// this file required the dependency on both services, so restoring it would
-				// otherwise look like a correction.
+				// THE WORKER NEVER DIALS A BROKER, so gating its start-up on one made an unrelated
+				// dependency into a reason this process could not come up. It writes outbox rows;
+				// the relay in the server role publishes them.
 				worker, declared := services["worker"].(map[string]interface{})
 				require.True(t, declared, "%s must declare a worker service", composeFile)
 
@@ -168,29 +137,7 @@ func TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts(t *testing.T) {
 
 // TestCompose_NoKafkaCredentialIsKnownFromSource is the security guard.
 //
-// # What was wrong, and why it was not a small thing
-//
-// KAFKA_SASL_ADMIN_SECRET defaulted to a literal readable in the Compose file. That value is
-// the password of a Kafka SUPERUSER — `super.users=User:${KAFKA_SASL_ADMIN_USER}` in the
-// rendered broker configuration — on a broker the same file PUBLISHES TO THE HOST. Anyone who
-// could reach the port could create and delete topics, mint SCRAM credentials for any
-// principal, and rewrite every ACL, which includes granting themselves Read on every
-// subscriber's events and revoking every real subscriber's credential. A credential that is in
-// the source is not a credential.
-//
-// Worse, that same default was injected into the WORKER — a process that turned out to publish
-// nothing at all, so it held the strongest identity in the cluster for no capability whatsoever.
-// The worker's Kafka credentials are gone entirely now; the sub-test below asserts their absence
-// rather than their shape.
-//
-// # Why an empty default is the right answer rather than a required one
-//
-// Compose interpolates the whole file on every command, so `${VAR:?message}` would fail
-// `docker compose up` even for a stack that selected no Kafka profile — which would undo the
-// graceful degradation the test above exists to protect. An empty default degrades correctly
-// instead: nothing reads it with the profile inactive, and with the profile active
-// scripts/kafka-bootstrap.sh refuses an empty administrative secret BY NAME, so the failure is
-// loud, immediate and local to the broker rather than a puzzling authentication error later.
+// KAFKA_SASL_ADMIN_SECRET defaulted to a literal readable in the Compose file.
 func TestCompose_NoKafkaCredentialIsKnownFromSource(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -243,26 +190,8 @@ func TestCompose_NoKafkaCredentialIsKnownFromSource(t *testing.T) {
 			})
 
 			t.Run("the worker holds no Kafka credential at all", func(t *testing.T) {
-				// THE WORKER PUBLISHES NOTHING, so it needs no broker credential of any kind —
-				// not the administrative pair, and not the producer pair either.
-				//
-				// This assertion used to be the opposite for the producer pair: the worker was
-				// REQUIRED to receive it, on the belief that transaction.rejected was published
-				// from its rejection handler. It is not. That handler's post-transaction actions
-				// insert an outbox row inside the ledger transaction, and the relay — which
-				// cmd/server.go starts and only the server role runs — is what publishes it.
-				// Nothing in this process ever produced a Kafka message, so the credential bought
-				// standing Write and Describe authority over every Blnk-owned topic, dead-letter
-				// siblings included, for a capability that was never exercised. A compromise of
-				// the worker could forge any ledger event onto any topic, and a subscriber cannot
-				// tell a forged event from a real one when both arrive under valid producer
-				// credentials.
-				//
-				// blnk.NewBlnkForRole is the enforcement in code — `blnk workers` resolves to
-				// ProcessRoleWorker, which selects the no-op publisher before the broker list is
-				// read — and this is the environment half of the same decision: a credential that
-				// is not in the container's environment is not in `docker inspect`, not in
-				// /proc/<pid>/environ, and not in a crash dump.
+				// THE WORKER PUBLISHES NOTHING, so it needs no broker credential of any kind — not
+				// the administrative pair, and not the producer pair either.
 				worker, declared := services["worker"].(map[string]interface{})
 				require.True(t, declared, "%s must declare a worker service", composeFile)
 
@@ -298,8 +227,8 @@ func TestCompose_NoKafkaCredentialIsKnownFromSource(t *testing.T) {
 				}
 
 				// WHAT IT MUST STILL RECEIVE. Capture is gated on the broker list rather than on
-				// the publisher, and the row's topic and retry budget are decided where the row
-				// is written — so these four are configuration this role genuinely applies, and
+				// the publisher, and the row's topic and retry budget are decided where the row is
+				// written — so these four are configuration this role genuinely applies, and
 				// removing any of them would make the worker's events diverge from the server's.
 				for _, key := range []string{
 					"KAFKA_BROKERS",
@@ -319,11 +248,8 @@ func TestCompose_NoKafkaCredentialIsKnownFromSource(t *testing.T) {
 			t.Run("the publishing service defaults its producer pair from one source", func(t *testing.T) {
 				// One value in .env both mints the principal on the broker (KAFKA_PRODUCER_*, read
 				// by scripts/kafka-provision.sh) and is presented by the publishing process
-				// (KAFKA_SASL_*). Two independent values would drift, and the symptom of drift is
-				// a SASL handshake failure that reads exactly like a wrong password.
-				//
-				// One service, not two: the worker presents no credential at all, which the
-				// sub-test above asserts.
+				// (KAFKA_SASL_*). Two independent values would drift, and the symptom of drift is a
+				// SASL handshake failure that reads exactly like a wrong password.
 				const consumer = "server"
 
 				service := services[consumer].(map[string]interface{})
@@ -406,55 +332,17 @@ func composeStringList(t *testing.T, raw interface{}) []string {
 // the makefile's kafka_provision target run.
 const kafkaProvisionScript = "scripts/kafka-provision.sh"
 
-// kafkaProvisionValidationComplete is the line the script logs once every PURE decision has
-// been made — geometry, iterations, the topic catalogue, and all three principals — and before
-// it touches the network. Reaching it means every value it was handed was accepted; failing to
-// reach it means one of them was refused.
-//
-// It is the only synchronisation point in the script that separates "the configuration is
-// usable" from "the broker is reachable", which is what lets the assertion below run in CI
-// with no Docker and no Kafka CLI.
+// kafkaProvisionValidationComplete is the line the script logs once every PURE decision
+// has been made — geometry, iterations, the topic catalogue, and all three principals —
+// and before it touches the network. Reaching it means every value it was handed was
+// accepted; failing to reach it means one of them was refused.
 const kafkaProvisionValidationComplete = "resolved the topic catalogue"
 
-// TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript closes the gap that let
-// the local stack ship unprovisionable.
-//
-// # What was wrong
-//
-// Both compose files passed the kafka-init service
-// `KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-blnk-sample-subscriber}`
-// and .env.example set the same unterminated value uncommented. The script DERIVES that
-// namespace as the principal plus the group terminator — "blnk-sample-subscriber." — and
-// refuses any explicit value that differs, because the namespace is granted as a PREFIXED ACL
-// and choosing it means choosing how far the grant reaches. So
-// `docker compose --profile kafka up -d kafka kafka-init` and `make kafka_provision` BOTH
-// exited 1 with "Nothing has been provisioned", every time, on a clean checkout — and because
-// compose resolves `${VAR:-default}` for an empty value as well as an unset one, no value an
-// operator could export would suppress it.
-//
-// # Why the existing tests could not catch it
-//
-// event_compose_test.go and event_stack_test.go read the kafka-init environment block and
-// assert things ABOUT it — that no secret carries a literal default, that the worker holds no
-// administrative credential. event_provisioning_test.go asserts the script's own credential
-// floors. Nothing compared the two: no test asked whether the values one side SENDS are values
-// the other side ACCEPTS. That is a whole class of defect, not one variable, and it is
-// invisible to both halves read alone.
-//
-// # What this asserts, and why by execution
+// TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript closes the gap
+// that let the local stack ship unprovisionable.
 //
 // The compose defaults and .env.example's assignments are collected exactly as a plain
-// bring-up would resolve them, and the real script is then RUN against them. Everything up to
-// the log line above is pure decision-making, so the assertion is that the script reaches it:
-// any refusal of any shipped value happens before it and is reported here with the script's own
-// words. Re-implementing the script's validators in Go would only assert that the copy agrees
-// with itself.
-//
-// Only the CREDENTIALS are supplied by the test, because they are the values the repository
-// deliberately does NOT ship (see TestCompose_NoKafkaCredentialIsKnownFromSource and
-// TestEnvExample_ShipsTheKafkaCredentialsEmpty) and without them the script skips the
-// principals whose validation is most of the point. Everything else is exactly what a clean
-// checkout sends.
+// bring-up would resolve them, and the real script is then RUN against them.
 func TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -479,12 +367,9 @@ func TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript(t *te
 			require.True(t, isMap, "kafka-init must declare an environment block")
 
 			// A DERIVED value must never arrive with a LITERAL default. Compose substitutes
-			// `${VAR:-default}` for an empty value as well as an unset one, so a non-empty default
-			// here is not a default — it is a value that always arrives, and the only spelling the
-			// script derives is built from another variable in this same block. The key is still
-			// passed, with an empty default, because that is what lets the script SEE a stale
-			// override an operator is still exporting and say it is no longer honoured; dropping
-			// the key would make such a value silently ignored instead. Empty means "derive".
+			// `${VAR:-default}` for an empty value as well as an unset one, so a non-empty
+			// default here is not a default — it is a value that always arrives, and the only
+			// spelling the script derives is built from another variable in this same block.
 			if declaredPrefix, passed := environment["KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX"]; passed {
 				assert.Equal(t, "${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-}", declaredPrefix,
 					"%s must pass KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX to kafka-init with an EMPTY "+
@@ -533,9 +418,8 @@ func TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript(t *te
 
 // envExampleAssignments returns the uncommented assignments .env.example makes.
 //
-// `make kafka_provision` sources .env, and .env is a copy of this template, so a value here is
-// a value the script receives. Commented lines are excluded because they are documentation
-// until an operator uncomments them.
+// `make kafka_provision` sources .env, and .env is a copy of this template, so a value
+// here is a value the script receives.
 func envExampleAssignments(t *testing.T, root string) map[string]string {
 	t.Helper()
 
@@ -560,13 +444,11 @@ func envExampleAssignments(t *testing.T, root string) map[string]string {
 	return assignments
 }
 
-// composeResolvedDefaults renders a compose environment block the way a bring-up with an empty
-// environment renders it: `${VAR:-default}` becomes the default, `${VAR}` and `${VAR:-}` become
-// empty, and a literal stays as written.
+// composeResolvedDefaults renders a compose environment block the way a bring-up with
+// an empty environment renders it: `${VAR:-default}` becomes the default, `${VAR}` and
+// `${VAR:-}` become empty, and a literal stays as written.
 //
-// Nested references are not resolved. The one place they appear is the publishing services'
-// producer pair, not kafka-init, so leaving such a value empty here reproduces what an operator
-// who set nothing would get — which is the case under test.
+// Nested references are not resolved.
 func composeResolvedDefaults(t *testing.T, environment map[string]interface{}) map[string]string {
 	t.Helper()
 
@@ -598,14 +480,8 @@ func composeResolvedDefaults(t *testing.T, environment map[string]interface{}) m
 // runKafkaProvisionValidation runs the provisioning script with exactly the supplied
 // environment and returns its combined output.
 //
-// The environment is REPLACED rather than extended, so a KAFKA_* variable that happens to be
-// exported in the developer's or CI runner's shell cannot mask a bad shipped default — the
-// value under test must be the one the repository ships. PATH is minimal for the same reason:
-// it keeps a host that has a Kafka distribution installed from wandering into the network phase
-// on a longer timeout than the bounded one above.
-//
-// A non-zero exit is expected and is not asserted on: the script cannot finish without a
-// broker. The caller asserts on how FAR it got.
+// A non-zero exit is expected and is not asserted on: the script cannot finish without
+// a broker.
 func runKafkaProvisionValidation(t *testing.T, root string, environment map[string]string) (string, error) {
 	t.Helper()
 
@@ -629,9 +505,9 @@ func runKafkaProvisionValidation(t *testing.T, root string, environment map[stri
 
 // composeImageRef returns a service's raw, uninterpolated image reference.
 //
-// Raw rather than rendered on purpose: the interpolation DEFAULT is the thing under test in
-// two of the guards below, and `docker compose config` would have already collapsed it into
-// whatever the ambient environment happened to say.
+// Raw rather than rendered on purpose: the interpolation DEFAULT is the thing under
+// test in two of the guards below, and `docker compose config` would have already
+// collapsed it into whatever the ambient environment happened to say.
 func composeImageRef(t *testing.T, services map[string]interface{}, service, label string) string {
 	t.Helper()
 
@@ -646,26 +522,9 @@ func composeImageRef(t *testing.T, services map[string]interface{}, service, lab
 
 // TestCompose_ThirdPartyImagesArePinnedByTagAndDigest is the supply-chain guard.
 //
-// # What was wrong
+// The jaeger and prometheus services were pinned to `latest`.
 //
-// The jaeger and prometheus services were pinned to `latest`. A floating tag means the image
-// a rebuilt stack runs is whatever the registry resolved to that morning, which defeats the
-// point of having a tested stack: the next `docker compose pull` can change the Prometheus
-// major version — Prometheus 3 rejected some Prometheus 2 configuration outright — or move
-// Jaeger under a collector whose defaults differ, with nothing in the repository recording
-// that anything moved.
-//
-// # Why the digest and not just the tag
-//
-// A tag is a mutable pointer. The same `v3.13.2` can be repushed over a different image, so a
-// version tag alone records intent rather than identity. The digest is what makes a rebuild
-// byte-identical to the tested stack, and pinning both means a mismatch fails the pull instead
-// of resolving quietly.
-//
-// # Why "latest" is asserted absent everywhere, not just on these two
-//
-// The two services that carried it are fixed, but the defect is a habit rather than an
-// incident. Asserting across every service is what stops the next one arriving.
+// A tag is a mutable pointer.
 func TestCompose_ThirdPartyImagesArePinnedByTagAndDigest(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -721,10 +580,10 @@ func TestCompose_ThirdPartyImagesArePinnedByTagAndDigest(t *testing.T) {
 			t.Run("jaeger is on the supported v2 line", func(t *testing.T) {
 				image := composeImageRef(t, services, "jaeger", composeFile)
 
-				// jaegertracing/all-in-one is Jaeger v1, which reached end-of-life on
-				// 31 December 2025 and receives no further security patches — the image
-				// says so itself on startup. Pinning its digest would have frozen a
-				// knowingly unpatched image, so the pin has to be on the v2 repository.
+				// jaegertracing/all-in-one is Jaeger v1, which reached end-of-life on 31 December
+				// 2025 and receives no further security patches — the image says so itself on
+				// startup. Pinning its digest would have frozen a knowingly unpatched image, so the
+				// pin has to be on the v2 repository.
 				assert.NotContainsf(t, image, "jaegertracing/all-in-one",
 					"%s: jaeger must not pin the v1 all-in-one image, which is end-of-life "+
 						"and unpatched; use the v2 jaegertracing/jaeger image", composeFile)
@@ -736,9 +595,9 @@ func TestCompose_ThirdPartyImagesArePinnedByTagAndDigest(t *testing.T) {
 				declared, isMap := services["jaeger"].(map[string]interface{})
 				require.Truef(t, isMap, "%s must declare a jaeger service", composeFile)
 
-				// COLLECTOR_OTLP_ENABLED was the v1 switch for OTLP ingest. v2 enables OTLP
-				// by default and ignores the variable, so leaving it set would read as
-				// load-bearing configuration while doing nothing at all.
+				// COLLECTOR_OTLP_ENABLED was the v1 switch for OTLP ingest. v2 enables OTLP by
+				// default and ignores the variable, so leaving it set would read as load-bearing
+				// configuration while doing nothing at all.
 				rendered := fmt.Sprintf("%v", declared["environment"])
 				assert.NotContainsf(t, rendered, "COLLECTOR_OTLP_ENABLED",
 					"%s: COLLECTOR_OTLP_ENABLED is a Jaeger v1 switch that v2 ignores — remove "+
@@ -750,28 +609,20 @@ func TestCompose_ThirdPartyImagesArePinnedByTagAndDigest(t *testing.T) {
 
 // TestCompose_RedisIsPatchedAndCanBeAuthenticated is the CVE-2025-49844 guard.
 //
-// # What was wrong
+// Both Compose files must pin a Redis that carries the fix for CVE-2025-49844
+// ("RediShell", CVSS 10.0), a use-after-free in the Lua interpreter's garbage collector
+// that lets a client holding credentials escape the Lua sandbox and execute arbitrary
+// code on the host; the 7.2 line was fixed in 7.2.11.
 //
-// Both Compose files pinned redis:7.2.4 with no authentication. 7.2.4 is vulnerable to
-// CVE-2025-49844 ("RediShell", CVSS 10.0), a use-after-free in the Lua interpreter's garbage
-// collector that lets a client holding credentials escape the Lua sandbox and execute
-// arbitrary code on the host; the 7.2 line was fixed in 7.2.11. With no password, "holding
-// credentials" is satisfied by anyone who can reach the port, so the two halves compounded.
+// Pinning the exact string would make this test the thing that has to be edited on
+// every future upgrade, and a test that must be edited to allow a patch is a test that
+// gets edited carelessly.
 //
-// # Why the version assertion is a floor and not an equality
-//
-// Pinning the exact string would make this test the thing that has to be edited on every
-// future upgrade, and a test that must be edited to allow a patch is a test that gets edited
-// carelessly. The floor is the property that matters: on the 7.2 line, at or above the patch
-// that carries the fix.
-//
-// # Why authentication is asserted as WIRED rather than as ON
-//
-// It is off by default, deliberately: 37 Go test files dial an unauthenticated localhost:6379
-// as a literal and the CI workflow publishes its redis service the same way, so requiring a
-// password unconditionally would break `make test` for a defect that lives in the image. What
-// must hold is that setting one variable turns it on — and that the compensating control for
-// the default, the loopback bind, is still there.
+// AUTHENTICATION IS OPTIONAL HERE, deliberately: 37 Go test files dial an
+// unauthenticated localhost:6379 as a literal and the CI workflow publishes its redis
+// service the same way, so requiring a password unconditionally would break `make test`
+// for a defect that lives in the image. What is asserted is that a password CAN be
+// supplied and is honoured when it is.
 func TestCompose_RedisIsPatchedAndCanBeAuthenticated(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -868,9 +719,9 @@ func TestCompose_RedisIsPatchedAndCanBeAuthenticated(t *testing.T) {
 				require.Lenf(t, ports, 1, "%s: redis must publish exactly one port mapping",
 					composeFile)
 
-				// The loopback bind is the compensating control for shipping without a
-				// password. Losing it while authentication is still opt-in would put an
-				// unauthenticated Redis holding TRANSACTION_QUEUE on the network.
+				// The loopback bind is the compensating control for shipping without a password.
+				// Losing it while authentication is still opt-in would put an unauthenticated Redis
+				// holding TRANSACTION_QUEUE on the network.
 				assert.Containsf(t, ports[0], "REDIS_OUTER_HOST:-127.0.0.1",
 					"%s: redis must default to a 127.0.0.1 bind; authentication is opt-in, so "+
 						"the loopback default is what keeps the shipped stack safe", composeFile)
@@ -879,31 +730,10 @@ func TestCompose_RedisIsPatchedAndCanBeAuthenticated(t *testing.T) {
 	}
 }
 
-// TestCompose_ApplicationImageHasNoStaleDefault is the SEC-03 guard.
+// TestCompose_ApplicationImageHasNoStaleDefault is the guard.
 //
-// # What was wrong
-//
-// docker-compose.yaml defaulted both the server and the worker to a published Blnk release.
-// Because that image really exists, `docker compose up` SUCCEEDED and handed the operator a
-// ledger built from code older than their checkout: no Kafka publishing, no outbox relay, no
-// /events endpoints, no subscriber registry, and no error explaining the absence. Every CVE
-// fixed after that release was present too.
-//
-// # Why the fix is "no default" rather than "a newer default"
-//
-// There is no digest that would be correct, because the image for the commit in the working
-// tree is not published. Any default at all reintroduces the same class of defect one release
-// later. So the image is an operator input, and the shipped fallback is a reference that
-// cannot resolve — `docker compose up server` stops with a message naming the variable
-// instead of running the wrong code.
-//
-// # Why interpolation must still succeed
-//
-// The `${VAR:?message}` form would have been the obvious way to demand a value, but Compose
-// interpolates the whole file for every command: it breaks `docker compose config` and the
-// infrastructure-only paths this project depends on, including `make kafka_provision` and
-// bringing up postgres or the broker alone. An unresolvable default gates starting the
-// application without gating anything else, which is why the guard asserts both halves.
+// docker-compose.yaml defaulted both the server and the worker to a published Blnk
+// release.
 func TestCompose_ApplicationImageHasNoStaleDefault(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -1026,27 +856,9 @@ func k8sManifestImage(t *testing.T, root, manifest, container string) string {
 
 // TestKubernetesManifests_CarryTheSamePinsAsCompose is the projection-drift guard.
 //
-// # What was wrong
+// Restating the digest here would make two places to edit and one to forget.
 //
-// The manifests under infrastructure/k8s-manifests are kompose projections of
-// docker-compose.yaml — their own annotations say so — so every image defect in the Compose
-// file was reproduced there. redis-deployment.yaml pinned the same CVE-2025-49844-vulnerable
-// redis:7.2.4 and jaeger-deployment.yaml the same end-of-life `all-in-one:latest`. Fixing the
-// Compose file alone would have left the cluster, which is the deployment that actually faces
-// a network, running the vulnerable images.
-//
-// # Why parity is the assertion rather than a second literal
-//
-// Restating the digest here would make two places to edit and one to forget. Comparing the
-// manifest against the Compose file it is derived from is the invariant that actually needs to
-// hold, and it fails whichever side is upgraded alone.
-//
-// # Scope
-//
-// redis, jaeger and prometheus — every service that appears in both projections. The Blnk
-// server and worker are excluded because their image is an operator input with no shipped
-// default on either side, so there is no pin to compare; TestKubernetesWorkloads_AreHardened
-// asserts their placeholder instead.
+// redis, jaeger and prometheus — every service that appears in both projections.
 func TestKubernetesManifests_CarryTheSamePinsAsCompose(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -1083,8 +895,8 @@ func TestKubernetesManifests_CarryTheSamePinsAsCompose(t *testing.T) {
 		redis := k8sManifestContainer(t, root, "redis-deployment.yaml", "redis")
 
 		// A Service resolves from every pod that can reach the namespace, so the loopback
-		// bind that makes the Compose default safe has no equivalent here. The password
-		// must be reachable, and it must come from a Secret rather than this manifest.
+		// bind that makes the Compose default safe has no equivalent here. The password must
+		// be reachable, and it must come from a Secret rather than this manifest.
 		rendered := fmt.Sprintf("%v", redis["env"])
 		assert.Containsf(t, rendered, "REDIS_PASSWORD",
 			"redis-deployment.yaml must accept a REDIS_PASSWORD; there is no loopback bind in "+
@@ -1130,29 +942,9 @@ func k8sPodSpec(t *testing.T, root, manifest string) map[string]interface{} {
 
 // TestKubernetesWorkloads_AreHardened is the workload-hardening guard.
 //
-// # What was wrong
-//
 // Every application workload ran with the Kubernetes defaults, which are permissive by
-// design: root, a writable root filesystem, every capability the runtime grants, a mounted
-// ServiceAccount token, no resource requests or limits, and no probes. The Blnk image declares
-// no USER, so root was not a choice anyone made — it was what happened.
-//
-// # Why resources are the least obvious of these and not the least important
-//
-// With no requests the pods were BestEffort, so they were first to be evicted under node
-// pressure — the server owns the event relay and the worker drains TRANSACTION_QUEUE, so the
-// two most important processes were the two the kubelet would kill first. Requests also make
-// the existing HPAs work: server-hpa.yaml and worker-hpa.yaml scale on `Utilization`, which is
-// a percentage OF THE REQUEST, so with no request the autoscalers reported <unknown> and never
-// scaled. They were configured and inert.
-//
-// # Why the probes are asserted per workload rather than generically
-//
-// Each has a different correct target and getting it wrong is silent. The server answers GET /
-// unauthenticated. The worker's /health is registered directly on its monitoring mux and is
-// deliberately NOT wrapped in MetricsAuthHandler, so it is the only path there that does not
-// need a bearer token — probing /metrics would start reporting 401 as unhealthy the moment
-// secure mode was switched on. Prometheus distinguishes /-/ready from /-/healthy.
+// design: root, a writable root filesystem, every capability the runtime grants, a
+// mounted ServiceAccount token, no resource requests or limits, and no probes.
 func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -1161,10 +953,10 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 		container string
 		probePath string
 		uid       int
-		// mountsAPIToken marks the one workload that legitimately needs a
-		// ServiceAccount token: Prometheus, whose scrape jobs discover their targets
-		// through the Kubernetes API. See the token subtest for why asserting
-		// otherwise silences the whole alerting pipeline.
+		// mountsAPIToken marks the one workload that legitimately needs a ServiceAccount
+		// token: Prometheus, whose scrape jobs discover their targets through the Kubernetes
+		// API. See the token subtest for why asserting otherwise silences the whole alerting
+		// pipeline.
 		mountsAPIToken bool
 	}{
 		{manifest: "server-deployment.yaml", container: "server", probePath: "/", uid: 10001},
@@ -1220,26 +1012,10 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 
 			t.Run("mounts a ServiceAccount token only where one is called for",
 				func(t *testing.T) {
-					// The application workloads call no Kubernetes API. The server is the
-					// process most exposed to the network and the worker processes
-					// untrusted transaction payloads off a queue, so a namespace-scoped
-					// credential is exactly what should not be sitting in either
-					// filesystem.
-					//
-					// PROMETHEUS IS THE EXCEPTION, and asserting `false` for it was the
-					// defect rather than the safeguard. Its scrape jobs discover targets
-					// through `kubernetes_sd_configs: role: pod`, so it calls the API on
-					// every discovery refresh — and with no token file it logs `Cannot
-					// create service discovery` once and then serves happily with zero
-					// targets. Pod healthy, rules loaded, nothing collected, every alert
-					// permanently unable to fire. `automountServiceAccountToken: false`
-					// on this workload is therefore not hardening, it is the thing that
-					// silences the alerting pipeline; the least-privilege statement that
-					// belongs here instead is the namespace-scoped Role in
-					// prometheus-rbac.yaml, which grants pods and nothing else.
-					//
-					// TestPrometheusDiscovery_ShipsBothHalvesTogether owns the positive
-					// side of that in full.
+					// The application workloads call no Kubernetes API. The server is the process most
+					// exposed to the network and the worker processes untrusted transaction payloads
+					// off a queue, so a namespace-scoped credential is exactly what should not be
+					// sitting in either filesystem.
 					if workload.mountsAPIToken {
 						assert.Equalf(t, true, podSpec["automountServiceAccountToken"],
 							"%s calls the Kubernetes API for target discovery, so it must "+
@@ -1304,9 +1080,9 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 						"%s: %s must target the port by NAME", workload.manifest, probe)
 				}
 
-				// Liveness must be the most forgiving of the three: readiness drains a
-				// stalled pod from its Service, and only a truly wedged one should be
-				// restarted — restarting the server discards the relay lease it holds.
+				// Liveness must be the most forgiving of the three: readiness drains a stalled pod
+				// from its Service, and only a truly wedged one should be restarted — restarting
+				// the server discards the relay lease it holds.
 				liveness := container["livenessProbe"].(map[string]interface{})
 				readiness := container["readinessProbe"].(map[string]interface{})
 				assert.Greaterf(t, liveness["failureThreshold"], readiness["failureThreshold"],
@@ -1317,12 +1093,7 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 	}
 
 	t.Run("the Blnk workloads exec the binary directly", func(t *testing.T) {
-		// PID 1 has to be blnk. The server container previously started as
-		// `/bin/sh -c "blnk migrate up ... && blnk start ..."`, and sh does not forward
-		// signals: the SIGTERM Kubernetes sends on every rollout went to the shell, so
-		// cmd/server.go's handler — which drains the lineage and event relays and closes
-		// the database pool — never ran and the process was SIGKILLed at the end of the
-		// grace period.
+		// PID 1 has to be blnk.
 		for _, workload := range []struct{ manifest, container string }{
 			{manifest: "server-deployment.yaml", container: "server"},
 			{manifest: "worker-deployment.yaml", container: "worker"},
@@ -1363,10 +1134,9 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 
 	t.Run("the application image is an operator input with no stale default", func(t *testing.T) {
 		// Same defect and same resolution as docker-compose.yaml: the manifests deployed
-		// jerryenebeli/blnk:0.13.3, a real published image built before this
-		// implementation, so `kubectl apply` succeeded and the cluster ran a binary with
-		// no relay and no /events beside a ConfigMap full of KAFKA_* keys it had never
-		// heard of.
+		// jerryenebeli/blnk:0.13.3, a real published image built before this implementation,
+		// so `kubectl apply` succeeded and the cluster ran a binary with no relay and no
+		// /events beside a ConfigMap full of KAFKA_* keys it had never heard of.
 		for _, workload := range []struct{ manifest, container string }{
 			{manifest: "server-deployment.yaml", container: "server"},
 			{manifest: "server-deployment.yaml", container: "migrate"},
@@ -1386,25 +1156,6 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 
 	// The placeholder above is necessary but not sufficient, and this subtest is the
 	// difference between the two.
-	//
-	// # What was still wrong
-	//
-	// Kubernetes does not validate image references at admission. It accepts
-	// `blnk:REPLACE_WITH_PINNED_DIGEST` as a perfectly well-formed reference, admits the
-	// object, schedules the pod, and the problem surfaces only when the kubelet tries to
-	// pull. So the operator's feedback was an ImagePullBackOff several seconds AFTER an
-	// apply that reported success — on a Deployment that is by then partially rolled out,
-	// with the previous ReplicaSet scaling down and the new one unable to start. The
-	// placeholder made the failure certain; it did not make it early, and "certain but
-	// late" is what turns a thirty-second fix into an incident.
-	//
-	// # Why this is a script rather than more manifest
-	//
-	// Nothing expressible inside a manifest fails before admission: an absent `image` key
-	// is rejected by the API server, but it is also rejected by `kubectl create
-	// --dry-run=client`, which would break the static validation this repository already
-	// runs over the whole folder. The gate therefore has to live outside the YAML, and it
-	// has to be runnable with no cluster and no kubeconfig so CI can run it too.
 	t.Run("a preflight gate refuses an unresolved image before any apply", func(t *testing.T) {
 		script := filepath.Join(root, "scripts", "k8s-preflight.sh")
 
@@ -1436,10 +1187,10 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 			"the refusal must carry the remedy; a gate that reports a problem without "+
 				"the fix relocates the guesswork rather than removing it")
 
-		// And it must ACCEPT a resolved tree, or it is unusable and will be bypassed.
-		// The digest here is syntactically valid and refers to nothing: the gate checks
-		// the SHAPE of the reference and never contacts a registry, which is what keeps
-		// it runnable in CI with no network.
+		// And it must ACCEPT a resolved tree, or it is unusable and will be bypassed. The
+		// digest here is syntactically valid and refers to nothing: the gate checks the SHAPE
+		// of the reference and never contacts a registry, which is what keeps it runnable in
+		// CI with no network.
 		rendered := filepath.Join(t.TempDir(), "rendered")
 		const fakeDigest = "ghcr.io/blnkfinance/blnk@sha256:" +
 			"1111111111111111111111111111111111111111111111111111111111111111"
@@ -1467,9 +1218,8 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 				"%s: the rendered manifest must carry the supplied digest", name)
 		}
 
-		// Rendering must be a COPY. An in-place edit would leave a digest in the working
-		// tree that must never be committed, and the next `git status` would invite
-		// exactly that.
+		// Rendering must be a COPY. An in-place edit would leave a digest in the working tree
+		// that must never be committed, and the next `git status` would invite exactly that.
 		for _, name := range []string{"server-deployment.yaml", "worker-deployment.yaml"} {
 			body, readErr := os.ReadFile(filepath.Join(manifests, name))
 			require.NoError(t, readErr)
@@ -1483,30 +1233,7 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 
 	// A SHAPE assertion on the one manifest that can silently corrupt a metadata log.
 	//
-	// # What must never exist, and what may
-	//
-	// A SINGLETON kafka-data PersistentVolumeClaim used to exist here, generated by
-	// Kompose. A PVC is ONE claim bound to ONE volume, and ReadWriteOnce means one node may
-	// mount it at a time — while this StatefulSet runs three replicas, each of which needs
-	// its own KRaft metadata log and its own partition segments. Three brokers sharing one
-	// claim either fail to schedule onto separate nodes or, far worse, write concurrently
-	// into a single log directory, which corrupts the metadata log rather than reporting an
-	// error. Nothing ever mounted it either, so applying the folder simply provisioned an
-	// idle volume for someone to find later.
-	//
-	// What is forbidden is therefore the SINGLETON, not the file. A claim whose name is one
-	// of the per-ordinal names Kubernetes derives from the template —
-	// <template>-<statefulset>-<ordinal>, i.e. kafka-data-kafka-0/-1/-2 — is not shared by
-	// anything: the StatefulSet ADOPTS the existing object instead of creating a second, and
-	// pre-provisioning them is the only way to bind a particular PersistentVolume, a named
-	// local disk or a restored snapshot to a particular broker, which one template cannot
-	// express. That is why this file may exist and why pg-data's presence beside
-	// postgres-statefulset.yaml is not the asymmetry it looks like.
-	//
-	// So this asserts SHAPE rather than absence, which is also strictly stronger: an absence
-	// assertion passes on a file that exists with the wrong shape, while this one catches the
-	// singleton, a name no pod will ever ask for, an access mode that contradicts the
-	// template, and a size that silently disagrees with it.
+	// What is forbidden is therefore the SINGLETON, not the file.
 	t.Run("kafka storage is per-pod only, with no standalone claim to share", func(t *testing.T) {
 		manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
 
@@ -1588,22 +1315,11 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 	})
 }
 
-// TestKubernetesConfig_ProjectsCredentialsFromSecrets is the SEC-01 and SEC-07 guard.
+// TestKubernetesConfig_ProjectsCredentialsFromSecrets is the guard.
 //
-// # What was wrong
+// Two defects that compounded.
 //
-// Two defects that compounded. The manifests projected no authentication settings at all, and
-// api/middleware/auth.go calls c.Next() BEFORE looking for a credential whenever
-// Server.Secure is false — so a cluster deployed from these files served the whole ledger API
-// to anyone who could reach it: create transactions, read every identity, mint API keys. And
-// the ConfigMap carried the PostgreSQL password in plaintext with sslmode=disable, in an object
-// stored unencrypted, readable by anything with get-configmap, and printed in full by
-// `kubectl describe`.
-//
-// # Why the assertions are split between "in a Secret" and "not in the ConfigMap"
-//
-// Adding a Secret reference does not remove a committed credential. Both halves have to hold
-// or the credential is simply in two places, and the ConfigMap copy is the readable one.
+// Adding a Secret reference does not remove a committed credential.
 func TestKubernetesConfig_ProjectsCredentialsFromSecrets(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -1645,8 +1361,8 @@ func TestKubernetesConfig_ProjectsCredentialsFromSecrets(t *testing.T) {
 
 	t.Run("the Deployments project every credential from a Secret", func(t *testing.T) {
 		// key -> the workloads that must project it. The master key is server-only on
-		// purpose: nothing in the worker role authenticates an inbound API caller, so the
-		// key would be an unused credential in a pod that processes untrusted payloads.
+		// purpose: nothing in the worker role authenticates an inbound API caller, so the key
+		// would be an unused credential in a pod that processes untrusted payloads.
 		wantSecretEnv := map[string][]string{
 			"BLNK_SERVER_SECRET_KEY":    {"server"},
 			"BLNK_METRICS_BEARER_TOKEN": {"server", "worker"},
@@ -1700,8 +1416,8 @@ func TestKubernetesConfig_ProjectsCredentialsFromSecrets(t *testing.T) {
 
 		// Blnk terminates no TLS — cmd/server.go always uses plain ListenAndServe and
 		// serveTLS is unreachable dead code — so a LoadBalancer on this Service published
-		// unencrypted HTTP straight to the internet, carrying the master key in a header
-		// and one-time SCRAM passwords in response bodies.
+		// unencrypted HTTP straight to the internet, carrying the master key in a header and
+		// one-time SCRAM passwords in response bodies.
 		assert.Equal(t, "ClusterIP", spec["type"],
 			"server-service.yaml must be ClusterIP. Blnk terminates no TLS, so exposing it "+
 				"directly publishes plaintext HTTP; terminate at an Ingress instead")
@@ -1721,8 +1437,8 @@ func TestKubernetesConfig_ProjectsCredentialsFromSecrets(t *testing.T) {
 // mebibytes parses the subset of Kubernetes and JVM size suffixes these manifests use.
 //
 // Returning bytes-as-MiB rather than a resource.Quantity keeps the comparison below
-// dependency-free: the guard needs to know whether one number is smaller than another, not to
-// reimplement quantity arithmetic.
+// dependency-free: the guard needs to know whether one number is smaller than another,
+// not to reimplement quantity arithmetic.
 func mebibytes(t *testing.T, value string) int {
 	t.Helper()
 
@@ -1743,40 +1459,11 @@ func mebibytes(t *testing.T, value string) int {
 	}
 }
 
-// TestKafkaStatefulSet_CanColdStartAndIsHardened guards the four defects that made the broker
-// set unable to start, unable to read its own keystore, and unbounded.
+// TestKafkaStatefulSet_CanColdStartAndIsHardened guards the four defects that made the
+// broker set unable to start, unable to read its own keystore, and unbounded.
 //
-// # SEC-04, and why OrderedReady was a deadlock rather than a preference
-//
-// OrderedReady creates kafka-1 only after kafka-0 is READY, and kafka-0's readiness probe is an
-// authenticated kafka-topics.sh --list, which needs a metadata response, which needs the KRaft
-// controller quorum to have elected a leader. The voter list enumerates all three replicas, so
-// a majority is two — and with only kafka-0 running there is one voter of three. No majority,
-// no leader, no readiness, so kafka-1 is never created and the quorum can never reach two. The
-// set never starts and never explains why.
-//
-// # SEC-05, and why the keystore mode and the fsGroup are one assertion
-//
-// A Secret volume's files are owned by root with their group taken from the pod's fsGroup.
-// Mode 0400 is owner-read-only, and the apache/kafka image runs as uid 1000 — so the broker
-// could not open its own keystore. Both listeners are SASL_SSL, so that is not degradation: TLS
-// initialisation fails and no listener binds. Group-readable mode without an fsGroup is equally
-// useless, and an fsGroup without group-readable mode likewise, which is why neither is
-// asserted alone.
-//
-// # SEC-11
-//
-// Neither container declared a security context or a resource budget, and the heap was an
-// invisible 1G default from kafka-server-start.sh. A memory limit chosen without reference to
-// that default is an OOMKill under load, so the two are asserted against each other rather than
-// merely asserted present.
-//
-// # SEC-17
-//
-// The hard half is enforced here: required hostname anti-affinity, so three replicas of a
-// replication-factor-3 cluster cannot land on one node and be lost together. Dedicated
-// controllers remain a documented scaling step rather than a guarded property, because that is
-// a multi-manifest topology change.
+// A Secret volume's files are owned by root with their group taken from the pod's
+// fsGroup.
 func TestKafkaStatefulSet_CanColdStartAndIsHardened(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -1969,33 +1656,10 @@ func TestKafkaStatefulSet_CanColdStartAndIsHardened(t *testing.T) {
 	})
 }
 
-// TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce is the guard for a duplication that
-// Kubernetes accepts and then behaves unpredictably under.
+// TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce is the guard for a duplication
+// that Kubernetes accepts and then behaves unpredictably under.
 //
-// # What was wrong
-//
-// Two PodDisruptionBudgets targeted the identical Kafka pod selector: a generic `kafka` in
-// blnk-poddisruptionbudgets.yaml and the purpose-built `kafka-quorum` shipped alongside the
-// StatefulSet it protects. Kubernetes documents a pod matched by more than one budget as an
-// UNSUPPORTED configuration — it admits both, `kubectl get pdb` lists both, and which one the
-// eviction API honours is not something the manifests decide.
-//
-// # Why it was benign, and why that is the problem
-//
-// The two agreed: both said maxUnavailable: 1. So nothing was observably wrong, which is
-// precisely what let it ship. The eviction budget only ever matters during a node drain or a
-// cluster upgrade, and that is exactly when a later edit to either file — raising one to
-// maxUnavailable: 2, or narrowing a selector — would silently change how many of three KRaft
-// voters may go at once. Losing two brokers costs the controller quorum AND the in-sync
-// replica minimum simultaneously, so the blast radius of the ambiguity is the whole cluster's
-// availability.
-//
-// # What this asserts
-//
-// One budget per selector across the WHOLE manifest folder, not per file — the duplication
-// spanned two files, so a per-file check would have found nothing. Multi-document files are
-// read in full for the same reason: `kafka-quorum` is the second document of
-// kafka-statefulset.yaml, which is where it belongs.
+// The two agreed: both said maxUnavailable: 1.
 func TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce(t *testing.T) {
 	root := moduleRootDir(t)
 	manifestDir := filepath.Join(root, "infrastructure", "k8s-manifests")
@@ -2111,8 +1775,8 @@ func TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce(t *testing.T) {
 
 // workloadPodLabels returns the pod-template labels of a workload document.
 //
-// Only the kinds whose pods an eviction can remove are considered, because those are the only
-// ones a PodDisruptionBudget can govern.
+// Only the kinds whose pods an eviction can remove are considered, because those are
+// the only ones a PodDisruptionBudget can govern.
 //
 // Parameters:
 //   - document map[string]interface{}: one decoded manifest document.
@@ -2169,8 +1833,8 @@ func workloadDescription(fileName string, document map[string]interface{}) strin
 	return fmt.Sprintf("%v/%s (%s)", document["kind"], name, fileName)
 }
 
-// labelsSatisfy reports whether every label in a selector is present with the same value in a
-// workload's pod labels, which is what matchLabels means.
+// labelsSatisfy reports whether every label in a selector is present with the same
+// value in a workload's pod labels, which is what matchLabels means.
 //
 // Parameters:
 //   - podLabels map[string]interface{}: the workload's pod-template labels.
@@ -2189,22 +1853,14 @@ func labelsSatisfy(podLabels, selector map[string]interface{}) bool {
 	return len(selector) > 0
 }
 
-// eventStreamingEnvTagPattern extracts the environment variable name from an envconfig tag
-// in config/config.go, restricted to the four families this feature owns.
-//
-// Reading the tags rather than a written-down list is the whole point: a list would be a
-// second copy of the contract, and a second copy is what let eleven documented knobs go
-// unforwarded while every file involved read correctly on its own.
+// eventStreamingEnvTagPattern extracts the environment variable name from an envconfig
+// tag in config/config.go, restricted to the four families this feature owns.
 var eventStreamingEnvTagPattern = regexp.MustCompile(
 	`envconfig:"((?:KAFKA|RELAY|WEBHOOK|EVENT)_[A-Z0-9_]+)"`,
 )
 
-// eventStreamingEnvTags returns every environment variable name config/config.go resolves in
-// the Kafka, relay, webhook-window and event-metrics families.
-//
-// WEBHOOK_DEPRECATION_START_DATE is excluded because it is DERIVED rather than read: the
-// window's opening instant is computed from the sunset date, and config.go carries no
-// envconfig tag for it.
+// eventStreamingEnvTags returns every environment variable name config/config.go
+// resolves in the Kafka, relay, webhook-window and event-metrics families.
 func eventStreamingEnvTags(t *testing.T) []string {
 	t.Helper()
 
@@ -2229,18 +1885,16 @@ func eventStreamingEnvTags(t *testing.T) []string {
 	return tags
 }
 
-// workerExemptEventStreamingEnv is every event-streaming variable the WORKER service does not
-// receive, each with the reason it does not.
+// workerExemptEventStreamingEnv is every event-streaming variable the WORKER service
+// does not receive, each with the reason it does not.
 //
 // It is a declared table rather than an inferred difference so that adding a knob to
-// config.go forces a DECISION about the worker instead of defaulting to silence in either
-// direction: forget to forward one it needs and the test fails, forward one it cannot use and
-// the test fails too. Both mistakes have shipped in this file, in both directions.
+// config.go forces a DECISION about the worker instead of defaulting to silence in
+// either direction: forget to forward one it needs and the test fails, forward one it
+// cannot use and the test fails too.
 //
-// The role's boundary is ProcessRole.PublishesEvents, an allowlist naming only the server. So
-// the worker builds the no-op publisher, opens no broker connection and administers nothing —
-// while still CAPTURING events into the outbox inside the ledger transaction, which is why the
-// four keys it does receive are the four capture reads.
+// The role's boundary is ProcessRole.PublishesEvents, an allowlist naming only the
+// server.
 var workerExemptEventStreamingEnv = map[string]string{
 	"KAFKA_SUBSCRIBER_BROKERS":        "only credential issuance reports it, and only the server serves that endpoint",
 	"KAFKA_KEY_SCOPE_ENFORCEMENT":     "the same: it gates issuance, which this role does not serve",
@@ -2290,15 +1944,10 @@ var workerExemptEventStreamingEnv = map[string]string{
 	"EVENT_METRICS_SUBSCRIBER_BUDGET": "the same ceiling under its other published spelling",
 }
 
-// composeServiceEnvironment returns a service's environment block as a map, preserving a nil
-// value for compose's pass-through form.
+// composeServiceEnvironment returns a service's environment block as a map, preserving
+// a nil value for compose's pass-through form.
 //
-// The nil is the load-bearing part. `BLNK_X:` with nothing after the colon copies the variable
-// from .env when it is set there and leaves it ENTIRELY ABSENT when it is not, whereas
-// `BLNK_X: ${BLNK_X:-}` sets it to the empty string — and because applyPrefixedEnvAliases
-// decides on os.LookupEnv, presence rather than non-emptiness, an empty prefixed value WINS
-// over the bare name and blanks it. So the two forms are not interchangeable and this map has
-// to be able to tell them apart.
+// The nil is the load-bearing part.
 func composeServiceEnvironment(t *testing.T, composeFile, service string) map[string]interface{} {
 	t.Helper()
 
@@ -2338,28 +1987,10 @@ func eventStreamingKeysOf(t *testing.T, composeFile, service string) []string {
 	return keys
 }
 
-// TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves is M-10, executed.
+// TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves is the compose-forwarding contract, executed.
 //
-// # The defect
-//
-// config/config.go resolves a knob, .env.example documents it, and nothing forwarded it into
-// the container. Eleven were in that state at once — KAFKA_ALLOW_ADMIN_PRODUCER, the four TLS
-// certificate settings, the three retention settings, and both spellings of the consumer-lag
-// budget — plus BLNK_KAFKA_SUBSCRIBER_BROKERS, which was documented as resolvable under the
-// prefix and forwarded under neither name.
-//
-// The symptom is silence in the direction that reads as success: an operator sets the key in
-// .env, `docker compose up` accepts it, the container never sees it, the application applies
-// its default, and nothing anywhere reports a problem. For a retention period that means no
-// sweeping; for a TLS certificate path it means an unauthenticated client against a broker
-// that accepts both; for the admin-producer switch it means the escape hatch cannot be closed
-// or opened deliberately.
-//
-// # Why this is derived from config.go rather than listed here
-//
-// A list in a test is a second copy of the contract, and the reason eleven knobs drifted is
-// that every copy of the contract read correctly on its own. The tags in config.go are the one
-// definition every other file is a projection of, so this test reads them and compares.
+// config/config.go resolves a knob, .env.example documents it, and nothing forwarded it
+// into the container.
 func TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves(t *testing.T) {
 	tags := eventStreamingEnvTags(t)
 
@@ -2387,12 +2018,10 @@ func TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves(t *testin
 			})
 
 			t.Run("every prefixed alias uses the pass-through form", func(t *testing.T) {
-				// ONLY THE ALIASES OF THIS FAMILY. A top-level setting whose envconfig tag
-				// already carries the prefix — BLNK_ENABLE_OBSERVABILITY,
-				// BLNK_METRICS_BEARER_TOKEN — is resolved by envconfig itself under that one
-				// name, so `${...:-default}` is the right form for it and shipping a default
-				// is the point. The pass-through requirement is specific to the names
-				// applyPrefixedEnvAliases overlays ON TOP OF a bare name.
+				// ONLY THE ALIASES OF THIS FAMILY. A top-level setting whose envconfig tag already
+				// carries the prefix — BLNK_ENABLE_OBSERVABILITY, BLNK_METRICS_BEARER_TOKEN — is
+				// resolved by envconfig itself under that one name, so `${...:-default}` is the
+				// right form for it and shipping a default is the point.
 				aliases := make(map[string]struct{}, len(tags))
 				for _, tag := range tags {
 					aliases["BLNK_"+tag] = struct{}{}
@@ -2421,10 +2050,10 @@ func TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves(t *testin
 
 					switch {
 					case exempt:
-						// LEAST PRIVILEGE, ASSERTED IN THE OTHER DIRECTION. Forwarding a key
-						// this role cannot use is not harmless: for a credential it widens
-						// what a compromise of the process is worth, and for anything else it
-						// implies the role honours a setting it never reads.
+						// LEAST PRIVILEGE, ASSERTED IN THE OTHER DIRECTION. Forwarding a key this role
+						// cannot use is not harmless: for a credential it widens what a compromise of the
+						// process is worth, and for anything else it implies the role honours a setting
+						// it never reads.
 						assert.Falsef(t, forwarded,
 							"%s: the worker service must NOT forward %s — %s", composeFile, tag, reason)
 						_, aliasForwarded := workerEnv["BLNK_"+tag]
@@ -2449,12 +2078,8 @@ func TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves(t *testin
 	}
 }
 
-// TestCompose_BothProjectionsForwardTheSameEventStreamingKeys asserts the production and
-// development Compose files agree, key for key and role for role.
-//
-// They are edited by hand, in step, and the development one is the copy a contributor reaches
-// for — so a knob added to only one of them produces a stack that behaves differently from the
-// one CI and production run, which is the hardest kind of difference to attribute.
+// TestCompose_BothProjectionsForwardTheSameEventStreamingKeys asserts the production
+// and development Compose files agree, key for key and role for role.
 func TestCompose_BothProjectionsForwardTheSameEventStreamingKeys(t *testing.T) {
 	require.Len(t, composeFiles, 2, "this comparison assumes exactly two projections")
 
@@ -2471,41 +2096,17 @@ func TestCompose_BothProjectionsForwardTheSameEventStreamingKeys(t *testing.T) {
 	}
 }
 
-// TestRelayTarget_RequiresAnActuallyUsableBrokerList is the M-15 guard.
-//
-// # What was wrong
-//
-// `make run_relay` decided whether blnk.json counted as a configured broker source with
-//
-//	grep -q '"brokers"' "${CONFIG_FILE}"
-//
-// and `"kafka": { "brokers": [] }` contains that string. So an empty array passed the check, the
-// target announced the file as its configuration source and started the server — which then
-// resolved no writer, ran no event relay, and left every captured event sitting in
-// blnk.event_outbox at status `pending` while the HTTP API answered normally and every probe
-// stayed green. The whole purpose of the broker check is to refuse exactly that state before it
-// starts, so a check that a declared-but-empty array satisfies is worse than none: it converts a
-// loud misconfiguration into a silent one.
-//
-// `"brokers": [""]` and `"brokers": ["  "]` are the same defect wearing a different hat — a blank
-// string is not a broker, and kafka-go would fail to dial it just as surely.
-//
-// # Why this is asserted behaviourally and not only textually
-//
-// The text assertion pins the fix; the exec assertion pins the BEHAVIOUR, and only the second
-// one would notice a JSON expression that was subtly wrong — a jq filter that returned a
-// non-empty array as false, say, or a python snippet that raised on a missing "kafka" key and
-// was read as success. Both halves are here because the textual one still runs where `make` is
-// not on PATH.
+// TestRelayTarget_RequiresAnActuallyUsableBrokerList holds `make run_relay` to a broker
+// list it can actually dial.
 func TestRelayTarget_RequiresAnActuallyUsableBrokerList(t *testing.T) {
 	root := moduleRootDir(t)
 	makefile := readRepoFile(t, "makefile")
 
 	// COMMENTS ARE STRIPPED BEFORE THE ABSENCE IS ASSERTED, the same rule
-	// event_loadtest_contract_test.go applies for the same reason. The rationale comment above
-	// the replacement target deliberately QUOTES the old `grep -q '"brokers"'` form while
-	// explaining why it was wrong, and prose that names a removed construct must not be able to
-	// fail an assertion about code.
+	// event_loadtest_contract_test.go applies for the same reason. The rationale comment
+	// above the replacement target deliberately QUOTES the old `grep -q '"brokers"'` form
+	// while explaining why it was wrong, and prose that names a removed construct must not
+	// be able to fail an assertion about code.
 	recipes := make([]string, 0, 64)
 	for _, line := range strings.Split(makefile, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "#") {
@@ -2522,12 +2123,11 @@ func TestRelayTarget_RequiresAnActuallyUsableBrokerList(t *testing.T) {
 		"makefile: run_server_relay must delegate the broker-array question to something that "+
 			"actually parses JSON")
 
-	// AND IT MUST NOT DO SO WITH $(MAKE). GNU make executes any recipe line containing $(MAKE)
-	// even under -n, so that a sub-make can print its own commands. run_server_relay's recipe is
-	// a single backslash-continued line ending in `exec ./blnk start`, so a $(MAKE) anywhere in
-	// it turns `make -n run_relay` into a real server start. That is not cosmetic: the server
-	// hosts the event relay, the relay claims blnk.event_outbox rows, and the event and outbox
-	// suites require it to be DOWN. The first version of this fix had exactly that bug.
+	// AND IT MUST NOT DO SO WITH $(MAKE). GNU make executes any recipe line containing
+	// $(MAKE) even under -n, so that a sub-make can print its own commands.
+	// run_server_relay's recipe is a single backslash-continued line ending in `exec
+	// ./blnk start`, so a $(MAKE) anywhere in it turns `make -n run_relay` into a real
+	// server start.
 	relayRecipe := executable
 	if start := strings.Index(relayRecipe, "\nrun_server_relay:\n"); start >= 0 {
 		relayRecipe = relayRecipe[start:]

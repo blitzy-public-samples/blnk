@@ -27,45 +27,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file guards ONE fact about the worker role, and it is the single most consequential
-// thing to get wrong when the legacy webhook transport is finally deleted:
-//
-//	THE "WEBHOOK" ASYNQ SERVER IS SHARED. It is not the webhook feature's server.
-//
-// Its queue map carries both the webhook queue and the TypeSense index queue, and its mux
-// carries four handlers: the webhook delivery handler, the transaction-hook execution handler,
-// and two search-indexing handlers. Two of those belong to features that are explicitly out of
-// scope for the Kafka migration and must outlive it — the /hooks surface implements
-// PRE_TRANSACTION and POST_TRANSACTION request-time callouts, and the hooks subsystem enqueues
-// its work onto the webhook queue BY NAME, so the queue itself is part of the hooks feature's
-// wiring rather than the webhook feature's.
-//
-// # What this file is defending against
-//
-// The sunset procedure at the foot of webhooks.go removes ONE LINE: the mapping from
-// cfg.Queue.WebhookQueue to ProcessWebhook. Everything else on this server stays. The mistake
-// available to anyone performing that deletion is to read "webhook queue", "webhook mux" and
-// "webhook worker server" as belonging to the transport being retired and remove them together
-// — and the consequence is silent in every existing test: transaction hooks would stop
-// executing and search indexing would stop, with asynq archiving each task as "no handler
-// found" while the API, the ledger and every other test carried on perfectly.
-//
-// Nothing anywhere asserted this before. These tests are that assertion.
+// This file guards ONE fact about the worker role, and it is the single most
+// consequential thing to get wrong when the legacy webhook transport is finally
+// deleted:
 
 // sharedQueueTaskProbe reports whether the mux has a handler for a task type.
 //
-// # Why the answer is inferred from a panic
-//
-// asynq's ServeMux exposes no lookup, so the only way to ask "is there a handler for this
-// type?" is to dispatch a task and interpret the outcome. A missing handler produces asynq's
-// own "no handler found for task" error. A PRESENT handler runs, and every handler here needs
-// live infrastructure and a well-formed payload it is not being given, so it fails or panics —
-// and either of those is evidence that the mapping exists, which is the only thing being
-// asserted. Distinguishing "no handler" from "the handler ran and was unhappy" is therefore the
-// whole of the technique.
-//
-// The panic is recovered rather than allowed to fail the test for the same reason: a panic from
-// inside a handler means the handler was reached.
+// asynq's ServeMux exposes no lookup, so the only way to ask "is there a handler for
+// this type?" is to dispatch a task and interpret the outcome.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper marking.
@@ -92,8 +61,8 @@ func sharedQueueTaskProbe(t *testing.T, mux *asynq.ServeMux, taskType string) bo
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				// Reached the handler body and it panicked on the probe payload or on
-				// infrastructure it does not have here. That is a registration, which is what
-				// is being asserted.
+				// infrastructure it does not have here. That is a registration, which is what is
+				// being asserted.
 				reached = true
 			}
 		}()
@@ -105,11 +74,12 @@ func sharedQueueTaskProbe(t *testing.T, mux *asynq.ServeMux, taskType string) bo
 	return reached
 }
 
-// TestWebhookWorkerServer_KeepsEveryHandlerTheSharedQueueCarries pins all four registrations.
+// TestWebhookWorkerServer_KeepsEveryHandlerTheSharedQueueCarries pins all four
+// registrations.
 //
-// Each is named with the feature it belongs to and what its absence costs, because the point of
-// the test is not that four handlers exist but that THREE OF THEM ARE NOT PART OF THE WEBHOOK
-// FEATURE and must survive its deletion.
+// Each is named with the feature it belongs to and what its absence costs, because the
+// point of the test is not that four handlers exist but that THREE OF THEM ARE NOT PART
+// OF THE WEBHOOK FEATURE and must survive its deletion.
 func TestWebhookWorkerServer_KeepsEveryHandlerTheSharedQueueCarries(t *testing.T) {
 	instance := newCmdTestInstance(t)
 	cfg := instance.cnf
@@ -156,10 +126,9 @@ func TestWebhookWorkerServer_KeepsEveryHandlerTheSharedQueueCarries(t *testing.T
 
 // TestWebhookWorkerServer_PollsBothQueuesItOwns pins the queue map.
 //
-// A handler with no queue behind it is as inert as a queue with no handler, and the failure
-// looks different: the task is accepted by Redis and simply never dequeued, because the asynq
-// server was never told to poll that queue. The index queue is the one at risk — it rides on
-// this server precisely because it is cheap to remove alongside "the webhook queue".
+// A handler with no queue behind it is as inert as a queue with no handler, and the
+// failure looks different: the task is accepted by Redis and simply never dequeued,
+// because the asynq server was never told to poll that queue.
 func TestWebhookWorkerServer_PollsBothQueuesItOwns(t *testing.T) {
 	cfg := realInfraConfig(t)
 
@@ -180,15 +149,10 @@ func TestWebhookWorkerServer_PollsBothQueuesItOwns(t *testing.T) {
 	}
 }
 
-// TestWebhookWorkerServer_SurvivesTheWebhookSunset states the sunset contract as an executable
-// assertion rather than as a comment in the file being deleted.
+// TestWebhookWorkerServer_SurvivesTheWebhookSunset states the sunset contract as an
+// executable assertion rather than as a comment in the file being deleted.
 //
-// The deletion removes the ProcessWebhook MAPPING. This test therefore asserts what must be
-// true AFTERWARDS: with the webhook mapping absent, the other three handlers are still
-// registered and both queues are still polled. It is written against a mux built by hand rather
-// than by initializeWebhookTaskHandlers, because the whole point is to describe the
-// post-deletion shape while the pre-deletion code is still in place — and to fail immediately
-// if a future edit takes the hook or index registrations down with the webhook one.
+// The deletion removes the ProcessWebhook MAPPING.
 func TestWebhookWorkerServer_SurvivesTheWebhookSunset(t *testing.T) {
 	instance := newCmdTestInstance(t)
 	cfg := instance.cnf

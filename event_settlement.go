@@ -16,79 +16,18 @@ limitations under the License.
 
 // event_settlement.go finishes the broker-side work a subscriber operation could not.
 //
-// # The failure this exists for
+// A subscriber's state lives in two systems that cannot be written atomically: the
+// registry row in PostgreSQL, and the principal, credential and ACL bindings at the
+// Kafka broker. Three operations span both — issuing a credential, changing an
+// authorization, deregistering — and every one of them has intermediate states that are
+// reachable in practice:
 //
-// A subscriber's state lives in two systems that cannot be written atomically: the registry row
-// in PostgreSQL, and the principal, credential and ACL bindings at the Kafka broker. Three
-// operations span both — issuing a credential, changing an authorization, deregistering — and
-// every one of them has intermediate states that are reachable in practice:
-//
-//   - an authorization change that pruned the broker and then failed to persist, or persisted
-//     and then failed to grant, or whose process disappeared between the two;
-//   - a credential written at the broker whose compensating revocation itself failed, leaving a
-//     principal that can authenticate with no authorization boundary;
-//   - a credential revoked and confirmed gone whose registry record could not be cleared,
-//     leaving the registry reporting access that does not exist.
-//
-// Each of those USED TO BE recorded as nothing more than a returned error and a log line, some
-// of them ending in the words "revoke it by hand immediately". A log line cannot be queried per
-// subscriber, cannot be retried, and cannot be alerted on. So the divergence persisted until
-// somebody happened to read the right line, and the caller's own retry was the only repair
-// mechanism that existed — which is no mechanism at all for the case where the caller is a
-// process that no longer exists.
-//
-// The obligation columns on blnk.event_subscribers turn each of those into a durable, queryable
-// to-do item, and this worker is what discharges them.
-//
-// # Two obligations, because two remedies
-//
-// grant_reconcile_pending_at means the broker's ACL bindings may not match the row's
-// authorized_topics. The remedy is to reconcile the broker TO THE ROW — the row is the source of
-// truth, so this is well defined however far the original attempt got, and it needs no knowledge
-// of which step failed.
-//
-// credential_cleanup_pending_at means a SCRAM credential may exist that Blnk intended to
-// destroy, or the row names one that no longer works. The remedy is to revoke at the broker and
-// clear the row's credential record. Revoking a credential that is already gone is a harmless
-// no-op, which is exactly why ONE marker covers both shapes.
-//
-// # The order between them is fixed
-//
-// CREDENTIAL CLEANUP RUNS FIRST. Its revocation removes every binding the principal holds — by
-// principal rather than by the current grant, because the broker's bindings are the union of
-// every grant a principal has ever held — so running it second would undo a reconciliation that
-// had just completed. Running it first and reconciling afterwards converges on the correct end
-// state: bindings that match the row, no credential, and a row that reports "registered, not yet
-// provisioned".
-//
-// # Shape
-//
-// Modelled on EventRetentionSweeper and, through it, on LineageOutboxProcessor
-// [lineage_worker.go:31-193]: a mutex-guarded running flag, a stop channel, a wait group, fluent
-// With* configurators, a double-start-guarded Start(ctx), a Stop() that closes and waits,
-// IsRunning(), and a ticker/select loop over context cancellation, the stop channel and the tick.
-// The server role gets the same two lines every other background worker gets.
-//
-// # Safety properties
-//
-// EVERY REMEDY TAKES THE SUBSCRIBER'S PROVISIONING CLAIM FIRST. Settlement changes broker state,
-// and nothing may do that for a subscriber without holding its claim. A subscriber somebody is
-// actively issuing for is therefore SKIPPED rather than fought over, and its obligation is left
-// for the next pass.
-//
-// PACED, NOT HAMMERED. Settlement talks to the same broker that just failed, so a row attempted
-// within the retry interval is passed over. Without that, one persistently failing subscriber
-// would monopolise every pass and bury the log.
-//
-// BOUNDED IN EVERY DIRECTION. Each pass reads at most a batch of obligations, each subscriber's
-// remedy runs under its own deadline, and the pass as a whole runs under one too — so a pass
-// against a struggling broker ends and is retried rather than overlapping the pass after it.
-//
-// NOTHING IS DISCHARGED ON A GUESS. An obligation is cleared only after the write or round trip
-// that satisfies it returned successfully. A pass that crashed after acting but before clearing
-// leaves the obligation outstanding and repeats an idempotent remedy, which is the safe
-// direction: over-reporting costs one redundant reconciliation, under-reporting costs an
-// undetected divergence.
+//   - an authorization change that pruned the broker and then failed to persist, or
+//     persisted and then failed to grant, or whose process disappeared between the two;
+//   - a credential written at the broker whose compensating revocation itself failed,
+//     leaving a principal that can authenticate with no authorization boundary;
+//   - a credential revoked and confirmed gone whose registry record could not be
+//     cleared, leaving the registry reporting access that does not exist.
 package blnk
 
 import (
@@ -105,53 +44,23 @@ import (
 
 const (
 	// defaultSubscriberSettlementInterval is how often a pass runs.
-	//
-	// A minute, which is between a relay's second and retention's hour and for the same
-	// reasons. An outstanding obligation is real divergence between Blnk and the broker, so it
-	// should not wait an hour; but obligations are rare — they are the residue of failures —
-	// so polling every second would be a query per second to find nothing, against a table the
-	// API layer is reading.
 	defaultSubscriberSettlementInterval = time.Minute
 
 	// defaultSubscriberSettlementBatchSize is how many obligations one pass takes.
-	//
-	// Deliberately small. Each one performs several broker round trips under its own deadline,
-	// so a large batch would make a single pass long enough to overlap the next and would
-	// concentrate administrative load on a broker that, by construction, has recently failed.
-	// The backlog drains over successive passes instead.
 	defaultSubscriberSettlementBatchSize = 20
 
 	// defaultSubscriberSettlementRetryInterval is how long a failed attempt is left alone.
-	//
-	// Five minutes. A settlement failure is almost always the broker still being unavailable,
-	// and retrying that every minute achieves nothing except load and log volume. It is long
-	// enough to let a broker restart complete and short enough that the dead-letter-style
-	// alerting thresholds elsewhere in this feature remain meaningful.
 	defaultSubscriberSettlementRetryInterval = 5 * time.Minute
 
 	// subscriberSettlementPassTimeout bounds ONE pass.
-	//
-	// Generous, because a pass may settle a whole batch and each remedy makes several round
-	// trips; bounded all the same, so a pass against an unresponsive broker ends and is retried
-	// on the next tick rather than accumulating.
 	subscriberSettlementPassTimeout = 5 * time.Minute
 
 	// subscriberSettlementBudget bounds ONE subscriber's remedy.
-	//
-	// Sized against the work rather than guessed: a remedy performs up to two broker phases —
-	// a revocation and a prune-then-grant reconciliation — and each of those is already capped
-	// by subscriberBrokerPhaseBudget. This is the room for both plus the registry writes
-	// between them, so one unresponsive subscriber cannot consume the whole pass.
 	subscriberSettlementBudget = 30 * time.Second
 )
 
-// The obstacles that stop the processor running, as values rather than freshly-built errors.
-//
-// ErrSubscriberSettlementDisabled is EXPORTED and the other two are not, and the split matters:
-// a deployment with no broker configured is a LEGITIMATE STEADY STATE — the AAP requires the
-// whole feature to degrade to a no-op there — so the caller must be able to recognise it and log
-// it as unremarkable, while the other two are wiring defects with nothing useful to branch on.
-// Matching on message text instead would break the moment the wording improved.
+// The obstacles that stop the processor running, as values rather than freshly-built
+// errors.
 var (
 	// ErrSubscriberSettlementDisabled means no Kafka broker is configured, so there is no
 	// broker-side state to reconcile and nothing for this worker to do.
@@ -223,8 +132,9 @@ type SubscriberSettlementProcessor struct {
 // NewSubscriberSettlementProcessor builds a processor from a Blnk instance.
 //
 // Parameters:
-//   - b *Blnk: the service container. A nil instance, or one with no datasource, yields a
-//     processor that declines to start rather than a nil pointer the caller must guard.
+//   - b *Blnk: the service container. A nil instance, or one with no datasource, yields
+//     a processor that declines to start rather than a nil pointer the caller must
+//     guard.
 //
 // Returns:
 //   - *SubscriberSettlementProcessor: ready to Start. Never nil.
@@ -249,10 +159,10 @@ func NewSubscriberSettlementProcessor(b *Blnk) *SubscriberSettlementProcessor {
 		processor.settler = service
 	}
 
-	// Read from the instance's own configuration, falling back to the process configuration
-	// when the instance carries none — the same fallback retentionPeriodFor makes, and for the
-	// same reason: a Blnk built before configuration was published would otherwise report the
-	// broker as absent and silently never settle anything.
+	// Read from the instance's own configuration, falling back to the process
+	// configuration when the instance carries none — the same fallback retentionPeriodFor
+	// makes, and for the same reason: a Blnk built before configuration was published
+	// would otherwise report the broker as absent and silently never settle anything.
 	processor.configured = subscriberSettlementConfigured(b.Config())
 
 	return processor
@@ -260,9 +170,10 @@ func NewSubscriberSettlementProcessor(b *Blnk) *SubscriberSettlementProcessor {
 
 // subscriberSettlementConfigured reports whether a Kafka broker is configured.
 //
-// It asks the same question every other part of this feature asks — is the broker list non-empty
-// — rather than a variant of it, because a worker that disagreed with the publisher about whether
-// Kafka exists would either poll forever on a deployment without it or stay silent on one with it.
+// It asks the same question every other part of this feature asks — is the broker list
+// non-empty — rather than a variant of it, because a worker that disagreed with the
+// publisher about whether Kafka exists would either poll forever on a deployment
+// without it or stay silent on one with it.
 //
 // Parameters:
 //   - cnf *config.Configuration: the instance's configuration, possibly nil.
@@ -284,9 +195,9 @@ func subscriberSettlementConfigured(cnf *config.Configuration) bool {
 
 // WithInterval sets how often a pass runs.
 //
-// A non-positive interval falls back to the default rather than being rejected, matching every
-// other worker here: a misconfigured cadence must not be able to stop settlement running,
-// because the failure mode is a divergence nobody notices.
+// A non-positive interval falls back to the default rather than being rejected,
+// matching every other worker here: a misconfigured cadence must not be able to stop
+// settlement running, because the failure mode is a divergence nobody notices.
 //
 // Parameters:
 //   - interval time.Duration: the pass interval.
@@ -330,8 +241,9 @@ func (p *SubscriberSettlementProcessor) WithBatchSize(size int) *SubscriberSettl
 
 // WithRetryInterval sets how long a failed attempt is left alone.
 //
-// A non-positive value falls back to the default. Zero is NOT read as "retry immediately",
-// because that is the one setting that would turn a broker outage into a busy loop.
+// A non-positive value falls back to the default. Zero is NOT read as "retry
+// immediately", because that is the one setting that would turn a broker outage into a
+// busy loop.
 //
 // Parameters:
 //   - interval time.Duration: the retry interval.
@@ -412,10 +324,10 @@ func (p *SubscriberSettlementProcessor) Start(ctx context.Context) {
 		defer p.clearRunning()
 
 		// The channel is PASSED IN, captured from the same locked section that created it,
-		// rather than read from the field inside the loop. Stop nils the field, and a Stop that
-		// lands between this goroutine being scheduled and its first read would hand the loop a
-		// nil channel — which in a select blocks forever, so the loop would never see the stop
-		// signal and Stop's Wait would never return.
+		// rather than read from the field inside the loop. Stop nils the field, and a Stop
+		// that lands between this goroutine being scheduled and its first read would hand the
+		// loop a nil channel — which in a select blocks forever, so the loop would never see
+		// the stop signal and Stop's Wait would never return.
 		p.run(ctx, stop)
 	}()
 }
@@ -458,15 +370,15 @@ func (p *SubscriberSettlementProcessor) IsRunning() bool {
 
 // run is the ticker loop.
 //
-// The first pass is on the first tick rather than at start-up, matching the retention sweeper.
-// An obligation that has been outstanding since before this process existed can wait one more
-// interval, and a pass during a rollout would have every replica making administrative calls to
-// the broker at the same moment.
+// The first pass is on the first tick rather than at start-up, matching the retention
+// sweeper. An obligation that has been outstanding since before this process existed
+// can wait one more interval, and a pass during a rollout would have every replica
+// making administrative calls to the broker at the same moment.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it ends the loop.
-//   - stop <-chan struct{}: the stop channel, captured by Start rather than read from the field.
-//     See Start for why that distinction is load-bearing.
+//   - stop <-chan struct{}: the stop channel, captured by Start rather than read from
+//     the field.
 func (p *SubscriberSettlementProcessor) run(ctx context.Context, stop <-chan struct{}) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -487,11 +399,12 @@ func (p *SubscriberSettlementProcessor) run(ctx context.Context, stop <-chan str
 	}
 }
 
-// Pass performs ONE bounded settlement pass and returns how many obligations it discharged.
+// Pass performs ONE bounded settlement pass and returns how many obligations it
+// discharged.
 //
-// It is exported so an operator-facing path can run settlement on demand — the same code, the
-// same bounds, the same ordering — rather than a second implementation able to disagree with
-// this one.
+// It is exported so an operator-facing path can run settlement on demand — the same
+// code, the same bounds, the same ordering — rather than a second implementation able
+// to disagree with this one.
 //
 // Parameters:
 //   - ctx context.Context: cancels the pass. A deadline of its own is applied on top.
@@ -552,10 +465,10 @@ func (p *SubscriberSettlementProcessor) Pass(ctx context.Context) int {
 
 // settle discharges one subscriber's obligations and records the attempt either way.
 //
-// The attempt is recorded on a context DETACHED from the per-subscriber deadline, because the
-// commonest failure is that deadline expiring and an attempt that could not be recorded would
-// never pace the next one — turning a broker outage into a pass-per-minute busy loop against the
-// same failing subscriber.
+// The attempt is recorded on a context DETACHED from the per-subscriber deadline,
+// because the commonest failure is that deadline expiring and an attempt that could not
+// be recorded would never pace the next one — turning a broker outage into a
+// pass-per-minute busy loop against the same failing subscriber.
 //
 // Parameters:
 //   - ctx context.Context: the pass context.

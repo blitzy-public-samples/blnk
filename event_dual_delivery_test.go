@@ -14,7 +14,7 @@
 	limitations under the License.
 */
 
-// Dual-delivery payload equivalence — acceptance criterion V-8.
+// Dual-delivery payload equivalence — the acceptance criterion.
 //
 // The criterion is that, during the dual-delivery window, the Kafka message and the legacy HTTP
 // webhook carry THE SAME PAYLOAD for the same event, asserted byte for byte. It holds
@@ -730,11 +730,11 @@ func dualDeliverySampleEvent() NewWebhook {
 // The byte-equality guarantee across the whole event catalogue
 // ---------------------------------------------------------------------------
 
-// TestDualDelivery_EveryEventTypeCarriesIdenticalBytesOnBothTransports is acceptance criterion
-// V-8, driven for EVERY event type: capture, claim, Kafka publish, legacy enqueue, queue round
-// trip, HTTP delivery.
+// TestDualDelivery_EveryEventTypeCarriesIdenticalBytesOnBothTransports is the cross-transport
+// byte-equality criterion, driven for EVERY event type: capture, claim, Kafka publish, legacy
+// enqueue, queue round trip, HTTP delivery.
 //
-// Coverage is the point rather than a bonus. Requirement R-1 is 100% of the event types that
+// Coverage is the point rather than a bonus. The contract covers 100% of the event types that
 // reached the legacy webhook sender, so a comparison proved for one and assumed for the rest
 // would leave it unverified. The catalogue comes from outboxEventFixtures, the repository's
 // single statement of those types and of the payload SHAPE each producer passes — pointer,
@@ -1102,7 +1102,7 @@ func TestDualDelivery_PreservesTheLegacyWireContractOverTheSharedBytes(t *testin
 }
 
 // ---------------------------------------------------------------------------
-// Both sides of the sunset boundary (requirement R-12)
+// Both sides of the sunset boundary
 // ---------------------------------------------------------------------------
 
 // TestDualDelivery_SunsetVerdictComesFromConfiguration walks the boundary the 30-day window

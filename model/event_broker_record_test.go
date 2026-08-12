@@ -23,20 +23,6 @@ import (
 
 // -----------------------------------------------------------------------------
 // Broker-record coordinates and the zero-loss audit arithmetic.
-//
-// Every function covered here was exercised only from the ROOT package, where
-// the mutation gate cannot reach it: `make mutate` scores a package by running
-// that package's own tests, so a statement whose only coverage lives in another
-// package is reported NOT COVERED and is never scored at all. Eleven functions
-// in model/event.go were in that position, which meant the arithmetic behind
-// the zero-loss verdict (V-2) carried no mutation score despite being money
-// -critical.
-//
-// So these tests are written to KILL MUTANTS rather than merely to execute the
-// lines: each one pins a boundary (>= versus >), a connective (&& versus ||),
-// an operator (- versus +) or a normalisation (TrimSpace present or absent), so
-// that flipping any of them in the source makes a named assertion fail.
-// model/mutation_killers_test.go is the in-repository precedent for the style.
 // -----------------------------------------------------------------------------
 
 // intPtr and int64Ptr address the nullable broker-coordinate columns. The three
@@ -47,25 +33,24 @@ func intPtr(v int) *int       { return &v }
 func int64Ptr(v int64) *int64 { return &v }
 
 func TestBrokerRecord_ConfirmedRequiresATopicAndANonNegativeOffset(t *testing.T) {
-	// Offset ZERO with a topic is CONFIRMED. This is the boundary the coordinate
-	// exists to get right: offset 0 is the first record on a fresh partition, an
-	// entirely ordinary location, and reading it as "no record" would report a
-	// perfectly published event as lost. It also kills the boundary mutant that
-	// turns `Offset >= 0` into `Offset > 0`.
+	// Offset ZERO with a topic is CONFIRMED. This is the boundary the coordinate exists to
+	// get right: offset 0 is the first record on a fresh partition, an entirely ordinary
+	// location, and reading it as "no record" would report a perfectly published event as
+	// lost.
 	first := BrokerRecord{Topic: "blnk.transactions", Partition: 0, Offset: 0}
 	assert.True(t, first.Confirmed(),
 		"partition 0 offset 0 is a real record — the first one on a fresh partition — and must "+
 			"not be read as an absent coordinate")
 
-	// A NEGATIVE offset is not a location. Kafka never reports one; it is what an
-	// unset sentinel looks like, and accepting it would let a fabricated
-	// coordinate satisfy the audit.
+	// A NEGATIVE offset is not a location. Kafka never reports one; it is what an unset
+	// sentinel looks like, and accepting it would let a fabricated coordinate satisfy the
+	// audit.
 	assert.False(t, BrokerRecord{Topic: "blnk.transactions", Offset: -1}.Confirmed(),
 		"a negative offset names no record")
 
-	// The TOPIC is what distinguishes a zero coordinate from a real one, so an
-	// absent topic must fail even with a plausible offset. This kills the mutant
-	// that replaces the && with ||, which would confirm any row with an offset.
+	// The TOPIC is what distinguishes a zero coordinate from a real one, so an absent
+	// topic must fail even with a plausible offset. This kills the mutant that replaces
+	// the && with ||, which would confirm any row with an offset.
 	assert.False(t, BrokerRecord{Topic: "", Partition: 3, Offset: 148291}.Confirmed(),
 		"a coordinate with no topic cannot be read back and is not confirmed")
 
@@ -81,9 +66,9 @@ func TestBrokerRecord_ConfirmedRequiresATopicAndANonNegativeOffset(t *testing.T)
 }
 
 func TestBrokerRecord_StringRendersTheTriageCoordinateOrANamedAbsence(t *testing.T) {
-	// The exact rendering matters: it is the string an operator pastes into a
-	// console consumer, and the dead-letter API and the runbook both quote this
-	// form. Asserting the whole string kills any mutation of the format.
+	// The exact rendering matters: it is the string an operator pastes into a console
+	// consumer, and the dead-letter API and the runbook both quote this form. Asserting
+	// the whole string kills any mutation of the format.
 	assert.Equal(t, "blnk.transactions/3@148291",
 		BrokerRecord{Topic: "blnk.transactions", Partition: 3, Offset: 148291}.String(),
 		"a confirmed coordinate renders as topic/partition@offset")
@@ -94,9 +79,9 @@ func TestBrokerRecord_StringRendersTheTriageCoordinateOrANamedAbsence(t *testing
 		BrokerRecord{Topic: "blnk.balances", Partition: 0, Offset: 0}.String(),
 		"the first record on a partition renders as the location it is")
 
-	// An unconfirmed coordinate renders as a NAMED ABSENCE. "/0@0" would read as
-	// a location and send an operator looking for a record that was never
-	// written, which is the failure this branch exists to prevent.
+	// An unconfirmed coordinate renders as a NAMED ABSENCE. "/0@0" would read as a
+	// location and send an operator looking for a record that was never written, which is
+	// the failure this branch exists to prevent.
 	assert.Equal(t, "unconfirmed", BrokerRecord{}.String(),
 		"a zero coordinate must say so rather than rendering as /0@0")
 	assert.Equal(t, "unconfirmed", BrokerRecord{Topic: "  ", Partition: 7, Offset: 9}.String(),
@@ -104,9 +89,9 @@ func TestBrokerRecord_StringRendersTheTriageCoordinateOrANamedAbsence(t *testing
 }
 
 func TestEventOutbox_BrokerRecordRequiresAllThreeColumns(t *testing.T) {
-	// All three present is the confirmed case, and the accessor must return the
-	// values verbatim — a mutation that swapped partition for offset, or dropped
-	// the topic, would be invisible to a test that only checked the boolean.
+	// All three present is the confirmed case, and the accessor must return the values
+	// verbatim — a mutation that swapped partition for offset, or dropped the topic, would
+	// be invisible to a test that only checked the boolean.
 	row := EventOutbox{
 		KafkaTopic:     "blnk.transactions",
 		KafkaPartition: intPtr(4),
@@ -118,9 +103,9 @@ func TestEventOutbox_BrokerRecordRequiresAllThreeColumns(t *testing.T) {
 	assert.Equal(t, 4, record.Partition)
 	assert.Equal(t, int64(90210), record.Offset)
 
-	// Each of the three guards is exercised on its own, because they are joined
-	// by ||: a test that omitted all three at once would pass even if two of the
-	// three conditions were deleted.
+	// Each of the three guards is exercised on its own, because they are joined by ||: a
+	// test that omitted all three at once would pass even if two of the three conditions
+	// were deleted.
 	missing := map[string]EventOutbox{
 		"no partition": {KafkaTopic: "blnk.transactions", KafkaOffset: int64Ptr(1)},
 		"no offset":    {KafkaTopic: "blnk.transactions", KafkaPartition: intPtr(1)},
@@ -137,9 +122,9 @@ func TestEventOutbox_BrokerRecordRequiresAllThreeColumns(t *testing.T) {
 		})
 	}
 
-	// The three columns present but the offset negative: the accessor defers to
-	// Confirmed, so this must be reported as unconfirmed even though nothing is
-	// nil. This is what keeps the two functions from drifting apart.
+	// The three columns present but the offset negative: the accessor defers to Confirmed,
+	// so this must be reported as unconfirmed even though nothing is nil. This is what
+	// keeps the two functions from drifting apart.
 	fabricated := EventOutbox{
 		KafkaTopic:     "blnk.transactions",
 		KafkaPartition: intPtr(0),
@@ -165,9 +150,9 @@ func TestPartitionOffsetInterval_ContainsIsHalfOpen(t *testing.T) {
 		Topic: "blnk.transactions", Partition: 2, FirstOffset: 100, EndOffset: 200,
 	}
 
-	// The two boundaries are the whole contract, and they are asymmetric because
-	// Kafka's are: FirstOffset is the earliest RETAINED record, EndOffset is one past
-	// the last WRITTEN one.
+	// The two boundaries are the whole contract, and they are asymmetric because Kafka's
+	// are: FirstOffset is the earliest RETAINED record, EndOffset is one past the last
+	// WRITTEN one.
 	assert.True(t, window.Contains(100), "the first retained offset is inside the window")
 	assert.True(t, window.Contains(199), "the last written offset is inside the window")
 	assert.False(t, window.Contains(200),
@@ -180,9 +165,9 @@ func TestPartitionOffsetInterval_ContainsIsHalfOpen(t *testing.T) {
 	assert.False(t, window.Contains(1_000_000),
 		"an offset far beyond the log end must read as outside: it is how a recreated topic is detected")
 
-	// An empty window admits nothing. This kills the mutant that turns the
-	// less-than into a less-than-or-equal, which would corroborate a row against a
-	// partition holding no records at all.
+	// An empty window admits nothing. This kills the mutant that turns the less-than into
+	// a less-than-or-equal, which would corroborate a row against a partition holding no
+	// records at all.
 	empty := PartitionOffsetInterval{Topic: "blnk.balances", FirstOffset: 42, EndOffset: 42}
 	assert.False(t, empty.Contains(42), "a zero-width window contains nothing")
 	assert.False(t, empty.Contains(41))
@@ -196,25 +181,24 @@ func TestPartitionOffsetInterval_RecordsIsTheWidthAndNeverNegative(t *testing.T)
 	assert.Equal(t, int64(0), PartitionOffsetInterval{}.Records(),
 		"an untouched partition holds no records")
 
-	// A partition every record of which has aged out: first equals end, at a
-	// non-zero offset. Zero is the correct reading, and it is a legitimate one
-	// rather than a fault.
+	// A partition every record of which has aged out: first equals end, at a non-zero
+	// offset. Zero is the correct reading, and it is a legitimate one rather than a fault.
 	assert.Equal(t, int64(0),
 		PartitionOffsetInterval{FirstOffset: 9_000, EndOffset: 9_000}.Records(),
 		"a fully aged-out partition holds no records, and that is not an error")
 
-	// An inverted reading cannot happen from a coherent broker response, and the
-	// width clamps rather than going negative: a negative would propagate into a
-	// reported record count and describe a log that holds less than nothing.
+	// An inverted reading cannot happen from a coherent broker response, and the width
+	// clamps rather than going negative: a negative would propagate into a reported record
+	// count and describe a log that holds less than nothing.
 	assert.Equal(t, int64(0),
 		PartitionOffsetInterval{FirstOffset: 500, EndOffset: 100}.Records(),
 		"an inverted window is reported as empty rather than as a negative width")
 }
 
 func TestEventRecordIntervalAudit_UncorroboratedRowsSumsEveryReasonAndNothingElse(t *testing.T) {
-	// Each bucket contributes, and the four are added rather than any one of them
-	// standing in for the rest. This kills the mutants that drop a term: a fix that
-	// counted only unconfirmed rows would call a topic recreation conclusive.
+	// Each bucket contributes, and the four are added rather than any one of them standing
+	// in for the rest. This kills the mutants that drop a term: a fix that counted only
+	// unconfirmed rows would call a topic recreation conclusive.
 	audit := EventRecordIntervalAudit{
 		PublishedRows:    10,
 		CorroboratedRows: 4,
@@ -251,9 +235,8 @@ func TestEventRecordIntervalAudit_UncorroboratedRowsSumsEveryReasonAndNothingEls
 }
 
 func TestEventRecordIntervalAudit_DuplicatedRecordsIsTheShortfallAndNeverNegative(t *testing.T) {
-	// Two rows corroborated by one record. Only possible with the partial unique
-	// index on the coordinate absent, which is why it is reported rather than
-	// absorbed.
+	// Two rows corroborated by one record. Only possible with the partial unique index on
+	// the coordinate absent, which is why it is reported rather than absorbed.
 	assert.Equal(t, int64(1),
 		EventRecordIntervalAudit{CorroboratedRows: 10, DistinctCorroboratedRecords: 9}.DuplicatedRecords(),
 		"one record corroborating two rows is double counting and must be visible")
@@ -261,13 +244,11 @@ func TestEventRecordIntervalAudit_DuplicatedRecordsIsTheShortfallAndNeverNegativ
 	assert.Equal(t, int64(0),
 		EventRecordIntervalAudit{CorroboratedRows: 10, DistinctCorroboratedRecords: 10}.DuplicatedRecords())
 
-	// MORE distinct records than corroborated rows is an impossible reading. It is
-	// not hypothetical: the repository counts distinct coordinates with
-	// COUNT(DISTINCT (topic, partition, offset)) and PostgreSQL counts the all-NULL
-	// row constructor as one distinct value, so an unfiltered query let a
-	// coordinate-less row contribute a phantom record. The query filters them out;
-	// this clamp keeps a negative from propagating into the verdict as duplication
-	// that did not occur if it ever stops.
+	// MORE distinct records than corroborated rows is an impossible reading. It is not
+	// hypothetical: the repository counts distinct coordinates with COUNT(DISTINCT (topic,
+	// partition, offset)) and PostgreSQL counts the all-NULL row constructor as one
+	// distinct value, so an unfiltered query let a coordinate-less row contribute a
+	// phantom record.
 	assert.Equal(t, int64(0),
 		EventRecordIntervalAudit{CorroboratedRows: 9, DistinctCorroboratedRecords: 10}.DuplicatedRecords(),
 		"an impossible reading is clamped rather than reported as negative duplication")
@@ -298,9 +279,9 @@ func TestEventRecordIntervalAudit_FullyCorroboratedNeedsEveryClaimPlacedAndDisti
 		"two rows naming one record defeats the verdict — the unique index that forbids it "+
 			"is evidently absent")
 
-	// An empty audit is trivially conclusive: nothing claims a publication, so
-	// nothing is unaccounted for. Asserting it pins the vacuous case rather than
-	// leaving it to be discovered by a caller.
+	// An empty audit is trivially conclusive: nothing claims a publication, so nothing is
+	// unaccounted for. Asserting it pins the vacuous case rather than leaving it to be
+	// discovered by a caller.
 	assert.True(t, EventRecordIntervalAudit{}.FullyCorroborated(),
 		"an audit of nothing is conclusive about nothing")
 }

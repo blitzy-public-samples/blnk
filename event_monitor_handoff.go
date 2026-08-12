@@ -18,72 +18,22 @@
 // processor that drains blnk.balance_monitor_handoff, judges each snapshot against its
 // monitors, and captures the resulting alerts transactionally.
 //
-// # THIS IS NO LONGER THE ORDINARY PATH FOR A NEW MOVEMENT
+// The atomic writers now decide a crossing and insert the canonical blnk.event_outbox
+// row inside the transaction that moved the balance, which is the requirement met
+// literally see database.captureBalanceMonitorAlertsInTx and, for the builder they
+// share with the pre-write pass, blnk.prepareBalanceMonitorAlertRow. A movement made by
+// a process with the alert capture registered, which every process built through
+// NewBlnk is, writes NO handoff.
 //
-// The atomic writers now decide a crossing and insert the canonical blnk.event_outbox row
-// inside the transaction that moved the balance, which is requirement R-2 met literally —
-// see database.captureBalanceMonitorAlertsInTx and, for the builder they share with the
-// pre-write pass, blnk.prepareBalanceMonitorAlertRow. A movement made by a process with the
-// alert capture registered, which every process built through NewBlnk is, writes NO handoff.
+// This processor remains, and is still started by the server, for two populations that
+// are real and finite:
 //
-// This processor remains, and is still started by the server, for two populations that are
-// real and finite:
-//
-//   - Handoff rows written by releases that PREDATE the in-transaction capture. They are
-//     durable, they carry both decision inputs, and an upgrade must not strand them.
-//   - Handoff rows written by a process with NO capture registered — a Datasource constructed
-//     directly, without the root service, which is what this repository's own tests do.
-//     database.recordBalanceMonitorEvaluation falls back to the handoff there rather than
-//     leaving the movement's alerts to be decided later against a monitors table an operator
-//     can edit in the meantime.
-//
-// # The gap it closed, and why the fallback is still sound
-//
-// Requirement R-2 puts every event in the same database transaction as the ledger
-// mutation that produced it. `balance.monitor` was the hardest producer to bring under it,
-// because a monitor fires on a balance a transaction has ALREADY committed as far as the
-// original post-commit design was concerned. The capture was therefore a standalone insert
-// taken after the commit, and a process that died in the window, or a database outage that
-// outlasted a small retry budget, destroyed the alert outright: the balance movement stood,
-// the low-balance or overdraft notification never existed, and nothing was left to replay
-// because no row had ever been written.
-//
-// The handoff closed that in two halves, and both halves still hold for the rows it drains.
-// The half that CAN be atomic is EVERY INPUT THE ALERT IS A FUNCTION OF.
-// database.insertBalanceMonitorHandoffsInTx writes one handoff row per monitored balance inside
-// the balance's own transaction, carrying the balance as written AND the monitor definitions
-// read in that same transaction — so a committed movement always carries its pending
-// evaluation together with the complete decision it is pending on, and a rolled-back
-// movement carries none.
-//
-// Both snapshots are load-bearing. Re-reading the monitors at drain time left one input live
-// on a table operators edit through PUT and DELETE /balance-monitors, so which events existed
-// could change after the mutation committed and two attempts at one row could disagree. The
-// snapshot is what makes this processor a pure function of the row it claimed.
-//
-// The half that is not atomic with the mutation is made atomic with the intent's
-// COMPLETION. This processor claims a handoff, evaluates it, and hands the alerts and the
-// completion to CompleteBalanceMonitorHandoffWithEvents, which writes both in one
-// transaction. So the sequence is at-least-once evaluation feeding an atomic capture, and
-// the only way to lose an alert is for its condition never to have been met. What it does not
-// give, and what the in-transaction capture does, is the canonical event row in the mutation's
-// own transaction: until the conversion commits, the event R-2 names does not exist.
-//
-// # The condition evaluation itself is UNTOUCHED
-//
-// model.BalanceMonitor.CheckCondition is called exactly as the post-commit path called
-// it, on a balance value with the same contents. AAP §0.6.2 freezes monitor condition
-// evaluation, and nothing here changes what a monitor decides — only when the decision is
-// taken and how its result is made durable.
-//
-// # Structure
-//
-// The processor is LineageOutboxProcessor's shape: the same fields, the same defaults of
-// 100 / 1 second / 30 seconds, the same fluent configurators, the same double-start
-// guard, the same channel-closing Stop, the same ticker/select loop and the same
-// claim-then-mark batch. chain_worker.go documents itself as modelled on the same
-// processor, so this is the house pattern for a background relay rather than one file's
-// preference.
+//   - Handoff rows written by releases that PREDATE the in-transaction capture.
+//   - Handoff rows written by a process with NO capture registered — a Datasource
+//     constructed directly, without the root service, which is what this repository's
+//     own tests do. database.recordBalanceMonitorEvaluation falls back to the handoff
+//     there rather than leaving the movement's alerts to be decided later against a
+//     monitors table an operator can edit in the meantime.
 package blnk
 
 import (
@@ -98,14 +48,12 @@ import (
 )
 
 // The processor's defaults, matching LineageOutboxProcessor's so the two background
-// relays behave alike under load and an operator has one set of numbers to reason about.
+// relays behave alike under load and an operator has one set of numbers to reason
+// about.
 //
-// The poll interval deserves a word, because it is the only latency this mechanism adds.
-// An alert used to be published from a goroutine spawned immediately after the commit;
-// it is now published up to one poll later. That is immaterial in context: the event
-// still has to be claimed by the event relay, which polls on the same interval, and then
-// published to Kafka and consumed. One second on a path already measured in seconds
-// buys the difference between an alert that is occasionally lost and one that never is.
+// The poll interval deserves a word, because it is the only latency this mechanism
+// adds. That is immaterial in context: the event still has to be claimed by the event
+// relay, which polls on the same interval, and then published to Kafka and consumed.
 const (
 	defaultMonitorHandoffBatchSize    = 100
 	defaultMonitorHandoffPollInterval = 1 * time.Second
@@ -114,11 +62,11 @@ const (
 
 // balanceMonitorEventType is the event name a fired monitor publishes under.
 //
-// It is a constant here because every route that can decide a crossing must agree on it —
-// this processor, the pre-write pass and the writer's in-transaction capture, which both reach
-// it through blnk.prepareBalanceMonitorAlertRow, and the legacy post-commit path in
-// balance.go — and a typo in any of them would route the alert to the wrong topic while every
-// test that only checks "an event was captured" still passed.
+// It is a constant here because every route that can decide a crossing must agree on it
+// — this processor, the pre-write pass and the writer's in-transaction capture, which
+// both reach it through blnk.prepareBalanceMonitorAlertRow, and the legacy post-commit
+// path in balance.go — and a typo in any of them would route the alert to the wrong
+// topic while every test that only checks "an event was captured" still passed.
 const balanceMonitorEventType = "balance.monitor"
 
 // BalanceMonitorHandoffProcessor drains blnk.balance_monitor_handoff.
@@ -209,9 +157,9 @@ func (p *BalanceMonitorHandoffProcessor) WithLockDuration(duration time.Duration
 
 // Start begins draining handoffs in the background.
 //
-// The double-start guard is not decoration. Two loops on one processor would double every
-// claim attempt and halve the effective lease, and Stop would close a channel one of them
-// no longer reads.
+// The double-start guard is not decoration. Two loops on one processor would double
+// every claim attempt and halve the effective lease, and Stop would close a channel one
+// of them no longer reads.
 //
 // Parameters:
 //   - ctx context.Context: cancelled to stop the loop.
@@ -321,30 +269,15 @@ func (p *BalanceMonitorHandoffProcessor) processBatch(ctx context.Context) {
 
 // processHandoff evaluates one handoff and captures its result atomically.
 //
-// # The sequence, and why each step is where it is
-//
 //  1. Decode the BALANCE snapshot. The condition is judged against the balance AS THE
-//     TRANSACTION WROTE IT, not against the balance now: re-reading would judge whatever
-//     later transactions had done to it, so a threshold crossed by this movement and
-//     uncrossed by the next would produce no alert, and two attempts could disagree.
-//  2. Decode the MONITOR snapshot, for the same reason applied to the other input. A row
-//     written before sql/1781252100.sql carries none, and only such a row falls back to the
-//     live cached read — see monitorsForHandoff.
+//     TRANSACTION WROTE IT, not against the balance now: re-reading would judge
+//     whatever later transactions had done to it, so a threshold crossed by this
+//     movement and uncrossed by the next would produce no alert, and two attempts could
+//     disagree.
+//  2. Decode the MONITOR snapshot, for the same reason applied to the other input.
 //  3. Evaluate each condition with the UNCHANGED CheckCondition.
 //  4. Prepare an event row per fired monitor, with a DERIVED id.
 //  5. Write the rows and the completion in ONE transaction.
-//
-// Step 4's derived id is what makes step 5 safe to repeat. The identity is the pair
-// (handoff, monitor): distinct across firings because each firing has its own handoff, and
-// stable across re-evaluations of one handoff. A lapsed lease, a retry or a restart
-// therefore produces the same ids and collides with the unique index rather than
-// delivering the alert twice.
-//
-// Zero fired monitors is the common case and is NOT a no-op: the handoff is completed with
-// an empty event list, which records "evaluated, nothing fired". Skipping the completion
-// would leave the row claimable and re-evaluate it until its budget ran out, and the
-// distinction between "evaluated, nothing fired" and "never evaluated" — the only question
-// worth asking when an expected alert did not arrive — would be lost.
 //
 // Parameters:
 //   - ctx context.Context: the context for the evaluation and the write.
@@ -368,9 +301,9 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 	events := make([]*model.EventOutbox, 0, len(monitors))
 	for index := range monitors {
 		monitor := monitors[index]
-		// UNCHANGED CONDITION EVALUATION. This is the same call the post-commit path
-		// made, on a balance with the same contents. AAP §0.6.2 freezes what a monitor
-		// decides; only the durability of the decision's result has changed.
+		// UNCHANGED CONDITION EVALUATION. This is the same call the post-commit path made, on
+		// a balance with the same contents. only the durability of the decision's result has
+		// changed.
 		if !monitor.CheckCondition(balance) {
 			continue
 		}
@@ -379,11 +312,11 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 			Event:   balanceMonitorEventType,
 			Payload: monitor,
 		},
-			// THE LEDGER IS SUPPLIED EXPLICITLY, from the handoff rather than from the
-			// monitor. model.BalanceMonitor carries a balance and a condition and no
-			// ledger, so without this the event's ledger column would be NULL — and R-6
-			// partitions by ledger id. The handoff carries the ledger of the balance whose
-			// movement created it, which is the authoritative answer.
+			// THE LEDGER IS SUPPLIED EXPLICITLY, from the handoff rather than from the monitor.
+			// model.BalanceMonitor carries a balance and a condition and no ledger, so without
+			// this the event's ledger column would be NULL — and Kafka partitions by ledger id.
+			// The handoff carries the ledger of the balance whose movement created it, which is
+			// the authoritative answer.
 			WithEventLedgerID(handoff.LedgerID),
 			// THE DERIVED IDENTITY, and it is what makes a repeated evaluation idempotent.
 			WithEventIdentity(model.BalanceMonitorEventIdentity(handoff.HandoffID, monitor.MonitorID)),
@@ -392,10 +325,10 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 			return fmt.Errorf("failed to prepare the balance.monitor event for monitor %s: %w", monitor.MonitorID, prepareErr)
 		}
 
-		// A nil row means publishing is not configured. The processor only runs when it
-		// is, so this is unreachable in a healthy deployment; skipping rather than
-		// failing means a configuration change mid-flight drains the backlog to
-		// completion instead of failing every row in it.
+		// A nil row means publishing is not configured. The processor only runs when it is,
+		// so this is unreachable in a healthy deployment; skipping rather than failing means
+		// a configuration change mid-flight drains the backlog to completion instead of
+		// failing every row in it.
 		if event == nil {
 			continue
 		}
@@ -420,42 +353,20 @@ func (p *BalanceMonitorHandoffProcessor) processHandoff(ctx context.Context, han
 // monitorsForHandoff resolves the monitor definitions this handoff is to be evaluated
 // against, preferring the snapshot the mutation captured.
 //
-// # The snapshot is the answer, and the fallback is a migration artefact
-//
-// A row written by this release carries the definitions that were in force when the
-// balance's transaction committed, read inside that transaction. Using them is what makes
-// the evaluation a pure function of the row: the same row evaluated twice, or evaluated an
-// hour later, reaches the same verdict, and no edit to blnk.balance_monitors between the
-// commit and the drain can add, remove or reshape an alert for a movement that has already
-// happened.
-//
-// A row written BEFORE sql/1781252100.sql carries no snapshot. Such a row is still
-// evaluable — by reading the monitors live, which is exactly what this processor used to do
-// — and it must be, because refusing it would strand the backlog an upgrade inherits at the
-// moment that backlog is largest. So the fallback exists, it is taken only for those rows,
-// and it is logged at WARN so the older guarantee is never applied silently.
-//
-// The fallback population is finite and shrinking: every row written from this release
-// forward carries a snapshot, and a handoff is written only for a balance that HAS a
-// monitor, so an empty snapshot can only mean "predates the column" and never "no
-// monitors".
-//
-// # A DECODE FAILURE IS PERMANENT
-//
-// Stored bytes do not change, so no further attempt can decode them and spending the
-// remaining budget only delays the same conclusion. It is reported as permanent, exactly as
-// a corrupt balance snapshot is. A failure of the live fallback read is NOT permanent: a
-// database that refused this read may answer the next one.
+// A row written BEFORE sql/1781252100.sql carries no snapshot. So the fallback exists,
+// it is taken only for those rows, and it is logged at WARN so the older guarantee is
+// never applied silently.
 //
 // Parameters:
-//   - ctx context.Context: the context for the fallback read, unused on the snapshot path.
+//   - ctx context.Context: the context for the fallback read, unused on the snapshot
+//     path.
 //   - handoff model.BalanceMonitorHandoff: the claimed row.
 //
 // Returns:
-//   - []model.BalanceMonitor: the definitions to evaluate. Empty is a legitimate answer and
-//     completes the handoff with no events.
-//   - error: a permanent error for an undecodable snapshot, a retryable one for a failed
-//     fallback read.
+//   - []model.BalanceMonitor: the definitions to evaluate. Empty is a legitimate answer
+//     and completes the handoff with no events.
+//   - error: a permanent error for an undecodable snapshot, a retryable one for a
+//     failed fallback read.
 func (p *BalanceMonitorHandoffProcessor) monitorsForHandoff(
 	ctx context.Context, handoff model.BalanceMonitorHandoff,
 ) ([]model.BalanceMonitor, error) {
@@ -493,12 +404,8 @@ func (p *BalanceMonitorHandoffProcessor) monitorsForHandoff(
 // recordHandoffFailure writes an evaluation failure against the row and reports it.
 //
 // The failure is logged at ERROR with the attempt count on EVERY attempt, not only the
-// last, because a handoff that is failing repeatedly is the signal that alerts are being
-// delayed — and by the time the budget is spent the delay has already happened.
-//
-// A failure to record the failure is itself logged and otherwise ignored: the lease will
-// expire, the row will be re-claimed, and there is nothing else this process can do about
-// a database it cannot write to.
+// last, because a handoff that is failing repeatedly is the signal that alerts are
+// being delayed — and by the time the budget is spent the delay has already happened.
 //
 // Parameters:
 //   - ctx context.Context: the context for the statement.
@@ -560,7 +467,8 @@ func (e *permanentMonitorHandoffError) Unwrap() error {
 	return e.cause
 }
 
-// isPermanentMonitorHandoffError reports whether a failure should skip the retry budget.
+// isPermanentMonitorHandoffError reports whether a failure should skip the retry
+// budget.
 //
 // Parameters:
 //   - err error: the failure to classify.
@@ -576,36 +484,22 @@ func isPermanentMonitorHandoffError(err error) bool {
 	return errors.As(err, &permanent)
 }
 
-// balanceMonitorHandoffEnabled reports whether the WRITER owns monitor evaluation on this
-// deployment, rather than the post-commit hook.
-//
-// # This is a SINGLE decision read from two places, and it has to be
+// balanceMonitorHandoffEnabled reports whether the WRITER owns monitor evaluation on
+// this deployment, rather than the post-commit hook.
 //
 // Two call sites depend on the answer and must never disagree:
 //
-//   - the atomic writers, which evaluate the monitors inside the balance transaction and insert
-//     the canonical alert rows there — or, with no capture registered, commit the handoff
-//     instead (both through database.recordBalanceMonitorEvaluation), and
-//   - the post-commit hook in transaction_execution.go, which evaluates monitors inline.
+//   - the atomic writers, which evaluate the monitors inside the balance transaction
+//     and insert the canonical alert rows there — or, with no capture registered,
+//     commit the handoff instead (both through
+//     database.recordBalanceMonitorEvaluation), and
+//   - the post-commit hook in transaction_execution.go, which evaluates monitors
+//     inline.
 //
-// If the writer captured the alert and the post-commit path also evaluated, every alert
-// would be delivered twice. If neither did, a movement's monitors would be evaluated by
-// nobody and the alert would be lost with nothing failing to say so. Both sides read the
-// same predicate — config.Configuration.EventPublishingConfigured — so the two faults are
-// unrepresentable rather than merely unlikely.
-//
-// # Why "Kafka is configured" is the right condition
-//
-// A captured alert is only useful if something publishes it, and what publishes it is the event
-// relay, which refuses to run without Kafka. A deployment with no broker has neither the relay
-// nor this processor, so a row written there would be one nothing can ever act on — the alert
-// would simply never be delivered. Such a deployment keeps the post-commit path, which
-// publishes down the legacy webhook transport exactly as it did before this feature
-// existed (AAP §0.5.4).
-//
-// The name predates the in-transaction capture and is kept because the predicate is unchanged:
-// it still answers "does the writer own this movement's monitor evaluation", which is what both
-// call sites ask.
+// A captured alert is only useful if something publishes it, and what publishes it is
+// the event relay, which refuses to run without Kafka. A deployment with no broker has
+// neither the relay nor this processor, so a row written there would be one nothing can
+// ever act on — the alert would simply never be delivered.
 //
 // Returns:
 //   - bool: true when the writer owns evaluation, false when the post-commit path does.

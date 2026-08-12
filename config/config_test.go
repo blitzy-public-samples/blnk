@@ -191,17 +191,17 @@ func TestValidateAndAddDefaults_TransactionLockWaitTimeoutAlreadyDuration(t *tes
 
 func TestLoadConfigFromFile(t *testing.T) {
 	// This test asserts what loadConfigFromFile does with a FILE, so the event-streaming
-	// variables must not reach it from the surrounding environment. They are cleared because
-	// an exported KAFKA_BROKERS — which is what the local stack and the integration tests set
-	// — is picked up by envconfig for a fixture that states no deprecation window, and the
-	// load then correctly refuses. The refusal is the intended behaviour; inheriting the
-	// variable is not.
+	// variables must not reach it from the surrounding environment. They are cleared
+	// because an exported KAFKA_BROKERS — which is what the local stack and the
+	// integration tests set — is picked up by envconfig for a fixture that states no
+	// deprecation window, and the load then correctly refuses. The refusal is the intended
+	// behaviour; inheriting the variable is not.
 	clearEventStreamingEnv(t)
 	// And the BLNK_-prefixed forms, for the same reason applied to the rest of the
-	// configuration tree: the assertions below say a value came out of the FILE, and
-	// an exported BLNK_DATA_SOURCE_DNS — the ordinary way to point this suite at a
-	// relocated Postgres — overlays it, so without this sweep the DataSource.Dns
-	// assertion fails while the loader is behaving exactly as designed.
+	// configuration tree: the assertions below say a value came out of the FILE, and an
+	// exported BLNK_DATA_SOURCE_DNS — the ordinary way to point this suite at a relocated
+	// Postgres — overlays it, so without this sweep the DataSource.Dns assertion fails
+	// while the loader is behaving exactly as designed.
 	clearBlnkPrefixedEnv(t)
 
 	// Create a temporary file
@@ -234,15 +234,15 @@ func TestLoadConfigFromFile(t *testing.T) {
 	if err := json.NewEncoder(tmpFile).Encode(sampleConfig); err != nil {
 		t.Fatalf("Unable to write to temporary file: %v", err)
 	}
-	// Closed so loadConfigFromFile can open it, and the error is checked because a
-	// failed close can mean the encoded JSON was never flushed — which would make the
-	// rest of this test assert against an empty file.
+	// Closed so loadConfigFromFile can open it, and the error is checked because a failed
+	// close can mean the encoded JSON was never flushed — which would make the rest of
+	// this test assert against an empty file.
 	require.NoError(t, tmpFile.Close())
 
-	// Set an environment variable to override the project name
-	// t.Setenv restores the previous value automatically at the end of the test, which
-	// is what the defer was hand-rolling, and it fails the test outright if the
-	// variable cannot be set rather than proceeding with an unset override.
+	// Set an environment variable to override the project name t.Setenv restores the
+	// previous value automatically at the end of the test, which is what the defer was
+	// hand-rolling, and it fails the test outright if the variable cannot be set rather
+	// than proceeding with an unset override.
 	t.Setenv("BLNK_PROJECT_NAME", "Env Project")
 
 	// Load the configuration from the file
@@ -330,9 +330,9 @@ func TestLoadConfigFromFileMonitoringDSN(t *testing.T) {
 }
 
 func TestInitConfig(t *testing.T) {
-	// Cleared for the same reason as in TestLoadConfigFromFile: InitConfig goes through the
-	// same load pipeline, so an inherited KAFKA_BROKERS with no window in the fixture would
-	// make it refuse.
+	// Cleared for the same reason as in TestLoadConfigFromFile: InitConfig goes through
+	// the same load pipeline, so an inherited KAFKA_BROKERS with no window in the fixture
+	// would make it refuse.
 	clearEventStreamingEnv(t)
 	// InitConfig goes through envconfig too, so the BLNK_ sweep applies unchanged: both
 	// assertions below name a value written into the fixture, and an ambient
@@ -468,66 +468,25 @@ func TestUploadWhitelistHostsParsing(t *testing.T) {
 
 // -----------------------------------------------------------------------------
 // Event-streaming configuration coverage (Kafka, outbox relay, webhook sunset).
-//
-// Everything below this line is additive; the tests above are untouched. The
-// helpers exist because these tests manipulate two pieces of process-global
-// state the older tests do not guard: the environment, which envconfig reads,
-// and the ConfigStore atomic.Value. Leaking either one makes a later assertion
-// pass for the wrong reason, so both are saved and restored.
+// Everything below this line is additive; the tests above are untouched.
 // -----------------------------------------------------------------------------
 
-// eventStreamingEnvKeys lists every environment variable that can influence the
-// Kafka, relay or webhook-deprecation configuration, in all three forms a reader
-// might reach for.
-//
-// # It is DERIVED, because a hand-written list is what went wrong
-//
-// This used to be a literal slice maintained beside the configuration structs, and
-// it fell behind them: KAFKA_HISTORICAL_TOPIC_PREFIXES and
-// RELAY_SUBSCRIBER_METRICS_BUDGET were added to KafkaConfig and RelayConfig and
-// never added here, so an ambient value for either survived clearEventStreamingEnv
-// and could satisfy a default or precedence assertion for the wrong reason. Adding
-// the two missing names would have fixed the symptom and left the mechanism —
-// two lists that must agree, with nothing making them agree — intact. Reflecting
-// over the structs makes them one list.
-//
-// # The three forms, and why each exists
-//
-// envconfig v1.4.0 derives a field's primary key by accumulating the prefix through
-// every enclosing struct and appending the tag literal, then falls back to the bare
-// tag literal as an alternate consulted only when the primary is unset. KafkaConfig
-// is Configuration.Kafka, so its primary key is BLNK_KAFKA_<TAG> and its alternate
-// is the bare, deployment-mandated <TAG> that AAP R-10 names.
-//
-// The intuitive-looking BLNK_<TAG> is neither of those keys and used to be read by
-// nothing at all — a deployment that set BLNK_KAFKA_BROKERS silently got default
-// behaviour. applyPrefixedEnvAliases now resolves it explicitly and with HIGHER
-// precedence than the bare name, so all three forms are live; each is asserted by
-// TestLoadConfigFromFile_KafkaEnvNameForms, and every form has to be cleared here
-// because any one of them leaking in would be read.
+// eventStreamingEnvKeys lists every environment variable that can influence the Kafka,
+// relay or webhook-deprecation configuration, in all three forms a reader might reach
+// for.
 var eventStreamingEnvKeys = deriveEventStreamingEnvKeys()
 
 // eventStreamingEnvExtras are names cleared defensively that no struct tag produces.
 //
 // WebhookDeprecationStartDate carries a json tag and no envconfig tag, so envconfig
-// derives BLNK_WEBHOOKDEPRECATIONSTARTDATE for it and the readable form below is
-// read by nothing today. It is cleared anyway: the field is documented as the other
-// end of the dual-delivery window, and an operator who exports the readable name
-// after it acquires a tag should not be able to change what these tests observe.
+// derives BLNK_WEBHOOKDEPRECATIONSTARTDATE for it and the readable form below is read
+// by nothing today.
 var eventStreamingEnvExtras = []string{
 	"WEBHOOK_DEPRECATION_START_DATE", "BLNK_WEBHOOK_DEPRECATION_START_DATE",
 }
 
 // deriveEventStreamingEnvKeys reads the envconfig tags off the configuration structs
 // themselves and expands each into the three forms described above.
-//
-// The subtrees are named rather than discovered because "event streaming" is a
-// judgement about which configuration this file's tests are allowed to disturb, not
-// a property of the type: clearing Configuration.Redis or Configuration.DataSource
-// here would break the tests that legitimately depend on them. Naming two structs
-// and a field is stable in a way that naming twenty-five variables is not — a new
-// field inside either struct is picked up with no edit to this file, which is the
-// failure this replaces.
 func deriveEventStreamingEnvKeys() []string {
 	keys := make([]string, 0, 96)
 	seen := make(map[string]struct{}, 96)
@@ -581,22 +540,14 @@ func deriveEventStreamingEnvKeys() []string {
 }
 
 // TestEventStreamingEnvKeys_CoverEveryConfiguredVariable pins the derivation above
-// against the variables AAP R-10 mandates by name.
-//
-// The derivation cannot omit a struct field, but it CAN be wrong about the shape of
-// the names it builds — a mistaken subtree prefix would produce a full-looking list
-// of keys that nothing reads, and every test that depends on clearing would go back
-// to passing for the wrong reason with nothing to show for it. Asserting the exact
-// eight names the requirement fixes, in every form, is the independent check: those
-// are stated in the AAP rather than derived from the code, so the two cannot drift
-// together.
+// against the variables the contract mandates by name.
 func TestEventStreamingEnvKeys_CoverEveryConfiguredVariable(t *testing.T) {
 	present := make(map[string]struct{}, len(eventStreamingEnvKeys))
 	for _, key := range eventStreamingEnvKeys {
 		present[key] = struct{}{}
 	}
 
-	// The eight names AAP R-10 mandates, plus the two whose absence was the finding.
+	// The eight names the contract mandates, plus the two aliases that must resolve too.
 	for _, expected := range []string{
 		"KAFKA_BROKERS", "BLNK_KAFKA_KAFKA_BROKERS", "BLNK_KAFKA_BROKERS",
 		"KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_TOPIC_PREFIX",
@@ -622,9 +573,9 @@ func TestEventStreamingEnvKeys_CoverEveryConfiguredVariable(t *testing.T) {
 				"envconfig tag", expected)
 	}
 
-	// Every derived name must be complete in its forms: a bare tag whose prefixed
-	// siblings are missing clears the alternate key and leaves the PRIMARY set, which
-	// is the form envconfig prefers and therefore the one that would win.
+	// Every derived name must be complete in its forms: a bare tag whose prefixed siblings
+	// are missing clears the alternate key and leaves the PRIMARY set, which is the form
+	// envconfig prefers and therefore the one that would win.
 	for _, key := range eventStreamingEnvKeys {
 		if strings.HasPrefix(key, blnkEnvPrefix) {
 			continue
@@ -640,11 +591,7 @@ func TestEventStreamingEnvKeys_CoverEveryConfiguredVariable(t *testing.T) {
 // clearEventStreamingEnv unsets every key in eventStreamingEnvKeys and restores
 // whatever was set before when the test finishes.
 //
-// Clearing every form is mandatory rather than defensive. Because envconfig
-// consults a prefixed primary key and then a bare alternate for the same field, a
-// variable left behind by an earlier subtest — or exported by the surrounding
-// environment — would satisfy a later assertion for the wrong reason. Restoring
-// the prior values keeps the rest of the package's tests hermetic.
+// Clearing every form is mandatory rather than defensive.
 func clearEventStreamingEnv(t *testing.T) {
 	t.Helper()
 
@@ -679,51 +626,16 @@ func clearEventStreamingEnv(t *testing.T) {
 // overlay a value read from a configuration file.
 const blnkEnvPrefix = "BLNK_"
 
-// clearBlnkPrefixedEnv unsets every BLNK_-prefixed variable present in the
-// environment and restores exactly those when the test finishes.
-//
-// # Why the tests that load a FILE need this
-//
-// loadConfigFromFile decodes the file and then hands the struct to
-// envconfig.Process("blnk", …), so any BLNK_-prefixed variable exported by the
-// surrounding shell wins over the file. A test that writes a fixture and then
-// asserts a value came out of that fixture is therefore asserting a property of
-// the machine it runs on, not of the loader: exporting BLNK_DATA_SOURCE_DNS —
-// which a developer pointing the suite at a relocated Postgres does as a matter
-// of course, and which the project's own test guidance discusses — made
-// TestLoadConfigFromFile and TestInitConfig fail on the DataSource.Dns
-// assertion while the loader was behaving exactly as designed.
-//
-// # Why the sweep is by prefix rather than by an enumerated key list
+// clearBlnkPrefixedEnv unsets every BLNK_-prefixed variable present in the environment
+// and restores exactly those when the test finishes.
 //
 // eventStreamingEnvKeys can be enumerated because those keys are a closed,
-// deliberately-designed set with three spellings each. The Configuration tree is
-// not: every exported field of every nested struct yields a key, and a field
-// added later would silently re-open the same hole in a list that looked
-// complete. Sweeping the prefix covers the whole tree by construction, including
-// the BLNK_KAFKA_* forms, and cannot rot.
-//
-// # Why unset rather than set-to-empty
-//
-// envconfig applies an EMPTY value as a real override — it checks whether the
-// variable is present, not whether it is non-blank — so t.Setenv(key, "") would
-// blank the field instead of leaving the file's value alone, and for the two
-// required fields that turns a hermeticity fix into a validation failure. The
-// variables must genuinely be absent, which only os.Unsetenv achieves.
-//
-// # Composition with clearEventStreamingEnv
-//
-// Both helpers save what they find and restore only that, so calling them
-// together is safe in either order: whichever runs first takes ownership of the
-// keys they share, the second finds them already absent, and t.Cleanup's LIFO
-// ordering hands the original values back. A variable the TEST sets for itself
-// afterwards — BLNK_PROJECT_NAME in TestLoadConfigFromFile — is unaffected,
-// because this sweep has already run by then.
+// deliberately-designed set with three spellings each.
 //
 // Parameters:
-//   - t *testing.T: the test. A variable that can be neither unset nor restored
-//     fails the test rather than being ignored, because either one silently
-//     re-opens the hole this closes.
+//   - t *testing.T: the test. A variable that can be neither unset nor restored fails
+//     the test rather than being ignored, because either one silently re-opens the hole
+//     this closes.
 func clearBlnkPrefixedEnv(t *testing.T) {
 	t.Helper()
 
@@ -754,12 +666,9 @@ func clearBlnkPrefixedEnv(t *testing.T) {
 	})
 }
 
-// restoreConfigStore snapshots the package-level ConfigStore and puts it back
-// when the test finishes, so a test that loads a configuration does not leave the
-// store pointing at its fixture.
-//
-// The nil guard is required, not stylistic: atomic.Value panics on Store(nil), so
-// a store that was empty to begin with must be left empty rather than "restored".
+// restoreConfigStore snapshots the package-level ConfigStore and puts it back when the
+// test finishes, so a test that loads a configuration does not leave the store pointing
+// at its fixture.
 func restoreConfigStore(t *testing.T) {
 	t.Helper()
 
@@ -774,22 +683,8 @@ func restoreConfigStore(t *testing.T) {
 // TestMain seeds ConfigStore before any test runs, and that is what makes
 // restoreConfigStore able to do its job.
 //
-// # The gap this closes
-//
-// ConfigStore is an atomic.Value, and atomic.Value CANNOT BE RESET TO NIL — Store(nil) panics.
-// So restoreConfigStore, which snapshots the previous value and puts it back, is powerless in
-// exactly one case: when the store was EMPTY when the test began. It has nothing to put back,
-// and the test's own fixture is left in place for the rest of the process. Whichever mutating
-// test happened to run first therefore decided the package's steady state, and under
-// `-shuffle=on` that is a different test on every run.
-//
-// Seeding here removes the case rather than working around it. Every restoreConfigStore call
-// now has a real previous value, so the store returns to THIS known baseline between tests
-// instead of to whichever fixture got there first.
-//
-// The baseline is deliberately recognisable. Nothing should read it — every test that depends
-// on configuration installs its own — so if a value from here ever shows up in a failure
-// message, the test that produced it was reading the store when it meant to populate it.
+// ConfigStore is an atomic.Value, and atomic.Value CANNOT BE RESET TO NIL — Store(nil)
+// panics.
 func TestMain(m *testing.M) {
 	baseline := Configuration{
 		ProjectName: "config-package-test-baseline",
@@ -801,15 +696,9 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestProcessGlobalRestoration_ReturnsEveryMutatedGlobalToItsPriorValue is the guard for the
-// three process globals this package's tests move: ConfigStore, the logrus level and
-// BLNK_LOG_LEVEL.
-//
-// It asserts the MECHANISM rather than any particular test's tidiness, which is what makes it
-// order-independent: it mutates each global inside a nested subtest through the same helper the
-// real tests use, and checks the value is back once that subtest has finished. A helper that
-// stopped restoring would fail here immediately instead of surfacing as an unrelated test
-// failing under a shuffle seed nobody can reproduce.
+// TestProcessGlobalRestoration_ReturnsEveryMutatedGlobalToItsPriorValue is the guard
+// for the three process globals this package's tests move: ConfigStore, the logrus
+// level and BLNK_LOG_LEVEL.
 func TestProcessGlobalRestoration_ReturnsEveryMutatedGlobalToItsPriorValue(t *testing.T) {
 	t.Run("the configuration store", func(t *testing.T) {
 		before := ConfigStore.Load()
@@ -868,13 +757,8 @@ func TestProcessGlobalRestoration_ReturnsEveryMutatedGlobalToItsPriorValue(t *te
 
 // pinLevel sets the global logrus level for one test and puts the previous one back.
 //
-// It is package level rather than a closure inside a single test because the level is PROCESS
-// GLOBAL and three separate tests in this file move it. A subtest that sets the level and
-// relies on its parent's single cleanup leaves the level changed for every sibling that runs
-// after it — which is invisible while the file runs in source order and becomes a failure the
-// moment `-shuffle=on`, or a future `t.Parallel()`, reorders them. Worse, the root package
-// pins the level to capture debug-only lines, so a leak from here breaks tests in another
-// package entirely.
+// It is package level rather than a closure inside a single test because the level is
+// PROCESS GLOBAL and three separate tests in this file move it.
 //
 // Every mutating subtest calls this, so the restore is local to the mutation.
 func pinLevel(t *testing.T, level logrus.Level) {
@@ -887,11 +771,9 @@ func pinLevel(t *testing.T, level logrus.Level) {
 
 // clearLogLevelEnv unsets BLNK_LOG_LEVEL for one test and restores whatever was there.
 //
-// The variable is cleared explicitly rather than through clearEventStreamingEnv, which covers
-// the Kafka block only: a value leaking in from the surrounding environment would satisfy a
-// file-only assertion for the wrong reason. The save-and-restore matters as much as the unset —
-// a bare os.Unsetenv strips the variable for the REST OF THE PROCESS, so a later test that
-// expects the ambient value silently sees nothing.
+// The variable is cleared explicitly rather than through clearEventStreamingEnv, which
+// covers the Kafka block only: a value leaking in from the surrounding environment
+// would satisfy a file-only assertion for the wrong reason.
 func clearLogLevelEnv(t *testing.T) {
 	t.Helper()
 
@@ -922,11 +804,11 @@ func eventStreamingBaseConfig() Configuration {
 	}
 }
 
-// testWindowStart and testWindowSunset are exactly WebhookDualDeliveryWindowDays
-// apart, which is the only pairing resolveWebhookDeprecationWindow accepts when both
-// ends are given. They are written out rather than computed so that a change to the
-// window constant fails the arithmetic assertion in
-// TestResolveWebhookDeprecationWindow rather than silently agreeing with itself.
+// testWindowStart and testWindowSunset are exactly WebhookDualDeliveryWindowDays apart,
+// which is the only pairing resolveWebhookDeprecationWindow accepts when both ends are
+// given. They are written out rather than computed so that a change to the window
+// constant fails the arithmetic assertion in TestResolveWebhookDeprecationWindow rather
+// than silently agreeing with itself.
 const (
 	testWindowStart  = "2026-08-05T00:00:00Z"
 	testWindowSunset = "2026-09-04T00:00:00Z"
@@ -935,11 +817,6 @@ const (
 // kafkaEnabledConfig returns a Configuration with Kafka publishing switched on and a
 // valid dual-delivery window, which is the combination every Kafka-configured test
 // needs.
-//
-// It exists because configuring brokers WITHOUT a window is now a hard error: dual
-// delivery would otherwise run forever with nothing to say so. A test that only wants
-// to assert something about brokers should not have to rediscover that, and a test
-// that wants to assert the error itself sets the brokers by hand.
 func kafkaEnabledConfig(brokers ...string) Configuration {
 	cnf := eventStreamingBaseConfig()
 	cnf.Kafka.Brokers = brokers
@@ -951,13 +828,6 @@ func kafkaEnabledConfig(brokers ...string) Configuration {
 // writeTempEventConfigFile writes the minimal valid configuration — with NO
 // dual-delivery window — to a temporary blnk.json and returns its path, removing the
 // file when the test finishes.
-//
-// Tests use it so that they run through the real load pipeline — file decode,
-// envconfig.Process("blnk", ...), applyPrefixedEnvAliases, then
-// validateAndAddDefaults — because asserting against a hand-built struct would not
-// exercise envconfig at all. Tests that configure brokers want
-// writeTempEventConfigFileWithWindow instead; this one is for the cases that assert
-// what happens WITHOUT a window.
 func writeTempEventConfigFile(t *testing.T) string {
 	t.Helper()
 
@@ -966,11 +836,6 @@ func writeTempEventConfigFile(t *testing.T) string {
 
 // writeTempEventConfigFileWithWindow is writeTempEventConfigFile plus a valid
 // dual-delivery window.
-//
-// Tests that configure Kafka brokers need it, because brokers with no window is now a
-// hard configuration error rather than a warning: dual delivery would otherwise have
-// no end. Keeping it a separate helper means the tests that assert THAT error can
-// still start from a fixture with no window at all.
 func writeTempEventConfigFileWithWindow(t *testing.T) string {
 	t.Helper()
 
@@ -1008,11 +873,7 @@ func writeTempConfigFile(t *testing.T, cnf Configuration) string {
 // TestLoadConfigFromFile_PrefixedAliasWinsOverBareName pins the PRECEDENCE between the
 // two names a nested Kafka or relay variable answers to.
 //
-// The rule is that the BLNK_-prefixed alias wins. That is not arbitrary: it is the
-// precedence envconfig itself gives the top-level WebhookDeprecationSunsetDate, where
-// the accumulated BLNK_ primary key beats the bare alternate. Making the nested fields
-// behave the same way is what stops the answer to "which name wins?" from depending on
-// whether a given setting happens to live inside a struct.
+// The rule is that the BLNK_-prefixed alias wins.
 func TestLoadConfigFromFile_PrefixedAliasWinsOverBareName(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -1045,11 +906,11 @@ func TestLoadConfigFromFile_PrefixedAliasWinsOverBareName(t *testing.T) {
 			},
 		},
 		{
-			// Both values sit INSIDE MaxRelayRetryAttempts on purpose. The budget is clamped
-			// to that ceiling because the attempt number is a bounded metric attribute, so a
-			// value above it resolves to the ceiling from either name form and the subtest
-			// would pass without the alias ever having been read — a discriminating pair is
-			// the whole point of this table.
+			// Both values sit INSIDE MaxRelayRetryAttempts on purpose. The budget is clamped to
+			// that ceiling because the attempt number is a bounded metric attribute, so a value
+			// above it resolves to the ceiling from either name form and the subtest would pass
+			// without the alias ever having been read — a discriminating pair is the whole point
+			// of this table.
 			name:       "relay max retry attempts",
 			bareKey:    "RELAY_MAX_RETRY_ATTEMPTS",
 			bareValue:  "2",
@@ -1085,26 +946,15 @@ func TestLoadConfigFromFile_PrefixedAliasWinsOverBareName(t *testing.T) {
 	}
 }
 
-// TestLoadConfigFromFile_RefusesKafkaBrokersWithNoWindow carries the missing-window rule
-// through the REAL load pipeline, not just validateAndAddDefaults.
+// TestLoadConfigFromFile_RefusesKafkaBrokersWithNoWindow carries the missing-window
+// rule through the REAL load pipeline, not just validateAndAddDefaults.
 //
-// # Why this must REFUSE rather than load with a warning
-//
-// It used to load, and the warning it emitted said that "legacy HTTP webhook delivery
-// will run alongside Kafka INDEFINITELY". The runtime does the OPPOSITE:
-// blnk.WebhookSunsetPassed fails closed on a publishing deployment with no usable
-// window, answering that the sunset has ALREADY passed — dual delivery stops and the
-// deprecated webhook management routes answer 410 Gone. Configuration and behaviour
-// therefore disagreed about the single decision requirement R-12 is made of, and an
-// operator reading the log was told the safer of the two answers while getting the other.
-//
-// The runtime's reading is the one worth keeping: carrying a deprecated, less protected
-// transport indefinitely on the strength of an unset variable is worse than retiring it
-// loudly. So the combination is refused at load, before any traffic is served, which is
-// also what event_sunset.go's own documentation already claimed happened.
-//
-// The refusal must NAME the variable, because "invalid configuration" sends an operator
-// looking through everything.
+// The runtime does the OPPOSITE: blnk.WebhookSunsetPassed fails closed on a publishing
+// deployment with no usable window, answering that the sunset has ALREADY passed — dual
+// delivery stops and the deprecated webhook management routes answer 410 Gone.
+// Configuration and behaviour therefore disagreed about the single decision the
+// requirement is made of, and an operator reading the log was told the safer of the two
+// answers while getting the other.
 func TestLoadConfigFromFile_RefusesKafkaBrokersWithNoWindow(t *testing.T) {
 	clearEventStreamingEnv(t)
 	restoreConfigStore(t)
@@ -1121,13 +971,10 @@ func TestLoadConfigFromFile_RefusesKafkaBrokersWithNoWindow(t *testing.T) {
 	}
 }
 
-// TestLoadConfigFromFile_LoadsWithNoBrokersAndNoWindow is the other side of that rule, and
-// it is AAP §0.7.2's graceful degradation stated as a test.
+// TestLoadConfigFromFile_LoadsWithNoBrokersAndNoWindow is the other side of that rule.
 //
-// With KAFKA_BROKERS unset there is no transport to migrate to, so there is no window to
-// describe and nothing has been mis-stated. The service must start and serve exactly as it
-// did before this feature existed, with the publisher resolving to the no-op — which is what
-// protects every deployment that has not adopted Kafka.
+// With KAFKA_BROKERS unset there is no transport to migrate to, so there is no window
+// to describe and nothing has been mis-stated.
 func TestLoadConfigFromFile_LoadsWithNoBrokersAndNoWindow(t *testing.T) {
 	clearEventStreamingEnv(t)
 	restoreConfigStore(t)
@@ -1158,8 +1005,7 @@ func TestLoadConfigFromFile_LoadsWithNoBrokersAndNoWindow(t *testing.T) {
 //
 // An operator who states a retirement instant and mis-types it must not be given the
 // silent resolution "keep the legacy behaviour": that keeps the deprecated, less
-// protected transport alive indefinitely with nothing failing. This is the distinction
-// from an absent date, where nothing was stated at all.
+// protected transport alive indefinitely with nothing failing.
 func TestLoadConfigFromFile_RefusesAnUnparseableSunsetDate(t *testing.T) {
 	clearEventStreamingEnv(t)
 	restoreConfigStore(t)
@@ -1177,18 +1023,10 @@ func TestLoadConfigFromFile_RefusesAnUnparseableSunsetDate(t *testing.T) {
 	}
 }
 
-// TestWebhookDeprecationStartDate_IsNotAnEnvironmentVariable pins the R-10 contract
-// surface.
+// TestWebhookDeprecationStartDate_IsNotAnEnvironmentVariable pins the contract surface.
 //
-// Requirement R-10 freezes the deployment contract at eight environment variables, of
-// which exactly ONE describes this window. A second variable for the other end was a
-// real convenience and still a contract violation, and it bought nothing derivable:
-// the window is exactly WebhookDualDeliveryWindowDays long, so the sunset determines
-// the start.
-//
-// The assertion is that setting the retired name has NO EFFECT, in either its bare or
-// its prefixed form. A test that merely checked the struct tag would pass while the
-// alias table still honoured the name.
+// The deployment contract is frozen at eight environment variables, of
+// which exactly ONE describes this window.
 func TestWebhookDeprecationStartDate_IsNotAnEnvironmentVariable(t *testing.T) {
 	for _, name := range []string{
 		"WEBHOOK_DEPRECATION_START_DATE",
@@ -1261,9 +1099,7 @@ func TestLoadConfigFromFile_AcceptsNoBrokersAndNoWindow(t *testing.T) {
 // ERROR rather than a silently discarded value.
 //
 // BLNK_RELAY_MAX_RETRY_ATTEMPTS=five must not quietly resolve to the default 5 and
-// leave an operator believing the retry budget had been reduced. The same reasoning
-// applies to every boolean: KAFKA_TLS_ENABLED=yeah must not read as false and
-// silently take the connection back to plaintext.
+// leave an operator believing the retry budget had been reduced.
 func TestApplyPrefixedEnvAliases_RejectsMalformedValues(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1299,11 +1135,6 @@ func TestApplyPrefixedEnvAliases_RejectsMalformedValues(t *testing.T) {
 
 // TestValidateSASLPair covers the one rule both Kafka clients now share: a SASL
 // credential is either complete or absent.
-//
-// Half a credential used to be tolerated differently by the two of them — the
-// publisher built a mechanism from whatever it had while the admin client skipped SASL
-// entirely — so the same misconfiguration produced an authentication failure in one
-// process and a silently unauthenticated connection in the other.
 func TestValidateSASLPair(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1337,12 +1168,9 @@ func TestValidateSASLPair(t *testing.T) {
 
 // TestProducerSASL covers the least-privilege selection the publisher depends on.
 //
-// The finding it guards: the steady-state publisher authenticated with the
-// ADMINISTRATIVE principal, so compromising the busiest process in the deployment
-// handed over authority to create topics, mint SCRAM credentials and rewrite ACLs.
-// A dedicated producer principal is now REQUIRED — there is no fallback, because a
-// fallback that warns leaves the excess privilege in place and only records it — so the
-// administrative pair is never returned here and the caller is told to refuse instead.
+// What it guards: a steady-state publisher authenticated with the ADMINISTRATIVE
+// principal, so that compromising the busiest process in the deployment would hand over
+// authority to create topics, mint SCRAM credentials and rewrite ACLs.
 func TestProducerSASL(t *testing.T) {
 	t.Run("a dedicated producer principal is preferred and is not the admin", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
@@ -1397,11 +1225,11 @@ func warnedAbout(hook *logtest.Hook, substring string) bool {
 	return false
 }
 
-// assertBrokerList compares a resolved broker list against the expectation,
-// checking the length fatally before comparing entries so that a mismatch reports
-// the whole slice rather than panicking on an index. A nil expectation is
-// satisfied by any empty slice: "no brokers configured" is one state, however
-// envconfig happens to represent it.
+// assertBrokerList compares a resolved broker list against the expectation, checking
+// the length fatally before comparing entries so that a mismatch reports the whole
+// slice rather than panicking on an index. A nil expectation is satisfied by any empty
+// slice: "no brokers configured" is one state, however envconfig happens to represent
+// it.
 func assertBrokerList(t *testing.T, got, want []string) {
 	t.Helper()
 
@@ -1416,14 +1244,10 @@ func assertBrokerList(t *testing.T, got, want []string) {
 }
 
 // TestValidateAndAddDefaults_KafkaAndRelayDefaults pins every default the event
-// streaming pipeline is built on. These are contract values rather than
-// preferences: the relay derives its retry schedule from the three relay values,
-// topic and dead-letter names are derived from the prefix, and topic creation uses
-// the partition count and replication factor. A change to any of them changes
-// delivery behaviour, so each is asserted individually.
-//
-// The environment is cleared first, and the bare and prefixed forms of every key
-// with it, so that only the code under test can contribute a value.
+// streaming pipeline is built on. These are contract values rather than preferences:
+// the relay derives its retry schedule from the three relay values, topic and
+// dead-letter names are derived from the prefix, and topic creation uses the partition
+// count and replication factor.
 func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -1446,23 +1270,18 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 		t.Errorf("Expected Relay.RetryMaxBackoffMS to be 30000, got %d", cnf.Relay.RetryMaxBackoffMS)
 	}
 
-	// SEC-10: the subscriber measurement budget IS defaulted, and the value is asserted
-	// because it decides how much of the consumer-lag signal exists. A subscriber past the
-	// budget has no lag series at all, so a silent change here would silently shrink
-	// monitoring coverage — the one kind of regression that makes the system look healthier
-	// rather than worse.
+	// the subscriber measurement budget IS defaulted, and the value is asserted because it
+	// decides how much of the consumer-lag signal exists. A subscriber past the budget has
+	// no lag series at all, so a silent change here would silently shrink monitoring
+	// coverage — the one kind of regression that makes the system look healthier rather
+	// than worse.
 	if cnf.Relay.SubscriberMetricsBudget != 200 {
 		t.Errorf("Expected Relay.SubscriberMetricsBudget to be 200, got %d", cnf.Relay.SubscriberMetricsBudget)
 	}
 
 	// EVENT RETENTION IS NOT DEFAULTED, and the asymmetry with the three values above is
-	// asserted rather than assumed. Those three have a correct answer that requirement R-4
-	// fixes, so an unset value is filled in. A retention period has no correct answer this
-	// code can know — it depends on jurisdiction, audit programme and any legal hold in force
-	// — and getting it wrong DELETES ledger-adjacent evidence irreversibly. Zero means
-	// retention is disabled, which is the only safe default for a destructive operation, and a
-	// future change that "helpfully" supplied one would start deleting on every deployment
-	// that upgraded.
+	// asserted rather than assumed. Those three have a correct answer that the requirement
+	// fixes, so an unset value is filled in.
 	if cnf.Relay.EventRetentionDays != 0 {
 		t.Errorf("Expected Relay.EventRetentionDays to default to 0 (retention disabled), got %d",
 			cnf.Relay.EventRetentionDays)
@@ -1484,8 +1303,8 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 
 	// The consumer-lag sweep budget. A zero default would be indistinguishable from
 	// "measure nothing", and the collector would publish an empty lag inventory on a
-	// registry of any size — so the number the shipped binary uses is asserted here
-	// rather than left to whatever the collector happens to fall back to.
+	// registry of any size — so the number the shipped binary uses is asserted here rather
+	// than left to whatever the collector happens to fall back to.
 	if cnf.Kafka.MetricsSubscriberBudget != 200 {
 		t.Errorf("Expected Kafka.MetricsSubscriberBudget to be 200, got %d",
 			cnf.Kafka.MetricsSubscriberBudget)
@@ -1501,15 +1320,10 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 		t.Errorf("Expected Kafka.SASLAdminSecret to stay empty, got a value of %d characters", len(cnf.Kafka.SASLAdminSecret))
 	}
 
-	// The admin-producer allowance must default to FALSE, and this assertion is the
-	// guard on that. It permits the event publisher to authenticate with the
-	// administrative credentials when no producer principal is configured — the
-	// principal that creates topics, mints SCRAM credentials and rewrites ACLs. A
-	// deployment reaches that state by leaving KAFKA_SASL_USER and KAFKA_SASL_SECRET
-	// unset, which is where every deployment starts, so a default of true would mean an
-	// ordinary rollout ran its whole data plane at maximum privilege with nothing but a
-	// log line to say so. Defaulting it on would not look like a security change in a
-	// diff, which is exactly why it is asserted here.
+	// The admin-producer allowance must default to FALSE, and this assertion is the guard
+	// on that. It permits the event publisher to authenticate with the administrative
+	// credentials when no producer principal is configured — the principal that creates
+	// topics, mints SCRAM credentials and rewrites ACLs.
 	if cnf.Kafka.AllowAdminProducer {
 		t.Error("Expected Kafka.AllowAdminProducer to default to false; publishing as the Kafka administrator must be opted into explicitly")
 	}
@@ -1519,9 +1333,9 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 		t.Errorf("Expected WebhookDeprecationSunsetDate to stay empty, got '%s'", cnf.WebhookDeprecationSunsetDate)
 	}
 
-	// Derive the schedule the three relay defaults produce — 1s, 2s, 4s, 8s, 16s
-	// with the 30s cap deliberately never reached — so that changing a default
-	// fails here instead of silently changing how long a failing event is retried.
+	// Derive the schedule the three relay defaults produce — 1s, 2s, 4s, 8s, 16s with the
+	// 30s cap deliberately never reached — so that changing a default fails here instead
+	// of silently changing how long a failing event is retried.
 	wantSchedule := []int{1000, 2000, 4000, 8000, 16000}
 	if len(wantSchedule) != cnf.Relay.MaxRetryAttempts {
 		t.Fatalf("Expected the schedule to cover all %d attempts, it covers %d", cnf.Relay.MaxRetryAttempts, len(wantSchedule))
@@ -1542,8 +1356,7 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 
 	// Graceful degradation: an empty broker list is a supported steady state, not a
 	// misconfiguration. It selects the no-op event publisher, which is what keeps a
-	// deployment without Kafka — and this whole test suite — working. A warning here
-	// would be noise on every Kafka-less run, so none may be emitted.
+	// deployment without Kafka — and this whole test suite — working.
 	for _, entry := range hook.AllEntries() {
 		if entry.Level != logrus.WarnLevel {
 			continue
@@ -1561,11 +1374,9 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 	clearEventStreamingEnv(t)
 
-	// The replication factor is the case that matters most. A single-broker KRaft
-	// cluster — the local Docker Compose stack — cannot satisfy a factor of 3;
-	// topic creation fails outright. The value must therefore be genuinely
-	// configuration-driven, so a configured 1 has to survive the production
-	// default of 3 rather than be overwritten by it.
+	// The replication factor is the case that matters most. A single-broker KRaft cluster
+	// — the local Docker Compose stack — cannot satisfy a factor of 3; topic creation
+	// fails outright.
 	t.Run("a replication factor of one survives the production default of three", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.ReplicationFactor = 1
@@ -1651,32 +1462,9 @@ func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 	})
 }
 
-// TestSetKafkaDefaults_MetricsSubscriberBudgetIsCorrectedNeverRefused pins both ends of the
-// consumer-lag sweep budget's domain, and pins that a bad value is CORRECTED rather than
-// fatal.
-//
-// # Why the budget needs a floor as well as a default
-//
-// The collector reads Kafka.MetricsSubscriberBudget to decide how many registry rows one lag
-// sweep examines. A zero or negative value there does not mean "no limit" to the collector —
-// it means the sweep window is empty, so no subscriber is ever measured, blnk.kafka.consumer_lag
-// is published for nothing, and SubscriberConsumerLagHigh can never fire. That failure is
-// silent by construction: the metric endpoint still answers, the series is simply absent. So
-// every non-positive value has to resolve to the shipped default, not to itself.
-//
-// # Why the ceiling clamps instead of refusing
-//
-// A budget above MaxMetricsSubscriberBudget is a real operational hazard rather than a typo to
-// reject: each subscriber measured costs an OffsetFetch and a ListOffsets round trip per
-// authorised topic, and each subscriber-topic pair is an exported gauge series. So an
-// unbounded budget makes one collection tick unbounded in both duration and cardinality, and a
-// tick that outlasts the collection interval stops EVERY event gauge refreshing on schedule —
-// including the dead-letter age that V-4's alert reads.
-//
-// It is clamped rather than fatal because that is how every other out-of-range value in this
-// file is handled: a misconfigured metrics budget must never stop the ledger from serving. The
-// correction is asserted to be LOGGED, because a silent clamp would leave an operator who
-// asked for 50,000 believing they had it.
+// TestSetKafkaDefaults_MetricsSubscriberBudgetIsCorrectedNeverRefused pins both ends of
+// the consumer-lag sweep budget's domain, and pins that a bad value is CORRECTED rather
+// than fatal.
 func TestSetKafkaDefaults_MetricsSubscriberBudgetIsCorrectedNeverRefused(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		configured  int
@@ -1726,31 +1514,15 @@ func TestSetKafkaDefaults_MetricsSubscriberBudgetIsCorrectedNeverRefused(t *test
 // TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented pins what
 // happens when Kafka is configured and no usable retirement instant has been given.
 //
-// # Why an absent date with brokers is now a REFUSAL
-//
 // It was a warning, and the warning promised that dual delivery would continue
 // indefinitely. blnk.WebhookSunsetPassed does the opposite: for a deployment that IS
-// publishing, a missing or unparseable window fails closed and answers that the sunset has
-// already passed, so the legacy leg stops and the deprecated management routes answer 410
-// Gone. Two components disagreeing about the single decision requirement R-12 consists of is
-// worse than either answer, and the fail-closed one is the safer of the two to keep — an
-// unset variable must not be able to preserve a deprecated, less protected transport
-// silently. So the combination is refused here, before any traffic is served, which is what
-// event_sunset.go's documentation already said happened.
-//
-// A MALFORMED date remains fatal for the same reason it always was, with or without brokers:
-// that IS a mis-statement, and it would otherwise resolve silently to "the sunset has not
-// passed".
-//
-// # Why no window is derived either
-//
-// Inventing one from "now" would produce a sunset that MOVES ON EVERY RESTART, so the legacy
-// transport's retirement instant would depend on when a pod last happened to start. The error
-// names the variable instead, which is the outcome an operator can act on.
-//
-// The local-dev flag makes NO difference here, and that is asserted rather than assumed: an
-// exception that derived a window under it would be one restart away from being the behaviour
-// a production deployment gets the moment the flag is left set.
+// publishing, a missing or unparseable window fails closed and answers that the sunset
+// has already passed, so the legacy leg stops and the deprecated management routes
+// answer 410 Gone. Two components disagreeing about the single decision the requirement
+// consists of is worse than either answer, and the fail-closed one is the safer of the
+// two to keep — an unset variable must not be able to preserve a deprecated, less
+// protected transport silently. So the combination is refused here, before any traffic
+// is served, which is what event_sunset.go's documentation already said happened.
 func TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -1784,9 +1556,7 @@ func TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented(
 	t.Run("a half-written window cannot survive with one end", func(t *testing.T) {
 		// A start that arrived from a configuration file with no sunset beside it is not a
 		// window. Keeping it would leave the sunset decision resting on a value nothing
-		// validates and the API's 410 guard reading a date that no longer has a partner. With
-		// brokers configured the orphan is ALSO a refusal, so both properties are asserted at
-		// once: cleared, and reported.
+		// validates and the API's 410 guard reading a date that no longer has a partner.
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.Brokers = []string{"kafka:9092"}
 		cnf.WebhookDeprecationStartDate = testWindowStart
@@ -1817,8 +1587,8 @@ func TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented(
 
 	t.Run("a malformed date is still fatal", func(t *testing.T) {
 		// The other half of the decision above: an absent date is a choice not yet made, a
-		// malformed one is a choice mis-stated, and only the second can silently mean
-		// "the sunset has not passed" forever.
+		// malformed one is a choice mis-stated, and only the second can silently mean "the
+		// sunset has not passed" forever.
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.Brokers = []string{"kafka:9092"}
 		cnf.Kafka.InsecureLocalDev = true
@@ -1834,9 +1604,9 @@ func TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented(
 	})
 
 	t.Run("no brokers and local dev set: no window is invented", func(t *testing.T) {
-		// There is nothing to migrate to, so there is no window to describe. Deriving
-		// one here would make the deprecated transport look scheduled for retirement on
-		// a deployment that never enabled Kafka.
+		// There is nothing to migrate to, so there is no window to describe. Deriving one
+		// here would make the deprecated transport look scheduled for retirement on a
+		// deployment that never enabled Kafka.
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.InsecureLocalDev = true
 
@@ -1886,13 +1656,9 @@ func TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented(
 	})
 }
 
-// Two properties are in tension and both must hold. A half-configured credential has
-// to stop a deployment that actually uses Kafka, because it cannot be honoured and
-// fails much later as a wrong-password or authorization error. But it must NOT stop a
-// deployment with no brokers, because nothing reads it there and the graceful
-// degradation that lets Blnk run entirely without Kafka is a shipped guarantee — the
-// .env.example that leaves KAFKA_BROKERS unset would otherwise fail to load the
-// moment an operator filled in one SASL key.
+// Two properties are in tension and both must hold. A half-configured credential has to
+// stop a deployment that actually uses Kafka, because it cannot be honoured and fails
+// much later as a wrong-password or authorization error.
 func TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -1981,32 +1747,20 @@ func TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers(t *testing.T
 	})
 }
 
-// TestLoadConfigFromFile_KafkaEnvNameForms proves that every environment variable
-// name form the deployment contract and the repository convention offer actually
-// resolves into the new configuration.
+// TestLoadConfigFromFile_KafkaEnvNameForms proves that every environment variable name
+// form the deployment contract and the repository convention offer actually resolves
+// into the new configuration.
 //
-// Read this before "correcting" the un-prefixed envconfig tags in config.go.
-// envconfig builds a field's primary key by accumulating the prefix through every
-// enclosing struct and appending the tag literal, then consults the bare tag
-// literal as an alternate key only when the primary is unset. So:
+// Read this before "correcting" the un-prefixed envconfig tags in config.go. envconfig
+// builds a field's primary key by accumulating the prefix through every enclosing
+// struct and appending the tag literal, then consults the bare tag literal as an
+// alternate key only when the primary is unset. So:
 //
-//   - Configuration.Kafka contributes a segment, making the envconfig primary key
-//     for Brokers BLNK_KAFKA_KAFKA_BROKERS and the alternate the mandated
-//     KAFKA_BROKERS.
-//   - The ordinary BLNK_KAFKA_BROKERS is neither of those keys. It USED TO RESOLVE
-//     TO NOTHING, which meant a deployment spelling the variable the way every other
-//     setting in config.go is spelled silently got no brokers and no error.
-//     applyPrefixedEnvAliases resolves it explicitly now, and every alias in that
-//     table is exercised below.
+//   - Configuration.Kafka contributes a segment, making the envconfig primary key for
+//     Brokers BLNK_KAFKA_KAFKA_BROKERS and the alternate the mandated KAFKA_BROKERS.
+//   - The ordinary BLNK_KAFKA_BROKERS is neither of those keys.
 //   - WebhookDeprecationSunsetDate is a top-level field, so it accumulates no
 //     intermediate segment and envconfig resolves both of its forms unaided.
-//
-// Adding a BLNK_ prefix to a tag would only change which bare name is honoured and
-// would break the mandated one. Each form is exercised in isolation — one key set
-// per subtest, every other form unset — because the point is that each resolves on
-// its own, and because two forms set at once would prove nothing about either. The
-// precedence between two forms that ARE both set is asserted separately, by
-// TestLoadConfigFromFile_PrefixedAliasWinsOverBareName.
 func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 	const sunsetDate = "2026-09-04T00:00:00Z"
 
@@ -2033,29 +1787,22 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// THE FINDING. This is the name a reader of config.go would write, because
-			// every other setting in that file is spelled this way — and it used to be
-			// read by nothing at all, so a deployment that set it got no brokers, the
-			// no-op publisher, and no error to explain why nothing was published.
-			// applyPrefixedEnvAliases resolves it explicitly now.
+			// THE ALIAS THAT MUST RESOLVE LIKE THE BARE NAME.
 			name:   "the ordinary BLNK_KAFKA_BROKERS alias resolves",
 			envKey: "BLNK_KAFKA_BROKERS",
 			value:  "broker-5:9092,broker-6:9092",
 			assert: func(t *testing.T, loaded *Configuration) {
-				// A comma-separated value through the alias must split the same way the
-				// bare and nested forms do, so the alias is a genuine equivalent rather
-				// than a single-value special case.
+				// A comma-separated value through the alias must split the same way the bare and
+				// nested forms do, so the alias is a genuine equivalent rather than a single-value
+				// special case.
 				assertBrokerList(t, loaded.Kafka.Brokers, []string{"broker-5:9092", "broker-6:9092"})
 			},
 		},
 		{
-			// The three forms of the subscriber-facing list, for the same reason the
-			// three above exist. This one answered to its bare name and to envconfig's
-			// BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS artefact, but NOT to the ordinary
-			// prefixed spelling — while config.go claimed every field of the struct was
-			// aliased. A deployment writing the documented convention therefore got no
-			// subscriber-facing brokers, and credential issuance refused with 503 and
-			// nothing to explain why.
+			// The three forms of the subscriber-facing list, for the same reason the three above
+			// exist. This one answered to its bare name and to envconfig's
+			// BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS artefact, but NOT to the ordinary prefixed
+			// spelling — while config.go claimed every field of the struct was aliased.
 			name:   "the mandated bare KAFKA_SUBSCRIBER_BROKERS resolves",
 			envKey: "KAFKA_SUBSCRIBER_BROKERS",
 			value:  "public-1:9092,public-2:9092",
@@ -2082,14 +1829,10 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// THE FINDING FOR THE HISTORICAL PREFIX LIST. Both compose files forward
-			// BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES and .env.example documents that either
-			// form resolves — and no field resolved it, so only the bare name and
-			// envconfig's own BLNK_KAFKA_KAFKA_ artefact worked. The consequence is the
-			// worst this variable has: a deployment that renamed KAFKA_TOPIC_PREFIX and
-			// declared the old namespace through the documented, forwarded name got an
-			// EMPTY historical list, and every event captured under the previous prefix was
-			// refused at writer resolution after the next restart.
+			// THE HISTORICAL PREFIX LIST. Both compose files forward
+			// BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES and .env.example documents that either form
+			// resolves, so the field has to resolve both: without the tag only the bare name
+			// and envconfig's own BLNK_KAFKA_KAFKA_ artefact would work.
 			name:   "the mandated bare KAFKA_HISTORICAL_TOPIC_PREFIXES resolves",
 			envKey: "KAFKA_HISTORICAL_TOPIC_PREFIXES",
 			value:  "legacy,older",
@@ -2116,10 +1859,10 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// The key-scope declaration is an AUTHORIZATION control, so a form that
-			// resolved to nothing would silently leave issuance refusing every key-scoped
-			// subscriber on a deployment that had declared a gateway. Both of its names are
-			// exercised for that reason, and so are both of the gateway list's.
+			// The key-scope declaration is an AUTHORIZATION control, so a form that resolved to
+			// nothing would silently leave issuance refusing every key-scoped subscriber on a
+			// deployment that had declared a gateway. Both of its names are exercised for that
+			// reason, and so are both of the gateway list's.
 			name:   "the mandated bare KAFKA_KEY_SCOPE_ENFORCEMENT resolves",
 			envKey: "KAFKA_KEY_SCOPE_ENFORCEMENT",
 			value:  KeyScopeEnforcementBrokerGateway,
@@ -2160,11 +1903,11 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// THE CONTROL ENDPOINT, whose absence turns the whole declaration above off.
-			// Both spellings are exercised for the same reason the mode's are: an operator
-			// who set the form that resolved to nothing would find every key-scoped
-			// issuance refused with SUBSCRIBER_KEY_SCOPE_UNATTESTED on a deployment that
-			// believed it had declared a component.
+			// THE CONTROL ENDPOINT, whose absence turns the whole declaration above off. Both
+			// spellings are exercised for the same reason the mode's are: an operator who set
+			// the form that resolved to nothing would find every key-scoped issuance refused
+			// with SUBSCRIBER_KEY_SCOPE_UNATTESTED on a deployment that believed it had declared
+			// a component.
 			name:   "the mandated bare KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL resolves",
 			envKey: "KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL",
 			value:  "https://gateway.example.com/key-scopes",
@@ -2231,9 +1974,9 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// THE OTHER DECLARATION. In secure mode a deployment must make one of the two,
-			// so a spelling that resolved to nothing would refuse every issuance on a
-			// cluster whose operator had acknowledged the model.
+			// THE OTHER DECLARATION. In secure mode a deployment must make one of the two, so a
+			// spelling that resolved to nothing would refuse every issuance on a cluster whose
+			// operator had acknowledged the model.
 			name:   "the mandated bare KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS resolves",
 			envKey: "KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS",
 			value:  "true",
@@ -2274,11 +2017,11 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// The lag-sweep budget is the newest variable in the table, so both of its
-			// forms are exercised: the bare name the deployment documentation gives, and
-			// the BLNK_-prefixed name a reader of config.go would write. An operator who
-			// raised the budget through the form that resolved to nothing would find the
-			// lag inventory still truncated with no error to explain it.
+			// The lag-sweep budget is the newest variable in the table, so both of its forms are
+			// exercised: the bare name the deployment documentation gives, and the
+			// BLNK_-prefixed name a reader of config.go would write. An operator who raised the
+			// budget through the form that resolved to nothing would find the lag inventory
+			// still truncated with no error to explain it.
 			name:   "the documented bare EVENT_METRICS_SUBSCRIBER_BUDGET resolves",
 			envKey: "EVENT_METRICS_SUBSCRIBER_BUDGET",
 			value:  "1500",
@@ -2445,9 +2188,8 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// A configured 1 is the single-broker local stack, and it must survive
-			// rather than being replaced by the production default of 3 — through
-			// either name form.
+			// A configured 1 is the single-broker local stack, and it must survive rather than
+			// being replaced by the production default of 3 — through either name form.
 			name:   "the mandated bare KAFKA_REPLICATION_FACTOR resolves",
 			envKey: "KAFKA_REPLICATION_FACTOR",
 			value:  "1",
@@ -2488,9 +2230,9 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// The relay half of the same finding: BLNK_RELAY_MAX_RETRY_ATTEMPTS used to
-			// resolve to nothing and leave the default 5 in place, so an operator who
-			// had deliberately reduced the retry budget still got five attempts.
+			// The relay half of the same rule: BLNK_RELAY_MAX_RETRY_ATTEMPTS must resolve. An
+			// alias resolving to nothing leaves the default 5 in place, so an operator who
+			// deliberately reduced the retry budget would still get five attempts.
 			name:   "the ordinary BLNK_RELAY_MAX_RETRY_ATTEMPTS alias resolves",
 			envKey: "BLNK_RELAY_MAX_RETRY_ATTEMPTS",
 			value:  "3",
@@ -2511,11 +2253,11 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
-			// SEC-10's variable, in all three forms. It is exercised here rather than
-			// trusted because a budget that silently fails to resolve leaves the default
-			// 200 in place — and an operator who raised it to cover a larger registry
-			// would believe coverage was complete while it was not, which is the precise
-			// failure this variable was added to end.
+			// The measurement-budget variable, in all three forms. It is exercised here rather than trusted
+			// because a budget that silently fails to resolve leaves the default 200 in place —
+			// and an operator who raised it to cover a larger registry would believe coverage
+			// was complete while it was not, which is the precise failure this variable was
+			// added to end.
 			name:   "the bare RELAY_SUBSCRIBER_METRICS_BUDGET resolves",
 			envKey: "RELAY_SUBSCRIBER_METRICS_BUDGET",
 			value:  "750",
@@ -2634,15 +2376,15 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			clearEventStreamingEnv(t)
 			restoreConfigStore(t)
 
-			// The fixture carries a valid dual-delivery window because several of
-			// the cases below configure brokers, and Kafka publishing without a
-			// window is a hard configuration error.
+			// The fixture carries a valid dual-delivery window because several of the cases
+			// below configure brokers, and Kafka publishing without a window is a hard
+			// configuration error.
 			configFile := writeTempEventConfigFileWithWindow(t)
 			t.Setenv(tc.envKey, tc.value)
 
 			// Going through loadConfigFromFile is the point: it is what runs
-			// envconfig.Process("blnk", &cnf) and then applyPrefixedEnvAliases over
-			// the decoded file.
+			// envconfig.Process("blnk", &cnf) and then applyPrefixedEnvAliases over the decoded
+			// file.
 			if err := loadConfigFromFile(configFile); err != nil {
 				t.Fatalf("loadConfigFromFile failed: %v", err)
 			}
@@ -2659,19 +2401,15 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 // TestLoadConfigFromFile_KafkaEnvNamePrecedence pins the order the three live name
 // forms resolve in when more than one is set at once.
 //
-// Coverage of each form in isolation, above, proves only that none of them is dead.
-// It says nothing about which value a deployment actually gets when two names
-// disagree — and two names disagreeing is not exotic: a Helm chart supplying the
-// conventional BLNK_-prefixed form over a base image's .env carrying the bare form
-// produces it on the first upgrade. The order below is the one documented on
-// eventStreamingEnvOverride:
+// Coverage of each form in isolation, above, proves only that none of them is dead. It
+// says nothing about which value a deployment actually gets when two names disagree —
+// and two names disagreeing is not exotic: a Helm chart supplying the conventional
+// BLNK_-prefixed form over a base image's .env carrying the bare form produces it on
+// the first upgrade.
 //
-//  1. BLNK_KAFKA_BROKERS       — the conventional prefixed name (overlay primary)
-//  2. KAFKA_BROKERS            — the mandated bare name        (overlay alternate)
+//  1. BLNK_KAFKA_BROKERS — the conventional prefixed name (overlay primary)
+//  2. KAFKA_BROKERS — the mandated bare name (overlay alternate)
 //  3. BLNK_KAFKA_KAFKA_BROKERS — the key the nested pass derives
-//
-// Every subtest sets values that are distinguishable from one another, so a wrong
-// answer names the form that won rather than merely failing.
 func TestLoadConfigFromFile_KafkaEnvNamePrecedence(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -2753,10 +2491,10 @@ func TestLoadConfigFromFile_KafkaEnvNamePrecedence(t *testing.T) {
 			clearEventStreamingEnv(t)
 			restoreConfigStore(t)
 
-			// The cases below configure brokers, and a configured broker makes the
-			// webhook deprecation window mandatory rather than advisory. Supplying it
-			// here keeps each case testing the one thing it is about — which environment
-			// name wins — instead of failing on an unrelated required setting.
+			// The cases below configure brokers, and a configured broker makes the webhook
+			// deprecation window mandatory rather than advisory. Supplying it here keeps each
+			// case testing the one thing it is about — which environment name wins — instead of
+			// failing on an unrelated required setting.
 			t.Setenv("WEBHOOK_DEPRECATION_SUNSET_DATE", testWindowSunset)
 
 			configFile := writeTempEventConfigFile(t)
@@ -2781,12 +2519,7 @@ func TestLoadConfigFromFile_KafkaEnvNamePrecedence(t *testing.T) {
 // companion property to the precedence test: an environment name that is NOT set must
 // leave the value blnk.json supplied exactly as it is.
 //
-// This is the failure mode an overlay invites. Copying a value struct rather than only
-// its set fields would write a zero over every Kafka and relay setting a JSON-only
-// deployment relies on — and it would do so silently, because zeros are then replaced
-// by defaults and the result looks plausible. The Kubernetes ConfigMap ships a literal
-// blnk.json, so JSON-only configuration is a real deployment shape rather than a
-// theoretical one.
+// This is the failure mode an overlay invites.
 func TestLoadConfigFromFile_KafkaEnvOverrideDoesNotErasePlainJSONConfiguration(t *testing.T) {
 	fromFile := eventStreamingBaseConfig()
 	fromFile.Kafka = KafkaConfig{
@@ -2888,16 +2621,12 @@ func TestLoadConfigFromFile_KafkaEnvOverrideDoesNotErasePlainJSONConfiguration(t
 	})
 }
 
-// TestKafkaBrokersParsing verifies how a KAFKA_BROKERS value becomes a broker
-// list. envconfig splits the comma-separated value but does not trim the pieces,
-// so " b:9092" would otherwise reach the dialler as an unusable address;
-// setKafkaDefaults runs the value through normalizeBrokers, which trims every
-// entry and drops the empty ones produced by consecutive or trailing commas. Both
-// behaviours are asserted here because both are load-bearing.
-//
-// The empty and unset cases are the graceful-degradation path and must yield no
-// brokers and no error, exactly as the whitelist test above treats an empty value
-// as nil rather than as a failure.
+// TestKafkaBrokersParsing verifies how a KAFKA_BROKERS value becomes a broker list.
+// envconfig splits the comma-separated value but does not trim the pieces, so " b:9092"
+// would otherwise reach the dialler as an unusable address; setKafkaDefaults runs the
+// value through normalizeBrokers, which trims every entry and drops the empty ones
+// produced by consecutive or trailing commas. Both behaviours are asserted here because
+// both are load-bearing.
 func TestKafkaBrokersParsing(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -2963,39 +2692,24 @@ func TestKafkaBrokersParsing(t *testing.T) {
 // TestResolveWebhookDeprecationWindow covers the dual-delivery window, whose surface is
 // exactly ONE setting.
 //
-// # The two failure modes are deliberately treated differently
-//
-// A date that will not parse is FATAL. An operator stated a retirement instant and got
-// it wrong, and the silent resolution would be "keep the legacy behaviour" — so a
-// single mis-typed variable would cancel the retirement of the very transport this
-// feature exists to replace, with nothing failing and nothing to notice.
+// A date that will not parse is FATAL.
 //
 // An ABSENT date depends on whether the deployment publishes, and the two cases are
 // genuinely different rather than one rule with an exception.
 //
-// With NO brokers, it is accepted quietly. Nothing was mis-stated, there is no Kafka
-// transport to migrate to and therefore no window to state, and AAP §0.7.2 requires a
-// deployment to keep starting and serving as Kafka configuration is introduced. The
-// legacy webhook path keeps behaving exactly as it did before this feature existed —
-// which is not "dual delivery continues", because with no brokers there is no second
-// transport for anything to be dual about.
+// With NO brokers, it is accepted quietly.
 //
 // With brokers, it is REFUSED, and KAFKA_INSECURE_LOCAL_DEV is the only acknowledgement
-// that lifts the refusal. This is the case TestResolveWebhookDeprecationWindow_AnUnusable
-// WindowIsRefusedNeverInvented covers, and the reasoning is recorded there: it was once a
-// warning that promised dual delivery would continue indefinitely, but
-// blnk.WebhookSunsetPassed fails CLOSED on a publishing deployment with no usable window,
-// so the promise and the behaviour pointed in opposite directions. An unset variable must
-// not be able to preserve a deprecated transport silently, so the combination is rejected
-// before any traffic is served.
-//
-// # There is only one input, so the window cannot be inconsistent
+// that lifts the refusal. This is the case
+// TestResolveWebhookDeprecationWindow_AnUnusable WindowIsRefusedNeverInvented covers,
+// and the reasoning is recorded there: it was once a warning that promised dual
+// delivery would continue indefinitely, but blnk.WebhookSunsetPassed fails CLOSED on a
+// publishing deployment with no usable window, so the promise and the behaviour pointed
+// in opposite directions. An unset variable must not be able to preserve a deprecated
+// transport silently, so the combination is rejected before any traffic is served.
 //
 // The start is DERIVED as sunset minus WebhookDualDeliveryWindowDays and carries no
-// environment variable, per the eight-variable R-10 contract. With one settable end
-// there is no second value to disagree with, so "exactly 30 days" is a property of the
-// arithmetic rather than a rule that has to be enforced — which is why the cases that
-// used to assert a mismatched pair being refused are gone rather than relaxed.
+// environment variable, per the eight-variable deployment contract.
 func TestResolveWebhookDeprecationWindow(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -3018,8 +2732,8 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 
 	t.Run("a start present on the struct is overwritten by the derived value", func(t *testing.T) {
 		// The field is output-only. A value that reached it from a configuration file, or
-		// from a caller assembling the struct directly, must not be able to describe a
-		// window of a different length than the code guarantees.
+		// from a caller assembling the struct directly, must not be able to describe a window
+		// of a different length than the code guarantees.
 		cnf := eventStreamingBaseConfig()
 		cnf.WebhookDeprecationSunsetDate = testWindowSunset
 		cnf.WebhookDeprecationStartDate = "2001-01-01T00:00:00Z"
@@ -3076,9 +2790,9 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 			})
 		}
 
-		// A malformed value on the DERIVED field cannot fail, because it is not read.
-		// This is asserted rather than assumed: an operator or a stale configuration file
-		// supplying nonsense for a value the code owns must not be able to fail the load.
+		// A malformed value on the DERIVED field cannot fail, because it is not read. This is
+		// asserted rather than assumed: an operator or a stale configuration file supplying
+		// nonsense for a value the code owns must not be able to fail the load.
 		t.Run("a malformed value on the derived start cannot fail the load", func(t *testing.T) {
 			cnf := eventStreamingBaseConfig()
 			cnf.WebhookDeprecationSunsetDate = testWindowSunset
@@ -3099,9 +2813,6 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 	// the chain is what a load actually runs. Accepting it with a warning is what let
 	// configuration promise indefinite dual delivery while the runtime treated the same
 	// state as already past the sunset — see resolveWebhookDeprecationWindow.
-	//
-	// The refusal must NAME the variable and STATE the consequence, so an operator can act
-	// on it without reading the source.
 	t.Run("an absent window is refused once kafka brokers are configured", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.Brokers = []string{"broker-1:9092"}
@@ -3127,9 +2838,9 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 		}
 	})
 
-	// ... and the case that must keep working: no Kafka, no window, no error. This is
-	// what every existing deployment and every existing test in this repository looks
-	// like, and it is the graceful-degradation contract.
+	// ... and the case that must keep working: no Kafka, no window, no error. This is what
+	// every existing deployment and every existing test in this repository looks like, and
+	// it is the graceful-degradation contract.
 	t.Run("an absent window is accepted when no broker is configured", func(t *testing.T) {
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
@@ -3180,9 +2891,9 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 		}
 	})
 
-	// The required-field surface is unchanged: the data source and Redis DNS values
-	// remain the only two, which is what keeps every existing configuration literal in
-	// the suite valid.
+	// The required-field surface is unchanged: the data source and Redis DNS values remain
+	// the only two, which is what keeps every existing configuration literal in the suite
+	// valid.
 	t.Run("no kafka or window field is a required field", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 		if cnf.WebhookDeprecationSunsetDate != "" || len(cnf.Kafka.Brokers) != 0 {
@@ -3195,25 +2906,10 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 	})
 }
 
-// TestValidateAndAddDefaults_RelayWindowWarnings covers what happens to an unusable relay
-// retry window. Relay tuning is an operational knob: a bad value must degrade event delivery,
-// never stop the server from starting, so every finding is a warning and
-// validateAndAddDefaults still returns nil in every case below.
-//
-// # A negative value is NORMALISED, not merely reported
-//
-// It used to be reported and left in place, and the report was wrong about the outcome: the
-// warning said "retries will not be delayed" while each consumer went on to substitute a
-// value of its own. For RELAY_MAX_RETRY_ATTEMPTS the two consumers substituted DIFFERENT
-// values — the row was stamped with the default of five by eventMaxAttempts while
-// newRelayRetryPolicy allowed the ceiling of eight — so one negative produced two effective
-// budgets and no log line named either. So each case below asserts BOTH halves of the fix:
-// the warning names the variable and the value applied, and the effective value really is
-// that one.
-//
-// The check runs after the defaults are applied, so it inspects effective values. That is why
-// each case supplies non-zero values for the fields it is exercising — a zero means "unset"
-// and is replaced by its default silently, with no warning to assert on.
+// TestValidateAndAddDefaults_RelayWindowWarnings covers what happens to an unusable
+// relay retry window. Relay tuning is an operational knob: a bad value must degrade
+// event delivery, never stop the server from starting, so every finding is a warning
+// and validateAndAddDefaults still returns nil in every case below.
 func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -3248,11 +2944,11 @@ func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 		},
 		{
-			// The inverted-window finding is NOT expected here any more, and its absence is
-			// the point: the cap is normalised to its default of 30000 before the window is
+			// The inverted-window finding is NOT expected here any more, and its absence is the
+			// point: the cap is normalised to its default of 30000 before the window is
 			// inspected, so the base of 1000 no longer exceeds it. Reporting an inversion
-			// against a value that had already been replaced was a warning about a state
-			// that did not exist.
+			// against a value that had already been replaced was a warning about a state that
+			// did not exist.
 			name:      "a negative cap warns and the default is applied",
 			relay:     RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: -1},
 			want:      []string{negativeCapWarning},
@@ -3260,9 +2956,9 @@ func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 		},
 		{
-			// THE FINDING. A negative budget now resolves to ONE value, named in the log,
-			// which is what stops eventMaxAttempts and newRelayRetryPolicy disagreeing about
-			// how many attempts an event gets.
+			// THE RULE. A negative budget resolves to ONE value, named in the log, which
+			// is what stops eventMaxAttempts and newRelayRetryPolicy disagreeing about how many
+			// attempts an event gets.
 			name:      "a negative retry count warns and the default is applied",
 			relay:     RelayConfig{MaxRetryAttempts: -1, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 			want:      []string{negativeAttemptsWarn},
@@ -3301,9 +2997,9 @@ func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 				}
 			}
 
-			// THE OTHER HALF. A warning that names an applied value is only true if that
-			// value is the one every consumer will read, so the effective configuration is
-			// asserted alongside the log line rather than instead of it.
+			// THE OTHER HALF. A warning that names an applied value is only true if that value
+			// is the one every consumer will read, so the effective configuration is asserted
+			// alongside the log line rather than instead of it.
 			if tc.effective != nil {
 				if cnf.Relay.MaxRetryAttempts != tc.effective.MaxRetryAttempts {
 					t.Errorf("Expected an effective max_retry_attempts of %d, got %d",
@@ -3322,14 +3018,12 @@ func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 	}
 }
 
-// TestMockConfig_KafkaAndRelayDefaultsApplied proves the new configuration surface
-// is safe for every test file that injects configuration through MockConfig.
+// TestMockConfig_KafkaAndRelayDefaultsApplied proves the new configuration surface is
+// safe for every test file that injects configuration through MockConfig.
 //
-// MockConfig fails closed: on a validation error it logs and returns without
-// storing, leaving whatever a previous test stored in place. Fetch would then hand
-// back that stale configuration and a naive assertion on the Kafka defaults could
-// still pass. Asserting the project name first is what makes this test honest — it
-// is the proof that this configuration was accepted and stored.
+// MockConfig fails closed: on a validation error it logs and returns without storing,
+// leaving whatever a previous test stored in place. Fetch would then hand back that
+// stale configuration and a naive assertion on the Kafka defaults could still pass.
 func TestMockConfig_KafkaAndRelayDefaultsApplied(t *testing.T) {
 	clearEventStreamingEnv(t)
 	restoreConfigStore(t)
@@ -3378,19 +3072,7 @@ func TestMockConfig_KafkaAndRelayDefaultsApplied(t *testing.T) {
 // TestSetRelayDefaults_SubscriberMetricsBudgetRefusesAnUnmeasurableValue pins the two
 // values that would silently switch consumer-lag measurement off.
 //
-// # Why a zero or negative budget cannot be honoured
-//
-// The budget bounds how many subscribers ONE collection tick examines. Read literally, zero
-// examines none and a negative value examines none — and a subscriber the collector does not
-// examine has NO blnk_kafka_consumer_lag series, so SubscriberConsumerLagHigh cannot fire for
-// it however far behind it falls. Honouring either value would therefore reach the exact
-// condition blnk_kafka_subscribers_unmeasured exists to expose, by configuration rather than by
-// scale, and it would do so while reporting no error at all.
-//
-// Zero additionally arrives by accident: an operator who writes RELAY_SUBSCRIBER_METRICS_BUDGET=
-// with no value, or a ConfigMap key whose value was templated away, both produce it. There is no
-// deployment for which "measure nobody" is the intent, so the default is substituted in both
-// cases and a negative value — which can only be a mistake — is additionally warned about.
+// The budget bounds how many subscribers ONE collection tick examines.
 func TestSetRelayDefaults_SubscriberMetricsBudgetRefusesAnUnmeasurableValue(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -3459,13 +3141,9 @@ func TestSetRelayDefaults_SubscriberMetricsBudgetRefusesAnUnmeasurableValue(t *t
 
 	t.Run("a budget beyond the supported ceiling is clamped and SAID SO", func(t *testing.T) {
 		// The ceiling is real rather than cautious: every measured subscriber-topic pair is a
-		// retained gauge series, so an unbounded budget makes one collection tick unbounded in
-		// cardinality as well as in duration — and a metrics pipeline that falls over takes
-		// every alert this feature added with it.
-		//
-		// What answers the objection to capping is that it is LOUD. The warning names the
-		// configured value and the applied one, so coverage is never capped silently, which
-		// is the only property that made a ceiling unacceptable.
+		// retained gauge series, so an unbounded budget makes one collection tick unbounded
+		// in cardinality as well as in duration — and a metrics pipeline that falls over
+		// takes every alert this feature added with it.
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
 
@@ -3506,17 +3184,7 @@ func TestSetRelayDefaults_SubscriberMetricsBudgetRefusesAnUnmeasurableValue(t *t
 //   - BOTH EMPTY is not an error. A broker with a plaintext listener is a supported
 //     deployment, and the shipped .env.example leaves both keys empty.
 //   - BOTH SET is SASL/SCRAM as the named principal.
-//   - EXACTLY ONE SET has no honest interpretation and must be refused. A username
-//     without a secret cannot authenticate. A secret without a username is the
-//     dangerous half: every component used to ignore it silently and connect
-//     anonymously while looking configured.
-//
-// Trimming is asserted because a value arriving from a Kubernetes secret or a
-// hand-edited .env routinely carries a trailing newline, and whitespace must read as
-// absence rather than as a principal nobody created.
-//
-// The refusal message must name the ENVIRONMENT VARIABLE, because that is the only one
-// of variable, struct field and role that an operator can act on.
+//   - EXACTLY ONE SET has no honest interpretation and must be refused.
 func TestKafkaConfig_SASLAdminCredentialsContract(t *testing.T) {
 	// Obviously fake: this file must never carry a value that could be mistaken for a
 	// real credential.
@@ -3621,9 +3289,7 @@ func TestKafkaConfig_SASLAdminCredentialsContract(t *testing.T) {
 // same validator.
 //
 // The two roles configure two different pairs of variables, and an error that named the
-// wrong pair would send an operator to change a value that was already correct. The role
-// word is asserted as well, because for the producer the variable names alone
-// (KAFKA_SASL_USER, KAFKA_SASL_SECRET) do not say which transport is affected.
+// wrong pair would send an operator to change a value that was already correct.
 func TestValidateSASLPair_NamesTheRightVariablesForEachRole(t *testing.T) {
 	const secret = "placeholder-not-a-real-secret"
 
@@ -3662,16 +3328,7 @@ func TestValidateSASLPair_NamesTheRightVariablesForEachRole(t *testing.T) {
 // TestLoadConfigFromFile_BareNameParseErrorNamesTheVariableThatWasSet closes the gap
 // between the variable an operator set and the variable the failure named.
 //
-// envconfig derives a nested field's primary key by accumulating the prefix through every
-// enclosing struct and treats the tag literal as an alternate, then always reports the
-// PRIMARY in its ParseError. So setting the mandated bare RELAY_MAX_RETRY_ATTEMPTS=five
-// used to fail with "assigning BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS to MaxRetryAttempts" —
-// a name that appears nowhere in the operator's configuration and that searching for it
-// will not find.
-//
-// The load must still FAIL, and fail for the same values it always did. What changes is
-// only which name leads the message. Both are asserted, and the original wording is
-// asserted to survive so no diagnostic detail is traded away for the better name.
+// The load must still FAIL, and fail for the same values it always did.
 func TestLoadConfigFromFile_BareNameParseErrorNamesTheVariableThatWasSet(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -3698,9 +3355,8 @@ func TestLoadConfigFromFile_BareNameParseErrorNamesTheVariableThatWasSet(t *test
 			nestedName: "BLNK_KAFKA_KAFKA_MIN_PARTITIONS",
 		},
 		{
-			// Two structs deep: KafkaConfig.TLS. The accumulated primary doubles the
-			// whole KAFKA_TLS segment, which is the case a single-segment recovery
-			// would have missed.
+			// Two structs deep: KafkaConfig.TLS. The accumulated primary doubles the whole
+			// KAFKA_TLS segment, which is the case a single-segment recovery would have missed.
 			name:       "a doubly nested tls switch",
 			key:        "KAFKA_TLS_ENABLED",
 			value:      "yeah",
@@ -3778,9 +3434,8 @@ func TestLoadConfigFromFile_BareNameParseErrorNamesTheVariableThatWasSet(t *test
 
 // TestBareEnvNameFrom covers the recovery in isolation, including what it must REFUSE.
 //
-// Returning a wrong bare name would be worse than returning none: the message would then
-// confidently name a variable the operator did not set. Every non-matching shape must
-// therefore yield the empty string so the caller falls back to envconfig's own wording.
+// Returning a wrong bare name would be worse than returning none: the message would
+// then confidently name a variable the operator did not set.
 func TestBareEnvNameFrom(t *testing.T) {
 	cases := []struct {
 		key  string
@@ -3813,17 +3468,8 @@ func TestBareEnvNameFrom(t *testing.T) {
 // TestValidateAndAddDefaults_KafkaGeometryWarnings covers the load-time diagnostics for
 // GEOMETRY values that are silently corrected later on.
 //
-// A negative partition count or replication factor is raised to a usable value by topic
-// assurance, at the moment Kafka is first used — which for a deployment with no event
-// traffic in flight can be long after start-up and a long way from the variable that
-// caused it. Naming it at load turns a silent correction into a line in the boot log.
-//
-// These stay WARNINGS, and the distinction from the topic prefix is deliberate rather than
-// inconsistent. A corrected geometry still delivers every event: six partitions instead of
-// minus four is a different shape, not a lost message. An illegal PREFIX loses events
-// outright — the rows are captured naming a topic the broker will never create, and their
-// dead-letter names are illegal too — so it is fatal, and
-// TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName owns it.
+// These stay WARNINGS, and the distinction from the topic prefix is deliberate rather
+// than inconsistent.
 func TestValidateAndAddDefaults_KafkaGeometryWarnings(t *testing.T) {
 	const (
 		negativePartitionsWarning = "KAFKA_MIN_PARTITIONS is negative"
@@ -3907,9 +3553,9 @@ func TestValidateAndAddDefaults_KafkaGeometryWarnings(t *testing.T) {
 			t.Fatalf("Expected the load to succeed, got %v", err)
 		}
 
-		// The defaults do not replace a negative value here — zero alone means unset —
-		// so the warning is the ONLY signal at load time, which is exactly why it had
-		// to be added. The floor is applied where topics are provisioned.
+		// The defaults do not replace a negative value here — zero alone means unset — so the
+		// warning is the ONLY signal at load time, which is exactly why it had to be added.
+		// The floor is applied where topics are provisioned.
 		if cnf.Kafka.MinPartitions != -4 {
 			t.Errorf("Expected the configured value to be preserved for the warning to describe, got %d",
 				cnf.Kafka.MinPartitions)
@@ -3919,14 +3565,6 @@ func TestValidateAndAddDefaults_KafkaGeometryWarnings(t *testing.T) {
 
 // TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName is the
 // configuration-load half of the fix for the prefix that only warned.
-//
-// The behaviour it replaces was the worst of the three available: the illegal value was
-// reported and then USED, so producers kept writing outbox rows naming a topic the broker
-// would never create. Every one of those rows exhausted its retry budget and then failed
-// its dead-letter write too, because the dead-letter name was composed from the same
-// illegal prefix — a ledger accepting mutations and silently notifying nobody. The warning
-// also interpolated the configured value straight into a log message, which is a
-// log-injection sink reachable by anyone who can set an environment variable.
 //
 // So the load now fails, and these are the cases it must fail on and the cases it must
 // still accept.
@@ -4026,8 +3664,8 @@ func TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName
 
 	t.Run("the prefix is validated even when no broker is configured", func(t *testing.T) {
 		// A deployment can configure the prefix before the brokers. Refusing only when
-		// brokers are present would let the illegal value sit unnoticed until the day
-		// someone switched publishing on.
+		// brokers are present would let the illegal value sit unnoticed until the day someone
+		// switched publishing on.
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.TopicPrefix = "blnk prod"
 
@@ -4040,23 +3678,7 @@ func TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName
 // TestValidateKafkaHistoricalTopicPrefixes_NormalisesTheAllowlistAndRefusesAnUnusableEntry
 // covers KAFKA_HISTORICAL_TOPIC_PREFIXES.
 //
-// # Why the list has to be validated rather than merely trimmed
-//
-// Every prefix in it is treated as OWNED: writers are pre-created for its whole topic
-// inventory, the publisher's ownership test admits it, and topic assurance keeps its topics
-// present. That is what keeps rows captured before a KAFKA_TOPIC_PREFIX rename publishable
-// after a restart — so a malformed entry is a silent failure of exactly the stranding the
-// list exists to prevent: the operator declares the old namespace, the value is unusable,
-// and the old rows still never drain. Refusing it at load, by name, is what makes the
-// declaration mean something.
-//
-// # Why the normalisations are normalisations rather than refusals
-//
-// The list is meant to be DRAINED. A trailing comma, or the current prefix left in place
-// after the rename completed, describes the same set of owned topics either way, so both are
-// collapsed. Removing the current prefix in particular is what lets every consumer treat the
-// field as "the prefixes BESIDES the configured one" and compose a duplicate-free inventory
-// from current-plus-historical.
+// The list is meant to be DRAINED.
 func TestValidateKafkaHistoricalTopicPrefixes_NormalisesTheAllowlistAndRefusesAnUnusableEntry(t *testing.T) {
 	t.Run("the ordinary case is an empty list", func(t *testing.T) {
 		cnf := kafkaEnabledConfig("localhost:9092")
@@ -4199,9 +3821,9 @@ func TestValidateKafkaHistoricalTopicPrefixes_NormalisesTheAllowlistAndRefusesAn
 	})
 
 	t.Run("OwnedTopicPrefixes answers for an unvalidated configuration too", func(t *testing.T) {
-		// Reached from a test or a tool that builds a KafkaConfig literal without running
-		// the validate-and-default path. A hole in the list would be worse than a fallback:
-		// the strictest available answer is the default prefix.
+		// Reached from a test or a tool that builds a KafkaConfig literal without running the
+		// validate-and-default path. A hole in the list would be worse than a fallback: the
+		// strictest available answer is the default prefix.
 		unvalidated := KafkaConfig{HistoricalTopicPrefixes: []string{" ", "legacy", "legacy"}}
 
 		owned := unvalidated.OwnedTopicPrefixes()
@@ -4217,16 +3839,8 @@ func TestValidateKafkaHistoricalTopicPrefixes_NormalisesTheAllowlistAndRefusesAn
 	})
 }
 
-// TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod covers the conversion and the
-// one input that would be catastrophic to honour.
-//
-// The configured value is DAYS and every consumer needs a duration, so the conversion is where
-// an order-of-magnitude error hides — hours instead of days would delete rows an operator
-// expected to keep for a month, irreversibly and with no error to notice. A NEGATIVE value is
-// worse still: read literally it places the cutoff in the FUTURE, which makes every terminal
-// row eligible including ones delivered seconds ago. It is almost certainly a typo, and the
-// most destructive possible reading of a typo is not the one to take, so it is refused and
-// retention is disabled instead.
+// TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod covers the conversion
+// and the one input that would be catastrophic to honour.
 func TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		days     int
@@ -4270,10 +3884,8 @@ func TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod(t *testing.T
 // TestEventRetentionDays_ResolvesFromBothEnvironmentVariableForms asserts the retention
 // variable follows the same dual-name contract as the other eight.
 //
-// The bare RELAY_EVENT_RETENTION_DAYS is the documented name, and the BLNK_-prefixed form is
-// the repository's own convention. Both must resolve, or an operator following either the
-// documentation or the surrounding convention would find retention silently switched off —
-// and the symptom of that is a table that just keeps growing.
+// The bare RELAY_EVENT_RETENTION_DAYS is the documented name, and the BLNK_-prefixed
+// form is the repository's own convention.
 func TestEventRetentionDays_ResolvesFromBothEnvironmentVariableForms(t *testing.T) {
 	for name, variable := range map[string]string{
 		"the documented bare name":             "RELAY_EVENT_RETENTION_DAYS",
@@ -4302,31 +3914,9 @@ func TestEventRetentionDays_ResolvesFromBothEnvironmentVariableForms(t *testing.
 	}
 }
 
-// TestEventRetentionPurgeCapacity_DefaultsAboveArrivalsAndResolvesFromBothEnvForms covers the
-// two settings PERF-P23 introduced, and covers them as CAPACITY rather than as two integers.
-//
-// # Why the default value is the assertion
-//
-// Purge capacity used to be a compile-time constant of 100 batches of 1,000 rows — 100,000 rows
-// an hour — whose own comment claimed it "overtakes any realistic arrival rate". At the rate
-// this system is validated against, 500 events a second, rows arrive at 1,800,000 an hour:
-// eighteen times faster. Capacity below arrivals does not slow growth, it permits it, and the
-// configured retention period is then never actually enforced however short it is set. So the
-// first subtest is arithmetic against that arrival rate, not a restatement of a literal — a
-// future change that lowered either factor back under peak would fail it.
-//
-// # Why zero defaults and unbounded has its own value
-//
-// An unset int field IS zero, so "I did not configure this" and "I want no ceiling" cannot both
-// be read from it. Zero is taken as unset and defaulted, because the bound is what stops the
-// first sweep after retention is enabled from attempting an entire historical backlog in one
-// pass beside a live relay — a deployment that never mentions the setting must keep that
-// protection. Asking for no ceiling is spelled EventRetentionUnboundedSweep, and every negative
-// normalises onto it so a reader downstream recognises one value rather than testing a sign.
-//
-// The batch SIZE has no such ambiguity and is simply defaulted: zero there would delete nothing
-// while still reporting healthy sweeps. Retention is switched off by its period, in one place,
-// and never by a capacity value.
+// TestEventRetentionPurgeCapacity_DefaultsAboveArrivalsAndResolvesFromBothEnvForms
+// covers the two purge settings, and covers them as CAPACITY rather than
+// as two integers.
 func TestEventRetentionPurgeCapacity_DefaultsAboveArrivalsAndResolvesFromBothEnvForms(t *testing.T) {
 	t.Run("the shipped defaults exceed the specified peak arrival rate", func(t *testing.T) {
 		clearEventStreamingEnv(t)
@@ -4460,15 +4050,8 @@ func TestEventRetentionPurgeCapacity_DefaultsAboveArrivalsAndResolvesFromBothEnv
 	})
 }
 
-// TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing pins the SAFE default of the
-// legacy transport's destination policy (SSRF-01).
-//
-// # Why this deserves its own test
-//
-// Every test that needs internal delivery sets this flag explicitly, so a change that made
-// it default to true would break nothing and be caught by nothing — while silently opening
-// loopback, RFC1918 and plain http on every deployment that never mentions it. The default is
-// the security property; the flag is only the exception to it.
+// TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing pins the SAFE default of
+// the legacy transport's destination policy.
 //
 // It is asserted after validateAndAddDefaults rather than on a bare literal, because a
 // default setter is exactly where such a change would be introduced.
@@ -4506,25 +4089,11 @@ func TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing(t *testing.T) {
 	})
 }
 
-// TestServerConfig_LoopbackCredentialIssuanceDefaultsToRefusing pins the default on the flag
-// that decides whether a plaintext loopback caller may be handed a one-time SASL password.
+// TestServerConfig_LoopbackCredentialIssuanceDefaultsToRefusing pins the default on the
+// flag that decides whether a plaintext loopback caller may be handed a one-time SASL
+// password.
 //
-// # Why the default is the whole point
-//
-// A loopback peer establishes only that the LAST hop stayed on the host. A reverse proxy on the
-// same host — nginx, Caddy, an Envoy or mesh sidecar — accepts a request from the internet,
-// possibly over plain http, and forwards it over 127.0.0.1, so from inside the process that
-// request cannot be told apart from an operator running curl in the container. Believing the peer
-// unconditionally therefore disclosed the password on whatever the earlier hop was, and it did so
-// on the deployment shape that is most common rather than on an exotic one.
-//
-// Only the deployment knows which shape it is, so this is a declaration with a deny-by-default
-// value — the same posture as TrustForwardedProto, which exists for the same reason on the same
-// endpoint. A default of true would re-enable the disclosure silently for every deployment that
-// never thought about it.
-//
-// The second sub-test is the other half: a default setter must not undo the local stack's
-// explicit opt-in, or `docker compose up` plus curl could never issue a credential.
+// A loopback peer establishes only that the LAST hop stayed on the host.
 func TestServerConfig_LoopbackCredentialIssuanceDefaultsToRefusing(t *testing.T) {
 	cnf := Configuration{
 		ProjectName: "Test Project",
@@ -4562,22 +4131,8 @@ func TestServerConfig_LoopbackCredentialIssuanceDefaultsToRefusing(t *testing.T)
 	})
 }
 
-// TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable is the test for the defect that
-// the event pipeline's designed diagnostics could not be switched on in a deployed binary.
-//
-// The relay's successful-publish line, the publisher's equivalent, the metrics collector's
-// per-tick summary and the consumer-lag retirement notice are all emitted at debug on
-// purpose — they are per-event or per-tick, and at 500 events a second a line saying "it
-// worked" is volume rather than observability. Nothing in the codebase called
-// logrus.SetLevel, though, so every built binary sat at logrus's default of info and those
-// lines were unreachable without recompiling: a delivery investigation had only failure
-// lines and batch counts to work from.
-//
-// Each sub-test below is one of the three outcomes the resolution has, and the third is the
-// one with teeth: BLANK MUST NOT TOUCH THE LOGGER. This runs from validateAndAddDefaults,
-// which MockConfig also calls, and several tests in the root package pin the level to
-// capture a debug-only line. An unconditional SetLevel here would undo those pins from
-// inside the configuration layer, and the failure would appear in an unrelated package.
+// TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable pins the rule that the
+// event pipeline's designed diagnostics can be switched on in a deployed binary.
 func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
 	t.Run("a stated level is applied and normalised", func(t *testing.T) {
 		for stated, want := range map[string]logrus.Level{
@@ -4586,9 +4141,9 @@ func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
 			" trace ": logrus.TraceLevel,
 			"warn":    logrus.WarnLevel,
 			"warning": logrus.WarnLevel,
-			// "error", "fatal" and "panic" are deliberately absent. They are not
-			// applied verbatim, because each of them suppresses the event relay's
-			// mandatory per-attempt records; they are raised to the floor instead, and
+			// "error", "fatal" and "panic" are deliberately absent. They are not applied
+			// verbatim, because each of them suppresses the event relay's mandatory per-attempt
+			// records; they are raised to the floor instead, and
 			// TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible covers them.
 		} {
 			t.Run(stated, func(t *testing.T) {
@@ -4688,15 +4243,10 @@ func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
 	})
 }
 
-// AAP R-4 requires the event relay to log the attempt count and error reason on EVERY
-// failed publish attempt. Those records are warnings, and logrus discards warnings
-// whenever the logger sits at error, fatal or panic — so three of the seven configurable
-// levels used to delete a mandatory audit trail, silently, with nothing in the log to
-// say anything had been withheld.
+// The contract requires the event relay to log the attempt count and error reason on
+// EVERY failed publish attempt.
 //
-// These assertions pin the floor that closes that gap. They are written against the
-// EFFECTIVE level rather than against the configuration string alone, because the string
-// is only a report: what decides whether the record survives is logrus.GetLevel().
+// These assertions pin the floor that closes that gap.
 func TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible(t *testing.T) {
 	pinLevel := func(t *testing.T, level logrus.Level) {
 		t.Helper()
@@ -4724,17 +4274,17 @@ func TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible(t *testing.T) {
 						stated, logrus.GetLevel())
 				}
 
-				// The field must report the level in force, not the one asked for.
-				// /metrics and support bundles read it, and a field claiming "error"
-				// while the logger runs at warn misleads exactly the person trying to
-				// work out why they can see more than they configured.
+				// The field must report the level in force, not the one asked for. /metrics and
+				// support bundles read it, and a field claiming "error" while the logger runs at
+				// warn misleads exactly the person trying to work out why they can see more than
+				// they configured.
 				if cnf.LogLevel != MINIMUM_LOG_LEVEL {
 					t.Errorf("Expected the field to report the effective level %q, got %q",
 						MINIMUM_LOG_LEVEL, cnf.LogLevel)
 				}
 
 				// The proof that matters: a warning emitted at this level is not
-				// discarded. This is the R-4 record's severity, exercised directly.
+				// discarded. This is the retry record's severity, exercised directly.
 				hook := logtest.NewGlobal()
 				defer hook.Reset()
 
@@ -4789,10 +4339,9 @@ func TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible(t *testing.T) {
 	})
 
 	t.Run("levels at or above the floor are untouched", func(t *testing.T) {
-		// The floor must not become a ceiling. trace and debug are the levels the
-		// LogLevel setting exists to make reachable, so clamping in the wrong direction
-		// would defeat the feature it was added for while still passing every
-		// assertion above.
+		// The floor must not become a ceiling. trace and debug are the levels the LogLevel
+		// setting exists to make reachable, so clamping in the wrong direction would defeat
+		// the feature it was added for while still passing every assertion above.
 		for stated, want := range map[string]logrus.Level{
 			"warn":  logrus.WarnLevel,
 			"info":  logrus.InfoLevel,
@@ -4822,11 +4371,10 @@ func TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible(t *testing.T) {
 // still looking right, because logrus orders its levels with the QUIET end at zero.
 // Reversing the test would clamp trace and debug away instead of error and panic.
 func TestClampLogLevel_RaisesOnlyTheLevelsThatSuppressMandatoryRecords(t *testing.T) {
-	// The constant is compared directly against the normalised LogLevel field, so it
-	// has to be the spelling logrus itself reports. logrus.ParseLevel accepts both
-	// "warn" and "warning" but String() only ever returns the latter, which makes
-	// "warn" a constant that parses correctly and then never equals the field it is
-	// meant to describe.
+	// The constant is compared directly against the normalised LogLevel field, so it has
+	// to be the spelling logrus itself reports. logrus.ParseLevel accepts both "warn" and
+	// "warning" but String() only ever returns the latter, which makes "warn" a constant
+	// that parses correctly and then never equals the field it is meant to describe.
 	t.Run("the constant is the spelling logrus reports", func(t *testing.T) {
 		if got := minimumVisibleLogLevel().String(); got != MINIMUM_LOG_LEVEL {
 			t.Errorf("MINIMUM_LOG_LEVEL is %q but the level it parses to reports %q; the "+
@@ -4866,13 +4414,9 @@ func TestClampLogLevel_RaisesOnlyTheLevelsThatSuppressMandatoryRecords(t *testin
 	}
 }
 
-// TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment pins the deployment surface of
-// the setting: an operator turning debug on does so with an environment variable, on a
-// running deployment, without editing blnk.json.
-//
-// Both the file value and the environment value are exercised, and the environment must WIN,
-// because that is the whole point of the variable — the file records what the deployment
-// normally runs at and the variable is how an investigation temporarily overrides it.
+// TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment pins the deployment surface
+// of the setting: an operator turning debug on does so with an environment variable, on
+// a running deployment, without editing blnk.json.
 func TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment(t *testing.T) {
 	previous := logrus.GetLevel()
 	t.Cleanup(func() { logrus.SetLevel(previous) })
@@ -4963,12 +4507,8 @@ func TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment(t *testing.T) {
 	})
 }
 
-// TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead covers the window InitConfig opens:
-// it calls logger() and THEN loads the file, and loading the file logs.
-//
-// Without the environment read inside logger(), the warnings emitted while a configuration is
-// being validated would be filtered by the PREVIOUS level — which is exactly backwards for
-// the run in which somebody has just turned debug on to find out what happens at start-up.
+// TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead covers the window InitConfig
+// opens: it calls logger() and THEN loads the file, and loading the file logs.
 func TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead(t *testing.T) {
 	previous := logrus.GetLevel()
 	t.Cleanup(func() { logrus.SetLevel(previous) })
@@ -5009,27 +4549,11 @@ func TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead(t *testing.T) {
 	})
 }
 
-// TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction is SEC-07's configuration half.
+// TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction is the production-credential rule's
+// configuration half.
 //
-// # What was wrong
-//
-// setDefaultValues substituted DEFAULT_TYPESENSE_KEY — the literal "blnk-api-key" — whenever no
-// key was configured, in every posture. That literal is published in this repository's compose
-// files and README, so it is known to everyone, and it grants full access to the search
-// collection holding indexed transaction, balance and identity records. A production deployment
-// that had merely forgotten BLNK_TYPESENSE_KEY therefore authenticated with a public credential.
-//
-// The substitution also destroyed the evidence: once applied, the field was non-empty, so no
-// later check could distinguish an operator's key from an invented one. That is why the fix is a
-// change of DECISION SITE and not just a change of value.
-//
-// # Why three arms rather than "require it"
-//
-// Each arm is a different deployment and a single rule gets one of them wrong. The local posture
-// must keep working — a local TypeSense is started with that very key and the whole test suite
-// runs there. A secure deployment that does not use search at all must not be refused startup
-// over a subsystem it never calls. A secure deployment that DOES use search must be refused,
-// because the only alternatives are a public credential or a stop, and a stop is correct.
+// setDefaultValues substituted DEFAULT_TYPESENSE_KEY — the literal "blnk-api-key" —
+// whenever no key was configured, in every posture.
 func TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction(t *testing.T) {
 	t.Run("an operator-supplied key is never touched, in either posture", func(t *testing.T) {
 		for _, secure := range []bool{false, true} {
@@ -5048,9 +4572,9 @@ func TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction(t *testing.T
 	})
 
 	t.Run("the local posture keeps the historical default", func(t *testing.T) {
-		// Unchanged behaviour, deliberately. The compose stack starts TypeSense with this key,
-		// the makefile targets rely on it and every test in this repository runs here; refusing
-		// would break all of them to protect a credential doing no work.
+		// Unchanged behaviour, deliberately. The compose stack starts TypeSense with this
+		// key, the makefile targets rely on it and every test in this repository runs here;
+		// refusing would break all of them to protect a credential doing no work.
 		cnf := eventStreamingBaseConfig()
 		cnf.Server.Secure = false
 		cnf.TypeSense = TypeSenseConfig{Dns: "http://localhost:8108"}
@@ -5082,18 +4606,18 @@ func TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction(t *testing.T
 			}
 		}
 
-		// AND the public literal must not have been left in the field on the way out. A refused
-		// configuration that still carries the credential would hand it to any caller that
-		// ignored the error.
+		// AND the public literal must not have been left in the field on the way out. A
+		// refused configuration that still carries the credential would hand it to any caller
+		// that ignored the error.
 		if cnf.TypeSenseKey != "" {
 			t.Errorf("Expected the key to stay empty on refusal, got %q", cnf.TypeSenseKey)
 		}
 	})
 
 	t.Run("a secure deployment not using search starts, with no key assumed", func(t *testing.T) {
-		// Search is optional in Blnk — an unset host means no indexing — so refusing here would
-		// stop every production deployment that does not run search, which is a worse defect
-		// than the one being fixed.
+		// Search is optional in Blnk — an unset host means no indexing — so refusing here
+		// would stop every production deployment that does not run search, which is a worse
+		// defect than the one being fixed.
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
 
@@ -5121,8 +4645,8 @@ func TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction(t *testing.T
 
 	t.Run("whitespace is not a credential", func(t *testing.T) {
 		// A variable set to spaces is an operator who meant to supply a value and did not.
-		// Accepting it would let the search client authenticate with " " and fail somewhere far
-		// less legible than here.
+		// Accepting it would let the search client authenticate with " " and fail somewhere
+		// far less legible than here.
 		cnf := eventStreamingBaseConfig()
 		cnf.Server.Secure = true
 		cnf.TypeSense = TypeSenseConfig{Dns: "http://typesense:8108"}
@@ -5134,24 +4658,10 @@ func TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction(t *testing.T
 	})
 }
 
-// TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit is SEC-14.
+// TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit is the finite default rate limit.
 //
-// # What was wrong
-//
-// The shipped defaults were 5,000,000 requests per second with a burst of 10,000,000, PER
-// CLIENT ADDRESS — tollbooth keys its limiter that way. No client can issue five million
-// requests a second against one instance, so the limiter never engaged. Rate limiting was
-// configured, was reported as configured, and did nothing: CWE-770, and worse than having no
-// limiter at all because it reads as present in every review of the configuration.
-//
-// # What is asserted
-//
-// That the default is FINITE and reachable — which is the whole property — and that it sits
-// above the throughput this project specifies for itself, so closing the security gap cannot
-// throttle a deployment operating at the volume Blnk is built for. The relationship between
-// burst and rate is asserted too, because this function applies the same 2× rule when only one
-// of the pair is supplied, and two different ratios in one function is how the next reader
-// concludes the numbers are arbitrary.
+// The shipped defaults were 5,000,000 requests per second with a burst of 10,000,000,
+// PER CLIENT ADDRESS — tollbooth keys its limiter that way.
 func TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit(t *testing.T) {
 	cnf := eventStreamingBaseConfig()
 
@@ -5179,7 +4689,7 @@ func TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit(t *testing.T) {
 			"so the limiter never engages and the control exists on paper only", rps)
 	}
 
-	// AND it must not throttle the throughput the project specifies for itself. AAP V-1 fixes
+	// AND it must not throttle the throughput the project specifies for itself. the contract fixes
 	// 500 events per second sustained, and the k6 harness drives exactly that from one host —
 	// which is one client address.
 	const specifiedThroughput = 500.0
@@ -5212,9 +4722,9 @@ func TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit(t *testing.T) {
 	})
 
 	t.Run("a tighter limit than the default is honoured, which is what makes the default a default", func(t *testing.T) {
-		// The point of asserting this: the fix must not have turned a default into a floor. An
-		// operator whose client identity IS resolvable should be able to go far tighter than
-		// 2,000, and nothing here may prevent it.
+		// The point of asserting this: the fix must not have turned a default into a floor.
+		// An operator whose client identity IS resolvable should be able to go far tighter
+		// than 2,000, and nothing here may prevent it.
 		tight := 10.0
 
 		cnf := eventStreamingBaseConfig()
@@ -5232,29 +4742,11 @@ func TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit(t *testing.T) {
 	})
 }
 
-// TestRelayConfig_RepairCapacityDefaultsAndResolves pins the capacity the two relay repair
-// passes run at (PERF-M06).
+// TestRelayConfig_RepairCapacityDefaultsAndResolves pins the capacity the two relay
+// repair passes run at.
 //
-// # What the numbers are for
-//
-// Two populations of outbox row are outside the publish claim's reach by design: rows whose
-// retry budget is spent and whose `<topic>.dlt` write also failed, and rows whose Kafka leg
-// finished and whose legacy webhook enqueue never succeeded. Both are EMPTY in normal operation
-// and fill during an OUTAGE, all at once — 15 minutes at the 500 events per second acceptance
-// rate is about 450,000 rows — so the capacity that clears them is a recovery-time property
-// rather than a throughput one, and it needs its own settings.
-//
-// # Why each assertion is here
-//
-// A zero or negative in any of the three would silently disable the only path that ever
-// revisits an event which reached no topic at all: no batch claims nothing, no per-tick bound
-// chains nothing, and no concurrency waits on a semaphore permit that never exists. So all
-// three default rather than being honoured, and there is deliberately no "off" value —
-// switching repair off has no legitimate use, unlike the retention sweep, whose PERIOD of zero
-// is the documented way to disable a destructive operation.
-//
-// Both environment name forms are asserted because the deployment contract publishes both: the
-// bare names the requirement mandates, and the repository's own BLNK_ prefix.
+// Both environment name forms are asserted because the deployment contract publishes
+// both: the bare names the requirement mandates, and the repository's own BLNK_ prefix.
 func TestRelayConfig_RepairCapacityDefaultsAndResolves(t *testing.T) {
 	t.Run("unset takes the shipped capacity", func(t *testing.T) {
 		clearEventStreamingEnv(t)
@@ -5280,8 +4772,8 @@ func TestRelayConfig_RepairCapacityDefaultsAndResolves(t *testing.T) {
 
 	t.Run("the shipped capacity clears an outage backlog", func(t *testing.T) {
 		// The arithmetic the defaults were chosen from, asserted so a future change to either
-		// number has to face it. 25 x 100 = 2,500 rows a tick; the superseded fixed batch of 20
-		// rows once per tick is what this replaced.
+		// number has to face it. 25 x 100 = 2,500 rows a tick; the superseded fixed batch of
+		// 20 rows once per tick is what this replaced.
 		perTick := DefaultRelayRepairMaxBatchesPerTick * DefaultRelayRepairBatchSize
 		if perTick < 1000 {
 			t.Errorf(
@@ -5356,25 +4848,14 @@ func TestRelayConfig_RepairCapacityDefaultsAndResolves(t *testing.T) {
 	})
 }
 
-// TestTrustsForwardedProtoFrom_RequiresBothTheDeclarationAndANamedPeer is the SEC-03 contract at
-// the configuration layer.
+// TestTrustsForwardedProtoFrom_RequiresBothTheDeclarationAndANamedPeer is the contract
+// at the configuration layer.
 //
-// # What was wrong
-//
-// The forwarded-HTTPS channel — the one that permits a one-time SASL password onto a connection
-// this process cannot see — was decided by BLNK_SERVER_TRUST_FORWARDED_PROTO alone. That flag is a
-// true statement about the intended path and says nothing about the request in hand: a caller that
-// reaches the process by any other route sends its own X-Forwarded-Proto and was believed.
-//
-// # Why the existing list rather than a new variable
-//
-// BLNK_SERVER_TRUSTED_PROXIES already names the proxies whose forwarded headers may be believed,
-// which is the same question about the same proxy. A second list could only let the two answers
-// disagree — a deployment trusting a proxy for the client address and not for the protocol, or the
-// reverse — and neither disagreement means anything an operator would have chosen.
-//
-// The table is exhaustive over the ways this can be answered wrongly, because every row of it
-// except the last two used to answer "trusted".
+// The forwarded-HTTPS channel — the one that permits a one-time SASL password onto a
+// connection this process cannot see — was decided by BLNK_SERVER_TRUST_FORWARDED_PROTO
+// alone. That flag is a true statement about the intended path and says nothing about
+// the request in hand: a caller that reaches the process by any other route sends its
+// own X-Forwarded-Proto and was believed.
 func TestTrustsForwardedProtoFrom_RequiresBothTheDeclarationAndANamedPeer(t *testing.T) {
 	t.Parallel()
 
@@ -5510,14 +4991,15 @@ func TestTrustsForwardedProtoFrom_RequiresBothTheDeclarationAndANamedPeer(t *tes
 	}
 }
 
-// TestValidateForwardedProtoTrust_RefusesADeclarationNothingScopes pins the start-up half.
+// TestValidateForwardedProtoTrust_RefusesADeclarationNothingScopes pins the start-up
+// half.
 //
-// A per-request refusal on its own is fail-closed and silent: the deployment runs, the flag reads
-// as effective in the ConfigMap, and the symptom is a 403 on somebody's credential request. So a
-// SECURE deployment that declares the channel without naming a proxy is refused at configuration
-// load, where the message can name the variable to set, and an insecure one is warned — the same
-// boundary resolveSearchCredential draws, and the reason the local stack and this suite are
-// unaffected.
+// A per-request refusal on its own is fail-closed and silent: the deployment runs, the
+// flag reads as effective in the ConfigMap, and the symptom is a 403 on somebody's
+// credential request. So a SECURE deployment that declares the channel without naming a
+// proxy is refused at configuration load, where the message can name the variable to
+// set, and an insecure one is warned — the same boundary resolveSearchCredential draws,
+// and the reason the local stack and this suite are unaffected.
 func TestValidateForwardedProtoTrust_RefusesADeclarationNothingScopes(t *testing.T) {
 	base := func() Configuration {
 		return Configuration{

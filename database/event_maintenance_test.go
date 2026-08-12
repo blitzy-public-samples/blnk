@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// event_maintenance_test.go covers the singleton claim behind PERF-P13.
+// event_maintenance_test.go covers the singleton claim behind leader election.
 //
 // These are REAL-DATABASE tests and they have to be. The whole mechanism is a Postgres
 // advisory lock and the session semantics of the connection it is pinned to — mutual exclusion
@@ -36,11 +36,7 @@ import (
 
 // testMaintenanceLockKey returns a key unique to one test run.
 //
-// NOT database.EventMaintenanceLockKey, deliberately. Advisory keys are global to the database
-// and this suite runs against a shared instance that may also have a real blnk server — and, in
-// this environment, sibling clones — competing for the production key. Using it here would make
-// these tests fail whenever something legitimate held the lease, which is the definition of a
-// flaky test. A per-run key tests the same mechanism in isolation.
+// NOT database.EventMaintenanceLockKey, deliberately.
 func testMaintenanceLockKey(t *testing.T) int64 {
 	t.Helper()
 
@@ -61,8 +57,8 @@ func TestTryAcquireEventMaintenanceLease_AdmitsExactlyOneHolder_RealDB(t *testin
 	t.Cleanup(func() { _ = first.Release(context.Background()) })
 
 	// THE POINT OF THE WHOLE MECHANISM: a second attempt on the same key is refused, and
-	// refused with the sentinel rather than an error, because "another replica is the leader"
-	// is an ordinary answer that N-1 replicas of N receive on every attempt.
+	// refused with the sentinel rather than an error, because "another replica is the
+	// leader" is the ordinary answer every replica but one receives on every attempt.
 	second, err := ds.TryAcquireEventMaintenanceLease(ctx, key)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrEventMaintenanceLeaseHeld,
@@ -122,11 +118,11 @@ func TestEventMaintenanceLease_ReleaseIsIdempotentAndNilSafe_RealDB(t *testing.T
 }
 
 func TestEventMaintenanceLease_ReleasedByTheDatabaseWhenTheSessionDies_RealDB(t *testing.T) {
-	// THE FAILOVER GUARANTEE, and the reason an advisory lock was chosen over a lease table:
-	// leadership is surrendered by the DATABASE when the session ends, so a replica that is
-	// killed, OOMed or partitioned stops being the leader without having to notice or agree.
-	// Simulated here by terminating the holder's backend, which is what a network partition or
-	// a proxy reset looks like from the database's side.
+	// THE FAILOVER GUARANTEE, and the reason an advisory lock was chosen over a lease
+	// table: leadership is surrendered by the DATABASE when the session ends, so a replica
+	// that is killed, OOMed or partitioned stops being the leader without having to notice
+	// or agree. Simulated here by terminating the holder's backend, which is what a
+	// network partition or a proxy reset looks like from the database's side.
 	holder := openRealTestDB(t)
 	ctx := context.Background()
 	key := testMaintenanceLockKey(t)
@@ -149,9 +145,9 @@ func TestEventMaintenanceLease_ReleasedByTheDatabaseWhenTheSessionDies_RealDB(t 
 	`, key)
 	require.NoError(t, err)
 
-	// The holder must now discover it is no longer the leader when it asks. This is exactly
-	// what holdEventMaintenanceLease checks on its verify tick, and what makes it stop the
-	// collector and the sweeper instead of running them beside the new leader's.
+	// The holder must now discover it is no longer the leader when it asks. This is
+	// exactly what holdEventMaintenanceLease checks on its verify tick, and what makes it
+	// stop the collector and the sweeper instead of running them beside the new leader's.
 	require.Eventually(t, func() bool {
 		return !lease.StillHeld(ctx)
 	}, 5*time.Second, 100*time.Millisecond,

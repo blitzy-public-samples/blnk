@@ -240,7 +240,7 @@ print it:
 
 ```bash
 umask 077
-resp="$(mktemp)"                 # created 0600 by umask, in the user's private temp dir
+resp="$(mktemp)"                 # created 0600 by umask, in $TMPDIR (often the shared /tmp)
 trap 'rm -f "$resp"' EXIT INT TERM   # removed even if the shell is interrupted
 
 curl -sS -X POST --config "$BLNK_CURL_CONFIG" \
@@ -654,7 +654,7 @@ This was the riskiest constraint on the stage-2 deletion above, because getting 
 
 | Symbol | Now declared in | Why it outlives the transport |
 |---|---|---|
-| `NewWebhook` | `event_outbox.go` | The two-key payload object. It defines the bytes every subscriber parses, on either transport, and is carried verbatim as the `payload` member of every `LedgerEvent`. Twelve surviving non-test files depend on it. |
+| `NewWebhook` | `event_outbox.go` | The two-key payload object. It defines the bytes every subscriber parses, on either transport, and is carried verbatim as the `payload` member of every `LedgerEvent`. Every producer call site constructs it. |
 | `getEventFromStatus` | `event_topics.go` | Maps a transaction's status to its event name, and so defines the `transaction.*` event vocabulary that decides which topic a transaction event is published to. Three surviving non-test files call it. |
 
 Both were file moves inside package `blnk`: no import changed and no call site was edited. Doing it ahead of the deletion release rather than as that release's first act means **stage 2 is now a pure deletion** — nobody has to rescue two symbols from a 1,300-line file while removing it. Nothing else in `webhooks.go` outlives it; the checklist at the foot of that file says so and says to confirm it with a build rather than by reading.

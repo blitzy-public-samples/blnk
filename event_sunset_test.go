@@ -49,9 +49,9 @@ func storeSunsetDate(t *testing.T, raw string) {
 
 			return
 		}
-		// Nothing was published before this test. Leaving the test's sunset date in
-		// place could influence later tests, so publish an empty configuration —
-		// strictly closer to the original state than a configured sunset date.
+		// Nothing was published before this test. Leaving the test's sunset date in place
+		// could influence later tests, so publish an empty configuration — strictly closer to
+		// the original state than a configured sunset date.
 		config.ConfigStore.Store(&config.Configuration{})
 	})
 
@@ -60,18 +60,12 @@ func storeSunsetDate(t *testing.T, raw string) {
 	config.ConfigStore.Store(&config.Configuration{WebhookDeprecationSunsetDate: raw})
 }
 
-// storeDeprecationWindow publishes BOTH ends of the dual-delivery window for one test and
-// restores whatever was there before.
+// storeDeprecationWindow publishes BOTH ends of the dual-delivery window for one test
+// and restores whatever was there before.
 //
-// It exists because the window predicate reads both ends, so a test that set only the sunset
-// would be asserting against a start DERIVED as sunset minus 30 days — which is correct
-// behaviour and a confusing fixture: a sunset far in the future then places "now" BEFORE the
-// window rather than inside it, and a test meaning "the window is open" would silently be
-// testing "the window has not opened".
-//
-// The pair is written verbatim rather than validated here. config refuses a window that is
-// not exactly 30 days when it LOADS one; this writes to the store directly, exactly as
-// storeSunsetDate does, so a test can also pin a deliberately inconsistent pair.
+// The pair is written verbatim rather than validated here. config refuses a window that
+// is not exactly 30 days when it LOADS one; this writes to the store directly, exactly
+// as storeSunsetDate does, so a test can also pin a deliberately inconsistent pair.
 //
 // Parameters:
 //   - t *testing.T: the test, for the restore.
@@ -98,8 +92,8 @@ func storeDeprecationWindow(t *testing.T, start, sunset time.Time) {
 	})
 }
 
-// restoreFetchConfiguration snapshots the package's configuration seam and puts it
-// back when the test finishes.
+// restoreFetchConfiguration snapshots the package's configuration seam and puts it back
+// when the test finishes.
 //
 // Tests that need a configuration shape the global store cannot hold — brokers
 // configured alongside a deliberately unusable sunset window, which
@@ -127,9 +121,9 @@ func mustParseSunset(t *testing.T, value string) time.Time {
 func TestWebhookSunsetPassed_UnsetDateHasNotPassed(t *testing.T) {
 	storeSunsetDate(t, "")
 
-	// The safe default: with no sunset configured, dual delivery keeps running and
-	// the deprecated webhook routes keep answering normally. Probing instants far
-	// apart proves the answer does not depend on the clock at all.
+	// The safe default: with no sunset configured, dual delivery keeps running and the
+	// deprecated webhook routes keep answering normally. Probing instants far apart proves
+	// the answer does not depend on the clock at all.
 	assert.False(t, WebhookSunsetPassed(time.Now()))
 	assert.False(t, WebhookSunsetPassed(time.Unix(0, 0).UTC()))
 	assert.False(t, WebhookSunsetPassed(time.Date(2999, time.December, 31, 23, 59, 59, 0, time.UTC)))
@@ -162,11 +156,9 @@ func TestWebhookSunsetPassed_FutureDateHasNotPassed(t *testing.T) {
 	assert.False(t, WebhookSunsetPassed(mustParseSunset(t, "2998-12-31T23:59:59Z")))
 }
 
-// TestWebhookSunsetPassed_BoundaryIsInclusiveToTheNanosecond pins the exact
-// semantics of the sunset instant. The instant itself belongs to the post-sunset
-// era, so the dual-delivery window is half-open: it ends at, and excludes, the
-// configured instant. Probing one nanosecond either side is what distinguishes an
-// at-or-after comparison from a strictly-after one.
+// TestWebhookSunsetPassed_BoundaryIsInclusiveToTheNanosecond pins the exact semantics
+// of the sunset instant. The instant itself belongs to the post-sunset era, so the
+// dual-delivery window is half-open: it ends at, and excludes, the configured instant.
 func TestWebhookSunsetPassed_BoundaryIsInclusiveToTheNanosecond(t *testing.T) {
 	const raw = "2026-06-15T12:30:45Z"
 	storeSunsetDate(t, raw)
@@ -181,12 +173,13 @@ func TestWebhookSunsetPassed_BoundaryIsInclusiveToTheNanosecond(t *testing.T) {
 		"one nanosecond after the sunset instant the sunset HAS passed")
 }
 
-// TestWebhookSunsetPassed_ThirtyDayDualDeliveryWindowBoundary checks the predicate for a
-// date configured 30 days out: the legacy transport is in use from the moment the window
-// opens until the instant before the sunset, and retired from the sunset on. Nothing in
-// the code records the opening instant or enforces the interval — configuring the date 30
-// days ahead is the operator's responsibility — so what is verified here is the boundary
-// behaviour of a correctly configured date, not duration enforcement.
+// TestWebhookSunsetPassed_ThirtyDayDualDeliveryWindowBoundary checks the predicate for
+// a date configured 30 days out: the legacy transport is in use from the moment the
+// window opens until the instant before the sunset, and retired from the sunset on.
+// Nothing in the code records the opening instant or enforces the interval —
+// configuring the date 30 days ahead is the operator's responsibility — so what is
+// verified here is the boundary behaviour of a correctly configured date, not duration
+// enforcement.
 func TestWebhookSunsetPassed_ThirtyDayDualDeliveryWindowBoundary(t *testing.T) {
 	windowOpens := mustParseSunset(t, "2026-01-01T00:00:00Z")
 	sunset := windowOpens.Add(30 * 24 * time.Hour)
@@ -255,8 +248,8 @@ func TestWebhookSunsetPassed_TrimsSurroundingWhitespace(t *testing.T) {
 	sunset := mustParseSunset(t, canonical)
 
 	// A trailing newline or stray space is a routine environment-file mistake. The
-	// configuration loader does not trim this field, so it must be tolerated here or
-	// a correct date would be read as malformed.
+	// configuration loader does not trim this field, so it must be tolerated here or a
+	// correct date would be read as malformed.
 	for _, raw := range []string{" " + canonical, canonical + "\n", "\t" + canonical + " \n"} {
 		storeSunsetDate(t, raw)
 
@@ -338,11 +331,9 @@ func TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath(t *testing.T
 		"the warning must carry the parse error itself, through the sanitized cause field")
 	assert.Nil(t, warning.Data[logrus.ErrorKey],
 		"logrus's raw error field is what rendered a dependency error verbatim; it must not return")
-	// The consequence, which is what an operator acts on. With no Kafka broker
-	// configured there is no dual-delivery window to end, so the stated consequence is
-	// that the deprecated routes keep answering. The Kafka-configured case states the
-	// opposite consequence and is asserted by
-	// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow.
+	// The consequence, which is what an operator acts on. With no Kafka broker configured
+	// there is no dual-delivery window to end, so the stated consequence is that the
+	// deprecated routes keep answering.
 	assert.Contains(t, warning.Message, "no Kafka broker is configured",
 		"the warning must say why the malformed value is being ignored rather than failing closed")
 	assert.Contains(t, warning.Message, "keep answering normally",
@@ -371,8 +362,8 @@ func TestWebhookSunsetInstant_MalformedDateWarnsOncePerDistinctValue(t *testing.
 
 	const fragment = "not a valid RFC3339 instant"
 
-	// No brokers configured, so a malformed value is a WARNING and resolves to
-	// "no transport to migrate to". The fail-closed path is asserted separately, by
+	// No brokers configured, so a malformed value is a WARNING and resolves to "no
+	// transport to migrate to". The fail-closed path is asserted separately, by
 	// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow.
 	first := &config.Configuration{WebhookDeprecationSunsetDate: "not-a-date"}
 	for i := 0; i < 5; i++ {
@@ -407,18 +398,10 @@ func TestWebhookSunsetInstant_NilConfigurationIsNotConfigured(t *testing.T) {
 	assert.True(t, date.IsZero())
 }
 
-// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow is the test
-// for the finding that the sunset used to fail OPEN.
+// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow pins the rule
+// that the sunset fails CLOSED.
 //
-// An unset or mis-typed WEBHOOK_DEPRECATION_SUNSET_DATE resolved to "the sunset has
-// not passed", which preserved legacy HTTP webhook delivery and the deprecated webhook
-// management surface indefinitely — on a deployment that had already moved to Kafka,
-// silently, with nothing to alert on. One typo cancelled the retirement of the
-// transport this whole feature replaces.
-//
-// The distinguishing fact is whether a Kafka transport exists. With brokers configured
-// there IS somewhere to have migrated to, so an unusable window fails closed. With no
-// brokers there is not, so "not passed" is simply the truth.
+// The distinguishing fact is whether a Kafka transport exists.
 func TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow(t *testing.T) {
 	unusable := []struct {
 		name   string
@@ -545,19 +528,11 @@ func TestWebhookSunsetDate_UnsetDateIsNotConfigured(t *testing.T) {
 	assert.True(t, date.IsZero())
 }
 
-// TestWebhookSunsetSnapshotAt_AnswersBothQuestionsFromOneResolution is C-14.
-//
-// # The defect
+// TestWebhookSunsetSnapshotAt_AnswersBothQuestionsFromOneResolution is the one-resolution rule.
 //
 // The HTTP guard needs two things — a Sunset header advertising the date, and a verdict
 // deciding whether to answer 410 — and it obtained them from two independent calls,
-// WebhookSunsetDate then WebhookSunsetPassed. Each re-reads the live configuration store,
-// which is replaced wholesale on reload, so a reload landing between them produced a single
-// response advertising date A while refusing under date B. A client reading the header was
-// told it had until A by the very response that had already applied B.
-//
-// The window is narrow, which is exactly why it must be closed structurally: it cannot be
-// reproduced on demand and would never be observed by watching for it.
+// WebhookSunsetDate then WebhookSunsetPassed.
 func TestWebhookSunsetSnapshotAt_AnswersBothQuestionsFromOneResolution(t *testing.T) {
 	const raw = "2026-06-15T12:30:45Z"
 	sunset := mustParseSunset(t, raw)
@@ -649,8 +624,8 @@ func TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant(t *testing.T) {
 
 	// The relay's dual-delivery branch, through the predicate the relay ACTUALLY calls
 	// rather than a negation composed here. Only the sunset is configured, so the window
-	// start is derived as sunset minus 30 days — which is why the earliest probe below sits
-	// exactly on the start rather than before it.
+	// start is derived as sunset minus 30 days — which is why the earliest probe below
+	// sits exactly on the start rather than before it.
 	relayDualDelivers := WebhookDualDeliveryActive
 	// The API guard's decision: the deprecated webhook routes answer 410 Gone from the
 	// sunset instant onwards.
@@ -713,8 +688,8 @@ func TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant(t *testing.T) {
 // Run under -race this fails if the guard is left unsynchronised.
 func TestWebhookSunsetPassed_IsSafeForConcurrentCallers(t *testing.T) {
 	// No brokers, so the malformed value resolves to sunsetAbsentNoTransport and the
-	// verdict is false. What is under test here is the warn suppressor's locking, not
-	// the verdict.
+	// verdict is false. What is under test here is the warn suppressor's locking, not the
+	// verdict.
 	storeSunsetDate(t, "definitely-not-a-date")
 
 	const callers = 32
@@ -786,10 +761,7 @@ var sunsetRawDateReaders = map[string]struct{}{
 
 // sunsetRawDateFieldIdents are the configuration fields holding the raw window values.
 //
-// BOTH ends are covered, not only the sunset. The window is a span, and requirement R-12
-// is about its length: a file that read the start date and compared it itself would be a
-// second decision about when dual delivery runs, which is the same divergence single
-// ownership of the sunset exists to prevent.
+// BOTH ends are covered, not only the sunset.
 var sunsetRawDateFieldIdents = []string{
 	"WebhookDeprecationSunsetDate",
 	"WebhookDeprecationStartDate",
@@ -933,14 +905,11 @@ func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
 // The dual-delivery window — both ends of it
 // ---------------------------------------------------------------------------
 
-// TestWebhookDualDeliveryWindowState_PlacesAnInstantInTheWindow pins all four states and
-// both boundaries.
+// TestWebhookDualDeliveryWindowState_PlacesAnInstantInTheWindow pins all four states
+// and both boundaries.
 //
-// The window is the half-open interval [start, sunset): the start instant is INSIDE and the
-// sunset instant is OUTSIDE. That asymmetry is what makes the span exactly the configured
-// number of days rather than a day either side of it, and both edges are asserted to the
-// nanosecond because an off-by-one here is a day of the wrong behaviour on the one day
-// anybody is watching.
+// The window is the half-open interval [start, sunset): the start instant is INSIDE and
+// the sunset instant is OUTSIDE.
 func TestWebhookDualDeliveryWindowState_PlacesAnInstantInTheWindow(t *testing.T) {
 	start := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 	sunset := start.Add(config.WebhookDualDeliveryWindow())
@@ -1003,16 +972,11 @@ func TestWebhookDualDeliveryWindowState_PlacesAnInstantInTheWindow(t *testing.T)
 	}
 }
 
-// TestWebhookDualDeliveryActive_ConsumesTheConfiguredStartDate is the regression guard on the
-// defect this predicate exists to fix.
+// TestWebhookDualDeliveryActive_ConsumesTheConfiguredStartDate is the regression guard
+// on the reason this predicate exists.
 //
-// WEBHOOK_DEPRECATION_START_DATE was resolved and validated by configuration and then read by
-// NOTHING: every decision looked at the sunset alone. A deployment whose relay began
-// publishing weeks before its declared start therefore ran both transports for weeks longer
-// than the 30 days its own configuration described, and no code disagreed with it.
-//
-// The two windows below share a sunset and differ only in their start, so the verdict can
-// only differ if the start is genuinely consulted.
+// WEBHOOK_DEPRECATION_START_DATE is resolved and validated by configuration, and a
+// decision that looked at the sunset alone would never read it.
 func TestWebhookDualDeliveryActive_ConsumesTheConfiguredStartDate(t *testing.T) {
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	sunset := now.Add(15 * 24 * time.Hour)
@@ -1036,13 +1000,8 @@ func TestWebhookDualDeliveryActive_ConsumesTheConfiguredStartDate(t *testing.T) 
 			"would break a transport that is still live")
 }
 
-// TestWebhookDualDeliveryWindowState_DerivesTheStartWhenOnlyTheSunsetIsConfigured asserts the
-// window is computable from either end alone.
-//
-// config.Configuration back-fills the start from the sunset when only the sunset is supplied,
-// and this reproduces that rule for a configuration published some other way — a test, or a
-// future reload path. Without the derivation such a configuration would have a window with no
-// beginning, and the state of any instant in it would be undefined.
+// TestWebhookDualDeliveryWindowState_DerivesTheStartWhenOnlyTheSunsetIsConfigured
+// asserts the window is computable from either end alone.
 func TestWebhookDualDeliveryWindowState_DerivesTheStartWhenOnlyTheSunsetIsConfigured(t *testing.T) {
 	sunset := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 	storeSunsetDate(t, sunset.Format(time.RFC3339))
@@ -1061,12 +1020,13 @@ func TestWebhookDualDeliveryWindowState_DerivesTheStartWhenOnlyTheSunsetIsConfig
 	assert.Equal(t, sunset, resolvedSunset)
 }
 
-// TestWebhookDualDeliveryWindowState_MalformedOrAbsentWindowIsUnavailable covers the state
-// that is neither inside nor outside a window, because there is no usable window at all.
+// TestWebhookDualDeliveryWindowState_MalformedOrAbsentWindowIsUnavailable covers the
+// state that is neither inside nor outside a window, because there is no usable window
+// at all.
 //
 // Both spellings resolve the same way and both fail closed for the legacy leg: an
-// unparseable window cannot be trusted to say the sunset has not passed, and enqueuing onto a
-// transport that may already be retired is worse than not enqueuing.
+// unparseable window cannot be trusted to say the sunset has not passed, and enqueuing
+// onto a transport that may already be retired is worse than not enqueuing.
 func TestWebhookDualDeliveryWindowState_MalformedOrAbsentWindowIsUnavailable(t *testing.T) {
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -1089,11 +1049,6 @@ func TestWebhookDualDeliveryWindowState_MalformedOrAbsentWindowIsUnavailable(t *
 
 // TestWebhookDualDeliveryWindowState_MalformedStartFallsBackToTheDerivedStart asserts a
 // mis-typed start date does not take the window with it.
-//
-// A malformed START is recoverable in a way a malformed SUNSET is not: the sunset determines
-// the window's length, so the start can be re-derived from it exactly as configuration does.
-// Falling back is therefore strictly better than failing closed here — it keeps delivering to
-// unmigrated subscribers — and the warning is what stops it being silent.
 func TestWebhookDualDeliveryWindowState_MalformedStartFallsBackToTheDerivedStart(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -1132,12 +1087,8 @@ func TestWebhookDualDeliveryWindowState_MalformedStartFallsBackToTheDerivedStart
 	assert.True(t, warned, "the malformed start must be warned about, or the fallback is silent")
 }
 
-// TestWebhookWindowPendingObstacle_ExplainsOnlyThePendingState asserts the refusal message a
-// process starts up with, and that it is produced for that state only.
-//
-// The message lives in this file because this file owns the window's vocabulary; a caller
-// composing it would be a second place that knew what the configured dates are called, which
-// the raw-read invariant rightly rejects.
+// TestWebhookWindowPendingObstacle_ExplainsOnlyThePendingState asserts the refusal
+// message a process starts up with, and that it is produced for that state only.
 func TestWebhookWindowPendingObstacle_ExplainsOnlyThePendingState(t *testing.T) {
 	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	sunset := start.Add(config.WebhookDualDeliveryWindow())
@@ -1176,32 +1127,10 @@ func TestWebhookWindowState_StringNamesEveryState(t *testing.T) {
 		"an unforeseen value must render legibly rather than as a bare integer")
 }
 
-// TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead is the M-4 guard, and it
-// is deterministic rather than a race probe.
+// TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead is the guard,
+// and it is deterministic rather than a race probe.
 //
-// # What could go wrong, stated precisely
-//
-// The window has two ends and they come from two INDEPENDENT configuration fields:
-// WebhookDeprecationSunsetDate, and WebhookDeprecationStartDate which overrides the derived start
-// when it is set. config.ConfigStore is an atomic.Value whose contents are replaced WHOLESALE on
-// reload, so composing the window out of two reads lets each end come from a different generation.
-//
-// That is not a cosmetic inconsistency. RFC 9745 §4 requires the Deprecation instant to precede
-// the Sunset instant, and both are rendered into the headers of ONE response by the HTTP guards.
-// A start taken from a generation whose dates are later than the sunset's generation produces a
-// response whose Deprecation header is AFTER its Sunset header — a protocol violation the response
-// carries with nothing to disclose it.
-//
-// # How the test forces the condition instead of waiting for it
-//
-// fetchConfiguration is replaced with a function that returns a DIFFERENT generation on every
-// call. Any implementation that reads twice therefore composes the window from two generations
-// every time, with no timing involved: the second read cannot help but return the later dates. An
-// implementation that reads once cannot see the second generation at all.
-//
-// The two generations are chosen so the failure is unmissable — generation two's START is a decade
-// AFTER generation one's SUNSET — so a two-read composition yields start > sunset rather than
-// merely a different-but-plausible pair.
+// That is not a cosmetic inconsistency.
 func TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead(t *testing.T) {
 	restoreFetchConfiguration(t)
 	sunsetParseWarnings.reset()
@@ -1258,30 +1187,11 @@ func TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead(t *te
 	assert.False(t, snapshot.Passed, "the probe instant is inside the first generation's window")
 }
 
-// TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead is the same
-// property for the OTHER consumer of the window, and it is the one that decides whether a
-// subscriber still receives an HTTP delivery.
+// TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead is the
+// same property for the OTHER consumer of the window, and it is the one that decides
+// whether a subscriber still receives an HTTP delivery.
 //
-// # What a second read costs here
-//
-// WebhookSunsetSnapshotAt drives the 410 guard and reads once. This predicate drives the relay's
-// legacy leg. When it resolved the sunset through one read and then re-read the store to derive
-// the start, the two ends of the window could come from different generations of
-// config.ConfigStore — which is an atomic.Value replaced WHOLESALE on reload, so any two reads
-// are two chances to see different contents. The pair that can then disagree is precisely the
-// pair requirement R-12 defines together: whether the legacy leg runs, and whether the webhook
-// routes answer 410. A reload landing between the two reads could stand the legacy leg down as
-// "pending" while the guard still answered 200, or the reverse, with nothing in either code path
-// able to report that the two had been decided from different configurations.
-//
-// # How the condition is forced rather than waited for
-//
-// The seam returns a LATER generation on every call after the first, so a second read cannot
-// help but observe it — no timing, no flakiness. The generations are chosen so the verdicts
-// differ rather than merely the dates: the probe instant is inside generation one's window
-// (ACTIVE) and a decade before generation two's start (PENDING). A two-read implementation
-// therefore answers PENDING and stops the legacy leg for a window that has not opened in any
-// configuration the process ever held.
+// WebhookSunsetSnapshotAt drives the 410 guard and reads once.
 func TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead(t *testing.T) {
 	restoreFetchConfiguration(t)
 	sunsetParseWarnings.reset()
@@ -1294,13 +1204,9 @@ func TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead
 		secondStart  = "2039-12-02T00:00:00Z"
 	)
 
-	// installFlippingSeam gives ONE entry point a store that answers with the first generation
-	// once and the later generation from then on, and reports how many times it was read.
-	//
-	// A fresh seam per sub-test is required rather than tidy: the flip is keyed on the read
-	// count, so a shared counter would leave the second entry point reading generation two on
-	// its FIRST read and every assertion after the first would be measuring the fixture instead
-	// of the code.
+	// installFlippingSeam gives ONE entry point a store that answers with the first
+	// generation once and the later generation from then on, and reports how many times it
+	// was read.
 	installFlippingSeam := func() *int {
 		reads := 0
 		fetchConfiguration = func() (*config.Configuration, error) {
@@ -1350,9 +1256,10 @@ func TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead
 	})
 
 	t.Run("the 410 guard agrees from its own single read", func(t *testing.T) {
-		// THE PAIR R-12 DEFINES TOGETHER, asserted as itself: whether the legacy leg runs and
-		// whether the webhook routes answer 410 are one decision taken twice, so each entry point
-		// reading one whole generation is what keeps them from disagreeing across a reload.
+		// THE PAIR THE SUNSET DEFINES TOGETHER, asserted as itself: whether the legacy leg runs and
+		// whether the webhook routes answer 410 are one decision taken twice, so each entry
+		// point reading one whole generation is what keeps them from disagreeing across a
+		// reload.
 		reads := installFlippingSeam()
 
 		snapshot := WebhookSunsetSnapshotAt(probe)
@@ -1366,13 +1273,10 @@ func TestWebhookDualDeliveryWindowState_PlacesTheInstantFromOneConfigurationRead
 	})
 }
 
-// TestWebhookDeprecationWindow_AgreesWithTheSnapshot pins the two public readings of one window to
-// each other.
+// TestWebhookDeprecationWindow_AgreesWithTheSnapshot pins the two public readings of
+// one window to each other.
 //
-// They are separate entry points — the guards take a snapshot, while startup logging and the
-// relay's refusal message take the window — and they used to resolve independently, so they could
-// describe different windows to an operator reading a log line and a client reading a header. They
-// now share one resolver, and this is what holds them to it.
+// They now share one resolver, and this is what holds them to it.
 func TestWebhookDeprecationWindow_AgreesWithTheSnapshot(t *testing.T) {
 	restoreFetchConfiguration(t)
 	sunsetParseWarnings.reset()
@@ -1416,16 +1320,15 @@ func TestWebhookDeprecationWindow_AgreesWithTheSnapshot(t *testing.T) {
 
 // terminalReleaseHeading is the checklist's heading in the published migration guide.
 //
-// The heading is matched literally because the test derives everything else from the section
-// under it: renaming the heading without updating this constant would silently reduce the whole
-// guard to nothing, so the require below fails loudly instead.
+// The heading is matched literally because the test derives everything else from the
+// section under it: renaming the heading without updating this constant would silently
+// reduce the whole guard to nothing, so the require below fails loudly instead.
 const terminalReleaseHeading = "### The terminal release: the deletion checklist"
 
 // terminalReleasePreserveMarker separates the checklist's two tables.
 //
-// Everything before it is what the release DELETES; everything after it is what the release must
-// leave alone. Both halves are asserted the same way — the difference is which direction a stale
-// row fails in — so one marker is all the parser needs.
+// Everything before it is what the release DELETES; everything after it is what the
+// release must leave alone.
 const terminalReleasePreserveMarker = "**Preserve."
 
 // terminalReleaseRow is one parsed row: the artifacts it names, and the files it says they live
@@ -1443,10 +1346,6 @@ type terminalReleaseRow struct {
 }
 
 // backtickedTokens returns the tokens a markdown cell wraps in backticks.
-//
-// Splitting on the backtick and taking the odd indices is exact for this input and needs no
-// regexp: a cell with unbalanced backticks would yield a trailing token, and a token that is not
-// an identifier fails the assertions below rather than passing silently.
 func backtickedTokens(cell string) []string {
 	parts := strings.Split(cell, "`")
 	tokens := make([]string, 0, len(parts)/2)
@@ -1530,34 +1429,26 @@ func terminalReleaseChecklist(t *testing.T) ([]terminalReleaseRow, []terminalRel
 	return deletes, preserves
 }
 
-// TestWebhookTerminalRelease_ChecklistMatchesTheSurface is what turns the deferred deletion from
-// an acknowledgement into an obligation.
+// TestWebhookTerminalRelease_ChecklistMatchesTheSurface is what turns the deferred
+// deletion from an acknowledgement into an obligation.
 //
-// # Why the deletion is deferred at all
+// The sunset has two halves that run in sequence: both transports deliver from
+// the same outbox rows for the fixed window, and only after it closes is the delivery
+// source removed.
 //
-// Requirement R-12 has two halves that run in sequence: both transports deliver from the same
-// outbox rows for the fixed window, and only after it closes is the delivery source removed. The
-// project's plan places these deletions as the feature's TERMINAL step for that reason — during
-// the window the legacy functions must exist, because the payload-equivalence check needs a live
-// second transport to compare against and the 410 is a runtime decision rather than a consequence
-// of deleted source. Deleting them now would break the window the same requirement mandates.
-//
-// # Why a comment saying so is not enough
-//
-// A deferral recorded only in prose decays in both directions. The prose can name symbols that
-// have since been renamed or deleted, so the release is performed against a stale list; or the
-// transport can grow a new exported symbol that no list mentions, so the release leaves it behind.
-// Both failures are invisible until someone performs the release.
+// A deferral recorded only in prose decays in both directions.
 //
 // This test closes both directions against the PUBLISHED checklist:
 //
-//   - every file the checklist names must exist, and every artifact must be findable in the file
-//     the checklist says holds it — so performing the release forces the table to be edited in the
-//     same change, and a rename cannot leave the table pointing at nothing;
-//   - every EXPORTED symbol the legacy transport declares must be named in the checklist — so a
-//     new one cannot escape the release;
-//   - the preserve half must still be intact — so a release that over-applies its own delete half
-//     fails here rather than silently disabling transaction hooks and search indexing.
+//   - every file the checklist names must exist, and every artifact must be findable in
+//     the file the checklist says holds it — so performing the release forces the table
+//     to be edited in the same change, and a rename cannot leave the table pointing at
+//     nothing;
+//   - every EXPORTED symbol the legacy transport declares must be named in the
+//     checklist — so a new one cannot escape the release;
+//   - the preserve half must still be intact — so a release that over-applies its own
+//     delete half fails here rather than silently disabling transaction hooks and
+//     search indexing.
 func TestWebhookTerminalRelease_ChecklistMatchesTheSurface(t *testing.T) {
 	root := moduleRootDir(t)
 	deletes, preserves := terminalReleaseChecklist(t)
@@ -1668,9 +1559,7 @@ func TestWebhookTerminalRelease_ChecklistMatchesTheSurface(t *testing.T) {
 // exportedTopLevelNames collects the exported top-level declarations of a parsed file:
 // functions and methods, and every name in a type, const or var declaration.
 //
-// Methods are included by their own name rather than qualified by receiver. The checklist names
-// SendWebhook and ProcessWebhook without receivers, which is how a release performing a text
-// search for them would look for them.
+// Methods are included by their own name rather than qualified by receiver.
 //
 // Parameters:
 //   - file *ast.File: the parsed source.

@@ -30,39 +30,8 @@ import (
 )
 
 // This file guards the LOCAL PROVISIONING PROJECTION: what the automatic Kafka bring-up
-// hands scripts/kafka-provision.sh, and what that makes the script do with a credential.
-//
-// It exists because the defect it guards had no compile error and no failing test to reveal
-// it. The sample subscriber's SASL password was simply left unset, the script read that as
-// "generate one", and a generated password is printed — correctly, for a human who asked for
-// it. What made that a security finding rather than a feature is WHERE it was printed from:
-// the kafka-init service runs unattended on every `docker compose up`, and its stdout is the
-// service log, which Docker retains for the lifetime of the container. A SASL credential
-// nobody asked to see was therefore recorded durably, readable by anyone who can reach the
-// daemon, and re-readable long after the run.
-//
-// # How it is closed, and why NOT by shipping a password
-//
-// The first fix considered was to ship a known password as the compose default, so the script
-// took its "supplied" path and printed nothing. That closes the log disclosure and opens a
-// worse one: a credential with a default in a committed file is a credential in every clone of
-// this repository, identical on every developer's broker, and one copy-paste away from a
-// deployment that is not loopback-bound. TestCompose_NoKafkaCredentialIsKnownFromSource
-// forbids it for exactly that reason.
-//
-// So the disclosure is closed in the SCRIPT instead, which is where it can be closed
-// completely: kafka-provision.sh will not print a generated credential at all. Given a
-// supplied secret it applies it and never echoes it; given a destination file it writes the
-// generated value there at mode 0600 and reports only the path; given neither it SKIPS the
-// sample principal and says what to set. The topic catalogue — the part the relay actually
-// needs — is assured either way, so a bring-up carrying no .env still succeeds. `./stack.sh
-// --init` generates the value into a mode-0600 .env, which is the intended local route.
-//
-// The assertions below therefore pin: no shipped literal, no path that invents its own value,
-// and no path that can print one.
-//
-// Every assertion below reads the compose files, stack.sh and the provisioning script AS DATA,
-// so the whole file runs in CI with no Docker and no broker.
+// hands scripts/kafka-provision.sh, and what that makes the script do with a
+// credential.
 
 // composeFilesWithKafkaInit are the two compose projections that run the provisioning
 // one-shot. They are maintained by hand as parallel files, so every assertion here runs
@@ -73,13 +42,11 @@ var composeFilesWithKafkaInit = []string{"docker-compose.yaml", "docker-compose.
 // provisioning script generates a password or is given one.
 const sampleSubscriberSecretVar = "KAFKA_SAMPLE_SUBSCRIBER_SECRET"
 
-// kafkaInitEnvironment returns the kafka-init service's environment block from composeFile.
+// kafkaInitEnvironment returns the kafka-init service's environment block from
+// composeFile.
 //
-// The values are returned RAW — as `${NAME:-default}` interpolation expressions rather than
-// as resolved values — because that is precisely what is under test. Resolving them (with
-// `docker compose config`, say) would answer "what does this evaluate to on this machine
-// right now", when the question is "what does this evaluate to on a machine that has set
-// nothing", which is every first bring-up.
+// The values are returned RAW — as `${NAME:-default}` interpolation expressions rather
+// than as resolved values — because that is precisely what is under test.
 //
 // Parameters:
 //   - t *testing.T: failed when the file, the service or the block is missing.
@@ -111,7 +78,8 @@ func kafkaInitEnvironment(t *testing.T, composeFile string) map[string]string {
 	return environment
 }
 
-// composeDefault splits a `${NAME:-default}` expression into its operator and its default.
+// composeDefault splits a `${NAME:-default}` expression into its operator and its
+// default.
 //
 // The OPERATOR is returned because the difference between `:-` and `-` is the whole
 // assertion in one of the tests below and is invisible on a casual read.
@@ -144,21 +112,13 @@ func composeDefault(t *testing.T, expression string) (string, string) {
 	return "-", def
 }
 
-// TestKafkaInitService_NeverPrintsAGeneratedPasswordIntoTheServiceLog is the F-20 guard.
+// TestKafkaInitService_NeverPrintsAGeneratedPasswordIntoTheServiceLog is the guard.
 //
-// Two properties together are the fix, and each is inert without the other.
+// Two properties together close the disclosure, and each is inert without the other.
 //
-// THE COMPOSE DEFAULT MUST BE EMPTY. A literal here would be a credential in every clone of
-// this repository; TestCompose_NoKafkaCredentialIsKnownFromSource forbids it. The key must
-// still be PASSED, though, and passed with the `:-` operator: the script's own defaulting uses
-// ${VAR:-...}, so a key omitted from this block is a key the script cannot receive at all, and
-// `${VAR-default}` would substitute only for an UNSET name while .env.example ships Kafka
-// credentials blank rather than absent.
+// THE COMPOSE DEFAULT MUST BE EMPTY.
 //
-// THE SCRIPT MUST REFUSE TO PRINT. With the default empty, the unattended path is the one
-// where no secret was supplied — so the guarantee has to live in the script: it delivers a
-// generated credential to a mode-0600 file and nowhere else, and with no file configured it
-// provisions no credential at all rather than printing one.
+// THE SCRIPT MUST REFUSE TO PRINT.
 func TestKafkaInitService_NeverPrintsAGeneratedPasswordIntoTheServiceLog(t *testing.T) {
 	for _, composeFile := range composeFilesWithKafkaInit {
 		t.Run(composeFile, func(t *testing.T) {
@@ -195,10 +155,9 @@ func TestKafkaInitService_NeverPrintsAGeneratedPasswordIntoTheServiceLog(t *test
 
 	// The helper this used to name was deliver_generated_secret. It is now a PAIR —
 	// stage_generated_secret before the broker is altered and commit_staged_secret after —
-	// because delivery has to be PROVEN POSSIBLE before a credential is activated: a broker
-	// that accepted a credential whose file could not then be written leaves a live account
-	// with an unrecoverable password. Both halves are asserted, so the split cannot silently
-	// collapse back into a single post-mutation write.
+	// because delivery has to be PROVEN POSSIBLE before a credential is activated: a
+	// broker that accepted a credential whose file could not then be written leaves a live
+	// account with an unrecoverable password.
 	assert.Contains(t, script, "stage_generated_secret",
 		"the script must stage a generated credential into a mode-0600 file BEFORE altering the "+
 			"broker; a printf of the value is what put a password into the container log, and a "+
@@ -218,19 +177,8 @@ func TestKafkaInitService_NeverPrintsAGeneratedPasswordIntoTheServiceLog(t *test
 			"and the compose gate then held the server and worker back too")
 }
 
-// TestSampleSubscriberSecret_IsNeverInventedByAnAutomaticProvisioningPath guards a divergence
-// that a per-path default would make possible.
-//
-// Three automatic paths provision the same principal on the same broker: the kafka-init service
-// in each compose file, and stack.sh's host fallback for when the CLI is not available inside
-// the compose projection. The script PRESERVES an existing credential, so whichever path runs
-// FIRST decides the live password, and a later run of a path carrying a different value upserts
-// over it. A developer's consumer then stops authenticating at an arbitrary later bring-up, with
-// the previous password valid at the moment they copied it and invalid afterwards, and nothing in
-// any log saying what changed it.
-//
-// The rule that removes the possibility is that NO path may invent a value: each passes the
-// operator's own through unchanged, so they cannot disagree whatever order they run in.
+// TestSampleSubscriberSecret_IsNeverInventedByAnAutomaticProvisioningPath guards a
+// divergence that a per-path default would make possible.
 func TestSampleSubscriberSecret_IsNeverInventedByAnAutomaticProvisioningPath(t *testing.T) {
 	for _, composeFile := range composeFilesWithKafkaInit {
 		_, secret := composeDefault(t, kafkaInitEnvironment(t, composeFile)[sampleSubscriberSecretVar])
@@ -242,16 +190,10 @@ func TestSampleSubscriberSecret_IsNeverInventedByAnAutomaticProvisioningPath(t *
 	stack, err := os.ReadFile(filepath.Join(moduleRootDir(t), "stack.sh"))
 	require.NoError(t, err, "stack.sh must be readable")
 
-	// The host fallback must FORWARD the variable rather than default it. The pass-through is an
-	// allowlist tested on DECLARATION, so an operator's value — including a deliberate empty one
-	// — crosses verbatim, and a name left off the list is silently replaced by the script's own
-	// default instead.
-	//
-	// ASSERTED AGAINST THE SCRIPT'S OWN INTERFACE rather than against a literal list in stack.sh,
-	// because stack.sh no longer has one: it reads "--print-interface-host" at startup, so the two
-	// cannot drift and the only meaningful question is whether these two names are IN that
-	// interface. This used to parse a literal array out of stack.sh, which is the sort of
-	// assertion that silently stops testing anything the moment the thing it parses moves.
+	// The host fallback must FORWARD the variable rather than default it. The pass-through
+	// is an allowlist tested on DECLARATION, so an operator's value — including a
+	// deliberate empty one — crosses verbatim, and a name left off the list is silently
+	// replaced by the script's own default instead.
 	forwarded := kafkaProvisionInterface(t, "--print-interface-host")
 
 	for _, variable := range []string{sampleSubscriberSecretVar, sampleSubscriberSecretFileVar} {
@@ -271,22 +213,11 @@ func TestSampleSubscriberSecret_IsNeverInventedByAnAutomaticProvisioningPath(t *
 			"test exists to prevent", sampleSubscriberSecretVar)
 }
 
-// TestGeneratedSampleSubscriberSecret_SatisfiesTheProvisioningScriptsCredentialFloors asserts
-// the value the supported route generates is one the script will actually accept.
+// TestGeneratedSampleSubscriberSecret_SatisfiesTheProvisioningScriptsCredentialFloors
+// asserts the value the supported route generates is one the script will actually
+// accept.
 //
-// This is where a well-meant edit does the most damage. Kafka's `--add-config` value grammar
-// splits on `,` and `=` with no escape sequence at all, and the JAAS properties value ends at
-// the first unescaped `"` and terminates at `;` — so the script REFUSES a password containing
-// any of them rather than escaping it, and dies before touching the broker. It also enforces a
-// length and a distinct-character floor. `./stack.sh --init` is the documented way to obtain
-// this credential, so a generator that drew from a wider alphabet would turn every local
-// bring-up into a hard provisioning failure whose message names the variable but, correctly,
-// not the value.
-//
-// The alphabet is READ FROM THE SCRIPT rather than restated here. Restating it would create a
-// second copy of a rule that already exists in exactly one place, and the copy would be the one
-// that went stale — leaving this test certifying a generator against an alphabet the script no
-// longer enforces.
+// This is where a well-meant edit does the most damage.
 func TestGeneratedSampleSubscriberSecret_SatisfiesTheProvisioningScriptsCredentialFloors(t *testing.T) {
 	script := readProvisioningScript(t)
 
@@ -309,8 +240,9 @@ func TestGeneratedSampleSubscriberSecret_SatisfiesTheProvisioningScriptsCredenti
 	require.NoError(t, err, "stack.sh must be readable")
 
 	// ONE GENERATOR, and every Kafka credential --init writes must come from it. A second
-	// generator is how one of the three credentials ends up drawn from a wider alphabet than the
-	// script accepts, which is a failure the operator cannot diagnose from the message.
+	// generator is how one of the three credentials ends up drawn from a wider alphabet
+	// than the script accepts, which is a failure the operator cannot diagnose from the
+	// message.
 	assert.Contains(t, string(stack), "generate_kafka_secret",
 		"stack.sh must generate Kafka credentials through a helper that enforces the script's floors")
 
@@ -337,9 +269,6 @@ func TestGeneratedSampleSubscriberSecret_SatisfiesTheProvisioningScriptsCredenti
 
 // expandCharacterClass expands a tr-style character class such as "A-Za-z0-9" into the
 // individual characters it matches.
-//
-// Ranges are expanded rather than pattern-matched so that a class widened by one character —
-// the way an alphabet quietly acquires "+/" — is caught as a concrete counterexample.
 func expandCharacterClass(t *testing.T, class string) []string {
 	t.Helper()
 
@@ -376,26 +305,14 @@ func readProvisioningScript(t *testing.T) string {
 // written to. It is the only channel the script will deliver a generated password over.
 const sampleSubscriberSecretFileVar = "KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE"
 
-// stubbedKafkaCLI writes fake kafka-topics, kafka-configs and kafka-acls onto a directory it
-// returns, along with the path of the file every invocation is appended to.
-//
-// # Why the script is EXECUTED rather than read
-//
-// Every other assertion in this file inspects the script's text, and text is the wrong
-// instrument for finding F-11. The defect was not a missing string — it was a control-flow
-// outcome: a failed `--describe` fell through to the arm that generates a password and upserts
-// it, so a working credential was rotated with nothing asked for and nothing reported. Only
-// running the thing shows which arm was taken, and the evidence that matters is the ABSENCE of
-// an `--alter --add-config 'SCRAM-...'` call for either principal.
-//
-// The stubs make the whole run succeed except the user describe, which is exactly the shape of
-// an unreachable broker or an admin principal without DescribeConfigs: topics list and create
-// fine, ACLs are added fine, and only the credential probe fails.
+// stubbedKafkaCLI writes fake kafka-topics, kafka-configs and kafka-acls onto a
+// directory it returns, along with the path of the file every invocation is appended
+// to.
 //
 // Parameters:
 //   - t *testing.T: owns the temporary directory's lifetime.
-//   - describeExit int: the exit status the stub returns for `--describe --entity-type users`.
-//     Zero makes the probe determinate; non-zero makes it indeterminate.
+//   - describeExit int: the exit status the stub returns for `--describe --entity-type
+//     users`.
 //   - describeOutput string: what that call prints, so a determinate probe can report a
 //     credential as present or absent.
 //
@@ -408,12 +325,8 @@ func stubbedKafkaCLI(t *testing.T, describeExit int, describeOutput string) (str
 	dir := t.TempDir()
 	invocations := filepath.Join(dir, "invocations.log")
 
-	// One stub body serves all three tools. It records its own name and every argument, then
-	// branches only on the case this test cares about.
-	//
-	// `kafka-configs --describe --entity-type users` is the probe. Everything else — topic
-	// creation, ACL addition, and any credential ALTER — succeeds silently, because the point
-	// is to prove the alter is never ISSUED, not that it would have failed.
+	// One stub body serves all three tools. It records its own name and every argument,
+	// then branches only on the case this test cares about.
 	stub := "#!/usr/bin/env bash\n" +
 		"printf '%s' \"$(basename \"$0\")\" >> " + invocations + "\n" +
 		"for arg in \"$@\"; do printf ' %s' \"$arg\" >> " + invocations + "; done\n" +
@@ -456,13 +369,11 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
-// runProvisioningScript executes scripts/kafka-provision.sh against stubbed CLIs and returns
-// its combined output, the recorded invocations, and whether it exited zero.
+// runProvisioningScript executes scripts/kafka-provision.sh against stubbed CLIs and
+// returns its combined output, the recorded invocations, and whether it exited zero.
 //
 // The environment is built from scratch rather than inherited, so an ambient .env or a
-// developer's KAFKA_* variables cannot change what is being tested. PATH carries the stub
-// directory first and the real toolchain after it, because the script itself runs `basename`,
-// `mktemp`, `chmod` and friends.
+// developer's KAFKA_* variables cannot change what is being tested.
 func runProvisioningScript(t *testing.T, stubDir string, extra map[string]string) (string, string, bool) {
 	t.Helper()
 
@@ -476,18 +387,18 @@ func runProvisioningScript(t *testing.T, stubDir string, extra map[string]string
 		// without needing a broker to exist.
 		"KAFKA_BOOTSTRAP_SERVER": "stub:9092",
 		"KAFKA_SASL_ADMIN_USER":  "admin",
-		// At least 32 characters from the allowed alphabet, which the script enforces before it
-		// touches the broker. A shorter literal is refused with a strength error and the run
-		// never reaches the probe this test is about.
-		// #nosec G101 -- a literal for a stubbed broker that is never contacted.
+		// At least 32 characters from the allowed alphabet, which the script enforces before
+		// it touches the broker. A shorter literal is refused with a strength error and the
+		// run never reaches the probe this test is about. #nosec G101 -- a literal for a
+		// stubbed broker that is never contacted.
 		"KAFKA_SASL_ADMIN_SECRET": "AdminSecretForTheStubbedBroker0123456789",
-		// The producer pair is supplied so the producer arm does not need the probe: this test
-		// is about the SUBSCRIBER's indeterminate probe unless a case overrides it.
+		// The producer pair is supplied so the producer arm does not need the probe: this
+		// test is about the SUBSCRIBER's indeterminate probe unless a case overrides it.
 		// #nosec G101 -- likewise a stub literal.
 		"KAFKA_PRODUCER_SECRET": "ProducerSecretForTheStubbedBroker0123456",
 		// A destination for a generated sample credential. Its presence is what makes the
-		// no-write property meaningful: without it the script would decline to generate for an
-		// unrelated reason and the test would pass vacuously.
+		// no-write property meaningful: without it the script would decline to generate for
+		// an unrelated reason and the test would pass vacuously.
 		sampleSubscriberSecretFileVar: secretFile,
 		// Keep the run fast: nothing here waits for a real broker.
 		"KAFKA_PROVISION_TIMEOUT_SECONDS":       "5",
@@ -516,26 +427,10 @@ func runProvisioningScript(t *testing.T, stubDir string, extra map[string]string
 	return string(output), secretFile, err == nil
 }
 
-// TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential is finding F-11, executed.
+// TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential is that finding,
+// executed.
 //
-// # The defect
-//
-// `kafka-configs --describe --entity-type users` can fail for reasons that say nothing about
-// the credential: an unreachable broker, an admin principal without DescribeConfigs, a TLS
-// failure, a missing CLI. The probe folded every one of those onto "absent" — and absent is the
-// branch that generates a password and upserts it whenever a secret-file destination is
-// configured. So an indeterminate probe silently ROTATED a working producer or subscriber
-// credential: no KAFKA_ROTATE_* asked for it, every consumer holding the old password stopped
-// authenticating, and the run reported success, because the broker accepts the new credential
-// and nothing compares it with the old one.
-//
-// # Why this test runs the script
-//
-// The property is the ABSENCE of a call, on a specific control-flow path. A text assertion can
-// check that a guard exists; only execution can show that the guard is REACHED before the arm
-// that writes. The stub therefore fails exactly the user describe and succeeds at everything
-// else, and the assertion is that no `--alter` carrying a SCRAM config was issued for either
-// principal.
+// The property is the ABSENCE of a call, on a specific control-flow path.
 func TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential(t *testing.T) {
 	t.Run("neither principal is altered when the probe fails", func(t *testing.T) {
 		stubDir, invocations := stubbedKafkaCLI(t, 1, "Error while executing config command: not authorized")
@@ -551,8 +446,8 @@ func TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential(t *testing.
 		require.NoError(t, err, "the stub must have been invoked at all; output was:\n%s", output)
 
 		// The credential write is `kafka-configs --alter --add-config-file <properties>`: the
-		// password never appears on a command line, so what identifies the call is the pairing
-		// of --alter with the user entity type, not the mechanism string.
+		// password never appears on a command line, so what identifies the call is the
+		// pairing of --alter with the user entity type, not the mechanism string.
 		calls := string(recorded)
 		for _, line := range strings.Split(calls, "\n") {
 			if !strings.HasPrefix(line, "kafka-configs ") || !strings.Contains(line, "--alter") {
@@ -578,10 +473,10 @@ func TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential(t *testing.
 	})
 
 	t.Run("a determinate absent probe still provisions, so the guard is not a blanket refusal", func(t *testing.T) {
-		// The counterpart, and the reason the fix is a narrowing rather than a refusal. A probe
-		// that SUCCEEDS and reports no SCRAM-SHA-512 credential must still generate one — that
-		// is the documented first-run behaviour, and a guard that blocked it would break
-		// bring-up on every fresh broker.
+		// The counterpart, and the reason the fix is a narrowing rather than a refusal. A
+		// probe that SUCCEEDS and reports no SCRAM-SHA-512 credential must still generate one
+		// — that is the documented first-run behaviour, and a guard that blocked it would
+		// break bring-up on every fresh broker.
 		stubDir, invocations := stubbedKafkaCLI(t, 0, "Configs for user-principal 'blnk-sample-subscriber' are ")
 
 		output, secretFile, _ := runProvisioningScript(t, stubDir, nil)
@@ -610,9 +505,9 @@ func TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential(t *testing.
 		recorded, err := os.ReadFile(invocations)
 		require.NoError(t, err, "the stub must have been invoked; output was:\n%s", output)
 
-		// Scoped to the SUBSCRIBER principal. The producer's password is supplied explicitly in
-		// this case's environment, so its credential is written on the "supplied" arm — which is
-		// correct, needs no probe, and is not what this case is about.
+		// Scoped to the SUBSCRIBER principal. The producer's password is supplied explicitly
+		// in this case's environment, so its credential is written on the "supplied" arm —
+		// which is correct, needs no probe, and is not what this case is about.
 		for _, line := range strings.Split(string(recorded), "\n") {
 			if strings.HasPrefix(line, "kafka-configs ") && strings.Contains(line, "--alter") {
 				assert.NotContainsf(t, line, "blnk-sample-subscriber",
@@ -630,44 +525,26 @@ func TestKafkaProvisionScript_AnIndeterminateProbeWritesNoCredential(t *testing.
 // TestKafkaProvisionScript_CredentialProbeIsAPredicate pins the shape of the probe that
 // decides whether an existing SCRAM password may be preserved.
 //
-// It was written to PRINT its answer — "exists", "absent" or "unknown" on stdout — and to
-// return 0 in every case, while both call sites used it as the condition of an `elif`. Every
-// caller therefore read "yes" whatever the broker had said, and the answer itself was emitted
-// into the operator's console in the middle of a sentence.
+// It was written to PRINT its answer — "exists", "absent" or "unknown" on stdout — and
+// to return 0 in every case, while both call sites used it as the condition of an
+// `elif`.
 //
 // The two callers failed differently and both were worse than an error:
 //
-//   - the producer arm took its `preserved` short-circuit, granted ACLs and reported SUCCESS
-//     with no credential on the broker at all. Bring-up was green and the server and worker
-//     then failed SASL authentication with nothing in the provisioning output to explain it;
-//   - the subscriber arm had no such short-circuit, so it fell through to the credential
-//     upsert with an EMPTY password. The broker refuses that, so the one run an operator makes
-//     to repair a drifted ACL failed on a principal and a broker that were both healthy.
+//   - the producer arm took its `preserved` short-circuit, granted ACLs and reported
+//     SUCCESS with no credential on the broker at all.
+//   - the subscriber arm had no such short-circuit, so it fell through to the
+//     credential upsert with an EMPTY password. The broker refuses that, so the one run
+//     an operator makes to repair a drifted ACL failed on a principal and a broker that
+//     were both healthy.
 //
 // It also made two subscriber arms unreachable, so the documented one-time secret-file
 // delivery never happened on a first run.
 //
-// The assertion is on the CONTRACT rather than on the implementation: nothing is written to
-// stdout, and there is a path that returns non-zero. A probe that cannot say "no" is not a
-// probe.
+// The assertion is on the CONTRACT rather than on the implementation: nothing is
+// written to stdout, and there is a path that returns non-zero.
 //
-// # It is now a TRI-STATE, and that is a second defect this pins
-//
-// Answering only yes-or-no was itself wrong, because there are three answers. "The broker says
-// this principal has no SHA-512 credential" licenses minting one; "the broker did not answer"
-// licenses nothing. Folding the two into a single non-zero return meant a transient describe
-// failure — a restart in progress, a timeout, an administrative principal without
-// DescribeConfigs on user entities — was read as absence, so the disposition chain skipped its
-// `preserved` arm and fell into generate-and-upsert. A WORKING credential was replaced with a
-// newly generated password under no rotation flag, every consumer and publishing process holding
-// the old one stopped authenticating, and the run printed success. The operator had asked only
-// for topics to be assured.
-//
-// So the work is split across two functions and this asserts the contract of BOTH: the probe
-// reports three distinct outcomes, and the predicate the call sites use RESOLVES the unknown one
-// by aborting rather than by guessing. Splitting it is why the round-trip and the local `status`
-// are asserted against the probe while the stdout and non-zero rules are asserted against both —
-// the contract moved, it did not weaken.
+// Answering only yes-or-no was itself wrong, because there are three answers.
 func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 	script := readProvisioningScript(t)
 
@@ -680,9 +557,7 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 				"and it lands in the operator's output mid-sentence", printed)
 	}
 
-	// THREE OUTCOMES, NOT TWO. This is finding F-11: a failed describe used to be reported as
-	// "absent", and absent is the branch that GENERATES a password and upserts it — so an
-	// unreachable broker or an unauthorised admin silently rotated a working credential.
+	// THREE OUTCOMES, NOT TWO.
 	for _, state := range []string{`SCRAM_CREDENTIAL_STATE="present"`, `SCRAM_CREDENTIAL_STATE="absent"`, `SCRAM_CREDENTIAL_STATE="unknown"`} {
 		assert.Containsf(t, body, state,
 			"the probe must be able to report %s: folding an indeterminate answer onto absent is what "+
@@ -699,24 +574,7 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 
 	// THE UNKNOWN ANSWER IS RESOLVED BY A GATE, NOT BY A WRAPPER THAT EXITS.
 	//
-	// There were two wrappers, from two independent attempts at this finding, and neither was
-	// reachable: one tested `((probe == SCRAM_PROBE_UNKNOWN))` against a `scram_credential_probe`
-	// helper that does not exist, and one read the state function's exit code and `die`d on the
-	// third answer. Both are gone, and what replaced them is require_determinate_credential_state
-	// — consulted by BOTH disposition chains, immediately after the predicate and before the arm
-	// that generates a password.
-	//
-	// The abort went with them, deliberately. The finding is that a credential must not be
-	// written on an answer the broker never gave, and skipping the principal satisfies that
-	// completely; aborting additionally discards the idempotent ACL assertion that follows, which
-	// is the repair an operator re-running this script during an incident came for, and in the
-	// compose stack it turns a briefly unauthorised describe into a bring-up that cannot start at
-	// all, because kafka-init is a one-shot the application services wait on. The script's
-	// reporting surface is built for the skip: "indeterminate" is a distinct disposition from
-	// "skipped" in all three summary printers, because they tell an operator to fix different
-	// things.
-	//
-	// So the refusal is asserted on the gate, and the escape hatch with it.
+	// The abort went with them, deliberately.
 	gate := shellFunctionBody(t, script, "require_determinate_credential_state")
 
 	assert.Contains(t, gate, `[[ "$SCRAM_CREDENTIAL_STATE" != "unknown" ]]`,
@@ -747,9 +605,9 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 		"the probe must declare `status` local, or its exit status escapes into whatever else reads "+
 			"that name")
 
-	// Both credential-writing call sites must consult the no-write guard, and they must do it
-	// BEFORE the arm that generates a password. Order is the whole property: placed after,
-	// the guard is unreachable and the rotation happens anyway.
+	// Both credential-writing call sites must consult the no-write guard, and they must do
+	// it BEFORE the arm that generates a password. Order is the whole property: placed
+	// after, the guard is unreachable and the rotation happens anyway.
 	for _, function := range []string{"ensure_sample_subscriber", "ensure_producer_principal"} {
 		arm := shellFunctionBody(t, script, function)
 
@@ -767,11 +625,12 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 			function)
 	}
 
-	// The third answer has to be distinguishable from the other two, or a caller cannot tell
-	// "the broker said no" from "the broker did not answer" — which is the whole defect. It is
-	// distinguishable on BOTH channels the probe writes, and the literal `return 2` is named
-	// rather than written out: SCRAM_PROBE_UNKNOWN is declared readonly at the top of the script
-	// beside SCRAM_PROBE_EXISTS and SCRAM_PROBE_ABSENT, so the three codes cannot drift apart.
+	// The third answer has to be distinguishable from the other two, or a caller cannot
+	// tell "the broker said no" from "the broker did not answer" — which is the whole
+	// defect. It is distinguishable on BOTH channels the probe writes, and the literal
+	// `return 2` is named rather than written out: SCRAM_PROBE_UNKNOWN is declared
+	// readonly at the top of the script beside SCRAM_PROBE_EXISTS and SCRAM_PROBE_ABSENT,
+	// so the three codes cannot drift apart.
 	assert.Contains(t, body, `return "$SCRAM_PROBE_UNKNOWN"`,
 		"scram_credential_state must report UNKNOWN as its own exit code; folding it into absent is "+
 			"what let an unanswered probe rotate a live credential")
@@ -779,11 +638,11 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 		"and absent must be its own code too, or the two answers that license opposite actions are "+
 			"the same answer")
 
-	// THE GLOBAL AND THE CODE ARE WRITTEN BY THE SAME FUNCTION, ON EVERY PATH. Two channels for
-	// one fact is only safe while one function sets both together — the merge of two attempts at
-	// this probe once left the exit codes in place and the assignments out, so a principal that
-	// held a credential reported "unknown" and a principal with none took the whole run down
-	// under `set -e`.
+	// THE GLOBAL AND THE CODE ARE WRITTEN BY THE SAME FUNCTION, ON EVERY PATH. Two
+	// channels for one fact is only safe while one function sets both together — the merge
+	// of two attempts at this probe once left the exit codes in place and the assignments
+	// out, so a principal that held a credential reported "unknown" and a principal with
+	// none took the whole run down under `set -e`.
 	for _, assignment := range []string{
 		`SCRAM_CREDENTIAL_STATE="present"`,
 		`SCRAM_CREDENTIAL_STATE="absent"`,
@@ -794,8 +653,8 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 	}
 
 	// And the predicate has to invoke it in a form a non-zero exit cannot kill. `set -euo
-	// pipefail` is in force, so a bare call returns 1 for the most ordinary outcome there is — a
-	// fresh broker with no credential — and takes the run with it.
+	// pipefail` is in force, so a bare call returns 1 for the most ordinary outcome there
+	// is — a fresh broker with no credential — and takes the run with it.
 	assert.Contains(t, predicate, `scram_credential_state "$user" || true`,
 		"the predicate must tolerate the probe's non-zero answers; a bare call aborts the run on a "+
 			"broker that simply has no credential yet")
@@ -817,18 +676,8 @@ func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
 // TestKafkaProvisionScript_NoSCRAMPasswordReachesACommandLine holds the rule for BOTH
 // principals, which is the whole point of it.
 //
-// The subscriber's upsert used `--add-config-file` and documented it as "a complete remedy
-// rather than a mitigation". The producer's built
-// `SCRAM-SHA-512=[iterations=N,password=SECRET]` and passed it to the CLI as an argument, with
-// a comment claiming the CLI offered no alternative — contradicted two hundred lines earlier
-// in the same script against the same image. So the asymmetry protected the local convenience
-// credential and exposed the one the server and worker authenticate with in every environment:
-// argv is readable through /proc/<pid>/cmdline for the life of the JVM start, by anything that
-// samples the process table.
-//
-// The bracketed form is asserted specifically because it is the form that only exists to
-// survive an OPTION parser. Its presence anywhere in this script means a credential is being
-// passed as an argument.
+// The subscriber's upsert used `--add-config-file` and documented it as "a complete
+// remedy rather than a mitigation".
 func TestKafkaProvisionScript_NoSCRAMPasswordReachesACommandLine(t *testing.T) {
 	script := readProvisioningScript(t)
 
@@ -848,12 +697,8 @@ func TestKafkaProvisionScript_NoSCRAMPasswordReachesACommandLine(t *testing.T) {
 	}
 }
 
-// shellFunctionBody returns the text of one shell function, from its `name() {` header to the
-// closing brace in column one.
-//
-// Scoped rather than whole-file, because every assertion above is about ONE function's
-// behaviour and the script documents the rejected alternatives in prose: a whole-file
-// `NotContains` would fail on a comment explaining the defect it forbids.
+// shellFunctionBody returns the text of one shell function, from its `name() {` header
+// to the closing brace in column one.
 //
 // Parameters:
 //   - t *testing.T: failed when the function is not found.
@@ -877,46 +722,28 @@ func shellFunctionBody(t *testing.T, script, name string) string {
 }
 
 // ---------------------------------------------------------------------------
-// SEC-15 — the credential is delivered without following a link and without a
-// window in which it is empty or partial
+// The credential is delivered without following a link and without a window in which it
+// is empty or partial
 // ---------------------------------------------------------------------------
 
-// TestSecretDelivery_RefusesSymlinksAndWritesAtomically is SEC-15.
-//
-// # The two defects, and why the destination makes them exploitable
+// TestSecretDelivery_RefusesSymlinksAndWritesAtomically is the atomic secret-file rule.
 //
 // A generated credential was delivered with `printf … >"$destination"` followed by
-// `chmod 600 "$destination"`. Both of those RESOLVE A SYMLINK, and the destination is normally a
-// compose bind mount — a host directory shared with every other process on the host. So anyone
-// who could write that directory could pre-place a link and receive the credential, and the
-// 0600 that the code was careful to apply landed on the LINK TARGET rather than on the path the
-// script chose. A dangling link was worse still: it is a request to create a file wherever it
-// points. Measured against the pre-fix body, a link at the destination transferred the password
-// into the target file verbatim and set that file to 0600.
+// `chmod 600 "$destination"`.
 //
-// Separately the write was three steps — truncate, chmod, write — so a reader arriving between
-// the first and the last saw an EMPTY or PARTIAL credential. On a rotation that reader is the
-// broker or the operator, and a partial password is indistinguishable from a wrong one.
+// Separately the write was three steps — truncate, chmod, write — so a reader arriving
+// between the first and the last saw an EMPTY or PARTIAL credential.
 //
-// # What is asserted, and why it is asserted on the source
-//
-// The delivery cannot be executed here: it runs inside the provisioning script, against a
-// broker, as a container one-shot. Both properties are STRUCTURAL — a test that the destination
-// is not opened directly, and that the visible transition is a rename — so the script's text is
-// the artefact that carries them. Each assertion names the construct rather than the outcome, so
-// a re-introduced direct write fails here even if it happens to work on the machine that made it.
+// The delivery cannot be executed here: it runs inside the provisioning script, against
+// a broker, as a container one-shot.
 func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 	script := readProvisioningScript(t)
 
 	// THE DELIVERY IS TWO PHASES, and the assertions are split across them accordingly.
 	//
-	// SEC-15 was answered twice: once as a single call that staged and renamed in one go, and
-	// once as a PAIR — stage the file before the broker is altered, commit it only once the
-	// broker has accepted the credential. The pair is what every call site uses and it is the
-	// better shape, because the single-shot form publishes a secret file for a credential that
-	// may still fail to be created, leaving an operator holding a password the broker never
-	// accepted. The single-shot form is retired; each of its properties is asserted below
-	// against whichever half now owns it.
+	// The rule is satisfied twice over: once as a single call that stages and renames in one go,
+	// and once as a PAIR — stage the file before the broker is altered, commit it only
+	// once the broker has accepted the credential.
 	staging := shellFunctionBody(t, script, "stage_generated_secret")
 	commit := shellFunctionBody(t, script, "commit_staged_secret")
 
@@ -943,9 +770,9 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 	})
 
 	t.Run("the credential is written to a fresh exclusive file, never to the destination", func(t *testing.T) {
-		// THE CORE OF THE FIX. The destination is never opened for writing at all — it is only
-		// ever the target of a rename — so there is no descriptor through which a link could be
-		// followed and no moment at which it holds half a credential.
+		// THE CORE OF THE FIX. The destination is never opened for writing at all — it is
+		// only ever the target of a rename — so there is no descriptor through which a link
+		// could be followed and no moment at which it holds half a credential.
 		assert.NotContains(t, staging, `>"$destination"`,
 			"the destination must never be opened for writing: that is the redirection that "+
 				"followed a symlink and that truncated the file before the new value existed")
@@ -966,16 +793,15 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 	})
 
 	t.Run("the staged file sits beside the destination so the rename is atomic", func(t *testing.T) {
-		// rename(2) is atomic only WITHIN one filesystem. A staged file in TMPDIR would fail with
-		// EXDEV or degrade into a copy, which is the non-atomic write again by another route. The
-		// name is DERIVED FROM THE DESTINATION, which is what makes it beside it by construction:
-		// no directory has to be spliced back on, so there is no way to get that splice wrong.
+		// rename(2) is atomic only WITHIN one filesystem. A staged file in TMPDIR would fail
+		// with EXDEV or degrade into a copy, which is the non-atomic write again by another
+		// route.
 		assert.Contains(t, staging, `staged="${destination}.blnk-staged.$$"`,
 			"the staged file must be created in the destination's own directory; a temporary file "+
 				"elsewhere cannot be renamed atomically onto it")
-		// The EXPANSION, not the word: the comment above the staged name says "never in TMPDIR"
-		// and is right to, so forbidding the string would forbid the explanation along with the
-		// mistake. What must not appear is a path drawn from it.
+		// The EXPANSION, not the word: the comment above the staged name says "never in
+		// TMPDIR" and is right to, so forbidding the string would forbid the explanation
+		// along with the mistake. What must not appear is a path drawn from it.
 		assert.NotContains(t, staging, "$TMPDIR",
 			"and specifically not under TMPDIR, which is a different filesystem in every container "+
 				"this runs in — a rename across filesystems fails with EXDEV or degrades into a copy")
@@ -984,9 +810,9 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 	})
 
 	t.Run("the destination is replaced by a rename, and only after the broker accepted", func(t *testing.T) {
-		// THE RENAME IS THE SECOND PHASE, and that is the point of splitting it. The write and the
-		// publication are separated by the broker's own answer, so a destination is never replaced
-		// for a credential that was not created.
+		// THE RENAME IS THE SECOND PHASE, and that is the point of splitting it. The write
+		// and the publication are separated by the broker's own answer, so a destination is
+		// never replaced for a credential that was not created.
 		require.Contains(t, commit, `mv -f -- "$staged" "$destination"`,
 			"the visible transition must be a rename: a reader then sees either the whole previous "+
 				"credential or the whole new one, never nothing and never half")
@@ -1000,11 +826,8 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 	})
 
 	t.Run("every failure path removes the staged credential", func(t *testing.T) {
-		// A staged file left behind is a mode-0600 copy of a live password sitting in a shared
-		// host directory under a name nothing will ever look at again.
-		//
-		// THE EXIT TRAP IS THE REMOVER, not an `rm -f` per failure arm, and it is the stronger
-		// form: it also covers a signal arriving part-way through, which no per-arm cleanup can.
+		// A staged file left behind is a mode-0600 copy of a live password sitting in a
+		// shared host directory under a name nothing will ever look at again.
 		assert.Contains(t, staging, `GENERATED_SECRET_FILES+=("$staged")`,
 			"the staged path must be registered for the EXIT trap BEFORE it is written, so a signal "+
 				"part-way through still leaves the trap a path to remove")
@@ -1016,10 +839,10 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 			"registration must come before the write, or a signal between them leaves a credential "+
 				"on disk that nothing will remove")
 
-		// THE ONE DELIBERATE EXCEPTION, and it must stay deliberate. A commit that fails AFTER the
-		// broker accepted the credential leaves the staged file holding the ONLY copy of a live
-		// password — a SCRAM verifier cannot be read back — so removing it would destroy the sole
-		// means of using an account that now exists.
+		// THE ONE DELIBERATE EXCEPTION, and it must stay deliberate. A commit that fails
+		// AFTER the broker accepted the credential leaves the staged file holding the ONLY
+		// copy of a live password — a SCRAM verifier cannot be read back — so removing it
+		// would destroy the sole means of using an account that now exists.
 		assert.Contains(t, commit, `retain_secret_file "$staged"`,
 			"a commit that fails after the broker accepted the credential must take the staged file "+
 				"OFF the trap's list: it holds the only copy of a live password")
@@ -1051,10 +874,10 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 					"whatever a link pointed at", function)
 		}
 
-		// Q-03's pattern again, in this file: write_secret_file was an UNREACHABLE near-duplicate
-		// of the delivery helper carrying the same two defects. Hardening a function nothing can
-		// call while leaving it as a template for the next caller to adopt is not a fix, so it was
-		// removed with the defect.
+		// The same pattern again, in this file: write_secret_file was an UNREACHABLE
+		// near-duplicate of the delivery helper carrying the same two defects. Hardening a
+		// function nothing can call while leaving it as a template for the next caller to
+		// adopt is not a fix, so it was removed with the defect.
 		assert.NotContains(t, script, "write_secret_file()",
 			"the unreachable duplicate secret writer must stay removed: two implementations of one "+
 				"security property is how they diverge, and only one of them was reachable")
@@ -1065,31 +888,19 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 // The created / grown / unchanged summary must report only what it confirmed
 // ---------------------------------------------------------------------------
 
-// topicSummaryStub builds a Kafka CLI stub whose TOPIC LISTING is controllable, which is what
-// makes the provisioning summary's classification observable without a broker.
+// topicSummaryStub builds a Kafka CLI stub whose TOPIC LISTING is controllable, which
+// is what makes the provisioning summary's classification observable without a broker.
 //
-// The existing stubbedKafkaCLI answers `--describe` and nothing else, because the tests it serves
-// are about a credential probe. The summary is decided by a different question — does the topic
-// EXIST before this run — and the script now asks that with `--list`, so this stub answers both:
-// a list whose contents and exit status the caller chooses, and a describe that always returns a
-// geometry matching what the run asks for, so the geometry check is satisfied rather than merely
-// survived.
+// The existing stubbedKafkaCLI answers `--describe` and nothing else, because the tests
+// it serves are about a credential probe.
 //
-// # Making the listing FAIL requires care, because readiness uses it too
-//
-// The script waits for the broker by calling `kafka-topics --list` until it succeeds, so a stub
-// that refuses every listing never gets past readiness and the summary is never reached. That is
-// itself the reason an unreadable pre-state is rare in practice — readiness has already proved the
-// listing works once. It is not impossible: a broker can become unreadable AFTER readiness, mid-run,
-// through an election or a metadata refresh, which is exactly the transient that used to be
-// reported as a creation.
-//
-// So failAfter reproduces that shape rather than a broker that was never reachable: the first
-// `failAfter` listings succeed, and every later one fails.
+// The script waits for the broker by calling `kafka-topics --list` until it succeeds,
+// so a stub that refuses every listing never gets past readiness and the summary is
+// never reached. That is itself the reason an unreadable pre-state is rare in practice
+// — readiness has already proved the listing works once.
 //
 // Parameters:
-//   - failAfter int: how many listings succeed before the rest fail. Zero or negative means every
-//     listing succeeds.
+//   - failAfter int: how many listings succeed before the rest fail.
 //   - listed []string: the topics the list reports when it succeeds.
 //
 // Returns:
@@ -1146,15 +957,11 @@ func topicSummaryStub(t *testing.T, failAfter int, listed []string) string {
 	return dir
 }
 
-// readinessListings is how many `kafka-topics --list` calls the script makes before it starts
-// assuring topics: exactly one, the readiness probe that waits for the broker to accept an
-// authenticated request. A stub that fails every listing after this many describes a broker that
-// was reachable at readiness and unreadable by the time each topic's pre-state was probed.
-//
-// Counted from the script's own invocations rather than read off the source: a stub that logged
-// every call recorded one listing more than there are topics in a full run — one readiness probe
-// and one per topic in the catalogue — with the first topic's `--create` arriving as the second
-// call overall.
+// readinessListings is how many `kafka-topics --list` calls the script makes before it
+// starts assuring topics: exactly one, the readiness probe that waits for the broker to
+// accept an authenticated request. A stub that fails every listing after this many
+// describes a broker that was reachable at readiness and unreadable by the time each
+// topic's pre-state was probed.
 const readinessListings = 1
 
 // allProvisionedTopics is the topic catalogue the script assures, in the order it assures them:
@@ -1164,34 +971,11 @@ var allProvisionedTopics = []string{
 	"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
 }
 
-// TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions is finding F-10, executed.
+// TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions is that finding,
+// executed.
 //
-// # What the summary is for, and what it was doing instead
-//
-// The closing line answers a question the geometry table cannot: not "is the catalogue correct
-// now" but "was it correct when this run started". A full `created` count on a deployment that has been
-// publishing for weeks means the catalogue was lost and silently rebuilt — and with it every
-// offset — which is an incident, and which the daily outbox-versus-offset reconciliation in
-// docs/kafka-operations.md relies on being able to detect. A count that is inferred rather than
-// confirmed cannot carry that weight.
-//
-// Three things made it inferred:
-//
-//	the pre-state came from `topic_geometry`, which answers empty both for an absent topic and
-//	for one the broker could not describe for a moment, so an EXISTING topic was reported as
-//	created by this run;
-//
-//	`SUMMARY_GROWN` was appended BEFORE the alter, so a topic stayed counted as grown by this run
-//	even when the alter failed and the re-read showed another provisioner had grown it;
-//
-//	and `unchanged` was the total minus the other two, so a topic counted in both — which the
-//	independent appends allowed — made it NEGATIVE.
-//
-// # What is asserted
-//
-// The three classifications this can reach without a broker, each from a stub whose answers are
-// unambiguous, plus the arithmetic property that makes the line trustworthy: the counts sum to
-// the catalogue size, and none of them is negative.
+// The closing line answers a question the geometry table cannot: not "is the catalogue
+// correct now" but "was it correct when this run started".
 func TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions(t *testing.T) {
 	// summaryCount extracts one count from the closing summary.
 	summaryCount := func(t *testing.T, output, label string) int {
@@ -1238,10 +1022,8 @@ func TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions(t *testing.T) {
 	})
 
 	t.Run("an unreadable pre-state is raced, never created", func(t *testing.T) {
-		// THE FINDING'S FIRST BULLET. Readiness gets its two listings and the broker then stops
-		// answering them, so whether each topic existed is not this run's to report. Every topic
-		// is still verified — the describe answers a geometry — so the run succeeds and the
-		// catalogue is confirmed correct; what it must not do is claim to have built it.
+		// AN UNREADABLE PRE-STATE. Readiness gets its two listings and the broker then
+		// stops answering them, so whether each topic existed is not this run's to report.
 		stubDir := topicSummaryStub(t, readinessListings, allProvisionedTopics)
 
 		output, _, _ := runProvisioningScript(t, stubDir, nil)
@@ -1261,9 +1043,9 @@ func TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions(t *testing.T) {
 	})
 
 	t.Run("the counts partition the catalogue in every case", func(t *testing.T) {
-		// The arithmetic property, which is what made `unchanged` able to go negative: the four
-		// classes must be mutually exclusive and jointly exhaustive. Asserted over all three
-		// stubs so no single classification can satisfy it by accident.
+		// The arithmetic property, which is what made `unchanged` able to go negative: the
+		// four classes must be mutually exclusive and jointly exhaustive. Asserted over all
+		// three stubs so no single classification can satisfy it by accident.
 		for name, stub := range map[string]string{
 			"existing":   topicSummaryStub(t, 0, allProvisionedTopics),
 			"absent":     topicSummaryStub(t, 0, nil),
@@ -1295,21 +1077,15 @@ func TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions(t *testing.T) {
 	})
 }
 
-// growthSummaryStub builds a stub whose topic starts UNDER-PARTITIONED and reaches the target once
-// an alter has been seen, so the grown / raced distinction is observable without a broker.
-//
-// The describe answer is stateful because the distinction being tested is temporal: what the
-// summary may claim depends on whether the growth this run requested is the growth that happened.
-// A marker file written by the alter is what separates "before" from "after".
-//
-// kafka-get-offsets is stubbed to report every partition at offset zero, which makes each topic
-// provably EMPTY and therefore growable without KAFKA_ALLOW_PARTITION_GROWTH. That keeps this test
-// about the summary rather than about the consent gate, which has its own coverage.
+// growthSummaryStub builds a stub whose topic starts UNDER-PARTITIONED and reaches the
+// target once an alter has been seen, so the grown / raced distinction is observable
+// without a broker.
 //
 // Parameters:
-//   - alterExit int: the exit status of `kafka-topics --alter`. Zero is this run growing the topic;
-//     non-zero with the marker still written is another provisioner having grown it first, which is
-//     the race the script tolerates and the summary must not claim as its own work.
+//   - alterExit int: the exit status of `kafka-topics --alter`. Zero is this run
+//     growing the topic; non-zero with the marker still written is another provisioner
+//     having grown it first, which is the race the script tolerates and the summary
+//     must not claim as its own work.
 //
 // Returns:
 //   - string: the directory to put first on PATH.
@@ -1318,10 +1094,10 @@ func growthSummaryStub(t *testing.T, alterExit int) string {
 
 	dir := t.TempDir()
 
-	// THE MARKER IS PER TOPIC. A single shared marker made the first topic's alter change the
-	// describe answer for every topic in the catalogue, so all but the first looked
-	// already-correct and the test measured one growth instead of the whole catalogue — the stub,
-	// not the script, deciding the outcome.
+	// THE MARKER IS PER TOPIC. A single shared marker made the first topic's alter change
+	// the describe answer for every topic in the catalogue, so all but the first looked
+	// already-correct and the test measured one growth instead of the whole catalogue —
+	// the stub, not the script, deciding the outcome.
 	topics := "#!/usr/bin/env bash\n" +
 		"topic=\"\"\n" +
 		"previous=\"\"\n" +
@@ -1388,15 +1164,8 @@ func growthSummaryStub(t *testing.T, alterExit int) string {
 	return dir
 }
 
-// TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt is the finding's second bullet,
-// executed.
-//
-// SUMMARY_GROWN used to be appended at the moment the script DECIDED to grow a topic, several lines
-// before the alter was attempted. The alter failing is not an error here and must not be — two
-// provisioners racing is an ordinary state, and the loser is told the topic already has the
-// partitions it wanted — but the topic stayed counted as grown BY THIS RUN either way. The two arms
-// below are the same code path with the same observable end state and different authorship, which
-// is precisely the distinction the summary is read for.
+// TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt holds the summary to what
+// THIS run did rather than to what the catalogue happens to look like afterwards.
 func TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt(t *testing.T) {
 	summaryCount := func(t *testing.T, output, label string) int {
 		t.Helper()
@@ -1439,28 +1208,9 @@ func TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt(t *testing.T) 
 	})
 }
 
-// TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation pins the runbook away from an
-// example that leaked the credential it was creating.
-//
-// The "Adding a runtime SCRAM user" section showed:
-//
-//	docker compose exec kafka .../kafka-configs.sh --alter \
-//	  --add-config "SCRAM-SHA-512=[iterations=4096,password=$NEW_PASSWORD]" ...
-//
-// which places a broker password in the argv of two processes at once — the host's docker client
-// and kafka-configs.sh in the container. /proc/<pid>/cmdline is mode 444 on Linux, so every
-// account on the host could read it for as long as the command ran, and it landed in shell
-// history besides.
-//
-// Worse than the example was the advice under it, which recommended preferring "a
-// --command-config-style properties file". That does not work for SCRAM: kafka-configs.sh
-// normalises the mechanism name out of a properties file and rejects its own input with
-// `Invalid credential property SCRAM_SHA_512=[...]`, verified against apache/kafka:3.9.2. An
-// operator following the guidance hit an error the guidance did not predict.
-//
-// The section now feeds the password on stdin, which removes the host-side exposure entirely,
-// records why a config file is not the answer so nobody re-derives it, and points at the API path
-// where the question does not arise at all.
+// TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation pins the runbook's
+// "Adding a runtime SCRAM user" section to an example that keeps the credential OUT OF
+// ARGV, where any process listing inside the container would expose it.
 func TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation(t *testing.T) {
 	runbook := readRepoFile(t, filepath.Join("docs", "kafka-operations.md"))
 
@@ -1505,38 +1255,26 @@ func TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation(t *testing.T) 
 			"protocol from inside the server process and therefore has no command line at all")
 }
 
-// TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue is MIN-13, executed.
-//
-// # What the summary is for
+// TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue is the catalogue report, executed.
 //
 // `kafka-topics --create --if-not-exists` makes creation idempotent by making it
-// INDISTINGUISHABLE: an existing topic and a freshly created one both leave exit 0 and both
-// land in the same reconciliation. So a run whose catalogue had been lost and silently rebuilt
-// printed output identical to a run where nothing had changed — the whole catalogue, the right
-// partition counts, and no hint that every offset had just restarted from zero. The daily
-// outbox-versus-offset reconciliation in docs/kafka-operations.md cannot be performed without
-// knowing the difference: it compares outbox rows against broker offsets, and a recreated
-// topic invalidates the comparison silently.
+// INDISTINGUISHABLE: an existing topic and a freshly created one both leave exit 0 and
+// both land in the same reconciliation. So a run whose catalogue had been lost and
+// silently rebuilt printed output identical to a run where nothing had changed — the
+// whole catalogue, the right partition counts, and no hint that every offset had just
+// restarted from zero.
 //
-// The dispositions are the answer to that, and their whole value is that they are EXACT. Two
-// properties therefore have to hold together, and neither implies the other:
+// The dispositions are the answer to that, and their whole value is that they are
+// EXACT. Two properties therefore have to hold together, and neither implies the other:
 //
 //   - The four buckets sum to the catalogue size, so no topic is unaccounted for.
-//   - Each topic is in the bucket that describes what happened to it, so a count cannot be
-//     right for the wrong reasons.
-//
-// # Why every case is a full run
-//
-// The dispositions are decided by comparisons across separate CLI invocations — a describe
-// before the create against a describe after it, a partition count read, altered and re-read —
-// so no static reading of the script can establish them. Each case below starts the stubbed
-// broker in a different state and requires the exact totals, the exact names, and the final
-// state of the broker itself.
+//   - Each topic is in the bucket that describes what happened to it, so a count cannot
+//     be right for the wrong reasons.
 func TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue(t *testing.T) {
 	// Derived from the same source the script derives it from — the category list — rather
-	// than written down. The script's own comment says the count follows EVENT_CATEGORIES so
-	// that adding a category leaves no stale number behind, and a test carrying a literal 8
-	// would be exactly that stale number.
+	// than written down. The script's own comment says the count follows EVENT_CATEGORIES
+	// so that adding a category leaves no stale number behind, and a test carrying a
+	// literal 8 would be exactly that stale number.
 	catalogue := AllTopicsWithDeadLettersForPrefix(DefaultTopicPrefix)
 	require.NotEmpty(t, catalogue, "the topic catalogue must not be empty")
 
@@ -1629,12 +1367,6 @@ func TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue(t *testing.T
 		// and a manual `make kafka_provision`. The loser's alter fails, and it fails with a
 		// message that says the topic ALREADY has that many partitions — so the topic is
 		// correct and the run must not treat it as a failure.
-		//
-		// The disposition is `raced` rather than `grown`, and that is the deliberate answer of
-		// TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt: the summary is what an
-		// operator reads to learn what THIS invocation did, so a run must not claim an alter it
-		// did not issue. The catalogue is still fully accounted for, because `raced` is one of
-		// the classes the identity below sums, and the per-topic line names what happened.
 		stub := newKafkaCatalogueStub(t, alterLosesARace, topicsAreEmpty)
 		stub.seedCatalogue(t, 3, catalogue)
 
@@ -1671,10 +1403,9 @@ func TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue(t *testing.T
 	})
 
 	t.Run("a refused growth is its own disposition and is not counted as unchanged", func(t *testing.T) {
-		// The misclassification the finding names. A topic that holds records is deliberately
-		// left under-partitioned, and the run still succeeds — an under-partitioned topic is a
-		// throughput limit, not an outage. Reporting it as "unchanged" is what makes the
-		// deliberate refusal indistinguishable from a catalogue that needed nothing.
+		// The misclassification this catches. A topic that holds records is deliberately
+		// left under-partitioned, and the run still succeeds — an under-partitioned topic is
+		// a throughput limit, not an outage.
 		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsHoldRecords)
 		stub.seedCatalogue(t, 3, catalogue)
 
@@ -1796,8 +1527,8 @@ func TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue(t *testing.T
 
 	t.Run("an alter that genuinely fails is fatal", func(t *testing.T) {
 		// The other side of the race case. When the alter fails AND the topic is still below
-		// the target, the topic is wrong and the run must say so rather than report a geometry
-		// it does not have.
+		// the target, the topic is wrong and the run must say so rather than report a
+		// geometry it does not have.
 		stub := newKafkaCatalogueStub(t, alterIsRefused, topicsAreEmpty)
 		stub.seedCatalogue(t, 3, catalogue)
 
@@ -1820,9 +1551,10 @@ const (
 	// alterSucceeds is the ordinary growth: the alter is accepted and the topic reaches the
 	// target partition count.
 	alterSucceeds catalogueStubMode = "grow"
-	// alterLosesARace is the concurrent-provisioner case. The topic reaches the target — some
-	// other provisioner got there first — and the alter still reports failure, which is what
-	// Kafka does when it is asked to grow a topic that already has that many partitions.
+	// alterLosesARace is the concurrent-provisioner case. The topic reaches the target —
+	// some other provisioner got there first — and the alter still reports failure, which
+	// is what Kafka does when it is asked to grow a topic that already has that many
+	// partitions.
 	alterLosesARace catalogueStubMode = "race"
 	// alterIsRefused is an authorization failure: the alter fails and the topic does NOT reach
 	// the target. This one must be fatal.
@@ -1843,18 +1575,8 @@ const (
 	recordStateIsUnknown catalogueRecordState = "unknown"
 )
 
-// kafkaCatalogueStub is a stubbed broker: a directory of recording CLI stubs plus the mutable
-// topic state they read and write between invocations.
-//
-// # Why the state is a directory of files
-//
-// The dispositions under test are all differences between two moments — a topic that did not
-// exist before the create and does after, a partition count that was three and is now six —
-// and the script observes each of them with a SEPARATE process invocation. A stub that
-// answered from a fixed table could not model that: `--describe` before the create and
-// `--describe` after it have to give different answers, and the only thing shared between two
-// stub processes is the filesystem. One file per topic holding its partition count, absent
-// when the topic does not exist, is the smallest thing that does it.
+// kafkaCatalogueStub is a stubbed broker: a directory of recording CLI stubs plus the
+// mutable topic state they read and write between invocations.
 type kafkaCatalogueStub struct {
 	// binDir goes at the front of PATH.
 	binDir string
@@ -1907,12 +1629,12 @@ type catalogueDisposition struct {
 
 // newKafkaCatalogueStub writes a stubbed Kafka CLI that models a real topic catalogue.
 //
-// Four tools are stubbed, because the disposition logic reaches all four: kafka-topics for
-// list, describe, create and alter; kafka-configs so the credential probe answers "present"
-// and no principal is rewritten; kafka-acls so grants succeed; and kafka-get-offsets, WITHOUT
-// which topic_record_state answers "unknown" for every topic and the growth gate refuses
-// everything — which would make the grown case unreachable and the refused case pass for the
-// wrong reason.
+// Four tools are stubbed, because the disposition logic reaches all four: kafka-topics
+// for list, describe, create and alter; kafka-configs so the credential probe answers
+// "present" and no principal is rewritten; kafka-acls so grants succeed; and
+// kafka-get-offsets, WITHOUT which topic_record_state answers "unknown" for every topic
+// and the growth gate refuses everything — which would make the grown case unreachable
+// and the refused case pass for the wrong reason.
 //
 // Parameters:
 //   - t *testing.T: owns the temporary directories.
@@ -2001,8 +1723,8 @@ func newKafkaCatalogueStub(
 		"exit 0\n"
 
 	// kafka-configs: the credential probe answers PRESENT, so no principal is generated or
-	// rotated. That keeps this file's subject the catalogue rather than the credentials, which
-	// TestKafkaProvisionScript_CredentialProbeIsAPredicate already owns.
+	// rotated. That keeps this file's subject the catalogue rather than the credentials,
+	// which TestKafkaProvisionScript_CredentialProbeIsAPredicate already owns.
 	configs := recorder +
 		"users=no; describe=no\n" +
 		"for arg in \"$@\"; do\n" +
@@ -2019,8 +1741,8 @@ func newKafkaCatalogueStub(
 	acls := recorder + "exit 0\n"
 
 	// kafka-get-offsets: `topic:partition:offset` per line, which is the shape
-	// topic_record_state parses. A failing tool is how "unknown" is produced, because that is
-	// how it happens for real — an unreachable broker or a principal without Describe.
+	// topic_record_state parses. A failing tool is how "unknown" is produced, because that
+	// is how it happens for real — an unreachable broker or a principal without Describe.
 	offsets := recorder +
 		"if [ \"$STUB_RECORD_STATE\" = unknown ]\n" +
 		"then\n" +
@@ -2078,12 +1800,11 @@ func (stub kafkaCatalogueStub) partitionsOf(t *testing.T, topic string) int {
 	return count
 }
 
-// runCatalogueProvisioning executes the real scripts/kafka-provision.sh against a stubbed
-// broker and returns what it printed and did.
+// runCatalogueProvisioning executes the real scripts/kafka-provision.sh against a
+// stubbed broker and returns what it printed and did.
 //
-// The environment is built from scratch, as in runProvisioningScript, so an ambient .env or a
-// developer's KAFKA_* variables cannot decide the outcome. The sample subscriber is skipped
-// by default: it needs a credential destination, and it is not what these cases are about.
+// The environment is built from scratch, as in runProvisioningScript, so an ambient
+// .env or a developer's KAFKA_* variables cannot decide the outcome.
 func runCatalogueProvisioning(
 	t *testing.T,
 	stub kafkaCatalogueStub,
@@ -2156,24 +1877,22 @@ func runCatalogueProvisioning(
 
 // dispositionSummaryPattern reads the four buckets back out of the script's own output.
 //
-// Parsed from the rendered line rather than computed alongside the script, because the finding
-// is about what the AUDIT TRAIL says: an operator reads these numbers, and a count that is
-// right internally and wrong on screen is the defect.
+// Parsed from the rendered line rather than computed alongside the script, because the
+// finding is about what the AUDIT TRAIL says: an operator reads these numbers, and a
+// count that is right internally and wrong on screen is the defect.
 var (
 	dispositionTotalPattern   = regexp.MustCompile(`all (\d+) topics are present with a verified geometry`)
 	dispositionCreatedPattern = regexp.MustCompile(`created\s+: (\d+)(?: \(([^)]*)\))?`)
 	dispositionGrownPattern   = regexp.MustCompile(`grown\s+: (\d+)(?: \(([^)]*)\))?`)
-	// A SIGN IS ACCEPTED here deliberately. "unchanged" is the one bucket that is computed by
-	// subtraction rather than counted, so a bucket that stops being subtracted — or one that is
-	// subtracted twice — renders as a negative number. Matching only digits would report that
-	// as "the run printed no unchanged disposition", which sends a reader looking for a missing
-	// line instead of at the arithmetic. Read the sign, then refuse it below.
+	// A SIGN IS ACCEPTED here deliberately. "unchanged" is the one bucket that is computed
+	// by subtraction rather than counted, so a bucket that stops being subtracted — or one
+	// that is subtracted twice — renders as a negative number.
 	dispositionUnchangedPattern = regexp.MustCompile(`unchanged\s+: (-?\d+)`)
 	dispositionRefusedPattern   = regexp.MustCompile(`under-partitioned : (\d+) \(([^)]*)\)`)
-	// The class that ABSTAINS. It is printed only when it is non-empty — an empty class printed
-	// every run is a line that stops being read — so it is optional here, and it has to be in
-	// the accounting identity below or a raced topic is in no bucket at all and the four figures
-	// silently stop summing to the catalogue.
+	// The class that ABSTAINS. It is printed only when it is non-empty — an empty class
+	// printed every run is a line that stops being read — so it is optional here, and it
+	// has to be in the accounting identity below or a raced topic is in no bucket at all
+	// and the four figures silently stop summing to the catalogue.
 	dispositionRacedPattern = regexp.MustCompile(`raced\s+: (\d+) \(([^)]*)\)`)
 )
 
@@ -2211,9 +1930,9 @@ func (outcome catalogueOutcome) dispositions(t *testing.T) catalogueDisposition 
 	parsed.refused, parsed.refusedNamed = readCount(dispositionRefusedPattern, "under-partitioned", false)
 	parsed.raced, parsed.racedNamed = readCount(dispositionRacedPattern, "raced", false)
 
-	// Held for EVERY case rather than restated in each. A bucket cannot be negative and the
-	// four cannot sum to anything but the catalogue size: either failure means a topic is
-	// counted twice or not at all, and the summary is then not a record of anything.
+	// Held for EVERY case rather than restated in each. A bucket cannot be negative and
+	// the four cannot sum to anything but the catalogue size: either failure means a topic
+	// is counted twice or not at all, and the summary is then not a record of anything.
 	require.GreaterOrEqualf(t, parsed.unchanged, 0,
 		"the unchanged bucket is computed by subtraction, and a negative value means a "+
 			"disposition is being subtracted that was never added, or added twice.\n"+

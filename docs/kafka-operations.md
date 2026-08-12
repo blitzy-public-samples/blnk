@@ -43,9 +43,9 @@ If you arrived for routine work, the four procedures are [Provisioning](#provisi
 
 Both are established by one snippet, stated once, in
 [Keep credentials out of process arguments](#keep-credentials-out-of-process-arguments) below. Run it
-per operator shell before any step in this runbook. It used to be stated twice, here and there, with
-two different file names and two different ways of reading the key — which is how thirteen examples
-came to pass the master key on the command line while both copies claimed that none did.
+per operator shell before any step in this runbook. Stating it once is deliberate: two copies, with
+two different file names and two different ways of reading the key, are how a runbook ends up with
+examples that pass the master key on the command line while both copies claim that none do.
 - **Metrics.** `enable_observability` must be true for any gauge or counter named here to exist. See [metrics.md](metrics.md) for the catalogue, the attribute domains and example queries; this document does not duplicate them.
 - **Broker access**, for the CLI steps only. The API-driven steps — listing, replaying and reconciling — need no broker access at all.
 
@@ -113,7 +113,7 @@ Every name is composed as `<prefix>.<category>` and `<prefix>.<category>.dlt`, w
 
 **`ledger.created` is on `blnk.system` too**, so a subscriber that needs ledger events needs that same privileged grant — the one operational consequence of the four-category catalogue you will actually field requests about. Granting it discloses `system.error`'s verbatim internal error text as well, so treat the request as the entitlement decision it is rather than a routine topic addition. See [why there is a fourth category, and what `blnk.system` costs](event-streaming.md#why-there-is-a-fourth-category-and-what-blnksystem-costs), which is the page a subscriber reads.
 
-> Do not "tidy" the inventory to a different count, and do not add a category to it. `model.EventCategory` routes events into exactly these four categories and `event_topics.go` composes exactly these eight names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment. A fifth `blnk.ledgers` category was added here once, to give `ledger.created` a grantable home, and withdrawn: the catalogue is a published contract subscribers, grants and dashboards build against.
+> Do not "tidy" the inventory to a different count, and do not add a category to it. `model.EventCategory` routes events into exactly these four categories and `event_topics.go` composes exactly these eight names from them. A name provisioning does not create is a name the relay cannot publish to; a name it creates that no code writes to is dead weight in every environment. Giving `ledger.created` a grantable home of its own would need a fifth category here, and that is a contract change to be agreed rather than a tidy-up: the catalogue is a published contract subscribers, grants and dashboards build against.
 
 ### Partitions
 
@@ -184,7 +184,7 @@ Swapping the image and watching the pod go ready proves almost nothing here, bec
 |---|---|---|---|
 | **Format seeds a credential** | `kafka-storage.sh format --add-scram 'SCRAM-SHA-512=[name=…,password=…,iterations=4096]'`, then look for `UserScramCredentialRecord` in the output | The credential reaches the metadata log. In KRaft there is no other way to create the *first* one | Format succeeds, broker starts, and authenticates nobody — which presents as a wrong password |
 | **The broker authenticates SCRAM-SHA-512** | Any admin call with `security.protocol=SASL_PLAINTEXT` and `sasl.mechanism=SCRAM-SHA-512` | The listener, the mechanism and the seeded credential agree | Broker reports healthy; every client is rejected |
-| **StandardAuthorizer *enforces*** | Bind an ACL, read it back with `kafka-acls --list`, and confirm `authorizer.class.name` is set | ACLs are enforced rather than merely accepted | ACLs apply cleanly and grant nothing. The V-5 subscriber-isolation test then passes **vacuously** |
+| **StandardAuthorizer *enforces*** | Bind an ACL, read it back with `kafka-acls --list`, and confirm `authorizer.class.name` is set | ACLs are enforced rather than merely accepted | ACLs apply cleanly and grant nothing. The subscriber-isolation test then passes **vacuously** |
 
 A fourth behaviour is worth re-checking even though it is not a version floor: **`kafka-storage format` exits 1 on an already-formatted directory unless `--ignore-formatted` is passed.** That holds on both 3.9.2 and 4.3.1, and it is why `scripts/kafka-bootstrap.sh` and the StatefulSet's init container both pass the flag — it is what makes a pod restart idempotent rather than a crash loop. Do not remove it.
 
@@ -224,7 +224,7 @@ Run `scripts/kafka-provision.sh` against a **running** broker. It creates, in th
 2. The **producer** principal (`KAFKA_SASL_USER`, falling back to `KAFKA_PRODUCER_USER`, default `blnk-producer`) with `Write` and `Describe` on the Blnk-owned topics and nothing else.
 3. One **sample subscriber** principal (`KAFKA_SAMPLE_SUBSCRIBER_USER`, default `blnk-sample-subscriber`) with `Read` and `Describe` on **three** category topics — `<prefix>.transactions`, `<prefix>.balances` and `<prefix>.identities` — and `Read` on its own prefixed consumer-group namespace.
 
-   **Those four are the whole allowlist this script will grant from.** `<prefix>.system` is not on it — it carries `system.error`, whose payload is an internal error message, and it is the catch-all for any uncatalogued event type. `POST /subscribers/{id}/kafka-credentials` will grant it on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`; **this script never will**, whatever that variable says, because a bring-up script makes no entitlement decision. `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` narrows the sample's grant to a subset and refuses anything off the script's allowlist: the system topic, a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it. Use it when you want a **grantable** topic outside the sample's grant to prove a denial on; a `.dlt` name and `<prefix>.system` are always outside it.
+   **Those three are the whole allowlist this script will grant from.** `<prefix>.system` is not on it — it carries `system.error`, whose payload is an internal error message, and it is the catch-all for any uncatalogued event type. `POST /subscribers/{id}/kafka-credentials` will grant it on a deployment that has declared `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true`; **this script never will**, whatever that variable says, because a bring-up script makes no entitlement decision. `KAFKA_SAMPLE_SUBSCRIBER_TOPICS` narrows the sample's grant to a subset and refuses anything off the script's allowlist: the system topic, a dead-letter sibling, a category that does not exist, or a topic outside this stack's prefix. Setting the variable *replaces* the default rather than adding to it. Use it when you want a **grantable** topic outside the sample's grant to prove a denial on; a `.dlt` name and `<prefix>.system` are always outside it.
 
 **Both principals' ACLs are RECONCILED, not merely added to.** Each run computes the grant the configuration asks for, then makes the broker hold exactly that: bindings the configuration no longer asks for are **revoked**, missing ones are created, and the end state is read back and compared. This matters because `kafka-acls --add` is idempotent without being convergent — it can only widen. Three ordinary changes therefore used to take no effect at all, each leaving the broker serving more than the configuration described while the run reported success:
 
@@ -592,7 +592,7 @@ The corresponding functions are `SubscriberKafkaPrincipal`, `SubscriberConsumerG
 ### There are no per-tenant topics
 
 There is no topic per tenant, per subscriber or per ledger — looking for one is looking for something
-that does not exist. Every subscriber reads from the **same four grantable category topics**, and each
+that does not exist. Every subscriber reads from the **same three grantable category topics**, and each
 one is granted **only the subset it was authorised for**: its `authorized_topics`. Two subscribers can
 therefore hold entirely different grants over one shared inventory, and no subscriber is ever granted a
 `.dlt` topic.
@@ -806,7 +806,7 @@ The response body contains a secret that exists nowhere else, so write it to a p
 
 ```bash
 umask 077
-resp="$(mktemp)"                       # 0600 at creation, in your private temp dir
+resp="$(mktemp)"                       # a 0600 file in $TMPDIR (often the shared /tmp)
 trap 'rm -f "$resp"' EXIT INT TERM     # disposed even on failure or interrupt
 
 curl -sS -X POST "$BLNK_API/subscribers/sub_9f8d3c214b7a5e6f/kafka-credentials" \
@@ -1036,7 +1036,7 @@ So when a subscriber loses its password, the answer is to re-issue — to a prot
 
 ```bash
 umask 077
-resp="$(mktemp)"                       # 0600 at creation, in your private temp dir
+resp="$(mktemp)"                       # a 0600 file in $TMPDIR (often the shared /tmp)
 trap 'rm -f "$resp"' EXIT INT TERM     # disposed even on failure or interrupt
 
 curl -sS -X POST "$BLNK_API/subscribers/sub_9f8d3c214b7a5e6f/kafka-credentials" \
@@ -1584,7 +1584,7 @@ records; it does not identify them. A screen pass means "no shortfall was detect
 which is a useful daily signal and a genuine alarm when it fails — but it is *not* evidence that every
 event reached a topic. Only the bounded per-`event_id` audit in
 [Step 6](#step-6--when-counting-is-not-enough-the-per-event_id-audit) establishes event presence, and
-**scoring acceptance criterion V-2 requires that audit.** The screen alone cannot score it.
+**scoring zero message loss requires that audit.** The screen alone cannot score it.
 
 Why counting cannot decide it, concretely — four independent reasons, each sufficient on its own:
 
@@ -1925,7 +1925,7 @@ If neither explains it, this is a defect in the relay's mark-after-publish path.
 
 ### Step 6 — When counting is not enough: the per-`event_id` audit
 
-**This step is REQUIRED to score acceptance criterion V-2. It is not an optional follow-up.**
+**This step is REQUIRED to score zero message loss. It is not an optional follow-up.**
 
 Steps 1 to 5 compare **totals**, and totals cannot establish that any particular event is present — for
 the four reasons given at the top of this section, of which the sharpest is that **a surplus is
@@ -1940,7 +1940,7 @@ own tooling.
 
 Run it:
 
-- **whenever V-2 is being scored or attested** — the screen cannot substitute for it;
+- **whenever zero message loss is being scored or attested** — the screen cannot substitute for it;
 - after any incident, broker replacement or relay crash;
 - whenever `unconfirmed_events` is persistently non-zero;
 - on a routine sampled basis, on a bounded window, so the evidence exists before you need it.
@@ -2525,7 +2525,7 @@ The precedence the application actually applies, highest first:
 | Source | Notes |
 |--------|-------|
 | `BLNK_KAFKA_BROKERS` | the conventional prefixed name; applied as an overlay after the rest of the environment, so it wins over every other source |
-| `KAFKA_BROKERS` | the R-10 deployment contract name |
+| `KAFKA_BROKERS` | the deployment contract name |
 | `BLNK_KAFKA_KAFKA_BROKERS` | the key envconfig derives for the nested field; still honoured |
 | `kafka.brokers` in `blnk.json` | used when no environment name is set |
 | a `.env` file in the working directory | not a fourth precedence level — `make run_relay` and `make kafka_provision` *source* it, so its assignments arrive as environment and rank by the names above. `./stack.sh --init` writes `KAFKA_BROKERS` there at mode 0600, with the `KAFKA_SASL_USER`/`KAFKA_SASL_SECRET` producer pair the publisher authenticates with. |
@@ -2643,44 +2643,50 @@ SQL
 
 ### Storage — Size The Volume From The Row, Not From A Round Number
 
-Retention is a multiplier on a measured quantity, and the quantity is larger than it looks: **roughly 88% of every outbox row is the event body, held three times over.** `payload` is a queryable JSONB projection, `payload_raw` is the byte-exact webhook body the payload-preservation guarantee lives in, and `event_raw` is the byte-exact envelope the replay guarantee lives in. Each has a reason, stated at the column in `sql/1781248800.sql`; together they cost this:
+Retention is a multiplier on a measured quantity, and the quantity is larger than it looks: **between 85% and 89% of every outbox row is the event body, held three times over.** `payload` is a queryable JSONB projection, `payload_raw` is the byte-exact webhook body the payload-preservation guarantee lives in, and `event_raw` is the byte-exact envelope the replay guarantee lives in. Each has a reason, stated at the column in `sql/1781248800.sql`.
 
-| Component | Bytes per row |
-|---|---|
-| `payload_raw` | 741 |
-| `event_raw` | 963 |
-| `payload` (JSONB) | 808 |
-| whole tuple (no TOAST — under the 2 KiB threshold) | 1,888 |
-| heap including page overhead | 2,048 |
-| all seventeen indexes | 323 |
-| **total** | **2,372** |
+**Measure it against your own payload.** Every figure below is one basis — bytes *as stored* after TOAST compression (`pg_column_size`), plus on-disk relation sizes (`pg_relation_size`, `pg_indexes_size`, `pg_total_relation_size`) — and logical (uncompressed) lengths are labelled where they appear. `sql/1781248800.sql` carries the exact query; clone the table with `CREATE TABLE ... (LIKE blnk.event_outbox INCLUDING ALL)`, load a representative sample, `ANALYZE`, and read it off.
 
-Measured on PostgreSQL 16 over 500,000 rows in a table created with `CREATE TABLE ... (LIKE blnk.event_outbox INCLUDING ALL)`, shaped like a real `transaction.applied` event. Not an estimate.
+Two shapes measured that way on PostgreSQL 16, 200,000 rows each — a minimally populated `transaction.applied` and a fully populated one, differing only in the webhook body, because the body is the caller's payload:
+
+| Component | Minimal body | Populated body |
+|---|---|---|
+| webhook body (logical) | 492 | 899 |
+| envelope (logical) | 706 | 1,113 |
+| `payload` JSONB (stored) | 561 | 985 |
+| `payload_raw` (stored) | 496 | 678 |
+| `event_raw` (stored) | 517 | 773 |
+| whole tuple (stored) | 1,861 | 2,726 |
+| heap, on disk incl. page overhead | 2,048 | 2,048 |
+| TOAST, on disk | 1 | 1,194 |
+| all seventeen indexes, on disk | 379 | 377 |
+| **total per row, on disk** | **2,427** | **3,619** |
+
+On the populated shape the three body columns exceed the 2 KiB threshold together, so part of them is stored out of line — which is why TOAST is a real row there and all but absent on the minimal shape.
 
 ```text
-GiB/day      = rate x 86400 x 2372 / 1024^3
+GiB/day      = rate x 86400 x measured_bytes_per_row / 1024^3
 steady state = GiB/day x RELAY_EVENT_RETENTION_DAYS x 1.5
 ```
 
 The 1.5 is bloat and autovacuum headroom, and it is not padding: every row is `UPDATE`d at least twice on its way to a terminal state, `status` is indexed so neither update can be HOT, and each one leaves a dead tuple and rewrites index entries. WAL sits on top and is bounded separately by `max_wal_size`.
 
-At the validated 500 events a second that is **95.4 GiB a day**, so:
+At 500 events a second that is **98–146 GiB a day** across those two shapes, so:
 
 | Retention | Outbox steady state |
 |---|---|
-| 1 day | 143 GiB |
-| **3 days (shipped)** | **429 GiB** |
-| 7 days | 1,002 GiB |
-| 90 days | 12.6 TiB |
+| 1 day | 146–218 GiB |
+| **3 days (shipped)** | **439–655 GiB** |
+| 7 days | 1,025–1,529 GiB |
 
-**Three settings are coupled and must move together.** `RELAY_EVENT_RETENTION_DAYS` is capped at the broker's `log.retention.hours` (168, so 7 days) because the reconciliation below can only compare a window both sides still hold; and the `pg-data` volume must hold the steady state above **plus the ledger's own tables plus WAL**. The reference manifests ship 3 days against a 600Gi volume, which is the 429 GiB above with roughly 170 GiB for everything else.
+**Three settings are coupled and must move together.** `RELAY_EVENT_RETENTION_DAYS` is capped at the broker's `log.retention.hours` (168, so 7 days) because the reconciliation below can only compare a window both sides still hold; and the `pg-data` volume must hold the steady state above **plus the ledger's own tables plus WAL**. The reference manifests ship 3 days against a 900Gi volume, sized from the populated figure — the one that has to fit — with roughly a fifth of the volume left for everything else. Confirm it against your own measured row cost before production.
 
 Two consequences worth stating plainly:
 
-- **The outbox shares its volume with the ledger.** An over-generous retention period does not buy more history, it exhausts the volume the ledger writes to — availability loss of the whole system, with a retention setting as the cause. This is why the manifests were wrong to ship 90 days against 10Gi: 858x apart.
-- **The ledger's own growth is not bounded by any of this.** Transactions and balances are never purged. The 429 GiB is the part this feature is responsible for and the part that has a ceiling; project the rest from your own transaction rate before going to production.
+- **The outbox shares its volume with the ledger.** An over-generous retention period does not buy more history, it exhausts the volume the ledger writes to — availability loss of the whole system, with a retention setting as the cause.
+- **The ledger's own growth is not bounded by any of this.** Transactions and balances are never purged. The band above is the part this feature is responsible for and the part that has a ceiling; project the rest from your own transaction rate before going to production.
 
-Running well under the validated peak? The demand scales linearly — at 20 events a second it is 3.8 GiB a day, so three days is 17 GiB and a 600Gi volume is far more than you need. Size down with the same arithmetic.
+Running well under the peak the load test drives? The demand scales linearly — at 20 events a second a populated event is 5.8 GiB a day, so three days is 26 GiB and a 900Gi volume is far more than you need. Size down with the same arithmetic.
 
 ### Purge Capacity — Check It Against Your Arrival Rate
 

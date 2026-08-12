@@ -2136,13 +2136,9 @@ func TestParseBigInt(t *testing.T) {
 	}
 }
 
-// TestCreateBalance_CommitsTheEventWithTheBalance is requirement R-2 for balance creation, and
-// again the assertion is the SHAPE OF THE TRANSACTION rather than any value in it.
-//
-// balance.created used to be inserted from a goroutine after CreateBalance had committed — and
-// from a goroutine holding the API request's context, which net/http cancels the moment the
-// handler returns, so the insert could be aborted by the response winning the race. The ordered
-// expectations pin the repair: BEGIN, the balance INSERT, the event INSERT, COMMIT.
+// TestCreateBalance_CommitsTheEventWithTheBalance is the requirement for balance
+// creation, and again the assertion is the SHAPE OF THE TRANSACTION rather than any
+// value in it.
 func TestCreateBalance_CommitsTheEventWithTheBalance(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
@@ -2184,15 +2180,15 @@ func TestCreateBalance_CommitsTheEventWithTheBalance(t *testing.T) {
 			"balance and a nil amount would marshal as null")
 }
 
-// TestCreateBalance_TheIndicatorConflictCapturesNothing is the case that makes the atomic capture
-// MORE correct than the post-commit publish it replaced, not merely safer.
+// TestCreateBalance_TheIndicatorConflictCapturesNothing is the case that makes the
+// atomic capture MORE correct than the post-commit publish it replaced, not merely
+// safer.
 //
-// A unique violation on unique_indicator_currency is reported as SUCCESS with an empty balance —
-// this method's long-standing idempotent-create contract, meaning the balance the caller asked
-// for already exists under that indicator. The old post-commit publish could not see that and
-// announced balance.created anyway, with a payload holding no id, no ledger and no currency. The
-// writer declines instead: no event insert, no commit, and the caller sees the same empty balance
-// and nil error as always.
+// A unique violation on unique_indicator_currency is reported as SUCCESS with an empty
+// balance — this method's long-standing idempotent-create contract, meaning the balance
+// the caller asked for already exists under that indicator. The old post-commit publish
+// could not see that and announced balance.created anyway, with a payload holding no
+// id, no ledger and no currency.
 func TestCreateBalance_TheIndicatorConflictCapturesNothing(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)

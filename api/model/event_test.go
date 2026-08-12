@@ -29,13 +29,6 @@ import (
 
 // This file covers the executable logic on the event-streaming DTOs: the request
 // validators, the two response projections, and the failure-reason classifier.
-//
-// The DTOs were once pure structs, which is why the original plan listed no test
-// beside them. They are not pure structs any more — they now decide which topics may
-// be granted, which URLs may be stored, and which parts of a stored row reach a
-// caller — and each of those decisions is the entire fix for a finding. A decision
-// with no test is a decision that can be reverted by an innocent-looking edit, so the
-// tests live here, beside the code that makes them.
 
 // testTopicPrefix is the default namespace, used explicitly rather than passing ""
 // so that each case states which namespace it is reasoning about.
@@ -53,24 +46,16 @@ func derivedReference(t *testing.T) string {
 }
 
 // ---------------------------------------------------------------------------
-// SEC-03 — authorized-topic allowlist
+// Authorized-topic allowlist
 // ---------------------------------------------------------------------------
 
-// TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics is the
-// SEC-03 guard at the request boundary.
+// TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics is the grant
+// guard at the request boundary.
 //
-// The list becomes the ACL bindings, so anything accepted here is something the
-// issued credential can read. Each rejected case below is a distinct route to an
-// unintended grant, and the wildcard case is the one that matters most: Kafka reads
-// the resource name "*" as matching every resource, so a single such entry converts
-// a per-topic grant into a cluster-wide one.
+// The list becomes the ACL bindings, so anything accepted here is something the issued
+// credential can read.
 //
-// The FOUR TENANT category topics are accepted. What is refused is `blnk.system` — the
-// internal category, for the reason set out at its subtest below, unless the deployment has
-// declared the acknowledgement — plus every DEAD-LETTER name, since those carry failure
-// metadata and other subscribers' failed events and are read under the master key instead,
-// along with foreign names, wildcards, and names whose category does not exist in the closed
-// five-category catalogue.
+// The THREE TENANT category topics are accepted.
 func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *testing.T) {
 	grantable := model.SubscriberGrantableTopics(testTopicPrefix)
 	require.NotEmpty(t, grantable, "there must be at least one grantable topic to test against")
@@ -109,27 +94,17 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS NOT IN THE DEFAULT SET, and it is the one refusal in the set that
-	// has to argue for itself, because it is a real topic with a real subscriber audience.
+	// THE SYSTEM CATEGORY IS NOT IN THE DEFAULT SET, and it is the one refusal in the set
+	// that has to argue for itself, because it is a real topic with a real subscriber
+	// audience.
 	//
 	// It is refused by default because of two things on that topic, neither of which a
-	// per-subscriber decision can remove. `system.error`'s payload is the frozen legacy body,
-	// so it renders Blnk's error text verbatim — schema, table, column, routine, broker
-	// address — and R-8 forbids narrowing it. And the category is the catalogue's CATCH-ALL, so
-	// a grant of it stands over every event type nobody has catalogued yet, which means access
-	// widened by a future routing omission rather than by an authorization decision.
-	//
-	// AN OPERATOR RULE ALONE WAS THE PREVIOUS CONTRACT: the category was ordinarily grantable
-	// and the documented rule was to grant it only where it was needed. A rule an operator can
-	// violate in one PUT is not a boundary. So the grant now takes TWO declarations — the
-	// deployment's KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and the subscriber's own
-	// authorized_topics — and this validator refuses the name whenever the first is missing,
-	// naming it in the message so the refusal is actionable.
-	//
-	// `ledger.created` DEPENDS ON IT TOO. The published catalogue places it on `blnk.system`
-	// with `system.error`, so a subscriber that consumed it over webhooks needs the same two
-	// declarations to keep receiving it — and accepts the disclosure that comes with them.
-	// docs/event-streaming.md states that cost for subscribers rather than leaving it implied.
+	// per-subscriber decision can remove. `system.error`'s payload is the frozen legacy
+	// body, so it renders Blnk's error text verbatim — schema, table, column, routine,
+	// broker address — and the frozen payload contract forbids narrowing it. And the category is the catalogue's
+	// CATCH-ALL, so a grant of it stands over every event type nobody has catalogued yet,
+	// which means access widened by a future routing omission rather than by an
+	// authorization decision.
 	t.Run("refuses the system category without the deployment acknowledgement", func(t *testing.T) {
 		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
 		require.Error(t, err,
@@ -226,28 +201,17 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 }
 
 // ---------------------------------------------------------------------------
-// SEC-01 / SEC-03 — the recorded key-scoped authorization
+// The recorded key-scoped authorization
 // ---------------------------------------------------------------------------
 
-// TestSubscriberRequests_AdjudicateTheKeyScopeShape pins where the key-scope SHAPE rules live.
+// TestSubscriberRequests_AdjudicateTheKeyScopeShape pins where the key-scope SHAPE
+// rules live.
 //
-// This test is the inverse of the one it replaces, and the reversal is the whole point. The
-// earlier version asserted that the DTO must PASS EVERY VALUE THROUGH — newlines, surrounding
-// whitespace, half a kilobyte of it — because the service was going to refuse any non-blank
-// prefix outright with a typed 409, and answering the same state with two different codes is
-// worse for a client than answering it with one.
+// This test is the inverse of the one it replaces, and the reversal is the whole point.
 //
 // The service no longer refuses it. A partition-key prefix is a CONSUMER-SIDE FILTERING
 // CONTRACT, disclosed with the credential rather than standing in the way of it, and
-// SUBSCRIBER_ISOLATION_UNENFORCEABLE is gone rather than retained unused. That removes the
-// argument for passing the value through and replaces it with the opposite one: the prefix is
-// persisted on the registry row, echoed in the credential response, and written into the log
-// fields of every issuance, revocation and provisioning failure. This validator is now the only
-// thing between a caller and a control character or an unbounded value in all three.
-//
-// So the shape rules are back, and they are asserted on BOTH paths. What must still hold is the
-// part that never depended on the refusal: a BLANK prefix is always fine, on create and as the
-// documented way to clear a legacy row on update.
+// SUBSCRIBER_ISOLATION_UNENFORCEABLE is gone rather than retained unused.
 func TestSubscriberRequests_AdjudicateTheKeyScopeShape(t *testing.T) {
 	t.Run("a well-formed prefix is accepted on both paths", func(t *testing.T) {
 		create := validCreateSubscriber()
@@ -289,12 +253,9 @@ func TestSubscriberRequests_AdjudicateTheKeyScopeShape(t *testing.T) {
 
 // TestValidateSubscriberName_RefusesUnstorableLabels covers the human label. CWE-20.
 //
-// The label was previously required and trimmed and nothing more, which bounds nothing: the
-// column is TEXT, which has no length limit in PostgreSQL, and NOT NULL does not stop a
-// megabyte of text or a value carrying newlines and terminal escapes. It is not inert either —
-// it is echoed in the subscriber list and the credential response and written into
-// operator-facing log lines — so these rules are about the string being storable and
-// displayable.
+// It is not inert either — it is echoed in the subscriber list and the credential
+// response and written into operator-facing log lines — so these rules are about the
+// string being storable and displayable.
 func TestValidateSubscriberName_RefusesUnstorableLabels(t *testing.T) {
 	assert.NoError(t, validateSubscriberName("ledger-ops", true),
 		"an ordinary label must be accepted")
@@ -317,8 +278,8 @@ func TestValidateSubscriberName_RefusesUnstorableLabels(t *testing.T) {
 		"the bound itself must be accepted, or the limit is off by one")
 
 	// THE BOUND IS IN RUNES, NOT BYTES. Counting bytes would give a label written in a
-	// non-Latin script roughly a third of the allowance the same label gets in English, which
-	// is a bound on the alphabet rather than on the value.
+	// non-Latin script roughly a third of the allowance the same label gets in English,
+	// which is a bound on the alphabet rather than on the value.
 	assert.NoError(t, validateSubscriberName(strings.Repeat("台", maxSubscriberNameLen), true),
 		"a label at the bound in runes must be accepted however many bytes it occupies")
 	assert.Error(t, validateSubscriberName(strings.Repeat("台", maxSubscriberNameLen+1), true))
@@ -328,14 +289,14 @@ func TestValidateSubscriberName_RefusesUnstorableLabels(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SSRF-01 — the legacy webhook destination policy
+// The legacy webhook destination policy
 // ---------------------------------------------------------------------------
 
-// TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy is the SSRF-01 guard.
+// TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy is the guard.
 //
-// Nothing sends to this URL today, which is exactly why it is constrained now: a
-// stored URL is a future sink, and the moment any code sends to it, whatever is in
-// the column becomes a request Blnk makes from inside its own network.
+// Nothing sends to this URL today, which is exactly why it is constrained now: a stored
+// URL is a future sink, and the moment any code sends to it, whatever is in the column
+// becomes a request Blnk makes from inside its own network.
 func TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy(t *testing.T) {
 	t.Run("accepts an external https endpoint", func(t *testing.T) {
 		assert.NoError(t, validateLegacyWebhookURL("https://hooks.example.com/blnk"))
@@ -385,10 +346,10 @@ func TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy(t *testing.T) {
 			require.Error(t, err, "%s must be refused", raw)
 
 			// The wording is the SHARED policy's, because the policy is now defined once in
-			// model.ValidateWebhookURL rather than copied here and in the repository. Asserting on
-			// the shared phrase is what makes the two doors — an HTTP caller and a service, CLI or
-			// migration caller reaching the repository directly — provably answer the same way for
-			// the same host.
+			// model.ValidateWebhookURL rather than copied here and in the repository. Asserting
+			// on the shared phrase is what makes the two doors — an HTTP caller and a service,
+			// CLI or migration caller reaching the repository directly — provably answer the
+			// same way for the same host.
 			assert.Contains(t, err.Error(), "internal destination")
 			assert.Contains(t, err.Error(), "webhook_url",
 				"a DTO validation error must name the body key the caller has to correct")
@@ -413,8 +374,8 @@ func TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy(t *testing.T) {
 	})
 }
 
-// TestInternalWebhookDestinationReason_ExplainsRatherThanRefuses checks that the
-// policy says WHICH rule was hit.
+// TestInternalWebhookDestinationReason_ExplainsRatherThanRefuses checks that the policy
+// says WHICH rule was hit.
 //
 // "not allowed" sends an operator looking for a policy document; naming the metadata
 // endpoint tells them what they just pointed Blnk at.
@@ -430,19 +391,13 @@ func TestInternalWebhookDestinationReason_ExplainsRatherThanRefuses(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// SEC-03 — the principal and group are not fields
+// The principal and group are not fields
 // ---------------------------------------------------------------------------
 
 // TestCreateSubscriber_HasNoPrincipalOrGroupField is a STRUCTURAL guard, and it is
 // deliberately about the type rather than about behaviour.
 //
-// The fields were once accepted as "omit to have the service derive it". A caller
-// able to choose the principal chooses which identity receives a grant; a caller
-// able to choose the consumer group chooses a PREFIXED ACL pattern that can span
-// other subscribers' group namespaces. Validating such a field is weaker than not
-// having it: a field validated on every path today can be read by a path added
-// tomorrow. This test fails the moment either is reintroduced, which is the only way
-// to keep a removal removed.
+// The fields were once accepted as "omit to have the service derive it".
 func TestCreateSubscriber_HasNoPrincipalOrGroupField(t *testing.T) {
 	forbidden := []string{"KafkaPrincipal", "ConsumerGroupID"}
 
@@ -544,9 +499,9 @@ func TestCreateSubscriber_Validate(t *testing.T) {
 	})
 
 	t.Run("refuses a missing name", func(t *testing.T) {
-		// Enforced by Validate rather than by a binding:"required" tag, so an omitted
-		// name and a whitespace-only one answer the same code — GEN_VALIDATION_ERROR —
-		// instead of the binder's GEN_MALFORMED_REQUEST for one and this for the other.
+		// Enforced by Validate rather than by a binding:"required" tag, so an omitted name
+		// and a whitespace-only one answer the same code — GEN_VALIDATION_ERROR — instead of
+		// the binder's GEN_MALFORMED_REQUEST for one and this for the other.
 		for name, value := range map[string]string{"omitted": "", "whitespace": "  \t "} {
 			t.Run(name, func(t *testing.T) {
 				request := valid
@@ -558,15 +513,11 @@ func TestCreateSubscriber_Validate(t *testing.T) {
 	})
 
 	t.Run("carries no webhook_url field at all", func(t *testing.T) {
-		// C-01. The four deprecated webhook-subscription routes are fronted by the
-		// sunset guard and answer 410 Gone after the retirement instant; THIS route is
-		// not deprecated and not guarded. A webhook_url accepted here would therefore
-		// let a caller keep writing legacy webhook state after the surface that owns it
-		// had been retired, which is the same as not retiring it.
-		//
-		// Asserted against the JSON shape rather than the Go struct, because the shape
-		// is what a client sees: an unknown key is simply ignored by encoding/json, so
-		// a caller sending one is not refused — it has no effect, which is the point.
+		// The four deprecated webhook-subscription routes are fronted by the sunset guard and
+		// answer 410 Gone after the retirement instant; THIS route is not deprecated and not
+		// guarded. A webhook_url accepted here would therefore let a caller keep writing
+		// legacy webhook state after the surface that owns it had been retired, which is the
+		// same as not retiring it.
 		body, err := json.Marshal(valid)
 		require.NoError(t, err)
 		assert.NotContains(t, string(body), "webhook_url",
@@ -607,9 +558,10 @@ func TestUpdateSubscriber_Validate(t *testing.T) {
 		assert.NoError(t, UpdateSubscriber{PartitionKeyPrefix: &cleared}.Validate(testTopicPrefix))
 	})
 
-	// A rule applied only on creation is a rule with an edit-shaped hole, which is the same
-	// reason the URL is re-checked below. A rename is the ordinary way a hostile label would
-	// arrive: creation is often scripted from a template, editing is done by hand.
+	// A rule applied only on creation is a rule with an edit-shaped hole, which is the
+	// same reason the URL is re-checked below. A rename is the ordinary way a hostile
+	// label would arrive: creation is often scripted from a template, editing is done by
+	// hand.
 	t.Run("a present name is checked at the same standard as create", func(t *testing.T) {
 		hostile := "ledger\nops"
 		assert.Error(t, UpdateSubscriber{Name: &hostile}.Validate(testTopicPrefix))
@@ -627,11 +579,8 @@ func TestUpdateSubscriber_Validate(t *testing.T) {
 	})
 
 	// The legacy webhook URL is NOT a field on this request any more: the subscriber
-	// registry no longer carries a per-subscriber destination, so there is nothing here for
-	// an edit to reach. The "a policy applied only on creation is a policy with an
-	// edit-shaped hole" assertion it used to make is made instead against the deprecated
-	// webhook-subscription requests, which are the only shapes that still take a URL — see
-	// TestWebhookSubscriptionRequests_ValidateTheirURL below.
+	// registry no longer carries a per-subscriber destination, so there is nothing here
+	// for an edit to reach.
 }
 
 // TestWebhookSubscriptionRequests_ValidateTheirURL covers the one route whose entire
@@ -647,16 +596,11 @@ func TestWebhookSubscriptionRequests_ValidateTheirURL(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SECRET-01 — the subscriber response carries a fingerprint, not a reference
+// The subscriber response carries a fingerprint, not a reference
 // ---------------------------------------------------------------------------
 
-// TestNewSubscriberResponse_ReportsAFingerprintNeverTheReference is the SECRET-01
+// TestNewSubscriberResponse_ReportsAFingerprintNeverTheReference is the secret-handling
 // guard.
-//
-// The reference is not a secret — nobody can authenticate with it — but returning it
-// makes internal correlation state part of the API contract, and "it is
-// non-reversible" is a property of the code that DERIVES it rather than of the column
-// that stores it.
 func TestNewSubscriberResponse_ReportsAFingerprintNeverTheReference(t *testing.T) {
 	reference := derivedReference(t)
 	issued := time.Now().UTC()
@@ -728,16 +672,9 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 	assert.Equal(t, prefix, full.PartitionKeyPrefix)
 	require.NotNil(t, full.MigratedAt)
 
-	// C-01: the recorded legacy URL is NOT projected, even though the row carries one.
-	// It is readable through GET /subscribers/:id/webhook-subscription alone, which the
-	// sunset guard fronts — so it stops being disclosed at the retirement instant.
-	// Echoing it here as well would keep it readable through an unguarded route after
-	// that, and the two reads would then disagree about whether the legacy surface still
-	// exists.
-	//
-	// Asserted on the marshalled body rather than a struct field, because a field that
-	// no longer exists cannot be asserted absent in Go, and the body is what a client
-	// reads.
+	// The recorded legacy URL is NOT projected, even though the row carries one. It is
+	// readable through GET /subscribers/:id/webhook-subscription alone, which the sunset
+	// guard fronts — so it stops being disclosed at the retirement instant.
 	fullBody, err := json.Marshal(full)
 	require.NoError(t, err)
 	assert.NotContains(t, string(fullBody), "webhook_url",
@@ -745,8 +682,8 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 	assert.NotContains(t, string(fullBody), webhook)
 
 	// migrated_at IS projected, and deliberately. It is migration progress about this
-	// deployment rather than legacy webhook state — no endpoint, no third-party data —
-	// and a progress report needs it before and after the sunset alike.
+	// deployment rather than legacy webhook state — no endpoint, no third-party data — and
+	// a progress report needs it before and after the sunset alike.
 	assert.Contains(t, string(fullBody), "migrated_at")
 
 	bare := NewSubscriberResponse(model.EventSubscriber{SubscriberID: "acme_prod"}, enabledDeployment())
@@ -762,18 +699,12 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DATA-01 — the dead-letter projection is an inventory, not a dump
+// The dead-letter projection is an inventory, not a dump
 // ---------------------------------------------------------------------------
 
-// deadLetteredEntry is the NARROW inventory entry the repository returns for the stored row
-// below, projected exactly as the listing statement projects it (PERF-P06): every column the
+// deadLetteredEntry is the NARROW inventory entry the repository returns for the stored
+// row below, projected exactly as the listing statement projects it: every column the
 // response needs, the body's SIZE, and not the body.
-//
-// The two fixtures are kept separate deliberately. deadLetteredRow describes what is STORED,
-// including the payload whose content DATA-01 is about; this one describes what the repository
-// is willing to READ. Deriving one from the other is what makes the removal assertions
-// meaningful — a fixture that simply never mentioned the payload would assert absence rather
-// than removal, and would keep passing if the projection widened again.
 func deadLetteredEntry(t *testing.T) model.DeadLetterInventoryEntry {
 	t.Helper()
 
@@ -824,9 +755,9 @@ func deadLetteredRow(t *testing.T) model.EventOutbox {
 		LedgerID:    "ldg_4b1e7c30",
 		// DELIBERATELY DIFFERENT from both AggregateID and LedgerID, and not the value
 		// today's keying would produce for an identity event. It is what a row committed
-		// before a keying change looks like, and it is the only fixture shape that can
-		// tell "the projection read the stored key" apart from "the projection read the
-		// aggregate id, or recomputed one, and happened to agree".
+		// before a keying change looks like, and it is the only fixture shape that can tell
+		// "the projection read the stored key" apart from "the projection read the aggregate
+		// id, or recomputed one, and happened to agree".
 		PartitionKey:  "bln_legacy_key_51d0",
 		Topic:         "blnk.identities",
 		DLTTopic:      "blnk.identities.dlt",
@@ -844,12 +775,10 @@ func deadLetteredRow(t *testing.T) model.EventOutbox {
 	}
 }
 
-// TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText is the DATA-01 guard.
+// TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText is the guard.
 //
-// The payload is the marshaled ledger event: an identity event carries a name,
-// email, phone, address and date of birth. Listing a page of dead-lettered events
-// would have returned all of it, for a triage task that needs none of it — replay
-// re-publishes the stored bytes server-side, so the operator never supplies them.
+// The payload is the marshaled ledger event: an identity event carries a name, email,
+// phone, address and date of birth.
 func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 	row := deadLetteredEntry(t)
 	item := NewDeadLetterEvent(row)
@@ -865,12 +794,11 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 			"the projection must not carry payload content (%q leaked)", sensitive)
 	}
 
-	// The BROKER ADDRESS AS AN ADDRESS, not the bare port digits. "9092" on its own is four
-	// digits, and the rendered body carries RFC3339 timestamps with nanosecond precision — so
-	// a substring test for it fails whenever a nanosecond fraction happens to contain that
-	// sequence, which is roughly one run in a few hundred and has nothing to do with the
-	// property under test. Asserting the host:port form keeps the guard exact: a leaked broker
-	// endpoint always appears with its host, because that is how the failure text names it.
+	// The BROKER ADDRESS AS AN ADDRESS, not the bare port digits. "9092" on its own is
+	// four digits, and the rendered body carries RFC3339 timestamps with nanosecond
+	// precision — so a substring test for it fails whenever a nanosecond fraction happens
+	// to contain that sequence, which is roughly one run in a few hundred and has nothing
+	// to do with the property under test.
 	for _, internal := range []string{
 		"10.0.0.4", "10.0.0.7", ":9092", "broken pipe", "write tcp",
 	} {
@@ -885,12 +813,7 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 	// The partition key IS rendered, and belongs in this test as well as in the
 	// keeps-what-triage-needs one: it is an identifier of the same class as aggregate_id
 	// and ledger_id, which are already carried, and asserting it here records that its
-	// inclusion was weighed against DATA-01 rather than overlooked.
-	//
-	// The value is the EFFECTIVE key — the ledger, on this fixture — because that is the key the
-	// publish path resolved and therefore the partition the message is in. The stored column is
-	// not rendered anywhere, which is deliberate: it is the publisher's second choice and reporting
-	// it would answer an ordering question with the wrong key.
+	// inclusion was weighed against the disclosure rule rather than overlooked.
 	assert.Contains(t, rendered, `"partition_key":"`+row.EffectiveKey()+`"`,
 		"the effective partition key must reach the response: it is an identifier of the same class "+
 			"as aggregate_id, and without it no ordering question can be answered from this API")
@@ -902,11 +825,9 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 		assert.False(t, present, "DeadLetterEvent must have no %s field", field)
 	}
 
-	// The guarantee moved one layer DOWN as well (PERF-P06). The projection this response is
-	// built from carries the body's size and not the body, so the bytes are never read out of
-	// the database at all — the response could not carry them even if it wanted to. Asserted
-	// structurally, because a widened projection is how a payload would find its way back
-	// into a listing, and it would do so without any change to DeadLetterEvent.
+	// The guarantee moved one layer DOWN as well. The projection this response is built
+	// from carries the body's size and not the body, so the bytes are never read out of
+	// the database at all — the response could not carry them even if it wanted to.
 	entryType := reflect.TypeOf(model.DeadLetterInventoryEntry{})
 	for _, field := range []string{"Payload", "PayloadRaw", "EventRaw"} {
 		_, present := entryType.FieldByName(field)
@@ -932,18 +853,6 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 	assert.Equal(t, row.AggregateID, item.AggregateID)
 	assert.Equal(t, row.LedgerID, item.LedgerID)
 	// THE EFFECTIVE KEY, which on this fixture is NOT the stored column.
-	//
-	// The fixture is deliberately the divergent case: it carries a ledger AND a partition key
-	// left over from an earlier keying rule, and the publish path prefers the ledger because
-	// requirement R-6 partitions by ledger ID. So the message went to the ledger's partition, and
-	// a response reporting `bln_legacy_key_51d0` would name the key the event was NOT routed by —
-	// on exactly the row an operator is investigating, and with nothing to indicate the answer
-	// might be wrong. It is the only field here an ordering question can be answered from, so
-	// naming the wrong key is worse than naming none.
-	//
-	// This assertion also still covers the field being unassigned, which is how it started: the
-	// tag is omitempty, so leaving it unset rendered no field at all and the answer read as "this
-	// event had no key" rather than as a gap.
 	require.NotEqual(t, row.LedgerID, row.PartitionKey,
 		"the fixture must keep the two values different, or this assertion proves nothing")
 	assert.Equal(t, row.EffectiveKey(), item.PartitionKey,
@@ -970,17 +879,9 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 		"a broken pipe is a broker problem, and saying so is the point of classifying")
 }
 
-// TestNewDeadLetterEvent_ReportsTheKeyThePublisherActuallyUsed is the whole of MD-8 in one
-// place: the reported key and the routed key must be one value resolved by one rule.
-//
-// The response used to read the stored partition_key column. The publish path prefers the
-// LEDGER — requirement R-6 partitions by ledger ID — so on any row where the two disagree the
-// API named a partition the event was not in. Nothing in the response said which value it was,
-// so an operator investigating "why are these two events out of order" got a confident wrong
-// answer from the only field that can answer the question.
-//
-// The three cases below are the fallback chain's three rungs, asserted through the DTO rather
-// than through the model, because it is the DTO that a subscriber and an operator read.
+// TestNewDeadLetterEvent_ReportsTheKeyThePublisherActuallyUsed is the key-provenance rule in
+// one place: the reported key and the routed key must be one value resolved by one
+// rule.
 func TestNewDeadLetterEvent_ReportsTheKeyThePublisherActuallyUsed(t *testing.T) {
 	base := deadLetteredEntry(t)
 
@@ -1171,14 +1072,16 @@ func TestClassifyFailureReason_DistinguishesTheActionableCases(t *testing.T) {
 	})
 }
 
-// enabledDeployment is the resolved deployment state in which every issuance precondition a
-// projection can see is satisfied and no key-scope enforcement point is declared.
+// enabledDeployment is the resolved deployment state in which every issuance
+// precondition a projection can see is satisfied and no key-scope enforcement point is
+// declared.
 //
-// It is the shipped local-stack posture: subscriber-facing brokers advertised, whole-topic access
-// permitted (secure mode off), and nothing evaluating record keys. Tests state it explicitly
-// rather than passing a zero value because the zero value is the FAIL-CLOSED reading — every
-// capability off — and a test that wanted "an ordinary healthy deployment" and passed the zero
-// value would be asserting against a deployment that blocks issuance for three separate reasons.
+// It is the shipped local-stack posture: subscriber-facing brokers advertised,
+// whole-topic access permitted (secure mode off), and nothing evaluating record keys.
+// Tests state it explicitly rather than passing a zero value because the zero value is
+// the FAIL-CLOSED reading — every capability off — and a test that wanted "an ordinary
+// healthy deployment" and passed the zero value would be asserting against a deployment
+// that blocks issuance for three separate reasons.
 func enabledDeployment() model.SubscriberAccessDeployment {
 	return model.SubscriberAccessDeployment{
 		KeyScopeEnforcement:         model.KeyScopeEnforcementNone,
@@ -1199,16 +1102,12 @@ func keyScopedDeployment() model.SubscriberAccessDeployment {
 // TestNewSubscriberResponse_StatesWhatTheNextCallWillDo covers the two predictions the
 // subscriber projection makes about calls the client has not made yet.
 //
-// Both exist because the state they describe was previously reported accurately field by field
-// while the CONSEQUENCE — the only part anybody acts on — was in a Go doc comment.
-//
-//   - CREDENTIAL ISSUANCE BLOCKED. A row whose next credential call will be refused says so on
-//     the row rather than at the call, and it does so for every reason knowable without a round
-//     trip: a deregistration whose broker-side revocation is still owed, an empty topic grant, a
-//     recorded key scope this deployment cannot enforce, a MISSING key scope in a deployment that
-//     does, an unacknowledged whole-topic model, and unadvertised subscriber-facing brokers. The
-//     first two are properties of the ROW; the other four need the deployment, which is why this
-//     projection takes it.
+//   - CREDENTIAL ISSUANCE BLOCKED. A row whose next credential call will be refused
+//     says so on the row rather than at the call, and it does so for every reason
+//     knowable without a round trip: a deregistration whose broker-side revocation is
+//     still owed, an empty topic grant, a recorded key scope this deployment cannot
+//     enforce, a MISSING key scope in a deployment that does, an unacknowledged
+//     whole-topic model, and unadvertised subscriber-facing brokers.
 //
 //     The four deployment-shaped predictions are the correction. This reported unblocked for
 //     everything except the two row conditions, so a key-scoped row on the shipped default
@@ -1217,12 +1116,10 @@ func keyScopedDeployment() model.SubscriberAccessDeployment {
 //     worse than no prediction, and it was reported as a security-relevant contract defect
 //     because the same projection simultaneously claimed the key boundary was enforced.
 //
-//   - REVOCATION PENDING. docs/metrics.md answers the critical revocation alert with "find the
-//     affected subscribers with GET /subscribers", and the response reported none of it — so the
-//     documented answer to "which subscribers owe a revocation?" was a psql session.
-//
-// Both are asserted present-and-false on an ordinary row too. A client that had to infer either
-// from a MISSING field would infer it wrong, which is why neither carries omitempty.
+//   - REVOCATION PENDING. docs/metrics.md answers the critical revocation alert with
+//     "find the affected subscribers with GET /subscribers", and the response reported
+//     none of it — so the documented answer to "which subscribers owe a revocation?"
+//     was a psql session.
 func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 	base := func() model.EventSubscriber {
 		return model.EventSubscriber{
@@ -1246,10 +1143,7 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 		assert.Nil(t, response.RevocationPendingAt)
 	})
 
-	// THE TWO KEY-SCOPED CASES, and keeping them apart is the whole of the correction. The same
-	// row projects differently in two deployments, and it used to project identically in both —
-	// claiming an enforced boundary and an unblocked issuance whether or not anything was
-	// declared to keep the boundary or willing to mint the credential.
+	// THE TWO KEY-SCOPED CASES, and keeping them apart is the whole of the correction.
 	t.Run("a recorded key scope with a declared component is enforced and provisionable", func(t *testing.T) {
 		row := base()
 		prefix := "ldg_acme"
@@ -1289,7 +1183,7 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 				"place a reader cannot mistake who keeps it")
 	})
 
-	// MAJ-1: the same row on the shipped default. Every claim above must reverse, and the block
+	// the same row on the shipped default. Every claim above must reverse, and the block
 	// must appear, because this is the deployment in which issuance refuses.
 	t.Run("a recorded key scope with nothing declared is neither enforced nor provisionable", func(t *testing.T) {
 		row := base()
@@ -1329,9 +1223,9 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 				"is blocking it")
 	})
 
-	// AND THE MIRROR. In a deployment that confines subscribers by record key, the prefix-less
-	// subscriber is the single credential that would escape the model, so issuance refuses it too
-	// and the row has to say so.
+	// AND THE MIRROR. In a deployment that confines subscribers by record key, the
+	// prefix-less subscriber is the single credential that would escape the model, so
+	// issuance refuses it too and the row has to say so.
 	t.Run("no key scope in a key-scoped deployment predicts the mirror refusal", func(t *testing.T) {
 		response := NewSubscriberResponse(base(), keyScopedDeployment())
 
@@ -1372,9 +1266,9 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 			"and names the variable")
 	})
 
-	// THE FAIL-CLOSED DEFAULT. A caller that cannot resolve configuration must understate the
-	// deployment rather than overstate it, because the overstatement is the security-relevant
-	// direction.
+	// THE FAIL-CLOSED DEFAULT. A caller that cannot resolve configuration must understate
+	// the deployment rather than overstate it, because the overstatement is the
+	// security-relevant direction.
 	t.Run("the zero deployment blocks rather than claims", func(t *testing.T) {
 		response := NewSubscriberResponse(base(), model.SubscriberAccessDeployment{})
 

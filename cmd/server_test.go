@@ -141,9 +141,9 @@ func TestNewHTTPServerAndGracefulShutdown(t *testing.T) {
 		return resp.StatusCode == http.StatusOK
 	}, 3*time.Second, 50*time.Millisecond)
 
-	// PERF-P25: every bound is applied, so a peer cannot hold a connection indefinitely.
-	// Asserted on the constructed server because that is the only place they can be observed
-	// — net/http exposes no accessor once it is serving.
+	// Every bound is applied, so a peer cannot hold a connection indefinitely. Asserted on
+	// the constructed server because that is the only place they can be observed —
+	// net/http exposes no accessor once it is serving.
 	assert.Equal(t, httpReadHeaderTimeout, server.ReadHeaderTimeout,
 		"the header read must be bounded: it is the span with no legitimate slow case and the one "+
 			"a Slowloris client exploits")
@@ -152,9 +152,9 @@ func TestNewHTTPServerAndGracefulShutdown(t *testing.T) {
 	assert.Equal(t, httpIdleTimeout, server.IdleTimeout)
 	assert.Equal(t, httpMaxHeaderBytes, server.MaxHeaderBytes)
 
-	// PERF-P11: gracefulShutdown no longer waits for a signal of its own. It drains when
-	// called, because the ONE signal context above it has already fired — which is what lets
-	// the background processors wind down concurrently with this drain instead of after it.
+	// GracefulShutdown no longer waits for a signal of its own. It drains when called,
+	// because the ONE signal context above it has already fired — which is what lets the
+	// background processors wind down concurrently with this drain instead of after it.
 	done := make(chan error, 1)
 	quit := make(chan os.Signal, 1)
 	// A nil listener channel is the "only a signal ends the wait" case: a nil channel blocks
@@ -175,28 +175,11 @@ func TestNewHTTPServerAndGracefulShutdown(t *testing.T) {
 	require.Error(t, err, "server must not accept requests after shutdown")
 }
 
-// TestGracefulShutdown_ReturnsTheListenerFailureInsteadOfWaitingForASignal is the lifecycle
-// property that replaced a process exit.
+// TestGracefulShutdown_ReturnsTheListenerFailureInsteadOfWaitingForASignal is the
+// lifecycle property that replaced a process exit.
 //
-// # What was wrong
-//
-// The listener runs on a goroutine, so its error could not be returned — and it ended in
-// logrus.Fatalf, which calls os.Exit and therefore runs NO deferred function. A port that was
-// already bound killed the process with the event relay, the retention sweeper, the event
-// metrics collector, the lineage processor, the database pool and the tracing exporter all
-// still open: every row the relay had claimed stayed leased until its lock expired, buffered
-// spans were dropped, and the cause was a log line rather than a non-zero exit status.
-//
-// # What must be true now
-//
-// The failure has to END THE WAIT — a shutdown function that only listens for a signal would
-// otherwise block for ever while nothing was being served, which is the state the exit
-// concealed — and it has to be RETURNED, because the return value is what reaches Cobra,
-// unwinds every defer in order, and sets the exit status.
-//
-// The three cases below are the three ways the wait can end, and the last is the one that is
-// easy to get wrong: a CLOSED channel with no value is a clean listener stop, which is what
-// http.ErrServerClosed is after a signalled shutdown, so it must not be reported as a failure.
+// The listener runs on a goroutine, so its error could not be returned — and it ended
+// in logrus.Fatalf, which calls os.Exit and therefore runs NO deferred function.
 func TestGracefulShutdown_ReturnsTheListenerFailureInsteadOfWaitingForASignal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -262,22 +245,11 @@ func TestGracefulShutdown_ReturnsTheListenerFailureInsteadOfWaitingForASignal(t 
 	})
 }
 
-// TestServerCommand_ReturnsErrorsRatherThanExitingTheProcess is the structural guard on the
-// lifecycle fix.
+// TestServerCommand_ReturnsErrorsRatherThanExitingTheProcess is the structural guard on
+// the lifecycle fix.
 //
-// # Why it is asserted against the source text
-//
-// serverCommands cannot be executed in a unit test: its RunE blocks in startServer, needs a
-// database, a router and a TypeSense client, and takes over the process. What went wrong is
-// STRUCTURAL — whether a failure path calls os.Exit at all — so the source is the artefact
-// that carries the answer. The behavioural half is covered by the shutdown test above.
-//
-// logrus.Fatal and Fatalf both call os.Exit(1), which runs no deferred function anywhere on
-// the stack. In this file that meant a failure abandoned the event relay's claimed rows, the
-// retention sweeper, the event metrics collector, the lineage and hash-chain processors, the
-// service container's Kafka writers, the database pool and the tracing exporter — none of
-// which is recoverable after the fact, because the process is gone before any of them is
-// asked to stop.
+// serverCommands cannot be executed in a unit test: its RunE blocks in startServer,
+// needs a database, a router and a TypeSense client, and takes over the process.
 func TestServerCommand_ReturnsErrorsRatherThanExitingTheProcess(t *testing.T) {
 	source, err := os.ReadFile("server.go")
 	require.NoError(t, err, "reading cmd/server.go")
@@ -296,15 +268,8 @@ func TestServerCommand_ReturnsErrorsRatherThanExitingTheProcess(t *testing.T) {
 		"the start command must use RunE so a returned error unwinds every deferred shutdown "+
 			"and becomes the process's exit status")
 
-	// F-21: the container close must be deferred, and it must be deferred where its
-	// registration order puts it AFTER the processors stop and BEFORE the pool close.
-	//
-	// Asserted on the DEFERRED CALL, not on the Close() expression. The work moved into
-	// closeServiceContainer — a named helper reachable from a test, unlike runServer itself —
-	// so the only thing a source read can still establish is the one thing a unit test cannot:
-	// WHERE the defer sits relative to the other two. That closeServiceContainer actually
-	// closes the container is asserted behaviourally by
-	// TestCloseServiceContainer_ClosesTheContainerAndLogsAFailure.
+	// the container close must be deferred, and it must be deferred where its registration
+	// order puts it AFTER the processors stop and BEFORE the pool close.
 	assert.Contains(t, body, "defer closeServiceContainer(b)",
 		"the start command must close the service container: it is the sole owner of the Kafka "+
 			"writers, their shared transport and the asynq client, and nothing else releases them")
@@ -393,27 +358,18 @@ func TestSetupBlnk(t *testing.T) {
 	require.NotNil(t, instance.GetDataSource(), "a real config must produce a wired Blnk instance")
 }
 
-// stopperSymbol names the function a lifecycle starter handed back, resolved from the runtime's
-// own symbol table.
+// stopperSymbol names the function a lifecycle starter handed back, resolved from the
+// runtime's own symbol table.
 //
-// It is what lets these tests tell "a relay was constructed and its Stop was returned" from "a
-// local no-op was returned", which is the ONLY externally visible difference between the two
-// branches of startEventRelay: both return a callable func(), and neither exposes the processor.
-// Asserting on the symbol is a statement about the value the caller will defer, not about the
-// source text — a rename of Stop, or a branch that stopped handing the relay's own stopper back,
-// each fail here with the name that was actually returned.
-// functionBody returns the source text of one top-level function in cmd/server.go.
-//
-// Used where the property under test is STRUCTURAL — what a function composes, in what order —
-// and therefore not observable at runtime. A closure's identity tells you nothing about what it
-// closes over, so reflecting on it cannot distinguish a stop that shuts two things down from one
-// that shuts down neither.
+// Used where the property under test is STRUCTURAL — what a function composes, in what
+// order — and therefore not observable at runtime.
 //
 // Parameters:
 //   - name string: the function name, without "func".
 //
 // Returns:
-//   - string: the text from the declaration to the start of the next top-level declaration.
+//   - string: the text from the declaration to the start of the next top-level
+//     declaration.
 func functionBody(t *testing.T, name string) string {
 	t.Helper()
 
@@ -449,14 +405,8 @@ func stopperSymbol(t *testing.T, stopper func()) string {
 // TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable pins the
 // graceful-degradation contract at the process's own entry point.
 //
-// A deployment with no KAFKA_BROKERS is a legitimate steady state, not a misconfiguration: its
-// producers deliver over the legacy webhook transport directly, so there is nothing for a relay
-// to drain. Starting one anyway would be actively harmful — the publisher would be the no-op
-// implementation, which reports every publish as dispatched without sending anything.
-//
 // The blank and comma-only broker lists are here because they are what a half-filled
-// environment variable actually looks like. `KAFKA_BROKERS=","` must mean "no brokers", and a
-// starter that tested only for a nil slice would treat it as configured.
+// environment variable actually looks like.
 func TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable(t *testing.T) {
 	for name, brokers := range map[string][]string{
 		"unset":       nil,
@@ -471,10 +421,10 @@ func TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable(t *testi
 			// ever built a relay, it would be building one from nothing.
 			stop, err := startEventRelay(context.Background(), nil, cfg)
 
-			// NIL ERROR, and this is the half of CR-2's fix that had to not break: the relay
-			// now returns its startup obstacle and runServer refuses to serve over one, so an
-			// error here would make every Kafka-less deployment — the shipped default — fail
-			// to start. No brokers is a steady state, not an obstacle.
+			// NIL ERROR, and this is the half that had to keep working: the relay
+			// returns its startup obstacle and runServer refuses to serve over one, so an error
+			// here would make every Kafka-less deployment — the shipped default — fail to start.
+			// No brokers is a steady state, not an obstacle.
 			assert.NoError(t, err,
 				"a deployment with no brokers must start cleanly: this is the documented "+
 					"graceful-degradation contract, not a misconfiguration")
@@ -499,20 +449,11 @@ func TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable(t *testi
 	})
 }
 
-// TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop is the wiring assertion
-// itself, and the defect it exists for was total.
+// TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop is the wiring
+// assertion itself, and the defect it exists for was total.
 //
-// Every producer captures its event into blnk.event_outbox inside the ledger transaction, and
-// the relay is the only thing that publishes those rows. It was constructible, fully unit-tested
-// and NEVER CONSTRUCTED BY A RUNNING PROCESS: a deployment with KAFKA_BROKERS set accumulated
-// outbox rows indefinitely and delivered nothing, with no error anywhere, because capturing each
-// row had succeeded. Nothing in the suite failed, because nothing asserted that production code
-// starts it.
-//
-// The broker is deliberately unreachable, which also exercises the documented decision that a
-// topic-assurance failure is logged and stepped past rather than fatal: assurance against a
-// broker that is not listening yet is a transient condition, and refusing to start would convert
-// it into an outage that only a restart could clear.
+// Every producer captures its event into blnk.event_outbox inside the ledger
+// transaction, and the relay is the only thing that publishes those rows.
 func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testing.T) {
 	cfg := &config.Configuration{
 		Kafka: config.KafkaConfig{
@@ -526,10 +467,10 @@ func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testi
 	started := time.Now()
 	stop, err := startEventRelay(context.Background(), nil, cfg)
 
-	// THE OBSTACLE IS RETURNED NOW (CR-2), and this instance has one: the Blnk instance is nil,
-	// so the relay has no datasource and no publisher. That is exactly the shape of refusal
-	// runServer must not serve over, and asserting it here is what proves the value reaches the
-	// caller rather than being logged and dropped as it was before.
+	// THE OBSTACLE IS RETURNED NOW, and this instance has one: the Blnk instance is nil,
+	// so the relay has no datasource and no publisher. That is exactly the shape of
+	// refusal runServer must not serve over, and asserting it here is what proves the
+	// value reaches the caller rather than being logged and dropped as it was before.
 	require.Error(t, err,
 		"a relay that refused to start must say so to its caller: a logged-and-discarded refusal "+
 			"is how a deployment came to capture outbox rows that neither transport would deliver")
@@ -537,16 +478,12 @@ func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testi
 		"the returned error must name what the operator has to change, because the obstacle alone "+
 			"says what is wrong and not what it costs")
 
-	// The property protected here is unchanged — the returned stop must really shut the relay
-	// down, because a local no-op means nothing drains the outbox — but PERF-P18 changed the
-	// SHAPE of the answer. The stop is now a closure that stops the relay and then joins the
-	// background topic-assurance retrier, so its runtime symbol is the closure's rather than
-	// EventRelayProcessor.Stop's, and reflecting on the name can no longer see through it.
-	//
-	// Asserted against the source instead, because composition is a structural property and
-	// the source is where it is visible. Both halves are named: dropping either one is a real
-	// defect — without relay.Stop() nothing drains the outbox, and without stopAssurance() the
-	// retry goroutine outlives the server it belongs to.
+	// The property protected here is unchanged — the returned stop must really shut the
+	// relay down, because a local no-op means nothing drains the outbox — but repeated assurance
+	// changed the SHAPE of the answer. The stop is now a closure that stops the relay and
+	// then joins the background topic-assurance retrier, so its runtime symbol is the
+	// closure's rather than EventRelayProcessor.Stop's, and reflecting on the name can no
+	// longer see through it.
 	relayBody := functionBody(t, "startEventRelay")
 
 	assert.Contains(t, relayBody, "relay.Stop()",
@@ -562,35 +499,10 @@ func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testi
 			"logged and stepped past")
 }
 
-// TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of the
-// TestRunServer_RefusesToServeWhenTheEventRelayRefusesToStart is the process-visibility half of
-// CR-2, and it is the half that decides whether the refusal costs anything.
-//
-// # The state being closed
-//
-// Take a deployment with KAFKA_BROKERS set and a dual-delivery window that has not opened yet —
-// a plain configuration mistake, and one the loader accepts because a future start date is a
-// legitimate thing to write down. Every producer captures its event into blnk.event_outbox
-// inside the ledger transaction, exactly as designed. The relay then refuses, because publishing
-// to Kafka while enqueuing no legacy webhooks would silently cut off every subscriber that has
-// not migrated. So NEITHER transport delivers: no Kafka publish, because the relay is not
-// running, and no legacy webhook, because the relay is the only thing that enqueues one during
-// the window.
-//
-// The process used to serve anyway. It bound its listener, answered health checks, accepted
-// transactions, and accumulated undeliverable rows behind a single ERROR line at boot. Nor could
-// it recover: the obstacle is evaluated once per process, so the relay stayed stopped even after
-// the window opened. Refusing to serve converts that into a failed boot with the remedy in the
-// message, which is the only signal an operator reliably acts on.
-//
-// # Why this is asserted against the source text
-//
-// runServer cannot be executed in a unit test: it loads configuration, binds a listener, needs a
-// database, a router and a TypeSense client, and blocks. The property is STRUCTURAL — that the
-// returned error is propagated rather than assigned and dropped, and that the stopper's defer is
-// registered BEFORE the check so a topic-assurance pass already running is still joined — and
-// the source is the artefact that carries it. startEventRelay's own behaviour is covered
-// above by TestStartEventRelay_*.
+// TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of
+// the TestRunServer_RefusesToServeWhenTheEventRelayRefusesToStart is the
+// process-visibility half of the start-up refusal, and it is the half that decides whether it
+// costs anything.
 func TestRunServer_RefusesToServeWhenTheEventRelayRefusesToStart(t *testing.T) {
 	body := functionBody(t, "runServer")
 
@@ -616,19 +528,12 @@ func TestRunServer_RefusesToServeWhenTheEventRelayRefusesToStart(t *testing.T) {
 			"the way out even when the relay itself never ran")
 }
 
-// TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of the
-// no-broker steady state, which is a contract rather than a cosmetic preference.
+// TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of
+// the no-broker steady state, which is a contract rather than a cosmetic preference.
 //
-// KAFKA_BROKERS is empty in the shipped configuration. The publisher resolves to its no-op,
-// producers deliver over the legacy webhook transport, and Blnk serves exactly as it did before
-// Kafka existed — a documented steady state and a validation gate, not a degraded mode.
+// KAFKA_BROKERS is empty in the shipped configuration.
 //
-// This function asked the admin client to assure topics anyway. The client answered "no brokers
-// are configured", and the answer was logged at ERROR alongside the claim that "the relay still
-// starts" — which was not true on that path. So a default deployment printed two error records
-// that contradicted each other and the info line that followed, and anyone alerting on error
-// severity was paged by a healthy stack. The remedy is to ask the question only when it has an
-// answer.
+// This function asked the admin client to assure topics anyway.
 func TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel(t *testing.T) {
 	for name, cfg := range map[string]*config.Configuration{
 		"unset":       {Kafka: config.KafkaConfig{Brokers: nil}},
@@ -658,16 +563,9 @@ func TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel(t *testing.T
 	}
 }
 
-// TestAssureEventTopics_KeepsTryingAfterAFailedPass covers PERF-P18.
+// TestAssureEventTopics_KeepsTryingAfterAFailedPass covers repeated topic assurance.
 //
-// # The defect
-//
-// Assurance was one attempt, logged at error, and never revisited. On a first deploy that is the
-// ORDINARY case, not an edge case: the broker's StatefulSet and the server's Deployment come up
-// together and the server frequently wins. The consequence was permanent rather than transient —
-// the topics were never created, so every event failed to publish and then failed to dead-letter
-// because the .dlt topic was missing for the same reason — and the only remedy was to restart the
-// pod. Nothing retried, so nothing recovered.
+// Assurance was one attempt, logged at error, and never revisited.
 func TestAssureEventTopics_KeepsTryingAfterAFailedPass(t *testing.T) {
 	cfg := &config.Configuration{
 		Kafka: config.KafkaConfig{
@@ -679,15 +577,15 @@ func TestAssureEventTopics_KeepsTryingAfterAFailedPass(t *testing.T) {
 	}
 
 	t.Run("a failed pass leaves a retrier that the stop function joins", func(t *testing.T) {
-		// A nil instance makes the attempt fail deterministically and without a broker, which is
-		// the same shape as an unreachable one for this purpose: the pass fails, so the retrier
-		// must exist.
+		// A nil instance makes the attempt fail deterministically and without a broker, which
+		// is the same shape as an unreachable one for this purpose: the pass fails, so the
+		// retrier must exist.
 		stop := assureEventTopics(context.Background(), nil, cfg)
 		require.NotNil(t, stop)
 
-		// The stop must JOIN the retry goroutine rather than merely signal it, and must return
-		// promptly — it runs from a deferred shutdown. A stop that did not join would leak a
-		// goroutine still talking to a broker after the server had gone.
+		// The stop must JOIN the retry goroutine rather than merely signal it, and must
+		// return promptly — it runs from a deferred shutdown. A stop that did not join would
+		// leak a goroutine still talking to a broker after the server had gone.
 		returned := make(chan struct{})
 		go func() { defer close(returned); stop() }()
 
@@ -699,12 +597,10 @@ func TestAssureEventTopics_KeepsTryingAfterAFailedPass(t *testing.T) {
 	})
 
 	t.Run("the retrier has no attempt ceiling", func(t *testing.T) {
-		// Structural, and the property is deliberate rather than an oversight. The condition being
-		// waited on is "the broker will accept administrative requests", and there is no number of
-		// attempts after which the right answer changes — a cluster thirty minutes into a rolling
-		// restart still needs its topics. A retry budget would recreate the permanent failure this
-		// exists to remove, only later and harder to diagnose. What bounds it is the process
-		// lifetime.
+		// Structural, and the property is deliberate rather than an oversight. The condition
+		// being waited on is "the broker will accept administrative requests", and there is
+		// no number of attempts after which the right answer changes — a cluster thirty
+		// minutes into a rolling restart still needs its topics.
 		retry := functionBody(t, "retryEventTopicAssurance")
 
 		assert.Contains(t, retry, "for attempt := 2; ; attempt++ {",
@@ -715,10 +611,10 @@ func TestAssureEventTopics_KeepsTryingAfterAFailedPass(t *testing.T) {
 	})
 
 	t.Run("assurance borrows the process-owned admin client", func(t *testing.T) {
-		// PERF-P10 alignment: assurance now runs repeatedly, so building and closing a client per
-		// attempt would mean a fresh transport, TCP connection and SASL/SCRAM handshake on every
-		// retry against a broker that is already struggling. It must also NOT close a client it
-		// does not own — Blnk.Close() does that, exactly once.
+		// SHARED-CLIENT ALIGNMENT: assurance runs repeatedly, so building and closing a client
+		// per attempt would mean a fresh transport, TCP connection and SASL/SCRAM handshake
+		// on every retry against a broker that is already struggling. It must also NOT close
+		// a client it does not own — Blnk.Close() does that, exactly once.
 		attempt := functionBody(t, "attemptEventTopicAssurance")
 
 		assert.Contains(t, attempt, "instance.KafkaAdmin()",
@@ -733,26 +629,7 @@ func TestAssureEventTopics_KeepsTryingAfterAFailedPass(t *testing.T) {
 // TestServerCommand_StartsExactlyOneEventRelay is the regression test for a duplicated
 // lifecycle, and the duplication was not cosmetic.
 //
-// The server command used to construct and start a relay INLINE and then call
-// startEventRelay as well, so one process ran two relays: two topic-assurance passes, two
-// sets of broker connections, two dual-delivery enqueue paths, and start and stop lines that
-// each appeared twice — which makes the lifecycle unreadable at exactly the moment somebody
-// is reading it, during an incident. The FOR UPDATE SKIP LOCKED claim tolerated the second
-// claimant, which is precisely why nothing failed and nothing noticed.
-//
-// It was worse on the shipped default. The inline copy did not guard on the broker list, so a
-// deployment with no KAFKA_BROKERS — a legitimate steady state under the graceful-degradation
-// contract — logged the condition twice at ERROR while the guarded helper reported the same
-// condition at info. The identical state was reported simultaneously as a fault and as normal.
-//
-// # Why this is asserted against the source text
-//
-// serverCommands cannot be executed in a unit test: its Run blocks in startServer, needs a
-// database, a router and a TypeSense client, and takes over the process. The two things that
-// went wrong are both STRUCTURAL — how many times a constructor is reached, and whether the
-// unguarded helper is called at all — so the source is the artefact that carries the answer.
-// TestStartEventRelay_* above covers the helper's behaviour; this covers how many times the
-// server command asks for it.
+// It was worse on the shipped default.
 func TestServerCommand_StartsExactlyOneEventRelay(t *testing.T) {
 	source, err := os.ReadFile("server.go")
 	require.NoError(t, err, "reading cmd/server.go")
@@ -787,21 +664,11 @@ func TestServerCommand_StartsExactlyOneEventRelay(t *testing.T) {
 			"reports its documented steady state as an error")
 }
 
-// TestServerCommand_StartsTheEventRelayBesideTheLineageProcessor pins the START ORDER the
-// wiring plan specifies: lineage outbox processor, then the event relay, then the OPTIONAL
-// hash-chain processor.
+// TestServerCommand_StartsTheEventRelayBesideTheLineageProcessor pins the START ORDER
+// the wiring plan specifies: lineage outbox processor, then the event relay, then the
+// OPTIONAL hash-chain processor.
 //
-// The order is not decoration. The two outbox relays are the same pattern over the same kind of
-// table, and a reader asking "where do outbox rows get drained?" has to find both answers in
-// one place; the event relay used to start last, after the chain processor and the metrics
-// collector, so the event pipeline's start-up — including the info line that reports the
-// Kafka-less steady state — sat several unrelated subsystems away from the relay it pairs with.
-// It also put the conditional chain block between two things that are not conditional on it,
-// which reads as though the relay depended on hash chaining being enabled.
-//
-// Asserted against the source text for the same reason the test above is: serverCommands
-// blocks in startServer and cannot be executed here, and start ORDER is a structural property
-// the source is the artefact for.
+// The order is not decoration.
 func TestServerCommand_StartsTheEventRelayBesideTheLineageProcessor(t *testing.T) {
 	source, err := os.ReadFile("server.go")
 	require.NoError(t, err, "reading cmd/server.go")
@@ -825,19 +692,11 @@ func TestServerCommand_StartsTheEventRelayBesideTheLineageProcessor(t *testing.T
 			"among lines that read as depending on a feature flag")
 }
 
-// TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers pins the settlement
-// processor into the same contiguous block as the relay and the retention sweeper.
+// TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers pins the
+// settlement processor into the same contiguous block as the relay and the retention
+// sweeper.
 //
-// Two structural properties, and both have a failure mode. The processor must be started at ALL:
-// without it every broker-side obligation a failed subscriber operation records accumulates for
-// ever, the registry stays diverged from the broker, and the only trace is a gauge climbing.
-// And it must sit between the retention sweeper and the OPTIONAL chain block, so the
-// event-pipeline workers are read together in the order AAP §0.4.4 establishes rather than
-// nested among lines that read as depending on a feature flag.
-//
-// Asserted against the source text for the reason the two tests above are: serverCommands blocks
-// in startServer and cannot be executed here, and start ORDER is a structural property whose
-// artefact is the source.
+// Two structural properties, and both have a failure mode.
 func TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers(t *testing.T) {
 	source, err := os.ReadFile("server.go")
 	require.NoError(t, err, "reading cmd/server.go")
@@ -855,10 +714,10 @@ func TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers(t *t
 
 	// The retention sweeper is reached through the MAINTENANCE starter rather than started
 	// directly in runServer: it is maintenance of a shared table, so it runs behind the
-	// singleton lease with the metrics collector (PERF-P13). What runServer orders is
-	// therefore the starter, and that is what this compares — asserting on the sweeper's own
-	// call site would compare against a line inside a helper defined further down the file,
-	// which says nothing about start-up order.
+	// singleton lease with the metrics collector. What runServer orders is therefore the
+	// starter, and that is what this compares — asserting on the sweeper's own call site
+	// would compare against a line inside a helper defined further down the file, which
+	// says nothing about start-up order.
 	maintenance := strings.Index(body, "startEventMaintenance(ctx, b, cfg)")
 	require.Positive(t, maintenance,
 		"the leader-elected maintenance work, which owns the retention sweeper, must be started")
@@ -879,20 +738,11 @@ func TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers(t *t
 			"among lines that read as depending on a feature flag")
 }
 
-// TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath is the guard on the
-// single call that stands between thirteen alert rules and no series at all.
+// TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath is the guard on
+// the single call that stands between thirteen alert rules and no series at all.
 //
-// The event pipeline's three gauges have exactly one production maintainer, the collector in
-// event_metrics.go. A gauge that is never recorded is absent from /metrics entirely, so every
-// rule in alerts/blnk-kafka-alerts.yml — including the two acceptance-criterion alerts,
-// dead-letter age above 900 seconds and consumer lag above 10,000 — would be unable to fire
-// whatever the system was doing, and nothing else in the suite would notice: the collector's
-// own tests would still pass, because they construct it directly.
-//
-// The second half of the contract is WHERE it is started. Two collectors write the same label
-// sets from two processes and each zeroes the other's series as stale, so the start must stay
-// behind the maintenance lease rather than running per replica. That is asserted structurally,
-// by position, because a call added to runServer would read perfectly well in review.
+// The event pipeline's three gauges have exactly one production maintainer, the
+// collector in event_metrics.go.
 func TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath(t *testing.T) {
 	source, err := os.ReadFile("server.go")
 	require.NoError(t, err, "reading cmd/server.go")
@@ -924,8 +774,8 @@ func TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath(t *te
 	}
 
 	// TWO, and both are required. One is the lease holder's, and one is the deliberate
-	// degradation when the lease cannot be evaluated at all — which fails towards a duplicated
-	// series an operator can see rather than towards no gauges and no alerts.
+	// degradation when the lease cannot be evaluated at all — which fails towards a
+	// duplicated series an operator can see rather than towards no gauges and no alerts.
 	assert.Equal(t, 2, starts,
 		"the collector is started from the lease holder and from the ungated fallback, and losing "+
 			"either leaves a deployment with unmaintained gauges")
@@ -935,13 +785,11 @@ func TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath(t *te
 			"beside the replica that won it")
 }
 
-// TestStartSubscriberSettlement_WithoutBrokersStartsNothingAndIsStillStoppable covers the
-// Kafka-less steady state.
+// TestStartSubscriberSettlement_WithoutBrokersStartsNothingAndIsStillStoppable covers
+// the Kafka-less steady state.
 //
-// With no broker there is no broker-side subscriber state, so there is nothing that could diverge
-// from the registry and the processor must decline. It must ALSO return a callable stop, because
-// the caller defers it unconditionally — a nil there would panic on every shutdown of every
-// deployment without Kafka.
+// With no broker there is no broker-side subscriber state, so there is nothing that
+// could diverge from the registry and the processor must decline.
 func TestStartSubscriberSettlement_WithoutBrokersStartsNothingAndIsStillStoppable(t *testing.T) {
 	stop := startSubscriberSettlement(context.Background(), nil)
 
@@ -951,13 +799,12 @@ func TestStartSubscriberSettlement_WithoutBrokersStartsNothingAndIsStillStoppabl
 	assert.NotPanics(t, stop)
 }
 
-// TestStartServer_ObservesTheSignalContextRatherThanItsOwnSignal covers PERF-P11.
+// TestStartServer_ObservesTheSignalContextRatherThanItsOwnSignal covers signal-context observation.
 //
-// startServer used to install a private signal.Notify and block on it, which meant the
-// shutdown was observed twice — once by the listener and once, much later and only implicitly,
-// by the deferred processor stops. The contract asserted here is that startServer returns when
-// the context it was GIVEN is cancelled, so a single cancellation can drive the listener and
-// every background processor at the same instant.
+// startServer must observe the signal CONTEXT rather than install a private
+// signal.Notify and block on it: a second observer means the shutdown is seen twice —
+// once by the listener and once, much later and only implicitly, by the deferred
+// processor stops.
 func TestStartServer_ObservesTheSignalContextRatherThanItsOwnSignal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -998,7 +845,7 @@ func TestStartServer_ObservesTheSignalContextRatherThanItsOwnSignal(t *testing.T
 		router := gin.New()
 
 		// Not cancelled: the only way out of startServer here is the listener failing, which
-		// is exactly what is being asserted. Before PERF-P11 this path called logrus.Fatalf
+		// is exactly what is being asserted: this path must not call logrus.Fatalf
 		// from inside the serving goroutine — os.Exit, which would have taken this test
 		// process down with it and skipped every deferred stop in production.
 		done := make(chan error, 1)
@@ -1016,27 +863,11 @@ func TestStartServer_ObservesTheSignalContextRatherThanItsOwnSignal(t *testing.T
 	})
 }
 
-// TestEveryHTTPServerIsHardened is the durable half of PERF-P25.
+// TestEveryHTTPServerIsHardened is the durable half of the server-hardening rule.
 //
-// TestNewHTTPServerAndGracefulShutdown asserts the five bounds on the server newHTTPServer
-// returns, which proves the helper works but says nothing about whether every server in the
-// process goes through it. That gap was not theoretical: this command builds THREE servers —
-// the plaintext API listener, the worker's monitoring listener, and the HTTPS listener inside
-// serveTLS — and the HTTPS one was constructed by hand and therefore ran with no timeouts at
-// all. It is the listener that faces the internet, and TLS makes an unbounded connection more
-// expensive rather than less, because the handshake allocates before a request line is read.
-//
-// serveTLS cannot be called from a test: it drives CertMagic, which reaches an ACME endpoint
-// and writes certificate storage. So the property is asserted over the SOURCE instead. Any
-// `&http.Server{...}` in a non-test file of this package must be the direct argument of a
-// hardenHTTPServer call, which is a rule about the construction site rather than about a value
-// this test can reach — and that is exactly why it holds for a server nothing can instantiate.
-//
-// Parsed with go/ast rather than matched with a regular expression, because the wrapper has to
-// be the ENCLOSING call for the guarantee to hold. Text search cannot distinguish
-// `hardenHTTPServer(&http.Server{...})` from a `hardenHTTPServer` mentioned in a nearby comment
-// or applied to a different value, and either confusion would make this test pass while the
-// server it is protecting ran unbounded.
+// TestNewHTTPServerAndGracefulShutdown asserts the five bounds on the server
+// newHTTPServer returns, which proves the helper works but says nothing about whether
+// every server in the process goes through it.
 func TestEveryHTTPServerIsHardened(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err, "the command package directory must be readable")
@@ -1112,9 +943,9 @@ func TestEveryHTTPServerIsHardened(t *testing.T) {
 
 // isHTTPServerType reports whether a composite literal's type is http.Server.
 //
-// Matches the selector rather than resolving the import, which is sufficient here: this package
-// imports net/http under its own name, and a second package aliased to `http` would be a far
-// larger problem than this test.
+// Matches the selector rather than resolving the import, which is sufficient here: this
+// package imports net/http under its own name, and a second package aliased to `http`
+// would be a far larger problem than this test.
 func isHTTPServerType(expr ast.Expr) bool {
 	selector, ok := expr.(*ast.SelectorExpr)
 	if !ok || selector.Sel == nil || selector.Sel.Name != "Server" {
@@ -1126,26 +957,10 @@ func isHTTPServerType(expr ast.Expr) bool {
 	return ok && pkg.Name == "http"
 }
 
-// TestCloseServiceContainer_ClosesTheContainerAndLogsAFailure is the behavioural half of F-21,
-// and it is what makes the source-text assertion in
-// TestServerCommand_ReturnsErrorsRatherThanExitingTheProcess sufficient rather than the whole
-// guard.
-//
-// # What each case protects
-//
-// A container that is closed exactly once is the point of the defer: the process owns one Kafka
-// writer per topic, one shared administrative client and one asynq client, and nothing else
-// releases them. Closing TWICE would be as wrong as not closing, because the second call reaches
-// an already-closed writer.
-//
-// The nil cases are not defensive padding. runServer reaches this only after preRun has built the
-// container, but tests construct a blnkInstance with no container at all, and a typed-nil
-// *blnk.Blnk placed in an interface produces a NON-nil interface holding a nil pointer — so the
-// check inside closeContainer cannot see it and the guard has to be at this level.
-//
-// The failure case matters because a close error is a LOST FLUSH: a writer that could not produce
-// what it had batched, for events the outbox already records as dispatched. Swallowed, that is
-// indistinguishable from a clean shutdown.
+// TestCloseServiceContainer_ClosesTheContainerAndLogsAFailure is the behavioural half
+// of the hardening rule, and it is what makes the source-text assertion in
+// TestServerCommand_ReturnsErrorsRatherThanExitingTheProcess sufficient rather than the
+// whole guard.
 func TestCloseServiceContainer_ClosesTheContainerAndLogsAFailure(t *testing.T) {
 	t.Run("a container is closed exactly once", func(t *testing.T) {
 		spy := &countingContainerCloser{}
@@ -1188,33 +1003,11 @@ func (c *countingContainerCloser) Close() error {
 	return c.err
 }
 
-// TestRequireKafkaBrokersConfigured_RefusesOnlyWhenTheApplicationItselfResolvesNoBroker is the
-// behavioural half of the --require-kafka guard.
+// TestRequireKafkaBrokersConfigured_RefusesOnlyWhenTheApplicationItselfResolvesNoBroker
+// is the behavioural half of the --require-kafka guard.
 //
-// # Why the guard is a flag on the binary
-//
-// startEventRelay declines to start without brokers and says so once at info, which is correct —
-// a deployment that has not migrated runs exactly that way. The failure it leaves behind is that
-// a deployment which MEANT to run the relay cannot say so: the server serves, looks healthy, and
-// every captured event accumulates in blnk.event_outbox.
-//
-// The makefile used to answer that in shell, resolving the broker list itself, and it could not
-// agree with the loader: it took the first non-empty of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and
-// BLNK_KAFKA_BROKERS in that order, where the loader's precedence puts BLNK_KAFKA_BROKERS first; it
-// read `"brokers": []` in the config file as configured; and a first-non-empty scan cannot express
-// that an explicitly EMPTY higher-precedence name clears what a lower one supplied. Each of those
-// made the target announce a relay the application would then decline to start.
-//
-// This test is what makes the replacement worth having: the predicate under test is the SAME one
-// startEventRelay gates on, read off the SAME configuration store, so the guard and the behaviour
-// it guards cannot disagree by construction.
-//
-// # The cases
-//
-// The broker lists below are the ones blnk.KafkaBrokersConfigured exists to separate. A caller
-// testing len(brokers) > 0 for itself would call {"   "} and {"", " "} configured — envconfig
-// splits KAFKA_BROKERS="," into a slice of blanks — and would then admit a server whose relay
-// could never connect to an address that is not an address.
+// startEventRelay declines to start without brokers and says so once at info, which is
+// correct — a deployment that has not migrated runs exactly that way.
 func TestRequireKafkaBrokersConfigured_RefusesOnlyWhenTheApplicationItselfResolvesNoBroker(t *testing.T) {
 	for name, tc := range map[string]struct {
 		brokers  []string
@@ -1278,13 +1071,8 @@ func TestRequireKafkaBrokersConfigured_RefusesOnlyWhenTheApplicationItselfResolv
 	}
 }
 
-// TestServerCommand_ExposesTheKafkaRequirementAsAFlagRatherThanShellResolution pins the guard's
-// LOCATION as well as its existence.
-//
-// The check must run before the listener binds and before any background processor starts, or a
-// server that is going to be refused has already begun serving and claiming rows. And it must be
-// reachable from the command line, because the makefile target is the caller: with no flag there
-// is nothing for `make run_relay` to delegate to and the shell resolution comes back.
+// TestServerCommand_ExposesTheKafkaRequirementAsAFlagRatherThanShellResolution pins the
+// guard's LOCATION as well as its existence.
 func TestServerCommand_ExposesTheKafkaRequirementAsAFlagRatherThanShellResolution(t *testing.T) {
 	source, err := os.ReadFile("server.go")
 	require.NoError(t, err, "reading cmd/server.go")

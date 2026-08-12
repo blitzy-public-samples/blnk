@@ -31,24 +31,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// storeNotificationConfig installs a configuration with the given Slack and
-// webhook URLs. DataSource/Redis DNS are required by config validation but are
-// never dialed by the notification package.
-// restoreConfigStoreAfterTest captures the process-global configuration and puts it back on
-// cleanup.
-//
-// config.ConfigStore is an atomic.Value shared by every test in the binary, and MockConfig
-// replaces it outright. Without a restore, the LAST configuration any test stored stays in
-// place for whatever runs next — and the failure that causes is order-dependent, so it appears
-// when a test is added, reordered or run in isolation, and it points at the wrong file.
-//
-// It is one helper used by every config-storing helper in this package precisely so the two
-// cannot diverge: a restore present in one and absent in the other leaks exactly as badly as
-// no restore at all, and is harder to spot.
-//
-// The previous value is restored only if there WAS one. A nil-typed interface stored back into
-// an atomic.Value panics, and an atomic.Value cannot be reset to empty, so "nothing was set
-// before" is correctly left exactly as it was.
+// storeNotificationConfig installs a configuration with the given Slack and webhook
+// URLs. DataSource/Redis DNS are required by config validation but are never dialed by
+// the notification package. restoreConfigStoreAfterTest captures the process-global
+// configuration and puts it back on cleanup.
 func restoreConfigStoreAfterTest(t *testing.T) {
 	t.Helper()
 
@@ -280,10 +266,10 @@ func TestNotifyError_WebhookSenderReceivesSystemError(t *testing.T) {
 		require.True(t, ok, "payload should be a map, got %T", got.payload)
 
 		// THE PAYLOAD IS THE FROZEN LEGACY CONTRACT, asserted at the dispatch boundary
-		// because this is the exact value that leaves the package. Requirement R-8
-		// requires it to match the webhook body field-for-field, and that body has always
-		// been {"error", "time"}: a subscriber re-points its consumer at a Kafka topic and
-		// its body handling keeps working, which is the whole point of the migration.
+		// because this is the exact value that leaves the package. The frozen payload requires
+		// it to match the webhook body field-for-field, and that body has always been
+		// {"error", "time"}: a subscriber re-points its consumer at a Kafka topic and its
+		// body handling keeps working, which is the whole point of the migration.
 		assert.Equal(t, "queue worker crashed", payloadMap["error"],
 			"the error text is the value subscribers parse; it must be carried verbatim")
 
@@ -291,10 +277,7 @@ func TestNotifyError_WebhookSenderReceivesSystemError(t *testing.T) {
 		require.True(t, ok, "payload time should be a time.Time")
 		assert.WithinDuration(t, time.Now(), ts, 10*time.Second)
 
-		// Exactly two keys. A third is a change to a published contract and should fail
-		// here rather than reach a subscriber — including the classified reason and the
-		// correlation id an earlier revision published, which belong on the log line
-		// instead.
+		// Exactly two keys.
 		assert.Len(t, payloadMap, 2,
 			"the system.error payload is a published contract: error and time, and nothing else")
 		assert.NotContains(t, payloadMap, "reason")
@@ -364,23 +347,12 @@ func TestNotifyError_SenderErrorIsSwallowed(t *testing.T) {
 	}
 }
 
-// TestNotifyError_DispatchesToBothSlackAndWebhook asserts both channels are reached AND the
-// order they are reached in.
+// TestNotifyError_DispatchesToBothSlackAndWebhook asserts both channels are reached AND
+// the order they are reached in.
 //
-// # The order is the assertion, not an implementation detail
+// The durable event is attempted FIRST and Slack second.
 //
-// The durable event is attempted FIRST and Slack second. Slack is a synchronous POST to a third
-// party whose client allows 30 seconds, and it is the call most likely to hang during the very
-// incident being reported — so with Slack first, every system.error waited on it before its
-// outbox row existed, a burst accumulated goroutines each holding an uncaptured event, and a
-// process that died in that window lost them with no row to replay from. Reversing the order
-// again would restore that, silently and with both channels still working, which is why the
-// sequence is pinned here rather than left to the reading of the code.
-//
-// The wait is the completion seam rather than a receive on the sender's channel. Waiting only
-// for the sender would return while the notifier was still inside the Slack POST, so the
-// deferred server close would race it and the Slack assertion would fail for a reason that has
-// nothing to do with the behaviour.
+// The wait is the completion seam rather than a receive on the sender's channel.
 func TestNotifyError_DispatchesToBothSlackAndWebhook(t *testing.T) {
 	original := webhookSender
 	defer RegisterWebhookSender(original)

@@ -32,26 +32,13 @@ import (
 type MockDataSource struct {
 	mock.Mock
 
-	// capturedEventOutboxes records every event outbox row handed to the three
-	// atomic transaction writers, in call order.
-	//
-	// It exists because those rows arrive as a VARIADIC tail and cannot be
-	// forwarded into m.Called without breaking argument matching for every
-	// expectation already written against the writers — see the note above
-	// RecordTransactionWithBalancesAndOutbox. Without somewhere to record them, a
-	// caller could pass an event row, or fail to pass one, and no test could tell
-	// the difference: "the mutation was recorded" was assertable and "its event was
-	// captured with it" was not, which is precisely the half of the transactional
-	// outbox guarantee that matters.
-	//
-	// Read it through CapturedEventOutboxes and clear it with
-	// ResetCapturedEventOutboxes.
+	// capturedEventOutboxes records every event outbox row handed to the three atomic
+	// transaction writers, in call order.
 	capturedEventOutboxes []*model.EventOutbox
 
-	// capturedMu guards capturedEventOutboxes. The writers are called from
-	// goroutines in several tests, and testify's own lock does not extend to fields
-	// this file adds, so an unguarded slice append would be a data race the race
-	// detector fails the suite on.
+	// capturedMu guards capturedEventOutboxes. The writers are called from goroutines in
+	// several tests, and testify's own lock does not extend to fields this file adds, so
+	// an unguarded slice append would be a data race the race detector fails the suite on.
 	capturedMu sync.Mutex
 }
 
@@ -73,12 +60,12 @@ func (m *MockDataSource) captureEventOutboxes(rows []*model.EventOutbox) {
 	}
 }
 
-// CapturedEventOutboxes returns a copy of every non-nil event outbox row passed to
-// the atomic transaction writers so far, in call order.
+// CapturedEventOutboxes returns a copy of every non-nil event outbox row passed to the
+// atomic transaction writers so far, in call order.
 //
-// A copy is returned rather than the backing slice so a test can hold the result
-// across further calls without it changing underneath, and so no test can mutate the
-// mock's record of what it observed.
+// A copy is returned rather than the backing slice so a test can hold the result across
+// further calls without it changing underneath, and so no test can mutate the mock's
+// record of what it observed.
 func (m *MockDataSource) CapturedEventOutboxes() []*model.EventOutbox {
 	m.capturedMu.Lock()
 	defer m.capturedMu.Unlock()
@@ -99,20 +86,13 @@ func (m *MockDataSource) ResetCapturedEventOutboxes() {
 // runEventPreparer runs the first non-nil preparer from a create writer's variadic tail
 // against the entity that create is about to return, and records the row it produced.
 //
-// It mirrors what the real writers do — database.firstEventPreparer picks one preparer,
-// and the row it returns is inserted inside the create's transaction — so that a service
-// that stops supplying a preparer, or supplies one that builds the wrong event, fails a
-// test here rather than silently losing the event in production. A nil row means
-// publishing is not configured and is recorded as nothing, which is the real
-// no-op-when-unconfigured contract.
-//
 // Parameters:
 //   - entity T: the created entity, exactly as it will be returned to the caller.
 //   - preparers []database.EventPreparer[T]: the writer's variadic tail.
 //
 // Returns:
-//   - error: the preparer's error, which the caller returns as the create's error just as
-//     the real writer aborts its transaction.
+//   - error: the preparer's error, which the caller returns as the create's error just
+//     as the real writer aborts its transaction.
 func runEventPreparer[T any](m *MockDataSource, entity T, preparers []database.EventPreparer[T]) error {
 	for _, prepare := range preparers {
 		if prepare == nil {
@@ -132,29 +112,19 @@ func runEventPreparer[T any](m *MockDataSource, entity T, preparers []database.E
 	return nil
 }
 
-// Compile-time proof that MockDataSource still satisfies the full IDataSource
-// contract.
+// Compile-time proof that MockDataSource still satisfies the full IDataSource contract.
 //
-// Without this, a method missing from the mock surfaces as a compile error in
-// every unrelated package that builds a mock — the api package, the root blnk
-// package, internal/search — with no indication that the mock is the cause. This
-// single line turns that confusing suite-wide failure into one clear local one at
-// the file that actually needs fixing.
-//
-// It is stated here, immediately after the type it constrains and ahead of the
-// method bodies, so that the contract this file exists to satisfy is the first
-// thing a reader meets rather than something they have to find at the bottom.
-//
-// It belongs in this package and NOT in the database package: database does not
-// import mocks, and adding the assertion there would create an import cycle.
+// It is stated here, immediately after the type it constrains and ahead of the method
+// bodies, so that the contract this file exists to satisfy is the first thing a reader
+// meets rather than something they have to find at the bottom.
 var _ database.IDataSource = (*MockDataSource)(nil)
 
-// RecordTransaction accepts the same variadic event outbox tail as the real
-// datasource, records it through captureEventOutboxes, and deliberately does not
-// forward it into m.Called() — for the same reason the atomic writers below do not.
-// Every expectation already written as m.On("RecordTransaction", ctx, txn) keeps
-// matching, while a test can still assert that the rejection path committed its
-// transaction.rejected event with the status mutation.
+// RecordTransaction accepts the same variadic event outbox tail as the real datasource,
+// records it through captureEventOutboxes, and deliberately does not forward it into
+// m.Called() — for the same reason the atomic writers below do not. Every expectation
+// already written as m.On("RecordTransaction", ctx, txn) keeps matching, while a test
+// can still assert that the rejection path committed its transaction.rejected event
+// with the status mutation.
 func (m *MockDataSource) RecordTransaction(ctx context.Context, txn *model.Transaction, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
 	m.captureEventOutboxes(eventOutbox)
 	args := m.Called(ctx, txn)
@@ -169,32 +139,9 @@ func (m *MockDataSource) RecordTransactionWithBalances(ctx context.Context, txn 
 	return args.Get(0).(*model.Transaction), args.Error(1)
 }
 
-// The three atomic writers below accept the same variadic event outbox tail as the
-// real datasource. They RECORD it, through captureEventOutboxes, and they
-// deliberately DO NOT forward it into m.Called().
-//
-// # Why it is recorded
-//
-// Discarding it made half of the transactional outbox guarantee unassertable. A
-// test could confirm that a mutation was recorded and could not confirm that its
-// event was captured alongside it — so a caller that stopped passing an event row
-// entirely would break the guarantee with every test still green. Recording the
-// rows on the mock closes that: see CapturedEventOutboxes.
-//
-// # Why it is still not forwarded into m.Called
-//
-// testify matches an expectation by argument count and position, so forwarding the
-// variadic would change the argument list every existing expectation was written
-// against — a caller that set up five mock.Anything matchers would stop matching
-// the moment a sixth argument appeared, and the failure would surface as an
-// unexpected-call panic at run time rather than as a compile error. Forwarding it
-// only when non-empty is worse still: the mock's arity would then depend on caller
-// data, so an expectation would match today and stop matching the day a caller
-// began passing rows, with nothing in either file to explain why.
-//
-// Recording gives assertability without touching argument matching, which is the
-// same source-compatibility property the variadic exists to provide on the real
-// interface. Assert on CapturedEventOutboxes, not on the Called() argument list.
+// The three atomic writers below accept the same variadic event outbox tail as the real
+// datasource. They RECORD it, through captureEventOutboxes, and they deliberately DO
+// NOT forward it into m.Called().
 func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
 	m.captureEventOutboxes(eventOutbox)
 	// eventOutbox is deliberately NOT forwarded into m.Called — see the note above.
@@ -355,21 +302,9 @@ func (m *MockDataSource) CountQueuedTransactionsForPairLane(ctx context.Context,
 	return args.Int(0), args.Error(1)
 }
 
-// CreateLedger accepts the same variadic EventPreparer tail as the real datasource
-// and RUNS the preparer against the ledger it is about to return, recording the row
-// it produced.
-//
-// Running it is what makes the atomic-capture behaviour observable: the preparer is
-// where the event's identity, aggregate id and payload are decided, and a mock that
-// merely accepted and dropped it would let ledger creation stop capturing its event
-// with no test able to notice. The row is passed to the created ledger, not the
-// requested one, because that is what the real writer does — the created value is the
-// only one carrying the generated LedgerID.
-//
-// A preparer error is returned as the create's error, exactly as the real writer
-// aborts its transaction, so the fail-closed contract is exercised too. The preparer
-// is not forwarded into m.Called(), so every existing m.On("CreateLedger", ledger)
-// expectation keeps matching.
+// CreateLedger accepts the same variadic EventPreparer tail as the real datasource and
+// RUNS the preparer against the ledger it is about to return, recording the row it
+// produced.
 func (m *MockDataSource) CreateLedger(ledger model.Ledger, prepareEvent ...database.EventPreparer[model.Ledger]) (model.Ledger, error) {
 	args := m.Called(ledger)
 	created, err := args.Get(0).(model.Ledger), args.Error(1)
@@ -386,10 +321,10 @@ func (m *MockDataSource) CreateLedger(ledger model.Ledger, prepareEvent ...datab
 
 // CreateLedgerWithEvent records the variadic event rows through captureEventOutboxes
 // and forwards only the ledger into m.Called, so an expectation written for
-// CreateLedger matches this variant unchanged. The reasoning is the same one
-// documented above RecordTransactionWithBalancesAndOutbox: forwarding a variadic
-// changes the argument count testify matches on, and that breaks at run time rather
-// than at compile time. Assert atomic capture on CapturedEventOutboxes.
+// CreateLedger matches this variant unchanged. The reasoning is the same one documented
+// above RecordTransactionWithBalancesAndOutbox: forwarding a variadic changes the
+// argument count testify matches on, and that breaks at run time rather than at compile
+// time. Assert atomic capture on CapturedEventOutboxes.
 func (m *MockDataSource) CreateLedgerWithEvent(ctx context.Context, ledger model.Ledger, eventOutbox ...*model.EventOutbox) (model.Ledger, error) {
 	m.captureEventOutboxes(eventOutbox)
 	args := m.Called(ledger)
@@ -452,8 +387,8 @@ func (m *MockDataSource) UpdateIdentityMetadata(id string, metadata map[string]i
 	return args.Error(0)
 }
 
-// CreateBalance accepts and RUNS the variadic EventPreparer tail against the balance
-// it is about to return, recording the row it produced. See CreateLedger for why the
+// CreateBalance accepts and RUNS the variadic EventPreparer tail against the balance it
+// is about to return, recording the row it produced. See CreateLedger for why the
 // preparer is run rather than dropped.
 //
 // The empty-balance case is honoured as the real writer honours it: a create reported
@@ -967,16 +902,10 @@ func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, clai
 	return args.Error(0)
 }
 
-// MarkEventFailed returns the outcome the real datasource decides in SQL. A test
-// that stubs only the error must still supply an outcome, because the caller reads
-// Exhausted to decide whether to dead-letter — returning a zero outcome on the
-// error path is correct and is what the nil check below produces.
-//
-// terminal and deadLetterLease are both part of the expectation rather than swallowed, so a
-// test can pin that the relay forwarded the publisher's permanent-failure verdict to the
-// durable transition instead of leaving the decision to the attempt count, AND that it supplied
-// a hand-off lease — a zero lease reintroduces the duplicate dead-letter race, and a mock that
-// dropped the argument could not tell one from the other.
+// MarkEventFailed returns the outcome the real datasource decides in SQL. A test that
+// stubs only the error must still supply an outcome, because the caller reads Exhausted
+// to decide whether to dead-letter — returning a zero outcome on the error path is
+// correct and is what the nil check below produces.
 func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool, deadLetterLease time.Duration) (model.EventFailureOutcome, error) {
 	args := m.Called(ctx, id, claimToken, errMsg, retryAfter, terminal, deadLetterLease)
 	if args.Get(0) == nil {
@@ -986,13 +915,10 @@ func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimTok
 }
 
 // MarkEventPermanentlyFailed returns the outcome the real datasource produces for a
-// permanent failure. As with MarkEventFailed a test that stubs only the error must still
-// supply an outcome, because the caller reads Exhausted and ClaimToken to perform the
-// dead-letter hand-off — and a zero outcome on the error path is what the nil check below
-// produces.
-//
-// deadLetterLease is likewise part of the expectation: this transition holds the row for the
-// hand-off, and a caller that passed nothing would leave the row re-claimable at once.
+// permanent failure. As with MarkEventFailed a test that stubs only the error must
+// still supply an outcome, because the caller reads Exhausted and ClaimToken to perform
+// the dead-letter hand-off — and a zero outcome on the error path is what the nil check
+// below produces.
 func (m *MockDataSource) MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string, deadLetterLease time.Duration) (model.EventFailureOutcome, error) {
 	args := m.Called(ctx, id, claimToken, errMsg, deadLetterLease)
 	if args.Get(0) == nil {
@@ -1122,8 +1048,8 @@ func (m *MockDataSource) CountDeadLetterInventory(ctx context.Context, query mod
 }
 
 // CountUnresolvedEventOutbox is the LIGHTWEIGHT status aggregate: every non-dispatched status,
-// exact and unwindowed. It takes no window argument, which is the point of it (PERF-M05) — a
-// test that expects a window here is expecting the on-demand history reading below instead.
+// exact and unwindowed. It takes no window argument; a test that expects a window here is
+// expecting the on-demand history reading below instead.
 func (m *MockDataSource) CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error) {
 	args := m.Called(ctx)
 	if args.Get(0) == nil {
@@ -1141,12 +1067,10 @@ func (m *MockDataSource) CountEventOutboxByStatus(ctx context.Context, since tim
 }
 
 // AuditEventRecordsInIntervals returns the outbox side of the zero-loss reconciliation,
-// classified against the measured broker windows. The intervals are part of the expectation
-// so a test can assert that the windows actually reached the audit — an audit run against no
-// windows classifies every row as unmeasured, which is a different verdict entirely.
-//
-// A test that stubs only the error may leave the audit nil: the zero audit the nil check
-// produces reports nothing published, which is the correct reading of a failed measurement.
+// classified against the measured broker windows. The intervals are part of the
+// expectation so a test can assert that the windows actually reached the audit — an
+// audit run against no windows classifies every row as unmeasured, which is a different
+// verdict entirely.
 func (m *MockDataSource) AuditEventRecordsInIntervals(ctx context.Context, intervals []model.PartitionOffsetInterval) (model.EventRecordIntervalAudit, error) {
 	args := m.Called(ctx, intervals)
 	if args.Get(0) == nil {
@@ -1457,12 +1381,12 @@ func (m *MockDataSource) CountUnfinalizedBulkTransactionBatches(ctx context.Cont
 	return int64(args.Int(0)), oldest, args.Error(2)
 }
 
-// ExistingEventIDs mocks the batched durability lookup the post-commit path uses to decide
-// whether a transaction's event still has to be captured.
+// ExistingEventIDs mocks the batched durability lookup the post-commit path uses to
+// decide whether a transaction's event still has to be captured.
 //
-// Reached only when event publishing is CONFIGURED — durableTransactionEvents short-circuits
-// on an unconfigured publisher — so the many tests that build a broker-less configuration never
-// call it and need no expectation for it.
+// Reached only when event publishing is CONFIGURED — durableTransactionEvents
+// short-circuits on an unconfigured publisher — so the many tests that build a
+// broker-less configuration never call it and need no expectation for it.
 func (m *MockDataSource) ExistingEventIDs(ctx context.Context, eventIDs []string) (map[string]struct{}, error) {
 	args := m.Called(ctx, eventIDs)
 	if args.Get(0) == nil {

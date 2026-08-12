@@ -30,34 +30,16 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// postIdentityActions performs actions after an identity has been created.
-// It sends the newly created identity to the search index queue.
-//
-// IT NO LONGER CAPTURES THE EVENT, and that is the point rather than an omission. The
-// identity.created row is now inserted INSIDE the transaction that inserts the identity, by
-// the repository, from the preparer identityCreatedEventPreparer supplies — so the event and
-// the identity commit together instead of the event being written from a goroutine after the
-// fact. Capturing it here as well would publish the same event twice, and event_id is derived
-// from the identity's own identity, so the second insert would be refused by the unique index
-// and the only visible result would be a logged conflict on every identity creation.
+// postIdentityActions performs actions after an identity has been created. It sends the
+// newly created identity to the search index queue.
 //
 // Indexing stays here because it is genuinely post-commit work: TypeSense is a separate
-// system with its own retry queue, and nothing about it belongs in a ledger transaction.
-//
-// # THE ONE CASE IT STILL PUBLISHES
-//
-// A webhook-only deployment — a webhook URL and no KAFKA_BROKERS — gets NO preparer, because
-// capturing rows no relay can drain is what eventCaptureEnabled exists to avoid. Nothing
-// captures the event on that shape, so the legacy publish is retained here as a fallback for
-// it alone, exactly as postTransactionActions retains one for a transaction its atomic writer
-// did not record. Without it this deployment lost identity.created from BOTH transports.
-//
-// publishEntityEventWhenUncaptured owns that decision and returns immediately whenever a
-// preparer was supplied, so the atomic capture and this call can never both run.
+// system with its own retry queue, and nothing about it belongs in a ledger
+// transaction.
 //
 // Parameters:
-//   - ctx context.Context: the creating request's context. Detached from cancellation before
-//     it is handed to the publish, which outlives the request that spawned it.
+//   - ctx context.Context: the creating request's context. Detached from cancellation
+//     before it is handed to the publish, which outlives the request that spawned it.
 //   - identity *model.Identity: A pointer to the newly created Identity model.
 func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity) {
 	// Derived outside the goroutine, while ctx is still live. See postLedgerActions.
@@ -78,61 +60,15 @@ func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity
 	}()
 }
 
-// identityCreatedEventPreparer returns the preparer that builds the identity.created outbox
-// row, for the repository to insert INSIDE the transaction that inserts the identity.
+// identityCreatedEventPreparer returns the preparer that builds the identity.created
+// outbox row, for the repository to insert INSIDE the transaction that inserts the
+// identity.
 //
-// # Why the event is captured through a callback rather than published here
-//
-// It used to be published from postIdentityActions, in a goroutine, after CreateIdentity had
-// already committed — so an identity could be durable while the event announcing it was
-// lost to a crash or a failed insert, with nothing left to replay from. Requirement R-2
-// exists to close exactly that window, and the event now commits with the identity or not at
-// all.
-//
-// The callback shape is forced by where the identity id comes from: the repository resolves
-// it during the insert — minting idt_<uuid> unless the caller supplied a canonical one — and
-// stamps CreatedAt, and both the payload and the event's aggregate id are derived from the
-// finished identity. See database.EventPreparer.
-//
-// # The payload is forwarded VERBATIM, PII included
-//
-// The event string is still "identity.created" and the payload is still the created
-// *model.Identity, unredacted, exactly as the HTTP webhook carried it. Filtering or
-// detokenizing it here would change what subscribers receive relative to the HTTP era and
-// break the equivalence the transport substitution is measured by; narrowing that exposure
-// is a separate, deliberate change to the contract rather than a side effect of moving
-// transports.
-//
-// AN IDENTITY HAS NO LEDGER, so requirement R-6's ledger partitioning has nothing to apply
-// here, and this is one of the two catalogue entries where that is a property of the DATA MODEL
-// rather than of this call site not bothering.
-//
-// model.Identity declares no ledger field and no balance reference: an identity is a party, and
-// the same party may hold balances in many ledgers or none. There is therefore no authoritative
-// ledger to thread — not one that is expensive to obtain, one that does not exist — and
-// inventing one by, say, picking the first balance that happens to reference the identity would
-// fabricate an ordering domain that changes as balances are added.
-//
-// So no WithEventLedgerID is supplied, ledger_id is stored as SQL NULL, and the partition key
-// resolves to the IDENTITY ID through PrepareEventOutbox's documented chain. That is the correct
-// answer rather than a degraded one: the identity is the aggregate these events describe, so
-// keying on it gives one identity's events a single partition and therefore a total order among
-// themselves — which is exactly the guarantee a consumer of identity events needs. The
-// partition-key table in docs/event-streaming.md states this, and event_ordering_integration_test.go
-// asserts it, so the choice is documented and pinned rather than incidental.
-//
-// A NULL ledger_id is likewise correct and not a gap: the column records the ledger the mutation
-// belonged to, and this mutation belonged to none. Storing a fabricated value would corrupt the
-// daily reconciliation and any consumer grouping by ledger.
-//
-// The `identity.created` event is captured atomically with the identity row: the capture
-// handed to the datasource is invoked with the finalised identity and its row is inserted
-// inside the same database transaction, so the identity and its event commit or roll back
-// together.
+// Capturing it here closes the window in which an identity exists and its event does
+// not: the event commits with the identity or not at all.
 //
 // Parameters:
-//   - ctx context.Context: the creating request's context, captured for tracing only. The
-//     preparer performs no I/O.
+//   - ctx context.Context: the creating request's context, captured for tracing only.
 //
 // Returns:
 //   - database.EventPreparer[model.Identity]: the preparer to hand to the repository.
@@ -152,29 +88,21 @@ func (l *Blnk) identityCreatedEventPreparer(ctx context.Context) database.EventP
 	}
 }
 
-// CreateIdentity creates a new identity together with its identity.created event, atomically.
+// CreateIdentity creates a new identity together with its identity.created event,
+// atomically.
 //
-// The event preparer is handed to the repository, which inserts the identity and the event
-// row in one transaction (requirement R-2). A failure to prepare or insert the event
-// therefore fails the creation, and the caller sees no identity — which is the correct
-// outcome: an identity whose event was lost is one no subscriber knows exists, and the
-// alternative trades a visible failure for an invisible one.
-//
-// postIdentityActions then performs the remaining post-commit work, which is indexing only.
-//
-// Parameters:
-// # This is requirement R-2 applied to identity creation
-//
-// The identity row and its identity.created event are written in ONE database transaction:
-// the event builder is invoked inside it with the created identity, so the payload carries
-// the generated id the legacy webhook body carried, and an event that cannot be recorded
-// rolls the identity back rather than leaving it committed and unannounced.
+// postIdentityActions then performs the remaining post-commit work, which is indexing
+// only.
 //
 // - identity model.Identity: The Identity model to be created.
 //
+// Parameters:
+// # This is the requirement applied to identity creation
+//
 // Returns:
-// - model.Identity: The created Identity model.
-// - error: An error if the identity could not be created, or if its event could not be captured.
+//   - model.Identity: The created Identity model.
+//   - error: An error if the identity could not be created, or if its event could not be
+//     captured.
 func (l *Blnk) CreateIdentity(identity model.Identity) (model.Identity, error) {
 	ctx := context.Background()
 

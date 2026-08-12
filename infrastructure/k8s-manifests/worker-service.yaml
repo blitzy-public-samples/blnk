@@ -1,4 +1,4 @@
-# THE WORKER'S METRICS ENDPOINT, WITHOUT WHICH IT IS NEVER SCRAPED (F-18).
+# THE WORKER'S METRICS ENDPOINT, WITHOUT WHICH IT IS NEVER SCRAPED.
 #
 # prometheus-configmap.yaml declares a `blnk-worker` scrape job pointing at
 # `worker:5004`, and there was no Service named `worker` in this folder. A Prometheus

@@ -140,19 +140,7 @@ func respondError(c *gin.Context, err error, opts ...respondOpt) {
 			logrus.WithField("cause", logsafe.Cause(err)).Error("API error masked by fallback message")
 
 		case serverFacingStatus(o.defaultCode, o):
-			// MI-3: A 5xx DEFAULT MUST NOT ECHO err.Error().
-			//
-			// Reaching here means classification found nothing: no typed APIError, no known
-			// sentinel, no recognised message pattern. So this message was not written for a
-			// client by anyone — it is whatever a repository, driver or broker produced, and on
-			// this path those are exactly the errors that carry a DSN, a host:port, SQL text or a
-			// filesystem path. `pq: connection refused on 10.0.0.5` reached callers of every
-			// endpoint using withDefault(GEN_INTERNAL), ErrEventReplayFailed,
-			// ErrReconStartFailed or ErrSubscriberProvisioningFailed with no fallback message.
-			//
-			// THE FINAL FALLBACK BELOW ALREADY DID THIS. The two paths differ only in whether a
-			// caller named a default code, which is a choice about the CODE, never a decision to
-			// disclose internals — so the same sanitized text applies to both.
+			// A 5xx DEFAULT MUST NOT ECHO err.Error.
 			//
 			// The test is on the STATUS rather than on a list of codes: a 4xx default is a
 			// caller-actionable refusal whose message is the useful part of the response, and
@@ -176,14 +164,9 @@ func respondError(c *gin.Context, err error, opts ...respondOpt) {
 	writeError(c, apierror.ErrGenInternal, sanitizedInternalMessage, nil, o)
 }
 
-// serverFacingStatus reports whether the response this code produces will be a server-fault
-// status, and therefore whether an unclassified error message must be withheld from the client.
-//
-// IT RESOLVES THE CODE THE SAME WAY writeError DOES — Normalize, then any registered upgrade —
-// because the status that matters is the one actually sent. Testing the raw code would give the
-// wrong answer for any caller combining withDefault with withUpgrade: the upgraded code decides
-// the status, so the un-upgraded code could read 4xx while a 5xx went out carrying the driver's
-// text.
+// serverFacingStatus reports whether the response this code produces will be a
+// server-fault status, and therefore whether an unclassified error message must be
+// withheld from the client.
 //
 // Parameters:
 //   - code apierror.ErrorCode: the default code respondError is about to write.

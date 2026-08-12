@@ -14,46 +14,17 @@
 	limitations under the License.
 */
 
-// Acceptance criterion V-2 — ZERO MESSAGE LOSS — measured end to end, live.
+// ZERO MESSAGE LOSS, measured end to end against a live broker.
 //
-// # Why this file exists
+// Zero message loss is the criterion with the most machinery behind it and the least
+// joined-up evidence. Three pieces were each well covered on their own:
 //
-// V-2 is the criterion with the most machinery behind it and, until now, the least joined-up
-// evidence. Three pieces were each well covered on their own:
-//
-//   - The PostgreSQL side. database/event_outbox_test.go drives real rows into every terminal
-//     state and checks the census and the interval audit against a real table.
-//   - The broker side. event_admin_test.go measures end offsets and partition windows against
-//     a fake Kafka client that answers scripted offsets.
-//   - The interpretation. ReconcileAgainstOutbox is exercised over hand-built reports and
-//     hand-built audits, which is how its every branch is reached.
-//
-// What no test did was put a REAL record on a REAL broker, record the coordinate the broker
-// actually assigned into a REAL outbox row, measure that partition's REAL window, and let the
-// production reconciliation read the two together. Every one of those seams is where the two
-// halves can disagree while each half is individually correct — a coordinate stored with the
-// wrong partition, an interval computed exclusive where the audit reads it inclusive, an
-// off-by-one at the log end — and each of those defects produces exactly the reassuring green
-// verdict this criterion exists to make impossible.
-//
-// So this file joins them. It publishes through the production publisher, stores through the
-// production repository transitions, measures through the production admin client, and asserts
-// the production verdict. Nothing here is scripted: every number comes from PostgreSQL or from
-// Kafka.
-//
-// # Why it owns a database
-//
-// The audit's population is every row in blnk.event_outbox that claims a publication — the
-// whole table, deliberately, because a reconciliation narrowed to a subset would be a
-// reconciliation of nothing. A CONCLUSIVE verdict therefore requires that every such row be
-// accounted for, which cannot be arranged on a table shared with other suites, other clones and
-// previous runs: one stale coordinate from a topic that has since been recreated is enough to
-// turn the verdict into a permanent LOSS DETECTED that says nothing about the code.
-//
-// The fixture therefore creates its own database, migrates it with the embedded migrations, and
-// drops it afterwards. That is the only arrangement in which "conclusive" is a statement about
-// the implementation rather than about the tidiness of a shared table — and it is also why this
-// suite cannot collide with the tier lock the other live outbox suites share.
+//   - The PostgreSQL side. database/event_outbox_test.go drives real rows into every
+//     terminal state and checks the census and the interval audit against a real table.
+//   - The broker side. event_admin_test.go measures end offsets and partition windows
+//     against a fake Kafka client that answers scripted offsets.
+//   - The interpretation. ReconcileAgainstOutbox is exercised over hand-built reports
+//     and hand-built audits, which is how its every branch is reached.
 package blnk
 
 import (
@@ -77,34 +48,24 @@ import (
 
 // zeroLossEventType is the event type every fixture row carries.
 //
-// A transaction event, so TopicForEvent routes it to blnk.transactions — an OWNED topic, which
-// is required rather than convenient: validateEventOutboxEntry refuses a stored destination
-// outside the namespaces this deployment owns, so a fixture could not name an invented topic
-// even if isolation would have been easier that way.
+// A transaction event, so TopicForEvent routes it to blnk.transactions — an OWNED
+// topic, which is required rather than convenient: validateEventOutboxEntry refuses a
+// stored destination outside the namespaces this deployment owns, so a fixture could
+// not name an invented topic even if isolation would have been easier that way.
 const zeroLossEventType = "transaction.applied"
 
 // zeroLossEvents is how many events are published and reconciled.
 //
-// Small on purpose. The property is a MAPPING — every row names the record it produced — and
-// the mapping either holds for one row or for none; volume adds runtime against a real broker
-// without adding evidence. Six is enough to spread across partitions under the keyed balancer
-// and therefore to catch a partition recorded from the wrong field.
+// Small on purpose.
 const zeroLossEvents = 6
 
 // zeroLossBudget bounds the live statistics projection.
-//
-// Generous rather than tight: it covers six publishes, two full-inventory offset reads across
-// the whole topic inventory and two audits against a real database, and a timeout that fires
-// part-way through
-// would report as a reconciliation failure rather than as the slow broker it is.
 const zeroLossBudget = 90 * time.Second
 
 // zeroLossStatisticsWindow is the window the statistics projection is asked for.
 //
-// One hour, which is far longer than the run and therefore includes every row this fixture
-// writes. The window bounds only the DISPATCHED population — the one status that grows without
-// bound — so a value shorter than the run would drop rows from the census while the audit still
-// classified them, and the mismatch would look like loss.
+// One hour, which is far longer than the run and therefore includes every row this
+// fixture writes.
 const zeroLossStatisticsWindow = time.Hour
 
 // zeroLossFixture owns one disposable database, a live admin client and a live publisher.
@@ -121,13 +82,8 @@ type zeroLossFixture struct {
 	runID string
 }
 
-// newZeroLossFixture builds the live end-to-end fixture, or skips naming exactly what is
-// missing.
-//
-// The skips are deliberate and each names the command that fixes it: this suite is part of the
-// Kafka acceptance job, where it must RUN, and it is also part of `go test ./...` on a developer
-// machine that may have neither a broker nor a provisioned producer. The acceptance job's
-// fail-on-skip gate is what makes those skips safe — a skip there is a job failure.
+// newZeroLossFixture builds the live end-to-end fixture, or skips naming exactly what
+// is missing.
 func newZeroLossFixture(t *testing.T) *zeroLossFixture {
 	t.Helper()
 
@@ -174,8 +130,8 @@ func newZeroLossFixture(t *testing.T) *zeroLossFixture {
 		Brokers:     brokers,
 		TopicPrefix: DefaultTopicPrefix,
 		// Two principals, because the two halves of this test are two ROLES: the publisher
-		// authenticates as the producer and the offset measurement as the administrator, which
-		// is exactly how a deployment is configured.
+		// authenticates as the producer and the offset measurement as the administrator,
+		// which is exactly how a deployment is configured.
 		SASLUser:        producerUser,
 		SASLSecret:      producerSecret,
 		SASLAdminUser:   adminUser,
@@ -237,15 +193,10 @@ func newZeroLossFixture(t *testing.T) *zeroLossFixture {
 	return fixture
 }
 
-// createZeroLossDatabase creates a disposable database beside the configured one and returns a
-// DSN pointing at it, migrated and empty.
+// createZeroLossDatabase creates a disposable database beside the configured one and
+// returns a DSN pointing at it, migrated and empty.
 //
-// # Why a whole database rather than a marker
-//
-// Every other live suite here scopes itself with a marker on the rows it wrote. That works for
-// a question about specific rows and cannot work for this one: the reconciliation's verdict is a
-// property of the WHOLE table, so a foreign row is not noise to be filtered but a fact the
-// verdict must account for. The only way to assert "conclusive" is to own every row in it.
+// Every other live suite here scopes itself with a marker on the rows it wrote.
 //
 // Parameters:
 //   - t *testing.T: owns the database's lifetime; it is dropped in cleanup.
@@ -326,13 +277,11 @@ func createZeroLossDatabase(t *testing.T, base, runID string) string {
 	return dsn
 }
 
-// publishAndRecord publishes one event through the production publisher and stores an outbox
-// row carrying the coordinate the BROKER assigned, exactly as the relay does.
+// publishAndRecord publishes one event through the production publisher and stores an
+// outbox row carrying the coordinate the BROKER assigned, exactly as the relay does.
 //
-// The two halves are what make this the joined path: the coordinate is not chosen by the test.
-// It is read out of the publish result, which read it out of the broker's acknowledgement, and
-// it is written through MarkEventDispatched, which is the only production route by which a row
-// comes to claim a publication.
+// The two halves are what make this the joined path: the coordinate is not chosen by
+// the test.
 //
 // Parameters:
 //   - ctx context.Context: cancels the publish and the transitions.
@@ -393,12 +342,9 @@ func (f *zeroLossFixture) publishAndRecord(ctx context.Context, index int) model
 	return result.Record
 }
 
-// reconcile runs the whole live join: measure the broker, audit the outbox against exactly the
-// windows that measurement produced, and interpret the pair with the production verdict.
-//
-// The intervals are taken from the report rather than computed here, which is the invariant the
-// interval form of the audit exists to enforce: an audit taken against different windows
-// produces a verdict about nothing.
+// reconcile runs the whole live join: measure the broker, audit the outbox against
+// exactly the windows that measurement produced, and interpret the pair with the
+// production verdict.
 func (f *zeroLossFixture) reconcile(ctx context.Context) (TopicOffsetReport, model.EventRecordIntervalAudit, OutboxReconciliation) {
 	f.t.Helper()
 
@@ -422,26 +368,19 @@ func (f *zeroLossFixture) reconcile(ctx context.Context) (TopicOffsetReport, mod
 	return report, audit, ReconcileAgainstOutbox(report, audit)
 }
 
-// TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords is acceptance
-// criterion V-2, joined.
+// joined.
 //
-// # The two outcomes, and why both are required
+// A reconciliation that can only return one answer is not a reconciliation. Asserting
+// the green verdict alone would pass against a function that returned "no loss
+// detected" unconditionally — which is the single most dangerous defect this criterion
+// can have, because it is invisible in every healthy run and silent in the one that
+// matters.
 //
-// A reconciliation that can only return one answer is not a reconciliation. Asserting the green
-// verdict alone would pass against a function that returned "no loss detected" unconditionally —
-// which is the single most dangerous defect this criterion can have, because it is invisible in
-// every healthy run and silent in the one that matters. So the same live pieces are used twice:
-//
-//  1. CONCLUSIVE. Six events are published to a real topic, each row records the coordinate the
-//     broker actually assigned, and the verdict must be conclusive with every row corroborated.
-//  2. LOSS DETECTED. One further row claims a coordinate at the end of its partition's log — a
-//     record the broker has not written and, by construction, does not have. The verdict must
-//     flip, name the row, and say why.
-//
-// The second is the honest form of a loss because it is the form a loss actually takes. A row
-// claiming an offset the log does not reach is what a truncated partition, a recreated topic, or
-// an event lost after being marked published leaves behind, and it is the one signal the
-// arithmetic cannot explain away as redelivery overhead.
+//  1. CONCLUSIVE. Six events are published to a real topic, each row records the
+//     coordinate the broker actually assigned, and the verdict must be conclusive with
+//     every row corroborated.
+//  2. LOSS DETECTED. One further row claims a coordinate at the end of its partition's
+//     log — a record the broker has not written and, by construction, does not have.
 func TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords(t *testing.T) {
 	fixture := newZeroLossFixture(t)
 
@@ -464,9 +403,9 @@ func TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords(t *
 		records = append(records, fixture.publishAndRecord(ctx, index))
 	}
 
-	// The keyed balancer must have spread the fixtures, or a partition read from the wrong field
-	// would be indistinguishable from a correct one — every row would name partition 0 and every
-	// window measured would be partition 0's.
+	// The keyed balancer must have spread the fixtures, or a partition read from the wrong
+	// field would be indistinguishable from a correct one — every row would name partition
+	// 0 and every window measured would be partition 0's.
 	partitions := make(map[int]struct{}, len(records))
 	for _, record := range records {
 		partitions[record.Partition] = struct{}{}
@@ -511,9 +450,10 @@ func TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords(t *
 			"the summary is what an operator pastes into a compliance record, so it must state the "+
 				"conclusion in words and not only in a boolean")
 
-		// The broker's own reading is reported alongside, and it is a CUMULATIVE total for a topic
-		// this stack shares. It must not be mistaken for a per-window count, and it must not be
-		// what the verdict rests on — which is exactly why the surplus is not read as a shortfall.
+		// The broker's own reading is reported alongside, and it is a CUMULATIVE total for a
+		// topic this stack shares. It must not be mistaken for a per-window count, and it
+		// must not be what the verdict rests on — which is exactly why the surplus is not
+		// read as a shortfall.
 		assert.Positivef(t, report.EndOffsetSum,
 			"the measured topic must report a positive end offset sum after six records were "+
 				"written to it")
@@ -527,10 +467,10 @@ func TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords(t *
 		intervals := report.PartitionIntervals()
 		require.NotEmpty(t, intervals, "the measurement must produce at least one partition window")
 
-		// AT the end offset, not past it by an arbitrary amount. The end offset is the position
-		// the NEXT record will take, so it is precisely the first coordinate that does not exist —
-		// which makes this the boundary case rather than an obviously absurd value, and the
-		// boundary is where an off-by-one lives.
+		// AT the end offset, not past it by an arbitrary amount. The end offset is the
+		// position the NEXT record will take, so it is precisely the first coordinate that
+		// does not exist — which makes this the boundary case rather than an obviously absurd
+		// value, and the boundary is where an off-by-one lives.
 		target := intervals[0]
 		phantom := model.BrokerRecord{
 			Topic:     target.Topic,
@@ -590,45 +530,33 @@ func TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords(t *
 	})
 }
 
-// TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka is the other half
-// of the V-2 join: the ORCHESTRATION an operator actually reads, rather than its two inputs.
+// TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka is the
+// other half of the join: the ORCHESTRATION an operator actually reads, rather than
+// its two inputs.
 //
-// # Why the reconciliation test above is not enough
+// That test calls the three collaborators itself — measure the broker, audit the outbox
+// against exactly those windows, interpret the pair — which proves the collaborators
+// agree.
 //
-// That test calls the three collaborators itself — measure the broker, audit the outbox against
-// exactly those windows, interpret the pair — which proves the collaborators agree. It says
-// nothing about the code that SEQUENCES them, and that code owns every policy decision the
-// endpoint's answer depends on: which instant both sides are measured from, whether the audit is
-// taken at all, which failures degrade the answer and which refuse it, and whether the verdict is
-// reported or withheld. Those decisions are exercised exhaustively against fakes elsewhere in
-// event_admin_test.go — TestEventOutboxStatistics_ReadsTheOutboxFirstAndTheBrokerAsAnEnrichment,
-// TestEventOutboxStatistics_ProducesAVerdictOnlyWhenBothSidesWereMeasured and
-// TestEventOutboxStatistics_ComparesOneCommonPopulation among them — because a policy reachable
-// only through a live PostgreSQL and a live broker is a policy whose branches go untested.
+// What no fake can establish is that the real repository, the real broker read and the
+// real verdict COMPOSE: that the counts the statistics report come from the same rows
+// the audit classifies, that the intervals the broker measured are the intervals the
+// audit was taken against, and that a verdict assembled from all three says what the
+// two halves separately say.
 //
-// What no fake can establish is that the real repository, the real broker read and the real
-// verdict COMPOSE: that the counts the statistics report come from the same rows the audit
-// classifies, that the intervals the broker measured are the intervals the audit was taken
-// against, and that a verdict assembled from all three says what the two halves separately say.
-// This test is that composition, and it is the reason it lives beside the fixture that owns a
-// disposable database rather than beside the fake-driven cases.
-//
-// # Both directions, again
-//
-// A projection that can only report health is worse than none, so the same live pieces answer
-// twice: once where every row names a record the broker can serve, and once where a row claims a
-// publication it cannot name at all. The second is the honest shape of a relay that crashed
-// between the write and the acknowledgement, and it must withdraw the verdict's confidence
-// rather than average the row away.
+// A projection that can only report health is worse than none, so the same live pieces
+// answer twice: once where every row names a record the broker can serve, and once
+// where a row claims a publication it cannot name at all.
 func TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka(t *testing.T) {
 	fixture := newZeroLossFixture(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), zeroLossBudget)
 	defer cancel()
 
-	// The whole inventory, exactly as the production reader does it. Narrowing to one topic would
-	// leave rows on any other topic UNMEASURED rather than corroborated, which is a caveat the
-	// endpoint must never manufacture for itself — see the note on b.readEventTopicEndOffsets.
+	// The whole inventory, exactly as the production reader does it. Narrowing to one
+	// topic would leave rows on any other topic UNMEASURED rather than corroborated, which
+	// is a caveat the endpoint must never manufacture for itself — see the note on
+	// b.readEventTopicEndOffsets.
 	readOffsets := func(ctx context.Context, since time.Time) (TopicOffsetReport, error) {
 		return fixture.admin.TopicEndOffsets(ctx, since)
 	}
@@ -688,8 +616,8 @@ func TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka
 
 		// THE TWO SIDES DESCRIBE ONE POPULATION. The audit the orchestration took must be the
 		// audit of the intervals the report it just measured produced — the invariant the
-		// interval form of the query exists to enforce — so the offsets it recorded must cover
-		// the topic the rows are on.
+		// interval form of the query exists to enforce — so the offsets it recorded must
+		// cover the topic the rows are on.
 		measured := make([]string, 0, len(statistics.Offsets.Topics))
 		for _, snapshot := range statistics.Offsets.Topics {
 			measured = append(measured, snapshot.Topic)
@@ -701,10 +629,11 @@ func TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka
 	})
 
 	t.Run("a row that cannot name its record withdraws the verdict's confidence", func(t *testing.T) {
-		// A ROW THAT IS DISPATCHED AND NAMES NOTHING. This is what a relay that crashed between
-		// a successful publish and its bookkeeping leaves behind, and it is the population a
-		// surplus of redeliveries could be hiding: arithmetically it is indistinguishable from a
-		// healthy row, so the verdict must refuse to conclude rather than count it as fine.
+		// A ROW THAT IS DISPATCHED AND NAMES NOTHING. This is what a relay that crashed
+		// between a successful publish and its bookkeeping leaves behind, and it is the
+		// population a surplus of redeliveries could be hiding: arithmetically it is
+		// indistinguishable from a healthy row, so the verdict must refuse to conclude rather
+		// than count it as fine.
 		aggregate := fmt.Sprintf("zl-%s-unconfirmed", fixture.runID)
 		entry := &model.EventOutbox{
 			EventID:       uuid.NewString(),
@@ -726,9 +655,9 @@ func TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka
 		require.Len(t, claimed, 1)
 		require.Equal(t, entry.EventID, claimed[0].EventID)
 
-		// The UNCONFIRMED record: no topic, no partition, no offset. The repository accepts it
-		// because a publish whose acknowledgement was lost is a real outcome; classifying it is
-		// the reconciliation's job, not the write's.
+		// The UNCONFIRMED record: no topic, no partition, no offset. The repository accepts
+		// it because a publish whose acknowledgement was lost is a real outcome; classifying
+		// it is the reconciliation's job, not the write's.
 		require.NoError(t,
 			fixture.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, model.BrokerRecord{}),
 			"a dispatched row with no coordinate must be recordable, or this state could not arise")

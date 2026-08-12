@@ -114,58 +114,35 @@ func TestInflightCommitHandlerRegistered(t *testing.T) {
 	}()
 }
 
-// TestHandleTransactionRejection_CapturesTheEventExactlyOnce is the worker half of the rejection
-// atomicity repair, and it asserts the consequence an operator actually saw.
+// TestHandleTransactionRejection_CapturesTheEventExactlyOnce is the worker half of the
+// rejection atomicity repair, and it asserts the consequence an operator actually saw.
 //
-// This handler used to call PublishEvent with "transaction.rejected" straight after
-// RejectTransaction returned — the SECOND capture of that event, because the rejection's own
-// post-transaction actions already captured it with the same payload. event_id is DERIVED from the
-// transaction's identity and status, so the two rows collided on the unique index, the second
-// insert came back as a conflict, and this handler RETURNED that conflict. asynq reads a non-nil
-// return as a task failure, so every rejection in a deployment with event capture configured was
-// retried for a transaction that had already been rejected.
-//
-// So the assertions are: the handler reports success, and the event exists exactly once. The count
-// is taken from the database rather than from a spy because the duplicate this covers was refused
-// BY the database — a mock has no unique index and could not have detected it.
-//
-// Event capture is enabled by CONFIGURING A BROKER, which is what eventPublishingConfigured
-// reads. Nothing here dials it: the capture decision is a pure configuration check, the row is
-// written by PrepareEventOutbox and RecordTransaction, and the relay — the only thing that
-// would speak to a broker — is not running. So the test needs Postgres and Redis exactly as
-// the rest of this suite does, and needs no broker at all.
+// So the assertions are: the handler reports success, and the event exists exactly
+// once.
 func TestHandleTransactionRejection_CapturesTheEventExactlyOnce(t *testing.T) {
 	cfg := realInfraConfig(t)
 	// A configured BROKER is what makes the capture path active. Without it the rejection
 	// captures nothing at all and this test would pass for the wrong reason.
 	//
-	// A webhook URL is deliberately NOT used for this: capture is tied to Kafka because the
-	// outbox is only a destination when a relay can drain it, and the relay refuses to run
-	// without brokers — see eventPublishingConfigured. A webhook-only deployment therefore
-	// writes no row and is served by the legacy transport directly, which is a different
-	// behaviour with its own coverage.
-	//
-	// The instance is assembled here rather than through newCmdTestInstance because that helper
-	// re-installs the plain configuration, and the capture decision is read from the
-	// configuration the instance was BUILT with — so the brokers have to be set before setupBlnk.
-	//
-	// The list comes from the environment rather than being hardcoded. Nothing here dials it,
-	// but a hardcoded endpoint describes this deployment as running on localhost:9092 when it
-	// does not, and that is the kind of statement a reader later trusts.
+	// A webhook URL is deliberately NOT used for this: capture is tied to Kafka because
+	// the outbox is only a destination when a relay can drain it, and the relay refuses to
+	// run without brokers — see eventPublishingConfigured. A webhook-only deployment
+	// therefore writes no row and is served by the legacy transport directly, which is a
+	// different behaviour with its own coverage.
 	cfg.Kafka.Brokers = cmdTestKafkaBrokers()
-	// The publisher refuses a plaintext broker unless the deployment says out loud that it is
-	// a development one. Saying so is correct here — nothing is dialled, and the alternative
-	// would be a TLS configuration this test has no use for.
+	// The publisher refuses a plaintext broker unless the deployment says out loud that it
+	// is a development one. Saying so is correct here — nothing is dialled, and the
+	// alternative would be a TLS configuration this test has no use for.
 	cfg.Kafka.InsecureLocalDev = true
 
 	newBlnk, err := setupBlnk(cfg)
 	require.NoError(t, err, "Postgres and Redis must be running for the cmd test suite")
 	instance := &blnkInstance{blnk: newBlnk, cnf: cfg}
 
-	// The assertions below read blnk.event_outbox, so a database whose event_outbox does not
-	// match what the capture path writes cannot answer them. That is an environment problem
-	// and is reported as one: without this guard a foreign schema surfaces as
-	// "the rejection event must exist exactly once" or as a raw pq constraint violation
+	// The assertions below read blnk.event_outbox, so a database whose event_outbox does
+	// not match what the capture path writes cannot answer them. That is an environment
+	// problem and is reported as one: without this guard a foreign schema surfaces as "the
+	// rejection event must exist exactly once" or as a raw pq constraint violation
 	// returned by the handler, both of which read as a defect in the handler.
 	skipUnlessEventOutboxSchemaMatches(t, newBlnk.GetDataSource(), cfg.DataSource.Dns)
 

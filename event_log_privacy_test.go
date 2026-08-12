@@ -37,24 +37,20 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// event_log_privacy_test.go covers the two disclosure rules the event pipeline's log and trace
-// output has to satisfy, and the pivot that makes the second one usable.
+// event_log_privacy_test.go covers the two disclosure rules the event pipeline's log
+// and trace output has to satisfy, and the pivot that makes the second one usable.
 //
 //   - A KAFKA CAUSE IS CLASSIFIED, NOT RENDERED. A kafka-go error prints with broker
-//     hostnames, listener addresses, the topic and partition it was acting on and, for a
-//     credential operation, the principal. Logs are shipped to an aggregator and indexed, so
-//     the raw text accumulates in a searchable store that a far wider audience reads than the
-//     cluster itself.
+//     hostnames, listener addresses, the topic and partition it was acting on and, for
+//     a credential operation, the principal.
 //   - AN IDENTIFIER IS PSEUDONYMISED. The metric labels already were, for the reason
-//     subscriberLagLabel documents; the log fields beside them were not, which both leaked the
-//     tenant and made the two UNJOINABLE — an alert naming a hash and a log line naming a name.
-//   - THE PSEUDONYM RESOLVES. A hash nobody can turn back into a subscriber is not privacy, it
-//     is an outage during an incident, so one identifier must produce ONE token in the metric,
-//     the log and the API response, and the registry must resolve it.
-//
-// The one documented exception is asserted here too rather than left implicit: AAP requirement
-// R-4 mandates the error reason on every publish attempt, so PublishResult.LogFields keeps a
-// rendered error and this file proves that is still true.
+//     subscriberLagLabel documents; the log fields beside them were not, which both
+//     leaked the tenant and made the two UNJOINABLE — an alert naming a hash and a log
+//     line naming a name.
+//   - THE PSEUDONYM RESOLVES. A hash nobody can turn back into a subscriber is not
+//     privacy, it is an outage during an incident, so one identifier must produce ONE
+//     token in the metric, the log and the API response, and the registry must resolve
+//     it.
 
 // TestKafkaErrorClass_IsClosedAndSeparatesTheNonFailures pins the log-side Kafka vocabulary.
 //
@@ -116,11 +112,8 @@ func TestKafkaErrorClass_IsClosedAndSeparatesTheNonFailures(t *testing.T) {
 	}
 }
 
-// TestKafkaErrorClass_NeverLeaksTheCausesOwnWords is the property the vocabulary exists for.
-//
-// A class that happened to interpolate the cause would satisfy every mapping assertion above
-// and defeat the whole point, so the output is checked for the disclosive substrings rather
-// than only for equality with an expected literal.
+// TestKafkaErrorClass_NeverLeaksTheCausesOwnWords is the property the vocabulary exists
+// for.
 func TestKafkaErrorClass_NeverLeaksTheCausesOwnWords(t *testing.T) {
 	cause := errors.New(
 		"failed to dial: dial tcp 10.42.7.19:9093: i/o timeout (principal blnk-sub-acme-payments-eu, " +
@@ -136,11 +129,8 @@ func TestKafkaErrorClass_NeverLeaksTheCausesOwnWords(t *testing.T) {
 	assert.Equal(t, kafkaErrorClassBroker, class)
 }
 
-// TestLogKafkaDiagnostic_EmitsTheRawCauseOnlyAtTrace proves the sink is genuinely separate.
-//
-// DEBUG is asserted silent, not merely "not INFO": debug is already this pipeline's routine
-// per-event volume, so an operator who raises the level to follow a delivery must not thereby
-// start shipping cluster topology. That is the whole reason the sink sits one level lower.
+// TestLogKafkaDiagnostic_EmitsTheRawCauseOnlyAtTrace proves the sink is genuinely
+// separate.
 func TestLogKafkaDiagnostic_EmitsTheRawCauseOnlyAtTrace(t *testing.T) {
 	cause := errors.New("dial tcp 10.42.7.19:9093: i/o timeout")
 
@@ -253,9 +243,8 @@ func TestKafkaErrorEntry_StartsALineCarryingOnlyTheClass(t *testing.T) {
 
 // TestSubscriberLogLabel_IsTheSameTokenTheMetricLabelPublishes is the PIVOT INVARIANT.
 //
-// If these two ever diverge for a registry subscriber, a lag alert names one token and the log
-// line explaining it names another, and nothing joins them. That is not a cosmetic difference:
-// it is the failure the pseudonymisation was supposed to be free of.
+// If these two ever diverge for a registry subscriber, a lag alert names one token and
+// the log line explaining it names another, and nothing joins them.
 func TestSubscriberLogLabel_IsTheSameTokenTheMetricLabelPublishes(t *testing.T) {
 	registryID := "sub_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
@@ -279,14 +268,7 @@ func TestSubscriberLogLabel_IsTheSameTokenTheMetricLabelPublishes(t *testing.T) 
 
 	t.Run("an unadmitted id is HASHED in a log and collapsed on a metric", func(t *testing.T) {
 		// The one deliberate divergence. A log has no cardinality budget and does have to
-		// keep two rogue identifiers apart; a metric has the opposite constraint. Nothing
-		// is lost for the pivot, because an id the registry does not admit is not in the
-		// registry to be resolved.
-		//
-		// The fixtures carry an uppercase letter and a space respectively, which is what
-		// makes them unadmitted: CanonicalizeSubscriberIdentifier permits lowercase
-		// alphanumerics with '_' and '-' only, so an ordinary tenant-ish name such as
-		// "acme-payments-eu" IS admissible and would not exercise this path.
+		// keep two rogue identifiers apart; a metric has the opposite constraint.
 		rogue, other := "Acme Payments EU", "Globex Treasury"
 
 		require.False(t, isRegistrySubscriberIdentifier(rogue))
@@ -308,9 +290,10 @@ func TestConsumerGroupLogLabel_HashesTheNamespaceRootLikeTheMetricDoes(t *testin
 	root, err := model.CanonicalConsumerGroupNamespace(subscriberID)
 	require.NoError(t, err, "the fixture must be a group the resolver recognises a root in")
 
-	// A subscriber's runtime group legitimately EXTENDS its namespace: the ACL grants Read on
-	// the group as a prefixed pattern, so three consumer instances may commit under three
-	// leaves. consumerGroupRoot requires the terminator, so the leaf is built with it.
+	// A subscriber's runtime group legitimately EXTENDS its namespace: the ACL grants Read
+	// on the group as a prefixed pattern, so three consumer instances may commit under
+	// three leaves. consumerGroupRoot requires the terminator, so the leaf is built with
+	// it.
 	group, err := model.CanonicalConsumerGroupID(subscriberID)
 	require.NoError(t, err)
 
@@ -332,11 +315,8 @@ func TestConsumerGroupLogLabel_HashesTheNamespaceRootLikeTheMetricDoes(t *testin
 		"a log hashes a group with no recognisable root rather than collapsing it")
 }
 
-// TestHashLogIdentifier_DelegatesToTheOneCanonicalRule guards against a second implementation.
-//
-// Three packages publish this token — the root package on metrics and logs, the database
-// package on its own log lines, and api/model on the subscriber resource — and drift between
-// them is silent: two tokens for one subscriber, and a resolver that returns nothing.
+// TestHashLogIdentifier_DelegatesToTheOneCanonicalRule guards against a second
+// implementation.
 func TestHashLogIdentifier_DelegatesToTheOneCanonicalRule(t *testing.T) {
 	for _, value := range []string{
 		"sub_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
@@ -358,10 +338,7 @@ func TestHashLogIdentifier_DelegatesToTheOneCanonicalRule(t *testing.T) {
 // TestPublishResultLogFields_KeepsTheErrorReasonBecauseR4MandatesIt is the documented
 // exception, asserted rather than assumed.
 //
-// AAP requirement R-4: "The attempt count and error reason must be logged on every attempt,
-// not only on final failure", with §0.1.3 naming the field list. A future sweep that
-// classified this field too would satisfy the general disclosure rule and BREAK the AAP, so
-// the exception is pinned here where such a sweep would trip over it.
+// not only on final failure", with §0.1.3 naming the field list.
 func TestPublishResultLogFields_KeepsTheErrorReasonBecauseR4MandatesIt(t *testing.T) {
 	fields := PublishResult{
 		Status:      model.PublishStatusRetrying,
@@ -380,16 +357,8 @@ func TestPublishResultLogFields_KeepsTheErrorReasonBecauseR4MandatesIt(t *testin
 	assert.Equal(t, 3, fields["attempt"], "and the attempt count is the other half of R-4")
 }
 
-// TestEventLogFields_CarryNoRawSubscriberOrGroupIdentifier is the lasting structural guard.
-//
-// Behaviour tests cover the resolvers; this covers the CALL SITES, which is where the defect
-// actually lived — the resolvers existed and were correct, and the log lines simply did not
-// use them. A new log line added later would reintroduce it silently, and there is no runtime
-// assertion that can see a field nobody happened to exercise.
-//
-// The forbidden set is the field KEYS rather than the values: a key named "subscriber" is the
-// one an aggregator indexes and an operator greps, so the rule is that those keys do not exist
-// in these files at all.
+// TestEventLogFields_CarryNoRawSubscriberOrGroupIdentifier is the lasting structural
+// guard.
 func TestEventLogFields_CarryNoRawSubscriberOrGroupIdentifier(t *testing.T) {
 	forbidden := map[string]string{
 		"subscriber":    "use subscriber_id_hash with subscriberLogLabel",
@@ -398,11 +367,11 @@ func TestEventLogFields_CarryNoRawSubscriberOrGroupIdentifier(t *testing.T) {
 		"group":         "use consumer_group_hash with consumerGroupLogLabel",
 
 		// THE GROUP'S THREE SPELLINGS, all of them. A consumer group id and a consumer group
-		// prefix are DERIVED from the subscriber id — CanonicalConsumerGroupID composes one from
-		// the other — so a log line publishing either discloses the subscriber by another route,
-		// which is exactly what TestConsumerGroupLogLabel_HashesTheNamespaceRootLikeTheMetricDoes
-		// asserts of the token. Listing only the bare "consumer_group" left the rule with a hole
-		// two live call sites were sitting in, so all three names are named.
+		// prefix are DERIVED from the subscriber id — CanonicalConsumerGroupID composes one
+		// from the other — so a log line publishing either discloses the subscriber by
+		// another route, which is exactly what
+		// TestConsumerGroupLogLabel_HashesTheNamespaceRootLikeTheMetricDoes asserts of the
+		// token.
 		"consumer_group":        "use consumer_group_hash with consumerGroupLogLabel",
 		"consumer_group_id":     "use consumer_group_hash with consumerGroupLogLabel",
 		"consumer_group_prefix": "use consumer_group_hash with consumerGroupLogLabel",
@@ -422,14 +391,10 @@ func TestEventLogFields_CarryNoRawSubscriberOrGroupIdentifier(t *testing.T) {
 	}
 }
 
-// logFieldKeys collects the string keys of every logrus.Fields composite literal in the file,
-// plus the first argument of every WithField call.
+// logFieldKeys collects the string keys of every logrus.Fields composite literal in the
+// file, plus the first argument of every WithField call.
 //
-// Keys only. The VALUE is not inspected, deliberately: a value is an arbitrary expression and
-// judging it would need the very analysis this avoids, while the key is a literal and is the
-// thing a log aggregator indexes. A field whose key is bounded and whose value is a hash is
-// the shape being enforced, and the key is sufficient to enforce it because the pseudonymised
-// keys are named differently from the raw ones.
+// Keys only.
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
@@ -484,9 +449,9 @@ func logFieldKeys(file *ast.File) []string {
 
 // pinLogLevel sets the standard logger's level for one test and returns the restorer.
 //
-// Restoring matters more than it looks: the level is process-wide, and a test that left it at
-// trace would make every later test in the package emit its diagnostics, changing what other
-// hook-based assertions observe.
+// Restoring matters more than it looks: the level is process-wide, and a test that left
+// it at trace would make every later test in the package emit its diagnostics, changing
+// what other hook-based assertions observe.
 //
 // Parameters:
 //   - t *testing.T: the test, for the helper marker.
@@ -504,12 +469,6 @@ func pinLogLevel(t *testing.T, level logrus.Level) func() {
 }
 
 // pagingSubscriberStore is a registry double that honours limit and offset.
-//
-// The package's general subscriberTestStore deliberately ignores both and returns its rows in
-// map order, which is right for the operations that do not page and useless here: the whole
-// subject of these tests is what happens BEYOND the first page, and a double that returned
-// everything at once would make every one of them pass without exercising the walk. Only
-// ListEventSubscribers is overridden; everything else is inherited.
 type pagingSubscriberStore struct {
 	*subscriberTestStore
 
@@ -537,10 +496,11 @@ func newPagingSubscriberStore(t *testing.T, size int) *pagingSubscriberStore {
 		// Canonical identifiers, because subscriberLogLabel only pseudonymises what the
 		// registry admits and a rejected fixture would make the assertions vacuous.
 		identifier := fmt.Sprintf("sub_%032x", i)
-		// A DISTINCT (created_at, id) per row, because that pair IS the keyset cursor. The real
-		// table cannot produce a duplicate — id is a BIGSERIAL and created_at is NOT NULL — and a
-		// fixture that left both zero would make every cursor resolve to the first row, so a walk
-		// would read the same page for ever and report the page ceiling on a registry of three.
+		// A DISTINCT (created_at, id) per row, because that pair IS the keyset cursor. The
+		// real table cannot produce a duplicate — id is a BIGSERIAL and created_at is NOT
+		// NULL — and a fixture that left both zero would make every cursor resolve to the
+		// first row, so a walk would read the same page for ever and report the page ceiling
+		// on a registry of three.
 		store.ordered = append(store.ordered, model.EventSubscriber{
 			ID:           int64(size - i),
 			SubscriberID: identifier,
@@ -553,11 +513,8 @@ func newPagingSubscriberStore(t *testing.T, size int) *pagingSubscriberStore {
 }
 
 // ListEventSubscribers returns one page, honouring limit and offset.
-// ListAndCountEventSubscribers pages exactly as ListEventSubscribers does and reports the
-// registry size, so the paging double satisfies the whole seam.
-//
-// It overrides the embedded implementation because that one pages an unordered map, and this
-// double exists precisely to give the walk a stable order.
+// ListAndCountEventSubscribers pages exactly as ListEventSubscribers does and reports
+// the registry size, so the paging double satisfies the whole seam.
 func (s *pagingSubscriberStore) ListAndCountEventSubscribers(
 	ctx context.Context,
 	query model.SubscriberPageQuery,
@@ -625,11 +582,6 @@ func (s *pagingSubscriberStore) ListEventSubscribers(
 }
 
 // TestResolveSubscriberByPseudonym_WalksEveryPageRatherThanTheFirst is F16's resolver.
-//
-// The documented procedure before this existed was to fetch one page and hash the rows
-// locally, which answers correctly only while the registry fits in that page and fails
-// SILENTLY past it — reporting "no match" for subscribers it never read, so an operator
-// concludes the alert names a subscriber that no longer exists and closes a live incident.
 func TestResolveSubscriberByPseudonym_WalksEveryPageRatherThanTheFirst(t *testing.T) {
 	t.Run("a subscriber past the first page is found", func(t *testing.T) {
 		store := newPagingSubscriberStore(t, 250)
@@ -768,11 +720,8 @@ func TestResolveSubscriberByPseudonym_WalksEveryPageRatherThanTheFirst(t *testin
 
 // TestListSubscribersAwaitingRevocation_IsTheAlertsFirstStep covers F24.
 //
-// SubscriberRevocationOutstanding is CRITICAL and carries no subscriber attribute, because a
-// label would export a tenant identifier into every notification. Its first remediation step is
-// therefore "find which subscribers are affected", and before this existed the alert told a
-// responder to read `revocation_pending` from GET /subscribers — a field the API did not have.
-// A critical alert whose first step is impossible spends the exposure window on a search.
+// SubscriberRevocationOutstanding is CRITICAL and carries no subscriber attribute,
+// because a label would export a tenant identifier into every notification.
 func TestListSubscribersAwaitingRevocation_IsTheAlertsFirstStep(t *testing.T) {
 	pendingAt := func(offset time.Duration) *time.Time {
 		instant := time.Now().UTC().Add(-offset)
@@ -857,16 +806,12 @@ func TestListSubscribersAwaitingRevocation_IsTheAlertsFirstStep(t *testing.T) {
 	})
 }
 
-// TestSubscriberResponse_PublishesTheRevocationMarkerTheAlertTellsRespondersentToRead pins the
-// wire shape F24 depends on, at the JSON level rather than the struct level.
-//
-// The struct field existing is not the contract; the KEY appearing in the body is, and the
-// boolean must appear even when false — an omitted false makes "settled" and "this version does
-// not report it" the same wire state.
+// TestSubscriberResponse_PublishesTheRevocationMarkerTheAlertTellsRespondersentToRead
+// pins the wire shape F24 depends on, at the JSON level rather than the struct level.
 func TestSubscriberResponse_PublishesTheRevocationMarkerTheAlertTellsRespondersToRead(t *testing.T) {
-	// The deployment state is irrelevant to what this test asserts — the revocation marker is a
-	// row fact — so the fail-closed zero value is passed rather than a fixture that would imply
-	// the assertions depend on it.
+	// The deployment state is irrelevant to what this test asserts — the revocation marker
+	// is a row fact — so the fail-closed zero value is passed rather than a fixture that
+	// would imply the assertions depend on it.
 	settled := apimodel.NewSubscriberResponse(model.EventSubscriber{
 		SubscriberID: "sub_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
 		Name:         "ledger-ops",

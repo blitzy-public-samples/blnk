@@ -33,23 +33,16 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// This file covers WHAT THE EVENT PIPELINE'S LOG LINES DISCLOSE, as distinct from what they
-// report. Every other test about logging in this package asserts that a required field is
-// present; these assert that a forbidden value is absent, which needs its own file because
-// the two kinds of assertion fail for opposite reasons and a reader must not have to
-// disentangle them.
-//
-// The disclosure this guards is a broker's address. A kafka-go error renders as
-// "dial tcp 10.0.3.14:9092: connect: connection refused", and the pipeline logs such an
-// error on every failed publish attempt, on every failed administrative call, on every
-// lease-renewal failure and at start-up. A log is retained, shipped onward and readable by
-// more people than the deployment's operators, so an address in one is reconnaissance that
-// outlives the incident that produced it.
+// This file covers WHAT THE EVENT PIPELINE'S LOG LINES DISCLOSE, as distinct from what
+// they report. Every other test about logging in this package asserts that a required
+// field is present; these assert that a forbidden value is absent, which needs its own
+// file because the two kinds of assertion fail for opposite reasons and a reader must
+// not have to disentangle them.
 //
 // The invariant every test here defends is the SPLIT: a normal-level line carries the
-// diagnosis with the topology removed, and the verbatim text is reachable only at debug.
-// Losing either half is a defect — without the first the address is published, and without
-// the second an operator cannot diagnose a broker they cannot name.
+// diagnosis with the topology removed, and the verbatim text is reachable only at
+// debug. Losing either half is a defect — without the first the address is published,
+// and without the second an operator cannot diagnose a broker they cannot name.
 
 // errKafkaDialFailure is the error shape every assertion in this file is built on: a real
 // kafka-go dial failure, whose text is one part diagnosis and one part topology.
@@ -116,13 +109,9 @@ func TestWithLoggableCause_SplitsRedactedFromVerbatim(t *testing.T) {
 	})
 }
 
-// TestRelayReasonRenderings_DifferByDestination is the invariant behind the two renderings,
-// and the one most likely to be undone by a future edit that "unifies" them.
-//
-// The durable rendering keeps the broker's own words because its two readers — the
-// last_error column and the failure metadata on a `<topic>.dlt` sibling, which subscribers
-// cannot be granted — are already privileged, and the address is the most useful part of a
-// dead-letter triage. The log rendering removes it because a log's readership is wider.
+// TestRelayReasonRenderings_DifferByDestination is the invariant behind the two
+// renderings, and the one most likely to be undone by a future edit that "unifies"
+// them.
 func TestRelayReasonRenderings_DifferByDestination(t *testing.T) {
 	durable := relayFailureReason(errKafkaDialFailure)
 	logged := relayLogReason(errKafkaDialFailure)
@@ -160,7 +149,8 @@ func TestRelayReasonRenderings_DifferByDestination(t *testing.T) {
 }
 
 // TestPublishResultLogFields_RedactsTheTransportCause covers the per-attempt line requirement
-// R-4 mandates. It is emitted once per attempt per event, so it is simultaneously the most
+// the retry contract mandates. It is emitted once per attempt per event, so it is
+// simultaneously the most
 // frequent line in the pipeline and the one most likely to carry a transport error.
 func TestPublishResultLogFields_RedactsTheTransportCause(t *testing.T) {
 	result := PublishResult{
@@ -197,20 +187,17 @@ func TestPublishResultLogFields_RedactsTheTransportCause(t *testing.T) {
 
 // TestEventPipelineLogging_NoSiteUsesLogrusWithError is a source-level guard.
 //
-// Every behavioural test above proves one site behaves; this proves no site was MISSED, and
-// that a new one cannot quietly reintroduce the defect. logrus.WithError renders err.Error()
-// verbatim into the record at whatever level the line is emitted at, which is precisely the
-// disclosure withLoggableCause exists to prevent — so its absence from these files is the
-// invariant, and it is cheaper to assert here than to rediscover in a review.
+// Every behavioural test above proves one site behaves; this proves no site was MISSED,
+// and that a new one cannot quietly reintroduce the defect. logrus.WithError renders
+// err.Error() verbatim into the record at whatever level the line is emitted at, which
+// is precisely the disclosure withLoggableCause exists to prevent — so its absence from
+// these files is the invariant, and it is cheaper to assert here than to rediscover in
+// a review.
 func TestEventPipelineLogging_NoSiteUsesLogrusWithError(t *testing.T) {
 	// Repository-relative, so the one guard covers every layer the pipeline spans: the
 	// services, the repositories beneath them and the process wiring above them. A
 	// redaction that holds in the service and not in the repository underneath it protects
 	// nothing, because the same failure is logged at both.
-	//
-	// webhooks.go is deliberately absent. Its single site is converted, but the file is
-	// DELETED at the sunset, and a guard naming it would turn that deletion into a test
-	// failure for a file that no longer exists.
 	files := []string{
 		"event_relay.go",
 		"event_admin.go",
@@ -251,18 +238,11 @@ func TestEventPipelineLogging_NoSiteUsesLogrusWithError(t *testing.T) {
 	}
 }
 
-// credentialConfigurationFields names every configuration field that holds a credential,
-// by its Go path in config.Configuration.
+// credentialConfigurationFields names every configuration field that holds a
+// credential, by its Go path in config.Configuration.
 //
-// It exists so that TestConfiguredCredentials_CannotSurviveALogLine can be complete rather
-// than illustrative. The test walks the configuration tree, and any field that looks like a
-// credential and is absent from this map fails it — so adding a credential to the
-// configuration forces a decision here instead of quietly arriving unredacted.
-//
-// A field is listed with false when its name reads like a credential but its value is not one.
-// That is what keeps the redaction rule strict: the alternative to classifying such a field is
-// loosening the name test until it stops matching, which would also stop it matching a real
-// credential named the same way.
+// It exists so that TestConfiguredCredentials_CannotSurviveALogLine can be complete
+// rather than illustrative.
 var credentialConfigurationFields = map[string]bool{
 	".AwsSecretAccessKey":        true,
 	".Server.SecretKey":          true,
@@ -272,30 +252,22 @@ var credentialConfigurationFields = map[string]bool{
 	".Kafka.SASLSecret":          true,
 	".Kafka.SASLAdminSecret":     true,
 
-	// THE BEARER CREDENTIAL Blnk presents to the declared key-scope enforcement component
-	// (SEC-01). It authenticates the bind-and-attest call, so anything holding it can register
+	// THE BEARER CREDENTIAL Blnk presents to the declared key-scope enforcement component.
+	// It authenticates the bind-and-attest call, so anything holding it can register
 	// key-scope bindings at that component — which is to say it can decide which records a
-	// subscriber sees. It is a secret on exactly the same footing as the SASL credentials above,
-	// and the call that carries it is the one most likely to fail with an authentication error
-	// quoting its own settings.
+	// subscriber sees.
 	".Kafka.KeyScopeGatewayAttestationToken": true,
 
-	// A BOOLEAN DECLARATION, not a secret. It states whether this host has anything in front
-	// of it, which decides whether a loopback caller may be issued a Kafka credential over
-	// plaintext — so its NAME reads as a credential while its value is "true" or "false" and
-	// discloses nothing. Redacting it would hide which transport declaration a refusal was
-	// decided by, in the log line an operator reads to fix exactly that.
+	// A BOOLEAN DECLARATION, not a secret. It states whether this host has anything in
+	// front of it, which decides whether a loopback caller may be issued a Kafka
+	// credential over plaintext — so its NAME reads as a credential while its value is
+	// "true" or "false" and discloses nothing.
 	".Server.AllowLoopbackCredentialIssuance": false,
 }
 
-// TestConfiguredCredentials_CannotSurviveALogLine is the guard that ties redaction to THIS
-// deployment's own credentials rather than to a hand-written list of plausible key names.
-//
-// The inputs are read from config.Configuration's envconfig tags, so the test follows a
-// rename of a variable automatically, and a rename to a spelling redaction does not
-// recognise fails here instead of leaking in production. That matters because a dependency
-// error routinely quotes the setting it rejected: a Kafka client reports the property it
-// could not authenticate with, and a Postgres driver quotes the DSN back.
+// TestConfiguredCredentials_CannotSurviveALogLine is the guard that ties redaction to
+// THIS deployment's own credentials rather than to a hand-written list of plausible key
+// names.
 func TestConfiguredCredentials_CannotSurviveALogLine(t *testing.T) {
 	t.Parallel()
 
@@ -323,13 +295,8 @@ func TestConfiguredCredentials_CannotSurviveALogLine(t *testing.T) {
 	}
 }
 
-// credentialEnvironmentVariables walks a configuration struct and returns the environment
-// variable name of every field that holds a credential.
-//
-// Classification is by the field's GO name, which is deliberately a different signal from
-// the environment-variable spelling that redaction matches on — a test that classified by
-// the same signal it is testing would agree with the implementation by construction and
-// prove nothing.
+// credentialEnvironmentVariables walks a configuration struct and returns the
+// environment variable name of every field that holds a credential.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when a credential-looking field is unclassified.
@@ -383,7 +350,8 @@ func credentialEnvironmentVariables(t *testing.T, structType reflect.Type, path 
 	return variables
 }
 
-// fieldNameReadsAsCredential reports whether a Go field name says the field holds a secret.
+// fieldNameReadsAsCredential reports whether a Go field name says the field holds a
+// secret.
 //
 // Parameters:
 //   - name string: the exported field name.

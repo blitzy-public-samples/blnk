@@ -14,15 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// EXECUTABLE coverage of two deployment surfaces that decide whether the relay runs at all and
-// whether the broker survives sustained load: the `run_relay` make target's broker resolution,
-// and the Kafka StatefulSet's storage budget.
+// EXECUTABLE coverage of two deployment surfaces that decide whether the relay runs at
+// all and whether the broker survives sustained load: the `run_relay` make target's
+// broker resolution, and the Kafka StatefulSet's storage budget.
 //
-// Both were previously asserted by nothing. The make recipe reimplements, in shell, a precedence
-// rule that config/config.go implements in Go — and reimplemented it wrongly, in a direction that
-// makes the guard ANNOUNCE a different broker list from the one the application then uses. The
-// StatefulSet's 160Gi claim is derived in a comment from the topic geometry and the per-partition
-// retention budget, and nothing checked the arithmetic or noticed when the two drifted apart.
+// The make recipe reimplements, in shell, a precedence rule that config/config.go
+// implements in Go — and reimplemented it wrongly, in a direction that makes the guard
+// ANNOUNCE a different broker list from the one the application then uses.
 package blnk
 
 import (
@@ -42,17 +40,11 @@ import (
 )
 
 // ---------------------------------------------------------------------------------------
-// MAJ-18 — `make run_relay` resolves brokers exactly as the application does.
+// `make run_relay` resolves brokers exactly as the application does.
 // ---------------------------------------------------------------------------------------
 
-// relayAliases are the three environment names the application accepts for the broker list, in
-// its OWN precedence order, highest first.
-//
-// Documented on config.eventStreamingEnvOverride and reproduced here because the make recipe is
-// a second implementation of that order and this test is what keeps the two the same. The order
-// is not the obvious one: the overlay struct is flat, so envconfig derives BLNK_KAFKA_BROKERS as
-// its primary key and consults the bare KAFKA_BROKERS as its alternate, while the nested pass
-// supplies BLNK_KAFKA_KAFKA_BROKERS.
+// relayAliases are the three environment names the application accepts for the broker
+// list, in its OWN precedence order, highest first.
 var relayAliases = []string{
 	"BLNK_KAFKA_BROKERS",
 	"KAFKA_BROKERS",
@@ -67,10 +59,10 @@ type relayMakeHarness struct {
 	effective string
 }
 
-// newRelayMakeHarness copies the real makefile into a temporary tree and installs a stub `blnk`.
+// newRelayMakeHarness copies the real makefile into a temporary tree and installs a
+// stub `blnk`.
 //
-// The makefile is COPIED rather than paraphrased. A test asserting against a restatement of the
-// recipe would pass while the recipe itself was wrong, which is the whole failure mode here.
+// The makefile is COPIED rather than paraphrased.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -98,9 +90,9 @@ func newRelayMakeHarness(t *testing.T, dotenv, configFile string) relayMakeHarne
 
 	harness := relayMakeHarness{dir: dir, effective: filepath.Join(dir, "effective.txt")}
 
-	// THE STUB IS THE APPLICATION'S SEAT. It records exactly what `./blnk start` would have
-	// inherited, which is the only thing that decides whether the relay runs: the recipe's
-	// announcement is a claim ABOUT that environment, and the two must agree.
+	// THE STUB IS THE APPLICATION'S SEAT. It records exactly what `./blnk start` would
+	// have inherited, which is the only thing that decides whether the relay runs: the
+	// recipe's announcement is a claim ABOUT that environment, and the two must agree.
 	stub := "#!/usr/bin/env bash\n" +
 		"{\n" +
 		"  echo \"ARGV=$*\"\n" +
@@ -119,9 +111,9 @@ func newRelayMakeHarness(t *testing.T, dotenv, configFile string) relayMakeHarne
 //
 // Parameters:
 //   - t *testing.T: the test.
-//   - caller map[string]string: the caller's environment. A value of relayUnset means the name
-//     is left unset, which is a different input from an empty string and the distinction this
-//     whole test exists for.
+//   - caller map[string]string: the caller's environment. A value of relayUnset means
+//     the name is left unset, which is a different input from an empty string and the
+//     distinction this whole test exists for.
 //
 // Returns:
 //   - string: combined stdout and stderr.
@@ -187,9 +179,7 @@ func (h relayMakeHarness) effectiveAlias(t *testing.T, name string) (bool, strin
 
 // effectiveArgv reports the command line the stub `blnk` was executed with.
 //
-// It is the observable that replaced the recipe's own exit status. The refusal moved into the
-// application behind --require-kafka, so what the recipe can still be held to is that it ASKED for
-// that refusal — and argv is where that is visible.
+// It is the observable that replaced the recipe's own exit status.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when the stub did not run.
@@ -214,12 +204,11 @@ func (h relayMakeHarness) effectiveArgv(t *testing.T) string {
 	return ""
 }
 
-// applicationEffectiveBrokers reports the broker list the application would resolve from an
-// environment, using envconfig's own rule: the first name that is SET wins, whatever its value.
+// applicationEffectiveBrokers reports the broker list the application would resolve
+// from an environment, using envconfig's own rule: the first name that is SET wins,
+// whatever its value.
 //
-// This is the oracle the make recipe is tested against. It is written here as five lines of
-// obvious code rather than by calling into config, because config.Fetch would read the process
-// environment of the TEST rather than of the make invocation.
+// This is the oracle the make recipe is tested against.
 //
 // Parameters:
 //   - environment map[string]string: alias to value, for the aliases that are set.
@@ -240,47 +229,25 @@ func applicationEffectiveBrokers(
 	return "", ""
 }
 
-// TestMakeRunRelay_ResolvesBrokersExactlyAsTheApplicationDoes is MAJ-18 executed.
+// TestMakeRunRelay_ResolvesBrokersExactlyAsTheApplicationDoes is the broker-resolution contract, executed.
 //
-// # What the recipe has to get right, and got wrong
+// A server started with no broker configured comes up looking healthy while every
+// captured event stays pending in blnk.event_outbox, so something has to refuse.
 //
-// A server started with no broker configured comes up looking healthy while every captured event
-// stays pending in blnk.event_outbox, so something has to refuse. The recipe used to be that
-// something, and it resolved the broker list two ways wrong. It probed the aliases in the order
-// KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS, BLNK_KAFKA_BROKERS — inverting the highest and lowest
-// of the three — so with BLNK_KAFKA_BROKERS in .env and KAFKA_BROKERS on the command line it
-// ANNOUNCED the command line's list while the application used the file's. And it tested each
-// candidate with `-n`, which cannot tell a variable that is UNSET from one set to the empty
-// string; envconfig treats set-and-empty as configured, so an explicitly emptied alias turns
-// Kafka off for the application while the guard stepped past it to a lower-precedence name and
-// reported brokers.
+// No shell reimplementation of the loader's precedence can be trusted to agree with the
+// loader, and a guard that disagrees is worse than none: it either refuses a deployment
+// the application would have admitted, or admits one whose relay never starts, and in
+// both cases it says so confidently. So the recipe passes `--require-kafka` and the
+// APPLICATION asks the question after the same load, of the same struct, with the same
+// predicate startEventRelay gates on — and its refusal names every source it read.
 //
-// # Why the refusal moved rather than being repaired
+// Assembling the environment the application resolves FROM.
 //
-// No shell reimplementation of the loader's precedence can be trusted to agree with the loader,
-// and a guard that disagrees is worse than none: it either refuses a deployment the application
-// would have admitted, or admits one whose relay never starts, and in both cases it says so
-// confidently. So the recipe passes `--require-kafka` and the APPLICATION asks the question after
-// the same load, of the same struct, with the same predicate startEventRelay gates on — and its
-// refusal names every source it read. TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication
-// pins that the shell resolution is gone rather than merely that the flag is present.
-//
-// # What remains the recipe's job, and is what this asserts
-//
-// Assembling the environment the application resolves FROM. That is what make is for here, and it
-// has two halves that only the recipe can do: .env supplies defaults for names the caller did not
-// set, and the caller's own environment is replayed on top so a set-but-EMPTY value survives and
-// reaches the application as the "no brokers for this run" it means.
-//
-// Replaying an `export -p` snapshot restores values the caller HAD but cannot remove a name .env
-// introduced, so a caller who named any alias also suppresses the ones they did not name —
-// otherwise BLNK_KAFKA_BROKERS parked in .env outvotes `KAFKA_BROKERS=host:9092 make run_relay`,
-// and a defaults file beats an explicit override. That scoping makes no ordering claim: it removes
-// contributions nobody asked for and leaves the ranking entirely to the loader.
-//
-// So for every combination below: the environment the stub `blnk` actually inherited must resolve,
-// under envconfig's own rule, to the intended answer; `--require-kafka` must be in its argv so the
-// refusal is the application's; and the recipe must not have named a source of its own.
+// Replaying an `export -p` snapshot restores values the caller HAD but cannot remove a
+// name .env introduced, so a caller who named any alias also suppresses the ones they
+// did not name — otherwise BLNK_KAFKA_BROKERS parked in .env outvotes
+// `KAFKA_BROKERS=host:9092 make run_relay`, and a defaults file beats an explicit
+// override.
 func TestMakeRunRelay_ResolvesBrokersExactlyAsTheApplicationDoes(t *testing.T) {
 	const dotenvPrefixed = "BLNK_KAFKA_BROKERS=env-prefixed:9092\n"
 	const dotenvBare = "KAFKA_BROKERS=env-bare:9092\n"
@@ -471,10 +438,8 @@ func TestMakeRunRelay_ResolvesBrokersExactlyAsTheApplicationDoes(t *testing.T) {
 
 // TestMakeRunRelay_PassesNoSecretOnTheCommandLine is the CWE-214 companion.
 //
-// The recipe sources .env, which holds the SASL producer and administrative secrets at mode 0600,
-// and then execs the server. Secrets must reach it through the inherited environment, where the
-// file put them, and must never be echoed or placed in argv: a broker credential in a process
-// command line is readable through /proc and recorded by audit and container telemetry.
+// The recipe sources .env, which holds the SASL producer and administrative secrets at
+// mode 0600, and then execs the server.
 func TestMakeRunRelay_PassesNoSecretOnTheCommandLine(t *testing.T) {
 	const secret = "make-relay-fixture-secret-7c31ab90de"
 
@@ -506,7 +471,7 @@ func TestMakeRunRelay_PassesNoSecretOnTheCommandLine(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// MAJ-19 — the Kafka StatefulSet's storage budget is derived, so it is checked.
+// The Kafka StatefulSet's storage budget is derived, so it is checked.
 // ---------------------------------------------------------------------------------------
 
 // kafkaStatefulSetPath and kafkaConfigPath are the two manifests the storage budget spans.
@@ -515,33 +480,15 @@ const (
 	kafkaConfigPath      = "infrastructure/k8s-manifests/blnk-config.yaml"
 )
 
-// kafkaRetentionHeadroom is the fraction of the volume the log data is budgeted to occupy.
-//
-// It is a REQUIREMENT rather than a preference, and the reason is the failure mode: Kafka writes
-// a new segment before deleting an old one, keeps an offset and a time index beside every
-// segment, and takes a log directory OFFLINE — dropping its partitions — when it runs out of
-// space rather than shedding data to continue. So the volume must be larger than the retention
-// budget by enough to absorb a segment roll on every partition at once, and 60% is the figure the
-// manifest's own derivation uses.
+// kafkaRetentionHeadroom is the fraction of the volume the log data is budgeted to
+// occupy.
 const kafkaRetentionHeadroom = 0.60
 
-// TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor derives the claim rather than
-// reading it.
+// TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor derives the claim rather
+// than reading it.
 //
-// # Why a test rather than a comment
-//
-// The volume size is a function of four numbers that live in three places: the topic catalogue
-// (Go), KAFKA_MIN_PARTITIONS and KAFKA_REPLICATION_FACTOR (blnk-config.yaml), and
-// log.retention.bytes and `replicas` (this StatefulSet). log.retention.bytes is PER PARTITION,
-// which is the subtlety that makes an eyeballed value wrong by two orders of magnitude, and with
-// RF equal to the broker count EVERY broker holds EVERY partition — so the per-broker log volume
-// is the whole catalogue's, not a third of it.
-//
-// The claim was 10Gi at one point, which is under three hours of a 2 KiB event at 500/second.
-// Nothing failed when it was: the broker accepts writes until the log directory fills, and then
-// takes it offline. Adding a category topic adds six partitions and 12 GiB per broker, and
-// changing the retention budget moves the floor without touching the claim — neither of which any
-// gate could previously see.
+// The claim was 10Gi at one point, which is under three hours of a 2 KiB event at
+// 500/second.
 func TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor(t *testing.T) {
 	root := moduleRootDir(t)
 
@@ -552,9 +499,10 @@ func TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor(t *testing.T) 
 	brokers := yamlInt(t, spec, "replicas")
 	require.Positive(t, brokers, "the broker count decides how the partitions are spread")
 
-	// The geometry comes from the code that creates the topics, not from a number written down
-	// beside the volume: EnsureTopics provisions one topic and one .dlt sibling per category, so
-	// adding a category adds two topics and this floor rises with it automatically.
+	// The geometry comes from the code that creates the topics, not from a number written
+	// down beside the volume: EnsureTopics provisions one topic and one .dlt sibling per
+	// category, so adding a category adds two topics and this floor rises with it
+	// automatically.
 	categories := len(model.AllEventCategories())
 	require.Positive(t, categories, "the topic catalogue must not be empty")
 	topics := categories * 2
@@ -576,10 +524,10 @@ func TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor(t *testing.T) 
 
 	retentionBytes := statefulSetRetentionBytes(t, filepath.Join(root, kafkaStatefulSetPath))
 
-	// EVERY broker holds `replication` copies of each partition spread over `brokers` brokers, so
-	// its share is the whole catalogue scaled by replication/brokers. With RF equal to the broker
-	// count that is the whole catalogue, which is the case this deployment is in and the one an
-	// eyeballed figure gets wrong.
+	// EVERY broker holds `replication` copies of each partition spread over `brokers`
+	// brokers, so its share is the whole catalogue scaled by replication/brokers. With RF
+	// equal to the broker count that is the whole catalogue, which is the case this
+	// deployment is in and the one an eyeballed figure gets wrong.
 	partitionsPerBroker := float64(topics*partitions) * float64(replication) / float64(brokers)
 	logBytesPerBroker := partitionsPerBroker * float64(retentionBytes)
 	floorBytes := logBytesPerBroker / kafkaRetentionHeadroom
@@ -599,9 +547,9 @@ func TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor(t *testing.T) 
 		logBytesPerBroker/math.Pow(2, 30), floorBytes/math.Pow(2, 30),
 		kafkaRetentionHeadroom*100, float64(claimed)/math.Pow(2, 30))
 
-	// AND THE STORAGE MUST BE DURABLE. A KRaft broker that came back with an empty volume has
-	// lost its metadata log and its share of every partition, so an emptyDir is not a smaller
-	// version of this — it is a different, silently lossy deployment.
+	// AND THE STORAGE MUST BE DURABLE. A KRaft broker that came back with an empty volume
+	// has lost its metadata log and its share of every partition, so an emptyDir is not a
+	// smaller version of this — it is a different, silently lossy deployment.
 	templates, ok := spec["volumeClaimTemplates"].([]interface{})
 	require.True(t, ok, "%s must claim its storage through volumeClaimTemplates: a StatefulSet "+
 		"re-binds each claim to the same pod across restarts, which is what makes the KRaft log "+
@@ -615,12 +563,13 @@ func TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor(t *testing.T) 
 	assert.Equal(t, []interface{}{"ReadWriteOnce"}, templateSpec["accessModes"],
 		"a broker's log directory is written by exactly one pod")
 
-	// The log directory must come from the CLAIM and from nowhere else. Asserted structurally
-	// rather than by forbidding the word emptyDir anywhere in the file: this pod legitimately
-	// uses emptyDir for the memory-backed generated configuration and for the two log-output
-	// directories, and a textual ban would fail on those while missing the one that matters —
-	// a pod-level volume shadowing the claim under the same name, which mounts a directory that
-	// does not survive a reschedule and takes the KRaft metadata log with it.
+	// The log directory must come from the CLAIM and from nowhere else. Asserted
+	// structurally rather than by forbidding the word emptyDir anywhere in the file: this
+	// pod legitimately uses emptyDir for the memory-backed generated configuration and for
+	// the two log-output directories, and a textual ban would fail on those while missing
+	// the one that matters — a pod-level volume shadowing the claim under the same name,
+	// which mounts a directory that does not survive a reschedule and takes the KRaft
+	// metadata log with it.
 	metadata, ok := template["metadata"].(map[string]interface{})
 	require.True(t, ok, "the claim template must be named")
 	claimName := fmt.Sprint(metadata["name"])
@@ -643,12 +592,8 @@ func TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor(t *testing.T) 
 	}
 }
 
-// statefulSetRetentionBytes reads log.retention.bytes out of the broker configuration the
-// StatefulSet generates.
-//
-// Read from the manifest text rather than from a structured field because the broker
-// configuration is a generated properties file inside a shell command, which is where a
-// StatefulSet has to put it.
+// statefulSetRetentionBytes reads log.retention.bytes out of the broker configuration
+// the StatefulSet generates.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when the setting is absent.
@@ -705,9 +650,9 @@ func statefulSetClaimedStorageBytes(t *testing.T, spec map[string]interface{}) i
 
 // parseKubernetesQuantity converts a Kubernetes storage quantity into bytes.
 //
-// Only the binary suffixes a volume claim realistically uses are accepted, and an unrecognised
-// one is a failure rather than a silent zero: a quantity this test could not read would make the
-// floor comparison pass for the wrong reason.
+// Only the binary suffixes a volume claim realistically uses are accepted, and an
+// unrecognised one is a failure rather than a silent zero: a quantity this test could
+// not read would make the floor comparison pass for the wrong reason.
 //
 // Parameters:
 //   - t *testing.T: the test.

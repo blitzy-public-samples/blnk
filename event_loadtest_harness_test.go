@@ -14,37 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// EXECUTABLE coverage of the V-1 and V-3 acceptance harness: tests/loadtest/events.js and
-// tests/loadtest/run_case.sh.
+// EXECUTABLE coverage of the throughput/latency and dead-letter harness:
+// tests/loadtest/events.js
+// and tests/loadtest/run_case.sh.
 //
-// # What this file adds that event_loadtest_contract_test.go cannot
+// That file reads events.js as TEXT and asserts that particular source strings are
+// present or absent.
 //
-// That file reads events.js as TEXT and asserts that particular source strings are present or
-// absent. It is a real defence against a whole class of substitution defects — a verdict quietly
-// re-pointed at the wrong series — and it is kept. But a source-string assertion cannot execute
-// a parser, difference a counter, interpolate a histogram quantile or evaluate a verdict rule,
-// so it cannot distinguish a rule that works from one that cannot possibly hold.
-//
-// It did not distinguish them. `verdictHolds` required a verdict entry to carry a `value`, the
-// sustained-subwindow entry carries `fraction_meeting_target` and no `value` at all, and the
-// aggregate is a conjunction over every entry — so `verdicts_all_hold` and the ALL CRITERIA row
-// were FALSE for every run this file has ever produced, including a flawless thirty-minute one.
-// Nothing in the repository could have observed that, because nothing ran the script.
+// It did not distinguish them.
 //
 // So these tests RUN it:
 //
-//   - the fixture harness (`k6 run -e FIXTURES=1 tests/loadtest/events.js`) drives the real
-//     exposition parser, label matcher, histogram collector, quantile interpolation, counter and
-//     bucket deltas, backlog reader, summary readers and verdict rules over a table of fixtures
-//     with exact expected answers, and its self-check mode proves the harness is capable of
-//     failing;
-//   - the runner is driven with a STUB k6 on PATH, which is what makes its two security and
-//     integrity contracts testable: that no credential appears in the k6 process's argv, and
-//     that a failed run leaves no artifact a reader could mistake for this run's verdict.
-//
-// Both skip only when the tool they need is genuinely absent from the machine, and each names
-// what was missing. Neither contacts a deployment: the fixture mode short-circuits setup and
-// teardown, and the stub k6 does no I/O beyond the capture files these tests read.
+//   - the fixture harness (`k6 run -e FIXTURES=1 tests/loadtest/events.js`) drives the
+//     real exposition parser, label matcher, histogram collector, quantile
+//     interpolation, counter and bucket deltas, backlog reader, summary readers and
+//     verdict rules over a table of fixtures with exact expected answers, and its
+//     self-check mode proves the harness is capable of failing;
+//   - the runner is driven with a STUB k6 on PATH, which is what makes its two security
+//     and integrity contracts testable: that no credential appears in the k6 process's
+//     argv, and that a failed run leaves no artifact a reader could mistake for this
+//     run's verdict.
 package blnk
 
 import (
@@ -73,9 +62,9 @@ const harnessStubTimeout = 60 * time.Second
 
 // harnessSecrets are the credential values the runner tests drive.
 //
-// They are distinctive strings rather than realistic ones so that a leak is unambiguous when it
-// is found in a captured command line, and they are DELIBERATELY not passed to any assertion
-// helper as an operand — see harnessAssertAbsent.
+// They are distinctive strings rather than realistic ones so that a leak is unambiguous
+// when it is found in a captured command line, and they are DELIBERATELY not passed to
+// any assertion helper as an operand — see harnessAssertAbsent.
 const (
 	harnessMetricsToken = "fixture-metrics-bearer-2f8c41d90b7e"
 	harnessMasterKey    = "fixture-master-key-6ad3e5719c02"
@@ -84,9 +73,8 @@ const (
 
 // harnessRequireK6 resolves the k6 binary or skips.
 //
-// A SKIP and not a failure, because k6 is a separate tool rather than a Go dependency and a
-// contributor without it must still be able to run the suite. The Kafka acceptance workflow
-// installs it, so the skip is not how this coverage goes missing in CI.
+// A SKIP and not a failure, because k6 is a separate tool rather than a Go dependency
+// and a contributor without it must still be able to run the suite.
 //
 // Parameters:
 //   - t *testing.T: the test, skipped when k6 is not on PATH.
@@ -107,8 +95,8 @@ func harnessRequireK6(t *testing.T) string {
 	return binary
 }
 
-// runK6Fixtures runs the fixture mode with the given extra environment and returns its combined
-// output and exit status.
+// runK6Fixtures runs the fixture mode with the given extra environment and returns its
+// combined output and exit status.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -128,19 +116,20 @@ func runK6Fixtures(t *testing.T, env []string) (string, int) {
 	}
 	args = append(args, filepath.Join("tests", "loadtest", "events.js"))
 
-	// BOUNDED, so a hang is reported as one. See harnessK6Timeout: the fixture mode performs
-	// no I/O, so nothing here can legitimately take this long, and an unbounded run would stall
-	// the package until the go test timeout killed the whole binary with no indication of which
-	// test was stuck.
+	// BOUNDED, so a hang is reported as one. See harnessK6Timeout: the fixture mode
+	// performs no I/O, so nothing here can legitimately take this long, and an unbounded
+	// run would stall the package until the go test timeout killed the whole binary with
+	// no indication of which test was stuck.
 	runContext, cancelRun := context.WithTimeout(context.Background(), harnessK6Timeout)
 	defer cancelRun()
 
 	command := exec.CommandContext(runContext, binary, args...)
 	command.Dir = harnessRepositoryRoot(t)
 	// A run with NO inherited environment except the minimum k6 needs. k6 enables
-	// --include-system-env-vars by default, so an ambient DURATION, SMOKE or RATE_WINDOW_SECONDS
-	// in the developer's shell would reach __ENV and change which verdict entries this run's
-	// configuration applies — the fixtures assert on that, so the environment has to be pinned.
+	// --include-system-env-vars by default, so an ambient DURATION, SMOKE or
+	// RATE_WINDOW_SECONDS in the developer's shell would reach __ENV and change which
+	// verdict entries this run's configuration applies — the fixtures assert on that, so
+	// the environment has to be pinned.
 	command.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
@@ -161,12 +150,11 @@ func runK6Fixtures(t *testing.T, env []string) (string, int) {
 	return string(output), status
 }
 
-// harnessRepositoryRoot resolves the directory the runner and the scenario are addressed
-// from.
+// harnessRepositoryRoot resolves the directory the runner and the scenario are
+// addressed from.
 //
-// The Go test's working directory IS the package directory, which for the root package is the
-// repository root, and both artefacts are referenced by paths relative to it. Resolved rather
-// than assumed so a failure names a missing file instead of producing a confusing k6 error.
+// The Go test's working directory IS the package directory, which for the root package
+// is the repository root, and both artefacts are referenced by paths relative to it.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when the layout is not what it expects.
@@ -190,17 +178,10 @@ func harnessRepositoryRoot(t *testing.T) string {
 	return root
 }
 
-// TestEventLoadHarness_FixtureModeAssertsTheRealVerdictRules is the test the aggregate verdict
-// defect needed.
+// TestEventLoadHarness_FixtureModeAssertsTheRealVerdictRules is the test the aggregate
+// verdict defect needed.
 //
-// It runs the fixture mode, which asserts — among 47 other exact answers — that a run meeting
-// every acceptance criterion reports `verdicts_all_hold` TRUE. Before the fix that was
-// unsatisfiable, and this test is what makes it unsatisfiable-again a failing build.
-//
-// The assertions here are on the HARNESS's own outcome rather than on individual fixtures: each
-// fixture states its expected answer inside events.js, where it sits beside the function it
-// describes, and the harness aborts naming any that disagreed. Restating them here would be a
-// second copy able to drift from the first.
+// It runs the fixture mode, which asserts — among 47 other exact answers.
 func TestEventLoadHarness_FixtureModeAssertsTheRealVerdictRules(t *testing.T) {
 	output, status := runK6Fixtures(t, nil)
 
@@ -212,10 +193,9 @@ func TestEventLoadHarness_FixtureModeAssertsTheRealVerdictRules(t *testing.T) {
 	assert.Contains(t, output, "verdict    PASS",
 		"the fixture summary must report a passing verdict")
 
-	// THE HARNESS MUST HAVE RUN SOMETHING. A fixture mode that registered zero checks would
-	// report a clean run, and "no failures" out of nothing is the vacuous pass every other
-	// assertion in this file is written to avoid. Both figures are read out rather than matched
-	// with a backreference, which Go's RE2 engine does not support.
+	// THE HARNESS MUST HAVE RUN SOMETHING. A fixture mode that registered zero checks
+	// would report a clean run, and "no failures" out of nothing is the vacuous pass every
+	// other assertion in this file is written to avoid.
 	held, total := harnessCheckCounts(t, output)
 	assert.Positive(t, total,
 		"the fixture harness registered NO checks, so its clean run asserts nothing")
@@ -224,9 +204,9 @@ func TestEventLoadHarness_FixtureModeAssertsTheRealVerdictRules(t *testing.T) {
 	assert.NotContains(t, output, "checks     NONE RAN",
 		"the fixture iteration did not run at all, so nothing was asserted")
 
-	// The fixture mode must not have contacted anything. A deployment reached by accident would
-	// make the harness environment-dependent, and provisioning is the expensive, irreversible
-	// part of a real run.
+	// The fixture mode must not have contacted anything. A deployment reached by accident
+	// would make the harness environment-dependent, and provisioning is the expensive,
+	// irreversible part of a real run.
 	assert.NotContains(t, output, "provisioned",
 		"fixture mode must not provision ledgers or balances: it short-circuits setup")
 	assert.NotContains(t, output, "http_req_duration",
@@ -259,13 +239,8 @@ func harnessCheckCounts(t *testing.T, output string) (int, int) {
 	return held, total
 }
 
-// TestEventLoadHarness_FixtureModeFailsWhenAnAnswerIsWrong proves the harness is capable of
-// failing.
-//
-// Without this the passing run above is worth very little: a harness whose assertions had been
-// commented out, or whose comparison always returned true, produces exactly the same clean
-// output. FIXTURES_SELFCHECK inverts one expectation, and the run must then fail with a named
-// disagreement and a non-zero status.
+// TestEventLoadHarness_FixtureModeFailsWhenAnAnswerIsWrong proves the harness is
+// capable of failing.
 func TestEventLoadHarness_FixtureModeFailsWhenAnAnswerIsWrong(t *testing.T) {
 	output, status := runK6Fixtures(t, []string{"FIXTURES_SELFCHECK=1"})
 
@@ -299,17 +274,14 @@ type harnessRunner struct {
 	envPath string
 }
 
-// newHarnessRunner builds a temporary tree in which run_case.sh can be executed with a stub k6.
-//
-// The real script is COPIED rather than reimplemented: a test that asserted against a
-// paraphrase of the runner would pass while the runner itself was wrong, which is the whole
-// failure mode here.
+// newHarnessRunner builds a temporary tree in which run_case.sh can be executed with a
+// stub k6.
 //
 // Parameters:
 //   - t *testing.T: the test.
 //   - stubExit int: the status the stub k6 exits with.
-//   - stubSummary string: what the stub writes to the SUMMARY_OUT path it is given; empty
-//     writes nothing, which models a run that never reached handleSummary.
+//   - stubSummary string: what the stub writes to the SUMMARY_OUT path it is given;
+//     empty writes nothing, which models a run that never reached handleSummary.
 //
 // Returns:
 //   - harnessRunner: the prepared invocation.
@@ -326,9 +298,9 @@ func newHarnessRunner(t *testing.T, stubExit int, stubSummary string) harnessRun
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(loadtest, "run_case.sh"), script, 0o755))
 
-	// A placeholder rather than the real scenario: the stub never reads it, and copying 270 KB
-	// of JavaScript per subtest would be waste. Its PRESENCE matters, because the argv
-	// assertions check that the runner handed k6 this path.
+	// A placeholder rather than the real scenario: the stub never reads it, and copying
+	// 270 KB of JavaScript per subtest would be waste. Its PRESENCE matters, because the
+	// argv assertions check that the runner handed k6 this path.
 	require.NoError(t, os.WriteFile(
 		filepath.Join(loadtest, "events.js"),
 		[]byte("// placeholder: the stub k6 in this test never reads the scenario\n"),
@@ -344,9 +316,8 @@ func newHarnessRunner(t *testing.T, stubExit int, stubSummary string) harnessRun
 		envPath:  filepath.Join(dir, "k6-env.txt"),
 	}
 
-	// THE STUB. It records its command line and its environment, optionally writes the summary
-	// it was told to write, and exits with the configured status. It resolves SUMMARY_OUT out of
-	// its own arguments, exactly as k6 would resolve -e SUMMARY_OUT into __ENV.
+	// THE STUB. It records its command line and its environment, optionally writes the
+	// summary it was told to write, and exits with the configured status.
 	stub := strings.Join([]string{
 		"#!/usr/bin/env bash",
 		"set -uo pipefail",
@@ -361,9 +332,9 @@ func newHarnessRunner(t *testing.T, stubExit int, stubSummary string) harnessRun
 		"  esac",
 		"done",
 		// The NDJSON stream is opened and written as the run proceeds, which is what real k6
-		// does and what makes an interrupted run leave a TRUNCATED file rather than none. It is
-		// written whatever the exit status, so a failing run genuinely produces a partial the
-		// runner has to clean up.
+		// does and what makes an interrupted run leave a TRUNCATED file rather than none. It
+		// is written whatever the exit status, so a failing run genuinely produces a partial
+		// the runner has to clean up.
 		"if [ -n \"${stream}\" ]; then",
 		"  printf '%s\\n' '{\"type\":\"Point\",\"metric\":\"stub\"}' > \"${stream}\"",
 		"fi",
@@ -381,7 +352,8 @@ func newHarnessRunner(t *testing.T, stubExit int, stubSummary string) harnessRun
 	return runner
 }
 
-// harnessItoa renders a small non-negative integer without importing strconv for one call site.
+// harnessItoa renders a small non-negative integer without importing strconv for one
+// call site.
 //
 // Parameters:
 //   - value int: the value.
@@ -419,25 +391,24 @@ func (r harnessRunner) run(t *testing.T, caseName string) (string, int) {
 	command.Env = []string{
 		"PATH=" + filepath.Join(r.dir, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
-		// The three credentials, under the names ./.env exports rather than the names events.js
-		// reads: the rename is part of what the runner does, and asserting on the renamed forms
-		// is what proves it did it.
+		// The three credentials, under the names ./.env exports rather than the names
+		// events.js reads: the rename is part of what the runner does, and asserting on the
+		// renamed forms is what proves it did it.
 		"BLNK_METRICS_BEARER_TOKEN=" + harnessMetricsToken,
 		"BLNK_SERVER_SECRET_KEY=" + harnessMasterKey,
 		"API_KEY=" + harnessAPIKey,
 		// THE TWO PREREQUISITES THE RUNNER REFUSES A RUN WITHOUT, stated here for the same
 		// reason an operator states them: an acceptance run is measured off process-global
 		// counters, so it needs an instance dedicated to it, and provisioning a spread adds
-		// ledgers and balances that Blnk has no endpoint to delete. Both refusals happen before
-		// k6 is started, so without them this harness would assert on the refusal's output
-		// instead of on the runner's artifact handling. The refusals themselves are covered by
-		// the contract tests, which read them out of the script.
+		// ledgers and balances that Blnk has no endpoint to delete. Both refusals happen
+		// before k6 is started, so without them this harness would assert on the refusal's
+		// output instead of on the runner's artifact handling.
 		"ISOLATED_INSTANCE=1",
 		"ALLOW_FIXTURE_CREATION=1",
-		// THE RAW NDJSON STREAM IS OPT-IN (PERF-M12): a thirty-minute run at the criterion's
-		// load writes tens of millions of records from the load generator while it is trying to
-		// measure sub-second latency. The lifecycle assertions below are about that stream as
-		// well as the summary, so this harness asks for it explicitly.
+		// THE RAW NDJSON STREAM IS OPT-IN: a thirty-minute run at the criterion's load writes
+		// tens of millions of records from the load generator while it is trying to measure
+		// sub-second latency. The lifecycle assertions below are about that stream as well as
+		// the summary, so this harness asks for it explicitly.
 		"RAW_OUTPUT=1",
 	}
 
@@ -470,12 +441,8 @@ func (r harnessRunner) run(t *testing.T, caseName string) (string, int) {
 	return string(output), status
 }
 
-// harnessAssertAbsent asserts that a haystack does not contain a secret, WITHOUT passing the
-// secret or the haystack to an assertion helper.
-//
-// testify renders both operands of NotContains into the failure message, so asserting
-// `NotContains(argv, secret)` prints the secret into the CI log on the one run where it
-// matters — the run that found the leak. A boolean assertion carries only the message.
+// harnessAssertAbsent asserts that a haystack does not contain a secret, WITHOUT
+// passing the secret or the haystack to an assertion helper.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -506,20 +473,14 @@ func harnessReadLines(t *testing.T, path string) []string {
 	return strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
 }
 
-// TestEventLoadRunner_PassesNoCredentialOnTheCommandLine is the CWE-214 guard on the acceptance
-// runner.
+// TestEventLoadRunner_PassesNoCredentialOnTheCommandLine is the CWE-214 guard on the
+// acceptance runner.
 //
-// The metrics bearer token, the master key and the API key used to be forwarded as `-e
-// NAME=value`, which puts each of them in the k6 process's argv. On Linux argv is readable
-// through /proc/<pid>/cmdline by any process of the same user, is reported by `ps` to every user
-// by default, and is recorded verbatim by auditd's execve events, by container runtimes and by
-// most APM agents. A run of this harness therefore disclosed the deployment's master key — the
-// credential that authorises the event management surface — to everything watching the host.
-//
-// The three must reach k6 through its inherited ENVIRONMENT instead, which k6 reads because
-// --include-system-env-vars is enabled by default. This test asserts both halves: nothing
-// secret in argv, and the credentials genuinely arriving under the names events.js reads, so the
-// fix cannot be "stop passing them at all".
+// On Linux argv is readable through /proc/<pid>/cmdline by any process of the same
+// user, is reported by `ps` to every user by default, and is recorded verbatim by
+// auditd's execve events, by container runtimes and by most APM agents. A run of this
+// harness therefore disclosed the deployment's master key — the credential that
+// authorises the event management surface — to everything watching the host.
 func TestEventLoadRunner_PassesNoCredentialOnTheCommandLine(t *testing.T) {
 	runner := newHarnessRunner(t, 0, `{"metrics":{}}`)
 
@@ -548,9 +509,9 @@ func TestEventLoadRunner_PassesNoCredentialOnTheCommandLine(t *testing.T) {
 				"is the channel this test exists to close, whatever value it carries", name)
 	}
 
-	// AND THEY MUST STILL ARRIVE. A runner that simply stopped forwarding them would pass every
-	// assertion above and silently produce a run with no authenticated scrape, whose verdicts
-	// are all withheld — a failure that looks like a measurement.
+	// AND THEY MUST STILL ARRIVE. A runner that simply stopped forwarding them would pass
+	// every assertion above and silently produce a run with no authenticated scrape, whose
+	// verdicts are all withheld — a failure that looks like a measurement.
 	environment := harnessReadLines(t, runner.envPath)
 	present := map[string]bool{}
 	for _, entry := range environment {
@@ -583,8 +544,8 @@ func TestEventLoadRunner_PassesNoCredentialOnTheCommandLine(t *testing.T) {
 
 // harnessEnvironmentCarries reports whether an environment listing binds name to value.
 //
-// Written as a predicate so that neither the name's value nor the expected secret is ever an
-// assertion operand.
+// Written as a predicate so that neither the name's value nor the expected secret is
+// ever an assertion operand.
 //
 // Parameters:
 //   - environment []string: KEY=value entries.
@@ -603,17 +564,11 @@ func harnessEnvironmentCarries(environment []string, name, value string) bool {
 	return false
 }
 
-// TestEventLoadRunner_AFailedRunLeavesNoStaleArtifactBehind is the artifact-integrity guard.
+// TestEventLoadRunner_AFailedRunLeavesNoStaleArtifactBehind is the artifact-integrity
+// guard.
 //
-// The summary is written by handleSummary, which runs only when the test reaches the end of its
-// lifecycle. A run that failed during init — an unknown scenario, an unreachable deployment, a
-// refused acceptance guard — or that was interrupted writes NO summary, and the file at the
-// stable path was then last week's. Same path, same shape, and a reviewer or a collector reading
-// it reads a stale PASS as this run's verdict. That is worse than an absent artifact in the way
-// that matters: an absence is visibly an absence.
-//
-// The stale file here carries a passing verdict, so a runner that leaves it in place fails this
-// test on the exact confusion being prevented.
+// The summary is written by handleSummary, which runs only when the test reaches the
+// end of its lifecycle.
 func TestEventLoadRunner_AFailedRunLeavesNoStaleArtifactBehind(t *testing.T) {
 	runner := newHarnessRunner(t, 99, "")
 
@@ -652,8 +607,8 @@ func TestEventLoadRunner_AFailedRunLeavesNoStaleArtifactBehind(t *testing.T) {
 // TestEventLoadRunner_PromotesTheArtifactOnlyWhenTheRunSucceeded is the other half: a
 // successful run must publish its verdict, atomically, at the documented path.
 //
-// Without this the fix for the stale-artifact defect could be "never write an artifact", which
-// would pass every assertion in the test above.
+// Without this the fix for the stale-artifact defect could be "never write an
+// artifact", which would pass every assertion in the test above.
 func TestEventLoadRunner_PromotesTheArtifactOnlyWhenTheRunSucceeded(t *testing.T) {
 	body := `{"metrics":{},"blnk_event_streaming":{"verdicts_all_hold":true}}`
 	runner := newHarnessRunner(t, 0, body)
@@ -670,19 +625,17 @@ func TestEventLoadRunner_PromotesTheArtifactOnlyWhenTheRunSucceeded(t *testing.T
 	assert.Contains(t, output, "Generated files:")
 	assert.Contains(t, output, "summary-event-streaming.json")
 
-	// The temporary the run wrote through must not survive. A left-behind `.partial.` file beside
-	// the artifact is a second copy of the verdict that no reader is looking for and no run
-	// cleans up.
+	// The temporary the run wrote through must not survive. A left-behind `.partial.` file
+	// beside the artifact is a second copy of the verdict that no reader is looking for
+	// and no run cleans up.
 	harnessAssertNoPartials(t, filepath.Join(runner.dir, "tests", "loadtest"))
 }
 
-// TestEventLoadRunner_RefusesAZeroExitThatProducedNoVerdict covers the third outcome, which is
-// neither a clean pass nor an honest failure.
+// TestEventLoadRunner_RefusesAZeroExitThatProducedNoVerdict covers the third outcome,
+// which is neither a clean pass nor an honest failure.
 //
 // k6 can exit 0 without having reached handleSummary — a run aborted through
-// `exec.test.abort()` in a configuration where no threshold failed, for instance. The runner
-// must not then announce a generated file that does not exist, because the next thing a
-// collector does is read it.
+// `exec.test.abort()` in a configuration where no threshold failed, for instance.
 func TestEventLoadRunner_RefusesAZeroExitThatProducedNoVerdict(t *testing.T) {
 	runner := newHarnessRunner(t, 0, "")
 
@@ -702,27 +655,13 @@ func TestEventLoadRunner_RefusesAZeroExitThatProducedNoVerdict(t *testing.T) {
 	harnessAssertNoPartials(t, filepath.Join(runner.dir, "tests", "loadtest"))
 }
 
-// TestEventLoadRunner_NamesArtifactsUnderEitherSpelling pins the artifact contract for the
-// documented alias.
+// TestEventLoadRunner_NamesArtifactsUnderEitherSpelling pins the artifact contract for
+// the documented alias.
 //
-// `events` and `event-streaming` are two names for one case, and normalising them onto one
-// dispatch point is right — two branches once forwarded different variables and spelled the
-// master key differently, so both names appeared to work while doing different things.
-//
-// The artifact names are NOT derived from the spelling the operator typed. They are the frozen
-// pair, `summary-event-streaming.json` and `run-event-streaming.ndjson`, and that direction was
-// settled from the code rather than chosen: events.js's own SUMMARY_OUT default is
-// `tests/loadtest/summary-event-streaming.json`, which is what a bare
-// `k6 run tests/loadtest/events.js` writes with no runner involved at all, and it is the pair the
-// load-test guide documents throughout. Deriving the filenames from the alias would mean one run
-// produced two possible names for its verdict, so a collector, the dashboard and the acceptance
-// record would each have to know which spelling was typed — and a run that wrote the other name
-// would fail no build and no assertion while producing correct numbers in a file nothing else
-// looks for.
-//
-// What the operator gets instead is the substitution REPORTED: the banner echoes the name they
-// typed alongside the one it resolved to, and the resolved artifact path, so nobody has to guess
-// which files to open. Both halves are asserted here.
+// `events` and `event-streaming` are two names for one case, and normalising them onto
+// one dispatch point is right — two branches once forwarded different variables and
+// spelled the master key differently, so both names appeared to work while doing
+// different things.
 func TestEventLoadRunner_NamesArtifactsUnderEitherSpelling(t *testing.T) {
 	body := `{"metrics":{}}`
 

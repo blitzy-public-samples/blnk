@@ -16,22 +16,8 @@ limitations under the License.
 
 package blnk
 
-// This file owns the SETTLEMENT LOOP: the worker that finishes broker-side subscriber work no
-// request could complete.
-//
-// The remedy itself — what discharging each obligation actually does at the broker and the
-// registry — is asserted in event_subscriber_test.go under SETTLE-01, against the faithful
-// registry mirror and the scriptable broker double. What is asserted HERE is the loop's own
-// contract, which can fail entirely independently of the remedy:
-//
-//	the pass declines to run when there is no broker-side state to reconcile;
-//	the pass PACES itself, so a persistently failing subscriber cannot monopolise it;
-//	an attempt is RECORDED whether or not it succeeded, because a pass that could not record
-//	  one would never pace the next and would turn a broker outage into a busy loop;
-//	the lifecycle starts, stops, clears its running flag and restarts.
-//
-// The store and the settler are both doubles, because every property above is a property of the
-// ORDER AND CONDITIONS under which the loop calls its two collaborators.
+// This file owns the SETTLEMENT LOOP: the worker that finishes broker-side subscriber
+// work no request could complete.
 
 import (
 	"context"
@@ -198,13 +184,11 @@ func settlementOwing(subscriberID string, grant, credential bool) model.Subscrib
 	}
 }
 
-// TestSubscriberSettlementProcessor_IsInactiveWithoutABroker keeps the no-Kafka steady state
-// working.
+// TestSubscriberSettlementProcessor_IsInactiveWithoutABroker keeps the no-Kafka steady
+// state working.
 //
-// A deployment with no broker has no broker-side subscriber state, so there is nothing that could
-// diverge from the registry. The obstacle is reported as its own value so the server role can log
-// it at info rather than warning — a Kafka-less deployment has not misconfigured anything, and a
-// warning on every start-up would train an operator to ignore the one that matters.
+// A deployment with no broker has no broker-side subscriber state, so there is nothing
+// that could diverge from the registry.
 func TestSubscriberSettlementProcessor_IsInactiveWithoutABroker(t *testing.T) {
 	processor := newSettlementProcessor(&settlementFakeStore{}, &settlementFakeSettler{})
 	processor.configured = false
@@ -223,12 +207,8 @@ func TestSubscriberSettlementProcessor_IsInactiveWithoutABroker(t *testing.T) {
 	assert.NotPanics(t, processor.Stop, "stopping one that never started must be safe")
 }
 
-// TestSubscriberSettlementProcessor_RefusesToRunWithoutItsCollaborators covers the two wiring
-// defects.
-//
-// They are reported as errors distinct from the disabled case because their consequence is the
-// opposite: a broker IS configured and the pass is not running, so obligations accumulate
-// silently.
+// TestSubscriberSettlementProcessor_RefusesToRunWithoutItsCollaborators covers the two
+// wiring defects.
 func TestSubscriberSettlementProcessor_RefusesToRunWithoutItsCollaborators(t *testing.T) {
 	t.Run("no registry", func(t *testing.T) {
 		processor := newSettlementProcessor(nil, &settlementFakeSettler{})
@@ -258,9 +238,8 @@ func TestSubscriberSettlementProcessor_RefusesToRunWithoutItsCollaborators(t *te
 
 // TestSubscriberSettlementProcessor_PacesRetriesFromItsOwnClock is the pacing contract.
 //
-// Settlement talks to the same broker that just failed, so a pass that re-attempted every row
-// every minute would hammer it and bury the log in one subscriber. The bound is now MINUS the
-// retry interval; computing it in the other direction would make every row eligible always.
+// Settlement talks to the same broker that just failed, so a pass that re-attempted
+// every row every minute would hammer it and bury the log in one subscriber.
 func TestSubscriberSettlementProcessor_PacesRetriesFromItsOwnClock(t *testing.T) {
 	store := &settlementFakeStore{}
 	processor := newSettlementProcessor(store, &settlementFakeSettler{}).
@@ -323,12 +302,8 @@ func TestSubscriberSettlementProcessor_RecordsAFailedAttemptAndKeepsGoing(t *tes
 	assert.Empty(t, attempts[1].failure)
 }
 
-// TestSubscriberSettlementProcessor_RecordsTheAttemptEvenWhenTheRemedyExhaustedItsBudget is why
-// the pacing write runs on a detached context.
-//
-// The commonest settlement failure is the per-subscriber deadline expiring, and an attempt
-// recorded on that same expired context would never land — so the row would never be paced and
-// the next pass would retry it immediately, against a broker that is already unresponsive.
+// TestSubscriberSettlementProcessor_RecordsTheAttemptEvenWhenTheRemedyExhaustedItsBudget
+// is why the pacing write runs on a detached context.
 func TestSubscriberSettlementProcessor_RecordsTheAttemptEvenWhenTheRemedyExhaustedItsBudget(t *testing.T) {
 	store := &settlementFakeStore{outstanding: []model.SubscriberSettlementObligation{
 		settlementOwing("sub_hanging", true, false),
@@ -350,11 +325,10 @@ func TestSubscriberSettlementProcessor_RecordsTheAttemptEvenWhenTheRemedyExhaust
 	assert.NotEmpty(t, attempts[0].failure)
 }
 
-// TestSubscriberSettlementProcessor_ContinuesWhenThePacingWriteFails keeps a bookkeeping problem
-// from becoming a settlement problem.
+// TestSubscriberSettlementProcessor_ContinuesWhenThePacingWriteFails keeps a
+// bookkeeping problem from becoming a settlement problem.
 //
-// The remedy succeeded, so the obligation is discharged and the pass reports it. A failure to
-// record the attempt only costs pacing, which is why it is logged rather than returned.
+// The remedy succeeded, so the obligation is discharged and the pass reports it.
 func TestSubscriberSettlementProcessor_ContinuesWhenThePacingWriteFails(t *testing.T) {
 	store := &settlementFakeStore{
 		outstanding: []model.SubscriberSettlementObligation{settlementOwing("sub_a", true, false)},
@@ -365,11 +339,10 @@ func TestSubscriberSettlementProcessor_ContinuesWhenThePacingWriteFails(t *testi
 		"the remedy completed, so the obligation is settled whatever happened to the pacing write")
 }
 
-// TestSubscriberSettlementProcessor_AttemptsNothingWhenTheBacklogCannotBeRead is the fail-safe
-// direction.
+// TestSubscriberSettlementProcessor_AttemptsNothingWhenTheBacklogCannotBeRead is the
+// fail-safe direction.
 //
-// An unreadable backlog is not an empty one. Treating it as empty would report "nothing owed" on
-// the strength of a reading that does not exist.
+// An unreadable backlog is not an empty one.
 func TestSubscriberSettlementProcessor_AttemptsNothingWhenTheBacklogCannotBeRead(t *testing.T) {
 	store := &settlementFakeStore{listErr: errors.New("registry read path unavailable")}
 	settler := &settlementFakeSettler{}
@@ -391,12 +364,8 @@ func TestSubscriberSettlementProcessor_AnEmptyBacklogIsTheHealthySteadyState(t *
 	assert.Len(t, store.recordedLists(), 1)
 }
 
-// TestSubscriberSettlementProcessor_LifecycleStartsStopsAndIsRestartable pins the lifecycle this
-// worker shares with every other background worker here.
-//
-// The two failures it guards against are both in the shape rather than the work: a Stop that
-// returns before the loop is accounted for, and a running flag that survives the loop and makes a
-// later Start a silent no-op.
+// TestSubscriberSettlementProcessor_LifecycleStartsStopsAndIsRestartable pins the
+// lifecycle this worker shares with every other background worker here.
 func TestSubscriberSettlementProcessor_LifecycleStartsStopsAndIsRestartable(t *testing.T) {
 	processor := newSettlementProcessor(&settlementFakeStore{}, &settlementFakeSettler{}).
 		WithInterval(time.Millisecond)
@@ -470,13 +439,8 @@ func TestSubscriberSettlementProcessor_HonoursCancellationMidPass(t *testing.T) 
 			"not reach still carries its marker")
 }
 
-// TestSubscriberSettlementProcessor_ConfiguratorsRejectNonPositiveValues asserts a misconfigured
-// cadence cannot switch settlement off or turn it into a busy loop.
-//
-// The failure modes of accepting them are both silent: an interval of zero makes time.NewTicker
-// panic, and a retry interval of zero would make every failing row eligible on every pass —
-// hammering a broker that is already failing, which is the exact behaviour the pacing exists to
-// prevent.
+// TestSubscriberSettlementProcessor_ConfiguratorsRejectNonPositiveValues asserts a
+// misconfigured cadence cannot switch settlement off or turn it into a busy loop.
 func TestSubscriberSettlementProcessor_ConfiguratorsRejectNonPositiveValues(t *testing.T) {
 	processor := newSettlementProcessor(&settlementFakeStore{}, &settlementFakeSettler{})
 
@@ -512,11 +476,11 @@ func TestNewSubscriberSettlementProcessor_IsSafeOnAnUnwiredInstance(t *testing.T
 	assert.NotPanics(t, processor.Stop)
 }
 
-// TestSubscriberSettlementConfigured_ReadsTheBrokerListTheSameWayEverythingElseDoes keeps the
-// worker's view of "is Kafka configured" identical to the publisher's.
+// TestSubscriberSettlementConfigured_ReadsTheBrokerListTheSameWayEverythingElseDoes
+// keeps the worker's view of "is Kafka configured" identical to the publisher's.
 //
-// A worker that disagreed would either poll a table forever on a deployment without Kafka, or
-// stay silent on one with it.
+// A worker that disagreed would either poll a table forever on a deployment without
+// Kafka, or stay silent on one with it.
 func TestSubscriberSettlementConfigured_ReadsTheBrokerListTheSameWayEverythingElseDoes(t *testing.T) {
 	t.Run("no brokers", func(t *testing.T) {
 		assert.False(t, subscriberSettlementConfigured(&config.Configuration{}))

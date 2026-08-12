@@ -32,12 +32,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// withRegisteredCapture installs a capture for the duration of one test and restores the
-// previous registration afterwards.
-//
-// Restoration matters because the registration is process-wide: a test that left its capture
-// installed would change the behaviour of every later test in the package, and the failure
-// would appear in whichever test happened to run next rather than in the one that caused it.
+// withRegisteredCapture installs a capture for the duration of one test and restores
+// the previous registration afterwards.
 func withRegisteredCapture(t *testing.T, capture TransactionEventCapture) {
 	t.Helper()
 
@@ -63,9 +59,9 @@ func captureRecordingEachCall(ledgers map[string]string) TransactionEventCapture
 
 // apiErrorDetail returns the wrapped cause carried on an APIError's Details field.
 //
-// APIError.Error() renders only the code and the operator-facing message, so a test asserting on
-// the diagnostic — which transaction failed, and why — has to read Details, where NewAPIError
-// puts the wrapped error.
+// APIError.Error() renders only the code and the operator-facing message, so a test
+// asserting on the diagnostic — which transaction failed, and why — has to read
+// Details, where NewAPIError puts the wrapped error.
 func apiErrorDetail(t *testing.T, err error) string {
 	t.Helper()
 
@@ -104,10 +100,9 @@ func newBatchTransactionFixture(id string) *model.Transaction {
 
 // expectTransactionCopy scripts the COPY the batch writer uses for transaction rows.
 //
-// The batch writer streams transactions through pq.CopyInSchema rather than issuing an INSERT,
-// so a test that scripts an INSERT never reaches the event capture that follows it. Arguments
-// are left unmatched deliberately: what these tests assert is the event capture's position
-// relative to the commit, not the transaction binding, which transactions_test.go already pins.
+// The batch writer streams transactions through pq.CopyInSchema rather than issuing an
+// INSERT, so a test that scripts an INSERT never reaches the event capture that follows
+// it.
 func expectTransactionCopy(mock sqlmock.Sqlmock) {
 	copySQL := pq.CopyInSchema(
 		"blnk",
@@ -138,9 +133,7 @@ func expectTransactionCopy(mock sqlmock.Sqlmock) {
 
 // TestResolveBatchEventOutboxes_PrefersSuppliedRowsOverDerivation pins the precedence.
 //
-// A caller that prepared its own events is authoritative. Deriving over it would discard rows
-// whose payload the caller may have shaped deliberately, and it would do so invisibly, because
-// the derived row is a valid event for the same transaction.
+// A caller that prepared its own events is authoritative.
 func TestResolveBatchEventOutboxes_PrefersSuppliedRowsOverDerivation(t *testing.T) {
 	derived := false
 	withRegisteredCapture(t, func(_ context.Context, _ *model.Transaction, _ string) (*model.EventOutbox, error) {
@@ -160,12 +153,11 @@ func TestResolveBatchEventOutboxes_PrefersSuppliedRowsOverDerivation(t *testing.
 	assert.False(t, derived, "derivation must not run when the caller supplied rows")
 }
 
-// TestResolveBatchEventOutboxes_DerivesOneRowPerTransactionWhenNoneSupplied is the R-2 fix
+// TestResolveBatchEventOutboxes_DerivesOneRowPerTransactionWhenNoneSupplied is the fix
 // itself, at the level the fix lives.
 //
-// The coalescing path reaches the batch writer with no event rows, and its file cannot be
-// changed to supply them. Before this, that meant a batch committed many transactions and
-// published nothing: durable money movement with no event anywhere, and no error to say so.
+// The coalescing path reaches the batch writer with no event rows, and its file cannot
+// be changed to supply them.
 func TestResolveBatchEventOutboxes_DerivesOneRowPerTransactionWhenNoneSupplied(t *testing.T) {
 	seen := map[string]string{}
 	withRegisteredCapture(t, captureRecordingEachCall(seen))
@@ -196,12 +188,8 @@ func TestResolveBatchEventOutboxes_DerivesOneRowPerTransactionWhenNoneSupplied(t
 	}, seen, "each transaction's ledger must be resolved from the balance set, source first")
 }
 
-// TestResolveBatchEventOutboxes_CapturesNothingWhenPublishingIsUnconfigured protects every
-// broker-less deployment and most of the existing test suite.
-//
-// A nil row is what PrepareEventOutbox returns when publishing is off, so an all-nil result is
-// the ordinary unconfigured case and must produce no rows and no error — the same
-// no-op-when-unconfigured contract the pipeline inherited from SendWebhook.
+// TestResolveBatchEventOutboxes_CapturesNothingWhenPublishingIsUnconfigured protects
+// every broker-less deployment and most of the existing test suite.
 func TestResolveBatchEventOutboxes_CapturesNothingWhenPublishingIsUnconfigured(t *testing.T) {
 	withRegisteredCapture(t, func(_ context.Context, _ *model.Transaction, _ string) (*model.EventOutbox, error) {
 		return nil, nil
@@ -215,12 +203,11 @@ func TestResolveBatchEventOutboxes_CapturesNothingWhenPublishingIsUnconfigured(t
 	assert.Empty(t, rows, "an unconfigured publisher captures nothing and fails nothing")
 }
 
-// TestResolveBatchEventOutboxes_RefusesAMixedCaptureResult refuses to insert a partial batch.
+// TestResolveBatchEventOutboxes_RefusesAMixedCaptureResult refuses to insert a partial
+// batch.
 //
-// Publishing is configured process-wide, so either every row is nil or none is; a mixed result
-// is a defect. Trimming the nils would insert fewer events than transactions, which is the
-// silently-dropped-event case the cardinality check exists to prevent — and it would then be
-// reported as a cardinality mismatch, blaming the caller for something it did not do.
+// Publishing is configured process-wide, so either every row is nil or none is; a mixed
+// result is a defect.
 func TestResolveBatchEventOutboxes_RefusesAMixedCaptureResult(t *testing.T) {
 	withRegisteredCapture(t, func(_ context.Context, txn *model.Transaction, _ string) (*model.EventOutbox, error) {
 		if txn.TransactionID == "txn_2" {
@@ -240,12 +227,8 @@ func TestResolveBatchEventOutboxes_RefusesAMixedCaptureResult(t *testing.T) {
 		"the detail must name the real problem rather than a count mismatch")
 }
 
-// TestResolveBatchEventOutboxes_AbandonsTheBatchWhenCaptureFails asserts the failure direction.
-//
-// Committing the mutation and logging the capture failure is the pre-R-2 behaviour, and it
-// produces exactly the unrecoverable gap between money moved and event published that R-2
-// exists to close. Returning the error abandons the write, so the caller sees a producer defect
-// immediately instead of losing one event per batch indefinitely.
+// TestResolveBatchEventOutboxes_AbandonsTheBatchWhenCaptureFails asserts the failure
+// direction.
 func TestResolveBatchEventOutboxes_AbandonsTheBatchWhenCaptureFails(t *testing.T) {
 	sentinel := errors.New("payload will not serialise")
 	withRegisteredCapture(t, func(_ context.Context, _ *model.Transaction, _ string) (*model.EventOutbox, error) {
@@ -316,14 +299,8 @@ func TestTransactionLedgerIDFromSet_ResolvesSourceThenDestination(t *testing.T) 
 	}
 }
 
-// TestRecordTransactionsWithBalanceSetAndOutboxes_InsertsDerivedEventsInsideTheTransaction is
-// the end-to-end proof that the derived rows land INSIDE the mutation's transaction.
-//
-// The script is deliberately minimal: no balances and no lineage outboxes exploit the
-// empty-input short circuits, so the only statements between BEGIN and COMMIT are the
-// transaction insert and the event insert. The event insert being scripted BEFORE the commit is
-// what makes "atomic with the mutation" an assertion rather than a claim — if the row were
-// written after the commit, or not at all, the outstanding expectation fails the test.
+// TestRecordTransactionsWithBalanceSetAndOutboxes_InsertsDerivedEventsInsideTheTransaction
+// is the end-to-end proof that the derived rows land INSIDE the mutation's transaction.
 func TestRecordTransactionsWithBalanceSetAndOutboxes_InsertsDerivedEventsInsideTheTransaction(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -353,10 +330,6 @@ func TestRecordTransactionsWithBalanceSetAndOutboxes_InsertsDerivedEventsInsideT
 
 // TestRecordTransactionsWithBalanceSetAndOutboxes_RollsBackWhenCaptureFails asserts the
 // mutation does not survive a capture failure.
-//
-// This is the whole point of failing rather than logging: the balances and transaction rows are
-// still uncommitted when the capture is attempted, so abandoning the write leaves nothing
-// behind. The caller retries and captures the event on the next attempt.
 func TestRecordTransactionsWithBalanceSetAndOutboxes_RollsBackWhenCaptureFails(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -400,14 +373,11 @@ func TestRegisterTransactionEventCapture_LastRegistrationWinsAndNilClears(t *tes
 	assert.Same(t, marker, row, "the most recent registration must be the one in force")
 }
 
-// TestRegisterBalanceMonitorAlertCapture_LastRegistrationWinsAndNilClears documents the same
-// semantics for the monitor alert capture, which a test relies on to restore the pre-test state.
+// TestRegisterBalanceMonitorAlertCapture_LastRegistrationWinsAndNilClears documents the
+// same semantics for the monitor alert capture, which a test relies on to restore the
+// pre-test state.
 //
-// NIL IS NOT MERELY "UNSET" HERE. Clearing this registration changes which path the atomic writers
-// take: with a capture in force they insert the canonical blnk.event_outbox row for a crossing
-// inside the mutation's transaction, and with none they commit a balance_monitor_handoff for a
-// second transaction to convert. A test that installed a capture and did not restore the previous
-// value would silently move every later test in this package onto the other path.
+// NIL IS NOT MERELY "UNSET" HERE.
 func TestRegisterBalanceMonitorAlertCapture_LastRegistrationWinsAndNilClears(t *testing.T) {
 	previous := registeredBalanceMonitorAlertCapture()
 	t.Cleanup(func() { RegisterBalanceMonitorAlertCapture(previous) })
@@ -470,12 +440,10 @@ func TestExistingEventIDs_IssuesNoQueryForAnEmptyRequest(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet(), "no statement may be issued")
 }
 
-// TestExistingEventIDs_ReturnsTheErrorRatherThanAnEmptySet pins the safe failure direction.
+// TestExistingEventIDs_ReturnsTheErrorRatherThanAnEmptySet pins the safe failure
+// direction.
 //
-// An empty set on error would read as "nothing is captured", which is harmless. Reporting the
-// error is nonetheless correct, because the CALLER is the one that decides what doubt means,
-// and it resolves doubt to "capture again" where the unique index is the backstop. Swallowing
-// the error here would take that decision away from it.
+// An empty set on error would read as "nothing is captured", which is harmless.
 func TestExistingEventIDs_ReturnsTheErrorRatherThanAnEmptySet(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}

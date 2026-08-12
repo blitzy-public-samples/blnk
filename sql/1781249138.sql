@@ -20,61 +20,23 @@
 -- were applied first, so this one takes the next slot. Ordering is otherwise irrelevant here:
 -- the two touch different tables.
 
--- Make the partition-key scope a DELIVERED scope of the subscriber access model
--- instead of a state the registry refuses to hold.
---
--- # What this supersedes
+-- Make the partition-key scope a DELIVERED scope of the subscriber access model instead
+-- of a state the registry refuses to hold.
 --
 -- sql/1781248920.sql added event_subscribers_key_scope_chk, forbidding a row from
 -- recording partition_key_prefix while it also held credential_reference, and
--- sql/1781248900.sql's column commentary describes that barrier as part of the
--- schema's contract. Both statements are superseded here. The reasoning behind them
--- was sound as far as it went and its premise is unchanged: Kafka's authorizer has
--- no message-key dimension, so a principal granted Read on a shared category topic
--- reads every record on it whatever the key. What was wrong was the conclusion.
+-- sql/1781248900.sql's column commentary describes that barrier as part of the schema's
+-- contract. Both statements are superseded here.
 --
 -- The access model this feature implements scopes a subscriber's credential by three
--- things: its authorised topics, its consumer group, and its partition-key prefix.
--- The constraint made the third one unusable — a subscriber that recorded a key scope
--- could never hold a credential, so the scope existed only on rows that could not
--- consume. That is not an implementation of the third scope; it is a refusal of it.
--- And the refusal bought nothing a reader could see: the row still recorded the
--- prefix, the registry still described the boundary, and the only thing that changed
--- was that the subscriber had no access at all.
+-- things: its authorised topics, its consumer group, and its partition-key prefix. The
+-- constraint made the third one unusable — a subscriber that recorded a key scope could
+-- never hold a credential, so the scope existed only on rows that could not consume.
 --
--- The two designs that COULD move the boundary to the broker are both closed off
--- deliberately, which is why disclosure is what is left. A resource per authorization
--- domain — a topic per key scope — contradicts the model's own first rule that there
--- are no per-tenant topics. An interposed filtering gateway is subscriber-side
--- consumer machinery, which Blnk explicitly does not build.
---
--- # What replaces it
---
--- The scope is issued, and it is DELIVERED to the one party that can apply it. The
--- credential endpoint returns it inside its enforced-access declaration, in the same
--- object as partition_key_prefix_enforced — which is false — so it is structurally
--- impossible to receive the prefix without receiving the statement that the broker
--- does not check it. model.EventSubscriber.HasKeyAccess is the rule the prefix means,
--- and EffectiveKeyScope is the pair that reports the scope together with who enforces
--- it, so no response can carry one without the other.
---
--- This is the posture the event contract already takes for duplicate suppression:
--- Kafka delivery is at-least-once, so event_id is a documented subscriber obligation
--- rather than a promise the broker keeps. A key scope is that pattern applied to
+-- This is the posture the event contract already takes for duplicate suppression: Kafka
+-- delivery is at-least-once, so event_id is a documented subscriber obligation rather
+-- than a promise the broker keeps. A key scope is that pattern applied to
 -- authorization.
---
--- # STEP 1 — drop the constraint
---
--- IF EXISTS because a database provisioned before sql/1781248920.sql ran, or one
--- restored from a dump taken before it, does not carry the constraint and must not
--- fail here.
---
--- NOTE ON WHAT IS NOT RECOVERABLE. sql/1781248920.sql's own step 1 NULLED the prefix
--- on every row that held a credential, and those values are gone. Nothing here
--- reinvents them: a prefix is a statement of intent only its author can make, and
--- guessing one would attach an authorization boundary to a subscriber that never
--- asked for it. Operators who recorded a prefix before that migration ran must record
--- it again and re-issue, which is also what hands the consumer its scope.
 ALTER TABLE blnk.event_subscribers
     DROP CONSTRAINT IF EXISTS event_subscribers_key_scope_chk;
 
@@ -104,25 +66,16 @@ COMMENT ON COLUMN blnk.event_subscribers.partition_key_prefix IS
 -- STEP 1 — repair before constraining, exactly as sql/1781248920.sql had to. Any row
 -- that now legitimately records a prefix beside a credential — which is the state this
 -- migration exists to permit, so on a live database there will be some — would fail the
--- validating scan. Clearing the PREFIX rather than the credential is the same choice
--- made there and for the same reason: the registry is left describing the access that
--- actually exists at the broker, whereas clearing credential_reference would leave it
--- reporting "registered, never provisioned" while a principal that authenticates is
--- still live, which is the dangerous direction.
+-- validating scan.
 UPDATE blnk.event_subscribers
 SET partition_key_prefix = NULL,
     updated_at           = NOW()
 WHERE partition_key_prefix IS NOT NULL
   AND credential_reference IS NOT NULL;
 
--- STEP 2 — the constraint, through a guarded DO block because PostgreSQL has no
--- ADD CONSTRAINT IF NOT EXISTS and a bare ALTER would fail the whole migration on a
+-- STEP 2 — the constraint, through a guarded DO block because PostgreSQL has no ADD
+-- CONSTRAINT IF NOT EXISTS and a bare ALTER would fail the whole migration on a
 -- database that already carries it.
---
--- The StatementBegin/StatementEnd markers are required, not decorative: sql-migrate
--- splits on semicolons and knows nothing about dollar quoting, so without them the
--- block is cut at its first internal semicolon and the migration fails with
--- "unterminated dollar-quoted string".
 -- +migrate StatementBegin
 DO $$
 BEGIN

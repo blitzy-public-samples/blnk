@@ -22,9 +22,8 @@ spec:
       # role: pod` rather than static DNS names, because the server and worker are
       # autoscaled between 2 and 10 replicas and a Service target load-balances — a
       # static `server:5001` reaches one arbitrary pod per scrape, so per-process
-      # counters appear to reset and the other replicas' backlogs have no series at
-      # all. Pod discovery is therefore correct here. But it means Prometheus CALLS
-      # THE KUBERNETES API, and to call it the pod needs an identity and a token.
+      # counters appear to reset and the other replicas' backlogs have no series at all.
+      # Pod discovery is therefore correct here.
       #
       # BOTH LINES BELOW ARE REQUIRED, AND EACH FAILS DIFFERENTLY.
       #
@@ -36,24 +35,6 @@ spec:
       #   /var/run/secrets/kubernetes.io/serviceaccount/token at all, and Prometheus
       #   logs `Cannot create service discovery … no such file or directory` once at
       #   startup and then serves normally with zero targets.
-      #
-      # Either way the pod is 1/1 Running, /-/ready is green, /api/v1/rules lists
-      # every rule, and /api/v1/targets is EMPTY — so no series is ever recorded and
-      # every rule in blnk-kafka-alerts.yml sits permanently unable to fire, including
-      # the dead-letter-age and consumer-lag rules that acceptance criterion V-4 names.
-      # An absent alert is indistinguishable from a healthy system, which is why this
-      # is stated at length rather than left to be inferred: the deployment looks
-      # correct and collects nothing.
-      #
-      # Verify at /api/v1/targets after any change here — `activeTargets` must be
-      # non-empty — never at /-/ready. docs/kafka-operations.md carries the command.
-      #
-      # This is the one workload in this folder that mounts a token. server-deployment
-      # .yaml and worker-deployment.yaml keep `automountServiceAccountToken: false`
-      # because neither calls the Kubernetes API, and the token is exactly what should
-      # not be sitting in the filesystem of the process most exposed to the network.
-      # Widening discovery beyond this namespace means widening the Role to a
-      # ClusterRole in the same change, or discovery fails silently again.
       serviceAccountName: prometheus
       automountServiceAccountToken: true
       # The prom/prometheus image already runs as nobody (65534), which the
@@ -76,9 +57,6 @@ spec:
         # some Prometheus 2 configuration outright, which is exactly the breakage a
         # floating tag introduces silently — and a Prometheus that fails to load its
         # rules alerts on nothing, which looks identical to a healthy system.
-        #
-        # Re-pin the tag and the digest together, and re-run `promtool check rules`
-        # when you do.
         - image: prom/prometheus:v3.13.2@sha256:1147c92841726a6fef55fe6124491d6f85480f8de204f7d420304ca5bbd0a8f7
           name: prometheus
           ports:
@@ -139,47 +117,31 @@ spec:
             - name: prometheus-config
               mountPath: /etc/prometheus/prometheus.yml
               subPath: prometheus.yml
-            # Projects the ConfigMap's blnk-kafka-alerts.yml key into the
-            # directory the rule_files glob scans, /etc/prometheus/alerts/*.yml,
-            # which is what actually loads all 13 Kafka alerts. A second
-            # subPath mount on the SAME volume keeps the scrape-config mount
-            # above untouched. subPath must equal the ConfigMap data key and
-            # mountPath must fall inside that glob: a mismatch loads no rules
-            # and raises no error, surfacing only as an empty /api/v1/rules.
+            # Projects the ConfigMap's blnk-kafka-alerts.yml key into the directory the
+            # rule_files glob scans, /etc/prometheus/alerts/*.yml, which is what
+            # actually loads all 13 Kafka alerts. A second subPath mount on the SAME
+            # volume keeps the scrape-config mount above untouched. subPath must equal
+            # the ConfigMap data key and mountPath must fall inside that glob: a
+            # mismatch loads no rules and raises no error, surfacing only as an empty
+            # /api/v1/rules.
             - name: prometheus-config
               mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
               subPath: blnk-kafka-alerts.yml
-            # The Kubernetes-only infrastructure rules (PERF-P24), which live
-            # in a key of their own precisely because they are NOT part of the
-            # mirrored file above — they read kubelet_volume_stats_*, which
-            # has no equivalent in the Compose stack. A third subPath mount on
-            # the same volume, into the same directory the rule_files glob
-            # scans, so both rule files load. Same failure mode as the mount
-            # above if the two names disagree: no rules, no error, and an
+            # The Kubernetes-only infrastructure rules, which live in a key of their own
+            # precisely because they are NOT part of the mirrored file above — they read
+            # kubelet_volume_stats_*, which has no equivalent in the Compose stack. A
+            # third subPath mount on the same volume, into the same directory the
+            # rule_files glob scans, so both rule files load. Same failure mode as the
+            # mount above if the two names disagree: no rules, no error, and an
             # /api/v1/rules that is simply short.
             - name: prometheus-config
               mountPath: /etc/prometheus/alerts/blnk-infra-alerts.yml
               subPath: blnk-infra-alerts.yml
-            # The metrics bearer token both scrape jobs authenticate with.
-            # Without it Prometheus scrapes an endpoint that answers every
-            # unauthenticated request with an error, so no series is collected
-            # and none of the 13 Kafka alerts can ever fire — a failure that looks
-            # exactly like health, because an absent alert and a healthy system
-            # are indistinguishable.
-            #
-            # A DIRECTORY mount, not a subPath one, and the difference matters:
-            # a subPath mount is resolved once at container start and does NOT
-            # track later updates to the Secret, whereas a directory mount is
-            # refreshed by the kubelet. Prometheus re-reads credentials_file on
-            # each scrape, so with this mount a rotated token takes effect
-            # without restarting the pod; with a subPath it would keep
-            # presenting the old one until someone noticed the targets had gone
-            # down. Nothing else lives in this directory, so a whole-directory
-            # mount shadows nothing.
-            #
-            # readOnly because Prometheus only ever reads it, and a credential
-            # that cannot be written cannot be corrupted by the process holding
-            # it.
+            # The metrics bearer token both scrape jobs authenticate with. Without it
+            # Prometheus scrapes an endpoint that answers every unauthenticated request
+            # with an error, so no series is collected and none of the 13 Kafka alerts
+            # can ever fire — a failure that looks exactly like health, because an
+            # absent alert and a healthy system are indistinguishable.
             - name: metrics-bearer-token
               mountPath: /etc/prometheus/secrets
               readOnly: true
@@ -190,40 +152,9 @@ spec:
         - name: prometheus-config
           configMap:
             name: prometheus-config
-        # Secret, never ConfigMap. The token is a credential: a ConfigMap is
-        # stored unencrypted, is readable by anything holding get-configmap in
-        # the namespace, and is printed in full by `kubectl describe`.
-        #
-        # The Secret is NOT part of this manifest set, deliberately. A committed
-        # Secret manifest either carries a real token in the repository or
-        # carries a placeholder that silently authenticates as nothing, and both
-        # are worse than requiring one command.
-        #
-        # THE TOKEN IS PASSED BY FILE, NOT ON THE COMMAND LINE.
-        # `--from-literal=metrics-bearer-token=$TOKEN` places the credential in
-        # kubectl's argv, where /proc/<pid>/cmdline exposes it to anything in the
-        # same namespace for the life of the process, and where shell history and CI
-        # job logs capture it verbatim. `--from-file` puts only the PATH in argv:
-        #
-        #   umask 077
-        #   printf '%s' "$BLNK_METRICS_BEARER_TOKEN" > ./metrics-bearer-token
-        #   kubectl -n blnk create secret generic blnk-metrics-token \
-        #     --from-file=metrics-bearer-token=./metrics-bearer-token
-        #   shred -u ./metrics-bearer-token
-        #
-        # printf rather than echo: echo appends a newline, the newline becomes part
-        # of the secret value, and the bearer token then fails to match. A token that
-        # works when pasted by hand and fails from the pod is almost always this.
-        #
-        # Where a secret manager is available, an ExternalSecret or a CSI
-        # SecretProviderClass is better still — the value never reaches argv OR the
-        # local filesystem.
-        #
-        # It is REQUIRED rather than optional: with the Secret absent the pod
-        # stays in ContainerCreating with a clear event naming it, instead of
-        # starting and scraping nothing. Failing loudly is the whole point — the
-        # defect this replaces was a monitoring stack that came up green while
-        # collecting no metrics.
+        # Secret, never ConfigMap. The token is a credential: a ConfigMap is stored
+        # unencrypted, is readable by anything holding get-configmap in the namespace,
+        # and is printed in full by `kubectl describe`.
         - name: metrics-bearer-token
           secret:
             secretName: blnk-metrics-token
@@ -236,10 +167,9 @@ spec:
               - key: metrics-bearer-token
                 path: metrics-bearer-token
             # 0444, not 0400. Secret volume files are owned by root, and the
-            # prom/prometheus image runs as nobody (65534) — under 0400 the
-            # process could not read its own credential, and Prometheus would
-            # crash-loop on a permission error that reads like a missing file.
-            # 0444 is safe here because the volume exists only inside this pod's
-            # mount namespace; the token is not exposed to anything that could
-            # not already read the Secret.
+            # prom/prometheus image runs as nobody (65534) — under 0400 the process
+            # could not read its own credential, and Prometheus would crash-loop on a
+            # permission error that reads like a missing file. 0444 is safe here because
+            # the volume exists only inside this pod's mount namespace; the token is not
+            # exposed to anything that could not already read the Secret.
             defaultMode: 0444

@@ -15,19 +15,13 @@ limitations under the License.
 */
 package blnk
 
-// This file covers the two controls that keep the legacy HTTP transport from being turned
-// against Blnk's own network, and the control that stops it delivering after its own
-// retirement:
+// This file covers the two controls that keep the legacy HTTP transport from being
+// turned against Blnk's own network, and the control that stops it delivering after its
+// own retirement:
 //
-//   - SSRF-01: the redirect refusal, the resolved-address guard, the scheme requirement and
-//     the protocol-owned-header protection.
+// - the redirect refusal, the resolved-address guard, the scheme requirement and the
+//   protocol-owned-header protection.
 //   - Q4-09: the execution-time sunset gate in ProcessWebhook.
-//
-// The distinction that matters throughout is between what is CONFIGURED and what is
-// REACHED. Several tests below configure a destination that passes every text check and then
-// prove the delivery is still refused, because the address it resolves or redirects to is one
-// Blnk must not reach. A test that only checked configured URLs would pass against a
-// transport with no guard at all.
 
 import (
 	"context"
@@ -62,8 +56,8 @@ import (
 // destinationTestPayload is a well-formed legacy webhook body.
 //
 // Well-formed matters: ProcessWebhook unmarshals to validate before delivering, so a
-// malformed body would fail for the wrong reason and a destination test would prove nothing
-// about destinations.
+// malformed body would fail for the wrong reason and a destination test would prove
+// nothing about destinations.
 func destinationTestPayload(t *testing.T) []byte {
 	t.Helper()
 
@@ -76,12 +70,8 @@ func destinationTestPayload(t *testing.T) []byte {
 	return body
 }
 
-// storeDestinationConfig publishes a configuration with the given URL and assertion, and
-// restores whatever was published before.
-//
-// Restoration is through t.Cleanup rather than a defer because several tests below use
-// subtests, and a defer in the parent would run after the children have already observed the
-// mutated store.
+// storeDestinationConfig publishes a configuration with the given URL and assertion,
+// and restores whatever was published before.
 func storeDestinationConfig(t *testing.T, url string, allowPrivate bool) *config.Configuration {
 	t.Helper()
 
@@ -119,15 +109,11 @@ func storeDestinationConfig(t *testing.T, url string, allowPrivate bool) *config
 // The redirect refusal
 // ---------------------------------------------------------------------------
 
-// TestLegacyWebhookClient_RefusesToFollowARedirect is the primary CWE-918 proof, and it is
-// built the only way that proves anything: with a real second listener that records whether
-// it was reached.
+// TestLegacyWebhookClient_RefusesToFollowARedirect is the primary CWE-918 proof, and it
+// is built the only way that proves anything: with a real second listener that records
+// whether it was reached.
 //
-// Two servers. The first is the configured subscriber and answers 307 — the status that
-// PRESERVES the method and body, so a client that followed it would repost the signed ledger
-// payload. The second stands in for the internal service an attacker is aiming at. The
-// assertion is not merely that an error came back; it is that the second server's counter is
-// still zero. An error with a delivered payload would be a leak with a tidy log line.
+// Two servers.
 func TestLegacyWebhookClient_RefusesToFollowARedirect(t *testing.T) {
 	var internalHits int
 	var mu sync.Mutex
@@ -179,13 +165,10 @@ func TestLegacyWebhookClient_RefusesToFollowARedirect(t *testing.T) {
 	}
 }
 
-// TestLegacyWebhookClient_RedirectRefusalIsNotConfigurable pins that no assertion re-enables
-// following redirects.
+// TestLegacyWebhookClient_RedirectRefusalIsNotConfigurable pins that no assertion
+// re-enables following redirects.
 //
-// AllowPrivateDestination opens loopback and http. If it also opened redirects — by being
-// consulted in CheckRedirect, or by a future author reading it as a general "trust this
-// destination" flag — the control would be off in exactly the deployments most likely to set
-// it. Asserting both settings is what keeps the two concerns separate.
+// AllowPrivateDestination opens loopback and http.
 func TestLegacyWebhookClient_RedirectRefusalIsNotConfigurable(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -246,13 +229,8 @@ func TestRefuseLegacyWebhookRedirect_ReportsTheTargetWithoutThePath(t *testing.T
 // The resolved-address guard
 // ---------------------------------------------------------------------------
 
-// TestGuardLegacyWebhookDial_JudgesTheAddressAboutToBeConnectedTo covers the hook directly.
-//
-// Calling it directly rather than through a dial is deliberate: the addresses that matter
-// most — the metadata endpoint, multicast, the unspecified address — cannot be dialled in a
-// test without either reaching something real or hanging. The hook is the whole decision, so
-// exercising it directly loses nothing, and TestLegacyWebhookClient_RefusesARebindingHost
-// below proves it is actually installed on the client.
+// TestGuardLegacyWebhookDial_JudgesTheAddressAboutToBeConnectedTo covers the hook
+// directly.
 func TestGuardLegacyWebhookDial_JudgesTheAddressAboutToBeConnectedTo(t *testing.T) {
 	t.Run("refused with no operator assertion", func(t *testing.T) {
 		storeDestinationConfig(t, "https://hooks.example.com/blnk", false)
@@ -345,17 +323,11 @@ func TestGuardLegacyWebhookDial_JudgesTheAddressAboutToBeConnectedTo(t *testing.
 	})
 }
 
-// TestLegacyWebhookClient_RefusesARebindingHost is the DNS-rebinding proof, and the reason
-// the guard lives in the dialer rather than in a URL check.
+// TestLegacyWebhookClient_RefusesARebindingHost is the DNS-rebinding proof, and the
+// reason the guard lives in the dialer rather than in a URL check.
 //
 // The configured URL is a perfectly ordinary public-looking name that passes every text
-// check. Its resolution is what is hostile. Resolving the name to 127.0.0.1 through the
-// dialer's own Resolver reproduces exactly that: the text never changes and the answer is
-// internal.
-//
-// It also proves the hook is INSTALLED. Every other guard test calls
-// guardLegacyWebhookDial directly, which would keep passing if initializeHTTPClient stopped
-// wiring it up.
+// check.
 func TestLegacyWebhookClient_RefusesARebindingHost(t *testing.T) {
 	var reached int
 	var mu sync.Mutex
@@ -377,9 +349,9 @@ func TestLegacyWebhookClient_RefusesARebindingHost(t *testing.T) {
 
 	client := initializeHTTPClient()
 
-	// The client's own transport is kept — only name resolution is redirected, which is what a
-	// rebinding attack does. Reaching into the transport rather than replacing it is what keeps
-	// guardLegacyWebhookDial on the path.
+	// The client's own transport is kept — only name resolution is redirected, which is
+	// what a rebinding attack does. Reaching into the transport rather than replacing it
+	// is what keeps guardLegacyWebhookDial on the path.
 	transport, ok := client.Transport.(*http.Transport)
 	require.True(t, ok, "the transport must stay a *http.Transport")
 
@@ -490,10 +462,7 @@ func TestValidateLegacyWebhookDestination_RefusesSchemesAndInternalHosts(t *test
 // TestProcessHTTPRaw_RejudgesTheDestinationOnEveryDelivery pins that the check is not a
 // one-time admission check.
 //
-// A task is enqueued, then the destination becomes unacceptable, then the task runs. That is
-// an ordinary sequence — configuration is reloadable and the queue has depth — and the
-// delivery must be refused at the moment it happens rather than permitted because it was
-// acceptable when it was queued.
+// A task is enqueued, then the destination becomes unacceptable, then the task runs.
 func TestProcessHTTPRaw_RejudgesTheDestinationOnEveryDelivery(t *testing.T) {
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
@@ -520,13 +489,10 @@ func TestProcessHTTPRaw_RejudgesTheDestinationOnEveryDelivery(t *testing.T) {
 // Protocol-owned headers
 // ---------------------------------------------------------------------------
 
-// TestProcessHTTPRaw_ConfiguredHeadersCannotShadowTheSignature is an integrity assertion, not
-// a tidiness one.
+// TestProcessHTTPRaw_ConfiguredHeadersCannotShadowTheSignature is an integrity
+// assertion, not a tidiness one.
 //
-// Configured headers are applied after the signature. Before they were filtered, a header
-// named X-Blnk-Signature replaced the real HMAC with a constant — which every
-// signature-verifying subscriber would reject, and every subscriber that merely checks the
-// header is present would accept forever, including for a forged body.
+// Configured headers are applied after the signature.
 func TestProcessHTTPRaw_ConfiguredHeadersCannotShadowTheSignature(t *testing.T) {
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
@@ -567,12 +533,7 @@ func TestProcessHTTPRaw_ConfiguredHeadersCannotShadowTheSignature(t *testing.T) 
 
 // sunsetGateHarness is a real asynq worker running the real handler.
 //
-// Nothing here is a stand-in for the worker role. The task is enqueued through the real
-// client, routed by a mux registered exactly as initializeWebhookTaskHandlers registers it,
-// and executed by a real asynq.Server on its own miniredis. That is what makes the
-// post-sunset assertion meaningful: the claim is not "the handler returns nil" but "a task
-// already sitting in the queue when the sunset arrives never reaches the subscriber, and
-// drains instead of accumulating in the retry set".
+// Nothing here is a stand-in for the worker role.
 type sunsetGateHarness struct {
 	blnk      *Blnk
 	inspector *asynq.Inspector
@@ -641,8 +602,8 @@ func newSunsetGateHarness(t *testing.T, sunset, now time.Time) *sunsetGateHarnes
 		asynqClient: asynqClient,
 		httpClient:  initializeHTTPClient(),
 		// The handler's clock. Only the clock is injectable — WebhookSunsetPassed remains the
-		// one decision point, so this cannot make the handler and the relay disagree about the
-		// RULE, only about the hour.
+		// one decision point, so this cannot make the handler and the relay disagree about
+		// the RULE, only about the hour.
 		legacyWebhookNow: func() time.Time { return now },
 	}
 
@@ -728,20 +689,23 @@ func TestProcessWebhook_DeliversWhileTheWindowIsOpen(t *testing.T) {
 
 // TestProcessWebhook_DropsAQueuedTaskOnceTheSunsetHasPassed is the Q4-09 proof.
 //
-// The task is enqueued and the worker executes it with the sunset already behind it — the
-// exact shape of the defect: a task that was legitimately queued before the boundary and
-// executed after it. Three things are asserted, and all three are necessary:
+// The task is enqueued and the worker executes it with the sunset already behind it —
+// the exact shape of the defect: a task that was legitimately queued before the
+// boundary and executed after it. Three things are asserted, and all three are
+// necessary:
 //
-//  1. NO DELIVERY. The subscriber received nothing. Without this the gate does not exist.
-//  2. NO RETRY, NO ARCHIVE. The queue drained. A gate that returned an error would send the
-//     task through its whole backoff schedule and then archive it, reporting a policy
-//     decision as an incident and leaving a post-sunset deployment with a growing archive.
+//  1. NO DELIVERY. The subscriber received nothing. Without this the gate does not
+//     exist.
+//  2. NO RETRY, NO ARCHIVE. The queue drained. A gate that returned an error would send
+//     the task through its whole backoff schedule and then archive it, reporting a
+//     policy decision as an incident and leaving a post-sunset deployment with a
+//     growing archive.
 //  3. THE TASK IS GONE. Retirement means the obligation is closed, not deferred.
 func TestProcessWebhook_DropsAQueuedTaskOnceTheSunsetHasPassed(t *testing.T) {
 	now := time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
-	// One nanosecond past. The sunset instant is the first moment of the post-sunset era, so
-	// the boundary is where a mistake would hide; a generous offset would pass even if the
-	// comparison were inclusive by accident.
+	// One nanosecond past. The sunset instant is the first moment of the post-sunset era,
+	// so the boundary is where a mistake would hide; a generous offset would pass even if
+	// the comparison were inclusive by accident.
 	harness := newSunsetGateHarness(t, now.Add(-time.Nanosecond), now)
 
 	harness.enqueue(t)
@@ -760,14 +724,8 @@ func TestProcessWebhook_DropsAQueuedTaskOnceTheSunsetHasPassed(t *testing.T) {
 	assert.Zero(t, info.Pending, "the queue drains, which is what retirement means")
 }
 
-// TestProcessWebhook_SunsetVerdictIsTheSharedDecisionPoint pins that the handler reads the
-// same predicate as everything else, rather than a comparison of its own.
-//
-// Two independent readings of the sunset can disagree — one stops dual-writing while the
-// other keeps delivering — and that disagreement is invisible until a subscriber reports
-// receiving a webhook from a deployment that has already retired webhooks. Asserting the
-// handler's behaviour against WebhookSunsetPassed for the same configuration and clock is
-// what forecloses it.
+// TestProcessWebhook_SunsetVerdictIsTheSharedDecisionPoint pins that the handler reads
+// the same predicate as everything else, rather than a comparison of its own.
 func TestProcessWebhook_SunsetVerdictIsTheSharedDecisionPoint(t *testing.T) {
 	now := time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
 
@@ -798,13 +756,11 @@ func TestProcessWebhook_SunsetVerdictIsTheSharedDecisionPoint(t *testing.T) {
 	}
 }
 
-// TestProcessWebhook_EnqueueTimeCheckIsNotEnoughOnItsOwn states the gap the handler gate
-// closes, as an executable claim rather than a comment.
+// TestProcessWebhook_EnqueueTimeCheckIsNotEnoughOnItsOwn states the gap the handler
+// gate closes, as an executable claim rather than a comment.
 //
-// The task is enqueued while the window is open — the relay's own check passes, and the task
-// is accepted onto the queue. The sunset then arrives before the worker gets to it. Only an
-// execution-time gate can refuse this delivery, because at enqueue time there was nothing to
-// refuse.
+// The task is enqueued while the window is open — the relay's own check passes, and the
+// task is accepted onto the queue.
 func TestProcessWebhook_EnqueueTimeCheckIsNotEnoughOnItsOwn(t *testing.T) {
 	now := time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
 
@@ -814,9 +770,9 @@ func TestProcessWebhook_EnqueueTimeCheckIsNotEnoughOnItsOwn(t *testing.T) {
 		"the enqueue must happen inside the window, or this test is not about the gap")
 
 	// The queue is PAUSED for the enqueue. That is what makes "the task sat in the queue
-	// across the boundary" a controlled fact rather than a race with a live worker: without
-	// it the worker can consume the task before the assertion below runs, and the test
-	// becomes flaky in exactly the direction that hides the defect.
+	// across the boundary" a controlled fact rather than a race with a live worker:
+	// without it the worker can consume the task before the assertion below runs, and the
+	// test becomes flaky in exactly the direction that hides the defect.
 	require.NoError(t, harness.inspector.PauseQueue(harness.queueName))
 
 	eventID := harness.enqueue(t)
@@ -826,9 +782,7 @@ func TestProcessWebhook_EnqueueTimeCheckIsNotEnoughOnItsOwn(t *testing.T) {
 	require.Len(t, tasks, 1, "the task was legitimately accepted onto the queue")
 	require.Equal(t, legacyWebhookTaskID(eventID), tasks[0].ID)
 
-	// Time passes, and the sunset arrives while the task is still queued. Advancing the
-	// HANDLER's clock is exactly that: the queue is unchanged, and only the moment of
-	// execution has moved.
+	// Time passes, and the sunset arrives while the task is still queued.
 	harness.blnk.legacyWebhookNow = func() time.Time { return now.Add(48 * time.Hour) }
 
 	// The worker is let loose only now, so the task it picks up is one that was accepted
@@ -842,11 +796,11 @@ func TestProcessWebhook_EnqueueTimeCheckIsNotEnoughOnItsOwn(t *testing.T) {
 			"the enqueue-time check had nothing to refuse when it ran")
 }
 
-// TestRetiredLegacyWebhookLogFields_ReportsWhatItKnowsAndOmitsWhatItDoesNot pins that the
-// drop can always be logged.
+// TestRetiredLegacyWebhookLogFields_ReportsWhatItKnowsAndOmitsWhatItDoesNot pins that
+// the drop can always be logged.
 //
-// A drop that panicked or was skipped because the task's identity was unavailable would make
-// a post-sunset deployment unable to account for what it retired.
+// A drop that panicked or was skipped because the task's identity was unavailable would
+// make a post-sunset deployment unable to account for what it retired.
 func TestRetiredLegacyWebhookLogFields_ReportsWhatItKnowsAndOmitsWhatItDoesNot(t *testing.T) {
 	fields := retiredLegacyWebhookLogFields(context.Background())
 
@@ -866,9 +820,7 @@ func TestRetiredLegacyWebhookLogFields_ReportsWhatItKnowsAndOmitsWhatItDoesNot(t
 
 // TestGuardsHoldForEveryDeliveryEntryPoint pins that both entry points are guarded.
 //
-// processHTTP is the struct-shaped wrapper and processHTTPRaw is the primitive. A guard added
-// to one and not the other would leave a live path to the socket, and the wrapper is the one
-// existing callers use.
+// processHTTP is the struct-shaped wrapper and processHTTPRaw is the primitive.
 func TestGuardsHoldForEveryDeliveryEntryPoint(t *testing.T) {
 	storeDestinationConfig(t, "https://169.254.169.254/latest/meta-data/", true)
 
@@ -893,15 +845,9 @@ func TestGuardsHoldForEveryDeliveryEntryPoint(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver is the delivery half of the
-// at-least-once contract: the transport is at-least-once with a bounded suppression window, so
-// the receiver has to be able to deduplicate, and until this header existed it had nothing to
-// deduplicate on.
-//
-// The body cannot carry it. It is the FROZEN legacy envelope — `{"event":…,"data":…}` — whose
-// bytes are asserted equal to the bytes published to Kafka, and two deliveries of one event are
-// byte-identical, so hashing the body cannot tell a duplicate from a legitimately repeated
-// event. A header is the only place the identity fits without breaking the payload-preservation
-// guarantee in the migration's final week.
+// at-least-once contract: the transport is at-least-once with a bounded suppression
+// window, so the receiver has to be able to deduplicate, and until this header existed
+// it had nothing to deduplicate on.
 func TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver(t *testing.T) {
 	const eventID = "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c"
 
@@ -922,9 +868,9 @@ func TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver(t *testing.T) {
 				"deduplicates on, so a migrating subscriber keeps one idempotency key rather than two")
 
 		// THE BODY IS BYTE-IDENTICAL. This is the assertion that makes the header safe: the
-		// payload-preservation guarantee is that a subscriber's existing parser works unchanged
-		// and that these bytes equal the bytes on the Kafka topic, and a member added to the
-		// envelope would break both.
+		// payload-preservation guarantee is that a subscriber's existing parser works
+		// unchanged and that these bytes equal the bytes on the Kafka topic, and a member
+		// added to the envelope would break both.
 		assert.Equal(t, payload, requests[0].body,
 			"adding the identity must not disturb a single byte of the body")
 	})
@@ -949,8 +895,9 @@ func TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver(t *testing.T) {
 
 		// Recomputed exactly as a receiver does — over timestamp + "." + body, with no header
 		// material. The identity is therefore NOT signed, which is a property to state rather
-		// than to leave implicit: it is a correlation and deduplication key, and the signature
-		// over the body remains the only evidence the delivery came from this deployment.
+		// than to leave implicit: it is a correlation and deduplication key, and the
+		// signature over the body remains the only evidence the delivery came from this
+		// deployment.
 		mac := hmac.New(sha256.New, []byte("destination-test-signing-secret"))
 		_, err := mac.Write([]byte(timestamp + "." + string(requests[0].body)))
 		require.NoError(t, err)
@@ -1009,25 +956,21 @@ func TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver(t *testing.T) {
 		requests := received()
 		require.Len(t, requests, 1)
 
-		// The transport owns this header for the same reason it owns the signature: a receiver
-		// deduplicating on it must be able to trust it. A configured constant would collapse
-		// every event onto one identity, and the receiver would discard all but the first.
+		// The transport owns this header for the same reason it owns the signature: a
+		// receiver deduplicating on it must be able to trust it. A configured constant would
+		// collapse every event onto one identity, and the receiver would discard all but the
+		// first.
 		assert.Equal(t, eventID, requests[0].headers.Get(LegacyWebhookEventIDHeader),
 			"a configured value must not replace the identity the transport computed")
 		assert.NotEqual(t, "forged-identity", requests[0].headers.Get(LegacyWebhookEventIDHeader))
 	})
 }
 
-// TestLegacyWebhookEventIDFromContext_YieldsNothingWithoutARelayTaskIdentity covers the read
-// side of the arrangement that gets the identity to the delivery.
+// TestLegacyWebhookEventIDFromContext_YieldsNothingWithoutARelayTaskIdentity covers the
+// read side of the arrangement that gets the identity to the delivery.
 //
-// The identity travels as the asynq TASK ID, because the body is frozen and carries none. Only
-// the negative half is reachable from a test: asynq builds the handler context inside an
-// internal package with no exported constructor, so a context carrying a task ID cannot be
-// constructed outside the library. The positive half is therefore asserted where it can be —
-// the namespace round trip in TestLegacyWebhookEventID_IsTheExactInverseOfTheTaskIdentity, the
-// header behaviour in the test above, and the WIRING in
-// TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery.
+// The identity travels as the asynq TASK ID, because the body is frozen and carries
+// none.
 func TestLegacyWebhookEventIDFromContext_YieldsNothingWithoutARelayTaskIdentity(t *testing.T) {
 	//nolint:staticcheck // a nil context is exactly the case being asserted
 	assert.Empty(t, legacyWebhookEventIDFromContext(nil),
@@ -1039,15 +982,8 @@ func TestLegacyWebhookEventIDFromContext_YieldsNothingWithoutARelayTaskIdentity(
 			"omits the header rather than sending a fabricated one")
 }
 
-// TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery asserts the WIRING, because no
-// test can assert it by running it.
-//
-// asynq's handler context is built by an internal package with no exported constructor, so a
-// test cannot produce a context carrying a task ID and cannot observe the header on the path
-// production actually takes. The pieces are each covered — the namespace round trip, the
-// context accessor, and the header behaviour given an identity — and this is what proves they
-// are connected. Without it, ProcessWebhook could pass the empty string forever and every other
-// test in this file would still pass.
+// TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery asserts the WIRING,
+// because no test can assert it by running it.
 func TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery(t *testing.T) {
 	source, err := os.ReadFile(filepath.Join(moduleRootDir(t), "webhooks.go"))
 	require.NoError(t, err, "webhooks.go must be readable to assert its wiring")

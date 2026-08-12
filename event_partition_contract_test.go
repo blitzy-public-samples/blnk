@@ -28,36 +28,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The partition-key contract, asserted from the PRODUCTION CALL SITES against the PUBLISHED
-// DOCUMENTATION.
-//
-// # Why this file exists (finding F-04)
-//
-// Requirement R-6 partitions by ledger id, and production does: every producer that performs a
-// ledger-scoped mutation passes WithEventLedgerID, which overrides both the recorded ledger and
-// the partition key. The subscriber-facing documentation said something else — that a transaction
-// is keyed on its SOURCE BALANCE — and that is not a cosmetic error. The partition key IS the
-// ordering and parallelism contract a consumer designs around: a subscriber told it would see
-// per-balance ordering, sizing its consumer group against a balance-count fan-out, gets
-// per-ledger ordering through however few partitions its ledgers hash to.
-//
-// The two statements cannot be kept in step by review alone, because nothing links them. This
-// file links them: it derives the key from the production producers and asserts the documentation
-// says the same thing, so a change to either without the other fails here.
-//
-// # Why the key is derived rather than restated
-//
-// A test that hard-coded "the key is the ledger" would pass against a producer that stopped
-// supplying the option, because it would only be checking its own literal. Every case below
-// therefore runs the real preparation path — l.PrepareEventOutbox through the real
-// eventPartitionKey and the real option application — and reads PartitionKey off the row that
-// would have been inserted.
+// The partition-key contract, asserted from the PRODUCTION CALL SITES against the
+// PUBLISHED DOCUMENTATION.
 
 // partitionContractBlnk returns an instance wired for event preparation only.
 //
-// Preparation performs NO I/O: it marshals the payload, derives the key and returns a row. So a
-// configuration and nothing else is sufficient, and deliberately so — a datasource here would
-// let a test accidentally assert something about persistence instead of about the key.
+// Preparation performs NO I/O: it marshals the payload, derives the key and returns a
+// row.
 func partitionContractBlnk(t *testing.T) *Blnk {
 	t.Helper()
 
@@ -75,13 +52,11 @@ func preparedKey(t *testing.T, instance *Blnk, event NewWebhook, options ...Even
 	return row.PartitionKey
 }
 
-// TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger asserts the key every production
-// producer actually produces, one event family at a time.
+// TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger asserts the key every
+// production producer actually produces, one event family at a time.
 //
-// The three families that CANNOT be keyed on a ledger are asserted too, because "the ledger
-// wherever a ledger exists" is only a contract if the exceptions are enumerated. An
-// unenumerated exception is how a consumer ends up designing around a rule that silently does
-// not hold for one of its topics.
+// The three families that CANNOT be keyed on a ledger are asserted too, because "the
+// ledger wherever a ledger exists" is only a contract if the exceptions are enumerated.
 func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 	instance := partitionContractBlnk(t)
 
@@ -108,8 +83,8 @@ func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 
 	t.Run("a transaction with no ledger anywhere falls back to its balances", func(t *testing.T) {
 		// The rejection path: RejectTransaction persists with no balances loaded, so
-		// transactionLedgerID yields nothing and WithEventLedgerID ignores the blank value. The
-		// documented fallback chain is what keeps the event keyed at all.
+		// transactionLedgerID yields nothing and WithEventLedgerID ignores the blank value.
+		// The documented fallback chain is what keeps the event keyed at all.
 		key := preparedKey(t, instance, NewWebhook{
 			Event:   model.EventTypeTransactionRejected,
 			Payload: &model.Transaction{TransactionID: "txn_f04_rejected", Source: "bln_source_reject", Destination: "bln_dest_reject", PreciseAmount: big.NewInt(1), CreatedAt: time.Now().UTC()},
@@ -132,8 +107,8 @@ func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 	t.Run("a balance monitor alert keys on the ledger of the monitored balance", func(t *testing.T) {
 		// model.BalanceMonitor carries a balance and a condition and NO ledger, so this key
 		// exists only because both producer sites — the atomic
-		// prepareBalanceMonitorEventOutboxes and the checkBalanceMonitors fallback — supply it
-		// from the balance they hold.
+		// prepareBalanceMonitorEventOutboxes and the checkBalanceMonitors fallback — supply
+		// it from the balance they hold.
 		key := preparedKey(t, instance, NewWebhook{
 			Event:   model.EventTypeBalanceMonitor,
 			Payload: model.BalanceMonitor{MonitorID: "mon_f04", BalanceID: "bln_monitored_f04"},
@@ -189,11 +164,11 @@ func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 	})
 }
 
-// docMustState asserts a document contains a phrase WITHOUT dumping the document on failure.
+// docMustState asserts a document contains a phrase WITHOUT dumping the document on
+// failure.
 //
-// testify's Contains prints both operands, and these documents are tens of kilobytes; a single
-// failed assertion would bury the CI log and the reason for the failure with it. The phrase and
-// the reason are what a reader needs, so those are what is printed.
+// testify's Contains prints both operands, and these documents are tens of kilobytes; a
+// single failed assertion would bury the CI log and the reason for the failure with it.
 func docMustState(t *testing.T, document, name, phrase, why string) {
 	t.Helper()
 
@@ -215,13 +190,11 @@ func docMustNotState(t *testing.T, document, name, phrase, why string) {
 	t.Errorf("%s must NOT state %q.\n%s", name, phrase, why)
 }
 
-// TestPartitionKeyContract_DocumentationMatchesTheProducers is the link that makes the section
-// above a contract rather than two independent descriptions.
+// TestPartitionKeyContract_DocumentationMatchesTheProducers is the link that makes the
+// section above a contract rather than two independent descriptions.
 //
-// It asserts on the SUBSCRIBER-FACING documents, because they are what a consumer designs
-// against. A source comment that disagreed with the code would be a maintenance problem; a
-// PUBLISHED document that disagrees with the code is a broken promise to somebody who cannot
-// read the code.
+// It asserts on the SUBSCRIBER-FACING documents, because they are what a consumer
+// designs against.
 func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
 	streaming := readRepoFile(t, "docs/event-streaming.md")
 
@@ -232,7 +205,7 @@ func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
 	})
 
 	t.Run("it does not promise per-balance transaction keying", func(t *testing.T) {
-		// The exact claim F-04 found. It is asserted as an ABSENCE because the sentence could
+		// The exact claim at issue. It is asserted as an ABSENCE because the sentence could
 		// come back in any number of rewordings, and the one thing every wording shares is
 		// telling a subscriber that a transaction is keyed on a balance.
 		forbidden := []string{
@@ -250,8 +223,8 @@ func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
 
 	t.Run("every non-ledger exception is enumerated", func(t *testing.T) {
 		// The three event families that genuinely cannot be keyed on a ledger. Each must be
-		// named, because an unenumerated exception is worse than none: a subscriber applies the
-		// general rule and is silently wrong for one topic.
+		// named, because an unenumerated exception is worse than none: a subscriber applies
+		// the general rule and is silently wrong for one topic.
 		for _, exception := range []string{
 			model.EventTypeSystemError,
 			"bulk_transaction.<status>",
@@ -286,9 +259,10 @@ func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
 	})
 
 	t.Run("the R-2 guarantee is not documented with an event-type exception", func(t *testing.T) {
-		// F-03's other half. balance.monitor is no longer exempt, so the document must not say
-		// it is — a subscriber that read the old text would keep polling balances it no longer
-		// needs to poll, and an operator would keep treating a missing alert as expected.
+		// The other half. balance.monitor is not exempt, so the document must not
+		// say it is — a subscriber that read the old text would keep polling balances it no
+		// longer needs to poll, and an operator would keep treating a missing alert as
+		// expected.
 		for _, claim := range []string{
 			"The one exception: `balance.monitor` is at-most-once",
 			"`balance.monitor` is the single event type whose capture is **not** atomic",
@@ -307,15 +281,10 @@ func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
 // TestPartitionKeyContract_EveryProducerSiteSuppliesTheLedgerWhereverOneExists is the
 // structural half: it reads the producer call sites themselves.
 //
-// The behavioural test above proves the key that comes out of preparation GIVEN the option.
-// This proves the option is actually passed at every site that has a ledger to pass — the
-// failure F-04 describes is precisely a site that stops passing it, which the behavioural test
-// cannot see because it supplies the option itself.
+// The behavioural test above proves the key that comes out of preparation GIVEN the
+// option.
 func TestPartitionKeyContract_EveryProducerSiteSuppliesTheLedgerWhereverOneExists(t *testing.T) {
 	// file -> how many producer sites in it must supply the ledger.
-	//
-	// The counts are exact rather than "at least one", because a site that lost the option
-	// would otherwise hide behind its neighbours in the same file.
 	ledgerScopedSites := map[string]int{
 		// prepareTransactionEventOutbox and the post-commit fallback.
 		"transaction_execution.go": 2,
@@ -324,12 +293,12 @@ func TestPartitionKeyContract_EveryProducerSiteSuppliesTheLedgerWhereverOneExist
 		// The monitor fallback, the atomic monitor preparation, and two balance creations.
 		"balance.go": 4,
 		// RejectTransaction, which resolves the ledger from the transaction's own source
-		// balance because model.Transaction carries none. It is BEST EFFORT and can never fail
-		// the rejection — see transactionRejectionLedgerID — and it is required rather than
-		// optional: without it this one event in a transaction's lifecycle would be keyed on the
-		// source balance while its siblings are keyed on the ledger, so the two would land on
-		// different partitions and a subscriber could legitimately observe the rejection before
-		// the queueing of the same transaction.
+		// balance because model.Transaction carries none. It is BEST EFFORT and can never
+		// fail the rejection — see transactionRejectionLedgerID — and it is required rather
+		// than optional: without it this one event in a transaction's lifecycle would be
+		// keyed on the source balance while its siblings are keyed on the ledger, so the two
+		// would land on different partitions and a subscriber could legitimately observe the
+		// rejection before the queueing of the same transaction.
 		"transaction_rejection.go": 1,
 	}
 
@@ -342,16 +311,10 @@ func TestPartitionKeyContract_EveryProducerSiteSuppliesTheLedgerWhereverOneExist
 			name, expected)
 	}
 
-	// The counterpart: the two producers that must NOT supply one, because their events are
-	// genuinely not ledger-scoped. Passing a fabricated ledger here would be worse than passing
-	// nothing — it would key the event onto a partition shared with a ledger it does not belong
-	// to.
-	//
-	// transaction_rejection.go was once in this list, on the reading that a rejection is
-	// persisted with no balances loaded and therefore has no ledger to give. It has one: the
-	// ledger of the balance the transaction names, resolved by a single indexed read on a
-	// failure path. "Not loaded" is not the same as "does not exist", and the cost of treating
-	// them alike was an ordering defect within one transaction's own event sequence.
+	// The counterpart: the two producers that must NOT supply one, because their events
+	// are genuinely not ledger-scoped. Passing a fabricated ledger here would be worse
+	// than passing nothing — it would key the event onto a partition shared with a ledger
+	// it does not belong to.
 	for _, name := range []string{"identity.go", "transaction_bulk.go"} {
 		source := readRepoFile(t, name)
 		assert.NotContainsf(t, source, "WithEventLedgerID(",

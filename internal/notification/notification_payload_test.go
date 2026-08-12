@@ -30,34 +30,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file guards the system.error PAYLOAD CONTRACT and the bounded classification that is
-// logged beside it.
-//
-// It is a separate file from the two upstream notification tests because those cover the
-// transport — Slack delivery, sender registration, the dispatch gate — and this covers a
-// different subject: what a system.error payload must contain, and what it must not.
-//
-// The subject changed once already, which is why the reasoning is written down here. An
-// earlier revision reshaped the payload into a classified reason, a correlation id and an
-// optional error code, to keep Blnk's internal error text off a durable, retained topic. The
-// concern is legitimate; the remedy was not, because requirement R-8 freezes this payload to
-// the webhook body it has always been and substituting one shape for another under the same
-// event name breaks every subscriber parser with nothing announcing it. The payload is back
-// to {"error", "time"}; the classification survives as the LOG line's diagnosis, where it
-// costs no contract anything.
+// This file guards the system.error PAYLOAD CONTRACT and the bounded classification
+// that is logged beside it.
 
 // hostileErrors are the error shapes Blnk actually produces, each carrying deployment
 // detail. They are used by several tests below, so they are declared once with a note
 // on what each one reveals.
 //
-// They are NOT a list of values the payload must suppress. The payload carries the
-// error text verbatim because that is the contract subscribers already parse, and
-// because the legacy webhook delivered exactly this text to exactly this audience;
-// narrowing it is a versioned schema change, not a transport detail. What these shapes
-// prove here is that the CLASSIFIER never echoes them — the reason it returns is drawn
-// from a fixed vocabulary whatever it is handed, so the log line — and any future
-// versioned schema that chooses to carry a summary instead of the error — has a safe
-// value to use.
+// They are NOT a list of values the payload must suppress.
 func hostileErrors() map[string]struct {
 	err     error
 	secrets []string
@@ -66,9 +46,8 @@ func hostileErrors() map[string]struct {
 		err     error
 		secrets []string
 	}{
-		// A PostgreSQL error renders with the schema, table, column, constraint, source
-		// file and routine that produced it — a description of the database's internal
-		// structure.
+		// A PostgreSQL error renders with the schema, table, column, constraint, source file
+		// and routine that produced it — a description of the database's internal structure.
 		"a postgres constraint violation": {
 			err: fmt.Errorf(`pq: duplicate key value violates unique constraint ` +
 				`"event_subscribers_kafka_principal_uidx" (schema blnk, table event_subscribers, ` +
@@ -100,18 +79,11 @@ func hostileErrors() map[string]struct {
 	}
 }
 
-// TestSystemErrorPayload_IsTheFrozenLegacyContract is the R-8 guard on the one payload in
+// TestSystemErrorPayload_IsTheFrozenLegacyContract is the guard on the one payload in
 // the catalogue that a well-intentioned change had already altered.
 //
-// Requirement R-8 requires a LedgerEvent's payload to match today's webhook body
-// FIELD-FOR-FIELD, and the webhook body for system.error has always been {"error", "time"}.
-// Every subscriber's parser reads those two keys. A revision of this function replaced them
-// with a classified reason, a correlation id and an optional code — a strictly better payload
-// to design from scratch, and a BREAKING CHANGE to a published contract when substituted
-// under the same event name as a side effect of a transport migration.
-//
-// So this test asserts the legacy shape exactly, including the key COUNT: a third key is a
-// contract change and must fail here rather than reach a subscriber.
+// So this test asserts the legacy shape exactly, including the key COUNT: a third key
+// is a contract change and must fail here rather than reach a subscriber.
 func TestSystemErrorPayload_IsTheFrozenLegacyContract(t *testing.T) {
 	systemError := errors.New("queue worker crashed")
 
@@ -132,17 +104,11 @@ func TestSystemErrorPayload_IsTheFrozenLegacyContract(t *testing.T) {
 	assert.NotContains(t, payload, "error_code")
 }
 
-// TestSystemErrorPayload_CarriesEveryErrorTextVerbatim covers the payload against the same
-// hostile errors the sanitizing revision was written for.
+// TestSystemErrorPayload_CarriesEveryErrorTextVerbatim covers the payload against the
+// same hostile errors the sanitizing revision was written for.
 //
-// It asserts the OPPOSITE of what those tests asserted, and deliberately: the error text IS
-// the contract, so it reaches the payload intact however awkward its content. The concern the
-// hostile fixtures encode is real and is addressed by the ACL model — system.error routes to
-// the internal blnk.system category, which model.SubscriberGrantableTopics excludes, so a
-// subscriber is granted it only where a deployment has declared
-// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS and that subscriber's grant names the topic — and by
-// keeping the raw text off the structured log lines. It is NOT addressed by silently reshaping
-// a published payload.
+// It asserts the OPPOSITE of what those tests asserted, and deliberately: the error
+// text IS the contract, so it reaches the payload intact however awkward its content.
 func TestSystemErrorPayload_CarriesEveryErrorTextVerbatim(t *testing.T) {
 	for name, hostile := range hostileErrors() {
 		t.Run(name, func(t *testing.T) {
@@ -152,10 +118,10 @@ func TestSystemErrorPayload_CarriesEveryErrorTextVerbatim(t *testing.T) {
 				"the payload must carry the rendered error exactly, as the webhook body did")
 
 			// Round-tripped through the JSON a subscriber would actually receive, so the
-			// assertion is about what arrives on the wire rather than about a Go map.
-			// DECODED rather than string-matched, because the encoder escapes quotes and
-			// backslashes — several of these fixtures quote their input — and a raw
-			// substring check would fail on the escaping rather than on the content.
+			// assertion is about what arrives on the wire rather than about a Go map. DECODED
+			// rather than string-matched, because the encoder escapes quotes and backslashes —
+			// several of these fixtures quote their input — and a raw substring check would fail
+			// on the escaping rather than on the content.
 			marshalled, err := json.Marshal(payload)
 			require.NoError(t, err)
 
@@ -167,14 +133,8 @@ func TestSystemErrorPayload_CarriesEveryErrorTextVerbatim(t *testing.T) {
 	}
 }
 
-// TestClassifySystemError_RemainsTheLoggedDiagnosis pins what the classification is FOR now
-// that it is not in the payload.
-//
-// It is the bounded value logged at the dispatch site beside the correlation id, which is how
-// an operator gets a diagnosis without the raw error text being duplicated into a second
-// structured record. Both vocabularies stay fixed, and the tests below still hold them to
-// that, because a classifier that could echo its input would put deployment detail into the
-// log fields it was introduced to keep clean.
+// TestClassifySystemError_RemainsTheLoggedDiagnosis pins what the classification is FOR
+// now that it is not in the payload.
 func TestClassifySystemError_RemainsTheLoggedDiagnosis(t *testing.T) {
 	assert.Equal(t, SystemErrorReasonTransport,
 		classifySystemError(errors.New("dial tcp: connection refused")),

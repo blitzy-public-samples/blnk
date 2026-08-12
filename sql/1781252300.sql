@@ -14,41 +14,18 @@
 
 -- +migrate Up
 
--- RESTATE THE KEY-SCOPE COLUMN COMMENT FOR THE GATEWAY MODEL (MAJ-1).
+-- RESTATE THE KEY-SCOPE COLUMN COMMENT FOR THE GATEWAY MODEL.
 --
--- # What this corrects
+-- This replaces the comment sql/1781249138.sql set on the column, which described the
+-- prefix as "ENFORCED AT THE CONSUMER, NOT AT THE BROKER" with
+-- partition_key_prefix_enforced hard-coded false. Neither describes the shipped model:
+-- consumer-side filtering asked the credential holder to police its own boundary while
+-- any other client read the whole topic, so cooperation stood in for an access control.
 --
--- sql/1781249138.sql set this comment when the consumer-side reading of a partition key
--- prefix was still the shipped model. It says the prefix is "ENFORCED AT THE CONSUMER,
--- NOT AT THE BROKER" and that the credential endpoint returns it "together with
--- partition_key_prefix_enforced = false".
---
--- Both statements have since been superseded, and both now describe behaviour the code
--- does not have:
---
---   * Consumer-side filtering was withdrawn as an authorization boundary. The party asked
---     to apply the filter was the party holding the credential, and any other Kafka
---     client read the whole topic — so cooperation was doing the work an access control
---     was credited with. A key-scoped principal is now granted Describe and NO topic
---     Read, so the broker refuses every direct fetch it attempts, and the records reach
---     it through the key-authorising component the deployment declared in
---     KAFKA_KEY_SCOPE_ENFORCEMENT.
---   * partition_key_prefix_enforced is therefore no longer hard-coded false. It is TRUE
---     for a recorded prefix in a deployment that declares such a component, and false
---     where none is declared — in which case credential issuance refuses the row outright
---     rather than emitting a response about it.
---
--- # Why a migration rather than a code change
---
--- The comment is a LIVE SCHEMA OBJECT. It is what an operator reads from `\d+
--- blnk.event_subscribers` or from information_schema during an incident, and it is the
--- one description of this column that no amount of editing Go doc comments reaches. A
--- correction that stopped at the source would leave the database itself asserting a model
--- withdrawn two releases ago — which is the same defect the previous migration's own STEP
--- 2 was written to avoid, arriving one revision later.
---
--- It is a comment and nothing else: no table, index, constraint or datum is touched, so
--- this migration cannot fail on data and needs no repair step.
+-- The comment below states the gateway model instead — the deployment names the component
+-- that enforces the key scope in KAFKA_KEY_SCOPE_ENFORCEMENT, a key-scoped principal is
+-- granted Describe and no topic Read, and issuance refuses a key-scoped row where no such
+-- component is declared.
 COMMENT ON COLUMN blnk.event_subscribers.partition_key_prefix IS
     'The third scope of the subscriber access model: the subscriber is entitled only to '
     'records whose message key carries this prefix. Because every Blnk event is keyed by '
@@ -71,12 +48,6 @@ COMMENT ON COLUMN blnk.event_subscribers.partition_key_prefix IS
 
 -- Restore the previous statement verbatim, so the down direction leaves the schema
 -- describing exactly what sql/1781249138.sql left it describing and nothing else.
---
--- Rolling back the WORDING does not roll back the behaviour, and that asymmetry is
--- inherent to a documentation object: the code in the binary decides what happens, and a
--- rollback of this file restores the comment its predecessor set. That is the correct
--- down direction regardless — this migration's whole content is the comment, so undoing
--- it means putting the old comment back.
 COMMENT ON COLUMN blnk.event_subscribers.partition_key_prefix IS
     'The third scope of the subscriber access model: the subscriber is entitled only to '
     'records whose message key carries this prefix. Because every Blnk event is keyed by '

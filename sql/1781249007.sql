@@ -18,42 +18,29 @@
 -- evidence of a failure someone has dealt with WITHOUT deleting the evidence of one
 -- nobody has looked at.
 --
--- # The defect this closes
---
 -- The retention purge selected on status alone, over the set {dispatched,
 -- dead_lettered}. dispatched belongs there: the event reached the broker, the
 -- subscriber has had it, and the row is a receipt. dead_lettered did not. A
 -- dead-lettered row is the record of an event NO SUBSCRIBER EVER RECEIVED — it is the
 -- only inventory an operator triages from, the only thing a replay can be driven from,
--- and the only place the failure metadata that explains the loss exists. Deleting it on
--- an age timer destroys, unrecoverably and without a trace, the evidence that a ledger
--- event went undelivered.
+-- and the only place the failure metadata that explains the loss exists.
 --
 -- The two populations therefore need SEPARATE LIFECYCLES, and status cannot express
 -- that on its own because "dealt with" is not a delivery state — it is an operator
 -- decision about a row that is already in its final delivery state. So it is recorded
 -- as its own fact.
 --
--- # Why a column and not a new status literal
---
 -- A 'resolved' status would have been the smaller diff and the wrong design. Three
 -- things read the dead_lettered literal and would all have had to change in step, and
 -- one of them is a correctness property rather than a convenience:
 --
---   * THE ZERO-LOSS RECONCILIATION (acceptance criterion V-2) passes when the
---     dispatched plus dead-lettered row counts equal the sum of the main-topic and
---     dead-letter-topic end offsets. A resolved event still has its message on the
---     `.dlt` topic, so moving it out of the dead_lettered count would make the identity
---     fail for a resolution that changed nothing about the broker.
+--   * THE ZERO-LOSS RECONCILIATION passes when the dispatched plus dead-lettered row
+--     counts equal the sum of the main-topic and dead-letter-topic end offsets.
 --   * idx_event_outbox_published_audit and the broker-coordinate projection select on
 --     the literal.
 --   * A replay requires the dead_lettered state, so a resolved row would stop being
 --     replayable — and "I have dealt with this" must not mean "and I can never resend
 --     it".
---
--- A nullable timestamp is additive against all three: the status is untouched, the
--- counts are untouched, replay is untouched, and the only behaviour that changes is the
--- one that must.
 ALTER TABLE blnk.event_outbox
     ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
 
@@ -79,12 +66,11 @@ COMMENT ON COLUMN blnk.event_outbox.resolution_note IS
 -- A note without a resolution is a note about nothing, and the pair is what the audit
 -- trail is. Enforced here rather than only in Go because the column is writable by
 -- anything holding the connection, and a half-written pair would read as an unresolved
--- row carrying an explanation.
--- The StatementBegin/StatementEnd markers are required, not decorative: sql-migrate
--- splits a migration on semicolons and knows nothing about dollar quoting, so without
--- them the block is cut at its first internal semicolon and the migration fails with
--- "unterminated dollar-quoted string". sql/1781248920.sql brackets its guarded
--- constraint additions the same way for the same reason.
+-- row carrying an explanation. The StatementBegin/StatementEnd markers are required,
+-- not decorative: sql-migrate splits a migration on semicolons and knows nothing about
+-- dollar quoting, so without them the block is cut at its first internal semicolon and
+-- the migration fails with "unterminated dollar-quoted string". sql/1781248920.sql
+-- brackets its guarded constraint additions the same way for the same reason.
 -- +migrate StatementBegin
 DO $$
 BEGIN
@@ -102,16 +88,16 @@ $$;
 -- +migrate StatementEnd
 
 -- A resolution may only be recorded against a row that actually has a dead-letter
--- record. failed is deliberately excluded: its `<topic>.dlt` write is still OWED, so the
--- outbox row is the only copy of the event in existence and "dealt with" cannot be true
--- of it yet. replaying is included because it is a transient state a dead_lettered row
--- passes through and back out of — refusing it would make a resolution fail for the
--- duration of an unrelated replay.
--- The StatementBegin/StatementEnd markers are required, not decorative: sql-migrate
--- splits a migration on semicolons and knows nothing about dollar quoting, so without
--- them the block is cut at its first internal semicolon and the migration fails with
--- "unterminated dollar-quoted string". sql/1781248920.sql brackets its guarded
--- constraint additions the same way for the same reason.
+-- record. failed is deliberately excluded: its `<topic>.dlt` write is still OWED, so
+-- the outbox row is the only copy of the event in existence and "dealt with" cannot be
+-- true of it yet. replaying is included because it is a transient state a dead_lettered
+-- row passes through and back out of — refusing it would make a resolution fail for the
+-- duration of an unrelated replay. The StatementBegin/StatementEnd markers are
+-- required, not decorative: sql-migrate splits a migration on semicolons and knows
+-- nothing about dollar quoting, so without them the block is cut at its first internal
+-- semicolon and the migration fails with "unterminated dollar-quoted string".
+-- sql/1781248920.sql brackets its guarded constraint additions the same way for the
+-- same reason.
 -- +migrate StatementBegin
 DO $$
 BEGIN
@@ -130,12 +116,6 @@ $$;
 
 -- THE PURGE INDEX, replaced rather than added to, because its predicate IS the purge's
 -- eligibility rule and the two must be identical or the purge stops being index-driven.
---
--- idx_event_outbox_terminal_retention covered {dispatched, dead_lettered} — the old,
--- wrong set. A partial index is usable only when its predicate is implied by the
--- query's, so leaving it in place while the purge narrowed its WHERE clause would have
--- left the narrower query falling back to a sequential scan of the whole table on every
--- sweep. It is dropped and replaced in one migration for that reason.
 DROP INDEX IF EXISTS blnk.idx_event_outbox_terminal_retention;
 
 CREATE INDEX IF NOT EXISTS idx_event_outbox_purgeable
@@ -145,14 +125,6 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_purgeable
 
 -- THE UNRESOLVED DEAD-LETTER INVENTORY, which is what an operator triages and what the
 -- age gauge behind the DeadLetterMessageStuck alert is computed from.
---
--- idx_event_outbox_failed covers {failed, dead_lettered} on (status, occurred_at) and
--- still serves the unfiltered listing. It cannot serve the unresolved subset: adding
--- `resolved_at IS NULL` to a query's WHERE clause does not make that index any more
--- selective, so once a deployment has accumulated resolved rows every poll of the age
--- gauge would sift them again. Keyed on occurred_at ascending-friendly order because the
--- gauge wants the OLDEST entry, and carrying dlt_topic so the per-topic maximum can be
--- built from the index alone.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_unresolved_dead_letter
     ON blnk.event_outbox (occurred_at, id)
     INCLUDE (dlt_topic)

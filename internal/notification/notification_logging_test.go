@@ -30,15 +30,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file guards what NotifyError WRITES TO THE LOG, which is a different subject from
-// the two adjacent files: notification_sanitize_test.go covers what a published payload may
-// contain, and notification_dispatch_test.go covers whether a notification is attempted at
-// all. What the log holds sits between them, and it had its own defect.
-//
-// The log is where the error's full text legitimately lives — a system error nobody can read
-// is an undiagnosable outage, not a security improvement — so these tests are not about
-// removing it. They are about there being ONE record of it, correlated to the event
-// subscribers receive, with its rendering bounded and stripped of control characters.
+// This file guards what NotifyError WRITES TO THE LOG, which is a different subject
+// from the two adjacent files: notification_sanitize_test.go covers what a published
+// payload may contain, and notification_dispatch_test.go covers whether a notification
+// is attempted at all. What the log holds sits between them, and it had its own defect.
 
 // notifyErrorLogCapture is what one NotifyError call wrote to the log.
 type notifyErrorLogCapture struct {
@@ -47,19 +42,6 @@ type notifyErrorLogCapture struct {
 }
 
 // syncLogBuffer is the buffer captureNotifyErrorLog redirects the standard logger into.
-//
-// IT IS MUTEX-GUARDED BECAUSE NOTIFYERROR LOGS FROM A GOROUTINE IT SPAWNS. logrus serialises
-// its own writes behind the logger's mutex, so a plain bytes.Buffer is safe against two
-// concurrent log calls — but nothing in logrus guards a READER, and captureNotifyErrorLog has
-// two: the arrival poll, which reads the buffer every 5ms while that goroutine is still
-// writing, and the final rendering, which reads it once the settling window closes.
-//
-// An unguarded read alongside a logrus write is a data race on the buffer's length and on its
-// backing array, reported by `go test -race` — which .github/workflows/go.yml runs across the
-// whole module on every push, so the package fails to pass CI rather than merely logging a
-// warning. It is not reporting-only either: Buffer.grow reallocates mid-Write, so a String
-// taken at the wrong moment can observe a half-copied record and fail the JSON decode, which
-// would read as a defect in NotifyError's rendering rather than in this helper.
 //
 // Every method takes the same mutex, which is what orders the reads against the writes
 // instead of merely making a collision rare.
@@ -95,10 +77,6 @@ func (b *syncLogBuffer) String() string {
 }
 
 // Bytes returns a COPY of everything written so far.
-//
-// The copy is the point. bytes.Buffer.Bytes aliases the live backing array, so decoding
-// straight out of it would read that array after the lock is dropped, while the goroutine may
-// still be appending — the same race, moved one call away from where it is visible.
 //
 // Returns:
 //   - []byte: an independent snapshot, safe to decode without holding the lock.
@@ -138,11 +116,7 @@ func (c notifyErrorLogCapture) errorEntries() []map[string]interface{} {
 // asynchronous notification goroutine to finish writing, and returns what it wrote.
 //
 // NotifyError does its work in a goroutine, so there is nothing to synchronise on from
-// outside. The wait is on the OUTPUT rather than on a fixed sleep: it polls until at least
-// one entry has been decoded and then allows a short settling window for any second entry,
-// so the "exactly one record" assertions cannot pass merely because the test looked too
-// early. A test asserting an absence therefore still waits for the presence of the record
-// that is expected.
+// outside.
 //
 // Parameters:
 //   - t *testing.T: for cleanup registration and decode failures.
@@ -164,10 +138,10 @@ func captureNotifyErrorLog(t *testing.T, expected int, fn func()) notifyErrorLog
 		logger.SetLevel(previousLevel)
 	})
 
-	// logrus serialises the WRITES behind the logger's mutex, but the arrival poll below reads
-	// the buffer while NotifyError's goroutine is still writing into it, so the buffer has to
-	// guard the read side itself. See syncLogBuffer for why a bytes.Buffer here is a data race
-	// rather than a settled-by-then read.
+	// logrus serialises the WRITES behind the logger's mutex, but the arrival poll below
+	// reads the buffer while NotifyError's goroutine is still writing into it, so the
+	// buffer has to guard the read side itself. See syncLogBuffer for why a bytes.Buffer
+	// here is a data race rather than a settled-by-then read.
 	buf := &syncLogBuffer{}
 	logger.SetOutput(buf)
 	logger.SetFormatter(&logrus.JSONFormatter{})
@@ -188,9 +162,9 @@ func captureNotifyErrorLog(t *testing.T, expected int, fn func()) notifyErrorLog
 	// then finding none is evidence rather than a race.
 	time.Sleep(150 * time.Millisecond)
 
-	// ONE snapshot, decoded from the same bytes the failure message quotes. Reading the sink
-	// twice could return two different renderings if a straggler arrived between them, and the
-	// assertions and the diagnostic would then be describing different logs.
+	// ONE snapshot, decoded from the same bytes the failure message quotes. Reading the
+	// sink twice could return two different renderings if a straggler arrived between
+	// them, and the assertions and the diagnostic would then be describing different logs.
 	written := buf.Bytes()
 
 	captured := notifyErrorLogCapture{raw: string(written)}
@@ -206,25 +180,10 @@ func captureNotifyErrorLog(t *testing.T, expected int, fn func()) notifyErrorLog
 
 // TestNotifyError_EmitsExactlyOneCorrelatedRecordForOneError is the duplication fix.
 //
-// # What was wrong
+// Two records carried the same raw error.
 //
-// Two records carried the same raw error. A bare logrus.Error(systemError) ran first, and then
-// the transport branch emitted a second record whose message asserted "the full error is on
-// this line only" — which the first record had already made untrue.
-//
-// The cost was threefold: the error's text, which describes the inside of the deployment, was
-// written into log retention twice for no diagnostic gain; the first record carried no
-// correlation id, because the id was minted inside the transport branch, so it could not be
-// tied to the system.error event a subscriber received; and it was rendered by
-// logrus.Error(err) with no length bound and no control-character handling at all.
-//
-// # What is asserted
-//
-// One record, at error level, carrying the correlation id, the classified reason and the
-// bounded full text — and a PAYLOAD THAT IS STILL THE FROZEN LEGACY BODY. Both halves matter
-// together: the narrowing this fix performs is worth nothing if it changes what a subscriber
-// receives, because the payload's byte-for-byte equivalence is what makes the dual-delivery
-// window verifiable, and it would change silently since both transports read the same bytes.
+// One record, at error level, carrying the correlation id, the classified reason and
+// the bounded full text — and a PAYLOAD THAT IS STILL THE FROZEN LEGACY BODY.
 func TestNotifyError_EmitsExactlyOneCorrelatedRecordForOneError(t *testing.T) {
 	original := webhookSender
 	defer RegisterWebhookSender(original)
@@ -269,17 +228,6 @@ func TestNotifyError_EmitsExactlyOneCorrelatedRecordForOneError(t *testing.T) {
 	require.NotEmpty(t, logCorrelation)
 
 	// THE PAYLOAD IS UNCHANGED BY THIS FIX, and that is the point of asserting it here.
-	//
-	// The correlation id and the classified, bounded diagnosis live on the OPERATOR RECORD.
-	// They are deliberately NOT added to the payload, and the error text is deliberately not
-	// removed from it: the payload is the frozen legacy body {"error", "time"}, so a
-	// subscriber's existing parser keeps working when only the transport changes (AAP R-8 and
-	// AMBIGUITY-3). Adding a key or substituting the error value would break the very
-	// equivalence the dual-delivery window exists to guarantee — and it would break it
-	// invisibly, since both transports read the same bytes.
-	//
-	// So the correlation is one-directional by design: an operator goes from a subscriber's
-	// event to the log by time and error text, and the log line is where the full story is.
 	select {
 	case payload := <-payloads:
 		assert.Equal(t, errorText, payload["error"],
@@ -298,12 +246,6 @@ func TestNotifyError_EmitsExactlyOneCorrelatedRecordForOneError(t *testing.T) {
 
 // TestNotifyError_LogsTheErrorEvenWithNoTransportConfigured pins the property the
 // reorganisation could most easily have broken.
-//
-// The single record is emitted BEFORE the configuration is read and before either transport is
-// consulted, precisely so that a deployment with no Slack webhook and no event transport still
-// records its system errors. Folding the record into the transport branch — which is where the
-// correlation id used to be minted — would have made an unconfigured deployment silently
-// discard every system error, which is a far worse outcome than the duplication being fixed.
 func TestNotifyError_LogsTheErrorEvenWithNoTransportConfigured(t *testing.T) {
 	original := webhookSender
 	defer RegisterWebhookSender(original)
@@ -326,14 +268,11 @@ func TestNotifyError_LogsTheErrorEvenWithNoTransportConfigured(t *testing.T) {
 		"the correlation id is minted unconditionally, so it is present even when nothing is published")
 }
 
-// TestNotifyError_BoundsTheSenderFailureDetail covers the second half of the finding.
+// TestNotifyError_BoundsTheSenderFailureDetail covers the second half of the bounding rule.
 //
-// A failed publish is a DISTINCT event from the system error itself — the error happened, and
-// separately the attempt to report it did not — so it gets its own record. What it must not do
-// is interpolate the sender's error into the message text with %v, which is what it used to do:
-// that error comes from the event pipeline or an HTTP client, so it can carry broker addresses,
-// a topic name or a response body, at any length and with any control characters in it, and a
-// newline in a line-oriented aggregator forges a log entry.
+// A failed publish is a DISTINCT event from the system error itself — the error
+// happened, and separately the attempt to report it did not — so it gets its own
+// record.
 func TestNotifyError_BoundsTheSenderFailureDetail(t *testing.T) {
 	originalSender := webhookSender
 	defer RegisterWebhookSender(originalSender)
@@ -423,9 +362,9 @@ func TestBoundedErrorText_NeutralisesAndBounds(t *testing.T) {
 
 // utf8ValidString reports whether every rune in s decoded successfully.
 //
-// It is spelled out rather than imported so the assertion above states exactly what it means:
-// no RuneError produced from a one-byte sequence, which is what a byte-wise truncation of a
-// multi-byte character produces.
+// It is spelled out rather than imported so the assertion above states exactly what it
+// means: no RuneError produced from a one-byte sequence, which is what a byte-wise
+// truncation of a multi-byte character produces.
 func utf8ValidString(s string) bool {
 	for _, character := range s {
 		if character == '\uFFFD' {

@@ -38,32 +38,27 @@ import (
 	"github.com/blnkfinance/blnk/internal/logsafe"
 )
 
-// This file covers what the HTTP layer WRITES ABOUT A REQUEST rather than what it answers:
-// the access log line, the recovery line, and the proxy-trust decision both of them depend
-// on.
+// This file covers what the HTTP layer WRITES ABOUT A REQUEST rather than what it
+// answers: the access log line, the recovery line, and the proxy-trust decision both of
+// them depend on.
 //
-// The three failure modes it guards are all invisible from the response, which is why they
-// need their own file:
+// The three failure modes it guards are all invisible from the response, which is why
+// they need their own file:
 //
-//   - A log line that carries the request PATH carries the ledger, transaction and identity
-//     identifiers in it, to a sink that is retained, shipped onward and read by more people
-//     than the API itself.
-//   - A client address taken from a header any caller can set makes the log a record of what
-//     the caller CLAIMED, while looking exactly like a record of what happened.
-//   - A recovery line that prints the panic verbatim republishes whatever the panicking code
-//     was holding — a broker address, a connection string, an internal file path.
+//   - A log line that carries the request PATH carries the ledger, transaction and
+//     identity identifiers in it, to a sink that is retained, shipped onward and read
+//     by more people than the API itself.
+//   - A client address taken from a header any caller can set makes the log a record of
+//     what the caller CLAIMED, while looking exactly like a record of what happened.
+//   - A recovery line that prints the panic verbatim republishes whatever the panicking
+//     code was holding — a broker address, a connection string, an internal file path.
 //
-// Every assertion checks the RAW rendering as well as the decoded field, because a value that
-// moved out of a field and into the message text would still satisfy a field assertion while
-// disclosing exactly as much.
+// Every assertion checks the RAW rendering as well as the decoded field, because a
+// value that moved out of a field and into the message text would still satisfy a field
+// assertion while disclosing exactly as much.
 
-// captureAPILogs redirects the standard logger for the duration of fn and returns the decoded
-// entries alongside the raw bytes.
-//
-// The standard logger is process-global, so the previous output, formatter and level are
-// restored through t.Cleanup rather than a defer: a require failure inside fn aborts the
-// goroutine, and a deferred restore that never ran would leave every later test in the
-// package logging into a dead buffer.
+// captureAPILogs redirects the standard logger for the duration of fn and returns the
+// decoded entries alongside the raw bytes.
 //
 // Parameters:
 //   - t *testing.T: the test, for cleanup registration and decode failures.
@@ -140,8 +135,8 @@ func firstEntryWithMessage(
 	return nil
 }
 
-// TestLogrusAccessLogger_LogsRouteTemplateNotIdentifiers is the core of the finding: the line
-// says which endpoint was called without saying which record it was called about.
+// TestLogrusAccessLogger_LogsRouteTemplateNotIdentifiers pins the access line's content:
+// it says which endpoint was called without saying which record it was called about.
 func TestLogrusAccessLogger_LogsRouteTemplateNotIdentifiers(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -165,10 +160,9 @@ func TestLogrusAccessLogger_LogsRouteTemplateNotIdentifiers(t *testing.T) {
 		"the raw path field is what carried identifiers; it must be gone, not merely shortened")
 }
 
-// TestLogrusAccessLoggerDropsQueryString keeps the property the earlier revision of this file
-// established — a query string never reaches the log — now that the field is the route
-// template. A token in a query parameter is a credential, and a credential in a log is a
-// credential in every system the log is shipped to.
+// TestLogrusAccessLoggerDropsQueryString pins the property that a query string never
+// reaches the log, now that the logged field is the route template. A token in a query parameter is a credential, and a credential in
+// a log is a credential in every system the log is shipped to.
 func TestLogrusAccessLoggerDropsQueryString(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -212,8 +206,8 @@ func TestLogrusAccessLogger_UnmatchedRouteIsNotEchoed(t *testing.T) {
 		"the status is what tells an operator the request found nothing")
 }
 
-// TestLogrusAccessLogger_ClientIPIsNotForgeableWithoutTrustedProxies is the CWE-345 half of
-// the finding. With no proxy trusted, a forwarded header is ignored and the address logged is
+// TestLogrusAccessLogger_ClientIPIsNotForgeableWithoutTrustedProxies is the CWE-345 half.
+// With no proxy trusted, a forwarded header is ignored and the address logged is
 // the peer that actually opened the connection.
 func TestLogrusAccessLogger_ClientIPIsNotForgeableWithoutTrustedProxies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -362,11 +356,6 @@ func TestLogrusRecovery_HandlesANonErrorPanic(t *testing.T) {
 
 // TestLogrusRecovery_DoesNotDumpRequestHeaders is the assertion that gin's own recovery
 // writer stays off.
-//
-// That writer prints the panic, the stack and a dump of the request headers to os.Stderr,
-// masking Authorization and nothing else — so Blnk's X-Blnk-Key would be published in full by
-// any panic on an authenticated request. This points gin's error writer at a buffer and
-// requires that nothing reaches it.
 func TestLogrusRecovery_DoesNotDumpRequestHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -398,12 +387,9 @@ func TestLogrusRecovery_DoesNotDumpRequestHeaders(t *testing.T) {
 		"the caller's API key must never appear in a recovery line")
 }
 
-// TestNewAPI_RefusesToStartOnMalformedTrustedProxies proves the setting fails closed. Ignoring
-// a malformed value would leave the engine on its trust-everything default while the
-// operator's configuration said otherwise — configured-looking and forgeable.
-//
-// It builds the instance directly rather than through setupRouterWithConfig, because the
-// expected result is a nil *Api and that helper calls Router() on whatever NewAPI returns.
+// TestNewAPI_RefusesToStartOnMalformedTrustedProxies proves the setting fails closed.
+// Ignoring a malformed value would leave the engine on its trust-everything default
+// while the operator's configuration said otherwise — configured-looking and forgeable.
 func TestNewAPI_RefusesToStartOnMalformedTrustedProxies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -423,8 +409,8 @@ func TestNewAPI_AcceptsAConfiguredProxyList(t *testing.T) {
 	assert.NotNil(t, instance, "a well-formed proxy list must be accepted")
 }
 
-// newAPIWithTrustedProxies builds an Api instance with a given BLNK_SERVER_TRUSTED_PROXIES
-// value, returning whatever NewAPI returned — nil included.
+// newAPIWithTrustedProxies builds an Api instance with a given
+// BLNK_SERVER_TRUSTED_PROXIES value, returning whatever NewAPI returned — nil included.
 //
 // Parameters:
 //   - t *testing.T: the test, for fixture failures.
@@ -481,18 +467,14 @@ func TestNewAPI_TrustsNoProxyByDefault(t *testing.T) {
 	assert.NotContains(t, raw, "203.0.113.77")
 }
 
-// TestEventAPILogging_NoSiteUsesLogrusWithError is a source-level guard over the files this
-// feature owns.
+// TestEventAPILogging_NoSiteUsesLogrusWithError is a source-level guard over the files
+// this feature owns.
 //
-// The behavioural tests above prove the sites that exist behave; this proves none was MISSED
-// and that a new one cannot quietly reintroduce the defect. logrus.WithError renders
-// err.Error() verbatim into the record at whatever level the line is emitted at, and the
-// errors these files log are Kafka and database errors whose text names broker addresses and
-// connection strings.
-//
-// The list is deliberately limited to the files this change owns. api/transactions.go,
-// api/errors.go and api/reconciliation_api.go log the same way and are outside this feature's
-// scope; converting them is a separate, self-contained change.
+// The behavioural tests above prove the sites that exist behave; this proves none was
+// MISSED and that a new one cannot quietly reintroduce the defect. logrus.WithError
+// renders err.Error() verbatim into the record at whatever level the line is emitted
+// at, and the errors these files log are Kafka and database errors whose text names
+// broker addresses and connection strings.
 func TestEventAPILogging_NoSiteUsesLogrusWithError(t *testing.T) {
 	files := []string{
 		"api.go",

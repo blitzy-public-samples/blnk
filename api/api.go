@@ -48,26 +48,8 @@ type Api struct {
 func (a Api) Router() *gin.Engine {
 	router := a.router
 
-	// THE WEBHOOK RETIREMENT GUARD IS NOT INSTALLED HERE, and that is a correction rather than
-	// an omission.
-	//
-	// It used to be, with router.Use, immediately before Authenticate. Both of those positions
-	// are necessary — before authentication, so a caller is not told 401 or 403 about a surface
-	// that is never coming back and left fixing credentials for it; and before route matching,
-	// so a PATCH, OPTIONS or HEAD that matches no registered handler is answered 410 rather than
-	// the router's own 404 or 405, since requirement R-12 says every request and four methods is
-	// not every request.
-	//
-	// Neither is sufficient. Every router.Use in this method runs AFTER every one in NewAPI, and
-	// NewAPI installs RequestSizeLimit and RateLimitMiddleware — both of which ABORT. So a
-	// throttled or oversized request to a retired route was answered 429 or 413 and never reached
-	// this guard at all. It is therefore installed in NewAPI, ahead of every aborting middleware;
-	// see the comment there. Installing it in both places would only run its path test twice per
-	// request.
-	//
-	// The per-route WebhookSunsetGuard below is unaffected and still attached to the four
-	// registered verbs: two independent barriers for a behaviour whose failure mode is "the
-	// routes quietly keep working" is deliberate.
+	// THE WEBHOOK RETIREMENT GUARD IS NOT INSTALLED HERE, and that is a correction rather
+	// than an omission.
 
 	// Apply auth middleware to all routes
 	router.Use(a.auth.Authenticate())
@@ -175,24 +157,8 @@ func (a Api) Router() *gin.Engine {
 	// purpose: no route parameter is registered directly there, so the
 	// dead-letter and stats subtrees can never be shadowed.
 	router.GET("/events/dead-letter", a.ListDeadLetterEvents)
-	// REPLAY IS THE WHOLE OF THE DEAD-LETTER WORKFLOW, and there is deliberately no
-	// second write beside it.
-	//
-	// A `resolve` route was registered here and has been removed. It recorded an
-	// operator's decision that a dead-lettered event needed no further action, so that
-	// retention could delete the row — and it made the surface fourteen routes where
-	// the agreed plan approves thirteen. Worse, the two writes could not compose: a
-	// resolved row could not then be replayed, because marking the successful
-	// re-publish `dispatched` violated the state constraint that kept a resolution
-	// confined to the dead-lettered states, and the refusal released the row as
-	// replayable again — so a broker-acknowledged replay reported failure and invited a
-	// duplicate publish.
-	//
-	// Retention is now modelled through this route alone: a dead-lettered row is
-	// retained indefinitely, keeps feeding the dead-letter age gauge and keeps the
-	// DeadLetterMessageStuck alert firing until a replay the broker acknowledges turns
-	// it into a dispatched receipt — which is the only state the retention sweep may
-	// delete by age.
+	// REPLAY IS THE WHOLE OF THE DEAD-LETTER WORKFLOW, and there is deliberately no second
+	// write beside it.
 	router.POST("/events/dead-letter/:event_id/replay", a.ReplayDeadLetterEvent)
 	router.GET("/events/stats", a.GetEventOutboxStats)
 
@@ -204,32 +170,21 @@ func (a Api) Router() *gin.Engine {
 	router.DELETE("/subscribers/:subscriber_id", a.DeleteSubscriber)
 	router.POST("/subscribers/:subscriber_id/kafka-credentials", a.IssueKafkaCredentials)
 
-	// THERE IS NO DATA-PLANE ROUTE UNDER /subscribers, and its absence is the design rather
-	// than an omission. Requirement R-7 has subscribers consume Kafka DIRECTLY with the
-	// per-subscriber SASL/SCRAM credential the endpoint above issues; every route registered
-	// here is an OPERATOR action gated on the master key.
-	//
-	// An HTTP polling route was tried and removed. It read the shared topics with Blnk's own
-	// broker credential and returned the records a subscriber's partition-key prefix admitted,
-	// which made Blnk a second, unauthorised data plane: it sat behind the deployment's own API
-	// authentication while the credential response contains no API key, and it answered from
-	// the registry's credential reference alone — so a principal already revoked at the broker,
-	// or one whose grant had not settled, kept being served. Kafka's authorizer has no
-	// message-key dimension, so a subscriber that records a partition_key_prefix is REFUSED a
-	// credential unless an operator has declared a component in front of the brokers that
-	// authorises record keys (KAFKA_KEY_SCOPE_ENFORCEMENT). Blnk does not ship that component.
-	// See event_subscriber.go's requireProvisionableKeyScope and docs/event-streaming.md.
+	// THERE IS NO DATA-PLANE ROUTE UNDER /subscribers, and its absence is the design
+	// rather than an omission. Subscribers consume Kafka DIRECTLY with the per-subscriber
+	// SASL/SCRAM credential the endpoint above issues; every route
+	// registered here is an OPERATOR action gated on the master key.
 
 	// Deprecated webhook-subscription management routes.
 	//
-	// Retained only for the dual-delivery window. Once
-	// WEBHOOK_DEPRECATION_SUNSET_DATE has passed these four answer 410 Gone, as does
-	// every other method addressed to the same path and every unauthenticated attempt
-	// at it — all of which is the work of the single path-scoped guard installed at the
-	// top of this function, ahead of authentication. That placement is what covers the
-	// cases a per-route guard cannot see: an unsupported verb and a path with no handler
-	// both reach no route at all, and a request rejected by authentication would
-	// otherwise be answered 401 on a surface that no longer exists.
+	// Retained only for the dual-delivery window. Once WEBHOOK_DEPRECATION_SUNSET_DATE has
+	// passed these four answer 410 Gone, as does every other method addressed to the same
+	// path and every unauthenticated attempt at it — all of which is the work of the
+	// single path-scoped guard installed at the top of this function, ahead of
+	// authentication. That placement is what covers the cases a per-route guard cannot
+	// see: an unsupported verb and a path with no handler both reach no route at all, and
+	// a request rejected by authentication would otherwise be answered 401 on a surface
+	// that no longer exists.
 	//
 	// The per-route guard is attached here as the SECOND barrier, and the two cannot
 	// disagree: both resolve the retirement through blnk.WebhookSunsetSnapshotAt, the
@@ -237,37 +192,15 @@ func (a Api) Router() *gin.Engine {
 	// same window. The pre-auth guard exists to reach the requests that never route — an
 	// unsupported verb, and a caller whose credential has also lapsed; this one is the
 	// retirement's local, visible statement at each registration and would still refuse if
-	// the global middleware were ever removed from the chain. For a behaviour whose failure
-	// mode is "the routes quietly keep working", two independent barriers is deliberate.
+	// the global middleware were ever removed from the chain.
 	//
-	// NEITHER BARRIER REACHES THE /hooks ROUTES ABOVE. Those are the PRE_TRANSACTION and
-	// POST_TRANSACTION request-time callouts of a different, fully supported feature, and the
-	// rest of /subscribers is the REPLACEMENT for the surface being retired — including the
-	// credential endpoint a subscriber needs in order to leave it. Both guards match this exact
-	// path shape rather than a prefix, for precisely that reason.
-	//
-	// It is attached PER ROUTE rather than with router.Use or to a group, and the four routes
-	// below are the whole of its reach. The reason is DUPLICATION, not safety: it does test the
-	// path, so a global installation would be correct — it would simply do the pre-auth guard's
-	// job a second time, after authentication, for every request in the API.
-	//
-	// THESE FOUR ROUTES ARE NOT DELETED BY THE TERMINAL RELEASE, and that is a decision rather
-	// than an omission. The requirement is that this surface answer 410 Gone on EVERY request
-	// after the sunset, and a route that has been removed answers 404 instead — so the
-	// registrations are what there is to answer with, and the guard is what answers. They also
-	// have to be here for a deployment whose own window has not closed yet, since the retirement
-	// is a per-deployment configuration instant rather than a property of this binary.
-	//
-	// Passing the instant changes behaviour, not code: the handlers remain and the retirement is
-	// reversible by moving the date. What the terminal release removes is the DELIVERY mechanism
-	// — webhooks.go, the ProcessWebhook queue mapping and the relay's dual-delivery branch — and
-	// docs/webhook-to-kafka-migration.md carries that as a checklist whose preserve half names
-	// these four registrations and both guards. TestWebhookTerminalRelease_ChecklistMatchesTheSurface
-	// fails if a release deletes them anyway.
-	//
-	// The path is middleware.DeprecatedWebhookSubscriptionRoute rather than four literals,
-	// so the routes registered here and the paths the pre-auth guard recognises are one
-	// fact stated in the file that owns the retirement decision.
+	// THESE FOUR ROUTES ARE NOT DELETED BY THE TERMINAL RELEASE, and that is a decision
+	// rather than an omission. The requirement is that this surface answer 410 Gone on
+	// EVERY request after the sunset, and a route that has been removed answers 404
+	// instead — so the registrations are what there is to answer with, and the guard is
+	// what answers. They also have to be here for a deployment whose own window has not
+	// closed yet, since the retirement is a per-deployment configuration instant rather
+	// than a property of this binary.
 	router.POST(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.RegisterWebhookSubscription)
 	router.GET(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.GetWebhookSubscription)
 	router.PUT(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.UpdateWebhookSubscription)
@@ -295,18 +228,6 @@ func NewAPI(b *blnk.Blnk) *Api {
 
 	// PROXY TRUST, decided before any middleware runs, because everything that reports a
 	// client address depends on it.
-	//
-	// Gin's default is to trust every proxy, which means it believes the leftmost
-	// X-Forwarded-For header on any request: a caller could choose the address that
-	// appears in the access log, and in a rate-limit decision or an audit built on it.
-	// Handing it the configured list — nil when nothing is configured — replaces that with
-	// "believe a forwarded address only from a proxy the operator named". With nothing
-	// configured, ClientIP resolves to the peer that actually opened the connection, which
-	// cannot be forged.
-	//
-	// A malformed entry is fatal rather than ignored. Continuing would leave the engine on
-	// its trust-everything default while the operator's configuration says otherwise,
-	// which is the one outcome worse than refusing: it looks configured and is not.
 	if err := r.SetTrustedProxies(conf.TrustedProxyCIDRs()); err != nil {
 		logrus.WithField("cause", logsafe.Cause(err)).Error(
 			"BLNK_SERVER_TRUSTED_PROXIES is not a valid list of CIDR blocks or IP literals, so the " +
@@ -322,59 +243,23 @@ func NewAPI(b *blnk.Blnk) *Api {
 
 	// MOVED AHEAD OF THE ABORTING MIDDLEWARE BELOW, and the move is the point.
 	//
-	// SecurityHeaders only SETS response headers; it never aborts. Running it before the two
-	// middlewares that do means every refusal this chain produces carries them — the retirement's
-	// 410, a 413 for an oversized body, a 429 for a throttled caller — where previously the first
-	// two of those were written by middleware that ran before it and went out bare.
+	// SecurityHeaders only SETS response headers; it never aborts.
 	r.Use(middleware.SecurityHeaders())
 
 	// THE RETIRED-PATH BARRIER, AND IT MUST PRECEDE EVERY MIDDLEWARE THAT CAN ABORT.
-	//
-	// This used to be installed in Router(), which runs its router.Use calls AFTER every one in
-	// this function. RequestSizeLimit and RateLimitMiddleware both abort, so a request to a
-	// retired webhook-subscription route was answered 413 or 429 — never reaching either sunset
-	// guard. A throttled caller was told to slow down and retry a surface that is gone, and would
-	// have retried it forever. Requirement R-12 says the webhook REST API answers 410 Gone on
-	// EVERY request, and "every request except the throttled ones" does not satisfy it.
-	//
-	// Its blast radius is unchanged by the move. WebhookSunsetPreAuthGuard tests the request
-	// against one exact three-segment path shape and the four retired methods before it does
-	// anything else, so /hooks, the live subscriber registry, the credential endpoint and every
-	// ledger and transaction route pass through it untouched — exactly as they did when it sat in
-	// Router(). It is installed HERE ONLY; Router() no longer installs it, because two
-	// registrations would run the same path test twice per request for no benefit.
-	//
-	// It sits before otelgin, which costs the 410 its server span. That is deliberate and it is
-	// the cheaper side of the trade: putting otelgin first would mean moving RateLimitMiddleware
-	// behind it too, and every throttled request under a flood would then open a span — turning
-	// an attack into trace volume. The retirement stays observable through the access log line
-	// logrusAccessLogger has already opened above.
 	r.Use(middleware.WebhookSunsetPreAuthGuard())
 
 	r.Use(middleware.RequestSizeLimit(conf.Server.MaxRequestBodySizeMB * 1024 * 1024))
 	auth := middleware.NewAuthMiddleware(b)
 	r.Use(middleware.RateLimitMiddleware(conf))
 	// The server span every request trace is rooted in, and the point from which the trace
-	// reaches the event pipeline: handlers pass c.Request.Context() into the service layer, the
-	// event capture writes the active trace context onto the outbox row, and the relay's publish
-	// links back to it. That chain starts here.
-	//
-	// NO SpanNameFormatter IS SUPPLIED, DELIBERATELY. otelgin names the span from c.FullPath() —
-	// the registered ROUTE TEMPLATE, "/events/dead-letter/:event_id/replay" — and sets the
-	// http.route attribute from the same value. A formatter reading r.URL.Path instead would name
-	// the span after the concrete path, which puts a financial identifier in a span name and gives
-	// the tracing backend one operation per event id: unbounded name cardinality on the busiest
-	// surface in the service. If a formatter is ever needed here it must derive from the route
-	// template, never from the request path.
+	// reaches the event pipeline: handlers pass c.Request.Context() into the service
+	// layer, the event capture writes the active trace context onto the outbox row, and
+	// the relay's publish links back to it. That chain starts here.
 	r.Use(otelgin.Middleware("BLNK",
 		otelgin.WithFilter(func(r *http.Request) bool {
-			// Exclude high-frequency operational endpoints from tracing
-			// to avoid polluting the trace feed with noise.
-			//
-			// /metrics is a scrape target hit by a monitor on a fixed interval, so a span per
-			// scrape describes nothing anybody would read and would outnumber the request spans
-			// that do. This is the only exclusion: every surface that MUTATES anything is traced,
-			// because those are the traces the event pipeline's spans link back to.
+			// Exclude high-frequency operational endpoints from tracing to avoid polluting the
+			// trace feed with noise.
 			return r.URL.Path != "/metrics"
 		}),
 	))
@@ -386,34 +271,13 @@ func NewAPI(b *blnk.Blnk) *Api {
 	return &Api{blnk: b, router: r, auth: auth}
 }
 
-// logrusAccessLogger logs one line per request, identifying it by ROUTE TEMPLATE rather than by
-// the path that was requested.
+// logrusAccessLogger logs one line per request, identifying it by ROUTE TEMPLATE rather
+// than by the path that was requested.
 //
-// # Why the template and not the path (SEC-09)
-//
-// The `path` field used to be c.Request.URL.Path — the concrete path, with its path parameters
-// substituted. That was harmless while every route took an opaque business id, and it stopped
-// being harmless the moment routes like /events/dead-letter/:event_id/replay and
-// /subscribers/:subscriber_id/kafka-credentials existed: every request to them wrote a financial
-// or tenant identifier into an access log that is shipped to whatever log pipeline the deployment
-// runs, retained on its schedule, and readable by anyone with log access rather than by anyone
-// with an API key.
-//
-// The SECOND cost is cardinality, and it is the one that bites a log platform rather than a
-// reader. `path` is an indexed field in every structured log store; a value containing an
-// identifier means one distinct field value per event, per subscriber, per transaction. The route
-// template is a closed set — one value per registered route — so the field becomes groupable, and
-// "which endpoint is slow" becomes answerable at all.
-//
-// Nothing correlating is lost. The identifier is still in the handler's own log lines and in the
-// response, and the request's trace carries the same route template as its span name, so a log
-// line and a trace can still be joined. What is gone is the identifier's appearance in a field
-// nobody needed it in.
-//
-// The field is named `route` rather than `path`, because after this change it holds a route
-// template and not a path: keeping the old name would have left every existing query selecting a
-// field whose meaning had silently changed under it. `path` is not emitted at all, so a query
-// that still selects it fails visibly instead of quietly reading a different thing.
+// The SECOND cost is cardinality, and it is the one that bites a log platform rather
+// than a reader. `path` is an indexed field in every structured log store; a value
+// containing an identifier means one distinct field value per event, per subscriber,
+// per transaction.
 func logrusAccessLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -433,37 +297,21 @@ func logrusAccessLogger() gin.HandlerFunc {
 	}
 }
 
-// logrusRecovery turns a panic into a 500 and records it WITHOUT putting the panic's own
-// text or the stack into the log at a normal level.
-//
-// # gin's OWN recovery writer is disabled here, and that is the larger half of this
+// logrusRecovery turns a panic into a 500 and records it WITHOUT putting the panic's
+// own text or the stack into the log at a normal level.
 //
 // gin.CustomRecovery installs gin's error writer alongside the handler, and that writer
-// prints — unconditionally, to os.Stderr, which in a container IS the log — the panic value
-// verbatim, the full stack, AND A DUMP OF THE REQUEST HEADERS. It masks exactly one header,
-// Authorization, so Blnk's own authentication header, X-Blnk-Key, is printed in full: a
-// single panic on an authenticated request publishes the caller's API key to the log.
-//
-// Passing a nil writer to CustomRecoveryWithWriter turns that emitter off, which leaves the
-// line below as the only thing a panic writes. Nothing is lost: the panic value and the
-// stack are both still available here, and both are emitted at debug.
-//
-// # What a recovered value contains
-//
-// A panic value carries whatever the panicking code was holding: a nil-map write reveals
-// little, but a panic from a database or broker call renders with the connection string or
-// the broker address, and a panic carrying a wrapped error reproduces that error's full
-// text. The stack goes further — it names internal packages, file paths and line numbers,
-// which is a map of the deployment.
+// prints — unconditionally, to os.Stderr, which in a container IS the log — the panic
+// value verbatim, the full stack, AND A DUMP OF THE REQUEST HEADERS. It masks exactly
+// one header, Authorization, so Blnk's own authentication header, X-Blnk-Key, is
+// printed in full: a single panic on an authenticated request publishes the caller's
+// API key to the log.
 //
 // So the normal-level line carries the panic's TYPE and a redacted rendering of its
 // message: enough to tell one recurring panic from another and to find it in the code,
 // without publishing internals to everyone who can read the log. The verbatim value and
 // the stack are emitted at debug, which is the level an operator turns on deliberately
 // when they are debugging exactly this.
-//
-// The response itself is unchanged: a bare 500 with no body, which is what it already was.
-// Nothing about the panic has ever reached the caller, and nothing does now.
 //
 // Returns:
 //   - gin.HandlerFunc: the recovery middleware.
@@ -567,7 +415,8 @@ const unmatchedRoute = "unmatched"
 // requestRoute reports the matched route template for a request, or unmatchedRoute.
 //
 // Bounded even though a route template is this codebase's own string: the bound costs
-// nothing and it means no future route, however long, can produce an unbounded log field.
+// nothing and it means no future route, however long, can produce an unbounded log
+// field.
 //
 // Parameters:
 //   - c *gin.Context: the request context, after routing.
@@ -585,10 +434,10 @@ func requestRoute(c *gin.Context) string {
 
 // redactedPanicMessage renders a recovered value for a normal-level log line.
 //
-// An error is rendered through logsafe.Cause, so a panic that wrapped a broker or database
-// failure loses its addresses the same way a returned error would. Anything else is
-// rendered with %v and then sanitized and redacted identically, because a panic value is
-// frequently a string that was built from one of those errors.
+// An error is rendered through logsafe.Cause, so a panic that wrapped a broker or
+// database failure loses its addresses the same way a returned error would. Anything
+// else is rendered with %v and then sanitized and redacted identically, because a panic
+// value is frequently a string that was built from one of those errors.
 //
 // Parameters:
 //   - recovered interface{}: the value passed to the recovery handler.
@@ -610,20 +459,13 @@ func redactedPanicMessage(recovered interface{}) string {
 // withLoggableCause attaches a dependency error to a log entry in the two renderings an
 // operator needs, and it is the ONLY way this package should put an error into a line.
 //
-// The "cause" field is the redacted rendering, which is what a deployment writes at info,
-// warn and error. The "cause_verbatim" field carries the unredacted text and is attached
-// ONLY when the standard logger is at debug — the restricted sink.
-//
-// It is the counterpart of the identically named helper in package blnk, and both delegate
-// to internal/logsafe, so an error logged by a handler and the same error logged by the
-// service beneath it are redacted and bounded identically. Using logrus.WithError instead
-// is the defect this replaces: it renders err.Error() verbatim into the "error" field at
-// whatever level the line is emitted at, and the errors this package logs are Kafka and
-// database errors that name broker addresses and connection strings.
+// The "cause" field is the redacted rendering, which is what a deployment writes at
+// info, warn and error. The "cause_verbatim" field carries the unredacted text and is
+// attached ONLY when the standard logger is at debug — the restricted sink.
 //
 // Parameters:
-//   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one, so a
-//     caller with no fields to add does not have to construct one.
+//   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one,
+//     so a caller with no fields to add does not have to construct one.
 //   - err error: the error to attach. A nil error leaves the entry untouched.
 //
 // Returns:

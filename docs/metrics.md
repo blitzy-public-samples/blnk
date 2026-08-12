@@ -220,7 +220,7 @@ the row claimable so the event is published *again* — losing it is unrecoverab
 is suppressed at the subscriber on `event_id`. Counted at the acknowledgement, that second write
 increments the counter a second time for one event, so a series documented as "one per event"
 silently becomes "one per successful write" exactly when the pipeline is having trouble. Because this
-counter is simultaneously the V-1 throughput numerator and the V-3 dead-letter-rate denominator, that
+counter is simultaneously the throughput numerator and the dead-letter-rate denominator, that
 error inflates throughput and understates the dead-letter rate together. The dispatched transition is
 conditional on the claim token and clears it, so it completes for one worker once per event; the
 webhook-pending transition, which records the Kafka leg for a row whose legacy webhook is still owed,
@@ -232,7 +232,7 @@ does the same and is counted too.
 
 **`outcome` values**: `dispatched`, `retrying`, `dead_lettered`
 
-The vocabulary is closed at exactly these three values — requirement R-3 fixes it — and is
+The vocabulary is closed at exactly these three values — the publisher contract fixes it — and is
 mutually exclusive: exactly one value per attempted write. `dispatched` is a broker
 acknowledgement of the original write. `retrying` is **every** failed attempt, whether or not
 another one follows: "retrying" describes the attempt's place in the sequence, and whether the
@@ -313,8 +313,8 @@ publish ──► broker ack ──────► Kafka leg recorded ───�
 - **published** counts EVENTS, at the moment the claim-token-conditional statement recording the
   Kafka leg commits. That statement clears the token, so it succeeds for one worker once in an
   event's whole life: a republish after a crash increments acknowledgements again and cannot
-  increment this. **Anything per-event is read from here** — the V-1 throughput verdict and the
-  V-3 dead-letter rate both are.
+  increment this. **Anything per-event is read from here** — the throughput verdict and the
+  dead-letter rate both are.
 - **dispatched** counts EVENTS reaching the terminal row state. For a row that owes a legacy
   webhook the Kafka leg is durable while the row sits in `webhook_pending`, so this one lags by
   that leg's remaining budget and is counted on the later pass that settles it — once, whether
@@ -825,8 +825,8 @@ histogram_quantile(0.99, sum by (le) (rate(
 # Dead-letter rate INDICATOR, which stays below 0.001 — that is 0.1% — against a healthy broker.
 #
 # Both counters are per-EVENT and both are incremented at a durable row transition rather than
-# at a broker write, so they partition unique events and this is the figure acceptance criterion
-# V-3 is scored on. Do NOT substitute blnk_events_broker_acknowledgements_total for the
+# at a broker write, so they partition unique events and this is the figure the dead-letter
+# rate is scored on. Do NOT substitute blnk_events_broker_acknowledgements_total for the
 # denominator: that one counts writes, so a republished event or an afternoon of dead-letter
 # triage would move it and the rate would depend on how much re-delivery happened rather than on
 # how the pipeline behaved.
@@ -874,10 +874,10 @@ blnk_kafka_subscribers_unmeasured > 0
 sum without(reason)(blnk_kafka_subscribers_unmeasured) / clamp_min(blnk_subscribers_registered, 1)
 
 # Measurement-budget headroom. Watch this rather than waiting for the shortfall above: it goes
-# negative BEFORE any subscriber goes unmeasured. Both operands are series, so the query is true
-# on every deployment — it used to read `200 - blnk_subscribers_registered`, naming the DEFAULT
-# as a literal, which showed a deployment running a budget of 1000 as exhausted eight hundred
-# subscribers early. The budget is set by EVENT_METRICS_SUBSCRIBER_BUDGET (alias
+# negative BEFORE any subscriber goes unmeasured. BOTH OPERANDS ARE SERIES, which is what makes
+# the query true on every deployment: writing the default as a literal — `200 -
+# blnk_subscribers_registered` — would show a deployment running a budget of 1000 as exhausted
+# eight hundred subscribers early. The budget is set by EVENT_METRICS_SUBSCRIBER_BUDGET (alias
 # RELAY_SUBSCRIBER_METRICS_BUDGET) and exported as the gauge below.
 blnk_subscribers_measurement_budget - blnk_subscribers_registered
 

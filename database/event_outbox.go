@@ -14,50 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// event_outbox.go is the repository implementation of the eventOutbox contract
-// declared in repository.go: persistence for blnk.event_outbox, the transactional
-// outbox that carries every ledger mutation's event to Kafka.
+// event_outbox.go is the repository implementation of the eventOutbox contract declared
+// in repository.go: persistence for blnk.event_outbox, the transactional outbox that
+// carries every ledger mutation's event to Kafka.
 //
-// It is modelled directly on lineage.go's outbox half — the same in-transaction
-// insert, the same CTE claim with FOR UPDATE SKIP LOCKED, and the same
-// apierror-wrapped failures — because that is the proven house pattern for a
-// relay-backed outbox in this repository, and a second, differently shaped one
-// would be a maintenance liability rather than an improvement. blnk.event_outbox
-// and blnk.lineage_outbox are nonetheless SEPARATE TABLES served by SEPARATE
-// RELAYS: they are never merged, nothing here joins across them, and the lineage
-// relay's behaviour is untouched.
+// It is modelled directly on lineage.go's outbox half — the same in-transaction insert,
+// the same CTE claim with FOR UPDATE SKIP LOCKED, and the same apierror-wrapped
+// failures — because that is the proven house pattern for a relay-backed outbox in this
+// repository, and a second, differently shaped one would be a maintenance liability
+// rather than an improvement. blnk.event_outbox and blnk.lineage_outbox are nonetheless
+// SEPARATE TABLES served by SEPARATE RELAYS: they are never merged, nothing here joins
+// across them, and the lineage relay's behaviour is untouched.
 //
 // Three differences from the lineage outbox are deliberate and load-bearing:
 //
-//   - Ordering is by occurred_at, not created_at. occurred_at is the instant the
-//     domain action happened; created_at is merely when the row was written.
-//     Claiming in occurred_at order is one of the two mechanisms that jointly
-//     deliver the per-aggregate ordering guarantee — the other being the Kafka
-//     message key pinning one aggregate to one partition.
+//   - Ordering is by occurred_at, not created_at. occurred_at is the instant the domain
+//     action happened; created_at is merely when the row was written.
 //   - The terminal success state is dispatched, and there is an additional
-//     dead_lettered terminal state. The lineage vocabulary has neither, so every
-//     status here comes from model.EventOutboxStatus* and never from
-//     model.OutboxStatus*.
-//   - Every standalone method opens an OpenTelemetry span on the
-//     transaction.database tracer, following chain.go. The in-transaction insert
-//     deliberately does not: it runs inside a caller-owned transaction whose span
-//     is already open in transaction.go, and a second span per row would be noise.
-//
-// # Byte-for-byte payload fidelity, and the two columns that deliver it — READ THIS
+//     dead_lettered terminal state.
+//   - Every standalone method opens an OpenTelemetry span on the transaction.database
+//     tracer, following chain.go.
 //
 // The event body is stored TWICE, and which column a reader picks decides whether the
 // fidelity guarantee holds:
 //
 //   - payload is JSONB, a PARSED representation. PostgreSQL sorts object keys,
-//     renormalises whitespace, expands exponent notation and collapses a duplicate
-//     key, so a body marshaled as {"event":"x","data":{...}} comes back as
-//     {"data": {...}, "event": "x"}. Verified against a live database rather than
-//     assumed. The column is kept because that parsed form is what makes containment
-//     (@>) and member extraction (->, ->>) work, which is how an operator triages a
-//     stuck event in SQL.
-//   - payload_raw is BYTEA and holds THE EXACT BYTES the producer marshaled. Nothing
-//     about a bytea column can validate, reject, transcode or re-render its input,
-//     which is what makes it a byte contract rather than a hope.
+//     renormalises whitespace, expands exponent notation and collapses a duplicate key,
+//     so a body marshaled as {"event":"x","data":{...}} comes back as {"data": {...},
+//     "event": "x"}.
+//   - payload_raw is BYTEA and holds THE EXACT BYTES the producer marshaled.
 //
 // EVERY READ IN THIS FILE PROJECTS payload_raw INTO model.EventOutbox.Payload, never
 // the JSONB column — see eventOutboxColumns. That is what makes the two delivery
@@ -66,21 +51,10 @@ limitations under the License.
 //   - Dual-delivery consistency. The relay publishes to Kafka and enqueues the legacy
 //     webhook from the SAME claimed row, and the body it carries is the producer's own
 //     bytes, so the two transports cannot differ from each other OR from what the HTTP
-//     webhook body would have been (acceptance criterion V-8).
-//   - Replay fidelity. A replay re-publishes the STORED bytes rather than re-marshalling
-//     a struct, so a replayed event is byte-identical to the event originally published,
-//     aside from the added failure metadata (acceptance criterion V-9).
-//
-// The two columns cannot disagree, and that is a property of the write path rather than
-// a convention: eventOutboxInsertArgs binds BOTH from one in-memory slice, and no
-// statement anywhere UPDATEs either of them. Nothing else in this file transforms those
-// bytes either — the insert binds model.EventOutbox.Payload straight through, and every
-// read scans payload_raw back into that json.RawMessage field without re-marshalling.
-//
-// The practical consequence for anyone writing a test: compare payloads by BYTE equality
-// against the pre-insert value. JSON equivalence would also pass against a projection
-// that had silently gone back to the JSONB column, which is the one regression this
-// design exists to prevent.
+//     webhook body would have been.
+//   - Replay fidelity. A replay re-publishes the STORED bytes rather than
+//     re-marshalling a struct, so a replayed event is byte-identical to the event
+//     originally published, aside from the added failure metadata.
 
 package database
 
@@ -109,48 +83,41 @@ import (
 )
 
 const (
-	// defaultEventMaxAttempts mirrors the max_attempts column default and the
-	// default of RELAY_MAX_RETRY_ATTEMPTS. It is the fallback for a row inserted
-	// without an explicit retry budget: a zero budget would make the row both
-	// un-retryable AND un-claimable, because the claim predicate requires
-	// attempts < max_attempts, so it would silently never publish.
+	// defaultEventMaxAttempts mirrors the max_attempts column default and the default of
+	// RELAY_MAX_RETRY_ATTEMPTS. It is the fallback for a row inserted without an explicit
+	// retry budget: a zero budget would make the row both un-retryable AND un-claimable,
+	// because the claim predicate requires attempts < max_attempts, so it would silently
+	// never publish.
 	defaultEventMaxAttempts = 5
 
-	// defaultEventClaimLease is the lease applied when a caller asks for a
-	// non-positive one. A zero-length lease would expire the instant it was
-	// taken, letting a second relay instance reclaim a row that is still being
-	// published and delivering the event twice; falling back to the value the
-	// outbox relays already use is safer than honouring an obviously wrong
-	// argument.
+	// defaultEventClaimLease is the lease applied when a caller asks for a non-positive
+	// one. A zero-length lease would expire the instant it was taken, letting a second
+	// relay instance reclaim a row that is still being published and delivering the event
+	// twice; falling back to the value the outbox relays already use is safer than
+	// honouring an obviously wrong argument.
 	defaultEventClaimLease = 30 * time.Second
 
 	// eventDeadLetterHandoffLease is the lease a terminal transition LEAVES ON THE ROW so
 	// that the dead-letter write it owes is exclusively its own.
 	//
-	// # The race it closes
+	// MarkEventFailed's exhaustion arm and MarkEventPermanentlyFailed both retain the
+	// claim token, precisely so that only the worker that spent the last attempt may
+	// perform the dead-letter write and the MarkEventDeadLettered that records it. So a
+	// second relay instance could reclaim the row in the same instant, overwrite the token
+	// the first worker was about to present, and publish to the dead-letter topic
+	// concurrently with it — two copies of one event on the dead-letter topic, and the
+	// first worker's transition then failing with a lost claim it never actually lost.
 	//
-	// MarkEventFailed's exhaustion arm and MarkEventPermanentlyFailed both retain the claim
-	// token, precisely so that only the worker that spent the last attempt may perform the
-	// dead-letter write and the MarkEventDeadLettered that records it. Both used to clear
-	// locked_until at the same time, and clearing it handed the row straight back:
-	// ClaimFailedEventOutboxForDeadLetter selects a failed row with dlt_topic IS NULL and an
-	// ABSENT OR EXPIRED lease, and stamps a FRESH token over whatever was there. So a second
-	// relay instance could reclaim the row in the same instant, overwrite the token the first
-	// worker was about to present, and publish to the dead-letter topic concurrently with it —
-	// two copies of one event on the dead-letter topic, and the first worker's transition then
-	// failing with a lost claim it never actually lost. Retaining the token without retaining
-	// the lease made the token's exclusivity decorative.
+	// Holding a lease across the hand-off is what makes the retained token mean something:
+	// the repair path cannot see the row until the lease lapses, by which time the owning
+	// worker has either recorded the dead-letter write — MarkEventDeadLettered clears both
+	// the lease and the token — or died, which is exactly when the repair path SHOULD take
+	// it.
 	//
-	// Holding a lease across the hand-off is what makes the retained token mean something: the
-	// repair path cannot see the row until the lease lapses, by which time the owning worker
-	// has either recorded the dead-letter write — MarkEventDeadLettered clears both the lease
-	// and the token — or died, which is exactly when the repair path SHOULD take it.
-	//
-	// It equals defaultEventClaimLease deliberately. The hand-off is one broker write plus one
-	// UPDATE, the same shape of work an ordinary claim covers, and a longer lease would only
-	// delay repair after a crash while a shorter one would reintroduce the race under load.
-	// It is a separate constant rather than a reuse because the two answer different questions
-	// and a future change to one must not silently move the other.
+	// It equals defaultEventClaimLease deliberately. The hand-off is one broker write plus
+	// one UPDATE, the same shape of work an ordinary claim covers, and a longer lease
+	// would only delay repair after a crash while a shorter one would reintroduce the race
+	// under load.
 	eventDeadLetterHandoffLease = 30 * time.Second
 
 	// Page-size bounds for the dead-letter listing. The default keeps an
@@ -159,37 +126,22 @@ const (
 	defaultDeadLetterPageSize = 50
 	maxDeadLetterPageSize     = 500
 
-	// Slice-size bounds for the retention purge. The default keeps one sweep
-	// short enough that it never holds locks long against a table the relay is
-	// concurrently claiming from; the maximum stops a caller asking for a delete
-	// large enough to block the relay and bloat the WAL in one transaction. A
-	// caller sweeps in a loop until fewer than its limit are returned.
+	// Slice-size bounds for the retention purge. The default keeps one sweep short enough
+	// that it never holds locks long against a table the relay is concurrently claiming
+	// from; the maximum stops a caller asking for a delete large enough to block the relay
+	// and bloat the WAL in one transaction. A caller sweeps in a loop until fewer than its
+	// limit are returned.
 	defaultEventPurgeBatchSize = 1000
 	maxEventPurgeBatchSize     = 10000
 )
 
-// eventOutboxColumns is the column list every read of blnk.event_outbox
-// projects, in the exact order scanEventOutbox consumes it.
+// eventOutboxColumns is the column list every read of blnk.event_outbox projects, in
+// the exact order scanEventOutbox consumes it.
 //
 // It is declared once because the claim, the single-row fetch and the dead-letter
-// listing must project identically: a column added to one query and not the
-// others is a scan-order bug that no compiler catches and that surfaces only as
-// mis-assigned field values at runtime.
-//
-// created_at is deliberately absent. It exists on the table for forensics, but
-// model.EventOutbox has no field for it and nothing orders by it — all ordering
-// in this file is by occurred_at — so projecting it would only add a column with
-// nowhere to go.
-// payload_raw, NOT payload, is the body column projected here. The BYTEA column holds
-// the producer's exact bytes; the JSONB column holds PostgreSQL's normalised
-// re-rendering of them, and model.EventOutbox.Payload is what the Kafka publish, the
-// legacy webhook leg and a dead-letter replay all serialise. Projecting the JSONB
-// column would silently substitute normalised bytes for the producer's own and break
-// acceptance criteria V-8 and V-9 without any read failing.
-// traceparent and tracestate are projected because the PUBLISH path reads them: the relay
-// links its producer span to the trace that captured the event, and without them in the
-// projection a claimed row arrives with no memory of where it came from and every publish
-// span starts a trace of its own.
+// listing must project identically: a column added to one query and not the others is a
+// scan-order bug that no compiler catches and that surfaces only as mis-assigned field
+// values at runtime.
 const eventOutboxColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, schema_version, ` +
 	`payload_raw, event_raw, occurred_at, status, attempts, max_attempts, next_attempt_at, last_error, first_attempted_at, ` +
 	`last_attempted_at, dispatched_at, locked_until, claim_token, webhook_dispatched, kafka_dispatched_at, ` +
@@ -205,15 +157,9 @@ type eventOutboxScanner interface {
 // scanEventOutbox decodes one blnk.event_outbox row into a model.EventOutbox.
 //
 // Every nullable column is read through a sql.Null* wrapper and then normalised:
-// nullable text becomes the empty string, and nullable timestamps become nil
-// pointers rather than zero times. That distinction matters — a nil
-// FirstAttemptedAt means "never attempted", which a zero time.Time would silently
-// misreport as the year 1.
-//
-// Both JSONB columns are decoded as raw JSON. payload is scanned straight into
-// the json.RawMessage field so the stored bytes reach the caller untransformed,
-// and failure_metadata is scanned into a byte slice so that SQL NULL stays a nil
-// RawMessage rather than becoming the four bytes "null".
+// nullable text becomes the empty string, and nullable timestamps become nil pointers
+// rather than zero times. That distinction matters — a nil FirstAttemptedAt means
+// "never attempted", which a zero time.Time would silently misreport as the year 1.
 func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	var e model.EventOutbox
 	var ledgerID, lastError, claimToken, dltTopic, kafkaTopic sql.NullString
@@ -265,11 +211,10 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 		return model.EventOutbox{}, err
 	}
 
-	// ledger_id is NULLABLE and NULL means "this event has no ledger" as a
-	// positive fact — see the column comment in the migration. It collapses to the
-	// empty string on the Go side because model.EventOutbox.LedgerID is a plain
-	// string tagged omitempty, so both spellings render identically on the wire and
-	// no caller has to branch on a pointer.
+	// ledger_id is NULLABLE and NULL means "this event has no ledger" as a positive fact —
+	// see the column comment in the migration. It collapses to the empty string on the Go
+	// side because model.EventOutbox.LedgerID is a plain string tagged omitempty, so both
+	// spellings render identically on the wire and no caller has to branch on a pointer.
 	e.LedgerID = ledgerID.String
 	e.LastError = lastError.String
 	// A non-empty claim token means some worker holds this row right now, and it is
@@ -303,9 +248,10 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 		e.LockedUntil = &lockedUntil.Time
 	}
 	// The broker coordinate is all-or-nothing, which the check constraint enforces in the
-	// schema and this reads back the same way. Assigning the partition or the offset without
-	// the topic would produce a row that looks confirmed to a reader testing only the offset
-	// and has nothing to look the record up with — see model.EventOutbox.BrokerRecord.
+	// schema and this reads back the same way. Assigning the partition or the offset
+	// without the topic would produce a row that looks confirmed to a reader testing only
+	// the offset and has nothing to look the record up with — see
+	// model.EventOutbox.BrokerRecord.
 	if kafkaTopic.Valid && kafkaPartition.Valid && kafkaOffset.Valid {
 		partition := int(kafkaPartition.Int32)
 		offset := kafkaOffset.Int64
@@ -317,31 +263,10 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	return e, nil
 }
 
-// eventOutboxInsertQuery is shared by the in-transaction insert, the standalone
-// insert and the batch insert, so none of the three can diverge in which columns
-// it populates. The batch insert reuses the same column list and repeats the same
-// value tuple once per row; every other detail is identical.
-//
-// status is bound explicitly from model.EventOutboxStatusPending rather than left
-// to the column default, mirroring InsertLineageOutboxInTx: the initial state
-// belongs to this layer and not to the caller, and binding it means a caller that
-// sets Status to anything else cannot smuggle a row into the middle of the relay
-// state machine. The bound value and the column default agree, so the row is
-// pending either way.
-//
-// occurred_at, by contrast, IS the caller's value: it is the domain instant that
-// was observed, it is what the claim orders by, and replacing it with the insert
-// time would destroy the ordering guarantee built on it. created_at and the
-// remaining relay-state columns are left to their defaults.
-// Both body columns are populated, from the same bytes: payload for SQL-side
-// containment and extraction queries, payload_raw for every byte-level guarantee.
-// Populating one without the other is not an option — a reader takes the body from
-// payload_raw, so a missing payload_raw is a missing event body.
-// traceparent and tracestate are inserted so the trace that captured an event survives to
-// the publish. They are bound as SQL NULL when absent rather than as empty strings, on the
-// same reasoning as ledger_id: the column is nullable so that "there was no trace" is a
-// statable fact, and two spellings of one meaning is how a query filtering on one silently
-// misses rows.
+// eventOutboxInsertQuery is shared by the in-transaction insert, the standalone insert
+// and the batch insert, so none of the three can diverge in which columns it populates.
+// The batch insert reuses the same column list and repeats the same value tuple once
+// per row; every other detail is identical.
 const eventOutboxInsertColumns = `event_id, event_type, aggregate_id, partition_key, ledger_id, topic, ` +
 	`schema_version, payload, payload_raw, event_raw, occurred_at, status, max_attempts, traceparent, tracestate`
 
@@ -357,71 +282,34 @@ const eventOutboxInsertQuery = `
 // rather than to a literal that a later column addition would leave stale.
 const eventOutboxInsertValueCount = 15
 
-// maxEventOutboxInsertRows bounds how many rows one multi-row INSERT may carry,
-// and it is a hard requirement rather than tuning.
-//
-// PostgreSQL's extended protocol accepts at most 65535 bound parameters per
-// statement. At eventOutboxInsertValueCount parameters per row, a single statement
-// therefore tops out around 5957 rows — and the transaction coalescing path is
-// allowed to present up to 10000 transactions in one batch, so an unbounded batch
-// would fail outright on a large enough coalesced write and roll the whole ledger
-// transaction back with it. Chunking at 1000 rows keeps every statement an order of
-// magnitude clear of the limit while still costing only one round trip per
-// thousand events, and every chunk runs inside the caller's transaction, so the
-// batch remains all-or-nothing.
+// maxEventOutboxInsertRows bounds how many rows one multi-row INSERT may carry, and it
+// is a hard requirement rather than tuning.
 const maxEventOutboxInsertRows = 1000
 
-// validateEventOutboxEntry is the persistence-boundary gate on every field of an
-// event row, and it runs before ANY insert path — in-transaction, standalone or
-// batched. It converts each rejection into a typed bad-request rather than letting
-// it surface as an opaque driver error raised deep inside the caller's ledger
-// transaction, or worse, as a row that is accepted and then cannot be published.
-//
-// # Why the persistence layer validates at all
-//
-// A stored row is a COMMITMENT. Once it is in the table, the relay will try to
-// publish it, retry it, spend its budget on it, and finally preserve it on a
-// dead-letter topic — and every one of those steps costs work and produces alert
-// noise. A row that could never have been published is therefore not a harmless
-// bad value; it is a guaranteed dead-letter entry that an operator has to triage.
-// Validating here means the failure is reported to the caller that caused it, at
-// the moment it is caused, with the field named.
-//
-// It also validates what the schema's CHECK constraints enforce, one layer above
-// them, on purpose. The constraints are the backstop that protects the table from
-// any writer; these checks are what produce a diagnosable message instead of
-// "violates check constraint event_outbox_partition_key_not_blank".
+// validateEventOutboxEntry is the persistence-boundary gate on every field of an event
+// row, and it runs before ANY insert path — in-transaction, standalone or batched. It
+// converts each rejection into a typed bad-request rather than letting it surface as an
+// opaque driver error raised deep inside the caller's ledger transaction, or worse, as
+// a row that is accepted and then cannot be published.
 //
 // Each rule, and the specific failure it prevents:
 //
 //   - Nil entry: a programming error; dereferencing it would panic.
-//   - event_id must be a canonical hyphenated UUID. It is the SUBSCRIBER'S
-//     IDEMPOTENCY KEY, so a non-UUID or alternatively-spelled value is a key a
-//     consumer cannot deduplicate on reliably. An empty one is worse: the first row
-//     succeeds and every later one collides on the unique index, surfacing far from
-//     its cause.
-//   - event_type must be non-blank. It is what subscribers filter on and what the
-//     relay routes by; blank is unroutable.
+//   - event_id must be a canonical hyphenated UUID. It is the SUBSCRIBER'S IDEMPOTENCY
+//     KEY, so a non-UUID or alternatively-spelled value is a key a consumer cannot
+//     deduplicate on reliably.
+//   - event_type must be non-blank. It is what subscribers filter on and what the relay
+//     routes by; blank is unroutable.
 //   - aggregate_id must be non-blank. It is what consumers group by and what the
 //     ordering audit queries on.
 //   - partition_key must be non-blank. A blank key makes Kafka scatter the event
-//     round-robin, which silently destroys the per-aggregate ordering guarantee
-//     with nothing in the row to show it happened.
+//     round-robin, which silently destroys the per-aggregate ordering guarantee with
+//     nothing in the row to show it happened.
 //   - topic must be non-blank AND lie inside the Blnk-owned topic namespace.
-//     Without the namespace check, a row could name an arbitrary topic and the
-//     relay would lazily create a writer for it and publish there — a write to a
-//     destination Blnk does not own, driven by data.
 //   - schema_version must be a version this build actually emits. It reaches
 //     subscribers on the wire, where an unknown value is an unknown envelope shape.
 //   - payload must be present, must be valid JSON, and must fit within
-//     model.MaxEventMessageBytes. Absent means there is nothing to publish; invalid
-//     JSON would be rejected by the JSONB column anyway but with a driver error
-//     instead of a field name; and oversize means the row is accepted here and then
-//     rejected by the broker on every one of its attempts until it dead-letters.
-//
-// The entry must already have been normalised — normalizeEventOutboxEntry supplies
-// the defaults a caller may legitimately omit — so that this function sees exactly
-// the values that are about to be bound.
+//     model.MaxEventMessageBytes.
 func validateEventOutboxEntry(e *model.EventOutbox) error {
 	if e == nil {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox entry is required", nil)
@@ -463,12 +351,6 @@ func validateEventOutboxEntry(e *model.EventOutbox) error {
 	// entry it is handed. It is checked anyway because the column is NOT NULL, and a
 	// constraint violation raised inside a caller's ledger transaction is a far worse way
 	// to learn about it than a named failure — the whole reason this function exists.
-	//
-	// The size ceiling applies to the ENVELOPE and not only to the payload: the envelope is
-	// what Kafka is asked to accept, and a dead-letter copy of it is larger still. A row
-	// over the limit could therefore be published on no attempt and dead-lettered on none
-	// either, which is an unbounded backlog from one event. Refusing it at the boundary is
-	// what keeps that out of the table.
 	if len(bytes.TrimSpace(e.EventRaw)) == 0 {
 		return apierror.NewAPIError(apierror.ErrBadRequest,
 			"Event outbox entry requires its canonical event envelope", nil)
@@ -485,37 +367,13 @@ func validateEventOutboxEntry(e *model.EventOutbox) error {
 	return nil
 }
 
-// expectedEventTopicPrefixes resolves every topic namespace this deployment owns, for the
-// topic-membership check above.
-//
-// It reads KAFKA_TOPIC_PREFIX followed by KAFKA_HISTORICAL_TOPIC_PREFIXES, and falls back
-// to model.DefaultEventTopicPrefix when configuration is unset, blank or not loaded — which
-// mirrors the root package's OwnedTopicPrefixes exactly, so the names a row is validated
-// against are the names that row's topic could have been composed from.
-//
-// # Why the historical prefixes belong here too
-//
-// The two ownership checks — this one at insert and the publisher's at writer
-// resolution — must share ONE definition of an owned destination, or a row can be accepted
-// by the layer that stores it and refused by the layer that publishes it, which is a
-// permanently undeliverable committed event. Since the publisher now admits every declared
-// prefix so that rows captured before a rename can still drain, this admits them too.
+// expectedEventTopicPrefixes resolves every topic namespace this deployment owns, for
+// the topic-membership check above.
 //
 // The widening reaches nothing a producer can steer. A new row's topic is composed by
-// TopicForEvent from the CONFIGURED prefix alone, so a historical name cannot arrive on an
-// insert in the first place; what the shared definition buys is that the two layers cannot
-// disagree, not extra reach for a caller.
-//
-// THE FALLBACK IS THE STRICT ANSWER, not a permissive one. Defaulting to "blnk" means a
-// deployment that renamed its namespace but has not loaded configuration has its inserts
-// REFUSED rather than accepted; the failure is visible and safe. Defaulting to "accept
-// anything" would have turned a configuration problem into an open namespace.
-//
-// The value is re-read per call rather than cached, because the configuration store is
-// an atomic value that is re-published whenever configuration is reloaded; a cached
-// prefix would keep validating against configuration that no longer exists. The cost is
-// one atomic load and a trim of a few short strings, and nothing pays it on a hot loop —
-// validation runs once per inserted row.
+// TopicForEvent from the CONFIGURED prefix alone, so a historical name cannot arrive on
+// an insert in the first place; what the shared definition buys is that the two layers
+// cannot disagree, not extra reach for a caller.
 //
 // Returns:
 //   - []string: one or more distinct, non-blank prefixes, the configured one first.
@@ -533,14 +391,8 @@ func expectedEventTopicPrefixes() []string {
 	return prefixes
 }
 
-// configuredEventTopicPrefix resolves the CURRENT topic namespace only — KAFKA_TOPIC_PREFIX,
-// falling back to model.DefaultEventTopicPrefix.
-//
-// It is deliberately narrower than expectedEventTopicPrefixes and is for the questions where
-// only the live generation is a valid answer: which topics a SUBSCRIBER may be granted, and
-// which topics are provisioned into. A historical namespace is something to drain, so
-// granting a subscriber Read on it, or continuing to create topics there, would be exactly
-// the wrong direction — it keeps a generation alive that the allowlist exists to retire.
+// configuredEventTopicPrefix resolves the CURRENT topic namespace only —
+// KAFKA_TOPIC_PREFIX, falling back to model.DefaultEventTopicPrefix.
 //
 // Returns:
 //   - string: a non-empty prefix.
@@ -548,14 +400,13 @@ func configuredEventTopicPrefix() string {
 	return expectedEventTopicPrefixes()[0]
 }
 
-// prepareEventOutboxEntry normalises then validates one entry, in that order, and
-// is the single sequence every insert path uses.
+// prepareEventOutboxEntry normalises then validates one entry, in that order, and is
+// the single sequence every insert path uses.
 //
 // The order is not interchangeable. Normalisation supplies the schema version, the
-// retry budget and the occurrence instant that a caller may legitimately leave
-// unset; validating first would reject a perfectly ordinary entry for missing a
-// value this layer is responsible for providing. Sharing one function means the
-// three insert paths cannot end up applying the two steps in different orders.
+// retry budget and the occurrence instant that a caller may legitimately leave unset;
+// validating first would reject a perfectly ordinary entry for missing a value this
+// layer is responsible for providing.
 func prepareEventOutboxEntry(e *model.EventOutbox) error {
 	if e == nil {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox entry is required", nil)
@@ -567,15 +418,11 @@ func prepareEventOutboxEntry(e *model.EventOutbox) error {
 	return validateEventOutboxEntry(e)
 }
 
-// normalizeEventOutboxEntry applies the defaults a caller may legitimately leave
-// unset and pins the initial status, mutating the entry so that it describes
-// exactly what is about to be persisted. Callers read these fields back after the
-// insert — the relay and the dual-delivery leg both work from the in-memory row —
-// so leaving the struct disagreeing with the stored row would be a trap.
-//
-// A non-positive schema_version is raised to model.SchemaVersionV1 because the
-// envelope version reaches subscribers on the wire, where a zero would be read as
-// an unknown schema.
+// normalizeEventOutboxEntry applies the defaults a caller may legitimately leave unset
+// and pins the initial status, mutating the entry so that it describes exactly what is
+// about to be persisted. Callers read these fields back after the insert — the relay
+// and the dual-delivery leg both work from the in-memory row — so leaving the struct
+// disagreeing with the stored row would be a trap.
 func normalizeEventOutboxEntry(e *model.EventOutbox) error {
 	if e.OccurredAt.IsZero() {
 		e.OccurredAt = time.Now()
@@ -590,13 +437,6 @@ func normalizeEventOutboxEntry(e *model.EventOutbox) error {
 
 	// THE TRACE CONTEXT IS SANITISED, NEVER VALIDATED INTO A REJECTION.
 	//
-	// Both values originate in a caller-supplied HTTP header, and both columns carry a length
-	// CHECK. If an oversized header reached the statement, PostgreSQL would raise a constraint
-	// violation INSIDE THE CALLER'S LEDGER TRANSACTION and roll the money movement back — so a
-	// request header would be able to fail a transfer. Dropping the unusable value here means
-	// the worst a bad header can cost is one missing trace link, and it makes the database
-	// constraints a backstop that cannot fire rather than a live failure mode.
-	//
 	// SanitizeTraceContext owns the rules, including that a tracestate cannot outlive the
 	// traceparent it describes.
 	e.Traceparent, e.Tracestate = model.SanitizeTraceContext(e.Traceparent, e.Tracestate)
@@ -609,9 +449,6 @@ func normalizeEventOutboxEntry(e *model.EventOutbox) error {
 	// above. Deriving it AFTER the schema version and the occurrence instant is not
 	// optional: both are members of the envelope, so composing first would freeze a zero
 	// version or a zero timestamp into the stored value.
-	//
-	// A supplied value is never recomputed. It is the authority, and overwriting it would
-	// defeat the entire purpose of storing it.
 	if len(bytes.TrimSpace(e.EventRaw)) == 0 {
 		canonical, err := e.CanonicalEvent().CanonicalBytes()
 		if err != nil {
@@ -654,18 +491,17 @@ func eventOutboxInsertArgs(e *model.EventOutbox) []interface{} {
 		ledgerIDArg,
 		e.Topic,
 		e.SchemaVersion,
-		// ONE slice serves BOTH body columns, and that is the mechanism by which the
-		// JSONB projection and the byte-preserving column cannot disagree: PostgreSQL
-		// parses this value on its way into payload and stores it verbatim in
-		// payload_raw. Binding them from two expressions — or re-marshalling for one of
-		// them — is how they would drift, and the drift would be invisible until a
-		// replay was compared byte for byte.
+		// ONE slice serves BOTH body columns, and that is the mechanism by which the JSONB
+		// projection and the byte-preserving column cannot disagree: PostgreSQL parses this
+		// value on its way into payload and stores it verbatim in payload_raw. Binding them
+		// from two expressions — or re-marshalling for one of them — is how they would drift,
+		// and the drift would be invisible until a replay was compared byte for byte.
 		payload,
 		payload,
-		// THE CANONICAL ENVELOPE, stored rather than rebuilt on every publish. It is
-		// never nil here: prepareEventOutboxEntry derives it from the envelope fields
-		// when a caller left it empty, and validateEventOutboxEntry refuses a row
-		// without one, so this binding cannot violate the column's NOT NULL.
+		// THE CANONICAL ENVELOPE, stored rather than rebuilt on every publish. It is never
+		// nil here: prepareEventOutboxEntry derives it from the envelope fields when a caller
+		// left it empty, and validateEventOutboxEntry refuses a row without one, so this
+		// binding cannot violate the column's NOT NULL.
 		[]byte(e.EventRaw),
 		e.OccurredAt,
 		model.EventOutboxStatusPending,
@@ -681,9 +517,10 @@ func eventOutboxInsertArgs(e *model.EventOutbox) []interface{} {
 
 // nullableTraceValue binds a trace-context value, or SQL NULL when it is absent.
 //
-// Its own function rather than two inline conditionals because the two columns need identical
-// treatment and an asymmetry between them would be invisible: a tracestate stored as ” beside
-// a NULL traceparent reads as "vendor state for no trace", which is not a state that exists.
+// Its own function rather than two inline conditionals because the two columns need
+// identical treatment and an asymmetry between them would be invisible: a tracestate
+// stored as ” beside a NULL traceparent reads as "vendor state for no trace", which is
+// not a state that exists.
 //
 // Parameters:
 //   - value string: the trimmed trace value, or empty when there is none.
@@ -698,43 +535,27 @@ func nullableTraceValue(value string) interface{} {
 	return nil
 }
 
-// hashedEventIdentifier turns a financial identifier into a stable, non-reversible token
-// for a log field.
+// hashedEventIdentifier turns a financial identifier into a stable, non-reversible
+// token for a log field.
 //
-// It keeps the one property a log needs — the same identifier always produces the same token
-// — and gives up the one it does not need, the identifier itself. An empty input returns an
-// empty string rather than the digest of the empty string, so "no aggregate" and "some
-// aggregate" stay distinguishable.
-//
-// # It DELEGATES rather than reimplements, and that is the point
-//
-// This token is published in three places by three packages: on metrics and logs by the root
-// package, on this package's own log lines, and as subscriber_id_hash on the subscriber
-// resource by api/model. model.HashIdentifier is the single rule all three call, so one
-// identifier produces one token everywhere and an operator can pivot between them. A local
-// digest here — even a correct one — would be a second thing to keep in step, and drift would
-// be silent: two tokens for one subject and a pivot that resolves nothing.
+// It keeps the one property a log needs — the same identifier always produces the same
+// token — and gives up the one it does not need, the identifier itself. An empty input
+// returns an empty string rather than the digest of the empty string, so "no aggregate"
+// and "some aggregate" stay distinguishable.
 //
 // Parameters:
 //   - value string: the identifier. May be empty.
 //
 // Returns:
-//   - string: a short hex token of model.LogIdentifierHashLength characters, or "" for an
-//     empty input.
+//   - string: a short hex token of model.LogIdentifierHashLength characters, or "" for
+//     an empty input.
 func hashedEventIdentifier(value string) string {
 	return model.HashIdentifier(value)
 }
 
-// wrapEventOutboxInsertError turns a driver failure into the typed error the rest
-// of the system can act on, following the discrimination UpsertLineageMapping
-// performs on *pq.Error.
-//
-// The unique-violation case is the one that matters. event_id carries
-// event_outbox_event_id_uidx, which is what makes "one event is recorded once" a
-// schema-enforced invariant, so a duplicate insert is a CONFLICT and not a server
-// fault: a caller retrying a mutation whose event was already captured must be
-// able to recognise that and carry on. errors.As is used rather than a bare type
-// assertion so the discrimination still works if the driver error arrives wrapped.
+// wrapEventOutboxInsertError turns a driver failure into the typed error the rest of
+// the system can act on, following the discrimination UpsertLineageMapping performs on
+// *pq.Error.
 func wrapEventOutboxInsertError(err error) error {
 	var pqErr *pq.Error
 	if errors.As(err, &pqErr) {
@@ -746,10 +567,10 @@ func wrapEventOutboxInsertError(err error) error {
 		case "not_null_violation":
 			return loggedDatabaseError(apierror.ErrBadRequest, "Event outbox entry is missing a required field", "wrap_event_outbox_insert_error", err)
 		case "check_violation":
-			// The schema's CHECK constraints are the backstop beneath
-			// validateEventOutboxEntry. Reaching one means a value slipped past that
-			// gate, so this is a bad request and not a server fault — but it is also
-			// worth noticing, because the two layers are supposed to agree.
+			// The schema's CHECK constraints are the backstop beneath validateEventOutboxEntry.
+			// Reaching one means a value slipped past that gate, so this is a bad request and
+			// not a server fault — but it is also worth noticing, because the two layers are
+			// supposed to agree.
 			return loggedDatabaseError(apierror.ErrBadRequest, "Event outbox entry violates a field constraint", "wrap_event_outbox_insert_error", err)
 		default:
 			return loggedDatabaseError(apierror.ErrInternalServer, "Database error occurred", "wrap_event_outbox_insert_error", err)
@@ -762,16 +583,9 @@ func wrapEventOutboxInsertError(err error) error {
 // transaction, so the event is committed atomically with the ledger mutation that
 // produced it.
 //
-// This is the method that makes the transactional-outbox guarantee real: the
-// caller has already begun a transaction and applied its balance updates, and
-// passing that same *sql.Tx here is what ties the event's fate to theirs. Roll the
-// transaction back and the event row is gone with it; commit and neither can exist
-// without the other. The generated id is written back onto the supplied entry so
-// the caller can correlate it after the commit.
-//
-// No span is opened. This runs inside a caller-owned transaction whose span is
-// already open in transaction.go, and one span per inserted row would bury that
-// trace in noise for no diagnostic gain.
+// No span is opened. This runs inside a caller-owned transaction whose span is already
+// open in transaction.go, and one span per inserted row would bury that trace in noise
+// for no diagnostic gain.
 func (d Datasource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error {
 	if err := prepareEventOutboxEntry(e); err != nil {
 		return err
@@ -785,24 +599,12 @@ func (d Datasource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *mo
 
 // sqlExecer is the minimum surface an entity INSERT needs, satisfied by both *sql.DB
 // and *sql.Tx.
-//
-// It exists so that one insert function serves both the direct path and the
-// transactional path of a create-and-capture writer. Duplicating the statement for the
-// two paths is how the column list, the generated id and the driver-error mapping drift
-// apart, and the drift would show up as a create that behaves differently depending on
-// whether an event was being captured alongside it.
 type sqlExecer interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
-// sqlQueryer is the minimum surface a READ needs, satisfied by both *sql.DB and *sql.Tx.
-//
-// It is the read-side counterpart of sqlExecer and exists for the same reason: a page and the
-// total that accompanies it have to be answerable from ONE SNAPSHOT, which means running the
-// two statements inside a transaction, while the same two reads must remain available
-// standalone. Parameterising the statement by its connection is what keeps a single copy of
-// each — the alternative is a second copy of the cursor predicate that only the paired read
-// uses, and a divergence there is invisible until a total disagrees with the page it describes.
+// sqlQueryer is the minimum surface a READ needs, satisfied by both *sql.DB and
+// *sql.Tx.
 type sqlQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
@@ -811,46 +613,17 @@ type sqlQueryer interface {
 // EventPreparer builds the outbox row for an entity that has JUST BEEN INSERTED, and is
 // called from inside the transaction that inserted it.
 //
-// # Why a create-and-capture writer needs a callback rather than a prepared row
-//
-// The three creation events — ledger.created, identity.created, balance.created — describe
-// an entity whose identity and creation instant are minted INSIDE the repository:
-// CreateLedger assigns ldg_<uuid>, CreateIdentity assigns idt_<uuid> unless the caller
-// supplied one, CreateBalance assigns bln_<uuid>, and each stamps created_at. The event's
-// payload is that finished entity, and its aggregate id and partition key are derived from
-// the very id that does not exist until the insert has run. A row prepared BEFORE the call
-// would therefore describe an entity that does not exist yet, and moving id generation up
-// into the service layer to avoid that would change domain behaviour this change is not
-// permitted to touch.
-//
-// So the caller passes a function instead of a row: the writer inserts the entity, hands
-// the finished value to this function, and inserts whatever row comes back — all inside one
-// transaction, which is requirement R-2 for these three producers.
-//
-// # The contract this function must honour
-//
-// It runs while a database transaction is open, so it must do NO I/O and must not block:
-// blnk's implementation marshals the payload and reads process configuration, and nothing
-// else. Returning (nil, nil) is legitimate and means "no event to capture" — which is what
-// PrepareEventOutbox returns when publishing is not configured, and it leaves the entity
-// insert to commit on its own. Returning an error ABORTS the whole transaction, entity
-// included, because a mutation whose event cannot be built is exactly the half-committed
-// state the outbox exists to rule out.
+// So the caller passes a function instead of a row: the writer inserts the entity,
+// hands the finished value to this function, and inserts whatever row comes back — all
+// inside one transaction, which is the requirement for these three producers.
 type EventPreparer[T any] func(entity T) (*model.EventOutbox, error)
 
-// firstEventPreparer resolves a variadic preparer tail to the single preparer to use, or
-// nil when none was supplied.
+// firstEventPreparer resolves a variadic preparer tail to the single preparer to use,
+// or nil when none was supplied.
 //
-// The tail is variadic so that adding event capture to CreateLedger, CreateIdentity and
-// CreateBalance keeps every pre-existing caller source-compatible — the API layer, the
-// reconciliation and account paths, and a long tail of tests all call them with one
-// argument — which is the same reason the atomic transaction writers take their event rows
-// variadically. Nils are skipped rather than honoured, because a caller assembling the
-// argument conditionally would otherwise take a create down with it.
-//
-// Only the FIRST non-nil preparer is used. One entity produces one creation event; a second
-// preparer would mean two events for one mutation, which is a duplicate publication the
-// subscriber cannot distinguish from a genuine repeat.
+// Only the FIRST non-nil preparer is used. One entity produces one creation event; a
+// second preparer would mean two events for one mutation, which is a duplicate
+// publication the subscriber cannot distinguish from a genuine repeat.
 //
 // Parameters:
 //   - preparers []EventPreparer[T]: the caller's variadic tail, possibly empty.
@@ -867,12 +640,12 @@ func firstEventPreparer[T any](preparers []EventPreparer[T]) EventPreparer[T] {
 	return nil
 }
 
-// captureEntityEvent runs a preparer against a just-inserted entity and inserts the row it
-// returns inside the caller's transaction.
+// captureEntityEvent runs a preparer against a just-inserted entity and inserts the row
+// it returns inside the caller's transaction.
 //
-// It is a free function rather than a method because Go does not permit type parameters on
-// methods; the datasource is passed explicitly so the insert still goes through the one
-// exported in-transaction insert every atomic writer uses.
+// It is a free function rather than a method because Go does not permit type parameters
+// on methods; the datasource is passed explicitly so the insert still goes through the
+// one exported in-transaction insert every atomic writer uses.
 //
 // Parameters:
 //   - ctx context.Context: the writer's context.
@@ -882,8 +655,8 @@ func firstEventPreparer[T any](preparers []EventPreparer[T]) EventPreparer[T] {
 //   - prepare EventPreparer[T]: the caller's preparer. Must not be nil.
 //
 // Returns:
-//   - error: the preparer's error, or the insert's error. Either aborts the transaction,
-//     so the entity is not created without its event.
+//   - error: the preparer's error, or the insert's error. Either aborts the
+//     transaction, so the entity is not created without its event.
 func captureEntityEvent[T any](ctx context.Context, d Datasource, tx *sql.Tx, entity T, prepare EventPreparer[T]) error {
 	row, err := prepare(entity)
 	if err != nil {
@@ -902,44 +675,9 @@ func captureEntityEvent[T any](ctx context.Context, d Datasource, tx *sql.Tx, en
 // InsertEventOutbox inserts an event outbox entry directly, outside any ledger
 // transaction.
 //
-// # THIS PATH IS NOT ATOMIC WITH ITS MUTATION — read this before using it
-//
-// The transactional-outbox guarantee belongs to InsertEventOutboxInTx and to it
-// alone. This method opens no transaction and joins none, so it provides durable
-// retry, dead-lettering and replay for the event, and NOTHING about atomicity. A
-// caller that has already committed a domain mutation and then calls this has a real
-// window: if the process dies, or this insert fails, in between, the domain state is
-// committed and its event does not exist. No amount of retrying here closes that
-// window, because the mutation is already durable.
-//
-// Retrying does, however, remove the FAR MORE LIKELY failure inside that window — a
-// momentary connection reset, a brief pool exhaustion, a statement error — and the
-// producers whose mutation is already committed therefore call this through a bounded
-// retry rather than once: PublishEventDurably in event_outbox.go for balance.monitor
-// and for a coalesced batch's transaction.* events, and sendBulkTransactionWebhook for
-// the bulk outcome. All of them re-send the SAME prepared row, which is why the retry
-// cannot duplicate the event: an identical stored row is adopted as success below (see
-// resolveDuplicateEventOutboxInsert) instead of being inserted a second time under a
-// second id. The residual at-most-once behaviour that remains after the budget is spent
-// is documented as one of the THREE explicit exceptions to requirement R-2 in
-// docs/event-streaming.md, enumerated on PublishEventDurably.
-//
-// It is used by the producers that have NO SINGLE MUTATION to be atomic with:
-// balance monitor alerts, bulk transaction batch progress, the coalesced transaction
-// batch whose writer is called from a file this change may not edit, and system.error —
-// which is the one of the four that describes no mutation at all. For those, there is no
-// transaction to enrol the event in, so this path is the correct one rather than a
-// compromise.
-//
-// The three ordinary creation events NO LONGER COME HERE. Ledger, identity and balance
-// creation each insert their event inside the transaction that inserts the entity —
-// see CreateLedger, CreateIdentity and CreateBalance, which take an EventPreparer for
-// exactly that purpose — so the window described above is closed for them rather than
-// merely documented.
-//
-// A failure is logged at ERROR with the full event identity, not merely returned, so
-// that a lost event is visible in the log even at a call site that discards the
-// error. That is the difference between a gap that can be found and one that cannot.
+// The transactional-outbox guarantee belongs to InsertEventOutboxInTx and to it alone.
+// This method opens no transaction and joins none, so it provides durable retry,
+// dead-lettering and replay for the event, and NOTHING about atomicity.
 func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error {
 	if err := prepareEventOutboxEntry(e); err != nil {
 		return err
@@ -963,20 +701,10 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 		}
 
 		failDatabaseSpan(span, err)
-		// Loud by design. This is the non-atomic path, so a failure here means the
-		// domain mutation that produced this event is already committed and the event
-		// is gone. Returning the error alone would make that invisible at any call
-		// site that logs and continues.
-		//
-		// The aggregate is reported as a HASH rather than in plaintext. It is a ledger,
-		// balance, transaction or identity id — a financial identifier naming whose money
-		// this event describes — and this line is emitted on a failure path that a database
-		// problem can make high-volume, into a log with a wider audience and a longer life
-		// than the database itself. Correlation loses nothing: event_id identifies the event
-		// uniquely and is already here, and the token still lets an operator see that several
-		// failures share one aggregate, which is all the identifier was contributing. The
-		// producer-side log in event_outbox.go hashes the same field for the same reason, so
-		// the two lines can be joined on the token.
+		// Loud by design. This is the non-atomic path, so a failure here means the domain
+		// mutation that produced this event is already committed and the event is gone.
+		// Returning the error alone would make that invisible at any call site that logs and
+		// continues.
 		logrus.WithFields(logrus.Fields{
 			"event_id":          e.EventID,
 			"event_type":        e.EventType,
@@ -993,51 +721,28 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 	return nil
 }
 
-// resolveDuplicateEventOutboxInsert decides whether a failed insert is actually the event
-// ALREADY BEING RECORDED, and adopts the stored row's identity when it is.
+// resolveDuplicateEventOutboxInsert decides whether a failed insert is actually the
+// event ALREADY BEING RECORDED, and adopts the stored row's identity when it is.
 //
-// # Why a duplicate here is success and not loss
-//
-// event_outbox_event_id_uidx exists to make "one event is recorded once" an invariant the
-// database enforces. When it rejects an insert it is reporting that the invariant HOLDS — the
-// event is durable, exactly once, and every downstream guarantee built on it is intact. Treating
-// that as a failure inverted the meaning of the constraint: the caller was told the event was
-// lost, an ERROR line said so in the log, and a retrying caller — the bulk-outcome capture is
-// one — kept retrying a write that could only ever fail again, then reported the outcome as
-// uncaptured when it was sitting in the table.
+// event_outbox_event_id_uidx exists to make "one event is recorded once" an invariant
+// the database enforces. When it rejects an insert it is reporting that the invariant
+// HOLDS — the event is durable, exactly once, and every downstream guarantee built on
+// it is intact.
 //
 // The stored row's surrogate id is adopted so the caller ends up with the same
-// fully-identified row a first-time insert would have produced. Without that, an idempotent
-// success would hand back a row with ID 0, which the dead-letter path explicitly refuses.
-//
-// # What is NOT accepted
-//
-// Only a unique violation whose stored row is THE SAME EVENT. The comparison is on
-// event_raw — the canonical envelope bytes, which carry every envelope member — so two
-// genuinely different events that collided on one id stay a conflict and stay loud. That is
-// the case worth failing over: it means an id was reused, and silently discarding the second
-// event would lose it for real.
-//
-// A row that cannot be re-read is not accepted either. If the lookup fails, nothing has been
-// established, and the caller falls through to the loud path — reporting a possible loss it
-// could not rule out is the safe direction.
-//
-// # This applies to the NON-TRANSACTIONAL path only, and that is deliberate
-//
-// InsertEventOutboxInTx has no equivalent and must not: PostgreSQL marks a transaction
-// ABORTED after any error, so the re-read below could not run, and — more importantly — a
-// duplicate inside a ledger transaction means the caller is retrying a mutation whose event was
-// already captured. Aborting is then the correct outcome, because the mutation must roll back
-// with it.
+// fully-identified row a first-time insert would have produced. Without that, an
+// idempotent success would hand back a row with ID 0, which the dead-letter path
+// explicitly refuses.
 //
 // Parameters:
 //   - ctx context.Context: the insert's context, reused for the lookup.
-//   - e *model.EventOutbox: the row that failed to insert. Its ID is populated on adoption.
+//   - e *model.EventOutbox: the row that failed to insert. Its ID is populated on
+//     adoption.
 //   - cause error: the driver error the insert returned.
 //
 // Returns:
-//   - bool: true when the event is already recorded identically and the caller may treat the
-//     insert as having succeeded.
+//   - bool: true when the event is already recorded identically and the caller may
+//     treat the insert as having succeeded.
 func (d Datasource) resolveDuplicateEventOutboxInsert(
 	ctx context.Context,
 	e *model.EventOutbox,
@@ -1055,10 +760,11 @@ func (d Datasource) resolveDuplicateEventOutboxInsert(
 		return false
 	}
 
-	// The canonical envelope is the whole event, so byte equality here is identity. Compared as
-	// bytes rather than field by field because that is exactly what a subscriber received, and
-	// because the columns cannot be compared directly — occurred_at comes back truncated to the
-	// microsecond PostgreSQL stores, while these bytes round-trip unchanged.
+	// The canonical envelope is the whole event, so byte equality here is identity.
+	// Compared as bytes rather than field by field because that is exactly what a
+	// subscriber received, and because the columns cannot be compared directly —
+	// occurred_at comes back truncated to the microsecond PostgreSQL stores, while these
+	// bytes round-trip unchanged.
 	if len(stored.EventRaw) == 0 || !bytes.Equal(stored.EventRaw, e.EventRaw) {
 		return false
 	}
@@ -1079,24 +785,13 @@ func (d Datasource) resolveDuplicateEventOutboxInsert(
 	return true
 }
 
-// insertEventOutboxesInTx inserts a batch of event outbox entries inside an
-// existing transaction, in a single round trip.
-//
-// It is the entry point the atomic transaction writers use, including the
-// coalescing path, which is why it takes a slice and tolerates an empty one: the
-// event rows are threaded through those writers as a variadic argument, so a
-// caller that captures no events passes nothing and this is a no-op rather than an
-// error. nil elements are skipped for the same reason, mirroring
-// insertLineageOutboxesInTx.
+// insertEventOutboxesInTx inserts a batch of event outbox entries inside an existing
+// transaction, in a single round trip.
 //
 // One multi-row INSERT is used rather than a loop of single inserts because the
-// coalescing path can present a large batch inside an already-open ledger
-// transaction, where every extra round trip lengthens the window during which the
-// transaction holds its balance row locks.
-//
-// Every value is bound. The only string formatting is placeholder NUMBERING,
-// which is generated from eventOutboxInsertValueCount so it cannot fall out of
-// step with the column list, and never from caller data.
+// coalescing path can present a large batch inside an already-open ledger transaction,
+// where every extra round trip lengthens the window during which the transaction holds
+// its balance row locks.
 func insertEventOutboxesInTx(ctx context.Context, tx *sql.Tx, entries []*model.EventOutbox) error {
 	if len(entries) == 0 {
 		return nil
@@ -1207,45 +902,15 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 	return nil
 }
 
-// eventOutboxEffectiveKeySQL renders model.EffectivePartitionKey as SQL for one relation
-// alias, and it is the ONLY place that spelling exists in this package.
+// eventOutboxEffectiveKeySQL renders model.EffectivePartitionKey as SQL for one
+// relation alias, and it is the ONLY place that spelling exists in this package.
 //
-// # Why the claim cannot serialise on the partition_key column (PERF-C02)
-//
-// The Kafka message key is NOT the stored column. Requirement R-6 partitions by ledger id,
-// so the publish path keys on ledger_id when the row carries one and falls back to
+// The Kafka message key is NOT the stored column. Partitioning is by ledger id, so the
+// publish path keys on ledger_id when the row carries one and falls back to
 // partition_key only when it does not — model.EffectivePartitionKey, applied by
 // model.EventOutbox.EffectiveKey, by the publisher and by the relay's grouping.
 //
-// The claim's earlier-same-key exclusion is the statement "at most one row per KAFKA
-// PARTITION KEY is in flight". Written against partition_key it was a statement about a
-// different key, and the two disagree on exactly the rows the schema permits them to: a row
-// written before the ledger was threaded through its call site, or one whose partition key
-// was derived from the payload before the ledger was resolved. Two such rows sharing a
-// ledger have DIFFERENT stored keys, so the exclusion did not hold them apart — yet they
-// hash to ONE Kafka partition, so two relay replicas could claim them concurrently and
-// append them in either order. Silently: no error, no log line, and per-aggregate ordering
-// gone on precisely the rows an operator would later be investigating.
-//
-// # The expression is exact rather than approximate
-//
-// The expression is
-//
 //	COALESCE(NULLIF(btrim(ledger_id), <empty>), btrim(partition_key))
-//
-// which is Go's "TrimSpace(ledgerID) when non-empty, else TrimSpace(partitionKey)", term for
-// term: btrim is TrimSpace over SQL whitespace, NULLIF against the empty string turns a blank
-// ledger into NULL so COALESCE falls through, and a NULL ledger falls through directly. The
-// literal itself is written in eventOutboxEffectiveKeySQL's body just below, which is the only
-// place it appears. Two CHECK constraints make the
-// result NOT NULL and non-blank on every row — event_outbox_partition_key_not_blank and
-// event_outbox_ledger_id_not_blank_when_present — so the expression can never group rows
-// under NULL, which in an anti-join would silently stop excluding anything.
-//
-// Every function in it is IMMUTABLE, which is what makes the matching expression index in
-// sql/1781252000.sql legal and, more importantly, what makes the planner able to use it: the
-// index and the query must spell the expression identically, and they do because this
-// function is the only spelling either is built from.
 //
 // Parameters:
 //   - alias string: the relation alias the columns are qualified with.
@@ -1258,189 +923,25 @@ func eventOutboxEffectiveKeySQL(alias string) string {
 
 // claimPendingEventOutboxQuery claims a batch of publishable rows, takes a lease on
 // them and stamps a fresh claim token, all in one statement. It is a package-level
-// variable rather than a local so its text is reachable from tests, which assert
-// that FOR UPDATE SKIP LOCKED, the occurred_at ordering and the earlier-same-key
-// exclusion are all still present — the three properties a well-meaning refactor is
-// most likely to drop. A variable and not a constant only because the effective-key
-// expression is composed from eventOutboxEffectiveKeySQL rather than written twice;
-// nothing assigns to it after initialisation.
+// variable rather than a local so its text is reachable from tests, which assert that
+// FOR UPDATE SKIP LOCKED, the occurred_at ordering and the earlier-same-key exclusion
+// are all still present — the three properties a well-meaning refactor is most likely
+// to drop. A variable and not a constant only because the effective-key expression is
+// composed from eventOutboxEffectiveKeySQL rather than written twice; nothing assigns
+// to it after initialisation.
 //
-// UPDATE ... RETURNING does not preserve the inner ORDER BY, so the claimed rows
-// are re-ordered through a CTE to guarantee FIFO delivery within the batch.
-// Without the outer sort the batch would come back in arbitrary order and
-// per-aggregate FIFO would be lost inside a batch even though the partition key
-// was correct. The CTE therefore is NOT redundant and must not be collapsed.
+// UPDATE... RETURNING does not preserve the inner ORDER BY, so the claimed rows are
+// re-ordered through a CTE to guarantee FIFO delivery within the batch.
 //
-// Ordering is by occurred_at, NOT created_at as the lineage claim uses. This is
-// the one deliberate divergence from that query, and it carries the per-aggregate
-// ordering guarantee: occurred_at is the instant the domain action happened,
-// whereas created_at is when the row happened to be written. A copy-paste "fix"
-// back to created_at would leave every unit test green and silently break
-// ordering. id breaks ties, so rows that share an occurred_at instant — bulk
-// events stamped from one clock read, for instance — are still claimed in the
-// order they were recorded rather than in whatever order the planner returns.
+// Ordering is by occurred_at, NOT created_at as the lineage claim uses. This is the one
+// deliberate divergence from that query, and it carries the per-aggregate ordering
+// guarantee: occurred_at is the instant the domain action happened, whereas created_at
+// is when the row happened to be written.
 //
-// # THE EARLIER-SAME-KEY EXCLUSION, and why SKIP LOCKED alone is not enough
-//
-// The NOT EXISTS clause is the correctness heart of this query. Read it before
-// changing anything here.
-//
-// FOR UPDATE SKIP LOCKED makes it impossible for two relay instances to claim the
-// SAME row. It does NOT make it impossible for them to claim two rows of the same
-// aggregate out of order, and that is the failure it hides: relay B skips the
-// earlier row relay A holds and claims a LATER row with the same message key.
-// Kafka preserves APPEND order, not occurred_at, so relay B's message can be
-// appended first and a subscriber then observes transaction.applied before
-// transaction.queued for one transaction. There is no error, no log line and no
-// row state to show it happened — the ordering guarantee that the whole
-// partitioning scheme exists to provide is simply gone.
-//
-// THE KEY IT SERIALISES ON IS THE EFFECTIVE KEY, not the partition_key column, and
-// the difference is the whole point of the predicate rather than a detail of it. See
-// eventOutboxEffectiveKeySQL: the publish path keys by ledger id where a row has one,
-// so serialising on the stored column left same-ledger rows with divergent stored keys
-// unserialised while Kafka put them on one partition.
-//
-// NOT EXISTS closes it by making at most ONE row per effective key claimable at any
-// instant: a candidate is claimable only when no earlier row sharing its key is
-// still pending or processing. It is race-safe without any additional locking,
-// because the blocking read runs in the same snapshot in which an
-// uncommitted-but-locked earlier row still reads as pending — so a relay that skips
-// a locked row also declines every later row of that key.
-//
-// The blocking set is pending and processing ONLY, and it is deliberately narrower
-// than the claimable set. A row that has spent its retry budget (failed) or been
-// preserved on its dead-letter topic (dead_lettered) does NOT block its key
-// forever. That is an explicit trade: strict ordering would demand it block, but one
-// permanently undeliverable event would then stall every subsequent event for that
-// aggregate indefinitely, which is a worse failure than a gap. Retries DO preserve
-// order, because MarkEventFailed's retry arm returns the row to pending, where it
-// blocks its key again.
-//
-// A row that ClaimFailedEventOutboxForDeadLetter has taken does not block its key
-// either, and
-// that is the same trade rather than a new one: such a row will never reach the MAIN
-// topic under any outcome — the only question left is whether its event is preserved
-// on the dead-letter sibling — so a later event of the same aggregate overtaking it
-// changes nothing about the main topic's order. Blocking it would stall the
-// aggregate for as long as the dead-letter topic was unreachable, which is precisely
-// the failure this trade exists to avoid.
-//
-// The predicate is index-backed by idx_event_outbox_effective_key_inflight, an
-// EXPRESSION index on the same effective key this predicate compares, whose partial
-// WHERE clause is exactly the blocking set. Widening the blocking set here without
-// widening that index turns each candidate check into a scan of the key's entire
-// history; changing the expression on either side without the other loses the index
-// altogether, because a partial expression index is usable only when the query spells
-// its expression identically — which is why both are built from
-// eventOutboxEffectiveKeySQL.
-//
-// FOR UPDATE SKIP LOCKED is still not optional and must not be replaced by an
-// advisory lock, by NOWAIT, or by a status flag alone: it is what lets several relay
-// instances claim disjoint batches without blocking each other.
-//
-// # The claim token
-//
-// claim_token is stamped here and is what every subsequent transition must present
-// to be allowed to write. It converts each transition from "update row 42" into
-// "update row 42 IF I still hold it", which is what stops a worker whose lease
-// expired from overwriting the newer state of a row another instance has since
-// taken. One token is issued per CLAIM BATCH rather than per row: the transitions
-// match on (id, token) together, so a shared token is still exact per row, and two
-// different claims of the same row necessarily carry different tokens.
-//
-// The lease in locked_until, rather than an in-memory marker, is what makes a
-// crashed relay's in-flight rows recoverable: once the lease expires the rows
-// re-enter the claimable set instead of being stranded. attempts < max_attempts
-// keeps rows that have spent their retry budget out of the claimable set, so an
-// exhausted row is left for the dead-letter path rather than being retried
-// forever.
-//
-// A row whose budget IS spent and whose dead-letter write is still owed is
-// therefore invisible to this query, and it is reached by
-// ClaimFailedEventOutboxForDeadLetter instead. Keeping the two sets in two statements is
-// deliberate: folding the second into an OR here made this predicate
-// unsatisfiable by idx_event_outbox_claim's partial index — a partial index is
-// usable only when its predicate is implied by the query's — and the planner fell
-// back to a sequential scan of the whole table on every poll.
-//
-// # next_attempt_at <= NOW() is the DUE predicate, and it is what makes the backoff real
-//
-// The lease answers "has whoever claimed this row abandoned it". It does not answer
-// "may anybody claim it yet", and those are different questions for a row that has
-// just failed: MarkEventFailed releases the lease, so without this predicate the row
-// would be claimable again on the very next poll. At a 1-second poll interval the
-// configured 1s/2s/4s/8s/16s schedule then collapses into about five seconds of
-// consecutive attempts against a broker that has barely begun to fail.
-//
-// The alternative — sleeping the computed delay inside the relay — is worse than no
-// backoff at all: the schedule sums to 31 seconds, which outlives the 30-second
-// lease, so a second instance reclaims the row mid-sleep and publishes it twice.
-//
-// Filtering on a persisted due instant removes both options, and it does so for every
-// instance at once rather than per process. The schedule itself is not computed here;
-// the caller supplies the delay to MarkEventFailed, which records the instant.
-//
-// first_attempted_at and last_attempted_at are stamped here, on the claim, which
-// is what model.EventOutbox documents ("nil until the row is first claimed").
-// COALESCE pins the first to the first claim and leaves it alone thereafter, while
-// the last moves with every claim; together they bound the retry window that the
-// dead-letter failure metadata reports.
-//
-// # webhook_pending is CLAIMABLE but not BLOCKING — the asymmetry is deliberate
+// The NOT EXISTS clause is the correctness heart of this query. Read it before changing
+// anything here.
 //
 // SUNSET: this paragraph and the literal it describes go with the legacy transport.
-//
-// A webhook_pending row has been published to Kafka and recorded in
-// kafka_dispatched_at; what it still owes is a legacy webhook enqueue. It is in the
-// claimable set so that outstanding enqueue is actually retried — before it existed,
-// such a row was marked dispatched and the webhook was never delivered — and the
-// caller skips the publish for any claimed row carrying kafka_dispatched_at, so a
-// re-claim cannot put a duplicate on the topic.
-//
-// It is NOT in the blocking set of the NOT EXISTS predicate below. Ordering is a
-// property of the Kafka partition, and such a row's position in that partition is
-// already fixed, so nothing it does subsequently can reorder anything. Blocking its
-// key would instead let a failing LEGACY enqueue stall Kafka delivery for the entire
-// aggregate — the deprecated transport interfering with the new one, which is exactly
-// backwards. idx_event_outbox_claim's partial predicate covers the wider claimable
-// set and idx_event_outbox_effective_key_inflight's covers the narrower blocking one;
-// they must keep matching these two lists respectively.
-// AS MATERIALIZED IS WHAT MAKES THE LIMIT BINDING. It is not a hint and not an
-// optimisation, and removing it reintroduces a defect that is invisible in a small
-// table.
-//
-// Written as `WHERE id IN (SELECT … LIMIT $4 FOR UPDATE SKIP LOCKED)` — which is the
-// shape the fund-lineage claim this file is modelled on still uses — the planner is
-// free to implement the semi-join as a NESTED LOOP that RE-EXECUTES the subquery once
-// per candidate row of the outer scan. EXPLAIN ANALYZE against a six-row backlog with
-// a batch size of two showed exactly that:
-//
-//	Update on blnk.event_outbox (actual rows=6 loops=1)
-//	  -> Nested Loop Semi Join (actual rows=6 loops=1)
-//	       -> Seq Scan on blnk.event_outbox (actual rows=7 loops=1)
-//	       -> Subquery Scan on "ANY_subquery" (actual rows=1 loops=7)
-//	            -> Limit (actual rows=1 loops=7)
-//
-// Seven executions of a LIMIT 2 subquery, each returning a DIFFERENT row because the
-// previous execution had already locked its own, so a claim for two rows leased and
-// stamped six. The bound the caller asked for was silently discarded.
-//
-// That is not a cosmetic overshoot. The relay sizes its batch so one poll's work fits
-// inside one lease and one process's memory; an unbounded claim leases the entire
-// pending backlog under a single claim token, and every row it cannot publish before
-// the lease expires is republished by whoever claims it next. It is also PLAN
-// DEPENDENT, so it appears and disappears with table statistics — which is why it
-// surfaced as an intermittent test failure rather than as an outage.
-//
-// A MATERIALIZED CTE is evaluated exactly once (PostgreSQL 12+; this schema requires
-// 14+), so the candidate set is fixed before the UPDATE runs. The same plan then reads:
-//
-//	CTE candidates -> Limit (actual rows=2 loops=1)
-//	CTE claimed    -> Update on event_outbox (actual rows=2 loops=1)
-//
-// The CTE scan is still re-scanned by the semi-join, but it returns the same two rows
-// every time, so the UPDATE matches exactly those two.
 //
 // Nothing else about the candidate selection changes: the WHERE clause, the literal
 // status list, the ordering and FOR UPDATE SKIP LOCKED are all preserved verbatim, so
@@ -1478,25 +979,9 @@ var claimPendingEventOutboxQuery = `
 
 // ClaimPendingEventOutbox claims a batch of pending entries for publishing, takes a
 // lease on them for lockDuration and stamps every claimed row with one fresh claim
-// token. The returned entries are ordered oldest occurrence first, which is the
-// order they must be published in, and each carries the token in its ClaimToken
-// field — every transition the caller subsequently performs must present it.
-//
-// At most one row per EFFECTIVE key — the Kafka message key, resolved by
-// eventOutboxEffectiveKeySQL exactly as model.EffectivePartitionKey resolves it in Go — is
-// ever returned across all concurrent relay instances, which is what preserves
-// per-aggregate ordering; see the query comment.
-//
-// A non-positive batchSize is rejected rather than passed through. A zero LIMIT
-// claims nothing and returns no error, which is indistinguishable from an empty
-// backlog: the relay would look healthy while publishing nothing at all. A
-// non-positive lockDuration is instead normalised to defaultEventClaimLease,
-// because an expired-on-arrival lease is a correctness problem — a second relay
-// instance could reclaim and republish a row still being published — and failing
-// the poll outright would stop the relay rather than protect it.
-//
-// lockDuration is bound as its Go duration string ("30s"), which PostgreSQL parses
-// directly as an interval; the value is never hand-formatted into the statement.
+// token. The returned entries are ordered oldest occurrence first, which is the order
+// they must be published in, and each carries the token in its ClaimToken field — every
+// transition the caller subsequently performs must present it.
 func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimPendingEventOutbox")
 	defer span.End()
@@ -1558,51 +1043,25 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 // claimFailedEventOutboxForDeadLetterQuery claims rows whose retry budget is spent and
 // whose dead-letter PRESERVATION has not happened, so it can be attempted again.
 //
-// # The limbo this exists to end
+// The exhaustion arm of MarkEventFailed sets status = 'failed' and hands the claim
+// token to the worker that spent the last attempt, which then writes the event to its
+// `<topic>.dlt` sibling and records the result. When that write fails — no transport, a
+// broker outage, a topic that does not exist yet — the row is left at 'failed' with
+// dlt_topic still NULL, and that state was a dead end in three directions at once: the
+// ordinary claim predicate excludes 'failed', replay accepts only 'dead_lettered', and
+// the worker holding the token had already moved on.
 //
-// The exhaustion arm of MarkEventFailed sets status = 'failed' and hands the claim token to
-// the worker that spent the last attempt, which then writes the event to its `<topic>.dlt`
-// sibling and records the result. When that write fails — no transport, a broker outage, a
-// topic that does not exist yet — the row is left at 'failed' with dlt_topic still NULL, and
-// that state was a dead end in three directions at once: the ordinary claim predicate
-// excludes 'failed', replay accepts only 'dead_lettered', and the worker holding the token
-// had already moved on. The event existed ONLY as that row. It was visible in the
-// dead-letter inventory, which lists both literals precisely so it would be, and nothing in
-// the system would ever act on it again.
+// dlt_topic IS NULL is the whole definition of "not preserved": the column is set by
+// the same statement that moves the row to 'dead_lettered', so its absence on a failed
+// row means the message never reached a topic.
 //
-// # What it claims, and what it deliberately leaves alone
+// THE STATUS IS NOT CHANGED. The row stays 'failed' for two reasons.
 //
-// dlt_topic IS NULL is the whole definition of "not preserved": the column is set by the
-// same statement that moves the row to 'dead_lettered', so its absence on a failed row means
-// the message never reached a topic.
-//
-// THE STATUS IS NOT CHANGED. The row stays 'failed' for two reasons. It keeps the row in
-// the dead-letter inventory for the whole repair attempt, so an operator watching the
-// backlog does not see events flicker out of it; and MarkEventDeadLettered accepts 'failed'
-// as a prior state, so the recovered row can complete through exactly the same transition
-// the original attempt would have used. A fresh claim token IS stamped, because the original
-// token belonged to a worker that may no longer exist and every transition is conditional on
-// the token the caller holds.
-//
-// # Why the retry is not attempt-bounded
-//
-// Every other retry in this table is bounded, and this one is not, because there is nowhere
-// further to fall back to: the dead-letter topic IS the last resort, and abandoning the
-// write would delete the only copy of the event. What bounds it instead is FREQUENCY — a row
-// is re-claimable only once its lease has expired — and VISIBILITY: the row stays in the
-// dead-letter inventory and feeds blnk.dlt.oldest_message_age_seconds, whose 15-minute alert
-// is the escalation path for a preservation that is not succeeding.
-//
-// The ordering columns match the rest of the file (occurred_at, then id) and the predicate is
-// served by idx_event_outbox_failed, whose partial WHERE covers exactly the failed and
-// dead-lettered set. FOR UPDATE SKIP LOCKED is required for the same reason it is on the
-// ordinary claim: several relay instances must be able to repair disjoint subsets.
-// The candidate selection is a MATERIALIZED CTE for the reason given at length on
-// claimPendingEventOutboxQuery: inside an IN subquery the LIMIT can be re-executed per
-// outer row and the batch bound becomes advisory. All three claims in this file share
-// the shape, so all four take the same precaution — fixing one and leaving the others
-// would mean the bound holds for the ordinary claim and not for the repair paths, which
-// are the ones that run when the system is already unhealthy.
+// The ordering columns match the rest of the file (occurred_at, then id) and the
+// predicate is served by idx_event_outbox_failed, whose partial WHERE covers exactly
+// the failed and dead-lettered set. FOR UPDATE SKIP LOCKED is required for the same
+// reason it is on the ordinary claim: several relay instances must be able to repair
+// disjoint subsets.
 const claimFailedEventOutboxForDeadLetterQuery = `
 		WITH candidates AS MATERIALIZED (
 			SELECT candidate.id FROM blnk.event_outbox candidate
@@ -1628,23 +1087,14 @@ const claimFailedEventOutboxForDeadLetterQuery = `
 // spent and whose dead-letter write has not yet succeeded, taking a lease on them and
 // stamping one fresh claim token, so the preservation can be attempted again.
 //
-// The returned rows are oldest occurrence first and each carries the token in its ClaimToken
-// field; MarkEventDeadLettered must be presented that token. See the query comment for why
-// the status is deliberately left at 'failed' and why this retry is bounded by frequency
-// rather than by an attempt count.
-//
 // Parameters:
 //   - ctx context.Context: cancels the claim.
-//   - batchSize int: the maximum number of rows to claim. Must be positive — a zero LIMIT
-//     claims nothing and returns no error, which is indistinguishable from an empty repair
-//     backlog and would make a broken caller look healthy.
-//   - lockDuration time.Duration: the lease. Non-positive is normalised to
-//     defaultEventClaimLease rather than rejected, because an expired-on-arrival lease is a
-//     correctness problem while failing the poll would stop the repair entirely.
+//   - batchSize int: the maximum number of rows to claim.
+//   - lockDuration time.Duration: the lease.
 //
 // Returns:
-//   - []model.EventOutbox: the claimed rows, oldest first. Empty when nothing needs repair,
-//     which is the normal state.
+//   - []model.EventOutbox: the claimed rows, oldest first. Empty when nothing needs
+//     repair, which is the normal state.
 //   - error: a bad-request error for a non-positive batch, or a wrapped driver error.
 func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
 	ctx context.Context,
@@ -1717,21 +1167,13 @@ func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
 	return entries, nil
 }
 
-// brokerRecordBindings renders a broker coordinate as the three nullable SQL parameters the
-// marking statements bind, so all three transitions agree on one definition.
+// brokerRecordBindings renders a broker coordinate as the three nullable SQL parameters
+// the marking statements bind, so all three transitions agree on one definition.
 //
-// # Why NULL rather than zero
-//
-// Partition 0 and offset 0 are a perfectly ordinary location — the first record on a fresh
-// partition — so binding zeroes for an absent coordinate would write a row that claims to name
-// a record it never produced, and the audit would count it as confirmed while an operator
-// looking there would find somebody else's event. An absent coordinate must therefore be SQL
-// NULL, which is also what the all-or-nothing check constraint requires.
-//
-// An unconfirmed record is a legitimate input, not an error: the broker acknowledged the write
-// and the library reported no coordinate, which leaves the publication real but unnameable. The
-// existing values are left in place by COALESCE at the call sites, so a later confirmed write
-// can still fill them in.
+// An unconfirmed record is a legitimate input, not an error: the broker acknowledged
+// the write and the library reported no coordinate, which leaves the publication real
+// but unnameable. The existing values are left in place by COALESCE at the call sites,
+// so a later confirmed write can still fill them in.
 //
 // Parameters:
 //   - record model.BrokerRecord: the coordinate, possibly unconfirmed.
@@ -1748,15 +1190,13 @@ func brokerRecordBindings(record model.BrokerRecord) (topic, partition, offset a
 	return strings.TrimSpace(record.Topic), record.Partition, record.Offset
 }
 
-// requireEventOutboxClaimToken rejects a transition attempted without a claim
-// token.
+// requireEventOutboxClaimToken rejects a transition attempted without a claim token.
 //
-// Every conditional transition below matches on (id, claim_token), so an empty
-// token could only ever match a row whose token is NULL — which is to say a row
-// nobody holds, in pending or a terminal state. Letting the call through would
-// therefore either match nothing (and be reported as a lost claim, which is
-// misleading) or, worse, match a row that is not the caller's to move. Naming the
-// omission is the only honest outcome.
+// Every conditional transition below matches on (id, claim_token), so an empty token
+// could only ever match a row whose token is NULL — which is to say a row nobody holds,
+// in pending or a terminal state. Letting the call through would therefore either match
+// nothing (and be reported as a lost claim, which is misleading) or, worse, match a row
+// that is not the caller's to move.
 func requireEventOutboxClaimToken(claimToken, transition string) error {
 	if strings.TrimSpace(claimToken) == "" {
 		return apierror.NewAPIError(apierror.ErrBadRequest,
@@ -1765,21 +1205,21 @@ func requireEventOutboxClaimToken(claimToken, transition string) error {
 	return nil
 }
 
-// normalizeDeadLetterHandoffLease resolves the lease a terminal transition holds the row
-// under while its dead-letter write is owed.
+// normalizeDeadLetterHandoffLease resolves the lease a terminal transition holds the
+// row under while its dead-letter write is owed.
 //
 // A NON-POSITIVE LEASE MUST NOT BE HONOURED, and the reason is the same one the claim
 // paths already normalise for: `NOW() + '0s'::interval` is an instant that has already
 // passed by the time the next poll runs, so the row satisfies
 // claimFailedEventOutboxForDeadLetter's `locked_until < NOW()` immediately and is
 // re-claimed with a fresh token while the first worker's dead-letter write is still in
-// flight. That is the exact race the retained lease exists to prevent, reintroduced by a
-// zero-valued argument — which is what a caller that forgot to plumb its lock duration
-// through would pass.
+// flight. That is the exact race the retained lease exists to prevent, reintroduced by
+// a zero-valued argument — which is what a caller that forgot to plumb its lock
+// duration through would pass.
 //
-// Falling back to defaultEventClaimLease matches what every claim in this file does with
-// a non-positive lockDuration, so the two halves of the ownership window are governed by
-// one value rather than by whichever caller happened to supply something.
+// Falling back to defaultEventClaimLease matches what every claim in this file does
+// with a non-positive lockDuration, so the two halves of the ownership window are
+// governed by one value rather than by whichever caller happened to supply something.
 //
 // The fallback is LOGGED rather than silent: a relay that reaches this has a
 // configuration or wiring defect, and it will otherwise behave correctly enough that
@@ -1809,31 +1249,17 @@ func normalizeDeadLetterHandoffLease(lease time.Duration, transition string) tim
 	return defaultEventClaimLease
 }
 
-// eventOutboxClaimLost is the typed error every conditional transition returns when
-// its UPDATE matched no row, and it is a DELIBERATE behaviour change from the
-// previous warn-and-continue treatment.
+// eventOutboxClaimLost is the typed error every conditional transition returns when its
+// UPDATE matched no row, and it is a DELIBERATE behaviour change from the previous
+// warn-and-continue treatment.
 //
-// A transition that matches nothing means one of three things, and all three are
-// facts the caller must act on rather than facts to log and forget:
+// A transition that matches nothing means one of three things, and all three are facts
+// the caller must act on rather than facts to log and forget:
 //
-//   - The lease expired and another relay instance reclaimed the row. The caller is
-//     a zombie worker; whatever it just did to the broker has already been, or will
-//     be, redone by the current holder, and it must NOT go on to record a terminal
-//     state over the top of that holder's work.
-//   - The row is no longer in the state this transition moves out of, so somebody
-//     else has already moved it on.
+//   - The lease expired and another relay instance reclaimed the row.
+//   - The row is no longer in the state this transition moves out of, so somebody else
+//     has already moved it on.
 //   - The id does not exist, which is a defect.
-//
-// The old behaviour logged a warning and returned nil, so a caller that had lost its
-// claim carried on as though it had succeeded. That is precisely how a stalled
-// worker overwrote newer state, how two workers each recorded an attempt against the
-// same claim and double-spent the retry budget, and how a terminal row was moved back
-// out of its terminal state by a call that arrived late. Returning ErrConflict makes
-// the lost claim visible at the point it matters.
-//
-// It is a CONFLICT and not a server fault: nothing is broken, the caller simply no
-// longer owns what it is trying to change. A relay treats it as "stop working on
-// this row and move on".
 func eventOutboxClaimLost(id int64, transition string) error {
 	logrus.WithFields(logrus.Fields{
 		"event_outbox_id": id,
@@ -1844,13 +1270,13 @@ func eventOutboxClaimLost(id int64, transition string) error {
 		fmt.Sprintf("Event outbox row is no longer claimed for transition %q", transition), nil)
 }
 
-// requireEventOutboxRowAffected converts an UPDATE that matched no row into the
-// typed lost-claim conflict above.
+// requireEventOutboxRowAffected converts an UPDATE that matched no row into the typed
+// lost-claim conflict above.
 //
 // A driver that cannot report the affected count is treated as success rather than
-// failure: the UPDATE itself did not error, so the transition did happen, and
-// failing the caller over missing bookkeeping would turn a completed write into a
-// spurious retry. Every driver this repository uses does report it.
+// failure: the UPDATE itself did not error, so the transition did happen, and failing
+// the caller over missing bookkeeping would turn a completed write into a spurious
+// retry. Every driver this repository uses does report it.
 func requireEventOutboxRowAffected(result sql.Result, id int64, transition string) error {
 	if result == nil {
 		return nil
@@ -1874,51 +1300,19 @@ func requireEventOutboxRowAffected(result sql.Result, id int64, transition strin
 	return nil
 }
 
-// RenewEventOutboxLease extends the lease on every row still being worked under one claim
-// token, and reports how many it extended.
-//
-// # The defect it exists to remove
+// RenewEventOutboxLease extends the lease on every row still being worked under one
+// claim token, and reports how many it extended.
 //
 // The lease was a fixed 30 seconds while a batch could take far longer. At the shipped
-// defaults a claim takes 100 rows and publishes them 8 at a time, so the batch runs in 13
-// waves; a single wave can occupy the writer's whole 10-second produce timeout before it
-// fails. The rows in the last waves therefore had their lease expire BEFORE their publish
-// was even attempted — while this relay still held them and still intended to publish them.
-// A second instance then claimed and published those rows, and this instance published them
-// again afterwards, so the topic received duplicates and every transition this instance
-// attempted failed as a lost claim. Nothing in either process reported a defect.
-//
-// Renewal fixes it without lengthening the recovery latency. The alternatives both cost
-// something real: deriving a lease long enough for the worst-case batch would make a
-// crashed relay's rows unclaimable for minutes, and shrinking the batch to fit the lease
-// would cap throughput below the 500 events per second the pipeline is required to sustain.
-//
-// # Why the claim token alone identifies the work
-//
-// Every terminal and near-terminal transition CLEARS claim_token, so a row that has been
-// dispatched, dead-lettered, returned to pending or moved to webhook_pending is
-// automatically outside this statement's reach. What remains under the token is exactly the
-// set still in flight. That is why no id list is passed: the token IS the batch, and the
-// database already knows which of its rows are unfinished.
-//
-// The status guard is processing only — the state the claim itself set. A row in any other
-// state is either finished or owned by somebody else, and extending a lease on it would be
-// this instance asserting a hold it no longer has.
-//
-// # Reporting rather than failing
-//
-// A renewal that extends nothing is not an error: it is the ordinary end of a batch, where
-// every row has already reached a terminal state. The count is returned so the caller can
-// stop renewing when it reaches zero and can log the difference when it is smaller than the
-// batch it expected.
+// defaults a claim takes 100 rows and publishes them 8 at a time, so the batch runs in
+// 13 waves; a single wave can occupy the writer's whole 10-second produce timeout
+// before it fails.
 //
 // Parameters:
 //   - ctx context.Context: cancels the update.
 //   - claimToken string: the token the claim issued. Required; without it the statement
 //     could only match rows nobody holds.
-//   - lease time.Duration: how long from NOW the extended lease should run. Non-positive is
-//     replaced with defaultEventClaimLease, because an expired-on-arrival renewal is worse
-//     than no renewal at all.
+//   - lease time.Duration: how long from NOW the extended lease should run.
 //
 // Returns:
 //   - int64: how many rows were extended. Zero is a legitimate answer.
@@ -1974,44 +1368,16 @@ func (d Datasource) RenewEventOutboxLease(ctx context.Context, claimToken string
 	return renewed, nil
 }
 
-// MarkEventDispatched marks an entry dispatched once the broker has acknowledged
-// the publish, and does so ONLY IF the caller still holds the claim.
+// MarkEventDispatched marks an entry dispatched once the broker has acknowledged the
+// publish, and does so ONLY IF the caller still holds the claim.
 //
-// The lease and the claim token are released and dispatched_at is stamped in the
-// same statement. dispatched is a terminal state: the row is no longer claimable,
-// because it is outside the claim predicate's status list.
-//
-// kafka_dispatched_at is stamped through COALESCE in the same statement, so the
-// column answers "was this event published to the broker, and when" for EVERY
-// dispatched row rather than only for rows that passed through webhook_pending. The
-// COALESCE is what makes it the FIRST acknowledgement rather than the last write: a
-// row whose Kafka leg completed on an earlier claim keeps that instant, which is the
-// instant the message actually reached the broker.
-//
-// Both processing and replaying are accepted as the prior state. processing is the
-// ordinary relay path; replaying is the successful-replay path, where a
-// dead-lettered row that has just been re-published to its original topic becomes
-// dispatched and so leaves the dead-letter inventory. Nothing else is accepted, so
-// a late call cannot resurrect a row out of a terminal state.
-//
-// # The broker coordinate (OBS-02)
-//
-// The topic, partition and offset the broker assigned are persisted here, which is what turns
-// "this row claims a publication" into "this row IS that record". They are written through
-// COALESCE for the same reason kafka_dispatched_at is: a row whose Kafka leg completed on an
-// earlier claim already names its record, and a later marking must not overwrite that with the
-// nil coordinate a webhook-only pass carries. An unconfirmed coordinate therefore leaves the
-// existing values alone rather than erasing them.
-//
-// A caller that has lost its claim receives ErrConflict and must not treat the
-// publish as recorded — see eventOutboxClaimLost.
+// The lease and the claim token are released and dispatched_at is stamped in the same
+// statement. dispatched is a terminal state: the row is no longer claimable, because it
+// is outside the claim predicate's status list.
 //
 // The gap between the broker's acknowledgement and this call is where at-least-once
-// delivery comes from. A relay that dies in that gap has published the event but
-// not recorded it, so the row is reclaimed once its lease expires and published
-// again. That duplicate is by design and is suppressed at the consumer's
-// idempotency boundary on event_id; nothing here tries to close it, because closing
-// it would require a distributed transaction with the broker.
+// delivery comes from. A relay that dies in that gap has published the event but not
+// recorded it, so the row is reclaimed once its lease expires and published again.
 func (d Datasource) MarkEventDispatched(
 	ctx context.Context,
 	id int64,
@@ -2058,14 +1424,15 @@ func (d Datasource) MarkEventDispatched(
 	return nil
 }
 
-// defaultEventSettlementLease WAS RETIRED HERE. normalizeDeadLetterHandoffLease falls back to
-// defaultEventClaimLease instead, at the same thirty seconds.
+// MarkEventFailed records one failed publish attempt against a claimed row and settles
+// it: back to pending with a next-attempt instant, or into the terminal failed state
+// with a dead-letter hand-off lease when the retry budget is spent.
 //
-// Two constants for one window is how the two halves of an ownership window come to be governed
-// by different numbers. The lease a terminal transition holds a row under while its dead-letter
-// write is owed has to be the same kind of window the CLAIM took — that is the whole reason a
-// non-positive argument is corrected rather than honoured — so it falls back to the claim's own
-// default and there is one value to change.
+// A non-positive deadLetterLease is corrected to defaultEventClaimLease rather than
+// honoured, and there is deliberately no second lease constant. The window a terminal
+// transition holds a row under while its dead-letter write is owed is the same kind of
+// window the CLAIM took, and two constants for one window is how the two halves of an
+// ownership window come to be governed by different numbers.
 func (d Datasource) MarkEventFailed(
 	ctx context.Context,
 	id int64,
@@ -2096,11 +1463,6 @@ func (d Datasource) MarkEventFailed(
 	// status, the due instant, the retained token AND the retained lease all agree about
 	// which arm was taken. Repeating the condition rather than computing it once is what
 	// keeps the whole decision inside the single statement.
-	//
-	// locked_until follows the token: the exhausted arm keeps a lease for the dead-letter
-	// hand-off it still owes (see eventDeadLetterHandoffLease), and the retrying arm clears
-	// it, because a row going back to pending must become claimable as soon as
-	// next_attempt_at is due and is protected by that instant instead.
 	var outcome model.EventFailureOutcome
 	err := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_outbox
@@ -2154,67 +1516,24 @@ func (d Datasource) MarkEventFailed(
 }
 
 // MarkEventPermanentlyFailed records a publish attempt that failed PERMANENTLY: the row
-// becomes failed on this attempt, whatever budget it had left, and the dead-letter write
-// is owed immediately.
-//
-// # Why a separate transition rather than a flag on MarkEventFailed
+// becomes failed on this attempt, whatever budget it had left, and the dead-letter
+// write is owed immediately.
 //
 // The two answer different questions and one of them is decided in a different place.
 // MarkEventFailed asks the DATABASE whether the budget is spent, because two relay
-// instances racing on one row must not both conclude they were the last attempt. This one
-// carries a decision the PUBLISHER already made — the broker refused the write for a
-// reason no further attempt can change: an unauthorised principal, a destination outside
-// the topic catalogue, bytes that are not valid JSON, a message over the size limit.
-// Bolting that onto the same method would mean one statement whose exhaustion test is
-// sometimes SQL and sometimes a parameter, which is how the atomicity the other arm
-// depends on gets lost in a later edit.
+// instances racing on one row must not both conclude they were the last attempt.
 //
-// Before this existed the relay had no way to act on that verdict. A topic-authorisation
-// failure spent all five attempts and ~17 seconds of backoff proving the broker meant it,
-// five times per event, at whatever rate events were being produced — and the log said
-// "retryable=false" on each attempt and then "scheduled for another attempt" immediately
-// after, which is a log contradicting itself about the decision it just took.
-//
-// # What it does, and what it deliberately leaves alone
+// Before this existed the relay had no way to act on that verdict. A
+// topic-authorisation failure spent all five attempts and ~17 seconds of backoff
+// proving the broker meant it, five times per event, at whatever rate events were being
+// produced — and the log said "retryable=false" on each attempt and then "scheduled for
+// another attempt" immediately after, which is a log contradicting itself about the
+// decision it just took.
 //
 // attempts is INCREMENTED, so the failure metadata reports the number of attempts that
-// were really made — 1 for a permanent failure on the first attempt, which is the honest
-// figure and is what tells an operator triaging the dead-letter topic that this event
-// never had a chance rather than that it fought for thirty seconds.
-//
-// The row may therefore end up failed with attempts < max_attempts, and that is correct
-// and safe: ClaimPendingEventOutbox filters on status IN ('pending','processing',
-// 'webhook_pending'), so an unspent budget cannot make a failed row claimable again, while
-// ClaimFailedEventOutboxForDeadLetter selects on status, dlt_topic IS NULL and the lease
-// alone — so the dead-letter repair path still reaches it once the hand-off lease this
-// transition leaves behind has lapsed, which is the only point at which the owning worker
-// can no longer be performing the write itself.
-//
-// The CLAIM TOKEN AND THE LEASE ARE BOTH RETAINED, exactly as MarkEventFailed's exhaustion
-// arm retains them and for exactly the same reason: the dead-letter write and the
-// MarkEventDeadLettered that records it are still owed, and only the worker that took this
-// decision may perform them. That is what stops two workers putting two copies of one event
-// on a dead-letter topic.
-//
-// The lease used to be RELEASED here — locked_until = NULL — on the reasoning that a failed
-// row is outside the claimable set. It is not:
-// claimFailedEventOutboxForDeadLetter selects on `status = 'failed' AND dlt_topic IS NULL AND
-// (locked_until IS NULL OR locked_until < NOW())`, so releasing the lease made the row
-// claimable on the very next poll, with a FRESH token, while this worker's dead-letter write
-// was still in flight. Retaining the token without retaining the lease is not exclusive
-// ownership; it is a token whose exclusivity another claim can overwrite. See
-// MarkEventFailed for the full account.
-//
-// The LEASE IS RENEWED rather than released, and the two go together. Releasing it made the
-// retained token decorative: ClaimFailedEventOutboxForDeadLetter admits a failed row with
-// dlt_topic IS NULL and no live lease, and it stamps a FRESH token, so a second instance
-// could reclaim the row in the same instant and publish the dead-letter message alongside the
-// owning worker. Holding eventDeadLetterHandoffLease keeps the repair path out until the
-// hand-off has either been recorded — MarkEventDeadLettered clears the lease and the token —
-// or the holder can no longer be holding it.
-//
-// next_attempt_at is left as the last retry set it — there is no next attempt to describe,
-// and writing a future instant would tell an operator a retry was still coming.
+// were really made — 1 for a permanent failure on the first attempt, which is the
+// honest figure and is what tells an operator triaging the dead-letter topic that this
+// event never had a chance rather than that it fought for thirty seconds.
 //
 // Parameters:
 //   - ctx context.Context: cancels the update.
@@ -2222,12 +1541,12 @@ func (d Datasource) MarkEventFailed(
 //   - claimToken string: the token the claim issued; the update is refused without it.
 //   - errMsg string: the failure reason, stored in last_error.
 //   - deadLetterLease time.Duration: how long this worker holds the row for the
-//     dead-letter hand-off. Non-positive is normalised to defaultEventClaimLease.
+//     dead-letter hand-off.
 //
 // Returns:
 //   - model.EventFailureOutcome: Status failed, the new attempt count, Exhausted true —
-//     because no further attempt will be made whatever the count says — and the token for
-//     the dead-letter hand-off.
+//     because no further attempt will be made whatever the count says — and the token
+//     for the dead-letter hand-off.
 //   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
 func (d Datasource) MarkEventPermanentlyFailed(
 	ctx context.Context,
@@ -2293,35 +1612,8 @@ func (d Datasource) MarkEventPermanentlyFailed(
 // topic, moving it to the dead_lettered terminal state and storing the dead-letter
 // record — and does so ONLY IF the caller still holds the claim.
 //
-// It is the second half of the failure path, and it exists as a separate method
-// because only the dead-letter publisher can supply what it stores: the resolved
-// `<topic>.dlt` name and the marshaled failure metadata. Composing the dead-letter
-// envelope belongs to that publisher — deriving the topic name or building the
-// metadata in SQL here would duplicate the topic-naming rules and the metadata
-// schema in a second place, and they would drift.
-//
-// Recording it matters beyond bookkeeping: dlt_topic and failure_metadata are what
-// the dead-letter API displays and what an operator triages from, and
-// dead_lettered is the state a replay checks for before re-publishing. Leaving
-// either NULL would give the dead-letter inventory nothing to show.
-//
-// # The claim requirement, and which prior states are accepted
-//
-// The token is the one MarkEventFailed returned on its exhaustion arm, or the one
-// from the original claim when a non-retryable failure dead-letters a row directly.
-// Both failed and processing are therefore accepted as the prior state, and nothing
-// else — a row already dead_lettered cannot be dead-lettered again, so a duplicate
-// call is reported as a lost claim rather than silently overwriting the existing
-// dead-letter record with a second one.
-//
-// This is what stops two workers each publishing the event to the dead-letter topic:
-// only one of them holds the token, so only one gets past this transition, and the
-// caller that fails it knows not to have published. THE ORDER MATTERS — publish to
-// the dead-letter topic first and record it here second, so a row is never marked
-// dead-lettered without a message behind it.
-//
-// An empty dltTopic or empty failureMetadata is stored as SQL NULL rather than as
-// an empty string or an empty JSON document, so "not recorded" stays distinct from
+// An empty dltTopic or empty failureMetadata is stored as SQL NULL rather than as an
+// empty string or an empty JSON document, so "not recorded" stays distinct from
 // "recorded as empty".
 func (d Datasource) MarkEventDeadLettered(
 	ctx context.Context,
@@ -2353,11 +1645,11 @@ func (d Datasource) MarkEventDeadLettered(
 		failureMetadataArg = []byte(failureMetadata)
 	}
 
-	// The coordinate here names the record on the DEAD-LETTER topic, not on the original one:
-	// the original publish is what failed, so there is no record of it to name. It is assigned
-	// rather than COALESCEd, because a dead-letter write supersedes whatever a failed original
-	// attempt may have left behind — a coordinate on the main topic would send an operator
-	// looking for a record the retries never produced.
+	// The coordinate here names the record on the DEAD-LETTER topic, not on the original
+	// one: the original publish is what failed, so there is no record of it to name. It is
+	// assigned rather than COALESCEd, because a dead-letter write supersedes whatever a
+	// failed original attempt may have left behind — a coordinate on the main topic would
+	// send an operator looking for a record the retries never produced.
 	recordTopic, recordPartition, recordOffset := brokerRecordBindings(record)
 
 	result, err := d.Conn.ExecContext(ctx, `
@@ -2385,16 +1677,11 @@ func (d Datasource) MarkEventDeadLettered(
 // from dead_lettered to replaying and stamping a fresh claim token, and returns the
 // claimed row.
 //
-// # Why a replay must be a claim and not a read
-//
 // Without this, a replay was a read followed by a check followed by a publish: fetch
 // the row, confirm it is dead-lettered, then publish. Two concurrent replays of one
 // event both read a dead_lettered row, both pass the check, and both publish — so an
 // operator clicking twice, or two operators triaging the same backlog, put two copies
-// of the event on the topic. Because a replay re-publishes the STORED bytes, those
-// two copies are byte-identical and a consumer deduplicating on event_id will discard
-// one, but the duplicate is real, it costs a partition slot, and relying on consumer
-// behaviour to correct a defect on the publishing side is not a guarantee.
+// of the event on the topic.
 //
 // Making the transition the claim removes the window entirely: only the caller whose
 // UPDATE actually changed a row proceeds to publish, and it is handed the token that
@@ -2403,32 +1690,8 @@ func (d Datasource) MarkEventDeadLettered(
 //
 // The lease exists for the same reason it does on an ordinary claim: a process that
 // dies mid-replay must not strand the row in replaying forever. ReleaseEventReplay
-// returns the row to dead_lettered on every failure path, so a replay that merely
-// could not publish stays replayable.
-//
-// # AND AN EXPIRED REPLAY LEASE IS CLAIMABLE TOO, which is what makes that lease mean
-// something
-//
-// Admitting dead_lettered alone left the lease written down and nothing reading it. A
-// process that died mid-replay — or one whose ReleaseEventReplay failed because the
-// request context it was running under had already been cancelled — left the row in
-// replaying for ever: outside the relay's claimable states, outside the dead-letter
-// inventory's terminal state, and refused by every subsequent replay attempt with a
-// conflict naming a status the operator cannot clear. The event was preserved on its
-// dead-letter topic and permanently unreplayable at the same time.
-//
-// So the claim admits a replaying row whose lease has lapsed, on exactly the predicate
-// the ordinary claim uses for the same purpose. The concurrency guarantee is unchanged:
-// a replay holding a LIVE lease is still refused, so two operators triaging one backlog
-// still cannot both publish, and the row is reclaimable only once the holder can no
-// longer be holding it.
-//
-// A failure to match is discriminated rather than collapsed, because the two causes
-// need different answers: an unknown event_id is a not-found, while a row that exists
-// but is not dead-lettered is a conflict whose message names the state it is actually
-// in — a replay of an already-dispatched event and a replay of a still-pending one
-// are very different operator mistakes. That costs one extra query on the failure
-// path only.
+// returns the row to dead_lettered on every failure path, so a replay that merely could
+// not publish stays replayable.
 func (d Datasource) ClaimEventForReplay(ctx context.Context, eventID string, lockDuration time.Duration) (*model.EventOutbox, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimEventForReplay")
 	defer span.End()
@@ -2467,9 +1730,9 @@ func (d Datasource) ClaimEventForReplay(ctx context.Context, eventID string, loc
 // caller can answer "no such event" and "that event is not dead-lettered" differently
 // instead of conflating them into one unhelpful failure.
 //
-// A read error here is deliberately not propagated. The replay claim has already
-// failed and this call exists only to explain why; returning a database error instead
-// of the explanation would replace a precise answer with a vague one.
+// A read error here is deliberately not propagated. The replay claim has already failed
+// and this call exists only to explain why; returning a database error instead of the
+// explanation would replace a precise answer with a vague one.
 func (d Datasource) describeUnclaimableReplay(ctx context.Context, eventID string) error {
 	existing, lookupErr := d.GetEventByID(ctx, eventID)
 	if lookupErr != nil || existing == nil {
@@ -2483,15 +1746,10 @@ func (d Datasource) describeUnclaimableReplay(ctx context.Context, eventID strin
 // ReleaseEventReplay returns a replaying row to dead_lettered, releasing the claim.
 //
 // It is the rollback half of ClaimEventForReplay and the reason a failed replay does
-// not cost an event its replayability. Without it a replay that claimed a row and
-// then failed to publish would leave the row stuck in replaying — outside the relay's
+// not cost an event its replayability. Without it a replay that claimed a row and then
+// failed to publish would leave the row stuck in replaying — outside the relay's
 // claimable set and outside the dead-letter inventory's own terminal state — where
-// nothing would ever pick it up again. Every path out of a replay, success or
-// failure, must therefore end in either MarkEventDispatched or this method.
-//
-// replayErr is recorded in last_error when non-empty so the reason the replay failed
-// survives for the next operator; an empty string leaves whatever was already there,
-// which is the original publish failure, rather than blanking it.
+// nothing would ever pick it up again.
 func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ReleaseEventReplay")
 	defer span.End()
@@ -2522,63 +1780,13 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 	return nil
 }
 
-// claimPendingWebhookDeliveriesQuery claims rows whose Kafka leg has FINISHED and
-// whose LEGACY WEBHOOK leg is still owed, taking a lease and stamping a fresh claim
-// token WITHOUT changing the row's status.
+// claimPendingWebhookDeliveriesQuery claims rows whose Kafka leg has FINISHED and whose
+// LEGACY WEBHOOK leg is still owed, taking a lease and stamping a fresh claim token
+// WITHOUT changing the row's status.
 //
 // It is a package-level constant for the same reason the main claim query is: tests
-// assert that FOR UPDATE SKIP LOCKED, the occurred_at ordering and the untouched
-// status are all still present.
-//
-// # "Finished" means all three of its end states, not only the successful one
-//
-// The set was 'dispatched' alone, and that lost events. The relay enqueues the legacy
-// webhook first and publishes to Kafka second, so when BOTH fail on the attempt that
-// spends the retry budget the row travels failed → dead_lettered with
-// webhook_dispatched still FALSE. Neither state was in this predicate, neither is in
-// the main claim's, and the token is cleared — so the outstanding HTTP delivery was
-// discarded silently, in exactly the circumstance where the webhook is the only
-// transport that might still work, because the broker being unreachable is why the
-// Kafka leg failed at all.
-//
-// All three literals are therefore candidates. What they have in common is the
-// property that matters: the Kafka leg will not be attempted again, so no other
-// statement in this file will ever return to the row, and if this one does not carry
-// the legacy leg nothing will.
-//
-// # Why the status must NOT change, and why this is a second query rather than an arm
-//
-// For a dispatched row the event IS on its Kafka topic; returning the row to
-// processing would put it back in the main claimable set and publish it a second time.
-// For a dead-lettered row it would be worse still: the row is terminal by design and
-// the publisher would take it as unpublished work. So this claim takes only the two
-// things a conditional transition needs — a lease, so two relays cannot enqueue the
-// same webhook at once, and a claim token, because MarkWebhookDispatched is conditional
-// on one and every terminal transition deliberately cleared the row's previous token.
-//
-// The candidate statuses are LITERALS rather than bound parameters, exactly as in the
-// main claim and the dead-letter hand-off claim. That is not styling: a partial index
-// is usable only when its predicate is implied by the query's WHERE clause, and the
-// planner can only prove implication from a value it can see while planning. Binding
-// them would make idx_event_outbox_webhook_pending unusable for any generic plan, and
-// dispatched is the largest status in the table. The index's own predicate lists the
-// same three literals for that reason.
-//
-// # The two bounds
-//
-// webhook_attempts < max_attempts is the legacy leg's own budget, so an abandoned leg
-// leaves this candidate set permanently instead of being re-enqueued for ever against a
-// receiver that is never coming back. next_attempt_at <= NOW() is the backoff
-// MarkEventLegacyWebhookAttempted persisted, so a failing receiver is retried on the
-// configured schedule rather than once per poll interval.
-//
-// SUNSET NOTICE: this query, ClaimPendingWebhookDeliveries, MarkWebhookDispatched,
-// MarkEventLegacyWebhookAttempted, the webhook_dispatched and webhook_attempts columns
-// and the partial index are all DELETED at the webhook sunset, together with
-// webhooks.go and the relay's dual-delivery branch. Nothing else in this file depends
-// on them.
-//
-// MATERIALIZED for the reason given on claimPendingEventOutboxQuery.
+// assert that FOR UPDATE SKIP LOCKED, the occurred_at ordering and the untouched status
+// are all still present.
 const claimPendingWebhookDeliveriesQuery = `
 		WITH candidates AS MATERIALIZED (
 			SELECT candidate.id FROM blnk.event_outbox candidate
@@ -2601,60 +1809,21 @@ const claimPendingWebhookDeliveriesQuery = `
 		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
 	`
 
-// ClaimPendingWebhookDeliveries claims rows whose Kafka leg has finished and whose legacy
-// HTTP webhook leg has not been recorded, so the dual-delivery window can finish a leg
-// that failed alongside the Kafka publish — whether that publish then succeeded or was
-// itself given up on.
+// ClaimPendingWebhookDeliveries claims rows whose Kafka leg has finished and whose
+// legacy HTTP webhook leg has not been recorded, so the dual-delivery window can finish
+// a leg that failed alongside the Kafka publish — whether that publish then succeeded
+// or was itself given up on.
 //
-// # The defect this closes
-//
-// The relay enqueues the legacy webhook task and then publishes to Kafka. A failed
-// enqueue was logged and swallowed — correctly, because a webhook receiver being down
-// must not consume a Kafka retry attempt or dead-letter an event on the new transport —
-// and the log line promised the leg would be retried "on the next claim of this row".
-// There was no next claim: the row reached a state the main claim predicate never looks
-// at again — dispatched when the publish succeeded, or failed and then dead_lettered when
-// it did not — and every one of those transitions cleared the token. The legacy leg was
-// lost silently, for exactly the subscribers the 30-day window exists to protect: the ones
-// that have not migrated yet.
-//
-// The both-legs-failed case is the sharper of the two, because it loses the webhook in
-// precisely the situation where the webhook is the only transport that might still work.
-// The broker being unreachable is why the Kafka leg failed; the receiver may be perfectly
-// healthy.
-//
-// This makes the promise true. The rows are durable and independently reclaimable: the
-// webhook_dispatched flag is the outstanding-work marker, the lease serialises two
-// relays, and the asynq task identity (the event id) refuses a duplicate even if a
-// lease expires mid-enqueue.
-//
-// In a healthy window this returns nothing: the flag is set microseconds after the
-// enqueue. The partial index idx_event_outbox_webhook_pending is what keeps that cheap —
-// without it this would scan every dispatched row, which is the largest set in the
-// table.
-//
-// The lease and token this stamps are left in place once MarkWebhookDispatched succeeds,
-// and that is deliberate: the flag alone removes the row from this query's candidate set
-// permanently, and clearing the token here would break MarkWebhookDispatched's documented
-// idempotency for the main dual-delivery path, where the token must survive until
-// MarkEventDispatched consumes it.
-//
-// The one interaction worth stating: a FAILED row can also be claimed by
-// ClaimFailedEventOutboxForDeadLetter, which owes it a dead-letter write. The two cannot
-// hold it at once — both require the lease to be free and both stamp a fresh token — so a
-// claim by either invalidates the other's token and that transition is refused as a lost
-// claim. Nothing is lost by it: both sets are self-clearing on the work they exist for
-// (dlt_topic being recorded, webhook_dispatched being set), so whichever lost simply
-// re-claims once the lease lapses.
+// The lease and token this stamps are left in place once MarkWebhookDispatched
+// succeeds, and that is deliberate: the flag alone removes the row from this query's
+// candidate set permanently, and clearing the token here would break
+// MarkWebhookDispatched's documented idempotency for the main dual-delivery path, where
+// the token must survive until MarkEventDispatched consumes it.
 //
 // Parameters:
 //   - ctx context.Context: cancels the claim.
-//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero
-//     LIMIT claims nothing and returns no error, which is indistinguishable from "no
-//     webhook legs are outstanding".
-//   - lockDuration time.Duration: the lease. Non-positive is normalised to
-//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays enqueue
-//     the same webhook.
+//   - batchSize int: how many rows to claim.
+//   - lockDuration time.Duration: the lease.
 //
 // Returns:
 //   - []model.EventOutbox: the claimed rows, oldest occurrence first, each carrying the
@@ -2714,26 +1883,19 @@ func (d Datasource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize
 	return entries, nil
 }
 
-// MarkWebhookDispatched records that the legacy HTTP webhook leg was dispatched
-// for this entry, and does so ONLY IF the caller still holds the claim.
+// MarkWebhookDispatched records that the legacy HTTP webhook leg was dispatched for
+// this entry, and does so ONLY IF the caller still holds the claim.
 //
-// It serves the dual-delivery window only. The relay publishes to Kafka and
-// enqueues the legacy webhook task from the SAME claimed row — which is what makes
-// the two transports carry byte-identical payloads structurally rather than by
-// careful coding — and this flag makes the legacy leg individually idempotent: a
-// row republished to Kafka after a crash does not enqueue a second webhook.
+// It serves the dual-delivery window only. The relay publishes to Kafka and enqueues
+// the legacy webhook task from the SAME claimed row — which is what makes the two
+// transports carry byte-identical payloads structurally rather than by careful coding —
+// and this flag makes the legacy leg individually idempotent: a row republished to
+// Kafka after a crash does not enqueue a second webhook.
 //
-// The claim token requirement is what makes that idempotency hold under
-// concurrency. Without it a worker whose lease had expired could set the flag for a
-// row the current holder was about to enqueue for, so the current holder would skip
-// the enqueue and the webhook would be recorded as dispatched having never been
-// sent. Setting an already-true flag is left as a matching, no-op UPDATE rather than
-// excluded by the predicate, so an honest re-call from the claim holder is idempotent
-// instead of being reported as a lost claim.
-//
-// This method, the webhook_dispatched column and the relay branch that calls it are
-// all removed at the webhook sunset, together with webhooks.go. Every other method
-// in this file outlives it.
+// The claim token requirement is what makes that idempotency hold under concurrency.
+// Without it a worker whose lease had expired could set the flag for a row the current
+// holder was about to enqueue for, so the current holder would skip the enqueue and the
+// webhook would be recorded as dispatched having never been sent.
 func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkWebhookDispatched")
 	defer span.End()
@@ -2767,47 +1929,6 @@ func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimTo
 //
 // SUNSET: this method goes with the rest of the legacy transport.
 //
-// # The defect it exists to remove
-//
-// The two legs of the dual-delivery window used to share one terminal state. A row
-// whose Kafka publish succeeded was marked dispatched even when the webhook enqueue
-// alongside it had failed, and because dispatched is outside the claim predicate that
-// webhook was never retried and never delivered — permanently, for a transport
-// subscribers had been told would keep working until the sunset, with one warning line
-// as the only trace. The relay's own comment claimed the leg "will be retried on the
-// next claim of this row"; there was no next claim.
-//
-// So the two legs are now tracked independently. kafka_dispatched_at records the Kafka
-// leg, this transition moves the row to webhook_pending, and the claim predicate
-// includes that state so the row IS picked up again. The caller skips the publish for
-// any claimed row carrying kafka_dispatched_at, so retrying the webhook cannot put a
-// duplicate on the Kafka topic.
-//
-// # The budget, and why it is a separate one
-//
-// webhook_attempts is incremented here, never attempts. A webhook receiver being down
-// or a queue being unreachable must not consume a KAFKA retry attempt, because that
-// would let the deprecated transport dead-letter events on the new one. The budget
-// ceiling is nonetheless the row's own max_attempts, so one knob governs both legs
-// and a permanently unreachable queue cannot keep a row claimable forever.
-//
-// The decision is taken in SQL, in the CASE, for the same reason MarkEventFailed's is:
-// two relay instances working one row cannot both conclude they spent the last webhook
-// attempt. In a SET list every right-hand reference reads the OLD value, so both arms
-// agree on the same arithmetic.
-//
-// # What each arm does
-//
-// RETRY arm: status becomes webhook_pending, the lease and token are released so the
-// row can be re-claimed, and next_attempt_at becomes NOW() + retryAfter so the backoff
-// is honoured by every instance rather than by a sleeping goroutine.
-//
-// ABANDON arm: the budget is spent, so the row becomes dispatched and terminal on the
-// strength of its Kafka delivery alone. dispatched_at is stamped, the lease and token
-// are released, and last_error carries the reason — this is a webhook that will never
-// be delivered, and last_error plus the caller's error-level log line are the only
-// record of it.
-//
 // Both arms stamp kafka_dispatched_at through COALESCE, so the first acknowledgement
 // instant is preserved across repeated webhook retries.
 //
@@ -2821,8 +1942,7 @@ func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimTo
 //   - id int64: the row's surrogate key.
 //   - claimToken string: the token the claim issued; the update is refused without it.
 //   - errMsg string: why the enqueue failed, stored in last_error.
-//   - retryAfter time.Duration: how long before the row is due again. Applied on the
-//     retry arm only. Non-positive means due immediately.
+//   - retryAfter time.Duration: how long before the row is due again.
 //
 // Returns:
 //   - model.EventWebhookOutcome: the resulting status, the new webhook attempt count,
@@ -2853,9 +1973,10 @@ func (d Datasource) MarkEventWebhookPending(
 		return model.EventWebhookOutcome{}, err
 	}
 
-	// COALESCEd for the reason MarkEventDispatched documents: this row's Kafka leg may already
-	// have completed on an earlier claim, and a webhook-only retry carries no coordinate. A
-	// straight assignment would erase the record the first successful publish named.
+	// COALESCEd for the reason MarkEventDispatched documents: this row's Kafka leg may
+	// already have completed on an earlier claim, and a webhook-only retry carries no
+	// coordinate. A straight assignment would erase the record the first successful
+	// publish named.
 	recordTopic, recordPartition, recordOffset := brokerRecordBindings(record)
 
 	var outcome model.EventWebhookOutcome
@@ -2923,64 +2044,22 @@ func (d Datasource) MarkEventWebhookPending(
 	return outcome, nil
 }
 
-// MarkEventLegacyWebhookAttempted records one failed legacy webhook enqueue against a row
-// whose KAFKA leg has already finished, and decides in the same statement whether another
-// webhook attempt is made or the legacy leg is abandoned.
+// MarkEventLegacyWebhookAttempted records one failed legacy webhook enqueue against a
+// row whose KAFKA leg has already finished, and decides in the same statement whether
+// another webhook attempt is made or the legacy leg is abandoned.
 //
 // SUNSET: this method goes with the rest of the legacy transport.
-//
-// # Why this exists alongside MarkEventWebhookPending, which looks like the same thing
-//
-// The two cover disjoint halves of one problem, and collapsing them would break whichever
-// half lost. MarkEventWebhookPending handles a row whose Kafka leg SUCCEEDED: it may move
-// the status, because webhook_pending and dispatched are both truthful descriptions of such
-// a row, and the claim predicate includes webhook_pending precisely so the row comes back.
-//
-// This one handles a row whose Kafka leg has reached a state the ordinary claim will never
-// revisit — dispatched, failed, or dead_lettered — and it MUST NOT MOVE THE STATUS. Moving a
-// dead-lettered row to webhook_pending would revive an event that is terminal by design and
-// hand it back to the publisher, and marking it dispatched would assert a Kafka delivery that
-// never happened, in the one column the zero-loss audit reads. So the status is left exactly
-// as it is, and the row's re-claimability comes from the legacy leg's own columns instead:
-// webhook_dispatched FALSE and webhook_attempts < max_attempts, which is what
-// claimPendingWebhookDeliveriesQuery selects on.
-//
-// # THE DEFECT THIS CLOSES
-//
-// The relay enqueues the legacy webhook first and publishes to Kafka second. When BOTH fail
-// on the attempt that spends the retry budget, the row goes to failed and then dead_lettered
-// — terminal, token cleared, outside every claim predicate — while webhook_dispatched is
-// still FALSE. The outstanding HTTP delivery was silently discarded, for exactly the
-// subscribers the 30-day window exists to protect, and in exactly the circumstance where the
-// webhook is the ONLY transport that might still work: the broker being unreachable is why
-// the Kafka leg failed in the first place.
-//
-// # last_error is deliberately NOT overwritten
-//
-// On a failed or dead-lettered row, last_error holds the KAFKA failure reason. It is what
-// BuildFailureMetadata records, what the dead-letter API projection classifies, and what an
-// operator triaging a dead-lettered event reads. Replacing it with a webhook enqueue error
-// would destroy the diagnosis of the failure that actually stranded the event, to record a
-// transient queue problem that is already logged with the row's fields and already counted
-// in webhook_attempts. The durable trail for this leg is the counter; the reason is the log.
-//
-// # The decision is in SQL, and abandoned is RETURNED rather than derived
-//
-// For the reason MarkEventFailed's is: two relay instances working one row must not both
-// conclude they spent the last webhook attempt. And because the status deliberately does not
-// move, the caller cannot infer the arm from it — the comparison is therefore evaluated in
-// the RETURNING clause, against the incremented value, and reported.
 //
 // Parameters:
 //   - ctx context.Context: cancels the update.
 //   - id int64: the row's surrogate key.
-//   - claimToken string: the token ClaimPendingWebhookDeliveries issued; refused without it.
-//   - retryAfter time.Duration: how long before the legacy leg is due again. Applied on the
-//     retry arm only. Non-positive means due immediately.
+//   - claimToken string: the token ClaimPendingWebhookDeliveries issued; refused
+//     without it.
+//   - retryAfter time.Duration: how long before the legacy leg is due again.
 //
 // Returns:
-//   - model.EventWebhookOutcome: the row's UNCHANGED status, the new webhook attempt count,
-//     and whether the legacy leg has been abandoned.
+//   - model.EventWebhookOutcome: the row's UNCHANGED status, the new webhook attempt
+//     count, and whether the legacy leg has been abandoned.
 //   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
 func (d Datasource) MarkEventLegacyWebhookAttempted(
 	ctx context.Context,
@@ -3050,52 +2129,27 @@ func (d Datasource) MarkEventLegacyWebhookAttempted(
 	return outcome, nil
 }
 
-// PurgeTerminalEventsBefore deletes terminal event rows whose occurrence is older
-// than cutoff, and returns how many it removed. It is the retention primitive
-// behind the outbox's data-minimisation contract.
-//
-// # Why retention is a requirement here and not an optimisation
+// PurgeTerminalEventsBefore deletes terminal event rows whose occurrence is older than
+// cutoff, and returns how many it removed. It is the retention primitive behind the
+// outbox's data-minimisation contract.
 //
 // WHAT THIS TABLE STORES IS SENSITIVE. payload is the webhook body verbatim, so a
 // transaction event carries amounts and balance identifiers and an identity event
-// carries names, email addresses, phone numbers, postal addresses and dates of
-// birth. last_error and failure_metadata carry broker and driver text. None of it has
-// any operational value once the event has been delivered, so keeping it
-// indefinitely turns a delivery buffer into an unbounded secondary copy of the
-// ledger's most sensitive data — with none of the access controls the primary tables
-// have around them, and with an ever-growing blast radius if the database is ever
-// exposed.
-//
-// # The safety property: terminal states only
-//
-// Only dispatched and dead_lettered rows are eligible, taken from
-// model.TerminalEventOutboxStatuses so the set is defined in one place. A pending,
-// processing, replaying or failed row is still owed a delivery attempt and CANNOT be
-// deleted here however old it is. failed is excluded for a specific reason that is
-// easy to get wrong: its retry budget is spent but its dead-letter write is still
-// owed, so this table is the only copy of the event in existence and deleting it
-// would destroy that copy.
-//
-// # Bounded, resumable deletion
-//
-// The delete is bounded by limit and driven off idx_event_outbox_terminal_retention,
-// so a caller sweeps in slices rather than taking one enormous lock on a table the
-// relay is concurrently claiming from. A caller loops until the returned count is
-// less than the limit. An unbounded DELETE on a large backlog would block the relay
-// for the duration and bloat the WAL in a single transaction.
-//
-// Choosing the cutoff, and honouring any legal or audit hold that requires a longer
-// one, is an operator decision: this method provides the mechanism and takes no view
-// on the period.
+// carries names, email addresses, phone numbers, postal addresses and dates of birth.
+// last_error and failure_metadata carry broker and driver text. None of it has any
+// operational value once the event has been delivered, so keeping it indefinitely turns
+// a delivery buffer into an unbounded secondary copy of the ledger's most sensitive
+// data — with none of the access controls the primary tables have around them, and with
+// an ever-growing blast radius if the database is ever exposed.
 func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "PurgeTerminalEventsBefore")
 	defer span.End()
 
 	if cutoff.IsZero() {
-		// A zero cutoff would read as "delete everything older than the year 1",
-		// which deletes nothing — but it is far more likely to be an unset field
-		// than an intention, and silently doing nothing would hide a broken
-		// retention job that looks like it is running.
+		// A zero cutoff would read as "delete everything older than the year 1", which
+		// deletes nothing — but it is far more likely to be an unset field than an intention,
+		// and silently doing nothing would hide a broken retention job that looks like it is
+		// running.
 		err := apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox retention cutoff is required", nil)
 		failDatabaseSpan(span, err)
 		return 0, err
@@ -3112,58 +2166,8 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 		attribute.Int("event_outbox.retention_limit", limit),
 	)
 
-	// This is the one IN-subquery LIMIT in this file that is NOT wrapped in a
-	// MATERIALIZED CTE, and the omission is deliberate rather than an oversight.
-	//
-	// The hazard the three claims guard against — documented at length on
-	// claimPendingEventOutboxQuery — is that the planner may re-execute the subquery
-	// once per outer row, and that each execution then returns a DIFFERENT row because
-	// FOR UPDATE SKIP LOCKED has already taken the previous one. What makes the bound
-	// slip is the locking, not the re-execution.
-	//
-	// There is no locking here. Every execution runs in one statement snapshot over a
-	// candidate set nothing is removing, with the same plan and the same ORDER BY, so
-	// it returns the same rows and the LIMIT holds however many times it is evaluated.
-	// Add FOR UPDATE or FOR UPDATE SKIP LOCKED to this statement and that stops being
-	// true, at which point it needs the CTE too.
-	// The delete RETURNS what it removed, and the same statement records it.
-	//
-	// # Why the deletion and its record are one statement
-	//
-	// The reconciliation cannot reach a sound verdict without knowing how many terminal
-	// rows retention has removed — a broker end offset counts every record ever written
-	// and never falls, so once rows are gone the outbox side counts a suffix of history
-	// while the broker side counts all of it, and the resulting surplus can offset a
-	// genuine shortfall exactly. See the migration that creates the purge log.
-	//
-	// That makes the record part of the deletion rather than bookkeeping about it. Two
-	// statements — delete, then insert — would leave a window in which a crash loses the
-	// record while keeping the deletion, and the reconciliation would then be
-	// PERMANENTLY and SILENTLY wrong by however many rows that batch removed, with no way
-	// to discover it. One statement makes the two atomic without a transaction: the
-	// deleted rows are captured in a CTE and the log row is written from the same CTE, so
-	// either both happen or neither does.
-	//
-	// The aggregate is computed over the deleted rows themselves, so the counts describe
-	// exactly what left the table rather than a second query's idea of it. A batch that
-	// removes nothing writes no log row — HAVING COUNT(*) > 0 — because "retention ran and
-	// found nothing" is the steady state and recording it would bury the batches that
-	// matter in noise.
-	// ONE TERMINAL STATE IS ELIGIBLE, AND ONLY ONE (SEC-08). A dispatched row is a receipt for
-	// an event a subscriber has already had, so age alone governs it. A DEAD-LETTERED row is
-	// the record of an event NOBODY RECEIVED — the only inventory triage reads, the only thing
-	// a replay can be driven from, and the only place the failure metadata explaining the loss
-	// exists — so age must never remove it. Deleting one on an age timer destroyed all of that
-	// unrecoverably, oldest first: the failures most likely to have been forgotten rather than
-	// handled.
-	//
-	// A dead-lettered row leaves the inventory by being REPLAYED, not by being annotated: a
-	// re-publish the broker acknowledges makes the row dispatched, and a receipt is what this
-	// sweep may then remove. That is the whole retention model, and it needs no second column
-	// and no second endpoint to express.
-	//
-	// model.EventOutbox.IsPurgeableByRetention states the same rule in Go, and
-	// TestEventOutboxRetention_GoAndSQLAgreeOnEligibility pins the two together.
+	// This is the one IN-subquery LIMIT in this file that is NOT wrapped in a MATERIALIZED
+	// CTE, and the omission is deliberate rather than an oversight.
 	row := d.Conn.QueryRowContext(ctx, `
 		WITH removed AS (
 			DELETE FROM blnk.event_outbox
@@ -3196,33 +2200,17 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 	return purged, nil
 }
 
-// SumPurgedTerminalEvents reports what retention has removed from blnk.event_outbox over
-// the table's whole life.
+// SumPurgedTerminalEvents reports what retention has removed from blnk.event_outbox
+// over the table's whole life.
 //
-// # Why the reconciliation cannot do without it
-//
-// A broker's end offset counts every record ever appended and never decreases. The outbox
-// side of the reconciliation counts rows that still exist. Those two quantities describe
-// the same interval only until retention deletes its first terminal row; after that the
-// broker counts all of history and the outbox counts a suffix of it, and the difference is
-// indistinguishable from the expected surplus of redeliveries, replays and dead-letter
-// copies. Since the comparison is directional — a shortfall proves loss, a surplus is
-// expected — an inflated surplus can offset a real shortfall exactly and the verdict reads
-// a confident "no loss detected" while events are missing.
-//
-// Adding these totals back restores a MATCHED baseline: current terminal rows plus purged
-// terminal rows is an all-time count, which is what an all-time offset sum can be compared
-// against. Where the totals are unavailable the verdict must be inconclusive rather than
-// optimistic, because "no purge has happened" and "we cannot tell whether one has" are
-// different statements and only one of them supports a green verdict.
+// A broker's end offset counts every record ever appended and never decreases. The
+// outbox side of the reconciliation counts rows that still exist.
 //
 // Parameters:
 //   - ctx context.Context: cancels the aggregate.
 //
 // Returns:
-//   - model.EventOutboxPurgeTotals: the totals. An empty log yields zeroes with
-//     Recorded true, which is a real answer — retention has removed nothing — and is
-//     distinct from being unable to read the log at all.
+//   - model.EventOutboxPurgeTotals: the totals.
 //   - error: the repository's typed error.
 func (d Datasource) SumPurgedTerminalEvents(ctx context.Context) (model.EventOutboxPurgeTotals, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "SumPurgedTerminalEvents")
@@ -3273,48 +2261,24 @@ func (d Datasource) SumPurgedTerminalEvents(ctx context.Context) (model.EventOut
 	return totals, nil
 }
 
-// AuditEventRecordCoordinates reports, per (topic, partition), how many terminal rows claim
-// a broker record there and what the extreme claimed offsets are.
+// AuditEventRecordCoordinates reports, per (topic, partition), how many terminal rows
+// claim a broker record there and what the extreme claimed offsets are.
 //
-// # Why this exists alongside the counting audit
+// A coordinate can be checked rather than inferred. Compared against the live
+// per-partition bounds the broker reports, the claims divide into three cases, and only
+// the first is benign:
 //
-// AuditTerminalEventRecords answers "how many rows claim a publication, and how many of
-// those name a record". It cannot answer whether the records they name EXIST, and that gap
-// is what makes a purely arithmetic verdict unsound: the surplus of records over rows is
-// expected — a redelivery, a replay and a dead-letter copy each append a record no row
-// claims — so a surplus concealing an equal number of losses looks exactly like a healthy
-// pipeline.
-//
-// A coordinate can be checked rather than inferred. Compared against the live per-partition
-// bounds the broker reports, the claims divide into three cases, and only the first is
-// benign:
-//
-//   - within [first, end)     — the record exists and the claim is verified.
-//   - at or beyond end        — the row claims a record the log does not contain. That is
-//     direct evidence of loss or of a topic having been recreated
-//     beneath the ledger, not an inference from totals.
-//   - below first             — the record has aged out under retention, so the claim can
-//     no longer be verified either way and the verdict must say so.
-//
-// # Why extremes rather than every offset
-//
-// One row per partition, whatever the volume. The two comparisons that decide the cases
-// above are against the extremes — the largest claim tests the end bound and the smallest
-// tests the retention bound — so returning the whole set of offsets would multiply the
-// result by the size of the table to answer the same question. An aggregate over an index
-// scan stays affordable on a daily reconciliation of a table with tens of millions of rows;
-// streaming every coordinate would not.
-//
-// Rows with no coordinate are excluded by the NOT NULL predicate. They are not overlooked:
-// they are precisely the unconfirmed rows AuditTerminalEventRecords counts, and that count
-// already forces an inconclusive verdict while any exist.
+//   - within [first, end) — the record exists and the claim is verified.
+//   - at or beyond end — the row claims a record the log does not contain.
+//   - below first — the record has aged out under retention, so the claim can no longer
+//     be verified either way and the verdict must say so.
 //
 // Parameters:
 //   - ctx context.Context: cancels the aggregate.
 //
 // Returns:
-//   - model.EventRecordCoordinateAudit: one entry per claimed partition, ordered by topic
-//     then partition. Coordinates is non-nil and empty when nothing is confirmed.
+//   - model.EventRecordCoordinateAudit: one entry per claimed partition, ordered by
+//     topic then partition.
 //   - error: the repository's typed error.
 func (d Datasource) AuditEventRecordCoordinates(ctx context.Context) (model.EventRecordCoordinateAudit, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "AuditEventRecordCoordinates")
@@ -3385,15 +2349,9 @@ func (d Datasource) AuditEventRecordCoordinates(ctx context.Context) (model.Even
 //
 // The lookup is by event_id and not by the BIGSERIAL id because that is what the
 // dead-letter replay route carries and what a subscriber quotes when it asks for an
-// event to be resent; the surrogate key is never exposed outside this layer. The
-// lookup is index-backed by event_outbox_event_id_uidx, and the unique index also
-// guarantees at most one row can match.
-//
-// A missing row is returned as a typed not-found error rather than as (nil, nil)
-// the way GetOutboxByTransactionID does. That deviation is deliberate: the replay
-// handler has to tell "no such event" apart from "found it" to answer correctly,
-// and a nil-nil result forces every caller to re-derive that distinction and
-// invites the nil dereference that follows from forgetting to.
+// event to be resent; the surrogate key is never exposed outside this layer. The lookup
+// is index-backed by event_outbox_event_id_uidx, and the unique index also guarantees
+// at most one row can match.
 func (d Datasource) GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "GetEventByID")
 	defer span.End()
@@ -3420,24 +2378,21 @@ func (d Datasource) GetEventByID(ctx context.Context, eventID string) (*model.Ev
 	return &entry, nil
 }
 
-// deadLetterSpanAttributes WAS RETIRED HERE. Each dead-letter query now sets its own span
-// attributes at the point it knows them, which is where the filtered/unfiltered fact is decided;
-// a shared renderer had to be handed a query type, and there are two.
 // ListDeadLetteredEvents pages the dead-letter inventory, applying EVERY narrowing the
 // query expresses IN SQL.
 //
-// It is the single entry point every caller uses — the operator listing, the dead-letter age
-// scan and the recovery audit — and it delegates to ListDeadLetterInventory so a filtered page
-// and an unfiltered one cannot be drawn from different statements. The zero-valued query is
-// the whole inventory at the repository's default page size.
+// It is the single entry point every caller uses — the operator listing, the
+// dead-letter age scan and the recovery audit — and it delegates to
+// ListDeadLetterInventory so a filtered page and an unfiltered one cannot be drawn from
+// different statements. The zero-valued query is the whole inventory at the
+// repository's default page size.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
 //   - query model.DeadLetterQuery: the narrowing and the page. The zero value is valid.
 //
 // Returns:
-//   - []model.EventOutbox: the matching page, newest occurrence first. Empty, not an error,
-//     when nothing matches.
+//   - []model.EventOutbox: the matching page, newest occurrence first.
 //   - error: the repository's typed error.
 func (d Datasource) ListDeadLetteredEvents(
 	ctx context.Context,
@@ -3446,33 +2401,21 @@ func (d Datasource) ListDeadLetteredEvents(
 	return d.ListDeadLetteredEventsFiltered(ctx, query, query.Limit, query.Offset)
 }
 
-// ListDeadLetterInventory returns one page of the dead-letter inventory an operator triages
-// from, narrowed and paged entirely in SQL.
+// ListDeadLetterInventory returns one page of the dead-letter inventory an operator
+// triages from, narrowed and paged entirely in SQL.
 //
-// Both terminal failure states are included by default. A row becomes failed the moment its
-// retry budget is spent and dead_lettered only once the event has additionally reached its
-// `<topic>.dlt` sibling, so listing only the latter would hide the events whose dead-letter
-// write itself failed — the ones most in need of attention. Only a dead_lettered row can be
-// replayed; a failed one has no dead-letter message to replay from.
-//
-// Ordering is by occurred_at descending, newest first, because triage starts from the most
-// recent failures; id descending breaks ties so paging can neither show nor skip a row twice
-// when several share an instant.
-//
-// # What it does NOT read
-//
-// The event's body. See deadLetterInventoryColumns: the projection reports the body's size
-// and never its bytes, so the cost of a page is set by the number of items in it rather than
-// by how large the events happened to be.
+// Both terminal failure states are included by default. A row becomes failed the moment
+// its retry budget is spent and dead_lettered only once the event has additionally
+// reached its `<topic>.dlt` sibling, so listing only the latter would hide the events
+// whose dead-letter write itself failed — the ones most in need of attention.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
-//   - query model.DeadLetterInventoryQuery: the page and its narrowing. The zero value is
-//     valid and returns the newest default-sized page of everything.
+//   - query model.DeadLetterInventoryQuery: the page and its narrowing.
 //
 // Returns:
-//   - model.DeadLetterInventoryPage: the entries, plus the cursor for the next page when one
-//     exists. Entries is never nil on success.
+//   - model.DeadLetterInventoryPage: the entries, plus the cursor for the next page
+//     when one exists.
 //   - error: a logged internal error.
 func (d Datasource) ListDeadLetterInventory(
 	ctx context.Context,
@@ -3486,11 +2429,11 @@ func (d Datasource) ListDeadLetterInventory(
 
 // listDeadLetterInventory is the page read, parameterised by the connection it runs on.
 //
-// It exists so that the standalone read and the SNAPSHOT-CONSISTENT read that pairs the page
-// with its total run the identical statement over the identical bindings. Duplicating the
-// statement for the two paths is how the cursor predicate, the probe row and the ordering drift
-// apart, and that drift would show up as a page that differed depending on whether a total had
-// been asked for.
+// It exists so that the standalone read and the SNAPSHOT-CONSISTENT read that pairs the
+// page with its total run the identical statement over the identical bindings.
+// Duplicating the statement for the two paths is how the cursor predicate, the probe
+// row and the ordering drift apart, and that drift would show up as a page that
+// differed depending on whether a total had been asked for.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
@@ -3607,34 +2550,23 @@ func listDeadLetterInventory(
 	return page, nil
 }
 
-// deadLetterFilterClause renders a dead-letter filter as a SQL predicate and its arguments.
+// deadLetterFilterClause renders a dead-letter filter as a SQL predicate and its
+// arguments.
 //
-// # Why the clause is built rather than written out
-//
-// The three filters are independently optional, so eight combinations of predicate exist. A
-// query per combination would be eight strings to keep in step with one another; a single
-// string with `($n = ” OR column = $n)` per filter would defeat the partial index on
-// (status, occurred_at) for the unfiltered case, because the planner cannot prove the OR away.
-// Building only the predicates the caller actually set keeps the common case identical to the
-// query that existed before filtering was pushed down.
-//
-// EVERY VALUE IS A BOUND PARAMETER. Nothing from the caller is interpolated into the SQL text,
-// so an event type or topic containing a quote is a value that matches nothing rather than a
-// fragment of the statement — the property that makes an operator-facing filter safe to expose.
-//
-// The status filter REPLACES the two-state default rather than adding to it. Both terminal
-// states are listed when no status is named, because a row becomes `failed` when its retry
-// budget is spent and `dead_lettered` only once the dead-letter publication also succeeded, and
-// an operator triaging stuck events needs both.
+// EVERY VALUE IS A BOUND PARAMETER. Nothing from the caller is interpolated into the
+// SQL text, so an event type or topic containing a quote is a value that matches
+// nothing rather than a fragment of the statement — the property that makes an
+// operator-facing filter safe to expose.
 //
 // Parameters:
-//   - filter model.DeadLetterFilter: the requested narrowing. The zero value selects the whole
-//     inventory.
-//   - next int: the 1-based index of the first placeholder to allocate, so the caller can
-//     append LIMIT/OFFSET parameters after the predicate's own.
+//   - filter model.DeadLetterFilter: the requested narrowing. The zero value selects
+//     the whole inventory.
+//   - next int: the 1-based index of the first placeholder to allocate, so the caller
+//     can append LIMIT/OFFSET parameters after the predicate's own.
 //
 // Returns:
-//   - string: the WHERE clause body, never empty — it always at least bounds the status set.
+//   - string: the WHERE clause body, never empty — it always at least bounds the status
+//     set.
 //   - []interface{}: the arguments, in placeholder order.
 //   - int: the next unused placeholder index.
 func deadLetterFilterClause(filter model.DeadLetterFilter, next int) (string, []interface{}, int) {
@@ -3666,11 +2598,11 @@ func deadLetterFilterClause(filter model.DeadLetterFilter, next int) (string, []
 
 	// THE OCCURRENCE WINDOW, bound inclusively at both ends and omitted when either end is
 	// zero: zero means "unbounded", not "year one", and binding it literally would exclude
-	// every row at one end and none at the other. occurred_at is the right column for a triage
-	// window rather than the row's creation or last-attempt instant — it is when the ledger
-	// mutation happened, which is what an operator correlating a backlog against an incident
-	// timeline holds, and it is the column the listing is ordered by, so the window and the
-	// paging agree about what "newest first" selects.
+	// every row at one end and none at the other. occurred_at is the right column for a
+	// triage window rather than the row's creation or last-attempt instant — it is when
+	// the ledger mutation happened, which is what an operator correlating a backlog
+	// against an incident timeline holds, and it is the column the listing is ordered by,
+	// so the window and the paging agree about what "newest first" selects.
 	if !filter.OccurredFrom.IsZero() {
 		clauses = append(clauses, fmt.Sprintf("occurred_at >= $%d", next))
 		args = append(args, filter.OccurredFrom.UTC())
@@ -3686,23 +2618,12 @@ func deadLetterFilterClause(filter model.DeadLetterFilter, next int) (string, []
 	return strings.Join(clauses, " AND "), args, next
 }
 
-// ListDeadLetteredEventsFiltered pages the dead-letter inventory with the caller's filters
-// applied IN SQL.
-//
-// It is the listing the dead-letter API serves. The page it returns is exactly the requested
-// slice of the MATCHING set — not a filtered slice of an unfiltered page, and not a truncated
-// prefix of the matches — so a client paging a filtered inventory receives every match and can
-// tell the end of the result from an exhausted scan budget, because there is no scan budget.
-//
-// Ordering and bounds are identical to ListDeadLetteredEvents: occurred_at descending with id
-// descending to break ties, a defaulted and capped limit, and a negative offset clamped to
-// zero. Identical ordering is what makes paging stable across the two entry points, and the
-// tie-break is what stops a row being shown twice or skipped when several share an instant.
+// ListDeadLetteredEventsFiltered pages the dead-letter inventory with the caller's
+// filters applied IN SQL.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
-//   - filter model.DeadLetterFilter: the narrowing. The zero value lists the whole inventory,
-//     which makes this a superset of ListDeadLetteredEvents rather than a variant of it.
+//   - filter model.DeadLetterFilter: the narrowing.
 //   - limit int: page size. Non-positive selects the default; oversized is capped.
 //   - offset int: how many matching rows to skip. Negative is clamped to zero.
 //
@@ -3780,18 +2701,16 @@ func (d Datasource) ListDeadLetteredEventsFiltered(
 
 // CountDeadLetteredEvents counts the dead-letter inventory THE SAME FILTER selects.
 //
-// It is the other half of a usable paginated triage list. Without it a filtered page could
-// report no total at all — the API refused `include_count` alongside a filter for exactly that
-// reason — and a client had no way to know how many matches it was paging through, or whether
-// the short page it just received was the end of the result or the end of a scan budget.
-//
-// The predicate is built by the SAME function the listing uses, which is what guarantees the
-// count describes the set the pages are drawn from. Two hand-written predicates would drift,
-// and a total that disagrees with the pages is worse than no total.
+// It is the other half of a usable paginated triage list. Without it a filtered page
+// could report no total at all — the API refused `include_count` alongside a filter for
+// exactly that reason — and a client had no way to know how many matches it was paging
+// through, or whether the short page it just received was the end of the result or the
+// end of a scan budget.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
-//   - filter model.DeadLetterFilter: the narrowing. The zero value counts the whole inventory.
+//   - filter model.DeadLetterFilter: the narrowing. The zero value counts the whole
+//     inventory.
 //
 // Returns:
 //   - int64: how many rows match. Zero is a legitimate answer and not an error.
@@ -3824,43 +2743,20 @@ func (d Datasource) CountDeadLetteredEvents(
 	return total, nil
 }
 
-// CountUnresolvedEventOutbox returns a status-keyed count of every row that has NOT reached
-// its terminal dispatched state, and touches no dispatched row at all.
+// CountUnresolvedEventOutbox returns a status-keyed count of every row that has NOT
+// reached its terminal dispatched state, and touches no dispatched row at all.
 //
-// # PERF-M05: this is the reading every ROUTINE caller wants
-//
-// It exists because the two callers that run on a timer — the metrics collector, every
-// fifteen seconds, and the dead-letter service's awaiting-preservation count — read only
-// non-dispatched statuses and each said so in a comment, yet both went through
-// CountEventOutboxByStatus and so paid for an exact COUNT of a day of dispatched history on
-// every single call. At 500 events per second that is 43.2 million index entries counted
-// every fifteen seconds to produce a number nobody read: a permanently-running scan in the
-// steady state, and the largest routine cost in the whole event pipeline.
-//
-// Dropping the second arm is all it takes, because the arm that MATTERS to those callers was
-// never windowed. The population counted here is bounded by OPERATION rather than by history
-// — the pending backlog, the rows in flight, the dead-letter inventory, the two repair legs —
-// which acceptance criterion V-3 holds below 0.1% of throughput, and the partial index on
-// `status <> 'dispatched'` makes it an index-only scan of exactly those rows. Its cost is set
-// by how much work is outstanding, which is the only thing an operational reading should cost.
-//
-// So there is no `since` parameter, deliberately: a window would only be able to HIDE rows
-// this reading exists to surface. A pending row stuck for three days must appear in the
-// backlog gauge, and a `failed` row that has owed its dead-letter write since last week must
-// appear in the repair backlog. Every count here is exact and complete for all time.
-//
-// A status with no rows is ABSENT from the returned map rather than present with a zero,
-// because GROUP BY only produces rows that exist, so callers read it with the two-value form
-// or accept the zero value. The map is never nil on success.
-//
-// Callers needing the dispatched history — the daily zero-loss reconciliation, and nothing
-// else — use CountEventOutboxByStatus instead and pay for it deliberately.
+// Dropping the second arm is all it takes, because the arm that MATTERS to those
+// callers was never windowed. The population counted here is bounded by OPERATION
+// rather than by history — the pending backlog, the rows in flight, the dead-letter
+// inventory, the two repair legs.
 //
 // Parameters:
 //   - ctx context.Context: cancels the aggregate.
 //
 // Returns:
-//   - map[string]int64: counts by status for every non-dispatched status, never nil on success.
+//   - map[string]int64: counts by status for every non-dispatched status, never nil on
+//     success.
 //   - error: a logged internal error.
 func (d Datasource) CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountUnresolvedEventOutbox")
@@ -3878,55 +2774,19 @@ func (d Datasource) CountUnresolvedEventOutbox(ctx context.Context) (map[string]
 	return collectEventOutboxStatusCounts(span, rows, "count_unresolved_event_outbox")
 }
 
-// CountEventOutboxByStatus returns a status-keyed count of blnk.event_outbox rows, INCLUDING
-// the dispatched history inside the caller's window.
+// CountEventOutboxByStatus returns a status-keyed count of blnk.event_outbox rows,
+// INCLUDING the dispatched history inside the caller's window.
 //
-// IT IS NOT UNUSED — do not delete it. A grep for callers inside this package
-// alone finds none, which is exactly the trap this comment exists to prevent. It
-// exists for one named purpose: the daily zero-loss reconciliation, which passes
-// when the dispatched plus dead-lettered counts equal the sum of the main-topic and
-// dead-letter-topic end offsets reported by the broker. Two things consume it — the event
-// statistics endpoint when a caller asked for the broker side, and the reconciliation runbook
-// in the Kafka operations documentation that drives that endpoint.
+// IT IS NOT UNUSED — do not delete it. A grep for callers inside this package alone
+// finds none, which is exactly the trap this comment exists to prevent.
 //
-// # It is the ON-DEMAND reading, and CountUnresolvedEventOutbox is the routine one
-//
-// The dispatched arm is an exact COUNT over the one population in this table that grows
-// without bound: at 500 events per second the outbox gains 43.2 million rows a day, so a
-// day's window counts 43.2 million index entries and a week's counts 302.4 million. That is
-// affordable once for a deliberate reconciliation and unaffordable on a timer, which is why
-// the pending-backlog gauge and the dead-letter service — neither of which reads the
-// dispatched figure — now call CountUnresolvedEventOutbox instead (PERF-M05), and why the
-// statistics endpoint runs this arm only for a caller that asked for the broker side.
-//
-// # What "since" bounds, and what it deliberately does not
-//
-// Every status EXCEPT dispatched is counted exactly and in full, whatever the window says:
-// those are the populations an operator acts on and any of them can legitimately be older
-// than any window. `dispatched` — the only population that grows without bound — is counted
-// from since onwards. See countEventOutboxByStatusQuery for why the split is drawn there.
-//
-// A caller that wants the reading to be cheap therefore asks for a short window and gets a
-// complete answer about everything outstanding; the figure that becomes approximate is the
-// one that was already historical.
-//
-// A status with no rows is ABSENT from the returned map rather than present with a
-// zero, because GROUP BY only produces rows that exist. Callers must therefore read
-// it with the two-value form or accept the zero value — which is what the backlog
-// gauge does when nothing is pending. The map is keyed by the
-// model.EventOutboxStatus* values; any other key would mean a row carries a status
-// this code does not know about, which the column deliberately permits so the state
-// machine can be extended without a migration.
-//
-// The map is never nil on success: an empty table yields an empty map, so a caller
-// can range over the result without a nil check.
+// The map is never nil on success: an empty table yields an empty map, so a caller can
+// range over the result without a nil check.
 //
 // Parameters:
 //   - ctx context.Context: cancels the aggregate.
 //   - since time.Time: the earliest occurrence instant a dispatched row must have to be
-//     counted. A zero or future instant is normalised to defaultEventCountWindow before
-//     now, so a caller cannot accidentally ask for a whole-history scan or for a window
-//     that excludes everything.
+//     counted.
 //
 // Returns:
 //   - map[string]int64: counts by status, never nil on success.
@@ -3950,16 +2810,15 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context, since time.Tim
 
 // collectEventOutboxStatusCounts drains a `(status, row_count)` result set into a map.
 //
-// Shared by the two status aggregates so that the one thing a reader must be able to trust
-// about both — that a scan or iteration failure is reported rather than silently yielding a
-// SHORT count — is written once. Two copies of this loop is how one of them ends up returning
-// a partially-drained map on a mid-iteration error, and a zero-loss reconciliation compared
-// against a short total reports loss that has not happened.
-//
-// The rows are closed here, so a caller must not defer a close of its own.
+// Shared by the two status aggregates so that the one thing a reader must be able to
+// trust about both — that a scan or iteration failure is reported rather than silently
+// yielding a SHORT count — is written once. Two copies of this loop is how one of them
+// ends up returning a partially-drained map on a mid-iteration error, and a zero-loss
+// reconciliation compared against a short total reports loss that has not happened.
 //
 // Parameters:
-//   - span trace.Span: the caller's span, marked failed and annotated with the status count.
+//   - span trace.Span: the caller's span, marked failed and annotated with the status
+//     count.
 //   - rows *sql.Rows: the open result set. Closed before this returns.
 //   - operation string: the operation label for the logged error.
 //
@@ -4000,81 +2859,41 @@ func collectEventOutboxStatusCounts(
 	return counts, nil
 }
 
-// AuditEventRecordsInIntervals classifies every row that claims a Kafka record against the
-// MEASURED offset windows of the partitions those records live in.
+// AuditEventRecordsInIntervals classifies every row that claims a Kafka record against
+// the MEASURED offset windows of the partitions those records live in.
 //
-// # Why counting could never prove zero loss, and why an interval can
+// Those two numbers describe different populations, and no amount of care in the
+// arithmetic fixes that:
 //
-// The reconciliation used to compare the outbox's currently-retained rows against the
-// broker's cumulative end offsets. Those two numbers describe different populations, and no
-// amount of care in the arithmetic fixes that:
-//
-//   - Records are a LOWER BOUND on events — a redelivery, a replay or a dead-letter copy
-//     writes its own record — so the comparison is directional and a surplus is expected.
-//     The surplus is then INDISTINGUISHABLE FROM COMPENSATED LOSS: ten lost events plus ten
-//     redeliveries produce exactly the totals of a healthy pipeline.
-//   - Outbox retention prunes rows, so the left side shrinks over time while the right side
-//     only climbs, and the gap that hides loss grows on its own.
-//   - Kafka retention deletes records the end offset still counts, so "the sum says it was
-//     written" is not "a consumer could still read it".
-//   - Recreating a topic resets its offsets, so the right side collapses to a number smaller
-//     than the left and a healthy system reports catastrophic loss.
-//   - Foreign or pre-existing traffic on a shared topic inflates the right side by an unknown
-//     amount, masking loss by exactly that much.
-//
-// This query answers a different, answerable question, once per row: IS THE RECORD THIS ROW
-// NAMED INSIDE THE WINDOW ITS PARTITION CAN CURRENTLY SERVE. Nothing else on the topic
-// affects that answer, so foreign traffic is simply not attributed to Blnk, and every reason
-// a row cannot be corroborated is reported as its own count instead of vanishing into a
-// total.
-//
-// # The classification, and why every bucket is separate
+//   - Records are a LOWER BOUND on events — a redelivery, a replay or a dead-letter
+//     copy writes its own record — so the comparison is directional and a surplus is
+//     expected.
+//   - Outbox retention prunes rows, so the left side shrinks over time while the right
+//     side only climbs, and the gap that hides loss grows on its own.
+//   - Kafka retention deletes records the end offset still counts, so "the sum says it
+//     was written" is not "a consumer could still read it".
+//   - Recreating a topic resets its offsets, so the right side collapses to a number
+//     smaller than the left and a healthy system reports catastrophic loss.
+//   - Foreign or pre-existing traffic on a shared topic inflates the right side by an
+//     unknown amount, masking loss by exactly that much.
 //
 // Each row lands in exactly one bucket and the buckets sum to PublishedRows:
 //
-//   - corroborated — offset inside [first_offset, end_offset) of a measured partition. The
-//     only bucket a green verdict may contain.
-//   - unconfirmed — no coordinate at all. COUNT of a NULL-able expression ignores NULLs, and
-//     the all-or-nothing check constraint means a non-NULL offset implies a complete
-//     coordinate, so testing the offset alone is sufficient.
-//   - unmeasured — names a topic or partition absent from the measurement: a missing topic, an
-//     unavailable partition, or a partition count that has since shrunk. The LEFT JOIN is what
-//     detects it; an inner join would have silently dropped these rows and inflated the
-//     corroborated fraction, which is the failure this classification exists to prevent.
-//   - aged_out — offset BELOW first_offset. Written, then deleted by Kafka retention. Not
-//     loss, but not corroborable either.
-//   - beyond_end — offset AT OR ABOVE end_offset. Impossible on an intact log, because the
-//     broker assigned that offset when it accepted the write; it means the partition was
-//     truncated or the topic recreated. This is the topic-incarnation signal.
-//
-// DistinctCorroboratedRecords is counted over the corroborated rows only and is FILTERED to
-// rows naming a coordinate. The filter is required rather than defensive: COUNT(DISTINCT expr)
-// ignores a NULL expr, but a ROW CONSTRUCTOR whose every field is NULL is not itself NULL in
-// PostgreSQL, so without it every coordinate-less row would collapse into one phantom extra
-// "record" and the documented equality with CorroboratedRows would be false on a healthy
-// outbox.
-//
-// # The window the verdict covers is reported, not assumed
-//
-// OldestTerminalAt is the earliest publication instant among all terminal rows still retained,
-// and CorroboratedFrom/CorroboratedTo bound the corroborated population. They exist because
-// the outbox is pruned: a verdict is a statement about the rows that still exist, and one
-// presented without that bound is how an aggressively pruned outbox produced a
-// reconciliation that looked complete. COALESCE to occurred_at covers a dead-lettered row,
-// which has no kafka_dispatched_at because its record went to the dead-letter topic.
-//
-// # Why the webhook_pending row is included
-//
-// It HAS been published to Kafka; what is outstanding is the deprecated HTTP leg. Its record
-// is on the topic, so excluding it would leave a real record unaccounted for on the outbox
-// side during exactly the dual-delivery window when the reconciliation matters most.
+//   - corroborated — offset inside [first_offset, end_offset) of a measured partition.
+//   - unconfirmed — no coordinate at all. COUNT of a NULL-able expression ignores
+//     NULLs, and the all-or-nothing check constraint means a non-NULL offset implies a
+//     complete coordinate, so testing the offset alone is sufficient.
+//   - unmeasured — names a topic or partition absent from the measurement: a missing
+//     topic, an unavailable partition, or a partition count that has since shrunk.
+//   - aged_out — offset BELOW first_offset. Written, then deleted by Kafka retention.
+//   - beyond_end — offset AT OR ABOVE end_offset. Impossible on an intact log, because
+//     the broker assigned that offset when it accepted the write; it means the
+//     partition was truncated or the topic recreated.
 //
 // Parameters:
 //   - ctx context.Context: cancels the statement.
 //   - intervals []model.PartitionOffsetInterval: the measured windows, from
-//     TopicOffsetReport.PartitionIntervals(). An EMPTY list is valid and classifies every
-//     confirmed row as unmeasured, which is the correct reading of "the broker told us
-//     nothing" and is what stops a broker-less run reporting a green verdict.
+//     TopicOffsetReport.PartitionIntervals().
 //
 // Returns:
 //   - model.EventRecordIntervalAudit: the classification and the instants it covers.
@@ -4088,11 +2907,11 @@ func (d Datasource) AuditEventRecordsInIntervals(
 
 	audit := model.EventRecordIntervalAudit{MeasuredAt: time.Now().UTC()}
 
-	// The windows are passed as four parallel arrays and zipped by unnest, so one statement
-	// serves any number of partitions with a fixed parameter count. Built with make rather
-	// than left nil, because lib/pq renders a nil slice as SQL NULL and unnest(NULL) yields
-	// no rows at all — which would classify correctly by accident here, but would break the
-	// moment the join was used in the other direction.
+	// The windows are passed as four parallel arrays and zipped by unnest, so one
+	// statement serves any number of partitions with a fixed parameter count. Built with
+	// make rather than left nil, because lib/pq renders a nil slice as SQL NULL and
+	// unnest(NULL) yields no rows at all — which would classify correctly by accident
+	// here, but would break the moment the join was used in the other direction.
 	topics := make([]string, 0, len(intervals))
 	partitions := make([]int64, 0, len(intervals))
 	firstOffsets := make([]int64, 0, len(intervals))
@@ -4108,10 +2927,10 @@ func (d Datasource) AuditEventRecordsInIntervals(
 
 		first := interval.FirstOffset
 		if first < 0 {
-			// A broker that could not report the earliest retained offset is reported as
-			// zero rather than as a negative sentinel, which is the widest window the
-			// measurement supports and therefore the reading that cannot manufacture an
-			// aged-out row that is not one.
+			// A broker that could not report the earliest retained offset is reported as zero
+			// rather than as a negative sentinel, which is the widest window the measurement
+			// supports and therefore the reading that cannot manufacture an aged-out row that is
+			// not one.
 			first = 0
 		}
 
@@ -4215,31 +3034,18 @@ func (d Datasource) AuditEventRecordsInIntervals(
 	return audit, nil
 }
 
-// ListUndrainedEventTopics groups every row that still owes a publish by the destination
-// topic recorded on it. See database.eventOutboxRepository for what the audit is for and why
-// "undrained" is the two sets it is rather than simply the non-terminal statuses.
-//
-// # Why it groups rather than filtering in SQL
-//
-// The question this answers — "does any stored destination lie outside the namespaces we
-// own?" — needs the OWNED PREFIX LIST to answer, and that list lives in configuration read by
-// the root package. Encoding a namespace predicate in this statement would put topic-naming
-// policy in the persistence layer, where the doc comment on model.IsBlnkEventTopic explains it
-// does not belong. Returning the grouped inventory instead lets the caller apply whichever
-// ownership test it is holding, and keeps this query a plain aggregate.
-//
-// The result is bounded by the number of distinct topics in the table, so it is returned
-// whole. A topic recorded with a blank value cannot exist — the insert validation refuses
-// it — but the aggregate would still group one, so the row is skipped rather than reported
-// under an empty name that no ownership test can classify.
+// ListUndrainedEventTopics groups every row that still owes a publish by the
+// destination topic recorded on it. See database.eventOutboxRepository for what the
+// audit is for and why "undrained" is the two sets it is rather than simply the
+// non-terminal statuses.
 //
 // Parameters:
 //   - ctx context.Context: cancels the statement.
 //
 // Returns:
-//   - []model.EventTopicBacklog: one entry per distinct destination topic that still owes
-//     work, ordered by the oldest outstanding occurrence first, so the most overdue
-//     generation is read first. Empty when the outbox owes nothing.
+//   - []model.EventTopicBacklog: one entry per distinct destination topic that still
+//     owes work, ordered by the oldest outstanding occurrence first, so the most
+//     overdue generation is read first.
 //   - error: a logged internal error.
 func (d Datasource) ListUndrainedEventTopics(ctx context.Context) ([]model.EventTopicBacklog, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListUndrainedEventTopics")
@@ -4247,12 +3053,6 @@ func (d Datasource) ListUndrainedEventTopics(ctx context.Context) ([]model.Event
 
 	// The status sets are spelled from the model's own literals through parameters, so a
 	// status renamed there cannot leave this statement silently matching nothing.
-	//
-	// The undelivered set is stated as "not one of the two that owe no publish" rather than
-	// as a list of the four that do: a status ADDED to the state machine then joins the
-	// undrained set by default, which is the safe direction for an audit whose whole purpose
-	// is to notice rows nothing is draining. Getting that wrong the other way would report a
-	// stranded generation as drained.
 	rows, err := d.Conn.QueryContext(ctx, `
 		SELECT
 			topic,
@@ -4316,31 +3116,25 @@ func (d Datasource) ListUndrainedEventTopics(ctx context.Context) ([]model.Event
 }
 
 // ---------------------------------------------------------------------------------------
-// DATA-01: driver errors must not become API response bodies
+// Driver errors must not become API response bodies
 //
-// apierror.APIError carries its cause in an interface{} Details field that is serialised into
-// the response. lib/pq's *pq.Error is a STRUCT WITH EXPORTED FIELDS — Severity, Code, Message,
-// Detail, Hint, Schema, Table, Column, Constraint, File, Line, Routine — so passing one as
-// Details published the schema name, the table, the column, the violated constraint and even
-// the PostgreSQL source file and function that raised it, to whoever called the endpoint. That
-// is a map of the database handed out one failed request at a time.
+// apierror.APIError serialises its Details field into the response, and lib/pq's
+// *pq.Error is a struct of exported fields — schema, table, column, violated constraint,
+// even the PostgreSQL source file that raised it. Passing one as Details hands out a map
+// of the database one failed request at a time.
 //
-// Both event repositories therefore route every driver-origin failure through the helpers
-// below: the full error is LOGGED, with its SQLSTATE, and the API error carries a code and a
-// message and NO details at all. Details is `omitempty`, so it simply does not appear.
-//
-// Nothing is lost by that. The operator gets more than before — a structured log line naming
-// the operation and the SQLSTATE class — while the caller gets what a caller can act on, which
-// is the typed code. The two audiences were previously served by one field, and it was the
-// wrong field for one of them.
+// Every driver-origin failure therefore goes through the helpers below: the full error
+// is LOGGED with its SQLSTATE, and the API error carries a code and a message and no
+// details at all. Each audience gets what it can act on — the operator a structured log
+// line naming the operation and the SQLSTATE class, the caller the typed code.
 // ---------------------------------------------------------------------------------------
 
 // postgresSQLState extracts the five-character SQLSTATE from a driver error.
 //
-// It is a bounded, non-revealing value — a standardised error class such as "23505", not a
-// message — which makes it safe to put in a log field and useful for grouping failures. It
-// returns "unknown" for anything that is not a *pq.Error, including a wrapped one, so a log
-// line always has the field.
+// It is a bounded, non-revealing value — a standardised error class such as "23505",
+// not a message — which makes it safe to put in a log field and useful for grouping
+// failures. It returns "unknown" for anything that is not a *pq.Error, including a
+// wrapped one, so a log line always has the field.
 //
 // Parameters:
 //   - err error: the error to inspect. May be nil or wrapped.
@@ -4357,43 +3151,22 @@ func postgresSQLState(err error) string {
 }
 
 // ---------------------------------------------------------------------------------------
-// DATA-02: the driver's own words must not reach the standard log or a span either
+// The driver's own words must not reach the standard log or a span either
 //
-// DATA-01 above stopped the driver error being SERIALISED INTO THE RESPONSE. It left the
-// error in the two other places it does not belong, and both of them leave the process:
+// Keeping the driver error out of the RESPONSE is only the first half. It also does not
+// belong in either of the two other places that leave the process:
 //
-//   - attaching the cause to a log entry directly rendered the full text into an "error"
-//     field. A *pq.Error
-//     renders as its Message, and PostgreSQL's messages name the SCHEMA, the TABLE, the
-//     COLUMN and the violated CONSTRAINT; a plumbing failure names the HOST AND PORT it
-//     could not reach. Logs are shipped to an aggregator and indexed, so that is a map of
-//     the database and its topology accumulating in a searchable store.
-//   - failDatabaseSpan(span, cause) writes the same text as an exception.message attribute on a
-//     span. Traces go to a shared backend that is routinely readable by more people than
-//     the database is, and an exception event is retained for the whole trace's lifetime.
+//   - a log entry given the cause directly renders the full text into an "error" field.
+//   - failDatabaseSpan(span, cause) writes that same text as an exception.message
+//     attribute on a span.
 //
-// Both are replaced by a BOUNDED CLASS plus the SQLSTATE. The class vocabulary below is
-// closed and every member is a fixed literal, so the pair (error_class, sqlstate) groups
-// failures for alerting exactly as the raw text did — better, in fact, since two failures
-// of one kind no longer differ by an interpolated identifier.
-//
-// The raw cause is not discarded. It goes to logDatabaseDiagnostic, which emits at TRACE
-// and nowhere else. That level is the separately controlled sink: DEBUG is already the
-// event pipeline's routine per-event volume (see config.Configuration.LogLevel), so an
-// operator raising the level to debug for a delivery investigation must NOT thereby start
-// shipping schema and topology detail. Choosing the level below the one already in
-// ordinary use is what makes the sink a deliberate act rather than a side effect.
+// Both take the bounded class and the SQLSTATE instead, which is why every helper below
+// classifies before it reports.
 // ---------------------------------------------------------------------------------------
 
-// The bounded classes a database failure is reported as. Every value is a fixed literal and
-// the set is closed, which is what makes them safe as a log field and as a span status.
-//
-// The SQLSTATE-derived members use the two-character CLASS rather than the five-character
-// code, because the class is what decides where an operator looks: 08 is the network or the
-// pool, 23 is the data, 40 is contention that a retry resolves, 42 is the schema or the
-// grant — a genuine deployment fault — and 53/57 are the server refusing service. The exact
-// five characters travel beside the class in the sqlstate field, so nothing is lost by
-// classifying coarsely here.
+// The bounded classes a database failure is reported as. Every value is a fixed literal
+// and the set is closed, which is what makes them safe as a log field and as a span
+// status.
 const (
 	databaseErrorClassUnknown       = "unknown"
 	databaseErrorClassNoRows        = "no_rows"
@@ -4413,24 +3186,17 @@ const (
 
 // databaseErrorClass maps a failure to one of the bounded classes above.
 //
-// The Go-level conditions are tested FIRST and in this order deliberately. A cancelled or
-// expired context surfaces from lib/pq as a driver error on some paths and as a context
-// error on others, and reporting the same operator-visible event under two different
-// classes depending on where the cancellation landed would make the series useless for
-// alerting. sql.ErrNoRows precedes them because it is not a fault at all on the paths that
-// use RETURNING to detect a lost claim.
-//
 // An apierror.APIError is classified by its CODE and never by its message. That is not
 // timidity about Blnk's own prose: several of these values carry a Details error that
-// interpolates a subscriber or event identifier, so the message is caller data, while the
-// code vocabulary is closed and is already the value clients switch on.
+// interpolates a subscriber or event identifier, so the message is caller data, while
+// the code vocabulary is closed and is already the value clients switch on.
 //
 // Parameters:
 //   - err error: the failure to classify. May be nil or wrapped.
 //
 // Returns:
 //   - string: one of the databaseErrorClass* constants, or "api:<CODE>" for a typed
-//     application error. Never empty, so a log field is always present.
+//     application error.
 func databaseErrorClass(err error) string {
 	var apiErr apierror.APIError
 
@@ -4474,15 +3240,13 @@ func databaseErrorClass(err error) string {
 	}
 }
 
-// ErrorClass is the exported form of databaseErrorClass, for a caller OUTSIDE this package that
-// has to log a failure this package returned.
+// ErrorClass is the exported form of databaseErrorClass, for a caller OUTSIDE this
+// package that has to log a failure this package returned.
 //
-// The API layer is the caller that needs it. A handler receives an error from a repository
-// method and cannot assume anything about its text: IDataSource is an interface, so the value
-// may be the bounded apierror.APIError loggedDatabaseError returns, a driver error from a
-// different implementation, or a mock's own error. Classifying it here rather than rendering it
-// there means one vocabulary covers every implementation, and a handler cannot accidentally be
-// the place a driver error escapes.
+// The API layer is the caller that needs it. A handler receives an error from a
+// repository method and cannot assume anything about its text: IDataSource is an
+// interface, so the value may be the bounded apierror.APIError loggedDatabaseError
+// returns, a driver error from a different implementation, or a mock's own error.
 //
 // Parameters:
 //   - err error: the failure to classify. May be nil or wrapped.
@@ -4493,8 +3257,9 @@ func ErrorClass(err error) string {
 	return databaseErrorClass(err)
 }
 
-// SQLState is the exported form of postgresSQLState, so a caller outside this package can carry
-// the standardised five-character error class beside the bounded class from ErrorClass.
+// SQLState is the exported form of postgresSQLState, so a caller outside this package
+// can carry the standardised five-character error class beside the bounded class from
+// ErrorClass.
 //
 // Parameters:
 //   - err error: the failure to inspect. May be nil or wrapped.
@@ -4517,41 +3282,32 @@ func LogDiagnostic(operation string, cause error) {
 
 // logDatabaseDiagnostic sends the raw cause to the trace-level diagnostic sink.
 //
-// This is the ONE place in either event repository that renders a driver error's own text,
-// and it is reachable only when the standard logger is at TRACE. The level check is
-// explicit rather than left to logrus's own filtering because logrus.WithError formats the
-// error eagerly: without the guard the cause would be rendered into a field on every
-// failure and then thrown away, which is both wasted work at 500 events a second and a
-// value sitting in a hook's reach.
-//
 // Parameters:
-//   - operation string: what was being attempted, for correlation with the bounded line.
+//   - operation string: what was being attempted, for correlation with the bounded
+//     line.
 //   - cause error: the raw failure. A nil cause is a no-op.
 func logDatabaseDiagnostic(operation string, cause error) {
 	if cause == nil || !logrus.IsLevelEnabled(logrus.TraceLevel) {
 		return
 	}
 
-	// THE RAW CAUSE IS ATTACHED VERBATIM HERE, and only here. This sink exists precisely so
-	// the driver's or client's own text is reachable when an operator asks for it explicitly,
-	// which is why it is gated on the trace level and why it does NOT go through the
-	// redacting helper every other site uses — redacting the one place the full text is
-	// supposed to be available would leave it available nowhere.
+	// THE RAW CAUSE IS ATTACHED VERBATIM HERE, and only here. This sink exists precisely
+	// so the driver's or client's own text is reachable when an operator asks for it
+	// explicitly, which is why it is gated on the trace level and why it does NOT go
+	// through the redacting helper every other site uses — redacting the one place the
+	// full text is supposed to be available would leave it available nowhere.
 	logrus.WithField("operation", operation).WithField(logrus.ErrorKey, cause).Trace(
 		"database diagnostic: the driver's own error text, which may name schema objects, " +
 			"constraints and broker or host addresses and is therefore emitted at trace only",
 	)
 }
 
-// failDatabaseSpan marks a span failed with a bounded class instead of recording the raw error.
+// failDatabaseSpan marks a span failed with a bounded class instead of recording the
+// raw error.
 //
-// span.RecordError is deliberately not used, for the reason DATA-02 documents: it writes the
-// error's own text as an exception.message attribute, and both the driver's text and an
-// apierror's interpolated details leave the deployment on a span.
-//
-// The SQLSTATE is set as an attribute rather than folded into the status description so that
-// a trace backend can facet on it. A nil error is a no-op, so a caller may route both
-// outcomes through one call.
+// span.RecordError is deliberately not used, for the reason the banner above gives: it
+// writes the error's own text as an exception.message attribute, and both the driver's
+// text and an apierror's interpolated details leave the deployment on a span.
 //
 // Parameters:
 //   - span trace.Span: the span to mark. A nil or non-recording span is tolerated.
@@ -4569,26 +3325,24 @@ func failDatabaseSpan(span trace.Span, cause error) {
 	span.SetStatus(codes.Error, class)
 }
 
-// loggedDatabaseError logs a driver-origin failure as a bounded class and returns a typed API
-// error that carries NO details.
+// loggedDatabaseError logs a driver-origin failure as a bounded class and returns a
+// typed API error that carries NO details.
 //
-// It is the only way an event repository should report a database failure to a caller. The
-// alternative — passing the driver error as details — is the DATA-01 disclosure, and it is
-// easy to reintroduce because it reads like helpfulness.
-//
-// The error is constructed directly rather than through apierror.NewAPIError so that the
-// logging here, which carries the operation, the class and the SQLSTATE, is the only log line
-// for the failure rather than a second one alongside a details-only entry.
+// It is the only way an event repository should report a database failure to a caller.
+// The alternative — passing the driver error as details — is the disclosure this file's
+// error-reporting banner refuses, and it is easy to reintroduce because it reads like
+// helpfulness.
 //
 // Parameters:
-//   - code apierror.ErrorCode: the typed code the caller receives. Normalised.
+//   - code apierror.ErrorCode: the typed code the caller receives.
 //   - message string: the caller-facing message. Must not interpolate the cause.
-//   - operation string: what was being attempted, for the log field. A fixed literal.
-//   - cause error: the driver error. Classified, never rendered; the text itself goes only to
-//     the trace-level diagnostic sink.
+//   - operation string: what was being attempted, for the log field.
+//   - cause error: the driver error. Classified, never rendered; the text itself goes
+//     only to the trace-level diagnostic sink.
 //
 // Returns:
-//   - error: an apierror.APIError value, so errors.As continues to work at every call site.
+//   - error: an apierror.APIError value, so errors.As continues to work at every call
+//     site.
 func loggedDatabaseError(code apierror.ErrorCode, message, operation string, cause error) error {
 	logrus.WithFields(logrus.Fields{
 		"operation":   operation,
@@ -4613,38 +3367,6 @@ func loggedDatabaseError(code apierror.ErrorCode, message, operation string, cau
 // It is a package-level constant so tests can assert that FOR UPDATE SKIP LOCKED, the
 // occurred_at ordering, the untouched status and the dlt_topic IS NULL restriction are
 // all still present.
-//
-// # The set, and why it must be reachable at all
-//
-// MarkEventFailed's exhaustion arm records 'failed' and RETAINS the claim token so the
-// worker that spent the last attempt is the only one permitted to write the event to its
-// `<topic>.dlt` sibling. When that write — or the MarkEventDeadLettered that records it —
-// fails, the row is left failed with no dlt_topic, and at that point it was reachable by
-// nothing at all: the main claim excludes it twice over (wrong status, no budget) and
-// ClaimEventForReplay accepts only dead_lettered. This table is the ONLY copy of that
-// event — the retention purge deliberately refuses to delete a failed row for exactly this
-// reason — so an operator's only recourse was a hand-written UPDATE.
-//
-// 'processing' is included alongside 'failed' because a relay can die between this claim
-// and the dead-letter record; such a row is recovered by the same predicate once its lease
-// expires. dlt_topic IS NULL is what makes the set SELF-CLEARING: recording the
-// dead-letter takes the row out of it permanently.
-//
-// # Why the status is deliberately NOT changed
-//
-// Moving the row to 'processing' would put it back into the main claim's blocking set, so
-// a row whose dead-letter topic was unreachable would stall every later event of its
-// aggregate for as long as the outage lasted. Leaving it failed keeps the trade the main
-// claim's anti-join documents: an event that can never reach the main topic must not hold
-// its key back. MarkEventDeadLettered accepts 'failed' as a prior state precisely so this
-// works.
-//
-// # next_attempt_at is the retry pacing
-//
-// MarkEventFailed's exhaustion arm schedules it exactly as its retry arm does, so a
-// dead-letter topic that is unreachable is retried on the same bounded backoff the publish
-// attempts used rather than once per poll interval per stranded row.
-// MATERIALIZED for the reason given on claimPendingEventOutboxQuery.
 const claimEventsOwedDeadLetterQuery = `
 		WITH candidates AS MATERIALIZED (
 			SELECT candidate.id FROM blnk.event_outbox candidate
@@ -4672,23 +3394,14 @@ const claimEventsOwedDeadLetterQuery = `
 // dead-letter write is still owed, so the hand-off can be retried instead of the event
 // being stranded in the only table that holds it.
 //
-// In a healthy system this returns nothing: the hand-off happens in the same batch as the
-// attempt that exhausted the budget. It matters when the dead-letter topic is unreachable,
-// when the broker rejects the write, or when the relay dies between the write and the
-// record — and in every one of those cases the alternative is an event that exists nowhere
-// else and can be neither published, replayed nor purged.
-//
 // The returned rows carry a FRESH claim token, which is what authorises
 // MarkEventDeadLettered, and their attempt count still shows the budget spent, which is
 // how a caller knows to retry the hand-off rather than the publish.
 //
 // Parameters:
 //   - ctx context.Context: cancels the claim.
-//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero LIMIT
-//     claims nothing and returns no error, which is indistinguishable from "nothing is owed".
-//   - lockDuration time.Duration: the lease. Non-positive is normalised to
-//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays write the
-//     same event to the dead-letter topic.
+//   - batchSize int: how many rows to claim.
+//   - lockDuration time.Duration: the lease.
 //
 // Returns:
 //   - []model.EventOutbox: the claimed rows, oldest occurrence first.
@@ -4747,32 +3460,17 @@ func (d Datasource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int
 	return entries, nil
 }
 
-// deadLetterInventoryPredicate builds the WHERE clause shared by the dead-letter listing
-// and its count, and appends the values it binds.
-//
-// # One builder, because two would be a defect waiting to happen
+// deadLetterInventoryPredicate builds the WHERE clause shared by the dead-letter
+// listing and its count, and appends the values it binds.
 //
 // The listing and the count MUST select exactly the same set. If they can disagree, an
 // operator pages through entries while the total tells them a different number exists,
 // and neither figure can be trusted — the sort of discrepancy that is discovered during
-// an incident, at the worst possible moment. Deriving both clauses from one function makes
-// disagreement unrepresentable rather than merely unlikely: a filter added here is added
-// to both queries at once, and a filter cannot be added to one alone.
-//
-// Both terminal failure states are always included. A row becomes failed the moment its
-// retry budget is spent, and dead_lettered only once the event has additionally reached
-// its `<topic>.dlt` sibling, so restricting to the latter would hide the events whose
-// dead-letter write itself failed — the ones with no copy anywhere but the outbox row, and
-// therefore the ones most in need of attention. The status filter narrows WITHIN those two
-// rather than escaping them, so no filter value can reach a pending or dispatched row.
-//
-// Every value is bound. The only string formatting is placeholder NUMBERING, derived from
-// the length of the argument slice, so a filter's value can never become part of the
-// statement text.
+// an incident, at the worst possible moment.
 //
 // Parameters:
-//   - query model.DeadLetterQuery: the requested narrowing. Blank filters are skipped, so
-//     the zero value yields the unfiltered inventory.
+//   - query model.DeadLetterQuery: the requested narrowing. Blank filters are skipped,
+//     so the zero value yields the unfiltered inventory.
 //   - args []interface{}: the argument slice to append to, normally empty.
 //
 // Returns:
@@ -4796,10 +3494,10 @@ func deadLetterInventoryPredicate(
 		clause.WriteString(fmt.Sprintf(" AND event_type = $%d", len(args)))
 	}
 	if query.Topic != "" {
-		// The ORIGINAL category topic, compared against the stored column. That
-		// comparison is exact rather than a best effort: topic is NOT NULL and carries
-		// CHECK (btrim(topic) <> ''), so no stored row can hold a blank the service
-		// would have to substitute an event-type derivation for.
+		// The ORIGINAL category topic, compared against the stored column. That comparison is
+		// exact rather than a best effort: topic is NOT NULL and carries CHECK (btrim(topic)
+		// <> ''), so no stored row can hold a blank the service would have to substitute an
+		// event-type derivation for.
 		args = append(args, query.Topic)
 		clause.WriteString(fmt.Sprintf(" AND topic = $%d", len(args)))
 	}
@@ -4820,25 +3518,10 @@ func deadLetterInventoryPredicate(
 	return clause.String(), args
 }
 
-// normalizeDeadLetterPage WAS RETIRED HERE. Both dead-letter listings clamp their own limit
-// against defaultDeadLetterPageSize and maxDeadLetterPageSize inline, and the inventory listing
-// pages by CURSOR rather than by offset — so there is no offset left for a shared normaliser to
-// correct, and a helper that still normalised one would imply otherwise.
-// CountDeadLetterInventory counts the entries a listing query matches, ignoring its page.
-//
-// # Why a filter-aware count had to exist
-//
-// The total accompanying a page used to come from the per-status aggregate, which can only
-// answer for a status: with an event-type or topic filter set there was no way to count the
-// matching set, so the endpoint REFUSED to provide a total for exactly the narrowed
-// listings an operator pages through. That is the wrong trade in a triage tool — the whole
-// reason to narrow is to work through a specific backlog, and working through it without
-// knowing its size means never knowing whether you are near the end.
-//
-// It shares deadLetterInventoryPredicate with the listing, so the count is a count OF THE
-// LISTING rather than an independent query that resembles it. The page is deliberately not
-// applied: LIMIT and OFFSET select which matches to return and have no bearing on how many
-// there are.
+// CountDeadLetterInventory counts the entries a listing query matches, ignoring its
+// page. Both dead-letter listings clamp their own limit against
+// defaultDeadLetterPageSize and maxDeadLetterPageSize inline, and the inventory listing
+// pages by CURSOR rather than by offset.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
@@ -4857,9 +3540,9 @@ func (d Datasource) CountDeadLetterInventory(
 	return countDeadLetterInventory(ctx, d.Conn, span, query)
 }
 
-// countDeadLetterInventory is the count, parameterised by the connection it runs on, for the
-// same reason listDeadLetterInventory is: the paired read must count with the predicate the
-// page was drawn with, not with one that resembles it.
+// countDeadLetterInventory is the count, parameterised by the connection it runs on,
+// for the same reason listDeadLetterInventory is: the paired read must count with the
+// predicate the page was drawn with, not with one that resembles it.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
@@ -4897,43 +3580,21 @@ func countDeadLetterInventory(
 	return total, nil
 }
 
-// ListAndCountDeadLetterInventory returns one page of the inventory AND how many entries the
-// same narrowing matches, both read from a single snapshot.
+// ListAndCountDeadLetterInventory returns one page of the inventory AND how many
+// entries the same narrowing matches, both read from a single snapshot.
 //
-// # Why one snapshot rather than two reads
-//
-// The page and the total used to be two independent statements on two connections, and the
-// response then asserted a relationship between them that nothing established: an entry
-// dead-lettered between the two reads is counted by one and absent from the other, so the total
-// describes a set the page is not a slice of. On a triage endpoint that reads as a different
-// amount of stuck work than there is — the operator sees 41 entries and a total of 40, or pages
-// to the total and finds the backlog is not empty.
-//
-// REPEATABLE READ is what fixes it. In PostgreSQL that isolation level takes one snapshot at the
-// first statement and every later statement in the transaction sees exactly that snapshot, so
-// the count is a count of the very population the page was drawn from. The transaction is
-// declared READ ONLY as well, which lets PostgreSQL skip the bookkeeping a writable snapshot
-// needs and — more importantly here — makes it impossible for this path to write.
-//
-// # What is still NOT guaranteed, and why the response says so
-//
-// One snapshot makes the total and THIS page agree. It cannot make "paging to the total
-// exhausts the matches" true, because paging spans many requests over a live inventory: the
-// relay dead-letters entries and a replay removes them while a client pages. The total is
-// therefore exact as at this page, not a promise about the session, and the DTO documents it
-// that way rather than claiming an exactness no read can deliver.
+// On a triage endpoint that reads as a different amount of stuck work than there is —
+// the operator sees 41 entries and a total of 40, or pages to the total and finds the
+// backlog is not empty.
 //
 // Parameters:
 //   - ctx context.Context: cancels the transaction.
-//   - query model.DeadLetterInventoryQuery: the narrowing and the page. The count applies the
-//     same narrowing and ignores the page.
+//   - query model.DeadLetterInventoryQuery: the narrowing and the page.
 //
 // Returns:
 //   - model.DeadLetterInventoryPage: the page, as ListDeadLetterInventory.
 //   - int64: how many entries the narrowing matches in the same snapshot.
-//   - error: the repository's typed error. A failure to open or read the snapshot is reported
-//     rather than silently degraded to two reads, because a caller that asked for a coherent
-//     pair must not be handed an incoherent one that looks the same.
+//   - error: the repository's typed error.
 func (d Datasource) ListAndCountDeadLetterInventory(
 	ctx context.Context,
 	query model.DeadLetterInventoryQuery,
@@ -4952,11 +3613,11 @@ func (d Datasource) ListAndCountDeadLetterInventory(
 			"Failed to read the dead-letter inventory", "list_and_count_dead_letter_inventory", err)
 	}
 
-	// ROLLED BACK UNCONDITIONALLY, never committed. Nothing was written, so there is nothing to
-	// commit, and a rollback releases the snapshot on every path including the error ones. The
-	// result is already in hand by then, so a rollback failure is logged rather than returned:
-	// discarding a correct answer over a condition the caller cannot act on would be the worse
-	// outcome.
+	// ROLLED BACK UNCONDITIONALLY, never committed. Nothing was written, so there is
+	// nothing to commit, and a rollback releases the snapshot on every path including the
+	// error ones. The result is already in hand by then, so a rollback failure is logged
+	// rather than returned: discarding a correct answer over a condition the caller cannot
+	// act on would be the worse outcome.
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 			withLoggableCause(nil, rollbackErr).Error(
@@ -4979,58 +3640,21 @@ func (d Datasource) ListAndCountDeadLetterInventory(
 	return page, total, nil
 }
 
-// expectedEventTopicPrefix (singular) WAS RETIRED HERE. It resolved the one namespace this
-// deployment owns, and the question it answered has since split in two:
-//
-//   - expectedEventTopicPrefixes returns EVERY namespace this deployment owns, including the
-//     historical ones a renamed prefix leaves behind, and validateEventOutboxEntry admits a
-//     stored topic under any of them. A stored row written before the rename must still be
-//     publishable, or renaming the prefix strands the outbox.
-//   - configuredEventTopicPrefix returns only the CURRENT one, for the questions where a
-//     historical namespace is the wrong answer: which topics a subscriber may be granted, and
-//     which topics are provisioned into. A historical namespace is something to drain.
-//
-// Keeping the singular form beside them left a third answer to the same question, and it was the
-// one that could not tell those two cases apart.
-// AuditTerminalEventRecords reports how many rows claim a Kafka record and how many of those
-// name the record they produced.
-//
-// # Why counting alone could never prove zero loss
-//
-// The reconciliation compares the outbox against the broker's summed end offsets. Records are a
-// LOWER BOUND on events — a redelivery, a replay or a dead-letter copy writes a second record
-// for one event — so the comparison is directional and a surplus is expected. Its weakness is
-// that the surplus is INDISTINGUISHABLE FROM COMPENSATED LOSS: ten lost events plus ten
-// redeliveries produce exactly the totals of a healthy pipeline, and the verdict reads "no loss"
-// while ten events are genuinely missing.
-//
-// This query reports the mapping instead of a total. Every row that claims a publication either
-// names a coordinate or does not, and a row that does not is counted separately rather than
-// being absorbed. ReconcileAgainstOutbox then refuses to call a verdict conclusive while any
-// remain — which is what makes an undetectable loss impossible rather than merely unlikely.
-//
-// # The three counts, and why each is needed
+// AuditTerminalEventRecords counts, over a window, how many terminal rows claim a
+// broker record and how many of those records are distinct. It is the repository half of
+// the zero-loss reconciliation: the three counts are what a comparison against the
+// broker's own offsets is drawn from.
 //
 //   - PublishedRows counts every row whose Kafka leg completed (kafka_dispatched_at is
-//     stamped, which covers dispatched AND webhook_pending) plus every dead-lettered row,
-//     whose record is on the dead-letter topic. The unique index on event_id is what makes
-//     each row exactly one event.
-//   - ConfirmedRows counts the subset naming a coordinate. COUNT(kafka_offset) does this
-//     directly: SQL COUNT of an expression ignores NULLs, and the all-or-nothing check
-//     constraint means a non-NULL offset implies a complete coordinate.
-//   - DistinctRecords counts the DISTINCT coordinates, FILTERED to the rows that name one. It
-//     equals ConfirmedRows unless two rows name the same record, which the partial unique index
-//     forbids — so a discrepancy means that index is absent, and the audit reports the fact
-//     rather than assuming the schema is intact. Two rows sharing one record's corroboration is
-//     the same double-counting the whole mechanism exists to remove. The filter is what makes
-//     that equality true at all; see the query for why.
+//     stamped, which covers dispatched AND webhook_pending) plus every dead-lettered
+//     row, whose record is on the dead-letter topic.
 //
-// # Why the webhook_pending row is included
+//   - ConfirmedRows counts the subset naming a coordinate. COUNT(kafka_offset) does
+//     this directly: SQL COUNT of an expression ignores NULLs, and the all-or-nothing
+//     check constraint means a non-NULL offset implies a complete coordinate.
 //
-// It HAS been published to Kafka; what is outstanding is the deprecated HTTP leg. Its record is
-// on the topic and contributes to the broker's end offsets, so excluding it would inflate the
-// apparent surplus and loosen the reconciliation during exactly the dual-delivery window when it
-// matters most.
+//   - DistinctRecords counts the DISTINCT coordinates, FILTERED to the rows that name
+//     one.
 //
 // Parameters:
 //   - ctx context.Context: cancels the statement.
@@ -5048,20 +3672,6 @@ func (d Datasource) AuditTerminalEventRecords(ctx context.Context, since time.Ti
 	audit := model.EventOutboxAudit{MeasuredAt: time.Now().UTC(), WindowStart: since}
 
 	// THE FILTER ON THE DISTINCT COUNT IS REQUIRED, not defensive.
-	//
-	// COUNT(DISTINCT expr) ignores a NULL expr, but a ROW CONSTRUCTOR whose every field is NULL
-	// is not itself NULL in PostgreSQL — so without the filter every row that completed its
-	// Kafka leg WITHOUT a coordinate collapsed into one extra "record", (NULL, NULL, NULL), and
-	// was counted. A publication the library reported no coordinate for is precisely a row that
-	// names NO record, which is what ConfirmedRows already excludes it from.
-	//
-	// The consequence was not cosmetic. DistinctRecords could EXCEED ConfirmedRows for a reason
-	// that has nothing to do with duplication, which breaks both readers of this audit:
-	// FullyConfirmed requires the two to be equal and would report an inconclusive verdict on a
-	// perfectly healthy outbox, and ReconcileAgainstOutbox derives duplication from their
-	// difference and had to clamp a negative it should never have been able to see. The
-	// documented contract — DistinctRecords equals ConfirmedRows unless two rows name the same
-	// record — is only true with the filter in place.
 	err := d.Conn.QueryRowContext(ctx, auditTerminalEventRecordsQuery,
 		model.EventOutboxStatusDeadLettered, since).Scan(
 		&audit.PublishedRows, &audit.ConfirmedRows, &audit.DistinctRecords,
@@ -5083,19 +3693,12 @@ func (d Datasource) AuditTerminalEventRecords(ctx context.Context, since time.Ti
 	return audit, nil
 }
 
-// eventIdentifierHashLength WAS RETIRED HERE, in favour of model.LogIdentifierHashLength.
-//
-// The hashing moved into the model package precisely so that every layer that puts a derived
-// identifier in a log line produces the SAME token for the same input — the repository, the
-// service and the API all hash tenant-derived identifiers before logging them, and two copies of
-// the length would let one layer emit sixteen characters and another twelve for one subscriber,
-// which makes the two log lines impossible to correlate and defeats the reason for hashing.
 // scanDeadLetterInventoryEntry decodes one narrow inventory row.
 //
-// It is separate from scanEventOutbox because the projections differ and sharing one scanner
-// between them would mean either reading columns the listing does not select or silently
-// leaving fields zero — the second of which is how a listing starts reporting "this event had
-// no partition key" for every row.
+// It is separate from scanEventOutbox because the projections differ and sharing one
+// scanner between them would mean either reading columns the listing does not select or
+// silently leaving fields zero — the second of which is how a listing starts reporting
+// "this event had no partition key" for every row.
 //
 // Parameters:
 //   - s eventOutboxScanner: *sql.Rows or *sql.Row.
@@ -5156,68 +3759,41 @@ func scanDeadLetterInventoryEntry(s eventOutboxScanner) (model.DeadLetterInvento
 	return entry, nil
 }
 
-// oldestDeadLetterAgeByTopicQuery reports the oldest outstanding entry per dead-letter topic
-// as ONE grouped aggregate.
+// oldestDeadLetterAgeByTopicQuery reports the oldest outstanding entry per dead-letter
+// topic as ONE grouped aggregate.
 //
-// # PERF-P07: what this replaced
+// Counting the whole inventory, deriving a tail offset from that count and then reading
+// whole rows — bodies included — from that deep offset every collection interval is
+// three compounding costs for one number per topic, and it is not even exact: past any
+// scan cap it yields a lower bound, and an alert on a lower bound cannot fire when the
+// true age crosses the threshold and the bound does not.
 //
-// The age gauge used to COUNT the whole inventory, compute a tail offset from that count, and
-// then read up to 5,000 WHOLE rows — bodies included — from that deep offset, every
-// collection interval, to find a minimum. Three compounding costs to compute one number per
-// topic, and it was not even exact: past its scan cap it reported a lower bound and warned,
-// and an alert on a lower bound cannot fire when the true age crosses the threshold and the
-// bound does not.
+// This reads the partial index that already covers the two terminal failure states,
+// groups by the dead-letter topic and takes MIN of the age instant. No row is fetched,
+// the answer is exact, and the cost is set by the number of topics rather than by the
+// size of the backlog — which is what matters, because the backlog is largest exactly
+// when the gauge matters most.
 //
-// This reads the partial index that already covers the two terminal failure states, groups by
-// the dead-letter topic and takes MIN of the age instant. No row is fetched, the answer is
-// exact, and the cost is set by the number of topics rather than by the size of the backlog —
-// which is what matters, because the backlog is largest exactly when the gauge matters most.
+// EVERY OUTSTANDING ENTRY COUNTS, with no exemption. A dead-lettered row leaves this
+// aggregate by being REPLAYED — a re-publish the broker acknowledges makes it
+// dispatched, and dispatched is not one of the two states counted here.
 //
-// EVERY OUTSTANDING ENTRY COUNTS, with no exemption. A dead-lettered row leaves this aggregate
-// by being REPLAYED — a re-publish the broker acknowledges makes it dispatched, and dispatched
-// is not one of the two states counted here. Nothing else takes a row out, which is what keeps
-// the DeadLetterMessageStuck alert firing until the event has actually reached a subscriber.
-//
-// # The age instant, and why it is a COALESCE
-//
-// A dead_lettered row's age runs from when it reached its `<topic>.dlt` sibling, which is the
-// hand-off instant recorded as last_attempted_at. A row still AWAITING its dead-letter write
-// has no such instant and its age must run from something — otherwise the rows most in need
-// of attention would report no age at all — so it falls back to when the event occurred.
-//
-// The topic is likewise a COALESCE: a row that has been preserved names its dlt_topic, and a
-// row that has not is grouped under the `.dlt` sibling of the topic it was headed for, so
-// both appear on the series an operator alerts on rather than one of them silently missing.
-//
-// # PERF-M05: what this costs, measured, and why nothing here changed
-//
-// This aggregate's cost is set by the OUTSTANDING FAILURE INVENTORY and never by history: the
-// partial index restricts it to the two terminal failure states, so no dispatched row is
-// touched however much of it has accumulated. Acceptance criterion V-3 holds that inventory
-// below 0.1% of throughput, so in normal operation it reads almost nothing.
-//
-// The cost that WAS compounding it has been removed elsewhere: the metrics collector used to
-// run this and an exact count of a day's dispatched history on the same fifteen-second tick.
 // It now reads CountUnresolvedEventOutbox instead, whose plan is an Index Only Scan of
 // idx_event_outbox_status_open.
 //
-// Two candidate index changes were built and measured against a 1,000,000-row fixture with
-// 100,000 outstanding failure rows — a 10% inventory, an order of magnitude worse than the
-// criterion allows — and BOTH WERE REJECTED. Recorded here so the experiment is not repeated:
+// Two candidate index changes were built and measured against a 1,000,000-row fixture
+// with 100,000 outstanding failure rows — a 10% inventory, an order of magnitude worse
+// than the criterion allows — and BOTH WERE REJECTED. Recorded here so the experiment
+// is not repeated:
 //
-//   - Adding dlt_topic and last_attempted_at to idx_event_outbox_dead_letter_inventory's
-//     INCLUDE list does NOT make this index-only. The planner reaches this index by a BITMAP
-//     scan, and a bitmap scan always visits the heap, so the payload is never consulted. The
-//     wider index measured 1126 pages against 906 and ran slower: 37.9ms against 31.2ms.
-//   - An expression index keyed on the two COALESCEs is 36% smaller (4656 kB against 7280 kB)
-//     and no faster (30.9ms against 31.2ms) — and it cannot REPLACE the inventory index, whose
-//     keyset ordering the dead-letter listing pages by, so it would be a second index adding
-//     write amplification to every dead-letter transition for no measurable read gain.
-//
-// So the shape below is the right one, and a maintained rollup would be machinery to save tens
-// of milliseconds on a fifteen-second timer during an incident. The reading stays exact, which
-// is what the fifteen-minute alert needs: PERF-P07 removed a lower-bound reading precisely
-// because an alert cannot fire on a bound that does not cross the threshold.
+//   - Adding dlt_topic and last_attempted_at to
+//     idx_event_outbox_dead_letter_inventory's INCLUDE list does NOT make this
+//     index-only.
+//   - An expression index keyed on the two COALESCEs is 36% smaller (4656 kB against
+//     7280 kB) and no faster (30.9ms against 31.2ms) — and it cannot REPLACE the
+//     inventory index, whose keyset ordering the dead-letter listing pages by, so it
+//     would be a second index adding write amplification to every dead-letter
+//     transition for no measurable read gain.
 const oldestDeadLetterAgeByTopicQuery = `
 		SELECT
 			COALESCE(NULLIF(dlt_topic, ''), topic || $3) AS age_topic,
@@ -5228,22 +3804,21 @@ const oldestDeadLetterAgeByTopicQuery = `
 		GROUP BY age_topic
 	`
 
-// OldestDeadLetterAgeByTopic reports, per dead-letter topic, the age instant of the oldest
-// entry still outstanding and how many are outstanding there.
+// OldestDeadLetterAgeByTopic reports, per dead-letter topic, the age instant of the
+// oldest entry still outstanding and how many are outstanding there.
 //
-// It is what the dead-letter age gauge and the 15-minute alert are computed from, so it is
-// EXACT: no scan cap, no lower bound, no truncation warning to interpret.
+// It is what the dead-letter age gauge and the 15-minute alert are computed from, so it
+// is EXACT: no scan cap, no lower bound, no truncation warning to interpret.
 //
 // Parameters:
 //   - ctx context.Context: cancels the aggregate.
-//   - deadLetterSuffix string: the `.dlt` suffix used to name the sibling topic of a row whose
-//     dead-letter write has not happened yet. Passed in rather than written here so the topic
-//     naming rules live in exactly one place.
+//   - deadLetterSuffix string: the `.dlt` suffix used to name the sibling topic of a
+//     row whose dead-letter write has not happened yet.
 //
 // Returns:
-//   - []model.DeadLetterTopicAge: one entry per topic holding something, empty when nothing is
-//     outstanding — which is the healthy state and must be reported as a reading rather than
-//     as an absence.
+//   - []model.DeadLetterTopicAge: one entry per topic holding something, empty when
+//     nothing is outstanding — which is the healthy state and must be reported as a
+//     reading rather than as an absence.
 //   - error: a logged internal error.
 func (d Datasource) OldestDeadLetterAgeByTopic(
 	ctx context.Context,
@@ -5304,39 +3879,8 @@ func (d Datasource) OldestDeadLetterAgeByTopic(
 // exactly, and the terminally delivered rows only inside the caller's window.
 //
 // It is a package-level constant so a test can assert the two-armed shape, which is the
-// whole substance of the fix and is invisible from the method's behaviour on a small table.
-//
-// # PERF-P04: why the count is split rather than simply bounded
-//
-// It used to be one `GROUP BY status` over the whole table. At 500 events per second the
-// table grows by 43.2 million rows a day, so that aggregate is a sequential scan whose cost
-// rises for ever — and it sat behind an operator endpoint and a metrics collector that ran
-// it every fifteen seconds.
-//
-// Windowing the WHOLE count would have been cheap and wrong. The counts that matter
-// operationally are of rows that have NOT finished — the pending backlog, the rows in
-// flight, the dead-letter inventory — and any of those can be older than any window you
-// would pick. Under-reporting them is worse than an expensive query: a pending row stuck
-// for three days would vanish from a 24-hour reading of the backlog, and the gauge that
-// exists to show exactly that would report zero.
-//
-// So the split follows the cost, not the calendar. Every non-dispatched status is counted
-// exactly and completely, because that population is BOUNDED BY OPERATION — it is the
-// working set plus the dead-letter inventory, which acceptance criterion V-3 holds below
-// 0.1% of throughput — and a partial index on `status <> 'dispatched'` makes it an
-// index-only scan of just those rows. Only `dispatched`, the one unbounded population, is
-// restricted to the window, read through a partial index on its occurred_at.
-//
-// The result is a reading that hides nothing an operator acts on and stops growing with a
-// history nobody is asking about.
-//
-// # PERF-M05: and why even the bounded arm is now ON DEMAND
-//
-// Bounded is not cheap. A day of dispatched history is 43.2 million index entries to count and
-// a week is 302.4 million, which is affordable once for a deliberate reconciliation and
-// ruinous on a fifteen-second timer — and both timer-driven callers read only the FIRST arm.
-// They now use countUnresolvedEventOutboxQuery, which is this query's first arm alone, and the
-// only caller left here is the reconciliation that genuinely needs the dispatched figure.
+// whole substance of the fix and is invisible from the method's behaviour on a small
+// table.
 const countEventOutboxByStatusQuery = `
 		SELECT status, COUNT(*) AS row_count
 		FROM blnk.event_outbox
@@ -5349,20 +3893,8 @@ const countEventOutboxByStatusQuery = `
 		GROUP BY status
 	`
 
-// countUnresolvedEventOutboxQuery is countEventOutboxByStatusQuery's FIRST ARM ALONE: every
-// status except the terminal dispatched one, counted exactly and for all time.
-//
-// It is spelled as its own constant rather than assembled from the query above, for the same
-// reason that one is a constant: a test asserts the shape, and the substance of PERF-M05 is
-// that this statement contains no second arm and no window — which is invisible from the
-// method's behaviour on a small table and is exactly what a well-meaning future edit would
-// undo by "reusing" the fuller query with a wide window.
-//
-// The predicate is identical to the other query's first arm, character for character, so both
-// resolve to the SAME partial index on `status <> 'dispatched'`. A paraphrase — an IN list of
-// the known non-dispatched statuses, say — would read the same and plan as a sequential scan,
-// and would additionally stop counting any status added to the state machine later, which the
-// column deliberately permits.
+// countUnresolvedEventOutboxQuery is countEventOutboxByStatusQuery's FIRST ARM ALONE:
+// every status except the terminal dispatched one, counted exactly and for all time.
 const countUnresolvedEventOutboxQuery = `
 		SELECT status, COUNT(*) AS row_count
 		FROM blnk.event_outbox
@@ -5380,17 +3912,14 @@ const defaultEventCountWindow = 24 * time.Hour
 
 // normalizeEventCountWindow turns a caller's window start into a usable one.
 //
-// Two inputs are corrected rather than honoured, because both would defeat the bound this
-// parameter exists to impose:
+// Two inputs are corrected rather than honoured, because both would defeat the bound
+// this parameter exists to impose:
 //
-//   - THE ZERO INSTANT would select the whole history — the very scan PERF-P04 removed —
-//     and it is what a caller that simply forgot the parameter passes.
-//   - A FUTURE INSTANT would select nothing, reporting an empty outbox on a busy one, which
-//     is worse than expensive: it reads as a healthy system.
-//
-// Both become defaultEventCountWindow before now. Correcting rather than failing is
-// deliberate: these readings feed a gauge and an operator endpoint, and refusing to answer
-// would take away the observability at the moment somebody is looking for it.
+//   - THE ZERO INSTANT would select the whole history — the unbounded scan this window
+//     exists to prevent — and it is what a caller that simply forgot the parameter
+//     passes.
+//   - A FUTURE INSTANT would select nothing, reporting an empty outbox on a busy one,
+//     which is worse than expensive: it reads as a healthy system.
 //
 // Parameters:
 //   - since time.Time: the requested window start.
@@ -5409,24 +3938,9 @@ func normalizeEventCountWindow(since time.Time) time.Time {
 // auditTerminalEventRecordsQuery counts the rows inside the window that claim a broker
 // record, and how many of them name it.
 //
-// A package-level constant so a test can assert the windowed predicate and the FILTER, both
-// of which are load-bearing and neither of which is observable from the returned numbers on
-// a small table.
-//
-// # PERF-P05: the two arms of the window predicate
-//
-// A row's publication instant is kafka_dispatched_at, which is stamped when the broker
-// acknowledges the main-topic write — that is the instant the record it claims was written,
-// so it is the instant that has to fall inside the window for the row to be comparable
-// against records the broker wrote inside it. It is covered by
-// idx_event_outbox_published_audit, which INCLUDEs the whole coordinate, so this arm is an
-// index-only range scan.
-//
-// A DEAD-LETTERED row is the second arm because it has no kafka_dispatched_at: its record is
-// on the `<topic>.dlt` sibling and was written by the hand-off, whose instant the row
-// records as last_attempted_at. Excluding those rows would understate the outbox side and
-// manufacture an apparent surplus; using their occurrence instant instead would misplace
-// them in time by however long their retries ran.
+// A package-level constant so a test can assert the windowed predicate and the FILTER,
+// both of which are load-bearing and neither of which is observable from the returned
+// numbers on a small table.
 const auditTerminalEventRecordsQuery = `
 		SELECT
 			COUNT(*)            AS published_rows,
@@ -5438,54 +3952,16 @@ const auditTerminalEventRecordsQuery = `
 		   OR (status = $1 AND last_attempted_at >= $2)
 	`
 
-// listDeadLetterInventoryQuery pages the dead-letter inventory with every predicate applied
-// in SQL and the page bounded by a KEYSET rather than an offset.
+// listDeadLetterInventoryQuery pages the dead-letter inventory with every predicate
+// applied in SQL and the page bounded by a KEYSET rather than an offset.
 //
-// A package-level constant so a test can assert the keyset predicate, the SQL-side filters
-// and the ordering, none of which is observable from the rows a small fixture returns.
+// A package-level constant so a test can assert the keyset predicate, the SQL-side
+// filters and the ordering, none of which is observable from the rows a small fixture
+// returns.
 //
-// # PERF-P08: the keyset, and what it replaced
-//
-// `ORDER BY occurred_at DESC, id DESC OFFSET $n` makes a page's cost proportional to its
-// DEPTH: PostgreSQL reads and discards every row before the offset. The depth was supplied
-// by the caller and bounded by nothing, so one request could walk an arbitrary prefix of a
-// table growing by 43.2 million rows a day. The keyset predicate below — strictly older than
-// the cursor's instant, or the same instant with a lower id — is a range scan from the index
-// entry the cursor names, so EVERY page costs the same as the first.
-//
-// It is also correct under concurrent writes, which the offset never was: rows inserted while
-// a caller pages shift every later offset, so an offset-paged client silently repeats and
-// skips rows. A cursor names a POSITION, and positions do not move.
-//
-// # The filters
-//
-// event_type and topic compare exactly; status narrows to one of the two terminal failure
-// states, and its absence admits BOTH — a row that spent its retries but whose dead-letter
-// write also failed is the one an operator most needs to see, and listing only dead_lettered
-// would hide precisely those. Each predicate is written as `($n = ” OR column = $n)` so one
-// statement serves every combination: a second, filter-aware statement would be a second
-// thing to keep correct, and the planner discards the constant-false half of an unused arm.
-//
-// LIMIT is bound as limit+1 by the caller, which is how "is there another page" is answered
-// without a count: the extra row is read, not returned, and its presence is the answer.
-// deadLetterInventoryColumns is the NARROW projection the dead-letter inventory reads.
-//
-// # PERF-P06: what is missing from it, and why that is the whole point
-//
-// Neither payload_raw nor event_raw appears here. Both are the event's body — up to 768 KiB
-// each, and the same bytes twice over — and the listing shows neither: it reports the body's
-// SIZE, which octet_length computes inside PostgreSQL so the bytes never cross the wire at
-// all. Reading whole rows to build a listing of at most a few hundred small items moved
-// gibibytes to answer a question about kilobytes, and a filtered request moved that much
-// again for every page it walked looking for matches.
-//
-// octet_length is measured on payload_raw, the BYTEA column, and not on the JSONB one: the
-// JSONB column holds PostgreSQL's normalised re-rendering of the producer's bytes, so its
-// length is a different number from the one that was published.
-//
-// failure_metadata stays, because it is five fields and the API projection fills gaps in the
-// row's own columns from it. last_error stays because the projection CLASSIFIES it; nothing
-// publishes it verbatim.
+// failure_metadata stays, because it is five fields and the API projection fills gaps
+// in the row's own columns from it. last_error stays because the projection CLASSIFIES
+// it; nothing publishes it verbatim.
 const deadLetterInventoryColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, ` +
 	`schema_version, occurred_at, status, attempts, last_error, first_attempted_at, last_attempted_at, ` +
 	`dlt_topic, failure_metadata, octet_length(payload_raw) AS payload_bytes`
@@ -5504,20 +3980,14 @@ const listDeadLetterInventoryQuery = `
 		LIMIT $10
 	`
 
-// withLoggableCause attaches a driver or dependency error to a log entry in the two renderings
-// an operator needs, and it is the ONLY way the event repositories should put an error into a
-// line.
+// withLoggableCause attaches a driver or dependency error to a log entry in the two
+// renderings an operator needs, and it is the ONLY way the event repositories should
+// put an error into a line.
 //
 // The "cause" field is redacted — network topology and secret values removed, control
-// characters stripped, length bounded — and is what a deployment writes at info, warn and
-// error. The "cause_verbatim" field carries the unredacted text and is attached ONLY when the
-// standard logger is at debug, which is the restricted sink.
-//
-// It is the counterpart of the identically named helpers in package blnk and package api, and
-// all three delegate to internal/logsafe, so one failure travelling up through the repository,
-// the service and the handler is redacted and bounded identically at every layer. Using
-// logrus.WithError instead is the defect this replaces: a pq error routinely renders with the
-// host it dialled, and a wrapped configuration error can quote the DSN outright.
+// characters stripped, length bounded — and is what a deployment writes at info, warn
+// and error. The "cause_verbatim" field carries the unredacted text and is attached
+// ONLY when the standard logger is at debug, which is the restricted sink.
 //
 // Parameters:
 //   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one.
@@ -5543,45 +4013,18 @@ func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
 	return entry
 }
 
-// ListDeadLetteredEvents pages the dead-letter inventory behind the dead-letter
-// API.
+// ListDeadLetteredEvents pages the dead-letter inventory behind the dead-letter API.
 //
-// Both terminal failure states are included. A row becomes failed the moment its
-// retry budget is spent and dead_lettered only once the event has additionally been
-// written to its `<topic>.dlt` sibling; listing only the latter would hide events
-// that exhausted their retries but whose dead-letter publication itself failed —
-// exactly the events an operator most needs to see. The partial index on
-// (status, occurred_at) covers both literals for this reason.
-//
-// Ordering is by occurred_at descending, newest first, because triage starts from
-// the most recent failures; id descending breaks ties so paging cannot show or skip
-// a row twice when several share an instant. limit is defaulted and capped, and a
-// negative offset is clamped to zero, so a malformed page request degrades to a
-// sane one instead of scanning the table or failing.
-// ExistingEventIDs returns the subset of the supplied event ids that already have a row.
-//
-// # What it is for
-//
-// The post-commit path uses it to decide whether an event is still owed. The batch writer
-// captures a coalesced batch's events inside the mutation, and the frozen file that calls the
-// writer and then the post-commit work cannot pass that fact along, so the post-commit path
-// asks the table instead of guessing from which branch ran.
-//
-// # Read as a hint, never as permission to drop an event
-//
-// A row's PRESENCE is authoritative — the unique index on event_id means a row exists only
-// because a capture committed it. Its ABSENCE is authoritative too at the moment of the query.
-// What the caller must not do is treat an ERROR as presence: this returns the error and the
-// caller then re-captures, where the unique index refuses the duplicate. Failing that way round
-// costs a rejected insert; failing the other way loses the event.
-//
-// Status is deliberately not filtered. A row that has already been dispatched, failed or
-// dead-lettered is still a row that exists, so re-capturing it would either be refused by the
-// index or resurrect an event the relay has finished with.
+// Both terminal failure states are included. A row becomes failed the moment its retry
+// budget is spent and dead_lettered only once the event has additionally been written
+// to its `<topic>.dlt` sibling; listing only the latter would hide events that
+// exhausted their retries but whose dead-letter publication itself failed — exactly the
+// events an operator most needs to see.
 //
 // Parameters:
 //   - ctx context.Context: request context.
-//   - eventIDs []string: the ids to test. Empty or all-blank returns an empty map with no query.
+//   - eventIDs []string: the ids to test. Empty or all-blank returns an empty map with
+//     no query.
 //
 // Returns:
 //   - map[string]struct{}: the ids that exist. Never nil on success.

@@ -22,10 +22,8 @@ package blnk
 //
 // That single property is what three separate guarantees rest on:
 //
-//   - Dual delivery. For the 30-day window the relay publishes the claimed outbox row to
-//     Kafka AND enqueues the legacy webhook task from that same row. Their payloads are
-//     equal because they are the same bytes, and this file is where "the same bytes" is
-//     actually checked.
+//   - Dual delivery. For the 30-day window the relay publishes the claimed outbox row
+//     to Kafka AND enqueues the legacy webhook task from that same row.
 //   - Subscriber compatibility. The payload is the whole two-key {"event": ..., "data":
 //     ...} object, not just the inner "data", so an existing subscriber's body parser
 //     keeps working when only the transport changes.
@@ -33,27 +31,14 @@ package blnk
 //     bytes rather than by re-marshalling a struct, so byte equality at rest is what
 //     makes byte equality on replay possible.
 //
-// # Why the comparisons are on raw bytes
-//
-// Every payload assertion below compares []byte (or its string form) and NEVER an
-// unmarshalled map. json.Unmarshal into a map[string]interface{} discards key ORDER and
-// renormalises numbers, and key order is precisely what the dual-delivery equality
-// criterion depends on. A map comparison would keep passing while the guarantee was
-// broken — the worst possible failure mode for a test whose whole purpose is to detect
-// exactly that. The same reasoning drives the exact-value style throughout: this is a
-// money-adjacent path held to the repository's mutation-testing bar, so assertions
-// compare exact bytes and exact values rather than merely non-empty ones.
-//
-// # Scope: what this file deliberately does NOT cover
-//
 //   - No Kafka import and no broker. Everything here runs with no infrastructure, which
 //     mirrors the file under test: event_outbox.go talks to no broker either.
 //   - No retry, backoff or dead-letter assertions. Those belong to event_relay_test.go
 //     and event_dlt_test.go, which act on rows this file's subject creates.
 //   - No SQL-statement coverage beyond what go-sqlmock needs to identify the statement
 //     the two insert paths issue. database/event_outbox_test.go owns the repository.
-//   - No assertions about blnk.lineage_outbox or the lineage relay. The two outboxes are
-//     separate tables served by separate relays and are deliberately not merged.
+//   - No assertions about blnk.lineage_outbox or the lineage relay. The two outboxes
+//     are separate tables served by separate relays and are deliberately not merged.
 
 import (
 	"context"
@@ -105,9 +90,8 @@ const (
 	// message key for ledger and balance events.
 	outboxLedgerID = "ldg_outbox_fixture"
 	// outboxSourceBalanceID is the source balance of the transaction fixtures, and
-	// therefore their expected message key: transaction keying prefers the source
-	// balance so that Kafka partitioning agrees with the transaction queue's own
-	// sharding.
+	// therefore their expected message key: transaction keying prefers the source balance
+	// so that Kafka partitioning agrees with the transaction queue's own sharding.
 	outboxSourceBalanceID = "bln_outbox_source"
 	// outboxDestinationBalanceID is the destination balance, used to prove the second
 	// step of the transaction key preference.
@@ -164,10 +148,6 @@ func outboxSampleIdentity() *model.Identity {
 
 // outboxSampleBalance returns the payload the post-balance-creation actions pass for
 // "balance.created": a *model.Balance.
-//
-// The big.Int amounts are populated because they marshal as JSON numbers rather than
-// strings, and a payload that carries none of them would not exercise that encoding at
-// all.
 func outboxSampleBalance() *model.Balance {
 	return &model.Balance{
 		Balance:               big.NewInt(125000),
@@ -190,9 +170,7 @@ func outboxSampleBalance() *model.Balance {
 // "balance.monitor".
 //
 // It is returned BY VALUE, not as a pointer, because that is exactly how balance.go
-// passes it. The distinction is not cosmetic: the derivation type switch has separate
-// arms for the pointer and the value form, and a fixture that used the wrong one would
-// leave the arm the producer actually reaches untested.
+// passes it.
 func outboxSampleBalanceMonitor() model.BalanceMonitor {
 	return model.BalanceMonitor{
 		MonitorID:   outboxMonitorID,
@@ -236,15 +214,11 @@ func outboxSampleTransactionValue(status string) model.Transaction {
 	return *outboxSampleTransaction(status)
 }
 
-// outboxSampleBulkPayload reproduces, exactly, the map that
-// sendBulkTransactionWebhook builds for the bulk_transaction.<status> family.
+// outboxSampleBulkPayload reproduces, exactly, the map that sendBulkTransactionWebhook
+// builds for the bulk_transaction.<status> family.
 //
 // The two conditionals are deliberately restated here rather than imported, so this
 // file is an independent statement of the three shapes the family can take:
-//
-//	status != "failed"                 → transaction_count is present
-//	status == "failed" && errorMsg != "" → error is present
-//	status == "failed" && errorMsg == "" → neither is present
 func outboxSampleBulkPayload(status, errorMsg string, transactionCount int) map[string]interface{} {
 	payload := map[string]interface{}{
 		"batch_id":  outboxBatchID,
@@ -281,10 +255,7 @@ func outboxSampleSystemErrorPayload() map[string]interface{} {
 // outboxEventFixture is one row of the catalogue: an event exactly as a producer emits
 // it, paired with every value PrepareEventOutbox must derive from it.
 //
-// The topic, aggregate id and partition key are LITERALS. Deriving them from
-// TopicForEvent or from the derivation functions themselves would make the table agree
-// with the implementation no matter what the implementation said, including after a
-// category was renamed or a key preference reordered.
+// The topic, aggregate id and partition key are LITERALS.
 type outboxEventFixture struct {
 	// name identifies the subtest.
 	name string
@@ -299,22 +270,16 @@ type outboxEventFixture struct {
 	aggregateID string
 	// partitionKey is the expected partition_key column — the Kafka message key, and
 	// therefore the partition, and therefore the ordering guarantee. It is a DIFFERENT
-	// column from ledger_id, which records the authoritative ledger and takes no part
-	// in partitioning; several shapes below have a partition key and no ledger at all.
+	// column from ledger_id, which records the authoritative ledger and takes no part in
+	// partitioning; several shapes below have a partition key and no ledger at all.
 	partitionKey string
 }
 
 // outboxEventCatalogueSize is the number of event types Blnk emits: thirteen.
 //
-// It is a CONTRACTUAL figure. The coverage requirement is that every event type which
-// reached the legacy webhook sender reaches Kafka, with zero exceptions, and thirteen is
-// what an exhaustive sweep of the producer call sites found: seven transaction lifecycle
-// events from getEventFromStatus, the runtime-composed bulk transaction family counted
-// once, two balance events, one identity event, one ledger event, and the system error
-// raised through the registered webhook-sender indirection.
+// It is a CONTRACTUAL figure.
 //
 // Spelling it as an independent number is what stops the catalogue silently shrinking.
-// A fourteenth event type is welcome, but it must arrive with a fixture row here.
 const outboxEventCatalogueSize = 13
 
 // outboxBulkEventPrefix is the fixed prefix of the bulk transaction family. Its names
@@ -355,15 +320,12 @@ func outboxVocabularyKey(eventType string) string {
 // outboxEventFixtures returns the complete catalogue: all thirteen event types Blnk
 // emits, with the bulk transaction family represented by all three of its payload
 // shapes.
-//
-// Fresh payloads are built on every call, so a test that mutates one cannot affect
-// another.
 func outboxEventFixtures() []outboxEventFixture {
 	return []outboxEventFixture{
-		// The seven status-derived transaction events. All seven come from
-		// getEventFromStatus and all seven key on the SOURCE balance, which is what
-		// keeps one transaction's whole lifecycle — queued, then inflight, then applied
-		// — on a single partition and therefore in order.
+		// The seven status-derived transaction events. All seven come from getEventFromStatus
+		// and all seven key on the SOURCE balance, which is what keeps one transaction's
+		// whole lifecycle — queued, then inflight, then applied — on a single partition and
+		// therefore in order.
 		{
 			name:         "transaction.queued",
 			eventType:    "transaction.queued",
@@ -405,9 +367,9 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxSourceBalanceID,
 		},
 		{
-			// The worker's rejection handler passes the transaction BY VALUE, which is
-			// the only producer that does. The value arm of the derivation type switch
-			// exists for this call site alone.
+			// The worker's rejection handler passes the transaction BY VALUE, which is the only
+			// producer that does. The value arm of the derivation type switch exists for this
+			// call site alone.
 			name:         "transaction.rejected (payload by value)",
 			eventType:    "transaction.rejected",
 			payload:      outboxSampleTransactionValue(StatusRejected),
@@ -416,11 +378,11 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxSourceBalanceID,
 		},
 		{
-			// transaction.unknown is reachable, not hypothetical: getEventFromStatus has
-			// no case for the COMMIT status, so a committed inflight transaction falls
-			// through to it. That is pre-existing behaviour, preserved deliberately so
-			// the dual-delivery payload comparison is not disturbed by an unrelated
-			// change to the event vocabulary.
+			// transaction.unknown is reachable, not hypothetical: getEventFromStatus has no case
+			// for the COMMIT status, so a committed inflight transaction falls through to it.
+			// That is pre-existing behaviour, preserved deliberately so the dual-delivery
+			// payload comparison is not disturbed by an unrelated change to the event
+			// vocabulary.
 			name:         "transaction.unknown (COMMIT falls through)",
 			eventType:    "transaction.unknown",
 			payload:      outboxSampleTransaction(StatusCommit),
@@ -429,9 +391,9 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxSourceBalanceID,
 		},
 
-		// The bulk transaction family, in all three shapes its producer can build. The
-		// batch is the aggregate and the key, because a batch's progress events only
-		// make sense read in order relative to one another.
+		// The bulk transaction family, in all three shapes its producer can build. The batch
+		// is the aggregate and the key, because a batch's progress events only make sense
+		// read in order relative to one another.
 		{
 			name:         "bulk_transaction.applied (success, with transaction_count)",
 			eventType:    "bulk_transaction.applied",
@@ -457,9 +419,9 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxBatchID,
 		},
 
-		// The two balance events. Both route to the balances topic, but they key
-		// differently: a balance belongs to a ledger, whereas a monitor carries no
-		// ledger field at all and keys on the balance it watches.
+		// The two balance events. Both route to the balances topic, but they key differently:
+		// a balance belongs to a ledger, whereas a monitor carries no ledger field at all and
+		// keys on the balance it watches.
 		{
 			name:         "balance.created",
 			eventType:    "balance.created",
@@ -487,11 +449,11 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxIdentityID,
 		},
 
-		// The two events that belong to none of the three categories the requirement
-		// names, and that the coverage requirement forbids dropping. They do NOT share
-		// the one category beyond the three the requirements name: the published catalogue
-		// puts ledger.created and system.error together on blnk.system, so a subscriber
-		// reaches ledger.created only through the privileged grant of that topic — see
+		// The two events that belong to none of the three categories the requirement names,
+		// and that the coverage requirement forbids dropping. They do NOT share the one
+		// category beyond the three the requirements name: the published catalogue puts
+		// ledger.created and system.error together on blnk.system, so a subscriber reaches
+		// ledger.created only through the privileged grant of that topic — see
 		// model.EventCategorySystem.
 		{
 			name:         "ledger.created",
@@ -502,10 +464,10 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxLedgerID,
 		},
 		{
-			// system.error has no aggregate of any kind, so both the aggregate id and
-			// the partition key fall back to the event type. That gives the error
-			// stream one partition and therefore a total order, which is what an error
-			// consumer wants, and it keeps the key non-empty.
+			// system.error has no aggregate of any kind, so both the aggregate id and the
+			// partition key fall back to the event type. That gives the error stream one
+			// partition and therefore a total order, which is what an error consumer wants, and
+			// it keeps the key non-empty.
 			name:         "system.error (no aggregate)",
 			eventType:    "system.error",
 			payload:      outboxSampleSystemErrorPayload(),
@@ -523,32 +485,18 @@ func outboxEventFixtures() []outboxEventFixture {
 // outboxPublishingConfiguration returns a configuration in which event publishing is
 // enabled by the Kafka transport alone.
 //
-// Only Kafka.Brokers is populated. The legacy webhook URL is deliberately left empty so
-// that nothing in this file can accidentally depend on the legacy transport being
-// configured, and no test can accidentally POST anywhere.
-//
-// Relay.MaxRetryAttempts is left unset on purpose: an unset value is what a
-// configuration that never passed through the defaulting path carries, and the retry
-// budget test asserts the default is applied at row construction rather than assumed.
+// Only Kafka.Brokers is populated.
 func outboxPublishingConfiguration() *config.Configuration {
 	return &config.Configuration{
 		Kafka: config.KafkaConfig{Brokers: []string{"localhost:9092"}},
 	}
 }
 
-// outboxStoreConfiguration publishes cnf to config.ConfigStore and restores whatever was
-// there before once the test finishes.
+// outboxStoreConfiguration publishes cnf to config.ConfigStore and restores whatever
+// was there before once the test finishes.
 //
 // config.ConfigStore is a process-global atomic.Value, so leaking a Kafka-configured
-// state out of one test produces confusing failures in unrelated ones. The restore is
-// registered with t.Cleanup so it runs even when a test fails or calls t.Fatal.
-//
-// It writes to the store DIRECTLY rather than through config.MockConfig, matching the
-// approach the sunset, topic and legacy webhook tests take. MockConfig runs
-// validateAndAddDefaults, which refuses to store a configuration lacking a data-source
-// and Redis DSN — the value would be silently dropped — and which would also apply the
-// very defaults several tests here need to observe as absent. Storing directly is not a
-// workaround: it reproduces exactly the situation the production code must survive.
+// state out of one test produces confusing failures in unrelated ones.
 func outboxStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 	t.Helper()
 
@@ -559,9 +507,9 @@ func outboxStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 
 			return
 		}
-		// Nothing was published before this test. Leaving this test's configuration in
-		// place could influence later ones, so publish an empty configuration, which is
-		// strictly closer to the original state.
+		// Nothing was published before this test. Leaving this test's configuration in place
+		// could influence later ones, so publish an empty configuration, which is strictly
+		// closer to the original state.
 		config.ConfigStore.Store(&config.Configuration{})
 	})
 
@@ -571,25 +519,6 @@ func outboxStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 // newOutboxBlnk builds the smallest Blnk that PrepareEventOutbox and publishEvent
 // actually need: a cached configuration and a datasource. ds may be nil, which is a
 // supported construction the no-datasource contract covers.
-//
-// The configuration is BOTH cached on the instance and published to the store, and both
-// are necessary. The instance's copy is what (*Blnk).Config returns, and it supplies the
-// broker list and the retry budget. The store's copy is what topic naming reads, because
-// TopicPrefix resolves through the configuration seam rather than through any instance.
-// Setting only one of the two would leave the row half-configured.
-//
-// The struct is built directly rather than through NewBlnk so that no Redis client,
-// asynq client, queue, search client or hook manager is constructed: none of them is on
-// the path under test, and none of them should be able to make this file's outcome
-// depend on infrastructure.
-// mustPrepareEventOutbox prepares a row and fails the test if preparation errors.
-//
-// PrepareEventOutbox now returns an error, because a payload that cannot be serialised is
-// a lost event rather than a no-op — see the marshal-failure test for why that changed.
-// Almost every test here is about a row that DOES prepare, so this helper keeps the error
-// handling out of them while still failing loudly if one starts erroring unexpectedly.
-// Tests that are ABOUT the error, or about the unconfigured nil-nil no-op, call the method
-// directly and assert both return values.
 func mustPrepareEventOutbox(t *testing.T, b *Blnk, event NewWebhook, options ...EventOption) *model.EventOutbox {
 	t.Helper()
 
@@ -640,16 +569,16 @@ const outboxLegacyQueueName = "webhook_queue"
 
 // outboxLegacyWebhookURL is the endpoint the legacy-transport cases configure.
 //
-// The .invalid TLD is reserved by RFC 2606 and never resolves, which is deliberate: these
-// tests assert what is ENQUEUED, and a URL that could resolve would leave open the
-// possibility of an outbound request escaping the test.
+// The .invalid TLD is reserved by RFC 2606 and never resolves, which is deliberate:
+// these tests assert what is ENQUEUED, and a URL that could resolve would leave open
+// the possibility of an outbound request escaping the test.
 const outboxLegacyWebhookURL = "http://webhook.invalid/blnk"
 
-// outboxLegacyWebhookConfiguration returns the PRE-MIGRATION steady state: a webhook URL, a
-// queue to enqueue onto, and no Kafka broker anywhere.
+// outboxLegacyWebhookConfiguration returns the PRE-MIGRATION steady state: a webhook
+// URL, a queue to enqueue onto, and no Kafka broker anywhere.
 //
-// This is the configuration the overwhelming majority of existing deployments are in, and the
-// one every deployment is in before it opts into Kafka. Events must still be delivered in it.
+// This is the configuration the overwhelming majority of existing deployments are in,
+// and the one every deployment is in before it opts into Kafka.
 //
 // Parameters:
 //   - redisAddress string: the address of the Redis the asynq client enqueues into.
@@ -666,18 +595,13 @@ func outboxLegacyWebhookConfiguration(redisAddress string) *config.Configuration
 	}
 }
 
-// newOutboxLegacyBlnk builds a Blnk whose asynq client enqueues into a real (in-process)
-// Redis, which is what makes the legacy leg OBSERVABLE rather than merely unerroring.
-//
-// The instance is assembled directly rather than through NewBlnk for the same reason
-// newOutboxBlnk is: no search client, hook manager, tokenizer or event publisher belongs on
-// this path, and none of them should be able to make the outcome depend on infrastructure.
-// The asynq client is the one exception, because the enqueue IS the behaviour under test.
+// newOutboxLegacyBlnk builds a Blnk whose asynq client enqueues into a real
+// (in-process) Redis, which is what makes the legacy leg OBSERVABLE rather than merely
+// unerroring.
 //
 // Parameters:
 //   - t *testing.T: the test, used for the Redis lifecycle and the client's cleanup.
-//   - cnf *config.Configuration: the configuration to cache and publish. Its Redis.Dns must
-//     be the address the returned client enqueues into.
+//   - cnf *config.Configuration: the configuration to cache and publish.
 //   - ds database.IDataSource: the datasource, which the legacy path must never reach.
 //
 // Returns:
@@ -693,31 +617,20 @@ func newOutboxLegacyBlnk(t *testing.T, cnf *config.Configuration, ds database.ID
 	return &Blnk{config: cnf, datasource: ds, asynqClient: client}
 }
 
-// pendingLegacyTasks reads the legacy webhook queue and is safe to call from any goroutine.
+// pendingLegacyTasks reads the legacy webhook queue and is safe to call from any
+// goroutine.
 //
-// It deliberately takes no *testing.T. The windowed helpers below read the queue in a loop, and
-// a reader closed over the test would both register one cleanup per poll and fail the test from
-// a goroutine the test no longer controls. That is not hypothetical: testify runs an
-// Eventually/Never predicate in its own goroutine and returns as soon as its timer fires, so a
-// final in-flight poll could still be reading while the test's cleanups closed the inspector
-// underneath it, and the test then failed on "redis: client is closed" instead of on the queue
-// contents it was asserting. The inspector here is opened and closed within the call, so no
-// handle outlives the read and no cleanup accumulates.
+// It deliberately takes no *testing.T.
 //
-// A queue asynq has never seen is reported as ErrQueueNotFound, and that is the shape "nothing
-// was enqueued" takes rather than an error worth failing on, so it is normalised to an empty
-// result. Every other failure is returned rather than swallowed, because a caller that could
-// not read the queue has observed nothing and must not report success.
-//
-// It is for use from the TEST GOROUTINE. Inside an assert.Never or require.Eventually
-// condition, use pendingLegacyTasks instead: see the note there.
+// It is for use from the TEST GOROUTINE.
 //
 // Parameters:
 //   - t *testing.T: the test, used for fatal failures.
 //   - redisAddress string: the Redis the tasks were enqueued into.
 //
 // Returns:
-//   - []*asynq.TaskInfo: the pending tasks, in queue order. Empty when nothing was enqueued.
+//   - []*asynq.TaskInfo: the pending tasks, in queue order. Empty when nothing was
+//     enqueued.
 func outboxPendingLegacyTasks(t *testing.T, redisAddress string) []*asynq.TaskInfo {
 	t.Helper()
 
@@ -730,33 +643,23 @@ func outboxPendingLegacyTasks(t *testing.T, redisAddress string) []*asynq.TaskIn
 // pendingLegacyTasks reads the legacy webhook queue and RETURNS its error, taking no
 // *testing.T at all.
 //
-// # Why the polled callers must use this and not the T-taking form
+// testify evaluates an assert.Never or require.Eventually condition repeatedly and ON
+// ITS OWN GOROUTINE, and it stops WAITING for those goroutines once the window closes —
+// a straggler can still be mid-call after the test function has returned. Two things
+// then go wrong if the condition can fail the test:
 //
-// testify evaluates an assert.Never or require.Eventually condition repeatedly and ON ITS OWN
-// GOROUTINE, and it stops WAITING for those goroutines once the window closes — a straggler can
-// still be mid-call after the test function has returned. Two things then go wrong if the
-// condition can fail the test:
-//
-//   - t.Cleanup has already torn the miniredis server down, so the straggler's read fails; and
-//   - reporting that failure from a goroutine after the test completed is not a test failure
-//     but a PANIC ("Fail in goroutine after … has completed") that takes the whole package
-//     down, naming a test that had in fact passed.
-//
-// Under -race the wider scheduling window turned that from rare into routine. Returning the
-// error instead keeps every testify call on the test goroutine, where it is legal, and lets a
-// polled caller treat an unreadable queue as "not yet satisfied" — which is the correct reading
-// for both Never (nothing was observed) and Eventually (keep waiting, then fail loudly on
-// timeout).
-//
-// The inspector is owned and closed per call rather than at test cleanup, so a polling loop
-// neither accumulates connections nor closes one another's. The returned task info is plain
-// data that outlives the connection.
+//   - t.Cleanup has already torn the miniredis server down, so the straggler's read
+//     fails; and
+//   - reporting that failure from a goroutine after the test completed is not a test
+//     failure but a PANIC ("Fail in goroutine after … has completed") that takes the
+//     whole package down, naming a test that had in fact passed.
 //
 // Parameters:
 //   - redisAddress string: the Redis the tasks were enqueued into.
 //
 // Returns:
-//   - []*asynq.TaskInfo: the pending tasks, in queue order. Empty when nothing was enqueued.
+//   - []*asynq.TaskInfo: the pending tasks, in queue order. Empty when nothing was
+//     enqueued.
 //   - error: any failure other than the queue never having existed.
 func pendingLegacyTasks(redisAddress string) ([]*asynq.TaskInfo, error) {
 	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: redisAddress})
@@ -774,8 +677,8 @@ func pendingLegacyTasks(redisAddress string) ([]*asynq.TaskInfo, error) {
 	return tasks, nil
 }
 
-// countPendingLegacyTasks is pendingLegacyTasks for a polled condition: it answers with a
-// count and folds an unreadable queue into -1, which no expected count can equal.
+// countPendingLegacyTasks is pendingLegacyTasks for a polled condition: it answers with
+// a count and folds an unreadable queue into -1, which no expected count can equal.
 //
 // Parameters:
 //   - redisAddress string: the Redis the tasks were enqueued into.
@@ -791,24 +694,8 @@ func countPendingLegacyTasks(redisAddress string) int {
 	return len(tasks)
 }
 
-// outboxSpyDatasource records which outbox insert was called, with which transaction and
-// which row, and is the harness for every path-selection assertion below.
-//
-// # Why a spy rather than testify expectations
-//
-// The two insert methods are overridden so that the arguments — the *sql.Tx in particular —
-// NEVER reach testify's recorded-call list. testify formats every recorded argument with
-// fmt.Sprintf("%v") whenever it diffs a call, which reflects over the whole *sql.Tx
-// including its unexported fields. database/sql concurrently mutates those fields from the
-// goroutine it starts per transaction (awaitDone, which calls rollback when the
-// transaction's context completes), so handing a live transaction to a testify mock is a
-// genuine, detector-visible data race in any test built that way. Recording the pointer
-// here and comparing it directly is race-free and, as a bonus, lets the assertions inspect
-// the whole captured row rather than squeeze a verdict through a boolean matcher.
-//
-// The embedded *mocks.MockDataSource supplies the rest of database.IDataSource and carries
-// NO expectations, which is itself an assertion: any other datasource method this path
-// touched would panic rather than pass unnoticed.
+// outboxSpyDatasource records which outbox insert was called, with which transaction
+// and which row, and is the harness for every path-selection assertion below.
 type outboxSpyDatasource struct {
 	*mocks.MockDataSource
 
@@ -826,13 +713,6 @@ type outboxSpyDatasource struct {
 	insertErr error
 
 	// recordInsertDeadlines opts into recording the DEADLINE each insert ran under.
-	//
-	// It is opt-in because most tests here are about which path was taken and which row
-	// was passed, and recording a deadline they never read would be noise. The tests that
-	// do read it are asserting the fix for an unbounded detached capture: a context with
-	// no deadline can never give up, so an outbox insert on one blocks for as long as the
-	// database stays unresponsive, holding a goroutine and a pool connection, failing
-	// nothing and logging nothing.
 	recordInsertDeadlines bool
 	// standaloneDeadlineValues are the deadlines standalone inserts ran under, in call
 	// order. A nil entry means the context carried none, which is the defect.
@@ -912,15 +792,12 @@ func (s *outboxSpyDatasource) inTx() ([]*model.EventOutbox, []*sql.Tx) {
 	return rows, transactions
 }
 
-// assertWroteNothing asserts neither insert path was taken. It is the mechanical form of
-// "the event was not captured".
+// assertWroteNothing asserts neither insert path was taken. It is the mechanical form
+// of "the event was not captured".
 //
 // Parameters:
 //   - t *testing.T: the test to fail.
-//   - reasons ...string: optional context appended to the failure message. "Nothing was
-//     written" is expected for several different reasons — unconfigured, legacy-only,
-//     unmarshalable — and a failure that says which one was expected is the difference
-//     between a diagnosable report and a bare "not empty".
+//   - reasons ...string: optional context appended to the failure message.
 func (s *outboxSpyDatasource) assertWroteNothing(t *testing.T, reasons ...string) {
 	t.Helper()
 
@@ -936,17 +813,11 @@ func (s *outboxSpyDatasource) assertWroteNothing(t *testing.T, reasons ...string
 	assert.Empty(t, inTxRows, "no in-transaction insert may have been issued"+context)
 }
 
-// newOutboxSQLDatasource returns a real database.Datasource over a go-sqlmock connection,
-// together with the mock controller and the *sql.DB the caller needs to open a
-// transaction.
+// newOutboxSQLDatasource returns a real database.Datasource over a go-sqlmock
+// connection, together with the mock controller and the *sql.DB the caller needs to
+// open a transaction.
 //
-// This is the harness for the two insert paths. It exercises the genuine repository
-// implementation, so the statement that reaches the driver — and the bytes bound to it —
-// are the real ones rather than a mock's idea of them.
-//
-// Cache is left nil because the outbox insert path does not touch it; a cache here would
-// require a Redis client and would make this file depend on infrastructure it has no
-// business needing.
+// This is the harness for the two insert paths.
 func newOutboxSQLDatasource(t *testing.T) (database.IDataSource, *sql.DB, sqlmock.Sqlmock) {
 	t.Helper()
 
@@ -962,12 +833,10 @@ func newOutboxSQLDatasource(t *testing.T) (database.IDataSource, *sql.DB, sqlmoc
 	return &database.Datasource{Conn: db}, db, controller
 }
 
-// outboxLegacyWebhookBody marshals event exactly as SendWebhook marshals it to build the
-// HTTP body: json.Marshal of the WHOLE NewWebhook value, both keys.
+// outboxLegacyWebhookBody marshals event exactly as SendWebhook marshals it to build
+// the HTTP body: json.Marshal of the WHOLE NewWebhook value, both keys.
 //
-// This function is the reference side of every byte-equality assertion in this file. It
-// is one line on purpose — the moment it does anything cleverer than SendWebhook does,
-// it stops being a reference.
+// This function is the reference side of every byte-equality assertion in this file.
 func outboxLegacyWebhookBody(t *testing.T, event NewWebhook) []byte {
 	t.Helper()
 
@@ -977,27 +846,22 @@ func outboxLegacyWebhookBody(t *testing.T, event NewWebhook) []byte {
 	return body
 }
 
-// outboxEnvelopeCarrying matches the event_raw bound value: the canonical envelope, whose
-// payload member must be the given bytes VERBATIM.
-//
-// It is a matcher rather than a literal expectation because two of the envelope's members —
-// the generated event_id and the construction-time occurred_at — cannot be written down in
-// advance. Matching on structure and on the spliced payload instead is what keeps the
-// assertion meaningful: sqlmock.AnyArg() here would accept an empty column, a re-marshalled
-// payload or a bare `null`, which are precisely the three ways this column can be wrong.
+// outboxEnvelopeCarrying matches the event_raw bound value: the canonical envelope,
+// whose payload member must be the given bytes VERBATIM.
 type outboxEnvelopeCarrying struct {
 	// payload is the legacy webhook body the envelope must splice in unaltered.
 	payload []byte
 }
 
-// Match reports whether value is a canonical envelope carrying the expected payload bytes.
+// Match reports whether value is a canonical envelope carrying the expected payload
+// bytes.
 //
 // Parameters:
 //   - value driver.Value: the bound value sqlmock observed.
 //
 // Returns:
-//   - bool: true only for a valid JSON object that declares all six envelope members and
-//     whose payload member is byte-equal to the expected body.
+//   - bool: true only for a valid JSON object that declares all six envelope members
+//     and whose payload member is byte-equal to the expected body.
 func (m outboxEnvelopeCarrying) Match(value driver.Value) bool {
 	raw, isBytes := value.([]byte)
 	if !isBytes || len(raw) == 0 {
@@ -1025,9 +889,7 @@ func (m outboxEnvelopeCarrying) Match(value driver.Value) bool {
 // outboxTopLevelKeys returns the keys of a JSON object IN DOCUMENT ORDER.
 //
 // A map cannot be used for this: unmarshalling into one loses the very ordering the
-// dual-delivery byte-equality guarantee depends on. Streaming the tokens keeps the order
-// the bytes actually carry, which is what lets a test assert that the payload is
-// {"event": ..., "data": ...} in that sequence and nothing else.
+// dual-delivery byte-equality guarantee depends on.
 func outboxTopLevelKeys(t *testing.T, raw []byte) []string {
 	t.Helper()
 
@@ -1076,11 +938,11 @@ func outboxDataObject(t *testing.T, raw []byte) json.RawMessage {
 	return envelope.Data
 }
 
-// outboxEnvelopePrefix is the exact byte prefix a stored payload must carry for the given
-// event name: `{"event":"<name>","data":`.
+// outboxEnvelopePrefix is the exact byte prefix a stored payload must carry for the
+// given event name: `{"event":"<name>","data":`.
 //
-// It is composed by marshalling the name rather than by string concatenation with quotes,
-// so an event name needing JSON escaping still produces a correct expectation.
+// It is composed by marshalling the name rather than by string concatenation with
+// quotes, so an event name needing JSON escaping still produces a correct expectation.
 func outboxEnvelopePrefix(t *testing.T, eventName string) string {
 	t.Helper()
 
@@ -1097,15 +959,7 @@ func outboxEnvelopePrefix(t *testing.T, eventName string) string {
 // TestPrepareEventOutbox_PayloadIsByteIdenticalToTheLegacyWebhookBody is THE test this
 // file exists for.
 //
-// For every one of the thirteen event types Blnk emits, it builds the NewWebhook a
-// producer builds, marshals it exactly as SendWebhook marshals the HTTP body, and asserts
-// that the bytes PrepareEventOutbox put in the payload column are the same bytes.
-//
-// The comparison is on []byte and on its string form, never on an unmarshalled map. A map
-// comparison would ignore key order, and key order is exactly what the dual-delivery
-// equality criterion turns on: the relay publishes the Kafka message and enqueues the
-// legacy webhook task from this one stored row, so if these bytes were merely
-// "equivalent" rather than identical, the guarantee would already be broken here.
+// The comparison is on []byte and on its string form, never on an unmarshalled map.
 func TestPrepareEventOutbox_PayloadIsByteIdenticalToTheLegacyWebhookBody(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1131,11 +985,6 @@ func TestPrepareEventOutbox_PayloadIsByteIdenticalToTheLegacyWebhookBody(t *test
 // TestPrepareEventOutbox_PayloadIsTheTwoKeyWebhookEnvelope pins the resolution of "the
 // payload matches today's webhook body field-for-field" to its strongest reading: the
 // WHOLE two-key object travels, both keys, in the order the legacy body carries them.
-//
-// Carrying only the inner "data" object would force every existing subscriber to rewrite
-// its body parser, which is the opposite of preserving the payload. This test is what
-// makes that mistake impossible to land quietly: it asserts the key set, the key order,
-// the event name at the outer level and the inner object's own bytes.
 func TestPrepareEventOutbox_PayloadIsTheTwoKeyWebhookEnvelope(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1165,11 +1014,7 @@ func TestPrepareEventOutbox_PayloadIsTheTwoKeyWebhookEnvelope(t *testing.T) {
 // hand-written cross-check.
 //
 // Every other payload assertion in this file compares against json.Marshal of the same
-// value, which proves the two agree but not what either one looks like. This test writes
-// the expected bytes out in full for one event, so the file also states — in literal,
-// reviewable form — that a stored payload really is
-// {"event":"ledger.created","data":{...}} and not some reshaped variant that happens to
-// match a reshaped expectation.
+// value, which proves the two agree but not what either one looks like.
 func TestPrepareEventOutbox_LedgerCreatedPayloadIsExactlyTheDocumentedObject(t *testing.T) {
 	const expected = `{"event":"ledger.created","data":{"ledger_id":"ldg_outbox_fixture",` +
 		`"name":"Outbox Fixture Ledger","created_at":"2026-03-14T15:09:26.535897932Z",` +
@@ -1187,30 +1032,8 @@ func TestPrepareEventOutbox_LedgerCreatedPayloadIsExactlyTheDocumentedObject(t *
 		"the stored payload must be exactly the documented two-key object")
 }
 
-// TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers is the DATA-01 tracing guard.
-//
-// # Why a span is not a lesser exposure than a log line
-//
-// The prepared-row span event used to export event.aggregate_id, event.partition_key and
-// event.ledger_id IN THE CLEAR, while the log path around it treated the very same values as
-// sensitive: the relay's row fields omit the partition key outright, and the dead-letter log
-// fields carry only a hash of it, both on the stated ground that it is a financial identifier.
-// That inconsistency did not reduce the disclosure, it relocated it — a span leaves the
-// process, is retained by a collector, and is routinely readable by a wider audience than the
-// database it came from.
-//
-// # What is asserted, and why the absence is checked against every attribute
-//
-// The identifiers must not appear ANYWHERE on the span: not as the attribute they used to be,
-// not under a renamed key, and not spliced into a span or event name. So this walks every
-// attribute of every recorded span and every span event and asserts the raw values are absent,
-// rather than asserting that three specific keys are gone — which a rename would satisfy while
-// leaking exactly as before.
-//
-// The partition key is then asserted PRESENT AS A HASH, because dropping it entirely would cost
-// a real diagnostic: the key decides the partition and therefore whether the per-aggregate
-// ordering guarantee holds, and a stable hash groups one aggregate's spans together — the
-// actual tracing question — without publishing the identifier.
+// TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers is the tracing
+// guard.
 func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 	const (
 		ledgerID    = "ldg_span_disclosure_probe"
@@ -1218,12 +1041,12 @@ func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 		aggregateID = balanceID
 	)
 
-	// Through the package's shared span facility rather than by installing a provider here.
-	// OpenTelemetry delegates the global tracer exactly once, so a provider installed directly
-	// reached transaction.go's package-level tracer only if this test happened to be the FIRST
-	// span test to run: it passed at -count=1 in declaration order and recorded nothing at
-	// -count=2 or under any -shuffle seed that ran the bulk-capture span test first. See
-	// recordingTracerProvider for why the switchboard is the fix and not a workaround.
+	// Through the package's shared span facility rather than by installing a provider
+	// here. OpenTelemetry delegates the global tracer exactly once, so a provider
+	// installed directly reached transaction.go's package-level tracer only if this test
+	// happened to be the FIRST span test to run: it passed at -count=1 in declaration
+	// order and recorded nothing at -count=2 or under any -shuffle seed that ran the
+	// bulk-capture span test first.
 	recorder := recordingTracerProvider(t)
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
@@ -1295,10 +1118,7 @@ func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 // bulk_transaction family's payload can take, because the producer builds it
 // conditionally and each branch is a different set of keys on the wire.
 //
-// The key sets are asserted explicitly rather than inferred. A regression that always
-// included "error", or that dropped "transaction_count", would still round-trip through
-// json.Marshal and would still be byte-equal to a comparison built from the same faulty
-// map — only an independent statement of the expected keys catches it.
+// The key sets are asserted explicitly rather than inferred.
 func TestPrepareEventOutbox_BulkTransactionPayloadShapes(t *testing.T) {
 	const failureReason = "insufficient funds on bln_outbox_source"
 
@@ -1354,12 +1174,6 @@ func TestPrepareEventOutbox_BulkTransactionPayloadShapes(t *testing.T) {
 
 // TestPrepareEventOutbox_CoversEveryEmittedEventType is the completeness guard on the
 // catalogue above.
-//
-// The coverage requirement is absolute — every event type that reached the legacy webhook
-// sender must reach Kafka — so a fixture table that had quietly lost a row would leave a
-// real event type unproven while every remaining test still passed. Comparing the table
-// against an independently written vocabulary of thirteen keys is what makes adding a
-// fourteenth event type without a fixture a test failure rather than a silent gap.
 func TestPrepareEventOutbox_CoversEveryEmittedEventType(t *testing.T) {
 	require.Len(t, outboxEventVocabulary, outboxEventCatalogueSize,
 		"the hand-written vocabulary must name all thirteen event types")
@@ -1391,39 +1205,20 @@ func TestPrepareEventOutbox_CoversEveryEmittedEventType(t *testing.T) {
 // outboxUUIDSampleSize is how many rows the identifier test builds.
 //
 // event_id doubles as the subscriber idempotency key, so a collision is not a cosmetic
-// defect — it would make a duplicate look like a redelivery of a different event, or make
-// a genuinely new event look like a duplicate and be discarded. A few hundred draws will
-// not prove a generator sound on its own, but combined with parsing every value it does
-// catch the failure modes that matter in practice: a constant, a counter reset, a value
-// derived from the payload, or a truncated string.
+// defect — it would make a duplicate look like a redelivery of a different event, or
+// make a genuinely new event look like a duplicate and be discarded. A few hundred
+// draws will not prove a generator sound on its own, but combined with parsing every
+// value it does catch the failure modes that matter in practice: a constant, a counter
+// reset, a value derived from the payload, or a truncated string.
 const outboxUUIDSampleSize = 512
 
 // TestPrepareEventOutbox_EventIDIsACanonicalUUIDAndStableForOneMutation asserts the
 // identifier is a real, canonically formatted UUID and that its STABILITY matches the
 // event's nature.
 //
-// # Why the same mutation must yield the same id
-//
-// event_id carries two contracts at once: it is the subscriber's idempotency key, and it
-// is the unique index that makes the outbox's write side exactly-once. A freshly random id
-// per preparation satisfies neither for a RETRY. A mutation replayed after an ambiguous
-// failure — a commit whose acknowledgement was lost, a request repeated by a client, a
-// worker that restarted mid-flight — prepares its event a second time, and with a random
-// id the index sees a different key, admits a second row, and the subscriber receives one
-// business event twice with nothing to tell them apart.
-//
-// It also makes the CONFLICT arm of the repository's insert-error discrimination
-// unreachable, and that arm exists for exactly this case: so a caller retrying a mutation
-// whose event was already captured can recognise it and carry on rather than see a server
-// fault.
-//
-// # Why different mutations, and different event types, must still differ
-//
-// The derivation is over the mutation identity, the event type and the schema version, so
-// two events about different things — and two events about the SAME thing at different
-// points in its life — remain distinct. Collapsing transaction.queued and
-// transaction.applied for one transaction into one id would suppress the second as a
-// duplicate of the first.
+// event_id carries two contracts at once: it is the subscriber's idempotency key, and
+// it is the unique index that makes the outbox's write side exactly-once. A freshly
+// random id per preparation satisfies neither for a RETRY.
 func TestPrepareEventOutbox_EventIDIsACanonicalUUIDAndStableForOneMutation(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 	event := NewWebhook{Event: "ledger.created", Payload: outboxSampleLedger()}
@@ -1466,9 +1261,9 @@ func TestPrepareEventOutbox_EventIDIsACanonicalUUIDAndStableForOneMutation(t *te
 // identity contract, and it is the half that is easy to get catastrophically wrong.
 //
 // Determinism is CORRECT only for an event describing a mutation that happens once.
-// Applying it to a repeatable event would collapse every later occurrence into a duplicate
-// the unique index rejects, and the pipeline would stop delivering those events with no
-// error anywhere at all:
+// Applying it to a repeatable event would collapse every later occurrence into a
+// duplicate the unique index rejects, and the pipeline would stop delivering those
+// events with no error anywhere at all:
 //
 //   - balance.monitor fires every time its condition is met. A derived id would deliver
 //     the first alert and silently discard every one after it — the exact opposite of
@@ -1516,10 +1311,6 @@ func TestPrepareEventOutbox_EventIDStaysFreshForARepeatableEvent(t *testing.T) {
 
 // TestPrepareEventOutbox_EventTypeMirrorsTheInnerEventName asserts the event name is
 // hoisted to the envelope exactly.
-//
-// The duplication between the envelope and the payload is deliberate: it lets subscribers,
-// the relay and SQL-side triage route and filter without parsing the payload at all. It is
-// only useful if the two agree, which is what this asserts.
 func TestPrepareEventOutbox_EventTypeMirrorsTheInnerEventName(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1544,14 +1335,11 @@ func TestPrepareEventOutbox_EventTypeMirrorsTheInnerEventName(t *testing.T) {
 	}
 }
 
-// TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim pins the one place
-// where the envelope and the payload legitimately differ.
+// TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim pins the one
+// place where the envelope and the payload legitimately differ.
 //
 // The envelope trims the event name so that routing, filtering and topic resolution are
-// not defeated by a stray space. The payload is NOT re-derived from the trimmed value —
-// it is the marshalled NewWebhook exactly as the producer handed it over — because the
-// payload's whole contract is that it equals the byte sequence the legacy transport would
-// have sent, spacing included.
+// not defeated by a stray space.
 func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 	event := NewWebhook{Event: "  ledger.created\t", Payload: outboxSampleLedger()}
@@ -1567,12 +1355,11 @@ func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *te
 		"the payload must carry the producer's exact event string")
 }
 
-// TestPrepareEventOutbox_SchemaVersionIsV1 asserts the envelope version is the integer 1.
+// TestPrepareEventOutbox_SchemaVersionIsV1 asserts the envelope version is the integer
+// 1.
 //
 // The value reaches subscribers on the wire, where it is what a consumer branches on to
-// decide whether it understands the envelope shape. Asserting the exact integer — not
-// merely that it is non-zero — is what makes an accidental bump, or a zero left by a
-// missing assignment, a test failure.
+// decide whether it understands the envelope shape.
 func TestPrepareEventOutbox_SchemaVersionIsV1(t *testing.T) {
 	require.Equal(t, 1, model.SchemaVersionV1,
 		"the initial schema version is 1; a change here is a subscriber-facing contract change")
@@ -1593,18 +1380,9 @@ func TestPrepareEventOutbox_SchemaVersionIsV1(t *testing.T) {
 	}
 }
 
-// TestPrepareEventOutbox_OccurredAtIsUTCAndRoundTripsThroughRFC3339 asserts the timestamp
-// is present, is the current instant in UTC, and survives the wire without loss.
-//
-// occurred_at is not decoration: the relay claims rows in ascending occurred_at order, so
-// it is half of the ordering guarantee — the message key picks the partition, and this
-// picks the sequence within it. UTC matters because the value is rendered as RFC3339 on
-// the wire and must be unambiguous wherever the process runs.
-//
-// The round-trip is asserted at RFC3339Nano rendering, which is what time.Time's own JSON
-// encoding produces. Rendering at second precision would silently discard the fractional
-// part, and two events in the same second would then be indistinguishable to a consumer
-// ordering by this field.
+// TestPrepareEventOutbox_OccurredAtIsUTCAndRoundTripsThroughRFC3339 asserts the
+// timestamp is present, is the current instant in UTC, and survives the wire without
+// loss.
 func TestPrepareEventOutbox_OccurredAtIsUTCAndRoundTripsThroughRFC3339(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -1644,10 +1422,9 @@ func TestPrepareEventOutbox_OccurredAtIsUTCAndRoundTripsThroughRFC3339(t *testin
 // TestPrepareEventOutbox_TopicIsResolvedFromTheEventType asserts the destination topic
 // recorded on the row, for every one of the thirteen event types.
 //
-// Two assertions are made per fixture, and both are needed. The literal expectation is an
-// independent statement of the routing contract, so a renamed category or a changed
-// separator fails here. The equality with TopicForEvent proves the row is resolved through
-// the same routing function the rest of the pipeline uses, so the two can never disagree.
+// Two assertions are made per fixture, and both are needed: the literal expectation is an
+// independent statement of the routing contract, and the equality with TopicForEvent
+// proves the row was resolved through the same function the rest of the pipeline uses.
 func TestPrepareEventOutbox_TopicIsResolvedFromTheEventType(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1668,13 +1445,8 @@ func TestPrepareEventOutbox_TopicIsResolvedFromTheEventType(t *testing.T) {
 	}
 }
 
-// TestPrepareEventOutbox_TopicIsResolvedOnceAtConstruction asserts the topic follows the
-// configured namespace prefix and is FROZEN on the row.
-//
-// Recording the resolved name rather than re-deriving it at publish time is what keeps a
-// stored row replayable to its original destination: a dead-lettered event written before
-// KAFKA_TOPIC_PREFIX changed must still be replayable to the topic it was meant for, not
-// to a newly-named one no consumer has subscribed to yet.
+// TestPrepareEventOutbox_TopicIsResolvedOnceAtConstruction asserts the topic follows
+// the configured namespace prefix and is FROZEN on the row.
 func TestPrepareEventOutbox_TopicIsResolvedOnceAtConstruction(t *testing.T) {
 	configuration := outboxPublishingConfiguration()
 	configuration.Kafka.TopicPrefix = "acme"
@@ -1698,16 +1470,10 @@ func TestPrepareEventOutbox_TopicIsResolvedOnceAtConstruction(t *testing.T) {
 		"the recorded topic must not change when the configuration does")
 }
 
-// TestPrepareEventOutbox_MaxAttemptsFollowsTheRelayConfiguration asserts the retry budget
-// stamped on the row.
+// TestPrepareEventOutbox_MaxAttemptsFollowsTheRelayConfiguration asserts the retry
+// budget stamped on the row.
 //
-// The budget is stamped rather than read by the relay at publish time so that a
-// configuration change never retroactively alters rows already in flight, and so an
-// operator can extend the budget for one stuck event without restarting anything.
-//
-// A non-positive configured value is REPLACED, not honoured. Zero would mean "never
-// attempt", which strands the row: the relay would have no attempts to spend, so the event
-// would neither publish nor dead-letter, and nothing would surface the fact.
+// A non-positive configured value is REPLACED, not honoured.
 func TestPrepareEventOutbox_MaxAttemptsFollowsTheRelayConfiguration(t *testing.T) {
 	budgets := []struct {
 		name       string
@@ -1742,13 +1508,8 @@ func TestPrepareEventOutbox_MaxAttemptsFollowsTheRelayConfiguration(t *testing.T
 		"the default retry budget is five, agreeing with RELAY_MAX_RETRY_ATTEMPTS and the column default")
 }
 
-// TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh asserts the row enters the
-// relay state machine at its start.
-//
-// Status is set explicitly at construction even though the repository layer and the column
-// default would both supply it, so the in-memory row the caller holds agrees with the row
-// that lands in the table. The relay's claim query selects on this exact value, so a row
-// carrying anything else would simply never be picked up.
+// TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh asserts the row enters
+// the relay state machine at its start.
 func TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh(t *testing.T) {
 	require.Equal(t, "pending", model.EventOutboxStatusPending,
 		"the pending status is the literal the claim query selects on")
@@ -1784,18 +1545,10 @@ func TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh(t *testing.T)
 // The partition key: ledger_id, and therefore ordering
 // ---------------------------------------------------------------------------
 
-// TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation asserts the derived key for
-// every payload type, against a literal expectation.
+// TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation asserts the derived key
+// for every payload type, against a literal expectation.
 //
-// This is the highest-consequence value the file under test computes. The key is hashed by
-// a stable balancer to pick a partition, so every event sharing a key lands on one
-// partition and is consumed in publish order, while events with different keys carry no
-// ordering relationship whatsoever. Per-aggregate ordering is therefore a property of THIS
-// derivation, not of the broker and not of the relay.
-//
-// The expectations are literals rather than calls into the derivation, so a reordered key
-// preference — source before destination, say, or ledger before balance — fails here
-// instead of silently moving a partition assignment.
+// This is the highest-consequence value the file under test computes.
 func TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1815,15 +1568,8 @@ func TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation(t *testing.T) 
 	}
 }
 
-// TestPrepareEventOutbox_AggregateIDIsTheEventSubject asserts the aggregate identifier for
-// every payload type.
-//
-// aggregate_id is deliberately distinct from the partition key: the key controls
-// partitioning and therefore ordering, whereas this names the entity the event is ABOUT
-// and is what a consumer groups by. For some event types they coincide — a ledger event is
-// keyed on and about the same ledger — and for others they differ, most visibly the
-// balance monitor, which is ABOUT the monitor that fired but keyed on the balance it
-// watches so that every alert for that balance stays ordered.
+// TestPrepareEventOutbox_AggregateIDIsTheEventSubject asserts the aggregate identifier
+// for every payload type.
 func TestPrepareEventOutbox_AggregateIDIsTheEventSubject(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1858,14 +1604,11 @@ func TestPrepareEventOutbox_AggregateIDIsTheEventSubject(t *testing.T) {
 		"subject and partition key are different concepts and must not be conflated")
 }
 
-// TestPrepareEventOutbox_PartitionKeyFallbackChain pins every step of the documented fallback,
-// in order.
+// TestPrepareEventOutbox_PartitionKeyFallbackChain pins every step of the documented
+// fallback, in order.
 //
 // The chain exists for exactly one reason: the key must ALWAYS be present and always
-// deterministic. Kafka treats a null or empty key as "any partition", so an unkeyed event
-// is scattered round-robin and its ordering relative to its siblings is lost with nothing
-// in the data to show that it happened. Each case below is a real payload shape a producer
-// can present, and each one must still yield a usable key.
+// deterministic.
 func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 	fallbacks := []struct {
 		name        string
@@ -1875,9 +1618,9 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 		aggregateID string
 	}{
 		{
-			// Step 1 of the transaction preference: the source balance, which is what
-			// the transaction queue itself shards on, so Kafka partitioning and queue
-			// sharding agree.
+			// Step 1 of the transaction preference: the source balance, which is what the
+			// transaction queue itself shards on, so Kafka partitioning and queue sharding
+			// agree.
 			name:        "a transaction keys on its source balance",
 			eventType:   "transaction.applied",
 			payload:     outboxSampleTransaction(StatusApplied),
@@ -1912,9 +1655,9 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 			aggregateID: outboxTransactionID,
 		},
 		{
-			// Whitespace-only identifiers are treated as absent. They must be, because
-			// " " and "" hash to different partitions, so honouring a stray space would
-			// split one aggregate's events across two partitions.
+			// Whitespace-only identifiers are treated as absent. They must be, because " " and
+			// "" hash to different partitions, so honouring a stray space would split one
+			// aggregate's events across two partitions.
 			name:      "whitespace-only identifiers are treated as absent",
 			eventType: "transaction.applied",
 			payload: func() *model.Transaction {
@@ -1941,9 +1684,8 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 			aggregateID: outboxSourceBalanceID,
 		},
 		{
-			// BalanceMonitor carries no ledger field at all, and the balance it watches
-			// is the closest stable aggregate. With that gone, the monitor keys on
-			// itself.
+			// BalanceMonitor carries no ledger field at all, and the balance it watches is the
+			// closest stable aggregate. With that gone, the monitor keys on itself.
 			name:      "a monitor with no balance keys on itself",
 			eventType: "balance.monitor",
 			payload: func() model.BalanceMonitor {
@@ -1956,9 +1698,9 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 			aggregateID: outboxMonitorID,
 		},
 		{
-			// system.error has neither an aggregate nor a ledger, so the key falls back
-			// to the event type. That gives the error stream a single partition and
-			// therefore a total order, which is what an error consumer wants.
+			// system.error has neither an aggregate nor a ledger, so the key falls back to the
+			// event type. That gives the error stream a single partition and therefore a total
+			// order, which is what an error consumer wants.
 			name:        "system.error falls back to its event type",
 			eventType:   "system.error",
 			payload:     outboxSampleSystemErrorPayload(),
@@ -2064,15 +1806,8 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 // TestPrepareEventOutbox_UnkeyableEventIsRefused pins the replacement for the removed
 // "blnk.unkeyed" sentinel.
 //
-// An event with no aggregate of any kind AND no event type to fall back to used to be
-// admitted under a fixed sentinel key. That kept it out of the logs and out of every test's
-// way while giving it an ordering guarantee against nothing — the row was published, and the
-// only way to find out was to think to query the sentinel. Requirement R-6 makes the key
-// load-bearing, so the capture is now REFUSED and the producer sees the failure at its call
-// site.
-//
-// Only a zero-valued NewWebhook can reach it: every catalogued event type carries a declared
-// key dimension and every real payload yields at least the type.
+// Only a zero-valued NewWebhook can reach it: every catalogued event type carries a
+// declared key dimension and every real payload yields at least the type.
 func TestPrepareEventOutbox_UnkeyableEventIsRefused(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -2093,14 +1828,11 @@ func TestPrepareEventOutbox_UnkeyableEventIsRefused(t *testing.T) {
 		"an unkeyable event is a producer defect in this service, so it is a 500 and not a 400")
 }
 
-// TestPrepareEventOutbox_KeyDimensionIsDeclaredForEveryCataloguedEventType is the R-6
+// TestPrepareEventOutbox_KeyDimensionIsDeclaredForEveryCataloguedEventType is the partitioning
 // declaration contract.
 //
 // model.KeyDimensionForEventType declares what a type's key is SUPPOSED to be, and
-// PrepareEventOutbox compares the dimension it achieved against it. That comparison is only
-// worth anything if every event type this repository emits carries a declaration: an
-// undeclared type falls back to the aggregate dimension, which can never report a miss, so
-// an omission here silently switches the check off for that type.
+// PrepareEventOutbox compares the dimension it achieved against it.
 func TestPrepareEventOutbox_KeyDimensionIsDeclaredForEveryCataloguedEventType(t *testing.T) {
 	declared := model.EventKeyDimensionsByType()
 
@@ -2126,11 +1858,6 @@ func TestPrepareEventOutbox_KeyDimensionIsDeclaredForEveryCataloguedEventType(t 
 
 // TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension walks the whole
 // catalogue and asserts the key each event type actually gets.
-//
-// One case per declared dimension, plus the one real MISS: a rejected transaction carries no
-// balances, so nothing names its ledger and the key falls to the source balance. That miss is
-// reported rather than absorbed, and this test is what pins which shapes are supposed to
-// produce it.
 func TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -2236,13 +1963,8 @@ func TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension(t *testi
 	}
 }
 
-// TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate is the ordering guarantee
-// expressed as a property rather than as a table.
-//
-// Two things have to hold for per-aggregate ordering to survive: every event belonging to
-// one aggregate must derive the SAME key, so they share a partition; and events belonging
-// to different aggregates must derive DIFFERENT keys, so one busy aggregate cannot
-// serialise the whole topic behind it.
+// TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate is the ordering
+// guarantee expressed as a property rather than as a table.
 func TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -2325,18 +2047,10 @@ func TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate(t *testing.T) 
 // The no-op-when-unconfigured contract
 // ---------------------------------------------------------------------------
 
-// TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured asserts the contract that
-// protects every existing deployment and the whole existing test suite.
-//
-// SendWebhook returns nil the moment it sees an empty webhook URL, which is why Blnk runs
-// perfectly well with no notification sink and why tests that construct NewBlnk(nil) work
-// with no broker and no HTTP endpoint anywhere in sight. A publisher that errored, blocked
-// or captured rows nobody could ever publish would break all of that.
+// TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured asserts the contract
+// that protects every existing deployment and the whole existing test suite.
 //
 // Brokers are checked for a non-BLANK entry rather than merely for a non-empty slice.
-// KAFKA_BROKERS is parsed as a comma-separated list, so KAFKA_BROKERS="" and
-// KAFKA_BROKERS="," both yield a slice that is non-empty and carries nothing usable;
-// treating those as configured would fill the outbox with rows no relay could publish.
 func TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured(t *testing.T) {
 	unconfigured := []struct {
 		name          string
@@ -2404,18 +2118,11 @@ func TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured(t *testing.T
 // TestPrepareEventOutbox_IsConfiguredByKafkaBrokers asserts the positive half of the
 // contract: the outbox captures an event when, and only when, KAFKA IS CONFIGURED.
 //
-// # Why a webhook URL alone is NOT enough, having once been treated as enough
-//
-// The outbox is only a destination while something drains it, and the relay refuses to run
-// without Kafka — handed the no-op publisher it would report every publish as dispatched and
-// retire the entire outbox having sent nothing. A webhook-only deployment that captured rows
-// therefore accumulated them and delivered none of them, silently, because the producers had
-// stopped calling SendWebhook themselves.
-//
-// Capture is tied to the transport that can actually be drained, and the webhook-only case
-// keeps the transport it always had: PublishEvent sends it straight down SendWebhook. That
-// path is asserted by TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport;
-// what this test pins is that no unrelayable row is written.
+// The outbox is only a destination while something drains it, and the relay refuses to
+// run without Kafka — handed the no-op publisher it would report every publish as
+// dispatched and retire the entire outbox having sent nothing. A webhook-only
+// deployment that captured rows therefore accumulated them and delivered none of them,
+// silently, because the producers had stopped calling SendWebhook themselves.
 func TestPrepareEventOutbox_IsConfiguredByKafkaBrokers(t *testing.T) {
 	configured := []struct {
 		name          string
@@ -2485,16 +2192,8 @@ func TestPrepareEventOutbox_IsConfiguredByKafkaBrokers(t *testing.T) {
 }
 
 // TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent is the other half of
-// F-09's fix: having established that a webhook-only deployment captures nothing, this states
-// what it does INSTEAD.
-//
-// It makes exactly the call every producer made before this feature existed — SendWebhook —
-// so the deployment's behaviour is unchanged, which is what AAP §0.5.4 requires of the
-// KAFKA_BROKERS-empty state. Without this the fix would trade one silent failure for another.
-//
-// The instance is built by NewBlnk against miniredis rather than assembled by hand, because
-// SendWebhook enqueues through the asynq client and a hand-built instance has none: the
-// enqueue is the observable behaviour, so it has to be real.
+// Having established that a webhook-only deployment captures nothing, this
+// states what it does INSTEAD.
 func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing.T) {
 	newLegacyOnlyInstanceWithSunset := func(t *testing.T, webhookURL, sunset string) (*Blnk, *outboxSpyDatasource) {
 		t.Helper()
@@ -2526,8 +2225,8 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 	}
 
 	// No sunset: the ordinary state of a webhook-only deployment that has not scheduled a
-	// retirement. With no Kafka transport the sunset resolves to "not passed", so the legacy
-	// path keeps working exactly as it did before this feature existed.
+	// retirement. With no Kafka transport the sunset resolves to "not passed", so the
+	// legacy path keeps working exactly as it did before this feature existed.
 	newLegacyOnlyInstance := func(t *testing.T, webhookURL string) (*Blnk, *outboxSpyDatasource) {
 		t.Helper()
 
@@ -2577,8 +2276,8 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 	t.Run("the in-transaction entry point delivers nothing and reports success", func(t *testing.T) {
 		instance, datasource := newLegacyOnlyInstance(t, "https://example.com/webhooks")
 
-		// A non-nil transaction is what a caller holding an open ledger transaction passes.
-		// A real one is unnecessary — nothing dereferences it on this path — and opening one
+		// A non-nil transaction is what a caller holding an open ledger transaction passes. A
+		// real one is unnecessary — nothing dereferences it on this path — and opening one
 		// would make this test depend on a database it has no business needing.
 		require.NoError(t, instance.PublishEventInTx(context.Background(), new(sql.Tx), event),
 			"an in-transaction capture on a Kafka-less deployment is a documented no-op, not a failure")
@@ -2597,11 +2296,10 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 		}
 	})
 
-	// THE SUNSET GATE, and it is the review's C-1 finding on this path. The legacy-only
+	// THE SUNSET GATE on this path. The legacy-only
 	// branch compared nothing against the retirement instant, so a deployment that had
 	// scheduled the HTTP transport's retirement — and passed it — kept delivering over it,
-	// while the relay and the 410 guard on a Kafka deployment both treated it as gone. Every
-	// legacy enqueue now goes through the one predicate in event_sunset.go.
+	// while the relay and the 410 guard on a Kafka deployment both treated it as gone.
 	t.Run("nothing is enqueued once the configured sunset has passed", func(t *testing.T) {
 		past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
 		instance, datasource := newLegacyOnlyInstanceWithSunset(t, "https://example.com/webhooks", past)
@@ -2645,14 +2343,10 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 	})
 }
 
-// TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload asserts that a malformed payload
-// is a logged non-event, never an error and never a panic.
+// TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload asserts that a malformed
+// payload is a logged non-event, never an error and never a panic.
 //
-// A MALFORMED PAYLOAD MUST NEVER TAKE DOWN A LEDGER WRITE. Propagating an error here would
-// abort the enclosing ledger transaction and reject a financially valid mutation because of
-// a notification defect, which is the wrong trade in a ledger by a wide margin. Panicking
-// would be worse still: these entry points are called from goroutines spawned by
-// post-action hooks, where a panic takes down the process rather than surfacing as an error.
+// A MALFORMED PAYLOAD MUST NEVER TAKE DOWN A LEDGER WRITE.
 //
 // This mirrors PrepareLineageOutbox's handling of the same situation exactly.
 func TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload(t *testing.T) {
@@ -2690,24 +2384,8 @@ func TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload(t *testing.T) {
 			}, "a payload defect must not panic the ledger write path")
 			assert.Nil(t, row, "an unmarshalable payload yields no row")
 
-			// THE BEHAVIOUR THIS TEST NOW GUARDS, and it is the reverse of what it
-			// asserted before.
-			//
-			// It used to require that a marshal failure be swallowed, on the reasoning
-			// that a notification defect must not abort a financially valid mutation.
-			// The trade that actually made was worse than the one it avoided: the
-			// mutation committed, the event was gone, the caller was told it had
-			// succeeded, and NOTHING downstream could ever find the loss — not the
-			// outbox, not the relay, not the dead-letter inventory, and not the daily
-			// reconciliation, which can only count rows that exist. An event no
-			// mechanism can find is indistinguishable from one that was never produced.
-			//
-			// It is now an error, so the caller decides — and on the in-transaction path
-			// the caller's mutation rolls back, which is what requirement R-2 asks for.
-			// The risk is bounded: json.Marshal fails on channels, functions and cyclic
-			// structures, none of which appear in the model structs and small
-			// string-keyed maps that reach here, so a failure is a defect in a new
-			// producer and the loudest possible moment to learn of it is its first run.
+			// THE BEHAVIOUR THIS TEST NOW GUARDS, and it is the reverse of what it asserted
+			// before.
 			require.Error(t, prepareErr,
 				"a payload that cannot be serialised must be reported, not swallowed: a swallowed one is a lost event no mechanism can find")
 			requireAPIErrorCode(t, prepareErr, apierror.ErrInternalServer)
@@ -2742,31 +2420,17 @@ func TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload(t *testing.T) {
 // Persistence: which insert path, and what reaches the driver
 // ---------------------------------------------------------------------------
 
-// TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction asserts the path selection
-// for a caller that has no ledger transaction to enrol in.
+// TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction asserts the path
+// selection for a caller that has no ledger transaction to enrol in.
 //
-// # Which events actually arrive this way, and which no longer do
-//
-// The standalone path is for events that accompany NO MUTATION OF THEIR OWN. Three kinds
-// reach it:
+// The standalone path is for events that accompany NO MUTATION OF THEIR OWN. Three
+// kinds reach it:
 //
 //   - balance.monitor, which reports that a condition was met and changes nothing;
-//   - bulk_transaction.<status>, a batch SUMMARY, whose per-transaction mutations have each
-//     already committed under their own transaction — there is no batch-spanning transaction
-//     for it to join;
+//   - bulk_transaction.<status>, a batch SUMMARY, whose per-transaction mutations have
+//     each already committed under their own transaction — there is no batch-spanning
+//     transaction for it to join;
 //   - system.error, which describes a failure rather than a write.
-//
-// ledger.created, identity.created and balance.created NO LONGER arrive here, and that is
-// the point of requirement R-2: each is now captured inside its entity's creation
-// transaction through the atomic writers in the database package, so a committed ledger,
-// identity or balance always carries its event. Status-derived transaction events go through
-// the atomic transaction writer for the same reason, with the coalesced-batch path — whose
-// writer arguments are assembled in the frozen transaction_coalescing.go — as the one
-// exception that still captures post-commit.
-//
-// The fixture below still uses ledger.created because this test is about PATH SELECTION
-// given no transaction, not about which producer chooses which path: PublishEvent must issue
-// the standalone insert whenever no transaction is supplied, whatever the event is.
 func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	datasource := newOutboxSpyDatasource()
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
@@ -2788,34 +2452,24 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	assert.Empty(t, inTxRows, "no transaction was supplied, so none may be used")
 }
 
-// TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport is the other
-// half of TestPrepareEventOutbox_IsConfiguredByKafkaBrokers, and together they describe the
-// whole of what a deployment without a broker does.
+// TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport is the
+// other half of TestPrepareEventOutbox_IsConfiguredByKafkaBrokers, and together they
+// describe the whole of what a deployment without a broker does.
 //
-// # The regression this exists to prevent
+// Such a deployment has only the legacy transport, so PublishEvent routes it straight
+// down that one. The four cases below are the four states the two transports can be in, and each
+// pins a different half of the decision:
 //
-// Every producer call site used to call SendWebhook itself. They now call PublishEvent, and
-// for a while PublishEvent's only behaviour was to capture a row. On a deployment with a
-// webhook URL and no broker that combination delivered NOTHING: the relay refuses to run
-// without Kafka, so nobody claimed the rows, and no error was raised anywhere because
-// capturing the row had succeeded. The rows accumulated and the notifications simply stopped.
-//
-// So PublishEvent routes such a deployment straight down the transport it has always used.
-// The four cases below are the four states the two transports can be in, and each pins a
-// different half of the decision:
-//
-//   - webhook only — the legacy enqueue happens and NO row is captured, because a row nobody
-//     drains is worse than no row at all;
-//   - both configured — the outbox wins and there is no publish-time enqueue, because during
-//     the dual-delivery window the relay drives BOTH legs from the one claimed row, which is
-//     what makes their bytes identical;
-//   - neither configured — nothing at all, which is the no-op-when-unconfigured contract;
-//   - a webhook URL with no queue client — a typed error, because that deployment asked for a
-//     transport it has not got and dropping the event silently is how it would never find out.
-//
-// The payload assertion is byte equality against the same legacy body every other test in
-// this file compares against, so the legacy leg is held to the same guarantee as the Kafka
-// leg rather than merely to "something was enqueued".
+//   - webhook only — the legacy enqueue happens and NO row is captured, because a row
+//     nobody drains is worse than no row at all;
+//   - both configured — the outbox wins and there is no publish-time enqueue, because
+//     during the dual-delivery window the relay drives BOTH legs from the one claimed
+//     row, which is what makes their bytes identical;
+//   - neither configured — nothing at all, which is the no-op-when-unconfigured
+//     contract;
+//   - a webhook URL with no queue client — a typed error, because that deployment asked
+//     for a transport it has not got and dropping the event silently is how it would
+//     never find out.
 func TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport(t *testing.T) {
 	event := NewWebhook{Event: "transaction.applied", Payload: outboxSampleTransaction(StatusApplied)}
 
@@ -2894,11 +2548,8 @@ func TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport(t
 // TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction asserts the
 // transactional-outbox guarantee at its narrowest.
 //
-// The caller has already begun a transaction and applied its mutation; passing that same
-// *sql.Tx here ties the event's fate to it. The assertion is on the POINTER IDENTITY of the
-// transaction, not merely on one having been supplied: an insert performed inside some
-// other transaction would commit independently of the mutation and would defeat the whole
-// point.
+// The caller has already begun a transaction and applied its mutation; passing that
+// same *sql.Tx here ties the event's fate to it.
 func TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction(t *testing.T) {
 	_, db, controller := newOutboxSQLDatasource(t)
 	controller.ExpectBegin()
@@ -2948,17 +2599,11 @@ func TestPublishEventInTx_NilTransactionFallsBackToTheStandaloneInsert(t *testin
 	assert.Empty(t, inTxRows, "a nil transaction must never be handed to the in-transaction insert")
 }
 
-// TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes drives the real repository over
-// a stubbed driver, so the statement and the bound values asserted here are the ones that
-// would reach PostgreSQL.
+// TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes drives the real repository
+// over a stubbed driver, so the statement and the bound values asserted here are the
+// ones that would reach PostgreSQL.
 //
-// The payload argument is compared as EXACT BYTES. This is the byte-equality guarantee
-// followed all the way to the SQL boundary: it is not enough for the in-memory row to hold
-// the legacy body if something between the row and the driver re-marshals it.
-//
-// event_id and occurred_at are matched loosely because they are generated at construction;
-// every other value is exact, including the resolved topic, the pending status and the
-// retry budget.
+// The payload argument is compared as EXACT BYTES.
 func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 	datasource, _, controller := newOutboxSQLDatasource(t)
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
@@ -2966,8 +2611,8 @@ func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 
 	expectedPayload := outboxLegacyWebhookBody(t, event)
 
-	// partition_key and ledger_id are SEPARATE bound values, and this is the one place
-	// the distinction is visible all the way at the SQL boundary. A balance payload is the
+	// partition_key and ledger_id are SEPARATE bound values, and this is the one place the
+	// distinction is visible all the way at the SQL boundary. A balance payload is the
 	// case where both are populated and they happen to be the SAME value — the balance
 	// belongs to that ledger, so keying by the ledger co-locates its balance events — but
 	// they are still two columns carrying two different facts.
@@ -2981,26 +2626,25 @@ func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 			"blnk.balances",
 			model.SchemaVersionV1,
 			expectedPayload, // payload: the legacy webhook body, byte for byte
-			// payload_raw: the SAME bytes, bound from the SAME slice. Asserting the
-			// value twice is what pins the mechanism rather than merely the outcome —
-			// if a future edit re-marshalled for one of the two body columns, this
-			// expectation would fail here at the SQL boundary rather than silently
-			// producing a JSONB-normalised replay much later.
+			// payload_raw: the SAME bytes, bound from the SAME slice. Asserting the value twice
+			// is what pins the mechanism rather than merely the outcome — if a future edit
+			// re-marshalled for one of the two body columns, this expectation would fail here at
+			// the SQL boundary rather than silently producing a JSONB-normalised replay much
+			// later.
 			expectedPayload,
-			// event_raw: the canonical envelope, with that same body spliced in
-			// unaltered. It is written ONCE here and read by every later transport, so
-			// the bytes bound at this boundary are the bytes a subscriber eventually
-			// receives — which is why the payload member is compared exactly rather
-			// than the whole column being waved through.
+			// event_raw: the canonical envelope, with that same body spliced in unaltered. It is
+			// written ONCE here and read by every later transport, so the bytes bound at this
+			// boundary are the bytes a subscriber eventually receives — which is why the payload
+			// member is compared exactly rather than the whole column being waved through.
 			outboxEnvelopeCarrying{payload: expectedPayload},
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
 			// The two TRACE-CONTEXT columns, bound as SQL NULL because this capture runs on a
-			// background context with no active span. That is the common production shape — a CLI
-			// mutation, a worker-initiated rejection, observability disabled — and binding nil
-			// rather than '' is what keeps "no trace was recorded" a single spelling that the
-			// columns' CHECK constraints and any query filtering on them both agree about.
+			// background context with no active span. That is the common production shape — a
+			// CLI mutation, a worker-initiated rejection, observability disabled — and binding
+			// nil rather than '' is what keeps "no trace was recorded" a single spelling that
+			// the columns' CHECK constraints and any query filtering on them both agree about.
 			nil,
 			nil,
 		).
@@ -3009,16 +2653,10 @@ func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 	require.NoError(t, blnk.PublishEvent(context.Background(), event))
 }
 
-// TestPublishEvent_OpensNoTransactionOfItsOwn asserts an absence, and it is a load-bearing
-// one.
+// TestPublishEvent_OpensNoTransactionOfItsOwn asserts an absence, and it is a
+// load-bearing one.
 //
-// The standalone path must issue its insert on the connection pool. If it opened a
-// transaction instead, the event would commit independently of anything the caller was
-// doing, which is the exact failure the outbox exists to prevent — and callers that DO hold
-// a transaction would end up with their event outside it.
-//
-// The stub expects one query and nothing else, so an unexpected Begin fails the statement,
-// surfaces as a returned error and fails this test.
+// The standalone path must issue its insert on the connection pool.
 func TestPublishEvent_OpensNoTransactionOfItsOwn(t *testing.T) {
 	datasource, _, controller := newOutboxSQLDatasource(t)
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
@@ -3050,14 +2688,12 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 			outboxTransactionID,
 			// partition_key: the source balance. This test supplies NO ledger, so the row
 			// carries the payload-derived fallback; every production transaction capture
-			// supplies the ledger and is keyed on that instead. The identifier is the same
-			// one the transaction queue shards on, which is the same SIDE of the transfer
-			// and not the same partition — the two hash different values.
+			// supplies the ledger and is keyed on that instead.
 			outboxSourceBalanceID,
-			// ledger_id: SQL NULL. model.Transaction HAS NO LEDGER FIELD, so there is no
-			// ledger to record — and binding the source balance id here, as the single
-			// combined column used to, put a balance id in a column called ledger_id where
-			// everything downstream read it as a ledger.
+			// ledger_id: SQL NULL. model.Transaction HAS NO LEDGER FIELD, so there is no ledger
+			// to record — and binding the source balance id here, as the single combined column
+			// used to, put a balance id in a column called ledger_id where everything downstream
+			// read it as a ledger.
 			nil,
 			"blnk.transactions",
 			model.SchemaVersionV1,
@@ -3069,10 +2705,10 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
 			// The two TRACE-CONTEXT columns, bound as SQL NULL because this capture runs on a
-			// background context with no active span. That is the common production shape — a CLI
-			// mutation, a worker-initiated rejection, observability disabled — and binding nil
-			// rather than '' is what keeps "no trace was recorded" a single spelling that the
-			// columns' CHECK constraints and any query filtering on them both agree about.
+			// background context with no active span. That is the common production shape — a
+			// CLI mutation, a worker-initiated rejection, observability disabled — and binding
+			// nil rather than '' is what keeps "no trace was recorded" a single spelling that
+			// the columns' CHECK constraints and any query filtering on them both agree about.
 			nil,
 			nil,
 		).
@@ -3089,10 +2725,6 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 
 // TestPublishEvent_ReturnsThePersistenceError asserts the error is RETURNED rather than
 // swallowed, on both paths.
-//
-// Error handling has to match SendWebhook's so that no call site needs adjusting: the
-// producer sites route this error to notification.NotifyError exactly as they routed the
-// webhook enqueue's error. Swallowing it would leave a failed capture invisible.
 func TestPublishEvent_ReturnsThePersistenceError(t *testing.T) {
 	sentinel := errors.New("outbox insert rejected by the database")
 
@@ -3150,12 +2782,12 @@ func TestPublishEvent_ReturnsThePersistenceError(t *testing.T) {
 	})
 
 	t.Run("the failure line correlates by event id and hashes the aggregate", func(t *testing.T) {
-		// This is a FAILURE path a broker outage or a database incident can make
-		// high-volume, and the aggregate id is a ledger, balance, transaction or identity
-		// id — a financial identifier naming whose money the event is about. It is hashed
-		// rather than printed: event_id already identifies the event uniquely, so
-		// correlation loses nothing, and the token still shows that several failures share
-		// one aggregate, which is all the identifier was contributing.
+		// This is a FAILURE path a broker outage or a database incident can make high-volume,
+		// and the aggregate id is a ledger, balance, transaction or identity id — a financial
+		// identifier naming whose money the event is about. It is hashed rather than printed:
+		// event_id already identifies the event uniquely, so correlation loses nothing, and
+		// the token still shows that several failures share one aggregate, which is all the
+		// identifier was contributing.
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
 
@@ -3199,16 +2831,11 @@ func TestPublishEvent_ReturnsThePersistenceError(t *testing.T) {
 	})
 }
 
-// TestPublishEvent_DoesNotPanicWithoutADatasource asserts the two degenerate receivers a
-// real deployment and the existing test suite both produce.
+// TestPublishEvent_DoesNotPanicWithoutADatasource asserts the two degenerate receivers
+// a real deployment and the existing test suite both produce.
 //
 // NewBlnk(nil) is a supported construction — the legacy webhook tests use it — so a nil
-// datasource must never CRASH. It is nonetheless reported as an ERROR rather than swallowed
-// once publishing is configured: at that point every event in the deployment is being
-// dropped permanently and invisibly, and returning nil would tell every caller it had
-// succeeded. A nil receiver must not panic either: these methods are called from goroutines
-// spawned by post-action hooks, where a panic takes down the process instead of surfacing
-// as an error.
+// datasource must never CRASH.
 func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 	event := NewWebhook{Event: "balance.created", Payload: outboxSampleBalance()}
 
@@ -3244,33 +2871,18 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 	})
 
 	t.Run("the datasource really is absent, as NewBlnk(nil) leaves it", func(t *testing.T) {
-		// NewBlnk(nil) — the construction the legacy webhook tests use — is what makes a
-		// nil datasource a supported reality rather than a hypothetical. It is NOT called
-		// here, deliberately: NewBlnk builds a Redis client whose constructor pings the
-		// server and fails if it cannot reach it, and the payload guarantee this file
-		// proves has to hold with no infrastructure at all.
-		//
-		// Nothing is lost by building the struct instead. For this code path the two
-		// constructions are indistinguishable — publishEvent reads exactly two fields, the
-		// cached configuration and the datasource, and NewBlnk(nil) leaves the datasource
-		// nil and the configuration set, which is precisely the shape asserted below.
+		// NewBlnk(nil) — the construction the legacy webhook tests use — is what makes a nil
+		// datasource a supported reality rather than a hypothetical. It is NOT called here,
+		// deliberately: NewBlnk builds a Redis client whose constructor pings the server and
+		// fails if it cannot reach it, and the payload guarantee this file proves has to hold
+		// with no infrastructure at all.
 		blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
 		require.Nil(t, blnk.GetDataSource(),
 			"the instance under test must carry no datasource, exactly as NewBlnk(nil) leaves it")
 
-		// A CONFIGURED PUBLISHER WITH NO DATASOURCE IS AN ERROR, and this is the reverse
-		// of what this test asserted before.
-		//
-		// Reaching this point means publishing IS configured and there is nowhere to
-		// persist to, so EVERY event in such a deployment is dropped — permanently,
-		// invisibly, and while every caller is told it succeeded. A warning made that a
-		// log line nobody reads. Returning the error makes it a failure the caller
-		// reports and, inside a ledger transaction, rolls back over.
-		//
-		// NewBlnk(nil) remains supported: with no brokers configured PrepareEventOutbox
-		// returns the nil-nil no-op long before this branch, so instances that run
-		// without a datasource AND without Kafka are unaffected.
+		// A CONFIGURED PUBLISHER WITH NO DATASOURCE IS AN ERROR, and this is the reverse of
+		// what this test asserted before.
 		var err error
 		require.NotPanics(t, func() { err = blnk.PublishEvent(context.Background(), event) })
 		require.Error(t, err,
@@ -3292,9 +2904,9 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 
 		// A nil receiver must not PANIC — that is the property under test, and it matters
 		// because the post-action hooks call these from goroutines where a panic takes the
-		// process down rather than surfacing as an error. It is reported as an error for
-		// the same reason the nil-datasource case is: publishing is configured and the
-		// event is being dropped.
+		// process down rather than surfacing as an error. It is reported as an error for the
+		// same reason the nil-datasource case is: publishing is configured and the event is
+		// being dropped.
 		var err error
 		require.NotPanics(t, func() { err = blnk.PublishEvent(context.Background(), event) },
 			"a nil receiver must not panic: post-action hooks call this from goroutines")
@@ -3319,11 +2931,6 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // outboxConcurrentWriters and outboxEventsPerWriter size the concurrency test.
-//
-// The shape matters more than the size: several goroutines each publishing several events
-// is exactly how the producers behave, since the post-action hooks in ledger.go,
-// identity.go, balance.go and transaction_execution.go all call into this path from a
-// goroutine they spawn per action.
 const (
 	outboxConcurrentWriters = 32
 	outboxEventsPerWriter   = 8
@@ -3332,10 +2939,7 @@ const (
 // TestPublishEvent_IsSafeWhenCalledConcurrently asserts the entry point is safe to call
 // from many goroutines at once, and that every call still produces a distinct event id.
 //
-// Run under -race this covers the data-race question. The uniqueness assertion covers a
-// subtler failure: an identifier generated from shared mutable state would still be unique
-// single-threaded and would collide only under concurrency, and a collision on event_id is a
-// correctness bug because it is the subscriber idempotency key.
+// Run under -race this covers the data-race question.
 func TestPublishEvent_IsSafeWhenCalledConcurrently(t *testing.T) {
 	datasource := newOutboxSpyDatasource()
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
@@ -3351,9 +2955,8 @@ func TestPublishEvent_IsSafeWhenCalledConcurrently(t *testing.T) {
 
 			for event := 0; event < outboxEventsPerWriter; event++ {
 				transaction := outboxSampleTransaction(StatusApplied)
-				// A distinct source per writer, so the goroutines also exercise
-				// concurrent derivation of DIFFERENT partition keys rather than all
-				// hitting one.
+				// A distinct source per writer, so the goroutines also exercise concurrent
+				// derivation of DIFFERENT partition keys rather than all hitting one.
 				transaction.Source = fmt.Sprintf("bln_outbox_concurrent_%d", writer)
 				transaction.TransactionID = fmt.Sprintf("txn_outbox_concurrent_%d_%d", writer, event)
 
@@ -3392,8 +2995,8 @@ func TestPublishEvent_IsSafeWhenCalledConcurrently(t *testing.T) {
 	assert.Len(t, unique, len(rows), "every concurrently issued event_id must be distinct")
 }
 
-// TestPrepareEventOutbox_IsSafeWhenCalledConcurrently covers pure row construction under
-// concurrency, with no datasource involved at all.
+// TestPrepareEventOutbox_IsSafeWhenCalledConcurrently covers pure row construction
+// under concurrency, with no datasource involved at all.
 //
 // Separating it from the publish test isolates the question: if the publish test failed
 // under -race, this says whether the race is in construction or in persistence.
@@ -3435,7 +3038,8 @@ func TestPrepareEventOutbox_IsSafeWhenCalledConcurrently(t *testing.T) {
 	// function of the event: two writers preparing the same fixture must agree on the id,
 	// and two writers preparing different fixtures must not. Asserting "every row is
 	// distinct" would now be asserting the opposite of the idempotency contract — while
-	// still catching nothing about concurrency, since the derivation reads no shared state.
+	// still catching nothing about concurrency, since the derivation reads no shared
+	// state.
 	byFixture := make(map[string]map[string]struct{}, len(fixtures))
 	for index, row := range rows {
 		require.NotNil(t, row, "row %d must have been built", index)
@@ -3480,17 +3084,10 @@ func countRowsOfType(rows []*model.EventOutbox, eventType string) int {
 // Structural invariant
 // ---------------------------------------------------------------------------
 
-// TestEventOutboxSource_ImportsNoKafkaClient pins the invariant the file under test states
-// about itself: nothing on the producer's path talks to a broker.
+// TestEventOutboxSource_ImportsNoKafkaClient pins the invariant the file under test
+// states about itself: nothing on the producer's path talks to a broker.
 //
-// It matters because the alternative is silently plausible. A producer that published
-// inline would compile, would pass a happy-path test against a running broker, and would
-// then block a ledger write on broker availability — defeating the transactional outbox it
-// exists to provide and coupling the ledger's availability to Kafka's. Only the relay may
-// hold a writer.
-//
-// The path is relative because `go test` runs with the package directory as its working
-// directory, which keeps this assertion self-contained.
+// It matters because the alternative is silently plausible.
 func TestEventOutboxSource_ImportsNoKafkaClient(t *testing.T) {
 	parsed, err := parser.ParseFile(token.NewFileSet(), "event_outbox.go", nil, parser.ImportsOnly)
 	require.NoError(t, err, "event_outbox.go must be parseable to assert its imports")
@@ -3507,10 +3104,8 @@ func TestEventOutboxSource_ImportsNoKafkaClient(t *testing.T) {
 
 // TestEventOutboxTestSource_ImportsNoKafkaClient holds THIS file to the same standard.
 //
-// The payload contract has to be provable with no infrastructure, because that is the only
-// way it stays provable in every environment the suite runs in. A broker dependency here
-// would make the single most important assertion in the event pipeline conditional on a
-// container being up.
+// The payload contract has to be provable with no infrastructure, because that is the
+// only way it stays provable in every environment the suite runs in.
 func TestEventOutboxTestSource_ImportsNoKafkaClient(t *testing.T) {
 	parsed, err := parser.ParseFile(token.NewFileSet(), "event_outbox_test.go", nil, parser.ImportsOnly)
 	require.NoError(t, err, "event_outbox_test.go must be parseable to assert its imports")
@@ -3531,11 +3126,7 @@ func TestEventOutboxTestSource_ImportsNoKafkaClient(t *testing.T) {
 // TestPrepareEventOutbox_LeaksNoConfigurationBetweenTests asserts the harness itself is
 // well behaved.
 //
-// config.ConfigStore is a process-global atomic.Value. Every test above publishes to it, so
-// if the restore were not registered with t.Cleanup, a Kafka-configured state would leak
-// into unrelated tests in this package and cause failures far from their cause. This test
-// publishes a recognisable configuration through a subtest and then asserts the store no
-// longer carries it — which is only true if the cleanup ran.
+// config.ConfigStore is a process-global atomic.Value.
 func TestPrepareEventOutbox_LeaksNoConfigurationBetweenTests(t *testing.T) {
 	const sentinelPrefix = "outbox-leak-sentinel"
 
@@ -3562,17 +3153,7 @@ func TestPrepareEventOutbox_LeaksNoConfigurationBetweenTests(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The size ceiling on the wire — SIZE-01
-//
-// The rest of this file proves what the stored payload IS. These tests prove that the
-// envelope built around it is refused when it cannot be published, which is the other half
-// of the same guarantee: a payload that is faithfully stored but can never leave is not
-// preserved, it is stuck.
-//
-// They live here rather than beside the publisher because event_publisher_test.go belongs to
-// a later checkpoint and is not in this scope, and because the subject is the ENVELOPE — this
-// file's subject — rather than the transport. No case reaches a broker: the size check
-// precedes writer resolution precisely so an oversized message costs nothing.
+// The size ceiling on the wire. The rest of this file proves what the stored payload IS.
 // ---------------------------------------------------------------------------------------
 
 // sizeLimitPublisher builds a real Kafka-backed publisher without contacting a broker.
@@ -3608,22 +3189,12 @@ func sizedLedgerEvent(payloadBytes int) model.LedgerEvent {
 	}
 }
 
-// TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent is the SIZE-01 guard on the wire.
+// TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent is the guard on the wire.
 //
 // Persistence validates the PAYLOAD it is handed, which is the right place to reject a
-// caller's oversized data. What Kafka is asked to accept, though, is the ENVELOPE: the payload
-// plus the five sibling keys, and for a dead-letter copy the whole failure_metadata object as
-// well. So a payload that passed validation can still produce a message over the limit.
+// caller's oversized data.
 //
-// Without a check here that message reached the writer, was rejected by it or by the broker on
-// every attempt, and — because the dead-letter copy is strictly larger — could not be
-// dead-lettered either. The row could reach neither terminal state, so it sat in the table
-// being retried forever: unbounded backlog growth from a single request, with the relay's
-// throughput spent on an event that can never leave.
-//
-// The failure must be PERMANENT. Retrying cannot shrink a message and the broker's answer will
-// not change, so a transient classification would spend the whole retry budget establishing
-// what is already known before reaching the same place.
+// The failure must be PERMANENT.
 func TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -3662,27 +3233,18 @@ func TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent(t *testing.T) {
 		"the operator must be told the limit, not just that one was exceeded")
 }
 
-// TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling is the other side of the boundary.
+// TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling is the other side of the
+// boundary.
 //
-// A ceiling that also rejected ordinary events would be a availability defect dressed as a
-// safety check, so the largest payload that fits must still be accepted. This is asserted by
-// showing the refusal is NOT the reason a publish stops: with no broker reachable the write
-// fails, but on a transport error rather than on the size check.
+// A ceiling that also rejected ordinary events would be a availability defect dressed
+// as a safety check, so the largest payload that fits must still be accepted.
 func TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
 	publisher := sizeLimitPublisher(t)
 
-	// Sized so the whole envelope — the payload plus its five sibling members — lands EXACTLY
-	// on the ceiling, which is the largest message the check accepts.
-	//
-	// The overhead is MEASURED from the canonical serialiser rather than approximated by a
-	// scaffold constant, and measured from THE EVENT UNDER TEST rather than from a similar
-	// one. Both matter: the envelope's member names could change, and the RFC3339 rendering
-	// of the timestamp is variable-length because trailing zeros in the fractional second are
-	// trimmed, so an overhead borrowed from another instant can be several bytes wrong. A
-	// fixture that guessed high would prove only that a comfortably small message is
-	// accepted, which is not the boundary this test exists to hold.
+	// Sized so the whole envelope — the payload plus its five sibling members — lands
+	// EXACTLY on the ceiling, which is the largest message the check accepts.
 	event := sizedLedgerEvent(1024)
 	probe, err := event.CanonicalBytes()
 	require.NoError(t, err, "the probe envelope must serialise before its overhead can be measured")
@@ -3709,12 +3271,12 @@ func TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling(t *testing.T) {
 	}
 }
 
-// TestPublishToTopic_RefusesATopicOutsideTheOwnedNamespace is the VALID-01 guard reached
-// through the publish entry point rather than through writerFor directly.
+// TestPublishToTopic_RefusesATopicOutsideTheOwnedNamespace is the guard reached through
+// the publish entry point rather than through writerFor directly.
 //
-// This is the realistic shape of the attack: the destination arrives on a PublishRequest built
-// from a stored row, so what matters is that the whole path refuses it, not merely that an
-// internal helper would have.
+// This is the realistic shape of the attack: the destination arrives on a
+// PublishRequest built from a stored row, so what matters is that the whole path
+// refuses it, not merely that an internal helper would have.
 func TestPublishToTopic_RefusesATopicOutsideTheOwnedNamespace(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -3740,27 +3302,14 @@ func TestPublishToTopic_RefusesATopicOutsideTheOwnedNamespace(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// COVER-01 / TEST-01: the mock must not hide the event rows it is handed
+// The mock must not hide the event rows it is handed
 // ---------------------------------------------------------------------------
 
-// TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters closes the last half of
-// COVER-01, which was that database/mocks/repo_mocks.go dropped the variadic event rows
-// so no test could see them.
+// TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters closes the last half
+// of the coverage gap this closes: database/mocks/repo_mocks.go dropping the variadic event
+// rows so no test could see them.
 //
-// # Why the mock records rather than forwards, and why that needs a test
-//
-// The obvious repair — adding the variadic to the m.Called argument list — cannot be made.
-// testify matches an expectation on ARGUMENT COUNT, and it does so AT RUN TIME rather than
-// at compile time, so forwarding the rows turns every existing expectation written for five
-// arguments into a "mock: I don't know what to return" panic. There is such an expectation
-// in transaction_benchmark_test.go, which this checkpoint does not own. So the rows are
-// recorded on the mock and read through CapturedEventOutboxes instead.
-//
-// That design decision is exactly what makes this test necessary. A recording accessor
-// nobody calls is indistinguishable from one that does not work: the compiler is satisfied
-// either way, and the whole point of the accessor is that a caller's rows become visible.
-// This asserts the visibility, and it asserts the arity property the design rests on, so
-// that "complete" the forwarding later cannot pass silently.
+// That design decision is exactly what makes this test necessary.
 func TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters(t *testing.T) {
 	transaction := &model.Transaction{TransactionID: "txn_0f6e2c8a", Status: "APPLIED"}
 
@@ -3784,12 +3333,11 @@ func TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters(t *testing.
 	t.Run("the single-transaction writer", func(t *testing.T) {
 		datasource := new(mocks.MockDataSource)
 
-		// FIVE arguments, deliberately: this is the shape every existing expectation in
-		// the repository uses, and it must keep matching while the sixth variadic
-		// parameter is populated. If someone forwards the variadic into m.Called, this
-		// expectation stops matching and the call panics — which is the regression this
-		// arrangement exists to prevent, caught here rather than in an unrelated
-		// benchmark.
+		// FIVE arguments, deliberately: this is the shape every existing expectation in the
+		// repository uses, and it must keep matching while the sixth variadic parameter is
+		// populated. If someone forwards the variadic into m.Called, this expectation stops
+		// matching and the call panics — which is the regression this arrangement exists to
+		// prevent, caught here rather than in an unrelated benchmark.
 		datasource.On("RecordTransactionWithBalancesAndOutbox",
 			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 			Return(transaction, nil)
@@ -3827,8 +3375,8 @@ func TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters(t *testing.
 
 	t.Run("a nil row is not recorded", func(t *testing.T) {
 		// A nil row is what the atomic writers legitimately receive when publishing is
-		// unconfigured, and recording it would put a nil into the slice that every reader
-		// of the accessor would then have to guard against.
+		// unconfigured, and recording it would put a nil into the slice that every reader of
+		// the accessor would then have to guard against.
 		datasource := new(mocks.MockDataSource)
 		datasource.On("RecordTransactionWithBalancesAndOutbox",
 			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
@@ -3899,21 +3447,7 @@ func TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters(t *testing.
 // TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield covers the one option
 // PrepareEventOutbox accepts.
 //
-// # The gap it closes
-//
-// model.Transaction HAS NO LEDGER FIELD — its ledger association is indirect, through the
-// balances it moves value between — so a transaction event stores ledger_id as SQL NULL and
-// is keyed on its source balance. That is honest, but it leaves no way for a consumer, an
-// operator or the daily reconciliation to group a transaction event by ledger, and it means
-// the topic is partitioned by balance rather than by ledger for exactly the event type that
-// dominates the volume.
-//
-// # What the option does, stated as two separate effects
-//
-// It records the ledger AND it becomes the partition key. Both are asserted, because
-// asserting only the column would let a change that stopped affecting the key pass while
-// silently reverting R-6 partitioning, and asserting only the key would let ledger_id go
-// back to NULL.
+// It records the ledger AND it becomes the partition key.
 func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 	event := NewWebhook{Event: "transaction.queued", Payload: outboxSampleTransaction(StatusQueued)}
@@ -3940,9 +3474,9 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 	})
 
 	t.Run("a blank or whitespace-only value is ignored rather than stored", func(t *testing.T) {
-		// A whitespace key hashes to a different partition from an empty one, so storing
-		// it would split one ledger's events across two partitions — the precise failure
-		// the option exists to prevent.
+		// A whitespace key hashes to a different partition from an empty one, so storing it
+		// would split one ledger's events across two partitions — the precise failure the
+		// option exists to prevent.
 		for _, blank := range []string{"", "   ", "\t\n"} {
 			row := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(blank))
 			require.NotNil(t, row)
@@ -3963,8 +3497,8 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 
 	t.Run("it does not override a ledger the payload already carries correctly", func(t *testing.T) {
 		// A balance payload yields its own ledger, and the two agree in every real call.
-		// Asserting the supplied value still wins is what keeps the precedence rule ONE
-		// rule rather than one per payload type.
+		// Asserting the supplied value still wins is what keeps the precedence rule ONE rule
+		// rather than one per payload type.
 		balanceEvent := NewWebhook{Event: "balance.created", Payload: outboxSampleBalance()}
 
 		derived := mustPrepareEventOutbox(t, blnk, balanceEvent)
@@ -3979,9 +3513,9 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 	})
 
 	t.Run("the aggregate id is unaffected", func(t *testing.T) {
-		// aggregate_id answers "what is this event about" and the option answers "where
-		// does it belong". Letting the option move the aggregate would change what a
-		// consumer groups by, which is not what supplying a ledger states.
+		// aggregate_id answers "what is this event about" and the option answers "where does
+		// it belong". Letting the option move the aggregate would change what a consumer
+		// groups by, which is not what supplying a ledger states.
 		without := mustPrepareEventOutbox(t, blnk, event)
 		with := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(outboxLedgerID))
 		require.NotNil(t, without)
@@ -3994,9 +3528,9 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 
 	t.Run("the event id is unaffected, so an opted-in call site stays idempotent", func(t *testing.T) {
 		// The derived id is a function of the mutation identity, the event type and the
-		// schema version. If the ledger entered it, wiring the option at a call site
-		// would change every future event id for events already delivered, and a
-		// subscriber's idempotency store would stop recognising a replayed event.
+		// schema version. If the ledger entered it, wiring the option at a call site would
+		// change every future event id for events already delivered, and a subscriber's
+		// idempotency store would stop recognising a replayed event.
 		without := mustPrepareEventOutbox(t, blnk, event)
 		with := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(outboxLedgerID))
 		require.NotNil(t, without)
@@ -4007,24 +3541,9 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 	})
 }
 
-// TestPrepareTransactionEventOutbox_CapturesTheEventForTheAtomicWriter is the R-2 test for
+// TestPrepareTransactionEventOutbox_CapturesTheEventForTheAtomicWriter is the test for
 // the transaction family: it asserts that the event row exists BEFORE persistence and
 // therefore has something to commit inside.
-//
-// # What it replaces
-//
-// The event used to be captured by postTransactionActions, in a goroutine that runs after
-// the mutation has committed. Every test of that arrangement could only observe that an
-// event eventually appeared, which is true of a pipeline that loses events on any crash,
-// cancellation or insert failure between the commit and the goroutine. The guarantee R-2
-// actually states — the event is in the mutation's own transaction — is a property of WHEN
-// the row is built and WHERE it is passed, so that is what is asserted here.
-//
-// The builder under test is the one persistSingleTransactionExecutionWork calls immediately
-// before it invokes the atomic writer, and it is the ONLY place a transaction event row is
-// built. Its companion test below proves the row it returns actually reaches that writer; the
-// two are only meaningful together, because preparing a row and dropping it loses exactly as
-// many events as post-commit capture did.
 func TestPrepareTransactionEventOutbox_CapturesTheEventForTheAtomicWriter(t *testing.T) {
 	const ledgerID = "ldg_9c1f4a20"
 
@@ -4120,19 +3639,12 @@ func TestPrepareTransactionEventOutbox_CapturesTheEventForTheAtomicWriter(t *tes
 	})
 }
 
-// TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter proves the second
-// half of R-2 for the transaction family: the prepared row actually reaches the writer that
-// commits it.
+// TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter proves the
+// second half of same-transaction capture for the transaction family: the prepared row
+// actually reaches the
+// writer that commits it.
 //
-// Preparing a row and then dropping it on the floor would satisfy every assertion in the
-// test above while losing exactly as many events as post-commit capture did, so the two
-// tests are only meaningful together. The mock records the variadic tail rather than
-// forwarding it into m.Called — see TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters
-// for why — so CapturedEventOutboxes is what the assertion reads.
-//
-// The row is NOT injected. This function prepares it itself, immediately before the write, so
-// the assertion reads what production actually hands the writer rather than what a test handed
-// the function.
+// The row is NOT injected.
 func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_5b0d7e14",
@@ -4151,12 +3663,12 @@ func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *te
 	datasource.On("RecordTransactionWithBalancesAndOutbox",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(transaction, nil)
-	// The persistence path now resolves each balance's monitors BEFORE the write, so that a
-	// threshold alert commits in the same transaction as the movement that crossed it. No
-	// monitor is configured here, so no alert row is produced and this test still asserts
-	// exactly one event row — see
-	// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement for the
-	// case where one is.
+	// The persistence path now resolves each balance's monitors BEFORE the write, so that
+	// a threshold alert commits in the same transaction as the movement that crossed it.
+	// No monitor is configured here, so no alert row is produced and this test still
+	// asserts exactly one event row — see
+	// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement for
+	// the case where one is.
 	datasource.On("GetBalanceMonitors", mock.Anything).Return([]model.BalanceMonitor{}, nil)
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
@@ -4191,31 +3703,20 @@ func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *te
 	datasource.AssertExpectations(t)
 }
 
-// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement is the R-2 test
-// for balance.monitor, and it closes finding F-03's critical case.
+// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement is the
+// test for balance.monitor, and it closes that finding critical case.
 //
-// # The loss window this proves is gone
-//
-// A monitor alert used to be captured AFTER the movement that triggered it had committed: the
-// post-commit hook re-read the balance's monitors, re-evaluated each condition, and inserted a
-// row. The mutation was durable and the alert was not, so a process that died in between left a
-// balance past its threshold with an alert that existed nowhere — and no retry budget can close
-// that window, because the first attempt happens after the commit. The alert row now travels in
-// the same transaction as the balance updates and the transaction row.
-//
-// # What is asserted, and why each part matters
-//
-//   - The alert row REACHES THE WRITER, alongside the transaction event. Preparing it and
-//     dropping it would lose exactly as many alerts as post-commit capture did.
-//   - It is keyed on the LEDGER, not on the monitored balance. model.BalanceMonitor carries no
-//     ledger, so without the explicit option the row would key on the balance and store NULL —
-//     requirement R-6 partitions by ledger id.
-//   - The transaction event is still present and still exactly one. The cardinality invariant
-//     that refuses two mutation-describing rows for one transaction must not have been widened
-//     into one that refuses nothing.
-//   - The covered monitor is REPORTED BACK, because that set is the only thing stopping the
-//     post-commit path from publishing the same alert a second time. A balance.monitor id is a
-//     fresh UUID by design, so no subscriber-side idempotency could collapse a duplicate pair.
+//   - The alert row REACHES THE WRITER, alongside the transaction event.
+//   - It is keyed on the LEDGER, not on the monitored balance. model.BalanceMonitor
+//     carries no ledger, so without the explicit option the row would key on the
+//     balance and store NULL — the requirement partitions by ledger id.
+//   - The transaction event is still present and still exactly one. The cardinality
+//     invariant that refuses two mutation-describing rows for one transaction must not
+//     have been widened into one that refuses nothing.
+//   - The covered monitor is REPORTED BACK, because that set is the only thing stopping
+//     the post-commit path from publishing the same alert a second time. A
+//     balance.monitor id is a fresh UUID by design, so no subscriber-side idempotency
+//     could collapse a duplicate pair.
 func TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_f03a1c77",
@@ -4243,9 +3744,9 @@ func TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMoveme
 		Balance:   big.NewInt(9000),
 	}
 
-	// One monitor, on the SOURCE balance only, whose condition the post-movement value meets.
-	// Scoping it to one balance is deliberate: it proves the captured set names the monitor that
-	// actually fired rather than every monitor the transaction touched.
+	// One monitor, on the SOURCE balance only, whose condition the post-movement value
+	// meets. Scoping it to one balance is deliberate: it proves the captured set names the
+	// monitor that actually fired rather than every monitor the transaction touched.
 	firing := model.BalanceMonitor{
 		MonitorID: "mon_f03a1c77",
 		BalanceID: sourceBalance.BalanceID,
@@ -4316,28 +3817,10 @@ func TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMoveme
 }
 
 // TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeReadRatherThanRefusing
-// is the other half of F-03: the failure direction.
+// is the other half of the failure direction.
 //
-// # Why the movement still commits
-//
-// A monitor lookup that fails must NOT refuse the transaction, and the reason is a scope boundary
-// rather than a preference. This change substitutes a transport; it may not turn an outage of the
-// monitor store into an outage of the ledger. Refusing here would mean a transaction that Blnk
-// has always applied is now rejected because a table used only for threshold alerting could not
-// be read — money movement failing for a notification's sake.
-//
-// # What must therefore be true instead, and it is the whole assertion
-//
-// The failure must not be laundered into "covered". The balance whose monitors could not be read
-// is deliberately LEFT OUT of the capture, so the post-commit check evaluates it exactly as it
-// did before any of this existed: the pre-existing behaviour, with its pre-existing and
-// documented loss window, and not a silently skipped alert. A capture that claimed the balance
-// while having evaluated nothing would be strictly worse than no capture at all — it would
-// suppress the fallback as well.
-//
-// The sibling balance, whose read succeeded, IS covered. Degradation is per balance rather than
-// per transaction, so one unreadable monitor set does not send a whole write back to the
-// post-commit route.
+// A monitor lookup that fails must NOT refuse the transaction, and the reason is a
+// scope boundary rather than a preference.
 func TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeReadRatherThanRefusing(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_f03b2d88",
@@ -4396,21 +3879,15 @@ func TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeRead
 	datasource.AssertExpectations(t)
 }
 
-// TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEvent is the C-3
-// test: a mutation whose event cannot be prepared must not be written at all.
+// TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEvent is the
+// A mutation whose event cannot be prepared must not be written at all.
 //
-// # Why this is the correct answer rather than "log it and carry on"
+// The only way preparation can fail is a payload that will not serialise, which is a
+// producer defect.
 //
-// The only way preparation can fail is a payload that will not serialise, which is a producer
-// defect. Committing the balances anyway leaves money moved with no event anywhere and nothing
-// but a log line to say which event was due — and the transaction row alone cannot be used to
-// reconstruct it, because it does not record which event its status change was meant to
-// announce. Failing before the write leaves the caller's retry safe: nothing was persisted, so
-// there is nothing to reconcile.
-//
-// The unserialisable payload is a channel in the transaction's metadata. encoding/json refuses
-// it, which is exactly the failure the production code can encounter, and it is reached without
-// any database or broker being involved.
+// The unserialisable payload is a channel in the transaction's metadata. encoding/json
+// refuses it, which is exactly the failure the production code can encounter, and it is
+// reached without any database or broker being involved.
 func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEvent(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_c3f1a208",
@@ -4450,22 +3927,11 @@ func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEven
 	datasource.AssertExpectations(t)
 }
 
-// TestRejectTransaction_CommitsTheRejectionEventWithTheRejection is the R-2 test for the
-// rejection path, which is the one transaction-recording caller with an event to capture and
-// no balance movement to enrol it beside.
+// TestRejectTransaction_CommitsTheRejectionEventWithTheRejection is the test for the
+// rejection path, which is the one transaction-recording caller with an event to
+// capture and no balance movement to enrol it beside.
 //
-// It also pins the M-2 half of the same defect: the rejection used to be committed and its
-// event published afterwards by the worker's rejection handler, which then returned the
-// publish error as the asynq task's error — so a failed notification re-ran a rejection that
-// had already happened. Committing the event with the rejection removes the failure mode
-// rather than handling it.
-//
-// AND IT PINS THE ORDERING DOMAIN. The rejection event must be keyed on the LEDGER, like every
-// other event in the same transaction's lifecycle. It used to key on the source balance, because
-// this call site has no balances loaded and simply did not look one up — and a call site choosing
-// a different ordering domain from its siblings is an ordering defect rather than a graceful
-// fallback: one transaction's queueing would land on its ledger's partition and its rejection on
-// its source balance's, so a subscriber could observe the rejection first.
+// AND IT PINS THE ORDERING DOMAIN.
 func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_2e8b3f70",
@@ -4482,21 +3948,23 @@ func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T
 	datasource := new(mocks.MockDataSource)
 	datasource.On("RecordTransaction", mock.Anything, mock.Anything).Return(transaction, nil)
 	// The one lookup the ledger resolution makes. It is the SOURCE balance, matching
-	// transactionLedgerID in transaction_execution.go so the two producers of one transaction's
-	// events cannot disagree about which balance names the ledger.
+	// transactionLedgerID in transaction_execution.go so the two producers of one
+	// transaction's events cannot disagree about which balance names the ledger.
 	datasource.On("GetBalanceByIDLite", transaction.Source).Return(&model.Balance{
 		BalanceID: transaction.Source,
 		LedgerID:  rejectionLedgerID,
 	}, nil)
 
-	// A real Blnk rather than the bare struct newOutboxBlnk builds: RejectTransaction runs the
-	// post-commit actions, which index through the queue, so the instance needs a queue and a
-	// Redis to reach. miniredis is what the legacy webhook tests already use for this.
+	// A real Blnk rather than the bare struct newOutboxBlnk builds: RejectTransaction runs
+	// the post-commit actions, which index through the queue, so the instance needs a
+	// queue and a Redis to reach. miniredis is what the legacy webhook tests already use
+	// for this.
 	redisServer := miniredis.RunT(t)
 	cnf := outboxPublishingConfiguration()
-	// NewBlnk constructs the real Kafka publisher, which refuses to dial an unencrypted broker
-	// unless a deployment says so in writing. This test never contacts a broker — capture only
-	// writes an outbox row — so the acknowledgement is what lets the publisher be constructed.
+	// NewBlnk constructs the real Kafka publisher, which refuses to dial an unencrypted
+	// broker unless a deployment says so in writing. This test never contacts a broker —
+	// capture only writes an outbox row — so the acknowledgement is what lets the
+	// publisher be constructed.
 	cnf.Kafka.InsecureLocalDev = true
 	cnf.Redis = config.RedisConfig{Dns: redisServer.Addr()}
 	cnf.Queue = config.QueueConfig{WebhookQueue: "webhook_queue", IndexQueue: "index_queue", NumberOfQueues: 1}
@@ -4529,16 +3997,8 @@ func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T
 	datasource.AssertExpectations(t)
 }
 
-// TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved is the other half of the
-// ledger resolution, and the more important half.
-//
-// The lookup runs on the path that records a REJECTION, and a transaction naming a balance that
-// does not exist is one of the ordinary reasons a transaction is rejected in the first place — so
-// the lookup failing is a routine consequence of the very condition being recorded. It must
-// therefore be BEST EFFORT in the strongest sense: the rejection is still persisted, its event is
-// still captured, and the key falls back to the documented payload-derived chain. A rejection that
-// went unrecorded because a balance lookup failed would be strictly worse than a rejection event
-// on a less useful partition.
+// TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved is the other half of
+// the ledger resolution, and the more important half.
 func TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_no_ledger_5a1c",
@@ -4587,35 +4047,25 @@ func TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved(t *testing.
 	datasource.AssertExpectations(t)
 }
 
-// TestEventOutboxSource_HoldsTheRelocatedPayloadContract is the mirror of
-// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary, for the other symbol the
-// sunset had to rescue.
+// TestEventOutboxSource_HoldsTheRelocatedPayloadContract pins WHERE NewWebhook is
+// declared, which no behavioural test can express: the payload behaviour is covered
+// exhaustively above, but the declaration must not migrate back into webhooks.go, the
+// file the sunset deletes. Several non-test files depend on this type, so a declaration
+// inside the deleted transport would take the payload contract down with it — and the
+// terminal release is performed weeks later, by someone reading a checklist rather than
+// this file.
 //
-// # Why a source-level test rather than a behavioural one
+// The invariant is asserted in both directions:
 //
-// The behaviour of NewWebhook is covered exhaustively above: every payload assertion in this
-// file marshals it and compares bytes. What no behavioural test can express is WHERE it is
-// declared — and that is the property at risk, because it used to be declared in webhooks.go,
-// the file the sunset deletes. STEP 1 of the procedure at the foot of that file required
-// moving it out FIRST, and it has been moved here.
-//
-// The risk the previous arrangement carried was not subtle: twelve surviving non-test files
-// depend on this type, so deleting webhooks.go with the struct still inside it would have
-// removed the payload contract along with the transport — and the terminal release is by
-// design performed weeks later, by someone reading a checklist rather than this file.
-//
-// # The invariant, asserted in both directions
-//
-//   - It IS declared in event_outbox.go, exactly once. A revert or a bad merge that dropped
-//     the moved declaration would otherwise surface only as a build failure elsewhere.
-//   - It is NOT declared in webhooks.go. A relocation that ADDED without REMOVING is a
-//     duplicate declaration in package blnk and does not compile, so this is the assertion
-//     that fails if someone restores the old declaration.
-//   - The JSON tags are still `event` and `data`. They are the bytes every subscriber parses,
-//     on either transport, and a rename here is a silent break of every parser written
-//     against the HTTP era. Asserting them at the source level catches a rename that a
-//     round-trip test would not, because a round trip through the changed struct agrees with
-//     itself.
+//   - It IS declared in event_outbox.go, exactly once. A revert or a bad merge that
+//     dropped the declaration would otherwise surface only as a build failure
+//     elsewhere.
+//   - It is NOT declared in webhooks.go. Two declarations in package blnk do not
+//     compile, so this is the assertion that fails if someone restores the old
+//     declaration.
+//   - The JSON tags are still `event` and `data`. They are the bytes every subscriber
+//     parses, on either transport, and a rename here is a silent break of every parser
+//     written against the HTTP era.
 func TestEventOutboxSource_HoldsTheRelocatedPayloadContract(t *testing.T) {
 	path := filepath.Join(moduleRootDir(t), "event_outbox.go")
 	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ParseComments)
@@ -4644,7 +4094,7 @@ func TestEventOutboxSource_HoldsTheRelocatedPayloadContract(t *testing.T) {
 	}
 
 	require.Equal(t, 1, declarations,
-		"NewWebhook must be declared exactly once in event_outbox.go: it was relocated here from webhooks.go ahead of that file's deletion, and its marshaled form IS the payload every LedgerEvent carries")
+		"NewWebhook must be declared exactly once in event_outbox.go: its marshaled form IS the payload every LedgerEvent carries, so it must outlive the HTTP transport")
 	require.NotNil(t, fields, "NewWebhook must still be a struct type")
 
 	assert.NotContains(t, readRepoFile(t, "webhooks.go"), "type NewWebhook struct",

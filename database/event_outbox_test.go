@@ -16,48 +16,28 @@ limitations under the License.
 
 // event_outbox_test.go is the repository test suite for blnk.event_outbox.
 //
-// # Why this file is structured in two tiers
-//
-// The suite deliberately runs at two levels, because each proves something the
-// other physically cannot:
+// The suite deliberately runs at two levels, because each proves something the other
+// physically cannot:
 //
 //   - TIER 1 — go-sqlmock. Deterministic assertions about query SHAPE, argument
 //     binding, the mark transitions, error mapping, and — most importantly —
-//     transaction participation. It runs everywhere with no infrastructure, so it
-//     is what guards the invariants on every developer machine and in CI.
-//   - TIER 2 — a real PostgreSQL instance, every test suffixed _RealDB. FOR UPDATE
-//     SKIP LOCKED, lease expiry and FIFO ordering under concurrent claimers have no
-//     meaning at all under a mock: sqlmock replays scripted expectations and has no
-//     locking semantics, no planner and no clock. These tests skip cleanly through
-//     openRealTestDB when no database is reachable, so the default suite stays
-//     green without infrastructure.
+//     transaction participation.
+//   - TIER 2 — a real PostgreSQL instance, every test suffixed _RealDB.
 //
-// # The invariants this file exists to defend
+// Four of them would survive every naive happy-path test while being completely broken,
+// which is precisely why each gets an explicit, commented assertion:
 //
-// Four of them would survive every naive happy-path test while being completely
-// broken, which is precisely why each gets an explicit, commented assertion:
-//
-//  1. The event row is inserted INSIDE the caller's ledger transaction. Move the
-//     insert below tx.Commit() and every ordering test, every count test and every
-//     round-trip test still passes — while the transactional-outbox guarantee is
-//     gone. TestInsertEventOutboxInTx_ParticipatesInCallerTransaction and its
-//     _RealDB counterpart are the only things that catch it.
-//  2. The claim orders by occurred_at, NOT created_at. The neighbouring lineage
-//     claim orders by created_at, so a copy-paste "fix" in that direction is the
-//     single most likely regression here, and it would leave the whole suite green
-//     apart from TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB.
-//  3. FOR UPDATE SKIP LOCKED is still in the claim query. Without it concurrent
-//     relay instances block each other or claim the same row twice.
+//  1. The event row is inserted INSIDE the caller's ledger transaction.
+//  2. The claim orders by occurred_at, NOT created_at. The neighbouring lineage claim
+//     orders by created_at, so a copy-paste "fix" in that direction is the single most
+//     likely regression here, and it would leave the whole suite green apart from
+//     TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB.
+//  3. FOR UPDATE SKIP LOCKED is still in the claim query. Without it concurrent relay
+//     instances block each other or claim the same row twice.
 //  4. Payload bytes are bound through untransformed. A re-marshal or a
 //     map[string]interface{} round trip inside the repository would break the
 //     dual-delivery and replay guarantees, and a test comparing UNMARSHALLED values
 //     would not notice, because key order is exactly what a re-marshal changes.
-//
-// # One note on payload byte equality
-//
-// The body is stored twice: payload as JSONB, which PostgreSQL normalises, and
-// payload_raw as BYTEA, which returns the producer's exact bytes. event_outbox.go
-// documents the split at length. Reads project payload_raw.
 //
 // The consequence for this file is a hard rule, and both tiers assert the SAME thing:
 //
@@ -65,9 +45,7 @@ limitations under the License.
 //     database has touched it — the only place the repository itself could corrupt the
 //     bytes.
 //   - TIER 2 asserts BYTE identity of the value READ BACK, because payload_raw returns
-//     what was written. Asserting mere JSON equivalence here would pass just as well
-//     against a projection that had gone back to the JSONB column, which is exactly the
-//     regression the second column exists to prevent.
+//     what was written.
 package database
 
 import (
@@ -107,48 +85,31 @@ import (
 // testSettlementLease is the exclusive window the repository tests hand to the terminal
 // transitions as their settlement lease.
 //
-// It matches defaultEventRelayLockDuration, which is what the relay actually passes, so these
-// tests exercise the plumbed value rather than the zero-value fallback. A test that needs the
-// lease to have EXPIRED manipulates locked_until directly instead of shortening this, because
-// the point of the lease is that it is held for a duration a live worker plausibly needs.
+// It matches defaultEventRelayLockDuration, which is what the relay actually passes, so
+// these tests exercise the plumbed value rather than the zero-value fallback.
 const testSettlementLease = 30 * time.Second
 
 // ---------------------------------------------------------------------------
 // Shared scaffolding
-//
-// Every helper below is named so it cannot collide with the identifiers this
-// package's other test files already declare — openRealTestDB, eqFilter,
-// mockCache, newMockCache, quiesceOutbox and newOutboxEntry are all defined
-// elsewhere in package database and are reused, never redeclared.
 // ---------------------------------------------------------------------------
 
-// testDeadLetterHandoffLease is the lease every terminal transition in these tests holds
-// the row under while its dead-letter write is owed.
-//
-// It is deliberately LONGER than any single test spends between the terminal transition and
-// the assertion that follows it, because a lease that lapsed mid-test would let
-// ClaimFailedEventOutboxForDeadLetter reclaim the row and the assertion would then be
-// measuring the repair pass rather than the transition under test.
-//
-// It is also deliberately not the production default: passing the default here would let a
-// caller that forgot to plumb its lock duration through pass zero and still see the correct
-// value applied by normalizeDeadLetterHandoffLease, so the tests could not tell a supplied
-// lease from a normalised one. A distinct value makes the argument observable.
+// testDeadLetterHandoffLease is the lease every terminal transition in these tests
+// holds the row under while its dead-letter write is owed.
 const testDeadLetterHandoffLease = 45 * time.Second
 
-// storeSubscriberInternalTopicAccess installs a configuration declaring — or withholding —
-// subscriber access to the internal category topic, and restores the previous one on cleanup.
+// storeSubscriberInternalTopicAccess installs a configuration declaring — or
+// withholding — subscriber access to the internal category topic, and restores the
+// previous one on cleanup.
 //
-// It exists because the persistence boundary's allowlist is a FUNCTION of that declaration,
-// read from config.Fetch rather than taken as an argument (see
-// subscriberInternalTopicAccessDeclared for why), so a test that could not set it could only
-// ever assert one of the two states.
+// It exists because the persistence boundary's allowlist is a FUNCTION of that
+// declaration, read from config.Fetch rather than taken as an argument (see
+// subscriberInternalTopicAccessDeclared for why), so a test that could not set it could
+// only ever assert one of the two states.
 //
-// THE PREVIOUS VALUE IS PUT BACK. config.ConfigStore is process-wide, and this package's
-// real-database tests deliberately install nothing into it; a helper that left a fixture behind
-// would hand every later test in the package a configuration it never asked for. The prefix and
-// broker fields are carried over from whatever was already stored so that only the one field
-// under test changes.
+// THE PREVIOUS VALUE IS PUT BACK. config.ConfigStore is process-wide, and this
+// package's real-database tests deliberately install nothing into it; a helper that
+// left a fixture behind would hand every later test in the package a configuration it
+// never asked for.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and Cleanup.
@@ -160,8 +121,8 @@ func storeSubscriberInternalTopicAccess(t *testing.T, declared bool) {
 	t.Cleanup(func() {
 		if previous == nil {
 			// Nothing was installed, so nothing may be left installed. A zero-value
-			// Configuration is not "no configuration" — it answers every lookup with a
-			// default the test never chose.
+			// Configuration is not "no configuration" — it answers every lookup with a default
+			// the test never chose.
 			config.ConfigStore = atomic.Value{}
 
 			return
@@ -180,24 +141,14 @@ func storeSubscriberInternalTopicAccess(t *testing.T, declared bool) {
 
 // requireAPIError asserts that err is an apierror.APIError carrying the expected code.
 //
-// It deliberately returns NOTHING. An earlier version handed the decoded APIError back
-// "in case a caller wants to assert on the message", which no caller ever did — and
-// because apierror.APIError satisfies the error interface, every call site then looked to
-// errcheck like a discarded error return. Dropping the result removes that noise at its
-// root and makes the contract honest: this is an assertion, not a getter.
+// It deliberately returns NOTHING.
 //
 // The assertion goes through errors.As and the typed Code rather than through a
-// message-string comparison, for two reasons. A message comparison passes for the
-// wrong reason the moment two different failures happen to share wording, and it
-// breaks on a purely cosmetic rewording that changes no behaviour. The Code is the
-// contract the API layer actually maps to an HTTP status.
+// message-string comparison, for two reasons.
 //
-// errors.As rather than a bare type assertion, because two callers in
-// transaction.go wrap the repository's error with fmt.Errorf("...: %w", err); a
-// type assertion would fail there for a reason that has nothing to do with the
-// behaviour under test. Note that apierror.APIError is a VALUE type with a value
-// receiver on Error(), so the target is &apierror.APIError{} and never a
-// **APIError.
+// errors.As rather than a bare type assertion, because two callers in transaction.go
+// wrap the repository's error with fmt.Errorf("...: %w", err); a type assertion would
+// fail there for a reason that has nothing to do with the behaviour under test.
 func requireAPIError(t *testing.T, err error, want apierror.ErrorCode) {
 	t.Helper()
 	require.Error(t, err, "expected an error carrying apierror code %s", want)
@@ -208,18 +159,12 @@ func requireAPIError(t *testing.T, err error, want apierror.ErrorCode) {
 	assert.Equal(t, want, apiErr.Code, "unexpected apierror code (message was %q)", apiErr.Message)
 }
 
-// errorDetailText renders an apierror's Details so a test can assert on the diagnostic the
-// caller receives, not only on the code and message.
-//
-// APIError.Error() formats "CODE: message" and deliberately omits Details, so a marker phrase
-// carried in the wrapped cause — the way subscriberFenceLost carries the one blnk's
-// subscriberFenceWasLost matches on — is invisible to a plain err.Error() assertion. A test that
-// only checked the message would pass whether or not the marker survived, which is the opposite
-// of what it is for.
+// errorDetailText renders an apierror's Details so a test can assert on the diagnostic
+// the caller receives, not only on the code and message.
 //
 // Parameters:
-//   - err error: the error to inspect. Anything that is not an APIError, and any APIError with
-//     no details, renders as the empty string.
+//   - err error: the error to inspect. Anything that is not an APIError, and any
+//     APIError with no details, renders as the empty string.
 //
 // Returns:
 //   - string: the rendered details.
@@ -236,13 +181,8 @@ func errorDetailText(err error) string {
 	return fmt.Sprint(apiErr.Details)
 }
 
-// capturedArg is a sqlmock.Argument that records the value bound in its position
-// and then matches unconditionally.
-//
-// It exists because sqlmock's WithArgs compares with reflect.DeepEqual and reports
-// only "argument N does not match", which for a JSON payload or a timestamp is
-// close to useless. Capturing the value lets the assertion live in the test body,
-// where it can produce a diff that names the actual bytes.
+// capturedArg is a sqlmock.Argument that records the value bound in its position and
+// then matches unconditionally.
 type capturedArg struct {
 	into *driver.Value
 }
@@ -259,21 +199,9 @@ func (c capturedArg) Match(v driver.Value) bool {
 	return true
 }
 
-// newCapturingSQLMock returns a sqlmock whose query matcher RECORDS the exact SQL
-// text of every statement the code under test issues, in order, and then matches
+// newCapturingSQLMock returns a sqlmock whose query matcher RECORDS the exact SQL text
+// of every statement the code under test issues, in order, and then matches
 // unconditionally.
-//
-// This is what makes the convention-enforcement assertions possible. sqlmock's
-// default matcher treats the expected string as a regular expression and tells you
-// only whether it matched, so asserting "the claim query still contains FOR UPDATE
-// SKIP LOCKED" through it would mean encoding the property as a regex and reading a
-// match failure as evidence — indirect, and hostile to debug. Capturing the literal
-// text lets the test assert on the statement the database would really have
-// received and print it verbatim when the assertion fails.
-//
-// Matching unconditionally is safe: sqlmock still enforces expectation ORDER, still
-// distinguishes a Query from an Exec from a Begin, and still compares bound
-// arguments, so every other guarantee of the mock is intact.
 func newCapturingSQLMock(t *testing.T) (*sql.DB, sqlmock.Sqlmock, *[]string) {
 	t.Helper()
 
@@ -306,11 +234,7 @@ func newSQLMock(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 // eventOutboxProjectedColumns derives the projected column names FROM
 // eventOutboxColumns rather than restating them.
 //
-// Deriving them is the point. A column added to the projection but not to
-// scanEventOutbox is a scan-order bug no compiler catches, and a hand-maintained
-// duplicate of the list here would hide exactly that: the mocked rows would keep
-// agreeing with the test's copy while disagreeing with the real query. Reading the
-// constant means the mock's row shape is always the query's row shape.
+// Deriving them is the point.
 func eventOutboxProjectedColumns() []string {
 	raw := strings.Split(eventOutboxColumns, ",")
 	columns := make([]string, 0, len(raw))
@@ -322,14 +246,8 @@ func eventOutboxProjectedColumns() []string {
 	return columns
 }
 
-// eventOutboxRow renders one model.EventOutbox as the driver values a real
-// projection of eventOutboxColumns would produce, in that exact order.
-//
-// The nullable columns are rendered as SQL NULL when their Go zero value means
-// "unset", which is what lets a single builder drive both the fully-populated and
-// the all-NULL scan tests. Integers are rendered as int64 and the two JSONB columns
-// as []byte because that is what a real driver hands back; using a Go int or a
-// string here would let a scan pass under the mock that fails against PostgreSQL.
+// eventOutboxRow renders one model.EventOutbox as the driver values a real projection
+// of eventOutboxColumns would produce, in that exact order.
 func eventOutboxRow(e model.EventOutbox) []driver.Value {
 	nullTime := func(ts *time.Time) driver.Value {
 		if ts == nil {
@@ -355,18 +273,18 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		e.EventType,
 		e.AggregateID,
 		e.PartitionKey,
-		// ledger_id is NULLABLE and NULL is the documented "this event has no ledger"
-		// value, so an empty Go string is rendered as SQL NULL rather than as ''. The
-		// column's own CHECK constraint refuses '', so rendering it would exercise a
-		// row PostgreSQL would never store.
+		// ledger_id is NULLABLE and NULL is the documented "this event has no ledger" value,
+		// so an empty Go string is rendered as SQL NULL rather than as ''. The column's own
+		// CHECK constraint refuses '', so rendering it would exercise a row PostgreSQL would
+		// never store.
 		nullText(e.LedgerID),
 		e.Topic,
 		int64(e.SchemaVersion),
 		[]byte(e.Payload),
 		// event_raw is NOT NULL on the table, so it is rendered as plain bytes. A fixture
-		// that rendered NULL here would exercise a row PostgreSQL refuses, and one that
-		// left it empty would make the scanned row fall back to composing its envelope
-		// instead of reading the stored one.
+		// that rendered NULL here would exercise a row PostgreSQL refuses, and one that left
+		// it empty would make the scanned row fall back to composing its envelope instead of
+		// reading the stored one.
 		e.EventRaw,
 		e.OccurredAt,
 		e.Status,
@@ -389,16 +307,11 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		// this row is not done". SUNSET: this column goes with the legacy leg.
 		nullTime(e.KafkaDispatchedAt),
 		int64(e.WebhookAttempts),
-		// The BROKER COORDINATE is rendered all-or-nothing, mirroring the CHECK
-		// constraint that refuses a partial triple on the table. All three NULL means
-		// "no write to this row has been acknowledged yet" — the state the audit counts
-		// as unconfirmed — so a fixture that left, say, kafka_topic populated while the
-		// offset was NULL would exercise a row PostgreSQL would never store.
-		//
-		// The partition and offset are rendered as int64 because that is what a real
-		// driver hands back for INTEGER and BIGINT; the scanner reads them through
-		// sql.NullInt64 and sql.NullInt32-free int64 destinations, so a Go int here
-		// would let a scan pass under the mock that fails against PostgreSQL.
+		// The BROKER COORDINATE is rendered all-or-nothing, mirroring the CHECK constraint
+		// that refuses a partial triple on the table. All three NULL means "no write to this
+		// row has been acknowledged yet" — the state the audit counts as unconfirmed — so a
+		// fixture that left, say, kafka_topic populated while the offset was NULL would
+		// exercise a row PostgreSQL would never store.
 		nullText(e.KafkaTopic),
 		nullInt64(func() *int64 {
 			if e.KafkaPartition == nil {
@@ -422,12 +335,6 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 
 // nullInt64 renders an optional integer as the driver value a nullable INTEGER or
 // BIGINT column produces: SQL NULL when absent, an int64 when present.
-//
-// Absence has to be distinguishable from zero here, which is exactly why the model
-// carries pointers: partition 0 and offset 0 are both REAL broker coordinates — the
-// first message on the first partition of a fresh topic has precisely that record —
-// so rendering an absent value as 0 would make the audit count a row as confirmed
-// that the broker never acknowledged.
 func nullInt64(v *int64) driver.Value {
 	if v == nil {
 		return nil
@@ -435,12 +342,8 @@ func nullInt64(v *int64) driver.Value {
 	return *v
 }
 
-// indexOfProjectedColumn resolves a column's POSITION in the real projection, so a
-// test that needs to corrupt one cell can address it by name rather than by counting.
-//
-// Counting by hand is what makes such a test rot: it silently addresses a different
-// column the moment the projection changes, and the test then passes for the wrong
-// reason.
+// indexOfProjectedColumn resolves a column's POSITION in the real projection, so a test
+// that needs to corrupt one cell can address it by name rather than by counting.
 func indexOfProjectedColumn(t *testing.T, name string) int {
 	t.Helper()
 
@@ -470,12 +373,6 @@ func eventOutboxInsertColumnNames() []string {
 // insertArgMatchers builds the positional argument matchers for one inserted row —
 // exactly eventOutboxInsertValueCount of them — capturing the value bound to the named
 // column and accepting anything elsewhere.
-//
-// It is derived from eventOutboxInsertColumns rather than written out, and that is the
-// point: a hand-written list of AnyArg() matchers has to be re-counted by every author
-// who adds a column, and the failure mode when they forget is an unhelpful
-// "arguments do not match" a long way from the column that changed. Addressing the
-// value by name means these tests keep asserting the same thing as the schema grows.
 func insertArgMatchers(t *testing.T, column string, into *driver.Value) []driver.Value {
 	t.Helper()
 
@@ -509,11 +406,8 @@ func newEventOutboxRows(entries ...model.EventOutbox) *sqlmock.Rows {
 }
 
 // deadLetterInventoryProjectedColumns derives the NARROW inventory column list from
-// deadLetterInventoryColumns, for the same reason eventOutboxProjectedColumns derives the wide
-// one: a hand-kept copy would keep agreeing with itself while the query moved.
-//
-// The last entry is an expression with an alias — octet_length(payload_raw) AS payload_bytes —
-// so the alias is taken as the column name, which is what a driver reports for it.
+// deadLetterInventoryColumns, for the same reason eventOutboxProjectedColumns derives
+// the wide one: a hand-kept copy would keep agreeing with itself while the query moved.
 func deadLetterInventoryProjectedColumns() []string {
 	raw := strings.Split(deadLetterInventoryColumns, ",")
 	columns := make([]string, 0, len(raw))
@@ -531,12 +425,8 @@ func deadLetterInventoryProjectedColumns() []string {
 	return columns
 }
 
-// deadLetterInventoryRow renders one entry as the driver values the narrow projection produces,
-// in that exact order.
-//
-// Nullable columns render as SQL NULL when their Go zero value means "unset", and payload_bytes
-// renders as int64 because octet_length returns an integer PostgreSQL hands back as one — a Go
-// int here would let a scan pass under the mock that fails against the real driver.
+// deadLetterInventoryRow renders one entry as the driver values the narrow projection
+// produces, in that exact order.
 func deadLetterInventoryRow(e model.DeadLetterInventoryEntry) []driver.Value {
 	nullTime := func(ts *time.Time) driver.Value {
 		if ts == nil {
@@ -590,7 +480,7 @@ func newDeadLetterInventoryRows(entries ...model.DeadLetterInventoryEntry) *sqlm
 }
 
 // deadLetterInventoryEntryOf projects a stored row the way the narrow statement projects it:
-// every column the inventory reads, the body's SIZE, and not the body (PERF-P06).
+// every column the inventory reads, the body's SIZE, and not the body.
 func deadLetterInventoryEntryOf(e model.EventOutbox) model.DeadLetterInventoryEntry {
 	return model.DeadLetterInventoryEntry{
 		ID:               e.ID,
@@ -615,9 +505,9 @@ func deadLetterInventoryEntryOf(e model.EventOutbox) model.DeadLetterInventoryEn
 
 // deadLetterEventIDsOf projects the event ids out of an inventory page.
 //
-// Membership over a projection is asserted through this helper and assert.Contains rather than
-// through a bespoke containsDeadLetteredEventID predicate: one idiom, and a failure names the
-// ids that WERE found instead of reporting a bare false.
+// Membership over a projection is asserted through this helper and assert.Contains
+// rather than through a bespoke containsDeadLetteredEventID predicate: one idiom, and a
+// failure names the ids that WERE found instead of reporting a bare false.
 func deadLetterEventIDsOf(page model.DeadLetterInventoryPage) []string {
 	ids := make([]string, 0, len(page.Entries))
 	for _, entry := range page.Entries {
@@ -628,11 +518,6 @@ func deadLetterEventIDsOf(page model.DeadLetterInventoryPage) []string {
 }
 
 // walkDeadLetterInventory pages the whole inventory by CURSOR and returns every entry.
-//
-// A cursor walk rather than an offset one (PERF-P08), and it is what a real-database test has
-// to do now: a shared database holds other runs' dead-lettered rows, so this run's fixtures are
-// not guaranteed to be on page one. maxPages bounds it so a runaway walk fails the test rather
-// than the suite.
 func walkDeadLetterInventory(
 	t *testing.T,
 	ds Datasource,
@@ -670,14 +555,7 @@ func walkDeadLetterInventory(
 // dbTimestamp truncates an instant to the resolution PostgreSQL actually stores.
 //
 // TIMESTAMP WITH TIME ZONE holds MICROSECONDS, while Go's time.Now() carries
-// nanoseconds. A fixture stamped with nanosecond precision therefore comes back from
-// the database rounded, and an equality assertion against the pre-insert value fails
-// by a few hundred nanoseconds — a difference that says nothing about the code and
-// everything about the column type.
-//
-// Truncating at the fixture rather than loosening the assertion is the right fix,
-// because occurred_at equality genuinely matters: the FIFO claim orders by it, and a
-// tolerance-based comparison would also accept a value the database had mangled.
+// nanoseconds.
 func dbTimestamp(ts time.Time) time.Time {
 	return ts.UTC().Truncate(time.Microsecond)
 }
@@ -685,35 +563,22 @@ func dbTimestamp(ts time.Time) time.Time {
 // newEventOutboxFixture builds a valid, fully-populated entry ready to insert.
 //
 // markerPrefix is carried in aggregate_id, partition_key and ledger_id so that the
-// real-database tier can find, quiesce and retire exactly its own fixtures in a
-// shared database. The payload is deliberately shaped like the legacy webhook body
-// — the two-key {"event": ..., "data": ...} object that requirement R-2 preserves
-// verbatim — rather than an arbitrary JSON document, so the tests exercise the real
-// thing.
+// real-database tier can find, quiesce and retire exactly its own fixtures in a shared
+// database.
 //
 // event_id is a BARE canonical UUID and carries no marker, because the persistence
-// layer now requires canonical UUID form: event_id is the subscriber's idempotency
-// key, and two spellings of one UUID are two distinct keys to a consumer
-// deduplicating on the string. The fixtures find themselves by aggregate_id instead.
+// layer now requires canonical UUID form: event_id is the subscriber's idempotency key,
+// and two spellings of one UUID are two distinct keys to a consumer deduplicating on
+// the string. The fixtures find themselves by aggregate_id instead.
 func newEventOutboxFixture(markerPrefix string) *model.EventOutbox {
 	return &model.EventOutbox{
 		EventID:     uuid.NewString(),
 		EventType:   "transaction.applied",
 		AggregateID: markerPrefix + "agg",
 		// UNIQUE PER FIXTURE, deliberately, AND IN BOTH COLUMNS. At most one row per
-		// EFFECTIVE key is claimable at any instant — that is what preserves
-		// per-aggregate ordering — so fixtures sharing a key would drain one at a time
-		// and every test that claims a batch would see a single row.
-		//
-		// The effective key is the LEDGER wherever a row has one and the partition key
-		// only where it does not (model.EffectivePartitionKey, rendered as SQL by
-		// eventOutboxEffectiveKeySQL). So a unique partition_key over a SHARED ledger —
-		// which is what this fixture used to build — produces rows that are independent
-		// on paper and one aggregate in fact. Every real-database test that claims a
-		// batch of them then saw exactly one row.
-		//
-		// Tests that are ABOUT same-key behaviour call shareEventOutboxKey, which sets
-		// both columns; every other test wants independent rows and gets them here.
+		// EFFECTIVE key is claimable at any instant — that is what preserves per-aggregate
+		// ordering — so fixtures sharing a key would drain one at a time and every test that
+		// claims a batch would see a single row.
 		PartitionKey:  markerPrefix + "key-" + uuid.NewString(),
 		LedgerID:      markerPrefix + "ldg-" + uuid.NewString(),
 		Topic:         "blnk.transactions",
@@ -725,22 +590,16 @@ func newEventOutboxFixture(markerPrefix string) *model.EventOutbox {
 	}
 }
 
-// shareEventOutboxKey makes a fixture publish under a given Kafka message key, which means
-// setting BOTH key columns.
+// shareEventOutboxKey makes a fixture publish under a given Kafka message key, which
+// means setting BOTH key columns.
 //
-// A test asserting same-key behaviour is asserting something about the key the PUBLISHER uses,
-// and that key is the EFFECTIVE one: the ledger wherever the row has one, the stored partition
-// key only where it does not. Setting partition_key alone therefore does not make two rows share
-// a key at all — their distinct ledgers still separate them — and the assertion would be made
-// about a condition the fixtures never created. Setting the ledger alone would work today and
-// would stop working the moment a fixture stopped carrying one.
-//
-// Both, so the fixture states the intent unambiguously and holds under either resolution.
+// Both, so the fixture states the intent unambiguously and holds under either
+// resolution.
 //
 // Parameters:
 //   - entry *model.EventOutbox: the fixture to re-key.
-//   - key string: the key both columns take. Non-blank, because partition_key has a not-blank
-//     CHECK and a blank ledger falls through rather than grouping.
+//   - key string: the key both columns take. Non-blank, because partition_key has a
+//     not-blank CHECK and a blank ledger falls through rather than grouping.
 func shareEventOutboxKey(entry *model.EventOutbox, key string) {
 	entry.PartitionKey = key
 	entry.LedgerID = key
@@ -775,62 +634,53 @@ func containsEventID(entries []model.EventOutbox, eventID string) bool {
 // TIER 1 — the projection contract
 // ===========================================================================
 
-// TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers pins the projection
-// that the claim, the single-row fetch and the dead-letter listing all share.
+// TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers pins the projection that
+// the claim, the single-row fetch and the dead-letter listing all share.
 //
-// scanEventOutbox consumes these columns POSITIONALLY. Adding a column to the
-// constant without adding a matching destination to the scanner — or reordering them
-// — produces mis-assigned field values at runtime and not one compiler error, so the
-// count and the order are asserted explicitly rather than left implicit.
-//
-// created_at is asserted ABSENT on purpose: the column exists on the table for
-// forensics, model.EventOutbox has no field for it, and nothing orders by it,
-// because all ordering here is by occurred_at.
+// scanEventOutbox consumes these columns POSITIONALLY.
 func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) {
 	columns := eventOutboxProjectedColumns()
 
 	want := []string{
 		"id", "event_id", "event_type", "aggregate_id", "partition_key", "ledger_id", "topic",
-		// payload_raw and NOT payload: the BYTEA column carries the producer's exact
-		// bytes, the JSONB column carries PostgreSQL's normalised re-rendering of them,
-		// and every reader of the body — the Kafka publish, the legacy webhook leg and a
-		// dead-letter replay — must get the former.
-		// event_raw follows payload_raw because the two are read together and answer
-		// different questions: payload_raw is the legacy webhook body, which the HTTP leg
-		// posts, and event_raw is the whole canonical envelope, which is what goes on a
-		// Kafka topic. It is projected because every publish, dead-letter write and replay
-		// takes the stored value rather than rebuilding the envelope from these columns —
-		// a row read without it would silently fall back to composition and lose the byte
-		// guarantee for events captured under a different serialiser.
+		// payload_raw and NOT payload: the BYTEA column carries the producer's exact bytes,
+		// the JSONB column carries PostgreSQL's normalised re-rendering of them, and every
+		// reader of the body — the Kafka publish, the legacy webhook leg and a dead-letter
+		// replay — must get the former. event_raw follows payload_raw because the two are
+		// read together and answer different questions: payload_raw is the legacy webhook
+		// body, which the HTTP leg posts, and event_raw is the whole canonical envelope,
+		// which is what goes on a Kafka topic. It is projected because every publish,
+		// dead-letter write and replay takes the stored value rather than rebuilding the
+		// envelope from these columns — a row read without it would silently fall back to
+		// composition and lose the byte guarantee for events captured under a different
+		// serialiser.
 		"schema_version", "payload_raw", "event_raw", "occurred_at",
 		// next_attempt_at is projected because model.EventOutbox carries it and a caller
 		// deciding whether a row is due reads it. It sits between max_attempts and
-		// last_error, matching both the scanner's destination order and the column order
-		// in the migration.
+		// last_error, matching both the scanner's destination order and the column order in
+		// the migration.
 		"status", "attempts", "max_attempts", "next_attempt_at", "last_error",
 		"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until", "claim_token",
 		// kafka_dispatched_at and webhook_attempts are the DUAL-DELIVERY pair, and both are
 		// projected because the relay reads them on every claimed row: the first tells it the
-		// Kafka leg is already done — so the re-claim delivers only the outstanding webhook and
-		// publishes nothing — and the second is the legacy leg's own budget, kept separate so a
-		// webhook receiver being down cannot spend a Kafka retry attempt.
-		//
-		// SUNSET: both go with the legacy transport, along with webhook_dispatched above.
+		// Kafka leg is already done — so the re-claim delivers only the outstanding webhook
+		// and publishes nothing — and the second is the legacy leg's own budget, kept
+		// separate so a webhook receiver being down cannot spend a Kafka retry attempt.
 		"webhook_dispatched", "kafka_dispatched_at", "webhook_attempts",
-		// The BROKER COORDINATE is the triple the broker assigned to the accepted
-		// message, and it is projected because it is the only thing that makes the
-		// zero-loss reconciliation auditable: a terminal row that cannot name its
-		// (topic, partition, offset) is a row whose delivery nobody can confirm, and
-		// the audit counts exactly those. It is written all-or-nothing, so it must be
-		// read all-or-nothing too, which is why the three sit adjacent.
+		// The BROKER COORDINATE is the triple the broker assigned to the accepted message,
+		// and it is projected because it is the only thing that makes the zero-loss
+		// reconciliation auditable: a terminal row that cannot name its (topic, partition,
+		// offset) is a row whose delivery nobody can confirm, and the audit counts exactly
+		// those. It is written all-or-nothing, so it must be read all-or-nothing too, which
+		// is why the three sit adjacent.
 		"kafka_topic", "kafka_partition", "kafka_offset",
 		"dlt_topic", "failure_metadata",
 		// THE CAPTURED TRACE CONTEXT, projected because the PUBLISH path reads it: the relay
 		// links its producer span to the trace of the request that captured the event, and a
 		// claimed row read without these two arrives with no memory of where it came from, so
 		// every publish span would start a trace of its own. They sit last, matching both the
-		// scanner's destination order and the order the ALTER TABLE in sql/1781249137.sql adds
-		// them in.
+		// scanner's destination order and the order the ALTER TABLE in sql/1781249137.sql
+		// adds them in.
 		"traceparent", "tracestate",
 	}
 	assert.Equal(t, want, columns,
@@ -839,14 +689,11 @@ func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) 
 		"created_at is deliberately not projected: model.EventOutbox has no field for it and all ordering is by occurred_at")
 }
 
-// TestEventOutboxInsertColumns_MatchesBoundValueCount keeps the placeholder
-// arithmetic in the batch insert tied to the column list.
+// TestEventOutboxInsertColumns_MatchesBoundValueCount keeps the placeholder arithmetic
+// in the batch insert tied to the column list.
 //
 // insertEventOutboxChunkInTx generates $N placeholders from
-// eventOutboxInsertValueCount. If a column were added to eventOutboxInsertColumns
-// without bumping that constant, the generated statement would bind the wrong number
-// of values per row and every batch insert would fail at runtime with a syntax
-// error, in a code path only the bulk writer exercises.
+// eventOutboxInsertValueCount.
 func TestEventOutboxInsertColumns_MatchesBoundValueCount(t *testing.T) {
 	columns := strings.Split(eventOutboxInsertColumns, ",")
 	assert.Len(t, columns, eventOutboxInsertValueCount,
@@ -858,7 +705,7 @@ func TestEventOutboxInsertColumns_MatchesBoundValueCount(t *testing.T) {
 }
 
 // ===========================================================================
-// TIER 1 — ClaimPendingEventOutbox: query shape and FIFO ordering (V-6)
+// TIER 1 — ClaimPendingEventOutbox: query shape and FIFO ordering
 // ===========================================================================
 
 // TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering is the
@@ -869,20 +716,12 @@ func TestEventOutboxInsertColumns_MatchesBoundValueCount(t *testing.T) {
 // suite can see, and both are one careless edit away from being lost:
 //
 //   - FOR UPDATE SKIP LOCKED is what lets several relay instances claim DISJOINT
-//     batches without blocking one another. Replace it with a plain FOR UPDATE and
-//     concurrent relays serialise behind each other; drop the row lock entirely and
-//     two relays claim the same row and publish the event twice. Neither failure is
-//     visible to a single-threaded test.
-//   - ORDER BY occurred_at is what carries acceptance criterion V-6, per-aggregate
-//     ordering. The neighbouring lineage claim in database/lineage.go orders by
-//     created_at, so "fixing" this query to match its sibling is the single most
-//     likely regression in this file — and it would leave every unit test in the
+//     batches without blocking one another.
+//   - per-aggregate ordering. The neighbouring lineage claim in database/lineage.go
+//     orders by created_at, so "fixing" this query to match its sibling is the single
+//     most likely regression in this file — and it would leave every unit test in the
 //     suite green, because occurred_at and created_at almost always agree in a test
 //     that inserts rows in order.
-//
-// The assertion is made against the SQL the method ACTUALLY ISSUES, captured from
-// the driver, rather than against the constant alone: asserting only on the constant
-// would still pass if the method were changed to issue some other statement.
 func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -902,12 +741,8 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	assert.NotContains(t, issued, "ORDER BY created_at",
 		"ordering by created_at would silently break per-aggregate ordering while leaving every other test green")
 
-	// THE ORD-01 PREDICATE. FOR UPDATE SKIP LOCKED stops two relays claiming the same
-	// row; it does NOT stop one relay skipping an earlier locked row and claiming a
-	// LATER row of the same message key. Kafka preserves append order rather than
-	// occurred_at, so that reordering reaches subscribers with nothing anywhere to show
-	// it. The NOT EXISTS clause is what makes at most one row per key claimable, and it
-	// is asserted here because it is invisible in behaviour until two relays run.
+	// THE PER-KEY EXCLUSION PREDICATE. Kafka preserves append order rather than occurred_at, so that
+	// reordering reaches subscribers with nothing anywhere to show it.
 	assert.Contains(t, issued, "NOT EXISTS",
 		"the claim must exclude a row whose message key already has an earlier row in flight; SKIP LOCKED alone permits same-key reordering")
 
@@ -915,8 +750,8 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	// wherever a row has one, the stored partition key only where it does not. Scoping it
 	// wider would serialise unrelated aggregates and destroy throughput; scoping it to the
 	// partition_key COLUMN was the previous shape and was NARROWER than the Kafka
-	// partition, which is worse than either (PERF-C02): two same-ledger rows with divergent
-	// stored keys went unserialised while both hashed to one partition.
+	// partition, which is worse than either: two same-ledger rows with divergent stored
+	// keys went unserialised while both hashed to one partition.
 	assert.Contains(t, issued, eventOutboxEffectiveKeySQL("earlier")+" = "+eventOutboxEffectiveKeySQL("candidate"),
 		"the exclusion must compare the EFFECTIVE key on both sides, so the value the database serialises on is the value Kafka partitions on")
 	assert.NotContains(t, issued, "earlier.partition_key = candidate.partition_key",
@@ -938,9 +773,8 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	assert.NotContains(t, issued, "lineage_outbox",
 		"blnk.event_outbox and blnk.lineage_outbox are never joined or merged")
 
-	// UPDATE ... RETURNING does not preserve the inner ORDER BY, so the outer sort
-	// over the CTE is what guarantees FIFO WITHIN a batch. It is not redundant and
-	// must not be collapsed.
+	// UPDATE ... RETURNING does not preserve the inner ORDER BY, so the outer sort over
+	// the CTE is what guarantees FIFO WITHIN a batch.
 	assert.Contains(t, issued, "ORDER BY candidate.occurred_at ASC, candidate.id ASC",
 		"the inner selection must order by occurrence then id, so rows sharing an instant are still claimed in the order they were recorded")
 	assert.Contains(t, issued, "SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC",
@@ -952,11 +786,8 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 // TestClaimPendingEventOutbox_BindsProcessingStatusLockIntervalAndBatchSize pins the
 // three bound values, in order.
 //
-// The lock duration is bound as its Go duration string ("30s"), which PostgreSQL
-// parses directly as an interval through the $2::interval cast. It is asserted
-// because the alternative — formatting an interval into the statement text — is both
-// an injection surface and a locale hazard, and because binding a raw
-// time.Duration would send a nanosecond count that PostgreSQL reads as microseconds.
+// The lock duration is bound as its Go duration string ("30s"), which PostgreSQL parses
+// directly as an interval through the $2::interval cast.
 func TestClaimPendingEventOutbox_BindsProcessingStatusLockIntervalAndBatchSize(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -979,12 +810,9 @@ func TestClaimPendingEventOutbox_BindsProcessingStatusLockIntervalAndBatchSize(t
 
 // TestClaimPendingEventOutbox_NonPositiveBatchSizeIsRejected locks in the guard.
 //
-// A zero LIMIT claims nothing and raises no error, which is INDISTINGUISHABLE from
-// an empty backlog: the relay would report itself healthy while publishing nothing
-// at all, and the only symptom would be a silently growing outbox. The
-// implementation therefore rejects it as a bad request rather than passing it
-// through, and both the zero and the negative case are asserted because a guard
-// written as `== 0` would let the negative through.
+// A zero LIMIT claims nothing and raises no error, which is INDISTINGUISHABLE from an
+// empty backlog: the relay would report itself healthy while publishing nothing at all,
+// and the only symptom would be a silently growing outbox.
 func TestClaimPendingEventOutbox_NonPositiveBatchSizeIsRejected(t *testing.T) {
 	for _, batchSize := range []int{0, -1, -100} {
 		t.Run(fmt.Sprintf("batch size %d", batchSize), func(t *testing.T) {
@@ -1005,11 +833,7 @@ func TestClaimPendingEventOutbox_NonPositiveBatchSizeIsRejected(t *testing.T) {
 // deliberately DIFFERENT treatment of a bad lease.
 //
 // A non-positive lease is normalised rather than rejected, and the asymmetry with
-// batchSize above is the interesting part. A lease that expires the instant it is
-// taken is a correctness problem — a second relay instance could reclaim and
-// republish a row that is still being published — but failing the poll outright
-// would STOP the relay rather than protect it. Falling back to the lease the outbox
-// relays already use keeps the relay running and safe.
+// batchSize above is the interesting part.
 func TestClaimPendingEventOutbox_NonPositiveLockDurationFallsBackToDefault(t *testing.T) {
 	for _, lockDuration := range []time.Duration{0, -time.Second} {
 		t.Run(lockDuration.String(), func(t *testing.T) {
@@ -1028,21 +852,8 @@ func TestClaimPendingEventOutbox_NonPositiveLockDurationFallsBackToDefault(t *te
 	}
 }
 
-// TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim asserts that the
-// collect path does not re-sort in Go.
-//
-// This is the honest, provable half of the ordering guarantee under a mock. sqlmock
-// has no planner, so it cannot demonstrate that SQL returns rows in occurred_at
-// order — that is what TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB is for.
-// What it CAN demonstrate is the property that makes the SQL's ORDER BY the single
-// source of truth: the repository hands back exactly the order the driver produced.
-//
-// The rows are scripted in DESCENDING occurred_at order, deliberately contradicting
-// the statement's ascending ORDER BY, and the result must come back in that same
-// contradictory order. A Go-side sort here would look like a helpful belt-and-braces
-// addition while actually being harmful: it would MASK a broken SQL ORDER BY, and
-// the real-database FIFO test would then be the only thing standing between the code
-// and a silent V-6 regression.
+// TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim asserts that the collect
+// path does not re-sort in Go.
 func TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1071,13 +882,10 @@ func TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField walks a fully-populated
-// row through the scanner and checks every field.
+// TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField walks a fully-populated row
+// through the scanner and checks every field.
 //
-// It is the positional-scan safety net. Two columns of the same SQL type swapped in
-// either the projection or the scanner produce no error whatsoever — just two fields
-// holding each other's values — and the only way to catch that is to give every
-// field a DISTINCT value and assert each one individually.
+// It is the positional-scan safety net.
 func TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1108,11 +916,10 @@ func TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField(t *testing.T) {
 		DispatchedAt:      &dispatchedAt,
 		LockedUntil:       &lockedUntil,
 		WebhookDispatched: true,
-		// The broker coordinate is populated with PARTITION 0 AND OFFSET 0 on purpose.
-		// Those are the record of the very first message on the first partition of a
-		// fresh topic — entirely real values — and they are exactly the pair a scanner
-		// that tested truthiness instead of NULL-ness would drop. Asserting a non-nil
-		// pointer holding zero is therefore a stronger claim than any non-zero pair.
+		// The broker coordinate is populated with PARTITION 0 AND OFFSET 0 on purpose. Those
+		// are the record of the very first message on the first partition of a fresh topic —
+		// entirely real values — and they are exactly the pair a scanner that tested
+		// truthiness instead of NULL-ness would drop.
 		KafkaTopic:      "blnk.balances",
 		KafkaPartition:  intPtr(0),
 		KafkaOffset:     int64Ptr(0),
@@ -1175,19 +982,9 @@ func int64Ptr(v int64) *int64 { return &v }
 // TestClaimPendingEventOutbox_NullableColumnsScanCleanly is where a missing sql.Null*
 // wrapper surfaces.
 //
-// Every nullable column is scripted as SQL NULL. Without the wrappers this fails
-// outright with "converting NULL to string is unsupported"; with them, the
-// normalisation has to be right too — nullable text becomes the empty string, and a
-// nullable timestamp becomes a NIL POINTER rather than a zero time.Time.
+// Every nullable column is scripted as SQL NULL.
 //
-// That last distinction is not cosmetic. A nil FirstAttemptedAt means "never
-// attempted", which is what model.EventOutbox documents. A zero time.Time would
-// report the year 1 instead, and the dead-letter age arithmetic behind the
-// blnk.dlt.oldest_message_age_seconds gauge would compute an age of roughly two
-// thousand years and fire its 15-minute alert on every never-attempted row.
-//
-// failure_metadata is asserted nil rather than the four bytes "null", which is what
-// a []byte scan gives and a json.RawMessage scan of a JSON null would not.
+// That last distinction is not cosmetic.
 func TestClaimPendingEventOutbox_NullableColumnsScanCleanly(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1232,13 +1029,9 @@ func TestClaimPendingEventOutbox_NullableColumnsScanCleanly(t *testing.T) {
 //
 // The table's CHECK constraint refuses a partial triple, so PostgreSQL should never
 // hand one back — but the scanner still tests all three columns together, and this is
-// what proves it. A scanner that assigned each column independently would produce a
-// row naming a topic with no partition and no offset, and BrokerRecord would then have
-// to decide what that means at every call site instead of once here.
-//
-// The consequence of getting it wrong is not a crash but a WRONG AUDIT: a half-record
-// looks like evidence of a delivery nobody can actually look up, which is precisely
-// the masking the reconciliation verdict exists to refuse.
+// what proves it. A scanner that assigned each column independently would produce a row
+// naming a topic with no partition and no offset, and BrokerRecord would then have to
+// decide what that means at every call site instead of once here.
 func TestClaimPendingEventOutbox_APartialBrokerCoordinateScansAsAbsent(t *testing.T) {
 	partials := map[string][]driver.Value{
 		"topic without partition or offset": {"blnk.transactions", nil, nil},
@@ -1312,20 +1105,18 @@ func TestClaimPendingEventOutbox_QueryErrorIsWrapped(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestClaimPendingEventOutbox_ScanErrorIsWrapped drives the per-row scan failure
-// branch by returning a value the scanner cannot decode.
+// TestClaimPendingEventOutbox_ScanErrorIsWrapped drives the per-row scan failure branch
+// by returning a value the scanner cannot decode.
 //
-// A scan failure must abandon the whole batch rather than return a partial one. A
-// partially-returned batch would leave the unreturned rows leased in the processing
-// state with nobody publishing them, stranded until the lease expired.
+// A scan failure must abandon the whole batch rather than return a partial one.
 func TestClaimPendingEventOutbox_ScanErrorIsWrapped(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
 
-	// occurred_at is a timestamp; a non-numeric string cannot convert to time.Time.
-	// The row is built from the real fixture builder and then has its occurred_at cell
-	// corrupted by POSITION, so the column count can never drift away from the
-	// projection the way a hand-written value list does.
+	// occurred_at is a timestamp; a non-numeric string cannot convert to time.Time. The
+	// row is built from the real fixture builder and then has its occurred_at cell
+	// corrupted by POSITION, so the column count can never drift away from the projection
+	// the way a hand-written value list does.
 	valid := model.EventOutbox{
 		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
 		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
@@ -1378,16 +1169,12 @@ func TestClaimPendingEventOutbox_RowIterationErrorIsWrapped(t *testing.T) {
 //
 // Three things happen in ONE statement, and all three matter:
 //
-//   - status becomes dispatched, which is what removes the row from the claimable
-//     set, because the claim predicate admits only pending and processing rows.
-//   - dispatched_at is stamped. The column is dispatched_at and NOT processed_at:
-//     the lineage outbox uses processed_at and this table deliberately does not, so
-//     a copy-paste from that sibling would target a column that does not exist here.
+//   - status becomes dispatched, which is what removes the row from the claimable set,
+//     because the claim predicate admits only pending and processing rows.
+//   - dispatched_at is stamped. The column is dispatched_at and NOT processed_at: the
+//     lineage outbox uses processed_at and this table deliberately does not, so a
+//     copy-paste from that sibling would target a column that does not exist here.
 //   - locked_until is cleared, releasing the lease.
-//
-// It is additionally CONDITIONAL on the claim token and on the prior state, which is
-// what stops a worker whose lease expired from marking a row dispatched that another
-// instance has since taken and moved on.
 func TestMarkEventDispatched_SetsDispatchedStatusStampsTimestampAndClearsLease(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1419,27 +1206,11 @@ func TestMarkEventDispatched_SetsDispatchedStatusStampsTimestampAndClearsLease(t
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL exercises BOTH arms of the CASE
-// and the boundary between them.
-//
-// The status is decided inside the UPDATE rather than in Go, and that is
-// load-bearing: deciding it in SQL keeps the read of attempts and the write of
-// status atomic, so two relay instances racing on one row cannot both conclude they
-// were the last attempt and both dead-letter it.
+// TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL exercises BOTH arms of the CASE and
+// the boundary between them.
 //
 // Both arms are asserted because the boundary — attempts + 1 >= max_attempts — is a
-// classic off-by-one site, and requirement R-4 fixes the retry budget at 5 attempts.
-// Written as `>` instead of `>=` the row gets a sixth attempt; written as
-// `attempts >= max_attempts` it gets only four. Neither mistake is visible from a
-// single-arm test.
-//
-// NOTE ON THE STATE MACHINE, because it is easy to get backwards: the exhaustion arm
-// sets FAILED, not dead_lettered. Those are two distinct states — failed means "we
-// gave up publishing", dead_lettered means "and the event is now preserved on its
-// <topic>.dlt sibling, from which it can be replayed". Only the dead-letter publisher
-// knows whether that second step actually happened, so only MarkEventDeadLettered
-// may declare it. ListDeadLetterInventory covers both literals precisely so that an
-// event stranded between them is still visible to an operator.
+// classic off-by-one site, and the requirement fixes the retry budget at 5 attempts.
 func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1494,13 +1265,8 @@ func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 		"the exhaustion arm must bind failed and the retry arm pending, in that order")
 }
 
-// TestMarkEventFailed_ExhaustionReportsTheHandOffToken is the exhaustion arm's
-// outcome, and it pins the hand-off that makes concurrent dead-lettering impossible.
-//
-// When the budget is spent the row still owes one step — the dead-letter write and the
-// transition that records it — and the claim token is RETAINED so that only the worker
-// which spent the last attempt can take it. Returning that token here is what lets the
-// caller perform the hand-off without knowing which arm keeps it.
+// TestMarkEventFailed_ExhaustionReportsTheHandOffToken is the exhaustion arm's outcome,
+// and it pins the hand-off that makes concurrent dead-lettering impossible.
 func TestMarkEventFailed_ExhaustionReportsTheHandOffToken(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1523,21 +1289,10 @@ func TestMarkEventFailed_ExhaustionReportsTheHandOffToken(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt is the other input to the
-// in-SQL decision, and the reason it is an input at all.
+// TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt is the other input to
+// the in-SQL decision, and the reason it is an input at all.
 //
-// The publisher classifies every failure. Some are PERMANENT by construction: an envelope over
-// the size ceiling, bytes that are not valid JSON, a destination outside the topic namespace
-// Blnk owns. It reports those as terminal and no retry can change the answer — but the durable
-// state used to disagree, because this statement read only the attempt count. The row went back
-// to pending with four attempts left and spent the whole 31-second backoff schedule
-// rediscovering what the publisher already knew, which delayed preservation by that long, spent
-// four attempts of relay throughput on a message that can never be published, and reported a
-// permanently stuck event as a busy one in the status counter throughout.
-//
-// The verdict is bound as $8 and ORed into all three arms, so status, the due instant and the
-// retained token agree. The token in particular matters: the caller needs it to perform the
-// dead-letter hand-off, and it is retained here on attempt ONE.
+// The publisher classifies every failure.
 func TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1591,9 +1346,7 @@ func TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt(t *testing.T)
 // on the behaviour that made stale workers dangerous.
 //
 // A transition matching no row means the lease expired and another instance owns the
-// row now. The old code logged a warning and returned nil, so the zombie worker
-// carried on as though it had recorded its attempt — which is exactly how the retry
-// budget got double-spent and how newer state got overwritten. It must be a conflict.
+// row now.
 func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1613,12 +1366,11 @@ func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestEventOutboxTransitions_RefuseABlankClaimToken proves every conditional
-// transition names the omission instead of matching a row nobody holds.
+// TestEventOutboxTransitions_RefuseABlankClaimToken proves every conditional transition
+// names the omission instead of matching a row nobody holds.
 //
 // A blank token could only ever match a row whose claim_token is NULL — a pending or
-// terminal row that is not the caller's to move. Passing it through would either match
-// nothing and be reported as a lost claim, which misleads, or match the wrong row.
+// terminal row that is not the caller's to move.
 func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 	transitions := map[string]func(ctx context.Context, ds Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
@@ -1660,14 +1412,8 @@ func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 	}
 }
 
-// TestMarkEventFailed_BelowMaxAttemptsReturnsToPending is arm one, asserted through
-// the bound values.
-//
-// The retry arm binds model.EventOutboxStatusPending — and specifically pending
-// rather than processing, because only pending and processing rows are claimable and
-// leaving it processing while clearing the lease would work by accident. Pending is
-// the state the claim predicate and the partial index on pending rows are both
-// written against.
+// TestMarkEventFailed_BelowMaxAttemptsReturnsToPending is arm one, asserted through the
+// bound values.
 func TestMarkEventFailed_BelowMaxAttemptsReturnsToPending(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1688,14 +1434,10 @@ func TestMarkEventFailed_BelowMaxAttemptsReturnsToPending(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered is arm two, and it
-// pins the distinction the whole dead-letter surface rests on.
+// TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered is arm two, and it pins
+// the distinction the whole dead-letter surface rests on.
 //
-// Exhausting the retry budget produces FAILED. Declaring dead_lettered here would be
-// a lie: at this point the event has NOT been written to any dead-letter topic, and
-// dead_lettered is the state a replay checks for before re-publishing. A row marked
-// dead_lettered with a NULL dlt_topic and NULL failure_metadata is unreplayable and
-// shows an operator nothing, which is strictly worse than being honestly failed.
+// Exhausting the retry budget produces FAILED.
 func TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1720,17 +1462,6 @@ func TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered(t *testing.T)
 
 // TestMarkEventFailed_StampsFirstAttemptedAtOnceAndLastAttemptedAtEveryTime pins the
 // two timestamps that bound the retry window.
-//
-// first_attempted_at goes through COALESCE so it survives as the FIRST attempt across
-// every retry; last_attempted_at is set unconditionally so it tracks the most recent
-// one. Together they are two of the five fields model.FailureMetadata requires
-// (original topic, error reason, attempt count, first-attempted-at,
-// last-attempted-at), and they are what distinguishes a momentary broker blip from a
-// sustained outage during dead-letter triage.
-//
-// If first_attempted_at were assigned rather than COALESCEd, the window would collapse
-// to the final attempt on every dead-lettered event and the metadata would be
-// worthless — while remaining perfectly non-NULL, so nothing would look broken.
 func TestMarkEventFailed_StampsFirstAttemptedAtOnceAndLastAttemptedAtEveryTime(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1753,11 +1484,7 @@ func TestMarkEventFailed_StampsFirstAttemptedAtOnceAndLastAttemptedAtEveryTime(t
 // TestMarkEventFailed_RecordsErrorMessageAsABoundParameter asserts the reason is
 // stored, and stored as a PARAMETER.
 //
-// Parameterisation is the assertion that matters. The message is a broker error
-// string that this code never generated and cannot constrain, so interpolating it
-// into the statement text would be an injection surface reachable from anything that
-// can make a publish fail. The message chosen here would terminate the statement and
-// start another if it were interpolated.
+// Parameterisation is the assertion that matters.
 func TestMarkEventFailed_RecordsErrorMessageAsABoundParameter(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1783,11 +1510,6 @@ func TestMarkEventFailed_RecordsErrorMessageAsABoundParameter(t *testing.T) {
 
 // TestMarkEventDeadLettered_RecordsTerminalStateTopicAndMetadata pins the second half
 // of the failure path — the step that actually makes an event replayable.
-//
-// dlt_topic and failure_metadata are what the dead-letter inventory displays and what
-// an operator triages from, and dead_lettered is the state a replay requires before
-// it will re-publish. Left uncalled, those columns stay NULL and no event is ever
-// replayable, so requirement R-5's replay surface would have nothing to work with.
 func TestMarkEventDeadLettered_RecordsTerminalStateTopicAndMetadata(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1828,11 +1550,6 @@ func TestMarkEventDeadLettered_RecordsTerminalStateTopicAndMetadata(t *testing.T
 
 // TestMarkEventDeadLettered_EmptyTopicAndMetadataBindAsNull keeps "not recorded"
 // distinguishable from "recorded as empty".
-//
-// An empty string in dlt_topic would read as a topic named "", and an empty
-// failure_metadata document would read as metadata that was genuinely captured and
-// happened to be blank. Both would make the dead-letter inventory lie about what it
-// knows, and a NULL check is the only way a reader can tell the difference.
 func TestMarkEventDeadLettered_EmptyTopicAndMetadataBindAsNull(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1850,16 +1567,11 @@ func TestMarkEventDeadLettered_EmptyTopicAndMetadataBindAsNull(t *testing.T) {
 
 // TestMarkWebhookDispatched_SetsTheDualDeliveryFlag pins the dual-delivery marker.
 //
-// During the 30-day window the relay publishes to Kafka AND enqueues the legacy
-// webhook task FROM THE SAME CLAIMED ROW — which is what makes the two transports
-// carry byte-identical payloads structurally rather than by careful coding. This flag
-// is what makes the legacy leg individually idempotent: a row republished to Kafka
-// after a relay crash must not enqueue a second webhook.
-//
-// This method, the webhook_dispatched column and the relay branch that calls it are
-// all removed at the webhook sunset, together with webhooks.go. Every other method in
-// this file outlives it, so this is the one test here that is EXPECTED to be deleted
-// rather than maintained.
+// During the 30-day window the relay publishes to Kafka AND enqueues the legacy webhook
+// task FROM THE SAME CLAIMED ROW — which is what makes the two transports carry
+// byte-identical payloads structurally rather than by careful coding. This flag is what
+// makes the legacy leg individually idempotent: a row republished to Kafka after a
+// relay crash must not enqueue a second webhook.
 func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1886,30 +1598,21 @@ func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 // TestMarkEventWebhookPending_ChoosesRetryOrAbandonInSQL exercises BOTH arms of the
 // legacy leg's own budget and the boundary between them.
 //
-// # What this transition is for
-//
-// The two legs of the dual-delivery window used to share one terminal state. A row
-// whose Kafka publish succeeded was marked dispatched even when the webhook enqueue
-// beside it had failed — and dispatched is outside the claim predicate, so that
-// webhook was never retried and never delivered. This transition is the fix: it
-// records the Kafka leg in its OWN column and leaves the row claimable for the
-// webhook alone.
+// The two legs of the dual-delivery window carry SEPARATE budgets rather than one
+// shared terminal state.
 //
 // Four things are asserted about the statement, and each of them is a distinct way to
 // get this wrong:
 //
-//   - webhook_attempts, not attempts, is incremented. Spending a KAFKA retry attempt
-//     on a webhook receiver being down would let the deprecated transport
-//     dead-letter events on the transport replacing it.
+//   - webhook_attempts, not attempts, is incremented. Spending a KAFKA retry attempt on
+//     a webhook receiver being down would let the deprecated transport dead-letter
+//     events on the transport replacing it.
 //   - kafka_dispatched_at is stamped through COALESCE, so the FIRST acknowledgement
-//     instant survives every subsequent webhook retry. Overwriting it would report
-//     the last bookkeeping write as the moment the broker accepted the message.
+//     instant survives every subsequent webhook retry.
 //   - dispatched_at is stamped on the ABANDON arm only. Stamping it on the retry arm
 //     would say the row is finished while a delivery is still owed.
-//   - the arm is chosen in SQL. Deciding it in Go would let two relay instances
-//     working one row both conclude they spent the last webhook attempt.
-//
-// SUNSET: this test goes with the transition it covers.
+//   - the arm is chosen in SQL. Deciding it in Go would let two relay instances working
+//     one row both conclude they spent the last webhook attempt.
 func TestMarkEventWebhookPending_ChoosesRetryOrAbandonInSQL(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1964,12 +1667,8 @@ func TestMarkEventWebhookPending_ChoosesRetryOrAbandonInSQL(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestMarkEventWebhookPending_AbandonArmIsReportedFromTheStatusTheDatabaseChose pins the
-// terminal arm.
-//
-// Abandoned is DERIVED from the returned status rather than computed from the attempt
-// count, so the caller's verdict and the row's state cannot disagree — which they would
-// if the arithmetic were repeated in Go against a possibly different max_attempts.
+// TestMarkEventWebhookPending_AbandonArmIsReportedFromTheStatusTheDatabaseChose pins
+// the terminal arm.
 //
 // SUNSET: goes with the transition it covers.
 func TestMarkEventWebhookPending_AbandonArmIsReportedFromTheStatusTheDatabaseChose(t *testing.T) {
@@ -1995,8 +1694,6 @@ func TestMarkEventWebhookPending_AbandonArmIsReportedFromTheStatusTheDatabaseCho
 // row is reported rather than swallowed.
 //
 // No row matching means the lease expired and another instance owns this row now.
-// Returning nil would tell the caller its outstanding webhook was recorded when nothing
-// was written, and the row would carry on with a webhook owed and no record of it.
 //
 // SUNSET: goes with the transition it covers.
 func TestMarkEventWebhookPending_LostClaimIsAConflict(t *testing.T) {
@@ -2012,13 +1709,11 @@ func TestMarkEventWebhookPending_LostClaimIsAConflict(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestMarkEventWebhookPending_RequiresTheClaimToken asserts the transition refuses to run
-// without the token the claim issued.
+// TestMarkEventWebhookPending_RequiresTheClaimToken asserts the transition refuses to
+// run without the token the claim issued.
 //
 // Every conditional transition matches on (id, claim_token), so an empty token could
-// only ever match a row nobody holds. Naming the omission is the only honest outcome.
-//
-// SUNSET: goes with the transition it covers.
+// only ever match a row nobody holds.
 func TestMarkEventWebhookPending_RequiresTheClaimToken(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2038,9 +1733,8 @@ func TestMarkEventWebhookPending_RequiresTheClaimToken(t *testing.T) {
 
 // TestMarkEventWebhookPending_NegativeBackoffIsTreatedAsDueImmediately mirrors
 // MarkEventFailed's handling: a caller that computed a negative delay meant "no delay",
-// and reaching into the past would be indistinguishable from it while looking deliberate.
-//
-// SUNSET: goes with the transition it covers.
+// and reaching into the past would be indistinguishable from it while looking
+// deliberate.
 func TestMarkEventWebhookPending_NegativeBackoffIsTreatedAsDueImmediately(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2066,31 +1760,11 @@ func TestMarkEventWebhookPending_NegativeBackoffIsTreatedAsDueImmediately(t *tes
 		"a negative delay must be bound as 0s, never as a negative interval")
 }
 
-// TestRenewEventOutboxLease_ExtendsEveryRowStillInFlightUnderOneToken pins the statement the
-// relay's heartbeat issues.
+// TestRenewEventOutboxLease_ExtendsEveryRowStillInFlightUnderOneToken pins the
+// statement the relay's heartbeat issues.
 //
-// # The defect it exists for
-//
-// The lease is taken once, when the batch is claimed, and a batch can legitimately outlive it:
-// a hundred rows published eight at a time run in thirteen waves, and one wave can occupy the
-// writer's whole produce timeout. Rows in the later waves therefore had their lease expire
-// BEFORE their publish was attempted, while the relay still held them — so a second instance
-// claimed and published exactly those rows, this one published them again, and every transition
-// this one attempted failed as a lost claim. Duplicates on the topic, and no error anywhere.
-//
-// # Why the token alone addresses the batch
-//
-// Every terminal and near-terminal transition CLEARS claim_token, so a row that has been
-// dispatched, dead-lettered, returned to pending or moved to webhook_pending is already outside
-// this statement's reach. What is still under the token is exactly what is still in flight —
-// which is why no id list is passed and why the absence of one is asserted rather than assumed.
-//
-// # Why it is not in eventTransitionTable
-//
-// The shared table drives the wrapped-error, lost-claim and undeterminable-count cases for every
-// CONDITIONAL TRANSITION. This is not one: a renewal that extends nothing is the ordinary end of
-// a batch, not a lost claim, so the table's zero-rows-is-a-conflict case would be wrong here.
-// The three cases are therefore written out below with the semantics this method actually has.
+// The shared table drives the wrapped-error, lost-claim and undeterminable-count cases
+// for every CONDITIONAL TRANSITION.
 func TestRenewEventOutboxLease_ExtendsEveryRowStillInFlightUnderOneToken(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2132,13 +1806,11 @@ func TestRenewEventOutboxLease_ExtendsEveryRowStillInFlightUnderOneToken(t *test
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRenewEventOutboxLease_RenewingNothingIsNotAnError pins the semantics that make the
-// heartbeat self-retiring.
+// TestRenewEventOutboxLease_RenewingNothingIsNotAnError pins the semantics that make
+// the heartbeat self-retiring.
 //
-// Zero renewals means every row of the batch has reached a terminal state, which is how a batch
-// ordinarily ends. Reporting it as a lost claim — the right answer for every conditional
-// transition — would log an error on every successful batch and give the caller nothing to
-// distinguish a finished batch from a real failure.
+// Zero renewals means every row of the batch has reached a terminal state, which is how
+// a batch ordinarily ends.
 func TestRenewEventOutboxLease_RenewingNothingIsNotAnError(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2155,9 +1827,9 @@ func TestRenewEventOutboxLease_RenewingNothingIsNotAnError(t *testing.T) {
 
 // TestRenewEventOutboxLease_RequiresTheClaimToken asserts the guard.
 //
-// Without a token the statement's WHERE clause degenerates to "every row nobody holds", which
-// matches nothing on a healthy table and would be indistinguishable from a finished batch.
-// Naming the omission is the only honest outcome.
+// Without a token the statement's WHERE clause degenerates to "every row nobody holds",
+// which matches nothing on a healthy table and would be indistinguishable from a
+// finished batch.
 func TestRenewEventOutboxLease_RequiresTheClaimToken(t *testing.T) {
 	for name, token := range map[string]string{"empty": "", "whitespace": "  \t "} {
 		t.Run(name, func(t *testing.T) {
@@ -2174,12 +1846,8 @@ func TestRenewEventOutboxLease_RequiresTheClaimToken(t *testing.T) {
 	}
 }
 
-// TestRenewEventOutboxLease_NonPositiveLeaseFallsBackToTheDefault mirrors the claim's treatment
-// of a bad lease, and for the same reason.
-//
-// A renewal to an instant already past is worse than no renewal at all: it would look like a
-// heartbeat while leaving every row of the batch immediately claimable by another instance.
-// Normalising keeps the batch protected; failing would stop the heartbeat entirely.
+// TestRenewEventOutboxLease_NonPositiveLeaseFallsBackToTheDefault mirrors the claim's
+// treatment of a bad lease, and for the same reason.
 func TestRenewEventOutboxLease_NonPositiveLeaseFallsBackToTheDefault(t *testing.T) {
 	for _, lease := range []time.Duration{0, -time.Second} {
 		t.Run(lease.String(), func(t *testing.T) {
@@ -2200,13 +1868,11 @@ func TestRenewEventOutboxLease_NonPositiveLeaseFallsBackToTheDefault(t *testing.
 	}
 }
 
-// TestRenewEventOutboxLease_FailureBranchesAreReportedHonestly covers the two ways the renewal
-// can go wrong, which are deliberately reported differently.
+// TestRenewEventOutboxLease_FailureBranchesAreReportedHonestly covers the two ways the
+// renewal can go wrong, which are deliberately reported differently.
 //
-// A driver error is a failure: the lease may not have been extended, so the caller must be told
-// and must log it. An UNCOUNTABLE result is not: the statement succeeded, and the count is used
-// only to decide whether to keep renewing, so one uncounted round is harmless and reporting it
-// as an error would abort a heartbeat over a driver's bookkeeping.
+// A driver error is a failure: the lease may not have been extended, so the caller must
+// be told and must log it.
 func TestRenewEventOutboxLease_FailureBranchesAreReportedHonestly(t *testing.T) {
 	t.Run("a driver error is wrapped", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -2240,25 +1906,15 @@ func TestRenewEventOutboxLease_FailureBranchesAreReportedHonestly(t *testing.T) 
 	})
 }
 
-// TestClaimFailedEventOutboxForDeadLetter_ReachesRowsNoOtherClaimCan pins the predicate that
-// ends the dead-letter limbo.
+// TestClaimFailedEventOutboxForDeadLetter_ReachesRowsNoOtherClaimCan pins the predicate
+// that ends the dead-letter limbo.
 //
-// # The limbo
+// The event exists only as that row, listed in the dead-letter inventory and acted on
+// by nothing.
 //
-// A row whose retry budget is spent and whose dead-letter WRITE failed sits at 'failed' with
-// dlt_topic still NULL, and that is a dead end in three directions at once: the ordinary claim
-// admits only attempts < max_attempts, replay accepts only 'dead_lettered', and the worker that
-// held the token has moved on. The event exists only as that row, listed in the dead-letter
-// inventory and acted on by nothing.
-//
-// # The two properties that make the repair work
-//
-// The status is deliberately NOT changed — the row stays in the inventory for the whole repair,
-// and MarkEventDeadLettered accepts 'failed' as a prior state, so a recovered row completes
-// through exactly the transition the first attempt would have used. And the claim is NOT
-// attempt-bounded, because the dead-letter topic IS the last resort: abandoning the write would
-// delete the only copy of the event. Both are asserted here because both are invisible in the
-// method's signature.
+// The status is deliberately NOT changed — the row stays in the inventory for the whole
+// repair, and MarkEventDeadLettered accepts 'failed' as a prior state, so a recovered
+// row completes through exactly the transition the first attempt would have used.
 func TestClaimFailedEventOutboxForDeadLetter_ReachesRowsNoOtherClaimCan(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2323,14 +1979,9 @@ func TestClaimFailedEventOutboxForDeadLetter_BindsLeaseTokenAndBatchSize(t *test
 			"dead-letter write already failed still move the row")
 }
 
-// TestClaimFailedEventOutboxForDeadLetter_GuardsMatchTheOrdinaryClaim asserts the two guards
-// behave exactly as the ordinary claim's do, because the asymmetry between them is deliberate
-// and easy to get backwards.
-//
-// A non-positive batch is REJECTED: a zero LIMIT claims nothing and raises nothing, which is
-// indistinguishable from an empty repair backlog, so a broken caller would look healthy while
-// events stayed stranded. A non-positive lease is NORMALISED: an expired-on-arrival lease is a
-// correctness problem, but failing the poll would stop the repair altogether.
+// TestClaimFailedEventOutboxForDeadLetter_GuardsMatchTheOrdinaryClaim asserts the two
+// guards behave exactly as the ordinary claim's do, because the asymmetry between them
+// is deliberate and easy to get backwards.
 func TestClaimFailedEventOutboxForDeadLetter_GuardsMatchTheOrdinaryClaim(t *testing.T) {
 	for _, batchSize := range []int{0, -1} {
 		t.Run(fmt.Sprintf("batch size %d is rejected", batchSize), func(t *testing.T) {
@@ -2364,11 +2015,9 @@ func TestClaimFailedEventOutboxForDeadLetter_GuardsMatchTheOrdinaryClaim(t *test
 	}
 }
 
-// TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped covers the read's three failure
-// branches, so a repair that cannot run is reported rather than read as an empty backlog.
-//
-// That distinction is the whole point: "nothing needs repair" is the normal state, so a silently
-// swallowed error here would be indistinguishable from health while stranded events accumulated.
+// TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped covers the read's three
+// failure branches, so a repair that cannot run is reported rather than read as an
+// empty backlog.
 func TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped(t *testing.T) {
 	t.Run("the query fails", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -2428,11 +2077,6 @@ func TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped(t *testing.T) {
 
 // eventTransitionTable is every conditional transition, invoked with a held claim
 // token, reduced to a plain error-returning closure.
-//
-// One table drives the wrapped-error, lost-claim and undeterminable-count cases below,
-// which is what keeps a newly added transition from silently arriving without any of
-// the three. MarkEventFailed's outcome is discarded here on purpose: these cases are
-// about the failure branches, and the outcome is asserted where the decision is.
 func eventTransitionTable() map[string]func(context.Context, Datasource) error {
 	return map[string]func(context.Context, Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
@@ -2466,25 +2110,11 @@ func TestMarkEventTransitions_DatabaseErrorIsWrapped(t *testing.T) {
 	}
 }
 
-// TestMarkEventTransitions_ZeroRowsAffectedIsALostClaimConflict is the REGRESSION
-// GUARD on the most consequential behaviour change in this file, and it replaces a
-// test that asserted the opposite.
+// TestMarkEventTransitions_ZeroRowsAffectedIsALostClaimConflict is the REGRESSION GUARD
+// on the most consequential behaviour change in this file, and it replaces a test that
+// asserted the opposite.
 //
-// The previous behaviour — and the previous test — treated an UPDATE that matched no
-// row as benign: log a warning, return nil. The reasoning was that a concurrent relay
-// whose lease expired may legitimately have moved the row on, and that failing the
-// caller would turn a benign race into a spurious retry.
-//
-// That reasoning had the consequence backwards. Returning nil tells the caller its
-// transition SUCCEEDED, so a worker that had lost its claim went on to act as though
-// it owned the row: it recorded a terminal state over the top of the current holder's
-// work, it recorded a failed attempt against a claim it no longer held — spending the
-// retry budget at twice the intended rate — and it could move a row back out of a
-// terminal state entirely. The spurious retry the old behaviour avoided is a much
-// smaller cost than any of those.
-//
-// A lost claim is now a CONFLICT: nothing is broken, the caller simply no longer owns
-// what it is trying to change, and the correct response is to stop working on the row.
+// That reasoning had the consequence backwards.
 func TestMarkEventTransitions_ZeroRowsAffectedIsALostClaimConflict(t *testing.T) {
 	for name, invoke := range eventTransitionTable() {
 		t.Run(name, func(t *testing.T) {
@@ -2511,9 +2141,6 @@ func TestMarkEventTransitions_ZeroRowsAffectedIsALostClaimConflict(t *testing.T)
 // branch of the bookkeeping helper: a driver that cannot report RowsAffected.
 //
 // A completed UPDATE must not be turned into a failure by its own instrumentation.
-// The transition already succeeded; only the diagnostic is unavailable. This is the
-// one case that still resolves to success, and it does so because the UPDATE itself
-// did not error — which is different in kind from an UPDATE that matched nothing.
 func TestMarkEventTransitions_UndeterminableRowsAffectedIsNotAnError(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2528,10 +2155,6 @@ func TestMarkEventTransitions_UndeterminableRowsAffectedIsNotAnError(t *testing.
 
 // TestRequireEventOutboxRowAffected_ToleratesANilResult guards the defensive nil check
 // directly.
-//
-// database/sql guarantees a non-nil Result alongside a nil error, so this should be
-// unreachable — but a transition that has already SUCCEEDED must never be turned into
-// a failure by its own bookkeeping, and the cost of being sure is one assertion.
 func TestRequireEventOutboxRowAffected_ToleratesANilResult(t *testing.T) {
 	assert.NoError(t, requireEventOutboxRowAffected(nil, 1, model.EventOutboxStatusDispatched),
 		"bookkeeping must never fail a transition that already succeeded")
@@ -2544,11 +2167,7 @@ func TestRequireEventOutboxRowAffected_ToleratesANilResult(t *testing.T) {
 // TestClaimEventForReplay_TransitionsDeadLetteredToReplayingAndIssuesAToken pins the
 // transition that makes concurrent replay safe.
 //
-// The precondition lives INSIDE the update. Two concurrent replays of one event
-// therefore cannot both proceed: exactly one changes a row and receives a token, and
-// the other is refused before it can publish. The read-then-check form this replaced
-// let both pass and both publish, so an operator double-clicking put two copies of the
-// event on the topic.
+// The precondition lives INSIDE the update.
 func TestClaimEventForReplay_TransitionsDeadLetteredToReplayingAndIssuesAToken(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2591,10 +2210,7 @@ func TestClaimEventForReplay_TransitionsDeadLetteredToReplayingAndIssuesAToken(t
 // TestClaimEventForReplay_DiscriminatesMissingFromWrongState keeps two different
 // operator mistakes apart.
 //
-// A wrong id and an event that is not dead-lettered are not the same problem. Told
-// "not found" for an event they had already replayed, an operator goes looking for a
-// typo instead of realising the replay had already happened — so the wrong-state case
-// must be a conflict whose message names the status the row is actually in.
+// A wrong id and an event that is not dead-lettered are not the same problem.
 func TestClaimEventForReplay_DiscriminatesMissingFromWrongState(t *testing.T) {
 	t.Run("no such event", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -2633,11 +2249,6 @@ func TestClaimEventForReplay_DiscriminatesMissingFromWrongState(t *testing.T) {
 
 // TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable pins the
 // rollback half of the replay claim.
-//
-// Without it, a replay that claimed a row and then failed to publish would strand the
-// row in replaying — outside the relay's claimable set AND outside the dead-letter
-// inventory — where nothing would ever pick it up again. A failed replay must not cost
-// an event its replayability.
 func TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2670,20 +2281,6 @@ func TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable(t *te
 // and dates of birth, and a transaction event carries amounts and balance identifiers.
 // Kept forever, the delivery buffer becomes an unbounded second copy of the ledger's
 // most sensitive data.
-//
-// The safety property is that only ELIGIBLE rows are deleted, and SEC-08 narrowed what
-// eligible means to ONE state. A pending, processing, replaying or failed row is still owed a
-// delivery attempt — failed is the subtle one: its retry budget is spent but its dead-letter
-// write is not done, so this table is the ONLY copy of that event in existence.
-//
-// A DEAD-LETTERED row is the newly subtle one, and the reason this test changed. It is
-// terminal — Blnk will not try again — and it used to be purged on that basis alone. But it
-// is the record of an event NO SUBSCRIBER EVER RECEIVED: the only inventory triage reads,
-// the only thing a replay can be driven from, and the only place the failure metadata
-// explaining the loss exists. Deleting it on an age timer destroyed all of that
-// unrecoverably, oldest first — the failure most likely to have been forgotten rather than
-// handled. So it is NEVER eligible: a dead-lettered row leaves the inventory by being
-// REPLAYED, which makes it dispatched, and the predicate below is what enforces that.
 func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2709,13 +2306,11 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 	assert.Contains(t, issued, "LIMIT $3",
 		"the delete must be bounded, or one sweep blocks the relay and bloats the WAL in a single transaction")
 
-	// THE DELETION AND ITS RECORD ARE ONE STATEMENT, and that is the assertion that matters
-	// most here. A deleted row leaves no trace, so "how many terminal rows has retention
-	// removed" is unanswerable unless the purge records it — and the daily reconciliation
-	// cannot reach a sound verdict without that number, because a broker end offset counts
-	// every record ever written and never falls. Two statements would leave a window in which
-	// a crash keeps the deletion and loses the record, after which the reconciliation is
-	// permanently and silently wrong by that batch's size with no way to discover it.
+	// THE DELETION AND ITS RECORD ARE ONE STATEMENT, and that is the assertion that
+	// matters most here. A deleted row leaves no trace, so "how many terminal rows has
+	// retention removed" is unanswerable unless the purge records it — and the daily
+	// reconciliation cannot reach a sound verdict without that number, because a broker
+	// end offset counts every record ever written and never falls.
 	assert.Contains(t, issued, "INSERT INTO blnk.event_outbox_purge_log",
 		"the purge must record what it removed, in the same statement that removes it")
 	assert.Contains(t, issued, "RETURNING occurred_at, kafka_offset",
@@ -2743,16 +2338,11 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestEventOutboxRetention_GoAndSQLAgreeOnEligibility is the SEC-08 anti-drift guard.
+// TestEventOutboxRetention_GoAndSQLAgreeOnEligibility is the retention-eligibility anti-drift guard.
 //
-// The purge predicate lives in SQL and model.EventOutbox.IsPurgeableByRetention states the
-// same rule in Go, so a caller, a test and the runbook can evaluate eligibility without a
-// database. Two expressions of one rule drift, and this drift would be SILENT and would go
-// wrong in whichever direction the change was made: a looser Go rule tells an operator a row
-// will be deleted that will not, and a looser SQL rule deletes evidence the Go rule promised
-// to keep.
-//
-// So the table below is the rule, and both are checked against it.
+// The purge predicate lives in SQL and model.EventOutbox.IsPurgeableByRetention states
+// the same rule in Go, so a caller, a test and the runbook can evaluate eligibility
+// without a database.
 func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -2818,10 +2408,6 @@ func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
 	}
 
 	// And the SQL says the same thing: ONE arm, naming the one state a receipt is in.
-	//
-	// Compared on the NORMALISED statement rather than through whereClauseOf, because the
-	// purge nests a bounded SELECT inside the DELETE and therefore carries two WHERE
-	// keywords — the eligibility rule is the inner one.
 	normalized := strings.Join(strings.Fields(statement), " ")
 	assert.Contains(t, normalized,
 		"WHERE status = $1 AND occurred_at < $2",
@@ -2837,12 +2423,6 @@ func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
 
 // TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice covers the two
 // argument guards.
-//
-// A zero cutoff reads as "delete everything older than the year 1", which deletes
-// nothing — far more likely an unset field than an intention, and silently doing
-// nothing would hide a retention job that looks like it is running. A non-positive or
-// oversized limit is clamped rather than refused, because the caller's intent is clear
-// and the bound exists to protect the relay rather than the caller.
 func TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice(t *testing.T) {
 	t.Run("zero cutoff is refused before any statement", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -2881,30 +2461,14 @@ func TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice(t *testin
 }
 
 // ===========================================================================
-// TIER 1 — the inserts, and THE PROOF OF REQUIREMENT R-2
+// TIER 1 — the inserts, and THE PROOF OF SAME-TRANSACTION CAPTURE
 // ===========================================================================
 
 // TestInsertEventOutboxInTx_ParticipatesInCallerTransaction is the single most
 // important test in this file.
 //
-// Requirement R-2 demands that the event row be written INSIDE THE SAME DATABASE
-// TRANSACTION as the ledger mutation that produced it. That is the entire
-// transactional-outbox guarantee: roll the transaction back and the event is gone with
-// it, commit and neither can exist without the other. There is no window in which a
-// balance moved but its event was lost, and none in which an event describes work that
-// was rolled back.
-//
-// AN IMPLEMENTATION THAT INSERTS AFTER tx.Commit() PASSES EVERYTHING ELSE. Every
-// happy-path test, every ordering test, every count test, every round-trip test — all
-// green, while the guarantee is completely gone. There is no functional symptom until
-// a process dies at exactly the wrong moment in production and a ledger mutation is
-// left with no event, or an event is published for a mutation that never committed.
-// This assertion is the only thing in the suite that catches it.
-//
-// The mechanism: the statement is expected BETWEEN ExpectBegin and ExpectRollback,
-// with NO ExpectCommit scripted at all. sqlmock enforces expectation ORDER, so an
-// insert issued on the pooled connection rather than on the transaction, or issued
-// after the transaction closed, cannot satisfy this script.
+// The durability contract demands that the event row be written INSIDE THE SAME DATABASE
+// TRANSACTION as the ledger mutation that produced it.
 func TestInsertEventOutboxInTx_ParticipatesInCallerTransaction(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2930,11 +2494,6 @@ func TestInsertEventOutboxInTx_ParticipatesInCallerTransaction(t *testing.T) {
 
 // TestInsertEventOutboxInTx_BackfillsGeneratedID asserts the RETURNING id is written
 // back onto the supplied entry.
-//
-// The caller needs it after the commit: the relay and the dual-delivery leg both work
-// from the in-memory row, and every subsequent transition — MarkEventDispatched,
-// MarkEventFailed, MarkEventDeadLettered — keys on this surrogate id. Leaving it zero
-// would make every one of them silently address row 0.
 func TestInsertEventOutboxInTx_BackfillsGeneratedID(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2958,21 +2517,17 @@ func TestInsertEventOutboxInTx_BackfillsGeneratedID(t *testing.T) {
 }
 
 // TestRecordTransactionWithBalancesAndOutbox_EnrolsEventInTheLedgerTransaction proves
-// R-2 through the real atomic writer rather than through the repository method in
+// same-transaction capture through the real atomic writer rather than through the repository method in
 // isolation.
 //
 // Both halves matter, and they are asserted as two sub-cases:
 //
 //   - The COMMIT path pins the ORDERING. sqlmock matches expectations in order, so
 //     scripting the event insert after the transaction insert and before the commit
-//     asserts exactly that placement. Move the insert below tx.Commit() in
-//     transaction.go and this sub-case fails, because the commit would arrive while
-//     the insert expectation was still outstanding.
+//     asserts exactly that placement.
 //   - The FAILURE path pins the ATOMICITY. A failing event insert must roll the whole
-//     ledger mutation back — the balance updates and the transaction row included —
-//     and must never commit. That is the direction of the guarantee that actually
-//     protects the ledger: it is not enough that the event follows the mutation, the
-//     mutation must also be abandoned if the event cannot be recorded.
+//     ledger mutation back — the balance updates and the transaction row included — and
+//     must never commit.
 func TestRecordTransactionWithBalancesAndOutbox_EnrolsEventInTheLedgerTransaction(t *testing.T) {
 	newLedgerFixtures := func() (*model.Transaction, *model.Balance, *model.Balance) {
 		now := time.Now().UTC()
@@ -3068,21 +2623,16 @@ func TestRecordTransactionWithBalancesAndOutbox_EnrolsEventInTheLedgerTransactio
 }
 
 // TestRecordTransactionWithBalancesAndOutbox_CommitsAMonitorAlertWithTheMovement is the
-// repository half of finding F-03's critical case.
+// repository half of that finding critical case.
 //
-// A balance.monitor alert describes a threshold the movement being persisted has just crossed, so
-// it is mutation-derived and R-2 applies. The producer prepares it before the write; this asserts
-// the writer accepts it ALONGSIDE the transaction's own event and commits both in the same
-// database transaction.
+// A balance.monitor alert describes a threshold the movement being persisted has just
+// crossed, so it is mutation-derived and the same-transaction rule applies.
 //
-// # The cardinality rule this exercises, and why it had to be refined rather than relaxed
-//
-// resolveEventOutboxes refuses more mutation-DESCRIBING rows than there are transactions, because
-// two transaction events for one transaction is an undetectable duplicate publication. Counted
-// over EVERY row, that rule would also refuse an alert riding along with its trigger — so the
-// count is taken over the non-repeatable rows only, which is exactly the class the rule protects.
-// The three sub-cases below pin both halves: the alert is accepted, and a genuine duplicate is
-// still refused.
+// resolveEventOutboxes refuses more mutation-DESCRIBING rows than there are
+// transactions, because two transaction events for one transaction is an undetectable
+// duplicate publication. Counted over EVERY row, that rule would also refuse an alert
+// riding along with its trigger — so the count is taken over the non-repeatable rows
+// only, which is exactly the class the rule protects.
 func TestRecordTransactionWithBalancesAndOutbox_CommitsAMonitorAlertWithTheMovement(t *testing.T) {
 	newFixtures := func() (*model.Transaction, *model.Balance, *model.Balance) {
 		now := time.Now().UTC()
@@ -3184,9 +2734,9 @@ func TestRecordTransactionWithBalancesAndOutbox_CommitsAMonitorAlertWithTheMovem
 	})
 
 	t.Run("two transaction events for one transaction are still refused", func(t *testing.T) {
-		// The invariant must have been NARROWED, not removed. Two mutation-describing rows for
-		// one transaction is a duplicate publication that nothing can detect afterwards, and it
-		// must still be refused before any statement is issued.
+		// The invariant must have been NARROWED, not removed. Two mutation-describing rows
+		// for one transaction is a duplicate publication that nothing can detect afterwards,
+		// and it must still be refused before any statement is issued.
 		db, mock := newSQLMock(t)
 		ds := Datasource{Conn: db}
 		txn, source, destination := newFixtures()
@@ -3209,19 +2759,7 @@ func TestRecordTransactionWithBalancesAndOutbox_CommitsAMonitorAlertWithTheMovem
 // specific, INVISIBLE bug.
 //
 // RecordTransactionsWithBalancesAndOutboxes is a one-line delegation to
-// RecordTransactionsWithBalanceSetAndOutboxes. Because the event outboxes are a
-// VARIADIC parameter, an implementation that forgets to forward them —
-// `...Outboxes(ctx, txns, balances, outboxes)` instead of
-// `...Outboxes(ctx, txns, balances, outboxes, eventOutboxes...)` — COMPILES CLEANLY,
-// passes type checking, and silently drops every event produced by the bulk path.
-// Nothing else would notice: the transactions still commit, the balances still move,
-// and the only symptom is that bulk transaction events never reach Kafka.
-//
-// The script is deliberately minimal. Passing no transactions, no balances and no
-// lineage outboxes exploits the empty-input short circuits in updateBalanceSet,
-// recordTransactionsInTx and insertLineageOutboxesInTx, so the ONLY statement between
-// BEGIN and COMMIT is the event insert. If the variadic is dropped, no statement is
-// issued and the outstanding expectation fails the test.
+// RecordTransactionsWithBalanceSetAndOutboxes.
 func TestRecordTransactionsWithBalancesAndOutboxes_ForwardsEventOutboxes(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -3229,9 +2767,9 @@ func TestRecordTransactionsWithBalancesAndOutboxes_ForwardsEventOutboxes(t *test
 	entry := newEventOutboxFixture("fwd-")
 
 	mock.ExpectBegin()
-	// RETURNING comes back keyed by event_id rather than by position, because
-	// RETURNING makes no promise about row order, so the scripted row must carry the
-	// real event id for the id back-fill to find its entry.
+	// RETURNING comes back keyed by event_id rather than by position, because RETURNING
+	// makes no promise about row order, so the scripted row must carry the real event id
+	// for the id back-fill to find its entry.
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "event_id"}).AddRow(int64(77), entry.EventID))
 	mock.ExpectCommit()
@@ -3247,17 +2785,11 @@ func TestRecordTransactionsWithBalancesAndOutboxes_ForwardsEventOutboxes(t *test
 		"the bulk delegation must forward eventOutboxes...; dropping the variadic compiles cleanly and silently discards every bulk-path event")
 }
 
-// TestInsertEventOutboxInTx_BindsPendingStatusNotCallerStatus asserts the initial
-// state belongs to this layer.
+// TestInsertEventOutboxInTx_BindsPendingStatusNotCallerStatus asserts the initial state
+// belongs to this layer.
 //
 // The caller does not get to choose it — the same rule InsertLineageOutboxInTx
-// establishes. Binding it explicitly means a caller that sets Status to processing,
-// dispatched or dead_lettered cannot smuggle a row into the middle of the relay state
-// machine, where it would either be published twice or never published at all.
-//
-// The in-memory struct is asserted too, because the relay and the dual-delivery leg
-// read the entry back after the insert; leaving the struct disagreeing with the stored
-// row would be a trap.
+// establishes.
 func TestInsertEventOutboxInTx_BindsPendingStatusNotCallerStatus(t *testing.T) {
 	for _, smuggled := range []string{
 		model.EventOutboxStatusProcessing,
@@ -3298,23 +2830,7 @@ func TestInsertEventOutboxInTx_BindsPendingStatusNotCallerStatus(t *testing.T) {
 // that is the entire point of the test.
 //
 // The payload column holds the marshaled legacy webhook object — the exact bytes
-// today's HTTP webhook body carries. Acceptance criteria V-8 (dual-delivery byte
-// equality) and V-9 (byte-for-byte replay) are both written against those bytes. Any
-// re-marshal, map[string]interface{} round trip or JSON compaction inside the
-// repository would break both, and A TEST COMPARING UNMARSHALLED VALUES WOULD NOT
-// NOTICE, because key order and whitespace are precisely what a re-marshal changes and
-// precisely what an unmarshalled comparison discards.
-//
-// The fixture therefore uses deliberately NON-CANONICAL key order and spacing: "event"
-// after "data", and padding around the separators. A single json.Marshal round trip
-// anywhere in the insert path reorders and compacts this, and the byte comparison
-// fails immediately.
-//
-// This assertion belongs at the BIND SITE and nowhere else. The column is JSONB, which
-// is a parsed representation, so PostgreSQL itself sorts keys and renormalises
-// whitespace on write — see the _RealDB counterpart, which asserts JSON EQUIVALENCE
-// for exactly that reason. The bind site is the only place the repository could corrupt
-// the bytes, so it is the only place byte equality is both meaningful and achievable.
+// today's HTTP webhook body carries.
 func TestInsertEventOutboxInTx_PayloadBytesPassThroughUnmodified(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -3353,9 +2869,7 @@ func TestInsertEventOutboxInTx_PayloadBytesPassThroughUnmodified(t *testing.T) {
 // Each default prevents a specific silent failure rather than being a convenience:
 //
 //   - A zero max_attempts would make the row both un-retryable AND UN-CLAIMABLE,
-//     because the claim predicate requires attempts < max_attempts. The row would
-//     never publish and never appear in the dead-letter inventory either — invisible
-//     in both directions.
+//     because the claim predicate requires attempts < max_attempts.
 //   - A zero schema_version reaches subscribers on the wire, where it reads as an
 //     unknown schema.
 //   - A zero occurred_at would sort to the front of every FIFO claim forever, ahead of
@@ -3396,27 +2910,18 @@ func TestInsertEventOutboxInTx_AppliesDocumentedDefaults(t *testing.T) {
 // TestInsertEventOutbox_ValidationRejectsUnusableEntries covers EVERY field guard, on
 // all three insert entry points.
 //
-// # Why the persistence layer validates at all
-//
 // A stored row is a COMMITMENT: the relay will try to publish it, retry it, spend its
-// budget on it and finally preserve it on a dead-letter topic. A row that could never
-// have been published is therefore not a harmless bad value — it is a guaranteed
-// dead-letter entry that an operator has to triage, and the cause will by then be far
-// away from the code that caused it. Each guard converts that into a typed bad request
-// raised BEFORE any statement runs, which matters most inside a caller's ledger
-// transaction where an opaque driver error surfaces nowhere near its origin.
+// budget on it and finally preserve it on a dead-letter topic.
 //
 // The cases, and the specific failure each prevents:
 //
 //   - A nil entry would panic on dereference.
 //   - A non-UUID or non-canonical event_id is a SUBSCRIBER IDEMPOTENCY KEY a consumer
 //     cannot deduplicate on reliably; the braced and unhyphenated spellings are refused
-//     for the same reason, because two spellings of one UUID are two distinct keys. An
-//     empty one is worse: the first row succeeds and every later one collides on
-//     event_outbox_event_id_uidx, so the failure lands on an unrelated later write.
+//     for the same reason, because two spellings of one UUID are two distinct keys.
 //   - A blank event_type is unroutable and unfilterable; a blank aggregate_id leaves
-//     consumers nothing to group by; a blank partition_key makes Kafka scatter the event
-//     round-robin and silently destroys the per-aggregate ordering guarantee.
+//     consumers nothing to group by; a blank partition_key makes Kafka scatter the
+//     event round-robin and silently destroys the per-aggregate ordering guarantee.
 //   - A topic outside the Blnk-owned namespace would have the relay lazily create a
 //     writer and PUBLISH TO A DESTINATION BLNK DOES NOT OWN, driven by stored data.
 //   - An unsupported schema_version reaches subscribers on the wire as an unknown
@@ -3425,9 +2930,6 @@ func TestInsertEventOutboxInTx_AppliesDocumentedDefaults(t *testing.T) {
 //     JSONB column with a driver error instead of a field name; and an oversize payload
 //     is accepted here only to be rejected by the broker on every attempt until it
 //     dead-letters.
-//
-// Every case also asserts that NO statement reached the database, which is the half
-// that proves the guard runs first rather than merely running.
 func TestInsertEventOutbox_ValidationRejectsUnusableEntries(t *testing.T) {
 	invalid := func(mutate func(*model.EventOutbox)) *model.EventOutbox {
 		e := newEventOutboxFixture("invalid-")
@@ -3494,9 +2996,9 @@ func TestInsertEventOutbox_ValidationRejectsUnusableEntries(t *testing.T) {
 
 		t.Run(name+" via insertEventOutboxesInTx", func(t *testing.T) {
 			if entry == nil {
-				// The batch helper SKIPS nil elements rather than rejecting them, so a
-				// nil entry is covered by TestInsertEventOutboxesInTx_SkipsNilEntries
-				// instead. Asserting rejection here would contradict that contract.
+				// The batch helper SKIPS nil elements rather than rejecting them, so a nil entry is
+				// covered by TestInsertEventOutboxesInTx_SkipsNilEntries instead. Asserting
+				// rejection here would contradict that contract.
 				t.Skip("nil elements are skipped by the batch helper, not rejected")
 			}
 
@@ -3520,14 +3022,7 @@ func TestInsertEventOutbox_ValidationRejectsUnusableEntries(t *testing.T) {
 // discrimination that makes retry safe.
 //
 // event_id carries event_outbox_event_id_uidx, which is what makes "one event is
-// recorded once" a SCHEMA-ENFORCED invariant rather than merely an intention. A
-// duplicate insert is therefore a CONFLICT and not a server fault: a caller retrying a
-// mutation whose event was already captured has to be able to recognise that and carry
-// on. Collapsing it into a 500 would turn an idempotent retry into an outage.
-//
-// The test also asserts the method does not PANIC. wrapEventOutboxInsertError reaches
-// into *pq.Error to read Code.Name(), and a nil-safety mistake there would surface as
-// a panic inside a ledger transaction — the worst possible place for one.
+// recorded once" a SCHEMA-ENFORCED invariant rather than merely an intention.
 func TestInsertEventOutboxInTx_DuplicateEventIDReturnsWrappedConflict(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -3562,8 +3057,6 @@ func TestInsertEventOutboxInTx_DuplicateEventIDReturnsWrappedConflict(t *testing
 //
 // The distinction is what lets a caller act: a conflict is retry-safe, a bad request is
 // the caller's fault and will never succeed on retry, and an internal error may.
-// Collapsing them all into one code would make every failure look permanent or every
-// failure look transient, and both are wrong.
 func TestInsertEventOutbox_DriverErrorsMapToTypedCodes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -3571,10 +3064,10 @@ func TestInsertEventOutbox_DriverErrorsMapToTypedCodes(t *testing.T) {
 		want apierror.ErrorCode
 	}{
 		// The unique violation reaches ErrConflict HERE because the fixture's stored row
-		// cannot be re-read — the mock expects only the insert — so nothing about "the event is
-		// already recorded" is established and the original failure stands. That fall-through
-		// is itself the contract: a duplicate is only forgiven when the stored row is proven
-		// identical. The forgiving path has its own tests below.
+		// cannot be re-read — the mock expects only the insert — so nothing about "the event
+		// is already recorded" is established and the original failure stands. That
+		// fall-through is itself the contract: a duplicate is only forgiven when the stored
+		// row is proven identical.
 		{"unique violation whose stored row cannot be read", &pq.Error{Code: "23505"}, apierror.ErrConflict},
 		{"foreign key violation", &pq.Error{Code: "23503"}, apierror.ErrBadRequest},
 		{"not null violation", &pq.Error{Code: "23502"}, apierror.ErrBadRequest},
@@ -3604,29 +3097,16 @@ func TestInsertEventOutbox_DriverErrorsMapToTypedCodes(t *testing.T) {
 // TestInsertEventOutbox_AnIdenticalEventAlreadyRecordedIsIdempotentSuccess is the
 // non-transactional path's idempotency contract.
 //
-// # Why a duplicate here is SUCCESS
-//
-// event_outbox_event_id_uidx exists to make "one event is recorded once" an invariant the
-// database enforces. When it refuses an insert it is reporting that the invariant HOLDS: the
-// event is durable, exactly once, and every guarantee built on it is intact. Reporting that as
-// a failure inverted the constraint's meaning — the caller was told the event was lost, an
-// ERROR line in the log said so, and a retrying caller (the bulk-outcome capture retries three
-// times) kept re-attempting a write that could only ever fail again before finally reporting an
-// outcome that was sitting in the table all along.
-//
-// # The surrogate id must be ADOPTED, not left at zero
-//
-// A first-time insert returns the row fully identified. An idempotent success that left ID at 0
-// would hand the caller a row the dead-letter path explicitly refuses — "a row with no database
-// id cannot be dead-lettered" — so the two outcomes have to be indistinguishable to the caller.
+// event_outbox_event_id_uidx exists to make "one event is recorded once" an invariant
+// the database enforces.
 func TestInsertEventOutbox_AnIdenticalEventAlreadyRecordedIsIdempotentSuccess(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
 	ctx := context.Background()
 
-	// Normalised up front so the fixture carries the SAME canonical envelope the insert will
-	// bind, which is what the comparison is made on. The insert's own normalisation is
-	// idempotent, so calling it here changes nothing about what is sent.
+	// Normalised up front so the fixture carries the SAME canonical envelope the insert
+	// will bind, which is what the comparison is made on. The insert's own normalisation
+	// is idempotent, so calling it here changes nothing about what is sent.
 	entry := newEventOutboxFixture("idem-")
 	require.NoError(t, prepareEventOutboxEntry(entry))
 	require.NotEmpty(t, entry.EventRaw, "the fixture must carry its canonical envelope")
@@ -3656,12 +3136,10 @@ func TestInsertEventOutbox_AnIdenticalEventAlreadyRecordedIsIdempotentSuccess(t 
 		"the duplicate must be resolved by RE-READING the stored row, not assumed")
 }
 
-// TestInsertEventOutbox_ADifferentEventUnderTheSameIDStaysAConflict is the boundary of that
-// forgiveness, and the case worth failing over.
+// TestInsertEventOutbox_ADifferentEventUnderTheSameIDStaysAConflict is the boundary of
+// that forgiveness, and the case worth failing over.
 //
-// Two DIFFERENT events sharing one event_id means an id has been reused. Swallowing the second
-// would lose it for real — silently, reported as success — so the comparison is made on the
-// canonical envelope bytes and anything that does not match exactly stays a conflict.
+// Two DIFFERENT events sharing one event_id means an id has been reused.
 func TestInsertEventOutbox_ADifferentEventUnderTheSameIDStaysAConflict(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -3694,14 +3172,7 @@ func TestInsertEventOutbox_ADifferentEventUnderTheSameIDStaysAConflict(t *testin
 //
 // It exists for events that have NO accompanying ledger mutation to be atomic with —
 // internal error notifications, and ledger and identity creation, none of which go
-// through the atomic transaction writers. Those events still belong in the outbox so
-// they get the same durable retry, dead-letter and replay treatment as every other
-// event; there is simply no wider transaction to enrol them in.
-//
-// No ExpectBegin is scripted, so an implementation that opened its own transaction
-// here would fail. That would not be harmlessly redundant: it would create a second
-// transaction with its own commit point, and a caller who believed this method was
-// atomic with something else would be wrong.
+// through the atomic transaction writers.
 func TestInsertEventOutbox_UsesTheConnectionNotATransaction(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -3725,12 +3196,6 @@ func TestInsertEventOutbox_UsesTheConnectionNotATransaction(t *testing.T) {
 
 // TestInsertEventOutboxesInTx_EmptySliceIsNoOp asserts a zero-length batch issues NO
 // statement.
-//
-// This is what lets the event rows be threaded through the atomic writers as a
-// variadic: a caller that captures no events passes nothing, and this must be a
-// no-op rather than an error. Every existing caller of the three atomic writers relies
-// on it — that is the whole reason the parameter is variadic instead of a required
-// slice — so an error here would break the frozen transaction-coalescing pipeline.
 func TestInsertEventOutboxesInTx_EmptySliceIsNoOp(t *testing.T) {
 	for name, entries := range map[string][]*model.EventOutbox{
 		"nil slice":   nil,
@@ -3759,11 +3224,6 @@ func TestInsertEventOutboxesInTx_EmptySliceIsNoOp(t *testing.T) {
 // TestInsertEventOutboxesInTx_SkipsNilEntries mirrors insertLineageOutboxesInTx's nil
 // tolerance, so a producer that assembles its slice conditionally does not have to
 // compact it.
-//
-// The all-nil case is the interesting one: after compaction there is nothing left, so
-// the helper must return before building a statement. Building one anyway would emit
-// `VALUES` with no tuples and fail with a syntax error — and only on the specific input
-// where every element happened to be nil.
 func TestInsertEventOutboxesInTx_SkipsNilEntries(t *testing.T) {
 	t.Run("mixed nil and real entries insert only the real ones", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -3811,15 +3271,8 @@ func TestInsertEventOutboxesInTx_SkipsNilEntries(t *testing.T) {
 // TestInsertEventOutboxesInTx_BuildsOneMultiRowStatementWithBoundPlaceholders pins the
 // statement construction.
 //
-// One multi-row INSERT rather than a loop of single inserts, because the coalescing
-// path can present a large batch inside an already-open ledger transaction, where every
-// extra round trip lengthens the window during which that transaction holds its balance
-// row locks.
-//
 // The placeholder numbering is asserted because it is the ONLY string formatting in the
-// statement. It is generated from eventOutboxInsertValueCount, never from caller data,
-// and the assertion checks the second row's tuple starts at $11 — which is what proves
-// the arithmetic strides by the column count rather than restarting or overlapping.
+// statement.
 func TestInsertEventOutboxesInTx_BuildsOneMultiRowStatementWithBoundPlaceholders(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ctx := context.Background()
@@ -3842,9 +3295,9 @@ func TestInsertEventOutboxesInTx_BuildsOneMultiRowStatementWithBoundPlaceholders
 	issued := (*captured)[0]
 
 	assert.Contains(t, issued, "INSERT INTO blnk.event_outbox")
-	// The expected tuples are DERIVED from eventOutboxInsertValueCount rather than
-	// written out, so adding a column changes the assertion automatically and the test
-	// keeps proving the same property: the numbering strides by the real column count.
+	// The expected tuples are DERIVED from eventOutboxInsertValueCount rather than written
+	// out, so adding a column changes the assertion automatically and the test keeps
+	// proving the same property: the numbering strides by the real column count.
 	tupleAt := func(base int) string {
 		placeholders := make([]string, 0, eventOutboxInsertValueCount)
 		for offset := 0; offset < eventOutboxInsertValueCount; offset++ {
@@ -3862,14 +3315,8 @@ func TestInsertEventOutboxesInTx_BuildsOneMultiRowStatementWithBoundPlaceholders
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestInsertEventOutboxesInTx_BackfillsGeneratedIDsByEventID asserts the ids are matched
-// BY EVENT ID and not by position.
-//
-// PostgreSQL makes no promise about RETURNING row order, so a positional back-fill is a
-// latent bug that happens to work whenever the server returns insertion order — which
-// is most of the time. The scripted rows here come back DELIBERATELY REVERSED, so a
-// positional implementation assigns each entry the other one's id and this test fails
-// while a same-order script would have let it pass.
+// TestInsertEventOutboxesInTx_BackfillsGeneratedIDsByEventID asserts the ids are
+// matched BY EVENT ID and not by position.
 func TestInsertEventOutboxesInTx_BackfillsGeneratedIDsByEventID(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ctx := context.Background()
@@ -3897,13 +3344,9 @@ func TestInsertEventOutboxesInTx_BackfillsGeneratedIDsByEventID(t *testing.T) {
 
 // TestInsertEventOutboxesInTx_PartialInsertIsAnError guards against a LOST EVENT.
 //
-// A short RETURNING count means at least one event was silently not persisted. If the
-// helper returned nil, the surrounding ledger transaction would commit and that event
-// would be gone forever — a balance moved with no event announcing it, which is exactly
-// the failure the transactional outbox exists to make impossible. Returning an error
-// rolls the transaction back instead, so the mutation is retried WITH its event.
+// A short RETURNING count means at least one event was silently not persisted.
 //
-// This is the write-side half of acceptance criterion V-2, zero message loss.
+// zero message loss.
 func TestInsertEventOutboxesInTx_PartialInsertIsAnError(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ctx := context.Background()
@@ -3972,16 +3415,7 @@ func TestInsertEventOutboxesInTx_QueryAndScanErrorsAreWrapped(t *testing.T) {
 
 // TestInsertEventOutboxesInTx_ChunksBeyondTheStatementLimit asserts the batch is split.
 //
-// This is a HARD REQUIREMENT rather than tuning. PostgreSQL's extended protocol accepts
-// at most 65535 bound parameters per statement; at ten parameters per row a single
-// statement tops out around 6553 rows, and the transaction-coalescing path is allowed to
-// present up to 10000 transactions in one batch. An unbounded batch would therefore fail
-// outright on a large enough coalesced write and roll the whole ledger transaction back
-// with it.
-//
-// Every chunk runs inside the CALLER'S transaction, so the batch remains all-or-nothing
-// even though it is several statements — which is why the chunking does not weaken the
-// atomicity guarantee.
+// This is a HARD REQUIREMENT rather than tuning.
 func TestInsertEventOutboxesInTx_ChunksBeyondTheStatementLimit(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ctx := context.Background()
@@ -4025,12 +3459,6 @@ func TestInsertEventOutboxesInTx_ChunksBeyondTheStatementLimit(t *testing.T) {
 
 // TestGetEventByID_KeysOnTheBusinessEventID asserts the lookup targets event_id and not
 // the surrogate id.
-//
-// event_id is what the dead-letter replay route carries and what a subscriber quotes
-// when it asks for an event to be resent; the BIGSERIAL id is never exposed outside this
-// layer. Keying on id would make the replay endpoint unusable — and it would still
-// compile and still return rows, just the wrong ones, since both columns are addressable
-// by number.
 func TestGetEventByID_KeysOnTheBusinessEventID(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -4060,11 +3488,6 @@ func TestGetEventByID_KeysOnTheBusinessEventID(t *testing.T) {
 
 // TestGetEventByID_NotFoundReturnsTypedAPIError pins a DELIBERATE DIVERGENCE from
 // GetOutboxByTransactionID, which returns (nil, nil) for a missing row.
-//
-// The replay handler has to tell "no such event" apart from "found it" in order to answer
-// correctly, and a nil-nil result forces every caller to re-derive that distinction and
-// invites the nil dereference that follows from forgetting to. A typed not-found error is
-// what the API layer maps to its event-not-found response.
 //
 // Both the not-nil error AND the nil entry are asserted, because returning a populated
 // zero-value entry alongside the error would be just as dangerous.
@@ -4103,15 +3526,11 @@ func TestGetEventByID_ScanErrorIsWrappedAsInternal(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestListDeadLetterInventory_CoversBothTerminalFailureStates asserts the filter includes
-// failed AS WELL AS dead_lettered, and that every predicate is applied in SQL.
+// TestListDeadLetterInventory_CoversBothTerminalFailureStates asserts the filter
+// includes failed AS WELL AS dead_lettered, and that every predicate is applied in SQL.
 //
-// A row becomes failed the moment its retry budget is spent, and dead_lettered only once
-// the event has additionally been written to its <topic>.dlt sibling. Listing only the
-// latter would HIDE events that exhausted their retries but whose dead-letter publication
-// itself failed — which are exactly the events an operator most needs to see, because they
-// are the ones sitting nowhere at all. The partial index idx_event_outbox_failed covers
-// both literals for this reason.
+// A row becomes failed the moment its retry budget is spent, and dead_lettered only
+// once the event has additionally been written to its <topic>.dlt sibling.
 func TestListDeadLetterInventory_CoversBothTerminalFailureStates(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -4152,14 +3571,14 @@ func TestListDeadLetterInventory_CoversBothTerminalFailureStates(t *testing.T) {
 	assert.Contains(t, issued, "ORDER BY occurred_at DESC, id DESC",
 		"triage starts from the most recent failures, and id breaks ties so paging cannot show or skip a row twice")
 
-	// PERF-P06: the predicates live in the statement. Asserted on the SQL because a fixture
-	// small enough to read cannot distinguish "the database filtered" from "the application
-	// filtered what the database returned" — and that distinction was the finding.
+	// The predicates live in the statement. Asserted on the SQL because a fixture small
+	// enough to read cannot distinguish "the database filtered" from "the application
+	// filtered what the database returned" — and that distinction is the point.
 	assert.Contains(t, issued, "($3 = '' OR status = $3)")
 	assert.Contains(t, issued, "($4 = '' OR event_type = $4)")
 	assert.Contains(t, issued, "($5 = '' OR topic = $5)")
 
-	// PERF-P08: a keyset, not an offset.
+	// A keyset, not an offset.
 	assert.Contains(t, issued, "(occurred_at, id) < ($6::timestamptz, $7::bigint)")
 	assert.NotContains(t, issued, "OFFSET",
 		"an offset's cost grows with its depth and the depth was the caller's to choose")
@@ -4176,16 +3595,10 @@ func TestListDeadLetterInventory_CoversBothTerminalFailureStates(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestListDeadLetterInventory_ReadsNeitherBodyColumn is the PERF-P06 guard on the projection.
+// TestListDeadLetterInventory_ReadsNeitherBodyColumn is the guard on the projection.
 //
-// payload_raw and event_raw are the same event body twice over, up to 768 KiB each, and the
-// listing shows neither: it reports the body's SIZE, computed inside PostgreSQL. Reading whole
-// rows to build a page of at most a few hundred small items moved gibibytes to answer a
-// question about kilobytes.
-//
-// Asserted on the statement text rather than on the returned entries, because a projection that
-// selected the bodies and discarded them in Go would satisfy every assertion about the entries
-// while costing exactly what the finding was about.
+// payload_raw and event_raw are the same event body twice over, up to 768 KiB each, and
+// the listing shows neither: it reports the body's SIZE, computed inside PostgreSQL.
 func TestListDeadLetterInventory_ReadsNeitherBodyColumn(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -4224,18 +3637,8 @@ func TestListDeadLetterInventory_ReadsNeitherBodyColumn(t *testing.T) {
 		"the inventory's composition is published through one list")
 }
 
-// TestListDeadLetteredEvents_AppliesEveryNarrowingInSQL is the whole point of the filter
-// contract, and the defect it closes was invisible to the client.
-//
-// The narrowing used to be applied ABOVE this layer, in the service, by paging the
-// inventory and testing rows in Go up to a fixed scan ceiling. A page that reached the
-// ceiling was returned looking exactly like a complete one — only a log line said
-// otherwise — and an exact total was impossible, so include_count had to be refused for
-// any event-type or topic filter. Both were properties of where the filtering happened.
-//
-// The proof is the SQL: every filter must appear as a predicate, positionally aligned with
-// its argument, and LIMIT/OFFSET must bind AFTER them so the page applies to the filtered
-// set.
+// TestListDeadLetteredEvents_AppliesEveryNarrowingInSQL is the whole point of the
+// filter contract, and the defect it closes was invisible to the client.
 func TestListDeadLetteredEvents_AppliesEveryNarrowingInSQL(t *testing.T) {
 	from := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	to := from.Add(20 * time.Minute)
@@ -4368,18 +3771,10 @@ func TestListDeadLetteredEvents_AppliesEveryNarrowingInSQL(t *testing.T) {
 	}
 }
 
-// TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage is what makes include_count
-// answerable for a filtered request at all.
+// TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage is what makes
+// include_count answerable for a filtered request at all.
 //
-// The total used to come from a whole-table per-status aggregate that knew nothing about
-// the event-type or topic filter, so the endpoint refused include_count rather than report
-// a total describing a different set than the page. A total over a different predicate is
-// worse than no total: a client pages until it has seen total_count rows and either loops
-// forever or stops early, with nothing in the response to say which.
-//
-// The page is deliberately IGNORED. The total is a property of the filter, not of the
-// window into it — honouring Limit here would make total_count never exceed the page size,
-// which is precisely the number a caller asks for it in order not to have to guess.
+// The page is deliberately IGNORED.
 func TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage(t *testing.T) {
 	from := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	to := from.Add(20 * time.Minute)
@@ -4438,16 +3833,13 @@ func TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage(t *testing.T) {
 	})
 }
 
-// TestListDeadLetterInventory_NormalisesTheLimitAndPassesTheCursorThrough asserts a malformed
-// page request degrades to a sane one rather than scanning the table or failing.
+// TestListDeadLetterInventory_NormalisesTheLimitAndPassesTheCursorThrough asserts a
+// malformed page request degrades to a sane one rather than scanning the table or
+// failing.
 //
-// The upper cap is the load-bearing half: without it a caller could turn a triage
-// endpoint into a full table scan of an outbox that grows without bound, which is a
-// denial-of-service surface reachable from an authenticated operator endpoint.
-//
-// The cursor is passed through VERBATIM (PERF-P08). There is nothing to clamp about a position,
-// and the bound limit is limit+1 in every case — the probe row that answers "is there another
-// page" without a COUNT.
+// The cursor is passed through VERBATIM. There is nothing to clamp about a position,
+// and the bound limit is limit+1 in every case — the probe row that answers "is there
+// another page" without a COUNT.
 func TestListDeadLetterInventory_NormalisesTheLimitAndPassesTheCursorThrough(t *testing.T) {
 	resumeAt := dbTimestamp(time.Now().Add(-time.Hour))
 
@@ -4527,9 +3919,8 @@ func TestListDeadLetterInventory_BindsTheFiltersItWasGiven(t *testing.T) {
 
 // TestListDeadLetterInventory_ReadsAProbeRowToAnswerHasMore pins the limit+1 contract.
 //
-// The extra row is READ and not RETURNED, and the cursor comes from the last row that WAS
-// returned. Taking it from the probe instead would skip that row on the next page — a silent
-// gap in an inventory an operator is triaging from.
+// The extra row is READ and not RETURNED, and the cursor comes from the last row that
+// WAS returned.
 func TestListDeadLetterInventory_ReadsAProbeRowToAnswerHasMore(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -4614,23 +4005,18 @@ func TestListDeadLetterInventory_ErrorsAreWrapped(t *testing.T) {
 	}
 }
 
-// TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL is the assertion that the
-// narrowing reaches the DATABASE.
+// TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL is the assertion that
+// the narrowing reaches the DATABASE.
 //
-// It is the whole point of the method. The service used to filter above this layer: it read
-// unfiltered pages, applied the predicates in Go and stopped at a fixed row budget, so a
-// filtered page silently omitted every match past the budget and answered 200 with no
-// indication that it had stopped looking. A predicate that is not in this WHERE clause is
-// a predicate that has to be applied somewhere it cannot be applied correctly.
+// It is the whole point of the method.
 //
 // Three properties are asserted rather than one, because each is separately breakable:
 //
-//   - Every set filter appears as a BOUND PARAMETER, never as interpolated text. The
-//     values are operator-supplied, so an interpolated topic is an injection.
+//   - Every set filter appears as a BOUND PARAMETER, never as interpolated text.
 //   - A status filter REPLACES the two-state default rather than intersecting with it,
 //     which is what makes narrowing to `failed` alone expressible at all.
-//   - The page placeholders are numbered AFTER the predicates, so adding a filter cannot
-//     silently rebind the limit to a topic string.
+//   - The page placeholders are numbered AFTER the predicates, so adding a filter
+//     cannot silently rebind the limit to a topic string.
 func TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -4729,12 +4115,10 @@ func TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL(t *testing.T
 	}
 }
 
-// TestListDeadLetteredEventsFiltered_NormalisesPaginationLikeTheUnfilteredListing keeps the
-// two entry points interchangeable.
+// TestListDeadLetteredEventsFiltered_NormalisesPaginationLikeTheUnfilteredListing keeps
+// the two entry points interchangeable.
 //
-// A caller that adds a filter to a working request must not also get a different page. The
-// upper cap is the load-bearing half here as it is there: without it an authenticated
-// operator endpoint becomes a full table scan of an outbox that grows without bound.
+// A caller that adds a filter to a working request must not also get a different page.
 func TestListDeadLetteredEventsFiltered_NormalisesPaginationLikeTheUnfilteredListing(t *testing.T) {
 	cases := []struct {
 		name                  string
@@ -4813,15 +4197,10 @@ func TestListDeadLetteredEventsFiltered_ErrorsAreWrapped(t *testing.T) {
 	}
 }
 
-// TestCountDeadLetteredEvents_CountsTheSameSetTheListingPages is the invariant that makes a
-// reported total trustworthy.
+// TestCountDeadLetteredEvents_CountsTheSameSetTheListingPages is the invariant that
+// makes a reported total trustworthy.
 //
-// The count and the listing must narrow IDENTICALLY. A total taken with a different
-// predicate than the page it is reported beside is worse than no total: a paging client
-// either stops early, believing it has seen everything, or loops forever asking for a page
-// past the end. Both methods build their WHERE clause from the one shared clause builder,
-// and this test asserts the resulting predicate and bindings are the same rather than
-// merely similar.
+// The count and the listing must narrow IDENTICALLY.
 func TestCountDeadLetteredEvents_CountsTheSameSetTheListingPages(t *testing.T) {
 	filters := []model.DeadLetterFilter{
 		{},
@@ -4902,19 +4281,17 @@ func TestCountDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestCountEventOutboxByStatus_ReturnsPerStatusCounts pins the method that acceptance
-// criterion V-2 is measured with.
+// TestCountEventOutboxByStatus_ReturnsPerStatusCounts pins the method the zero-loss
+// reconciliation is measured with.
 //
-// IT IS NOT UNUSED — a grep for callers inside this package finds none, which is exactly
-// the trap this test and its comment exist to prevent. Three things consume it:
+// IT IS NOT UNUSED — a grep for callers inside this package finds none, which is
+// exactly the trap this test and its comment exist to prevent. Three things consume it:
 //
 //   - the event statistics endpoint, GET /events/stats;
 //   - the DAILY ZERO-LOSS RECONCILIATION in the Kafka operations runbook, which passes
 //     when the dispatched plus dead-lettered counts equal the sum of the main-topic and
 //     dead-letter-topic end offsets reported by the broker;
 //   - the blnk.outbox.pending backlog gauge exported to the metrics pipeline.
-//
-// Delete it as dead code and criterion V-2 becomes unmeasurable.
 func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -4946,8 +4323,8 @@ func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 	assert.Contains(t, issued, "GROUP BY status",
 		"the reconciliation needs one row per status, aggregated in the database rather than by counting rows in Go")
 
-	// PERF-P04: the count is TWO-ARMED, and which arm is windowed is the substance of the
-	// fix. Asserted on the statement because a small fixture cannot tell a bounded count from
+	// The count is TWO-ARMED, and which arm is windowed is the substance of the fix.
+	// Asserted on the statement because a small fixture cannot tell a bounded count from
 	// an unbounded one — both return the same rows.
 	assert.Contains(t, issued, "UNION ALL",
 		"one arm counts everything outstanding exactly, the other bounds the one unbounded population")
@@ -4966,29 +4343,11 @@ func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory is the PERF-M05 guard on the
+// TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory is the guard on the
 // repository side.
 //
-// # What the two-armed count cost the callers that only ever read one arm
-//
-// Two callers run this aggregate on a timer: the metrics collector recomputes the backlog and
-// repair gauges every fifteen seconds, and the dead-letter service counts the rows awaiting a
-// dead-letter write. Both read ONLY non-dispatched statuses, and both said so in a comment while
-// calling the two-armed query with a twenty-four-hour window — so every call additionally
-// performed an exact COUNT of a day of dispatched rows, 43.2 million index entries at the target
-// rate, and discarded the answer. Fifteen seconds apart, that is a scan that never stops.
-//
-// # The assertions are on the STATEMENT, and they have to be
-//
-// A fixture holding five rows cannot tell a one-armed query from a two-armed one: both return the
-// same rows. The substance of the fix is the ABSENCE of the second arm and of the window, which is
-// visible only in the SQL — and it is exactly what a well-meaning future edit would undo by
-// "reusing" the fuller query with a wide window.
-//
-// The predicate must also be spelled `status <> $1`, character for character as the other query's
-// first arm spells it, so both resolve to the same partial index. A paraphrase — an IN list of the
-// known non-dispatched statuses — would read identically, plan as a sequential scan, and silently
-// stop counting any status added to the state machine later, which the column deliberately allows.
+// A fixture holding five rows cannot tell a one-armed query from a two-armed one: both
+// return the same rows.
 func TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -5013,9 +4372,9 @@ func TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory(t *testing.T)
 		model.EventOutboxStatusDeadLettered:   7,
 	}, counts)
 
-	// The four figures the routine callers actually publish, all of them from this ONE reading:
-	// the backlog gauge is pending plus processing, and the two repair backlogs are `failed`
-	// and `webhook_pending` (PERF-M06).
+	// The four figures the routine callers actually publish, all of them from this ONE
+	// reading: the backlog gauge is pending plus processing, and the two repair backlogs
+	// are `failed` and `webhook_pending`.
 	assert.Equal(t, int64(4), counts[model.EventOutboxStatusPending]+
 		counts[model.EventOutboxStatusProcessing],
 		"the backlog gauge comes out of this reading")
@@ -5048,13 +4407,8 @@ func TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory(t *testing.T)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestCountUnresolvedEventOutbox_ErrorsAreWrapped covers the statement, scan and row-iteration
-// failures on the lightweight aggregate.
-//
-// It shares its scan loop with CountEventOutboxByStatus, and the shared loop is what makes these
-// cases worth stating twice: the one property both must have is that a mid-iteration failure is
-// REPORTED rather than yielding the partially-drained map, because a zero-loss reconciliation
-// compared against a short total reports loss that has not happened.
+// TestCountUnresolvedEventOutbox_ErrorsAreWrapped covers the statement, scan and
+// row-iteration failures on the lightweight aggregate.
 func TestCountUnresolvedEventOutbox_ErrorsAreWrapped(t *testing.T) {
 	for name, arrange := range map[string]func(sqlmock.Sqlmock){
 		"the statement fails": func(mock sqlmock.Sqlmock) {
@@ -5093,11 +4447,8 @@ func TestCountUnresolvedEventOutbox_ErrorsAreWrapped(t *testing.T) {
 
 // TestCountEventOutboxByStatus_NormalisesTheWindow pins what a caller cannot ask for.
 //
-// A zero instant means "no preference" and a future one is a caller error; both become one
-// default window before now. Correcting rather than failing is deliberate — a zero instant
-// bound verbatim would ask PostgreSQL for every dispatched row since year one, which is the
-// whole-history scan this window exists to prevent, and a future instant would report zero
-// dispatched rows and read as total message loss.
+// A zero instant means "no preference" and a future one is a caller error; both become
+// one default window before now.
 func TestCountEventOutboxByStatus_NormalisesTheWindow(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -5149,21 +4500,11 @@ func TestCountEventOutboxByStatus_NormalisesTheWindow(t *testing.T) {
 	})
 }
 
-// TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey pins the semantics a caller can
-// get catastrophically wrong.
+// TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey pins the semantics a caller
+// can get catastrophically wrong.
 //
-// GROUP BY produces rows only for statuses that EXIST, so a status with no rows is ABSENT
-// from the map rather than present with a zero. Callers must read it with the two-value
-// form or knowingly accept Go's zero value — which is what the pending-backlog gauge does
-// when nothing is pending, and which is correct there.
-//
-// It is asserted explicitly because misreading a MISSING key as a genuine zero is
-// precisely how the daily reconciliation would report success while events were missing:
-// if the dispatched key were absent because of a query fault, dispatched would read as
-// zero, and zero plus zero equalling a zero offset sum looks like a clean reconciliation.
-//
-// The map is also asserted NON-NIL on an empty table, so a caller can range over the
-// result without a nil check.
+// GROUP BY produces rows only for statuses that EXIST, so a status with no rows is
+// ABSENT from the map rather than present with a zero.
 func TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey(t *testing.T) {
 	t.Run("an empty table yields an empty, non-nil map", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -5200,10 +4541,9 @@ func TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey(t *testing.T) {
 	})
 
 	t.Run("an unknown status is carried through verbatim", func(t *testing.T) {
-		// The column is deliberately unconstrained TEXT so the state machine can be
-		// extended without a migration. An unknown literal must therefore surface rather
-		// than being dropped, or a future state would silently vanish from the
-		// reconciliation.
+		// The column is deliberately unconstrained TEXT so the state machine can be extended
+		// without a migration. An unknown literal must therefore surface rather than being
+		// dropped, or a future state would silently vanish from the reconciliation.
 		db, mock := newSQLMock(t)
 		ds := Datasource{Conn: db}
 
@@ -5256,17 +4596,7 @@ func TestCountEventOutboxByStatus_ErrorsAreWrapped(t *testing.T) {
 // TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr documents a subtle and
 // easily-misread interaction between the deferred close and the rows.Err() check.
 //
-// Each read in event_outbox.go closes its result set in a defer that LOGS rather than
-// returns, and the reasoning is sound: for ClaimPendingEventOutbox the batch has already
-// been claimed by the time the rows are closed, so the rows are LEASED IN THE DATABASE,
-// and failing there would make the relay discard a batch it already owns and leave those
-// events un-published until the lease expired.
-//
 // It is tempting to read that defer as meaning "a close failure can never fail a read".
-// IT DOES NOT, and this test is what stops the next reader believing it. database/sql
-// folds a DRIVER-reported close failure into (*sql.Rows).Err(), and rows.Err() IS checked
-// and returned. So a driver that fails on close does produce a typed internal error — by
-// way of the Err() branch rather than the defer.
 //
 // The distinction is worth pinning down, because the two behaviours are correct for
 // different reasons and a refactor could easily collapse them:
@@ -5277,11 +4607,6 @@ func TestCountEventOutboxByStatus_ErrorsAreWrapped(t *testing.T) {
 //   - The deferred close must stay non-failing, because by the time it runs the caller
 //     already has a complete, usable result and the only remaining question is
 //     bookkeeping.
-//
-// One consequence worth stating plainly: the defer's logging branch is NOT reachable
-// through sqlmock, because database/sql has already performed and recorded the underlying
-// close by the time the defer runs. Those few statements are defensive and are left
-// deliberately uncovered rather than covered by a test asserting something untrue.
 func TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr(t *testing.T) {
 	closeErr := errors.New("connection reset while closing rows")
 
@@ -5356,10 +4681,10 @@ func TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr(t *testing.T)
 		batchErr := insertEventOutboxesInTx(ctx, tx, []*model.EventOutbox{pending})
 		require.NoError(t, tx.Rollback())
 
-		// On the WRITE path this conservative outcome is the right one: if the driver
-		// cannot vouch for the RETURNING stream, the safe assumption is that not every
-		// event was recorded, and rolling the ledger mutation back beats committing one
-		// whose event may be missing.
+		// On the WRITE path this conservative outcome is the right one: if the driver cannot
+		// vouch for the RETURNING stream, the safe assumption is that not every event was
+		// recorded, and rolling the ledger mutation back beats committing one whose event may
+		// be missing.
 		requireAPIError(t, batchErr, apierror.ErrInternalServer)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
@@ -5367,17 +4692,10 @@ func TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr(t *testing.T)
 
 // ===========================================================================
 // TIER 1 — the subscriber registry's secret-handling posture
-//
-// This lives here rather than in a file of its own because the property is
-// structural and belongs beside the other repository-layer invariants.
 // ===========================================================================
 
 // credentialBearingIdentifier reports whether a name looks like it carries a
 // recoverable credential.
-//
-// "reference", "hash" and "digest" are deliberately NOT on this list: a non-reversible
-// reference to a credential is exactly what the registry is supposed to store, so
-// matching those would flag the correct design as a violation.
 func credentialBearingIdentifier(name string) bool {
 	lowered := strings.ToLower(name)
 	for _, forbidden := range []string{"password", "passwd", "secret", "plaintext", "cleartext"} {
@@ -5391,34 +4709,17 @@ func credentialBearingIdentifier(name string) bool {
 // TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret asserts the
 // secret-handling posture MECHANICALLY rather than by eyeballing the source.
 //
-// The posture: a SASL password is issued exactly once by the service layer that owns
-// issuance, and this repository persists only a NON-REVERSIBLE REFERENCE plus the
-// issuance instant. It mirrors the existing API-key posture, in which keys are hashed
-// and the raw key is never stored. The registry must therefore have no way — through
-// any parameter, any return value, or any field of any returned struct — to carry a
-// recoverable credential.
-//
 // Three independent structural checks, because the property can be broken in three
 // different places:
 //
 //  1. REFLECTION over the eventSubscriber interface's method set, walking every
-//     parameter and return type transitively into struct fields. This is the check that
-//     survives refactoring: it does not care what the source looks like, only what the
-//     types can carry.
+//     parameter and return type transitively into struct fields.
 //  2. AST PARSING of database/event_subscriber.go's import block, to confirm no
-//     password-hashing library is imported here. Hashing and derivation belong to the
-//     caller that owns issuance; importing one in the repository would signal that this
-//     layer handles raw credentials, which is the design mistake being prevented. The
-//     imports are parsed rather than grepped ON PURPOSE — the file's own documentation
-//     MENTIONS golang.org/x/crypto/bcrypt in prose, so a text search returns a
-//     false positive and would make this test pass or fail for the wrong reason.
+//     password-hashing library is imported here.
 //  3. Exported method signatures on Datasource whose names begin with the subscriber
 //     prefixes, checked for credential-bearing PARAMETER names in the source, since a
 //     parameter named `password` would be a design regression even if its type were a
 //     harmless string.
-//
-// A source-level assertion is legitimate here: the property being protected is
-// structural, and structural properties are best defended structurally.
 func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) {
 	subscriberRepo := reflect.TypeOf((*eventSubscriber)(nil)).Elem()
 	require.Positive(t, subscriberRepo.NumMethod(), "the eventSubscriber interface must declare methods")
@@ -5463,9 +4764,9 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 			}
 		}
 
-		// The reference and its issuance timestamp together are the complete stored
-		// record of an issuance, so their absence would mean the posture had been
-		// abandoned rather than tightened.
+		// The reference and its issuance timestamp together are the complete stored record of
+		// an issuance, so their absence would mean the posture had been abandoned rather than
+		// tightened.
 		subscriber := reflect.TypeOf(model.EventSubscriber{})
 		_, hasReference := subscriber.FieldByName("CredentialReference")
 		assert.True(t, hasReference, "the registry must keep a non-reversible credential reference")
@@ -5529,84 +4830,23 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 
 // ===========================================================================
 // TIER 2 — the real-database tier
-//
-// Every test below carries a _RealDB suffix and opens its connection through
-// openRealTestDB, which skips the test when no database is reachable so that the
-// default suite stays green without infrastructure.
-//
-// These tests prove what a mock physically cannot: FOR UPDATE SKIP LOCKED under real
-// contention, FIFO ordering decided by the planner rather than by a script, lease
-// expiry against the database clock, and the query plan itself.
 // ===========================================================================
 
-// quiesceEventOutbox RETIRES every UNRELATED row that is still in a claim-visible state,
-// so that this test's claim assertions see only its own fixtures, and registers a cleanup
-// that retires this test's fixtures the same way.
+// quiesceEventOutbox RETIRES every UNRELATED row that is still in a claim-visible
+// state, so that this test's claim assertions see only its own fixtures, and registers
+// a cleanup that retires this test's fixtures the same way.
 //
-// It is not optional hygiene — without it these tests are FLAKY AND POLLUTING. The test
-// database is shared and rows persist between runs, so an unquiesced claim picks up
-// whatever another test or an earlier run left behind and the assertions become
-// non-deterministic. The cleanup half matters just as much: fixtures left claimable would
-// be claimed by a later run's assertions, or chewed by a relay started elsewhere.
+// It is not optional hygiene — without it these tests are FLAKY AND POLLUTING.
 //
-// # WHY UNRELATED ROWS ARE RETIRED RATHER THAN PARKED, AND UNCONDITIONALLY
+// Parking is the weaker instrument for two structural reasons, and retiring is immune
+// to both:
 //
-// This used to park them instead — set locked_until an hour into the future, and only for
-// rows whose lease was already NULL or lapsed. That was measurably not enough: running the
-// database package repeatedly failed roughly one run in three or four, and the failing test
-// rotated between every assertion in this file that reads a GLOBAL claim or a GLOBAL status
-// count — "row was not claimed", "every fixture must be claimed exactly once ... but has 2",
-// "the backlog must drain rather than stall", and status deltas larger than the fixtures
-// inserted. A diagnostic run confirmed the shape directly: immediately after the parking
-// UPDATE returned without error, a foreign row from an earlier test was still sitting in the
-// claimable set.
-//
-// Parking is the weaker instrument for two structural reasons, and retiring is immune to
-// both:
-//
-//   - A LEASE IS A TIME WINDOW AND A STATUS IS NOT. Parking asserts nothing about the row
-//     after the hour, and it silently declines to touch a row whose lease has not yet
-//     lapsed — the exact rows a crashed or interrupted earlier test leaves behind. Moving
-//     the row to a terminal status removes it from the claim by the one predicate the claim
-//     cannot ignore.
-//   - THE CLAIM READS MORE THAN THE LEASE. It orders the whole claimable set by occurred_at
-//     and takes the first batch, and it excludes a row when an EARLIER row shares its
-//     EFFECTIVE key — its ledger where it has one, its stored partition key where it does
-//     not — and is still pending or processing. A foreign row that survives parking
-//     can therefore starve a fixture out of the batch or block its key, and both read as a
+//   - A LEASE IS A TIME WINDOW AND A STATUS IS NOT. Parking asserts nothing about the
+//     row after the hour, and it silently declines to touch a row whose lease has not
+//     yet lapsed — the exact rows a crashed or interrupted earlier test leaves behind.
+//   - THE CLAIM READS MORE THAN THE LEASE. A foreign row that survives parking can
+//     therefore starve a fixture out of the batch or block its key, and both read as a
 //     product defect in the claim rather than as pollution in the table.
-//
-// Retiring an unrelated row is safe because it is, by construction, a leftover: the test
-// that created it has finished, so nothing is still asserting on it. It is exactly what that
-// test's own cleanup was supposed to do.
-//
-// It mirrors quiesceOutbox, which does the same job for blnk.lineage_outbox, with two
-// differences that follow from this table's state machine: the claim-visible set here spans
-// pending, processing AND replaying rather than pending alone, and the terminal state used
-// to retire rows is dispatched rather than completed.
-// foreignEventOutboxIndexes returns the indexes present on blnk.event_outbox that NO migration
-// in this build creates, sorted by name.
-//
-// # Why a test needs to know this
-//
-// The plan assertion in TestClaimPendingEventOutbox_UsesClaimIndex_RealDB is a statement about
-// which of THIS BUILD'S indexes the planner chooses. On a shared development database the
-// available set can be larger: a database that has had another build's migrations applied keeps
-// that build's indexes, the planner costs them alongside this build's, and a cheaper foreign
-// index wins. The assertion then fails on a plan this build's schema cannot produce — and
-// widening it to accept the foreign index would make it vacuous, because a foreign index need
-// not have the partial predicate the guarantee depends on.
-//
-// # Why the expected set is read from the migration files
-//
-// Restating the index names in the test would be a second declaration of the schema, and it
-// would go stale silently in the direction that matters: a migration that ADDED an index would
-// make this function report the new index as foreign and skip the assertion for ever. Reading
-// sql/*.sql means the expected set is whatever this build actually creates, by construction.
-//
-// A name is matched anywhere in a migration, deliberately: an index may be created in one file
-// and dropped and recreated in a later one, and every mention is evidence that this build owns
-// the name.
 //
 // Parameters:
 //   - t *testing.T: the test, for fatal reporting.
@@ -5614,7 +4854,8 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 //   - ds Datasource: the connection to read pg_indexes through.
 //
 // Returns:
-//   - []string: index names present in the database and absent from this build's migrations.
+//   - []string: index names present in the database and absent from this build's
+//     migrations.
 func foreignEventOutboxIndexes(t *testing.T, ctx context.Context, ds Datasource) []string {
 	t.Helper()
 
@@ -5671,16 +4912,17 @@ func foreignEventOutboxIndexes(t *testing.T, ctx context.Context, ds Datasource)
 func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 	t.Helper()
 
-	// EXCLUSIVE USE OF THE TABLE FIRST, before anything is retired. Retiring is a whole-table
-	// write and the straggler assertion below is a whole-table read, and the root package's live
-	// tiers claim from the same table in another PROCESS — so without this the two corrupt each
-	// other in both directions. lockEventOutboxTier documents it in full.
+	// EXCLUSIVE USE OF THE TABLE FIRST, before anything is retired. Retiring is a
+	// whole-table write and the straggler assertion below is a whole-table read, and the
+	// root package's live tiers claim from the same table in another PROCESS — so without
+	// this the two corrupt each other in both directions. lockEventOutboxTier documents it
+	// in full.
 	lockEventOutboxTier(t, ds.Conn)
 
-	// Keyed on AGGREGATE_ID and not on event_id. event_id must now be a canonical
-	// UUID — it is the subscriber's idempotency key, so the persistence layer refuses
-	// any other spelling — which leaves no room for a test marker in it. aggregate_id
-	// is unconstrained and carries the marker instead.
+	// Keyed on AGGREGATE_ID and not on event_id. event_id must now be a canonical UUID —
+	// it is the subscriber's idempotency key, so the persistence layer refuses any other
+	// spelling — which leaves no room for a test marker in it. aggregate_id is
+	// unconstrained and carries the marker instead.
 	_, err := ds.Conn.Exec(`
 		UPDATE blnk.event_outbox
 		SET status = 'dispatched', dispatched_at = NOW(), locked_until = NULL, claim_token = NULL
@@ -5704,17 +4946,8 @@ func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 			"a straggler starves this test's fixtures out of the claim batch or blocks their partition key")
 
 	// DELETED, not retired. Retiring took the fixtures out of the claim, which is all the
-	// assertions in this file need, and left every row in the table for ever: one narrow subset
-	// of this tier left 301 rows behind, and four full runs left 5,698. That residue is not
-	// inert. It makes every subsequent claim read past it, it is what made a shared database a
-	// cross-test hazard, and a retired row records the broker coordinate it was dispatched to
-	// under a unique index on (kafka_topic, kafka_partition, kafka_offset) — so after a broker
-	// reset, when topic offsets restart at zero, a stale row's coordinate collides with a live
-	// publish and the relay cannot mark the new row dispatched at all.
-	//
-	// Both the aggregate id and the partition key are matched: newEventOutboxFixture derives
-	// both from the marker, but a test that is ABOUT same-key behaviour sets the aggregate id
-	// itself, and a cleanup that silently stopped covering those rows is the state this replaces.
+	// assertions in this file need, and left every row in the table for ever: one narrow
+	// subset of this tier left 301 rows behind, and four full runs left 5,698.
 	t.Cleanup(func() {
 		result, cleanupErr := ds.Conn.Exec(`
 			DELETE FROM blnk.event_outbox
@@ -5723,9 +4956,9 @@ func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 		if cleanupErr != nil {
 			// FAILS the test rather than logging, for the reasons the comment above already
 			// gives: a leaked row makes every subsequent claim read past it and its retired
-			// broker coordinate collides with a live publish after an offset reset, so the
-			// relay cannot mark the NEW row dispatched at all. That is a failure this test
-			// caused, and a log line lets it be reported as a pass.
+			// broker coordinate collides with a live publish after an offset reset, so the relay
+			// cannot mark the NEW row dispatched at all. That is a failure this test caused, and
+			// a log line lets it be reported as a pass.
 			t.Errorf("failed to remove event outbox fixtures for marker %q: %v",
 				markerPrefix, cleanupErr)
 		} else if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
@@ -5780,13 +5013,7 @@ func isMarkedEventOutbox(entry model.EventOutbox, markerPrefix string) bool {
 // claimEventOutboxToken claims a specific pending row and returns the claim token the
 // claim issued, which every subsequent transition must present.
 //
-// It exists because a transition is no longer addressable by row id alone. Threading
-// the real token through these tests is not ceremony: it is what makes them exercise
-// the same conditional path production takes, so a transition that stopped checking the
-// token would fail here rather than pass.
-//
-// It requires that the row actually be claimed, because a silently unclaimed row would
-// turn every following assertion into a test of the failure path.
+// It exists because a transition is no longer addressable by row id alone.
 func claimEventOutboxToken(t *testing.T, ds Datasource, entry *model.EventOutbox) string {
 	t.Helper()
 
@@ -5809,12 +5036,7 @@ func claimEventOutboxToken(t *testing.T, ds Datasource, entry *model.EventOutbox
 // inserted through the production path reads back with every field intact.
 //
 // The payload is compared by BYTE EQUALITY, and that is the whole point of the two body
-// columns. The read projects payload_raw, which is BYTEA and therefore returns the
-// producer's exact bytes; the JSONB payload column, which PostgreSQL normalises on write,
-// exists only for SQL-side containment and extraction queries and is never read as the
-// body. Asserting equivalence here instead of equality would pass just as well against a
-// projection that returned the normalised bytes — which is precisely the defect the second
-// column removes, and precisely what acceptance criteria V-8 and V-9 compare.
+// columns.
 func TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -5855,18 +5077,17 @@ func TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB(t *testing.T) {
 // TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte is the test the
 // byte-preserving column exists for.
 //
-// The fixture payload is close to canonical, so it would round-trip through JSONB looking
-// almost right — which is exactly why this second case is needed. Every element of the
-// body below is one PostgreSQL's JSONB parser is documented to change:
+// The fixture payload is close to canonical, so it would round-trip through JSONB
+// looking almost right — which is exactly why this second case is needed. Every element
+// of the body below is one PostgreSQL's JSONB parser is documented to change:
 //
-//   - member order that is NOT the order JSONB stores in (it sorts by length, then bytes)
+//   - member order that is NOT the order JSONB stores in (it sorts by length, then
+//     bytes)
 //   - insignificant whitespace, which JSONB renormalises rather than merely strips
 //   - a 17-digit integer, beyond float64's exact range
 //   - a trailing zero in a decimal, which a re-marshal would drop
 //   - exponent notation, which JSONB expands
 //   - a duplicate key, which JSONB collapses to its last occurrence
-//
-// If the read ever goes back to the JSONB column, this test fails on the first of them.
 func TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -5902,11 +5123,12 @@ func TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte(t *testin
 }
 
 // TestInsertEventOutbox_DuplicateEventIDIsRejectedByTheUniqueIndex_RealDB proves the
-// exactly-once WRITE-SIDE guarantee is enforced by the SCHEMA and not merely intended by
-// the code.
+// exactly-once WRITE-SIDE guarantee is enforced by the SCHEMA and not merely intended
+// by the code.
 //
-// event_outbox_event_id_uidx is what makes event_id usable as the subscriber idempotency
-// key: a consumer can only deduplicate on it if it is genuinely unique in the first place.
+// event_outbox_event_id_uidx is what makes event_id usable as the subscriber
+// idempotency key: a consumer can only deduplicate on it if it is genuinely unique in
+// the first place.
 func TestInsertEventOutbox_DuplicateEventIDIsRejectedByTheUniqueIndex_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -5923,13 +5145,7 @@ func TestInsertEventOutbox_DuplicateEventIDIsRejectedByTheUniqueIndex_RealDB(t *
 }
 
 // TestInsertEventOutboxInTx_RolledBackWithLedgerTransaction_RealDB is the real-database
-// half of the requirement R-2 proof.
-//
-// The sqlmock counterpart proves the insert is ISSUED on the caller's transaction; this
-// proves the consequence that actually matters — after a rollback the row is GENUINELY
-// ABSENT from the table, and after a commit it is genuinely present. Together they close
-// the guarantee from both ends: an event cannot outlive a rolled-back mutation, and it
-// cannot go missing from a committed one.
+// half of the requirement proof.
 func TestInsertEventOutboxInTx_RolledBackWithLedgerTransaction_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -5978,20 +5194,12 @@ func TestInsertEventOutboxInTx_RolledBackWithLedgerTransaction_RealDB(t *testing
 //
 // The fixtures are inserted so that their occurred_at order DELIBERATELY DISAGREES with
 // their insertion order — the row inserted first has the LATEST occurred_at — which is
-// exactly the situation the two columns are silently interchangeable in every other test.
-// created_at and id both follow insertion order, so:
+// exactly the situation the two columns are silently interchangeable in every other
+// test. created_at and id both follow insertion order, so:
 //
-//   - ordering by occurred_at returns them oldest-occurrence first, which is the reverse
-//     of the insertion order;
+//   - ordering by occurred_at returns them oldest-occurrence first, which is the
+//     reverse of the insertion order;
 //   - ordering by created_at or id returns them in insertion order.
-//
-// A copy-paste "fix" toward created_at, matching the neighbouring lineage claim, leaves
-// every other test in this suite green and fails only here. That is why this test exists
-// and why the disagreement is constructed rather than incidental.
-//
-// This is acceptance criterion V-6: per-aggregate ordering. All fixtures deliberately
-// share one aggregate and one ledger, so they would all be pinned to a single Kafka
-// partition and this claim order becomes the order a consumer observes.
 func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6027,13 +5235,9 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 		insertionOrder = append(insertionOrder, entry.EventID)
 	}
 
-	// ONE AT A TIME, and that is the guarantee rather than a limitation of the test.
-	// Every fixture shares a partition key, and at most one row per key may be in
-	// flight — otherwise a second relay could claim a later row of the same key while
-	// an earlier one was still being published, and because Kafka preserves APPEND
-	// order rather than occurred_at, a subscriber would observe the aggregate's events
-	// out of order. So the batch is drained by claiming, retiring, and claiming again,
-	// and the sequence that comes out is the sequence a consumer sees.
+	// ONE AT A TIME, and that is the guarantee rather than a limitation of the test. So
+	// the batch is drained by claiming, retiring, and claiming again, and the sequence
+	// that comes out is the sequence a consumer sees.
 	drained := make([]string, 0, len(inserted))
 	for len(drained) < len(inserted) {
 		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
@@ -6070,24 +5274,10 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 }
 
 // TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB is the
-// direct proof of the ORD-01 predicate, and it is the test SKIP LOCKED alone cannot pass.
+// direct proof of the per-key exclusion predicate, and it is the test SKIP LOCKED alone cannot
+// pass.
 //
-// # The failure it guards against
-//
-// FOR UPDATE SKIP LOCKED makes it impossible for two relays to claim the SAME row. It
-// does nothing about two relays claiming two DIFFERENT rows of the same aggregate out of
-// order: relay B skips the earlier row relay A holds and claims a LATER row with the same
-// key. Kafka preserves append order, not occurred_at, so relay B's message can land
-// first and a subscriber observes transaction.applied before transaction.queued for one
-// transaction — with no error, no log line, and nothing in the row state to show it.
-//
-// # What is asserted
-//
-// Two rows share a key and a third has its own. A first claim may take the earlier
-// same-key row and the independent row, and MUST NOT take the later same-key row. Only
-// once the earlier row leaves the blocking states does its successor become claimable.
-// The independent row proves the predicate is scoped to the key rather than serialising
-// the whole table, which would have destroyed throughput while passing the ordering test.
+// FOR UPDATE SKIP LOCKED makes it impossible for two relays to claim the SAME row.
 func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6121,8 +5311,8 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 		"the exclusion must be scoped to the partition key: serialising unrelated keys would destroy throughput")
 
 	// A second poll, with the earlier row still held, must still refuse its successor —
-	// which is the multi-relay case, since a second relay's poll is indistinguishable
-	// from a second poll here.
+	// which is the multi-relay case, since a second relay's poll is indistinguishable from
+	// a second poll here.
 	second, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
 	require.NoError(t, err)
 	assert.False(t, containsEventID(second, later.EventID),
@@ -6165,15 +5355,9 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 }
 
 // TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB pins the
-// deliberate trade inside the ORD-01 predicate.
+// deliberate trade inside the per-key exclusion predicate.
 //
-// The blocking set is pending and processing ONLY. A row that has spent its retry budget
-// (failed) or been preserved on its dead-letter topic (dead_lettered) does NOT hold its
-// key back. Strict ordering would demand that it did — but then a single permanently
-// undeliverable event would stall every subsequent event for that aggregate
-// indefinitely, which is a worse failure than a gap. That trade is asserted here so it
-// cannot be "tightened" into a stall by someone who reads the predicate and assumes the
-// narrower state list was an oversight.
+// The blocking set is pending and processing ONLY.
 func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6211,23 +5395,6 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 // property no mock can give, and the one the two-leg design rests on.
 //
 // SUNSET: this test goes with the legacy leg.
-//
-// # Two facts, and they pull in opposite directions
-//
-// A webhook_pending row must be CLAIMABLE — otherwise its outstanding webhook is never
-// enqueued, which is the defect the state exists to fix — and it must NOT BLOCK its
-// partition key, because it has already been published to Kafka and its position in the
-// partition is fixed. Blocking would let a failing legacy enqueue stall Kafka delivery
-// for the whole aggregate: the deprecated transport interfering with the one replacing
-// it.
-//
-// The two facts live in two different SQL predicates — the claim's status list and the
-// NOT EXISTS blocking list — backed by two different partial indexes whose WHERE clauses
-// must match them. Only a real database evaluates all four together.
-//
-// The re-claimed row is additionally asserted to carry kafka_dispatched_at, because that
-// is what tells the relay to publish nothing: without it, retrying the webhook would put
-// a duplicate on the topic.
 func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6286,21 +5453,23 @@ func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_Real
 	}
 }
 
-// TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB is the renewal proof
-// a mock cannot give: sqlmock has no clock, so it can show the statement is issued but never that
-// the row is still unclaimable after the lease it was claimed under would have expired.
+// TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB is the
+// renewal proof a mock cannot give: sqlmock has no clock, so it can show the statement
+// is issued but never that the row is still unclaimable after the lease it was claimed
+// under would have expired.
 //
-// Four properties are asserted, and each rules out a different way of getting this wrong:
+// Four properties are asserted, and each rules out a different way of getting this
+// wrong:
 //
-//   - The renewal EXTENDS the rows still in flight, so a batch that outlives its own lease keeps
-//     it and no second instance can claim those rows out from under it.
-//   - It leaves FINISHED rows alone. A dispatched row has had its token cleared, so it is outside
-//     the statement's reach — and it must be, or a terminal row would be handed a live lease and
-//     appear to an operator as work in progress.
-//   - The count reports what was extended, which is what lets the heartbeat retire itself when
-//     the batch is done rather than renewing an empty set for ever.
-//   - ANOTHER instance's token extends nothing, which is what makes the token an ownership claim
-//     rather than a shared handle.
+//   - The renewal EXTENDS the rows still in flight, so a batch that outlives its own
+//     lease keeps it and no second instance can claim those rows out from under it.
+//   - It leaves FINISHED rows alone. A dispatched row has had its token cleared, so it
+//     is outside the statement's reach — and it must be, or a terminal row would be
+//     handed a live lease and appear to an operator as work in progress.
+//   - The count reports what was extended, which is what lets the heartbeat retire
+//     itself when the batch is done rather than renewing an empty set for ever.
+//   - ANOTHER instance's token extends nothing, which is what makes the token an
+//     ownership claim rather than a shared handle.
 func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6393,27 +5562,26 @@ func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t
 		"another instance's token must extend nothing: the token is an ownership claim, not a shared handle")
 }
 
-// TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB is
-// the F14 limbo, walked end to end against the real table.
+// TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB
+// is the F14 limbo, walked end to end against the real table.
 //
-// The sequence is the production one: a row spends its retry budget, its dead-letter write fails,
-// and it is left at 'failed' with dlt_topic NULL. What is asserted is that this row —
+// The sequence is the production one: a row spends its retry budget, its dead-letter
+// write fails, and it is left at 'failed' with dlt_topic NULL.
 //
 //   - is INVISIBLE to the ordinary claim, because that predicate admits only attempts <
 //     max_attempts, which is exactly why the repair pass has to exist;
-//   - is invisible to the REPAIR claim too while the hand-off lease the exhaustion transition
-//     left on it is still live, which is what stops the repair pass racing the worker that owes
-//     the dead-letter write (F-28);
-//   - IS reachable by the repair claim once that lease lapses, which leaves the status at
-//     'failed' and stamps a fresh token;
-//   - is protected by its new lease from being repaired twice at once;
-//   - can then complete through the ORDINARY MarkEventDeadLettered transition, which accepts
-//     'failed' as a prior state precisely so no second code path is needed; and
-//   - fences the token the failed worker was holding, so a straggler cannot preserve a row the
-//     repair has taken over.
+//   - is invisible to the REPAIR claim too while the hand-off lease the exhaustion
+//     transition left on it is still live, which is what stops the repair pass racing
+//     the worker that owes
 //
-// A row that WAS preserved is seeded alongside it and must never be claimed, because a repair
-// pass that re-claimed dead-lettered rows would rewrite their dead-letter records for ever.
+// the dead-letter write;
+//   - IS reachable by the repair claim once that lease lapses, which leaves the status
+//     at 'failed' and stamps a fresh token;
+//   - is protected by its new lease from being repaired twice at once;
+//   - can then complete through the ORDINARY MarkEventDeadLettered transition, which
+//     accepts 'failed' as a prior state precisely so no second code path is needed; and
+//   - fences the token the failed worker was holding, so a straggler cannot preserve a
+//     row the repair has taken over.
 func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6434,9 +5602,9 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 	preserved.MaxAttempts = 1
 	insertRealEventOutbox(t, ds, preserved)
 
-	// Both rows fail their only attempt. They are claimed in ONE batch — their partition keys
-	// differ, so nothing serialises them — and the tokens are captured together, because a second
-	// claim would find them already leased under the first one.
+	// Both rows fail their only attempt. They are claimed in ONE batch — their partition
+	// keys differ, so nothing serialises them — and the tokens are captured together,
+	// because a second claim would find them already leased under the first one.
 	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
 	require.NoError(t, err)
 
@@ -6474,16 +5642,11 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 		"a row whose retry budget is spent must be outside the ordinary claim: if it were not, this "+
 			"test would be exercising the retry path rather than the repair")
 
-	// AND IT IS NOT REACHABLE BY THE REPAIR PASS EITHER, YET. This is the F-28 regression, and it
-	// is the assertion the earlier arrangement failed.
+	// AND IT IS NOT REACHABLE BY THE REPAIR PASS EITHER, YET. This is the regression guard,
+	// and it is the assertion the earlier arrangement failed.
 	//
-	// The exhaustion arm RETAINS the claim token so that only the worker which spent the last
-	// attempt may write the dead-letter message and record it. That retention is only worth
-	// anything if the row also stays LEASED: this repair claim admits a failed row with no
-	// dlt_topic and no live lease, and it stamps a FRESH token over whatever was there. When the
-	// exhaustion arm cleared locked_until, a second instance could therefore take the row in the
-	// same instant, overwrite the token the owning worker was about to present, and publish the
-	// dead-letter message alongside it — two copies of one event on the .dlt topic.
+	// The exhaustion arm RETAINS the claim token so that only the worker which spent the
+	// last attempt may write the dead-letter message and record it.
 	tooSoon, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
 	require.NoError(t, err)
 	require.False(t, containsEventID(tooSoon, stranded.EventID),
@@ -6492,8 +5655,8 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 			"puts two copies of one event on a dead-letter topic")
 
 	// EXPIRING THE LEASE is how the owning worker's death is modelled, and it is the only
-	// condition under which the repair pass should see the row. Written directly because there
-	// is no API for "that process is gone" — the lease lapsing IS that statement.
+	// condition under which the repair pass should see the row. Written directly because
+	// there is no API for "that process is gone" — the lease lapsing IS that statement.
 	_, err = ds.Conn.ExecContext(ctx,
 		`UPDATE blnk.event_outbox SET locked_until = NOW() - INTERVAL '1 second' WHERE id = $1`,
 		stranded.ID)
@@ -6559,33 +5722,17 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 		"once preserved, the row must leave the repair backlog for good")
 }
 
-// TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB proves that concurrent relay
-// instances never publish the same event twice, and sqlmock cannot give it: a mock has no
-// locking semantics at all.
+// TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB proves that concurrent
+// relay instances never publish the same event twice, and sqlmock cannot give it: a
+// mock has no locking semantics at all.
 //
 // Two properties are asserted, and both are needed:
 //
-//   - DISJOINTNESS. No row may appear in two workers' batches. Without the row lock entirely,
-//     two relay instances can claim the same row and publish the same event twice.
+//   - DISJOINTNESS. No row may appear in two workers' batches. Without the row lock
+//     entirely, two relay instances can claim the same row and publish the same event
+//     twice.
 //   - NO STARVATION. Every fixture must be claimed exactly once across the workers, so
 //     the whole backlog is drained.
-//
-// # What this test does NOT prove, and why a second one exists
-//
-// It does not prove SKIP LOCKED, and it is important not to read it as though it did. The
-// claim is a SINGLE autocommit statement, so the row locks it takes are released the instant
-// it returns. Two concurrent claimers with SKIP LOCKED removed would therefore BLOCK on each
-// other for microseconds, unblock when the other statement committed, re-evaluate the row
-// under READ COMMITTED, find it is no longer pending, and move on — arriving at exactly the
-// disjoint, fully-drained outcome asserted below. Both assertions here survive deleting SKIP
-// LOCKED from the query.
-//
-// That matters because SKIP LOCKED is doing real work: at 500 events per second across
-// several relay instances, a claimer that queues behind another's lock instead of skipping it
-// serialises the whole pipeline. Proving it needs a lock that OUTLIVES the claim statement,
-// which no self-contained concurrent claim can produce.
-// TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB holds exactly such
-// a lock and is where that property is established.
 func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6647,48 +5794,29 @@ func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T
 		"every fixture must be claimed exactly once across the workers; a short count means workers blocked on each other rather than skipping locked rows")
 }
 
-// TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB is the SKIP LOCKED
-// proof, and it is the only test in this file that can be one.
+// TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB is the SKIP
+// LOCKED proof, and it is the only test in this file that can be one.
 //
-// # Why the concurrent-claim test is not enough
+// The neighbouring disjointness test lines four claimers up against twenty rows and
+// asserts that no row is claimed twice and none is left behind.
 //
-// The neighbouring disjointness test lines four claimers up against twenty rows and asserts
-// that no row is claimed twice and none is left behind. Both hold with SKIP LOCKED deleted.
-// The claim is one autocommit statement, so its row locks live only for the duration of that
-// statement: a claimer without SKIP LOCKED waits microseconds for the other statement to
-// commit, re-evaluates the row it was waiting on, finds it is `processing` now, and skips it
-// anyway. The outcome is identical and the property is untested.
+// It holds a row lock that the claim CANNOT outlast. A second connection opens an
+// explicit transaction, takes `SELECT ...
 //
-// # What this test does instead
-//
-// It holds a row lock that the claim CANNOT outlast. A second connection opens an explicit
-// transaction, takes `SELECT ... FOR UPDATE` on the FIFO-earliest claimable row, and keeps it
-// open across the claim. Two behaviours then diverge completely:
-//
-//   - WITH SKIP LOCKED the locked row is passed over, the next candidate is locked instead,
-//     and the claim returns promptly with a different row.
-//   - WITHOUT IT the claim blocks on the lock for as long as the holder keeps it — here, until
-//     the context deadline expires and the claim fails outright.
-//
-// So the assertion is not a statistical one about contention. It is: the claim answered, it
-// answered with the OTHER row, it answered quickly, and the lock was still held when it did.
-//
-// # And the row is skipped, not excluded
-//
-// A claim that simply refused to consider the locked row would satisfy all of that while
-// stranding it for ever, so the lock is released and the parked row is required to become
-// claimable again. That is what makes "skipped" mean deferred rather than dropped — and it is
-// the difference between SKIP LOCKED and a bug that silently drains part of the backlog.
+//   - WITH SKIP LOCKED the locked row is passed over, the next candidate is locked
+//     instead, and the claim returns promptly with a different row.
+//   - WITHOUT IT the claim blocks on the lock for as long as the holder keeps it —
+//     here, until the context deadline expires and the claim fails outright.
 func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("skiplock")
 	quiesceEventOutbox(t, ds, marker)
 
-	// Two rows with DIFFERENT partition keys, which newEventOutboxFixture gives by default and
-	// which is load-bearing here: at most one row per partition key is claimable at a time, so
-	// two rows sharing a key would leave the second unclaimable for a reason that has nothing to
-	// do with locking and the test would pass without proving anything.
+	// Two rows with DIFFERENT partition keys, which newEventOutboxFixture gives by default
+	// and which is load-bearing here: at most one row per partition key is claimable at a
+	// time, so two rows sharing a key would leave the second unclaimable for a reason that
+	// has nothing to do with locking and the test would pass without proving anything.
 	base := dbTimestamp(time.Now().Add(-time.Hour))
 
 	parked := newEventOutboxFixture(marker)
@@ -6699,11 +5827,10 @@ func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t 
 	successor.OccurredAt = base.Add(time.Second)
 	insertRealEventOutbox(t, ds, successor)
 
-	// The FIFO-earliest row is the one locked, deliberately. It is the row the claim's ORDER BY
-	// reaches FIRST, so a claimer that blocks blocks immediately and a claimer that skips has to
-	// carry on to a later candidate — the arrangement in which the two behaviours are furthest
-	// apart. Locking a later row would let a blocking claimer succeed on the first candidate and
-	// prove nothing.
+	// The FIFO-earliest row is the one locked, deliberately. It is the row the claim's
+	// ORDER BY reaches FIRST, so a claimer that blocks blocks immediately and a claimer
+	// that skips has to carry on to a later candidate — the arrangement in which the two
+	// behaviours are furthest apart.
 	holder, err := ds.Conn.BeginTx(ctx, nil)
 	require.NoError(t, err, "opening the transaction that holds the row lock")
 
@@ -6729,9 +5856,9 @@ func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t 
 		"the holder transaction must take the row lock")
 	require.Equal(t, parked.ID, lockedID)
 
-	// A DEADLINE IS THE INSTRUMENT. Without SKIP LOCKED the claim waits on the lock above, which
-	// is never released inside this window, so the deadline is what converts an indefinite block
-	// into a reportable failure instead of a hung test.
+	// A DEADLINE IS THE INSTRUMENT. Without SKIP LOCKED the claim waits on the lock above,
+	// which is never released inside this window, so the deadline is what converts an
+	// indefinite block into a reportable failure instead of a hung test.
 	claimCtx, cancelClaim := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelClaim()
 
@@ -6766,9 +5893,10 @@ func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t 
 		"the holder transaction must still be open, or the claim may simply have waited it out")
 	require.Equal(t, parked.ID, stillLocked)
 
-	// SKIPPED MEANS DEFERRED, NOT DROPPED. Release the lock and the parked row must re-enter the
-	// claimable set; a claim that had excluded it rather than skipped it would strand the oldest
-	// event in the backlog for ever while reporting a healthy drain.
+	// SKIPPED MEANS DEFERRED, NOT DROPPED. Release the lock and the parked row must
+	// re-enter the claimable set; a claim that had excluded it rather than skipped it
+	// would strand the oldest event in the backlog for ever while reporting a healthy
+	// drain.
 	release()
 
 	reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 5, testSettlementLease)
@@ -6779,22 +5907,10 @@ func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t 
 }
 
 // TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB is the crash-recovery
-// mechanism behind acceptance criterion V-7.
+// mechanism behind the acceptance criterion.
 //
-// A relay that dies mid-batch leaves its rows in processing with a lease that nobody will
-// release. The lease — rather than an in-memory marker — is what makes those rows
-// recoverable: once locked_until passes they re-enter the claimable set and another relay
-// instance picks them up. Without this, a single relay crash would strand every in-flight
-// event permanently, and the outbox would guarantee durability of rows while still losing
-// the events.
-//
-// This is also the one behaviour where this table deliberately differs from
-// blnk.lineage_outbox, whose claim admits only pending rows and therefore CANNOT reclaim a
-// crashed processor's work — a limitation the lineage test suite documents as a suspected
-// bug. The claim here admits pending AND processing, so the recovery actually happens.
-//
-// The lease is expired on the DATABASE clock rather than by sleeping: it makes the test
-// fast and immune to any skew between the test process's clock and the server's.
+// A relay that dies mid-batch leaves its rows in processing with a lease that nobody
+// will release.
 func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6835,27 +5951,11 @@ func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
 		"an expired lease on a processing row must make it claimable again; this is what stops a relay crash from stranding in-flight events forever")
 }
 
-// TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB is the STATE-01
+// TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB is the stale-lease
 // scenario end to end, against real SQL, and it is the test that proves the claim token
 // does the job the lease alone could not.
 //
-// # The scenario, and what used to happen
-//
-// Relay A claims a row. A stalls — a long GC pause, a paused container, a network
-// partition — and its lease expires. Relay B reclaims the row and publishes the event
-// successfully. A then wakes up, still holding its own in-memory copy of the row, and
-// records the outcome of ITS attempt.
-//
-// When transitions matched on row id alone, A's write LANDED. Three things followed, and
-// every one of them was silent: A could mark the row failed and increment attempts,
-// double-spending a budget B had already used; A could mark it dispatched over the top of
-// a state B had moved on from; and A could move a terminal row back out of its terminal
-// state entirely. Nothing errored, and nothing in the row afterwards recorded that two
-// workers had written to it.
-//
-// The token closes it. A holds the token from ITS claim; B's reclaim issued a new one; so
-// every transition A attempts matches no row and is reported as a lost claim. A learns to
-// stop, which is the correct behaviour and the one the old code made impossible.
+// Relay A claims a row.
 func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6920,14 +6020,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 // honoured by the claim predicate.
 //
 // Once attempts reaches max_attempts the row must leave the claimable set, so the relay
-// stops retrying it and it is left for the dead-letter path. Without this the row is
-// retried forever: it never reaches a terminal state, it never appears in the dead-letter
-// inventory, and it occupies claim capacity on every poll for the rest of the table's
-// life.
-//
-// The over-budget case is asserted as well as the exactly-at-budget case, because a
-// predicate written as `attempts != max_attempts` would pass the boundary test and let an
-// over-budget row through.
+// stops retrying it and it is left for the dead-letter path.
 func TestClaimPendingEventOutbox_SkipsRowsAtMaxAttempts_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -7043,14 +6136,10 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 	t.Run("a row inside its backoff window is not claimed until it is due", func(t *testing.T) {
 		// This is the DURABLE half of the configured exponential backoff, and it is a
-		// property of the claim rather than of the relay. Releasing the lease is not
-		// enough: at a 1-second poll interval a released row is retried on the very next
-		// lap, so the configured 1s/2s/4s/8s/16s schedule collapses into roughly five
-		// seconds of consecutive attempts against a broker that has barely begun to fail.
-		//
-		// Sleeping the delay in the relay is worse than no backoff at all: the schedule
-		// sums to 31 seconds, which OUTLIVES the 30-second lease, so a second instance
-		// reclaims the row mid-sleep and publishes the event twice.
+		// property of the claim rather than of the relay. Releasing the lease is not enough:
+		// at a 1-second poll interval a released row is retried on the very next lap, so the
+		// configured 1s/2s/4s/8s/16s schedule collapses into roughly five seconds of
+		// consecutive attempts against a broker that has barely begun to fail.
 		entry := newEventOutboxFixture(marker)
 		entry.MaxAttempts = 3
 		insertRealEventOutbox(t, ds, entry)
@@ -7089,9 +6178,9 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 	})
 
 	t.Run("an exhausted row keeps the due instant it already had", func(t *testing.T) {
-		// A row whose budget is spent is not waiting for anything. Advancing its due
-		// instant would read as though a retry were still coming, which is exactly the
-		// wrong thing to show an operator triaging a dead-letter backlog.
+		// A row whose budget is spent is not waiting for anything. Advancing its due instant
+		// would read as though a retry were still coming, which is exactly the wrong thing to
+		// show an operator triaging a dead-letter backlog.
 		entry := newEventOutboxFixture(marker)
 		entry.MaxAttempts = 1
 		insertRealEventOutbox(t, ds, entry)
@@ -7234,13 +6323,6 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		// THE STATE GUARD: a row already replaying is not claimable, so a second request
 		// arriving after the first has landed finds nothing to claim and cannot publish a
 		// duplicate.
-		//
-		// This is a SERIAL call and it proves a serial property. It says nothing about two
-		// requests that arrive together — both could read `dead_lettered` and both transition if
-		// the claim were a read followed by a write instead of one conditional UPDATE, and this
-		// assertion would hold throughout. That race is proved in
-		// TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB, which is where
-		// the word "concurrent" belongs.
 		_, err = ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
 		requireAPIError(t, err, apierror.ErrConflict)
 
@@ -7294,32 +6376,11 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 	})
 }
 
-// TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB is the replay claim's
-// concurrency property, and it is the only test that establishes it.
+// TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB is the replay
+// claim's concurrency property, and it is the only test that establishes it.
 //
-// # What the serial assertion could not reach
-//
-// The replay lifecycle test calls the claim twice in sequence and asserts the second one
-// conflicts. That is a real property — a row already replaying is not claimable — but it is a
-// property about a row whose transition has ALREADY LANDED, and it holds under an
-// implementation with no atomicity whatsoever. A claim written as "read the row, check its
-// status in Go, then write" would pass it every time while allowing two simultaneous requests
-// to both read `dead_lettered`, both decide they may proceed, and both transition. Two replay
-// requests for one stuck event is not a hypothetical: it is a double-click on a triage console,
-// or two operators working the same dead-letter backlog, and the consequence is the same event
-// published twice onto its original topic.
-//
-// # The arrangement
-//
-// Two goroutines are lined up on a barrier and released together, both claiming the SAME
-// dead-lettered row. Exactly one must succeed with a token and exactly one must be told the row
-// is not available — and the row itself must end up `replaying` under the winner's token, so
-// that "one winner" is a fact about the database and not merely about the two return values.
-//
-// It runs several rounds on fresh rows. One round is logically sufficient — the claim is a
-// single conditional UPDATE, so PostgreSQL's row lock decides it — but a single round can be
-// won by the goroutines simply not overlapping, and rounds are what make the overlap real
-// rather than assumed.
+// The replay lifecycle test calls the claim twice in sequence and asserts the second
+// one conflicts.
 func TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -7363,8 +6424,8 @@ func TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB(t *tes
 
 		// A CLOSED CHANNEL rather than a WaitGroup for the release, so both goroutines are
 		// unblocked by one operation instead of being woken in sequence. `ready` proves each
-		// goroutine reached the barrier before it is opened, which is what makes the overlap a
-		// fact rather than a hope.
+		// goroutine reached the barrier before it is opened, which is what makes the overlap
+		// a fact rather than a hope.
 		release := make(chan struct{})
 		ready := make(chan struct{}, len(attempts))
 
@@ -7440,28 +6501,20 @@ func TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB(t *tes
 	}
 }
 
-// TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB is acceptance
-// criterion V-2 measured end to end against a real table.
-//
-// Known counts are driven into each terminal state and the returned map is checked
-// against them, so the arithmetic the daily reconciliation runbook performs — dispatched
-// plus dead-lettered against the broker's end offsets — is verified against real GROUP BY
-// output rather than a scripted result set.
+// TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB measures the
+// zero-loss reconciliation end to end against a real table.
 //
 // The counts are compared as DELTAS against a baseline taken before the fixtures are
-// inserted, because the table is shared and holds other tests' rows. An absolute
-// comparison would be wrong even when the code is right.
+// inserted, because the table is shared and holds other tests' rows.
 func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("count")
 	quiesceEventOutbox(t, ds, marker)
 
-	// TWO windows, read as a pair (PERF-P04). The narrow one covers only the fixtures this
-	// test creates at the current instant; the wide one additionally covers the deliberately
-	// AGED fixtures below. Comparing the two deltas is what proves the window bounds the
-	// dispatched arm and nothing else — and it is deterministic, which a single reading against
-	// an absolute count on a shared table could never be.
+	// TWO windows, read as a pair. The narrow one covers only the fixtures this test
+	// creates at the current instant; the wide one additionally covers the deliberately
+	// AGED fixtures below.
 	narrowWindow := time.Now().UTC().Add(-time.Hour)
 	wideWindow := time.Now().UTC().Add(-6 * time.Hour)
 
@@ -7482,11 +6535,9 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 	)
 
 	// ORDER MATTERS HERE, and getting it wrong is subtle. Driving a row to a terminal
-	// state requires CLAIMING it first, and a claim takes a whole batch — so any row
-	// left pending when the dispatched and dead-lettered fixtures are claimed would be
-	// swept into processing along with them and would then be counted in the wrong
-	// bucket. The terminal fixtures are therefore created first, and the pending ones
-	// last, so nothing claims them.
+	// state requires CLAIMING it first, and a claim takes a whole batch — so any row left
+	// pending when the dispatched and dead-lettered fixtures are claimed would be swept
+	// into processing along with them and would then be counted in the wrong bucket.
 	aged := func() *model.EventOutbox {
 		entry := newEventOutboxFixture(marker)
 		entry.OccurredAt = dbTimestamp(time.Now().Add(-agedOccurrenceShift))
@@ -7513,10 +6564,10 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 	for range wantPending {
 		insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 	}
-	// A row that has been PENDING since three hours ago — older than the narrow window, and
-	// therefore the single most important row in this test. It is the backlog a gauge exists to
-	// show, and windowing the whole count rather than only the dispatched arm would have hidden
-	// it precisely when it mattered.
+	// A row that has been PENDING since three hours ago — older than the narrow window,
+	// and therefore the single most important row in this test. It is the backlog a gauge
+	// exists to show, and windowing the whole count rather than only the dispatched arm
+	// would have hidden it precisely when it mattered.
 	for range wantAgedPending {
 		insertRealEventOutbox(t, ds, aged())
 	}
@@ -7541,9 +6592,9 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 	assert.Equal(t, delta(model.EventOutboxStatusDeadLettered), wideDelta(model.EventOutboxStatusDeadLettered),
 		"the dead-letter inventory is bounded by operation rather than by time, so it is counted in full as well")
 
-	// DISPATCHED IS THE ONE POPULATION THE WINDOW RESTRICTS, and this is the assertion that
-	// says so. The narrow reading sees only the recent fixtures; the wide one additionally sees
-	// the aged ones.
+	// DISPATCHED IS THE ONE POPULATION THE WINDOW RESTRICTS, and this is the assertion
+	// that says so. The narrow reading sees only the recent fixtures; the wide one
+	// additionally sees the aged ones.
 	assert.Equal(t, int64(wantDispatched), delta(model.EventOutboxStatusDispatched),
 		"a dispatched row older than the window must not be counted: that history is the population "+
 			"whose unbounded scan PERF-P04 is about")
@@ -7568,22 +6619,9 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 
 // TestClaimPendingEventOutbox_UsesClaimIndex_RealDB asserts the claim is INDEX-DRIVEN.
 //
-// This is what makes acceptance criterion V-1's 500 events per second attainable. A
-// sequential scan over the outbox works perfectly on a small table and degrades
+// A sequential scan over the outbox works perfectly on a small table and degrades
 // continuously as the table grows — the relay simply gets slower every day until it
-// cannot keep up, with no error and no failing test anywhere. No unit test can reveal
-// that; only the query plan can.
-//
-// The partial predicate on idx_event_outbox_claim is what confines the scan to the
-// CLAIMABLE WORKING SET, keeping dispatched and dead-lettered rows — eventually the
-// overwhelming majority of the table — out of the index entirely.
-//
-// A Sort node above the index scan is EXPECTED and is not a failure. Because the leading
-// index key is matched against a two-element IN-list, a btree cannot emit rows already
-// ordered by the trailing occurred_at, so the planner legitimately sorts. The migration
-// documents this and blnk.lineage_outbox has the same shape. It costs nothing that
-// matters, because the partial predicate confines that sort's input to the claimable
-// working set rather than the whole table. What must NOT appear is a sequential scan.
+// cannot keep up, with no error and no failing test anywhere.
 func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -7592,17 +6630,6 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 
 	// The table must be given its PRODUCTION SHAPE before the plan means anything, and
 	// getting this wrong is how a plan assertion becomes theatre.
-	//
-	// On a nearly-empty table PostgreSQL correctly prefers a sequential scan: one page
-	// is cheaper to read than any index lookup, so an assertion made there would fail
-	// for a reason that is not a defect. Seeding only CLAIMABLE rows does not help
-	// either — it makes the partial index cover the whole table, which is precisely the
-	// situation in which it saves nothing.
-	//
-	// The shape that matters is the steady state the index was designed for: a large
-	// cold history of terminal rows, which the partial predicate excludes ENTIRELY, and
-	// a small claimable working set. That is when the index is dramatically cheaper than
-	// a scan, and it is the shape the relay lives in.
 	const (
 		coldHistory   = 3000 // dispatched rows the partial index must exclude
 		claimableRows = 20   // the working set the relay actually polls
@@ -7610,14 +6637,13 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 
 	// Seeded in bulk rather than through InsertEventOutbox: this test is about the query
 	// PLAN, not the insert path, and three thousand single-row round trips would cost
-	// seconds for no additional coverage.
-	// partition_key is DISTINCT per row, and deliberately so: the plan under test
-	// includes the earlier-same-key exclusion, and seeding one shared key would give the
-	// planner a wildly unrepresentative selectivity estimate for that subquery.
-	// event_raw is NOT NULL, so the bulk seed must supply it exactly as the repository
-	// would: the canonical envelope with the body spliced in. It is composed in SQL here
-	// only because these rows never leave the table — the plan is the whole subject — and
-	// the alternative is three thousand Go-side round trips.
+	// seconds for no additional coverage. partition_key is DISTINCT per row, and
+	// deliberately so: the plan under test includes the earlier-same-key exclusion, and
+	// seeding one shared key would give the planner a wildly unrepresentative selectivity
+	// estimate for that subquery. event_raw is NOT NULL, so the bulk seed must supply it
+	// exactly as the repository would: the canonical envelope with the body spliced in. It
+	// is composed in SQL here only because these rows never leave the table — the plan is
+	// the whole subject — and the alternative is three thousand Go-side round trips.
 	_, err := ds.Conn.ExecContext(ctx, `
 		INSERT INTO blnk.event_outbox
 			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, event_raw, occurred_at, status, dispatched_at)
@@ -7652,25 +6678,10 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	`, marker, claimableRows)
 	require.NoError(t, err, "failed to seed the claimable working set")
 
-	// These rows exist ONLY to shape a query plan, so they are deleted rather than
-	// retired to a terminal state the way real fixtures are. Leaving three thousand rows
-	// behind on every run would grow the shared test database without bound and slow
-	// every other test in this package down over time.
-	//
-	// The VACUUM is not tidiness, it is what stops this test breaking the NEXT run of
-	// itself. A DELETE only marks tuples dead: three thousand of them stay in the heap
-	// and in every index, so relpages and reltuples remain inflated while the live row
-	// count collapses. The planner then costs the table as large and sparse, which is
-	// precisely the input that flips the anti-join below from a per-candidate index probe
-	// to a whole-set hash build — the plan this test forbids. Reclaiming the space and
-	// refreshing the statistics leaves the table as this test found it, in the only sense
-	// the planner cares about.
-	// Both steps FAIL the test rather than logging, and the second still runs when the first
-	// errored — the two obligations are independent and the VACUUM is the more important of the
-	// pair. Per the reasoning above, a leak here does not merely grow the table: it inflates
-	// relpages until the planner flips the anti-join to the whole-set hash build this very test
-	// forbids, so an unreported cleanup failure makes the NEXT run of this test fail for a
-	// reason that has nothing to do with the code under test.
+	// These rows exist ONLY to shape a query plan, so they are deleted rather than retired
+	// to a terminal state the way real fixtures are. Leaving three thousand rows behind on
+	// every run would grow the shared test database without bound and slow every other
+	// test in this package down over time.
 	t.Cleanup(func() {
 		if _, cleanupErr := ds.Conn.Exec(
 			"DELETE FROM blnk.event_outbox WHERE event_id LIKE $1", marker+"%"); cleanupErr != nil {
@@ -7698,19 +6709,6 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 
 	// VACUUM (ANALYZE) rather than ANALYZE alone, and the difference is what makes this
 	// assertion deterministic rather than dependent on which tests ran before it.
-	//
-	// ANALYZE refreshes the statistics but reclaims nothing, so the dead tuples every
-	// preceding test in this package left behind — including this test's own three
-	// thousand from the previous run — still count towards relpages. A table whose pages
-	// are mostly dead is costed as a large table with poor locality, and under that
-	// costing the planner legitimately prefers to hash the whole blocking-state set once
-	// instead of probing the partition-key index per candidate. Both plans are correct;
-	// only one is the plan this test is here to require. Vacuuming first removes the
-	// variable entirely, so the plan is a function of the seeded shape alone.
-	//
-	// It cannot run inside a transaction, which is why it is issued on the connection
-	// directly. It is safe on a shared test database: it removes only tuples no
-	// transaction can still see.
 	_, err = ds.Conn.ExecContext(ctx, "VACUUM (ANALYZE) blnk.event_outbox")
 	require.NoError(t, err,
 		"the planner needs current statistics AND a compacted heap for this assertion to mean anything")
@@ -7718,19 +6716,7 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// THE PREMISE HAS TO HOLD BEFORE THE PLAN MEANS ANYTHING, and on a SHARED test
 	// database it sometimes does not.
 	//
-	// quiesceEventOutbox parks unrelated claimable rows behind a future locked_until so
-	// they cannot be claimed — but locked_until is NOT part of either partial index's
-	// predicate, so those rows are still in the index and still in the statistics the
-	// planner reads. A concurrent run, or a package whose tests left rows behind, can
-	// therefore leave a claimable population that dwarfs the small working set seeded
-	// above, and at that point the planner is costing a data shape this test did not
-	// create and does not describe: with several hundred claimable rows a sequential scan
-	// genuinely is cheaper, and PostgreSQL is right to choose one.
-	//
-	// Failing there would report a defect that is not one. Skipping says plainly that the
-	// precondition could not be established, which is what the brittleness of a plan
-	// assertion actually requires — and it cannot make the test pass vacuously, because a
-	// skip is not a pass.
+	// Failing there would report a defect that is not one.
 	var unrelatedClaimable int
 	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
 		SELECT COUNT(*)
@@ -7750,23 +6736,15 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// THE OTHER PREMISE: the table must carry THIS BUILD'S INDEXES AND NO OTHERS.
 	//
 	// A plan assertion is a statement about the choice PostgreSQL makes among the indexes
-	// available to it, so it is only a statement about this build if the available set is this
-	// build's. On a shared development database it need not be: a database that has had another
-	// build's migrations applied to it keeps that build's indexes, and the planner will use one
-	// if it costs less.
+	// available to it, so it is only a statement about this build if the available set is
+	// this build's.
 	//
-	// That is not hypothetical and it is not a defect in either build. An index declared as
-	// `(status) WHERE status <> 'dispatched'` is narrower than this build's five-column claim
-	// index and cheaper to scan, so the planner picks it — and the assertion below then fails
-	// on a plan this build's schema cannot produce. Worse, accepting such an index to make the
-	// assertion pass would make it vacuous: its predicate spans the terminal states, so the
-	// cold history IS in it and the poll cost does grow with the table, which is the exact
-	// property this test exists to forbid.
+	// That is not hypothetical and it is not a defect in either build.
 	//
 	// Skipping is therefore the only honest answer, and it is safe in both directions: it
-	// cannot mask a real defect, because with only this build's indexes present the assertion
-	// still runs, and it does not touch the foreign index, which belongs to a build that is
-	// entitled to it.
+	// cannot mask a real defect, because with only this build's indexes present the
+	// assertion still runs, and it does not touch the foreign index, which belongs to a
+	// build that is entitled to it.
 	if foreign := foreignEventOutboxIndexes(t, ctx, ds); len(foreign) > 0 {
 		t.Skipf(
 			"blnk.event_outbox carries %d index(es) no migration in this build creates (%s), so the "+
@@ -7778,8 +6756,8 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 			len(foreign), strings.Join(foreign, ", "))
 	}
 
-	// EXPLAIN without ANALYZE PLANS the statement without executing it, so the claim
-	// takes no leases and mutates nothing — which matters here, because executing this
+	// EXPLAIN without ANALYZE PLANS the statement without executing it, so the claim takes
+	// no leases and mutates nothing — which matters here, because executing this
 	// particular statement would move rows into processing as a side effect.
 	rows, err := ds.Conn.QueryContext(ctx, "EXPLAIN "+claimPendingEventOutboxQuery,
 		model.EventOutboxStatusProcessing, (5 * time.Minute).String(), uuid.NewString(), 100)
@@ -7798,67 +6776,25 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	planText := plan.String()
 	require.NotEmpty(t, planText, "EXPLAIN returned no plan")
 
-	// THE CANDIDATE SIDE MUST REACH THE TABLE THROUGH A BLOCKING-STATE PARTIAL INDEX, which
-	// is the guarantee, rather than through one named index, which is a plan detail.
-	//
-	// This assertion used to pin "idx_event_outbox_claim" by name, then a list of two names,
-	// and it failed on plans that honour the guarantee completely — a Bitmap Index Scan on
-	// idx_event_outbox_effective_key_inflight, and an Index Scan on
-	// idx_event_outbox_status_open. THREE indexes on this table satisfy the guarantee for the
-	// shape seeded above, and which one the planner picks is a cost decision that moves with
-	// heap compaction, statistics freshness and host load. Every widening of the name list
-	// was a guess at the next plan, so the list is gone: the PROPERTY is read out of the
-	// catalog instead, which accepts any index that honours it and rejects any index that
-	// does not, including one added later.
-	//
-	// Asserted on the ONE plan line that reaches the candidate relation, for the same reason
-	// the earlier-same-key assertion below is: "the plan mentions an index somewhere" is
-	// nearly vacuous, whereas "the line reaching `event_outbox candidate` is an index scan
-	// through a blocking-state partial index" says exactly what it means. The
-	// sequential-scan prohibition further down closes the same failure mode across every
-	// other node in the plan.
-	// The ACCESS PATH rather than the single relation line, because a bitmap plan splits one
-	// access across two nodes and the index is named on the lower of them.
-	//
-	// This is the same lesson as the paragraph above, one step further in. Pinning the plan
-	// SHAPE is as brittle as pinning an index NAME: on a compacted heap PostgreSQL reaches
-	// the candidate rows with `Index Scan using idx_event_outbox_claim on event_outbox
-	// candidate`, and on other statistics it reaches exactly the same rows through the same
-	// index as `Bitmap Heap Scan on event_outbox candidate` with a child `Bitmap Index Scan
-	// on idx_event_outbox_claim`. The second honours the guarantee completely — the partial
-	// predicate still confines the read to the blocking states, so the cold history is never
-	// touched and the poll's cost is still independent of how large the outbox has grown —
-	// yet the relation line alone carries neither the word "Index" nor the index name, so an
-	// assertion made on that one line reported a defect that did not exist.
-	//
-	// planAccessPathFor therefore returns the relation node together with the index nodes
-	// beneath it, and the guarantee is asserted over that. What is still refused is what was
-	// always meant to be refused: reaching the candidate rows by a sequential scan, or
-	// through an index that is not partial on the blocking states.
+	// THE CANDIDATE SIDE MUST REACH THE TABLE THROUGH A BLOCKING-STATE PARTIAL INDEX,
+	// which is the guarantee, rather than through one named index, which is a plan detail.
 	candidateScan := planAccessPathFor(planText, "event_outbox candidate")
 	require.NotEmpty(t, candidateScan,
 		"the plan must reach the candidate relation explicitly.\nPlan was:\n"+planText)
 	assert.Contains(t, candidateScan, "Index",
 		"the claim's candidate selection must be index-driven. Read through a scan instead, the relay's per-poll cost grows with the whole table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nAccess path was: "+candidateScan)
 	// READ OUT OF THE CATALOG AND EVALUATED BY POSTGRESQL, which is the fourth and last
-	// generation of this assertion. The first pinned one index name; the second pinned a list of
-	// two; the third read the predicate out of pg_indexes and PATTERN-MATCHED it, recognising
-	// four shapes and treating anything else as admitting the history — so a correct predicate
-	// written a fifth way failed, and an `ANY (ARRAY[...])` it could not parse passed. Every
-	// equivalent rewrite of "not dispatched" — a negation, an ANY over the complement, a NOT IN —
-	// needs its own special case, and each case is a chance to accept a predicate that admits the
-	// cold history.
-	//
-	// So the predicate is now spliced into a COUNT over the rows this test seeded and evaluated
-	// by the same expression evaluator that decides what the index actually contains. The
-	// question asked is the one that matters — can a dispatched row be in this index? — and the
-	// count is scoped by the marker, so a concurrent run's rows cannot answer it.
+	// generation of this assertion. The first pinned one index name; the second pinned a
+	// list of two; the third read the predicate out of pg_indexes and PATTERN-MATCHED it,
+	// recognising four shapes and treating anything else as admitting the history — so a
+	// correct predicate written a fifth way failed, and an `ANY (ARRAY[...])` it could not
+	// parse passed.
 	requireColdHistoryExcludingIndex(t, ds, candidateScan, planText,
 		"the claim's candidate selection", marker)
 
 	// The earlier-same-key exclusion must be INDEX-DRIVEN and confined to the blocking
-	// states. What it must never be is a scan of each key's entire history, which would buy
-	// the ordering guarantee at a price that grows with the table — correct, and
+	// states. What it must never be is a scan of each key's entire history, which would
+	// buy the ordering guarantee at a price that grows with the table — correct, and
 	// progressively unable to keep up.
 	//
 	// That property is asserted rather than the name of one specific index, because
@@ -7866,22 +6802,9 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	//
 	//   - a NESTED LOOP anti-join that probes idx_event_outbox_effective_key_inflight once
 	//     per candidate row, which wins when there are many candidates; and
-	//   - a HASH anti-join whose build side is read from idx_event_outbox_claim in ONE index
-	//     scan, which wins when the claimable working set is small — the steady state the
-	//     relay actually lives in, and what it chooses on a compacted heap.
-	//
-	// BOTH indexes are partial on exactly the blocking states, so under either plan the
-	// cold history of terminal rows is never read — which is the guarantee the migration's
-	// index exists to provide and the only thing that keeps the poll's cost independent of
-	// how large the outbox has grown. Neither plan degrades as the table grows. Pinning one
-	// index name would therefore fail on a plan that honours the guarantee completely,
-	// which is how a plan assertion stops testing the system and starts testing the
-	// planner's mood — and is what made this assertion flaky.
-	//
-	// What is NOT negotiable is asserted instead: the exclusion is present, it is keyed on
-	// partition_key, and it reaches the table through one of the two partial indexes. The
-	// sequential-scan prohibition that follows closes the same failure mode over every node
-	// in the plan.
+	//   - a HASH anti-join whose build side is read from idx_event_outbox_claim in ONE
+	//     index scan, which wins when the claimable working set is small — the steady
+	//     state the relay actually lives in, and what it chooses on a compacted heap.
 	assert.Contains(t, planText, "Anti Join",
 		"the earlier-same-key exclusion must survive as an anti-join. Without the NOT EXISTS predicate a relay can skip an earlier locked row and claim a LATER row with the same partition key, and because Kafka preserves append order rather than occurred_at a subscriber then sees one aggregate's events out of order — with no error, no log line and no row state to show it.\nPlan was:\n"+planText)
 
@@ -7889,10 +6812,10 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 		"the anti-join must be keyed on partition_key, which is what makes it per-aggregate.\nPlan was:\n"+planText)
 
 	// Asserted on the ONE plan line that reaches the earlier-same-key relation rather than
-	// on the whole plan text: "the plan contains an index scan somewhere" is nearly vacuous
-	// — every plan here contains several — whereas "the line reaching `event_outbox earlier`
-	// is an index scan through a blocking-state partial index" says exactly what it means,
-	// and it says it for either of the two plan shapes above.
+	// on the whole plan text: "the plan contains an index scan somewhere" is nearly
+	// vacuous — every plan here contains several — whereas "the line reaching
+	// `event_outbox earlier` is an index scan through a blocking-state partial index" says
+	// exactly what it means, and it says it for either of the two plan shapes above.
 	earlierScan := planAccessPathFor(planText, "event_outbox earlier")
 	require.NotEmpty(t, earlierScan,
 		"the plan must reach the earlier-same-key relation explicitly.\nPlan was:\n"+planText)
@@ -7908,15 +6831,14 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// Because the leading index key is matched against a two-element IN-list, a btree
 	// cannot emit rows already ordered by the trailing occurred_at, so the planner
 	// legitimately sorts. blnk.lineage_outbox has the same index and query shape and the
-	// same plan. It costs nothing that matters, because the partial predicate confines
-	// that sort's input to the claimable working set rather than to the whole table.
+	// same plan.
 }
 
 // indexNameFromPlanLine extracts the index name from an EXPLAIN scan line.
 //
 // Both spellings the planner emits are handled — "Index Scan using <name> on <rel>" and
-// "Bitmap Index Scan on <name>" — because which one appears is another cost decision, and a
-// helper that understood only one would reintroduce the flakiness this replaces.
+// "Bitmap Index Scan on <name>" — because which one appears is another cost decision,
+// and a helper that understood only one would reintroduce the flakiness this replaces.
 //
 // Parameters:
 //   - planLine string: one EXPLAIN line.
@@ -7939,42 +6861,21 @@ func indexNameFromPlanLine(planLine string) string {
 	return ""
 }
 
-// planAccessPathFor returns the node of an EXPLAIN plan that mentions needle, together with the
-// index nodes beneath it, trimmed of the tree drawing and indentation.
-//
-// It replaced planLineReferencing, which returned the matched LINE alone:
+// planAccessPathFor returns the node of an EXPLAIN plan that mentions needle, together
+// with the index nodes beneath it, trimmed of the tree drawing and indentation. The
+// index children are what an access-path assertion needs, and the matched line alone
+// does not carry them:
 //
 //	Bitmap Heap Scan on event_outbox candidate
 //	  ->  Bitmap Index Scan on idx_event_outbox_claim
-//
-// Both read exactly the same rows through exactly the same index. The second names the index
-// on the CHILD node, so an assertion made on the line mentioning the relation sees neither the
-// word "Index" nor the index name and fails a plan that honours the guarantee completely.
-// That is a plan-shape assertion masquerading as a guarantee assertion, and it is the same
-// mistake as pinning one index by name.
-//
-// Returning the access path keeps the guarantee assertable — the caller can still require that
-// the read is index-driven, and through a blocking-state partial index — while accepting
-// either shape. It does not weaken the sequential-scan prohibition: a `Seq Scan` node has no
-// index child, so its access path carries no index name and no "Index", and the whole-plan
-// `Seq Scan on event_outbox` assertion is unaffected either way. This is why there is no
-// helper returning the single plan LINE that mentions a relation: on a bitmap plan that line is
-// `Bitmap Heap Scan on event_outbox candidate` and the index is nowhere in it.
-//
-// # How the children are found
-//
-// EXPLAIN indents each child deeper than its parent, so the descendants of the matched node
-// are the following lines whose indentation is strictly greater, up to the first line that is
-// not. Only the index-naming ones are collected; the Recheck Cond and Filter lines belong to
-// the same node and are already carried by it.
 //
 // Parameters:
 //   - planText string: the whole EXPLAIN output.
 //   - needle string: the relation reference identifying the node.
 //
 // Returns:
-//   - string: the matching node, plus its index children, each trimmed and joined by " | ".
-//     Empty when no line mentions needle.
+//   - string: the matching node, plus its index children, each trimmed and joined by "
+//     | ".
 func planAccessPathFor(planText, needle string) string {
 	lines := strings.Split(planText, "\n")
 
@@ -8004,13 +6905,8 @@ func planAccessPathFor(planText, needle string) string {
 	return ""
 }
 
-// planNodeIndent is the indentation depth of one EXPLAIN line, which is what expresses the
-// parent-child structure of the plan tree in text form.
-//
-// The "->  " arrow is counted as part of the indentation rather than as content, because a
-// child node's arrow sits where its parent's content begins: without folding it in, a direct
-// child would measure the same depth as its parent and the descendant walk would stop
-// immediately.
+// planNodeIndent is the indentation depth of one EXPLAIN line, which is what expresses
+// the parent-child structure of the plan tree in text form.
 //
 // Parameters:
 //   - line string: one raw line of EXPLAIN output.
@@ -8033,13 +6929,11 @@ func planNodeIndent(line string) int {
 	return indent
 }
 
-// TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation covers the parser directly,
-// because the assertion that depends on it lives in a _RealDB test that skips when the shared
-// outbox is too busy for a plan to be meaningful — and because the shape it exists to handle
-// is chosen by the planner, so a run may not produce one at all.
-//
-// The bitmap case is the one that was failing in the field: the index is named on the child,
-// so the guarantee is only assertable if the child comes back with the parent.
+// TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation covers the parser
+// directly, because the assertion that depends on it lives in a _RealDB test that skips
+// when the shared outbox is too busy for a plan to be meaningful — and because the
+// shape it exists to handle is chosen by the planner, so a run may not produce one at
+// all.
 func TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation(t *testing.T) {
 	t.Parallel()
 
@@ -8112,13 +7006,8 @@ func TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation(t *testing.T) 
 	}
 }
 
-// TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads covers the plan parser directly.
-//
-// It exists because the assertion that depends on it lives in a _RealDB test that SKIPS
-// when the shared outbox holds too many unrelated claimable rows for a plan to be
-// meaningful. A parser that silently returned nothing would make that assertion vacuous
-// on the runs where it does execute — require.NotEmpty is what stops that, and this test
-// is what proves the parser feeds it real names rather than luck.
+// TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads covers the plan parser
+// directly.
 func TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads(t *testing.T) {
 	t.Parallel()
 
@@ -8173,10 +7062,6 @@ func TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads(t *testing.T) {
 
 // planIndexNodePrefixes are the EXPLAIN node prefixes that name the index they read,
 // each ending immediately before the index name.
-//
-// Declared once rather than inline so a new access method is added in one place, and
-// ordered longest-first so "Bitmap Index Scan on " is matched before a prefix that is a
-// suffix of it could shadow it.
 var planIndexNodePrefixes = []string{
 	"Bitmap Index Scan on ",
 	"Index Only Scan using ",
@@ -8184,15 +7069,11 @@ var planIndexNodePrefixes = []string{
 	"Index Scan using ",
 }
 
-// planIndexesUsed returns the names of every index an EXPLAIN plan reads, in the order the
-// plan names them and without de-duplication.
+// planIndexesUsed returns the names of every index an EXPLAIN plan reads, in the order
+// the plan names them and without de-duplication.
 //
 // It exists so a plan assertion can be made about WHICH indexes serve a query without
-// pinning the plan's shape. PostgreSQL chooses freely between correct plans on cost, and on
-// a shared test database no single test controls the statistics that decide it — so an
-// assertion naming one expected index fails on plans that honour the guarantee completely.
-// The set of indexes touched is the durable property: it says whether the query reached the
-// table through something that excludes the cold history, whatever shape the plan took.
+// pinning the plan's shape.
 //
 // Parameters:
 //   - planText string: the EXPLAIN output, newline separated.
@@ -8209,9 +7090,9 @@ func planIndexesUsed(planText string) []string {
 				continue
 			}
 
-			// The index name runs to the next space or to the end of the line: EXPLAIN
-			// writes "Index Scan using <index> on <relation>" and "Bitmap Index Scan on
-			// <index>", so the name is the first field after the prefix in both.
+			// The index name runs to the next space or to the end of the line: EXPLAIN writes
+			// "Index Scan using <index> on <relation>" and "Bitmap Index Scan on <index>", so
+			// the name is the first field after the prefix in both.
 			name := strings.TrimSpace(line[position+len(prefix):])
 			if end := strings.IndexByte(name, ' '); end >= 0 {
 				name = name[:end]
@@ -8230,11 +7111,6 @@ func planIndexesUsed(planText string) []string {
 
 // eventOutboxClaimQueries are the three statements that lease rows, named so the
 // invariant below covers all of them rather than whichever one a reader remembers.
-//
-// Q-03: a fourth entry, "owed dead-letter claim", was removed with the orphan query it
-// named. Recovering a row whose dead-letter write is still owed has exactly ONE claim —
-// claimFailedEventOutboxForDeadLetterQuery, which the relay drives every tick — and the
-// orphan was a divergent second predicate for the same job that nothing called.
 var eventOutboxClaimQueries = map[string]string{
 	"pending claim":            claimPendingEventOutboxQuery,
 	"failed dead-letter claim": claimFailedEventOutboxForDeadLetterQuery,
@@ -8244,23 +7120,8 @@ var eventOutboxClaimQueries = map[string]string{
 // TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet is a
 // STRUCTURAL guard on a defect whose behavioural symptom is plan-dependent.
 //
-// Every one of these statements leases rows and every one bounds the lease with a LIMIT.
-// Written as `WHERE id IN (SELECT … LIMIT $n FOR UPDATE SKIP LOCKED)`, the planner may
-// implement the semi-join as a nested loop that re-executes the subquery once per outer
-// row — and because each execution skips the rows the previous one locked, each returns a
-// different row and the claim leases far more than it asked for. Measured on a six-row
-// backlog with a batch size of two, the pending claim leased all six.
-//
-// The behavioural assertion for that lives in the batch-bound test below, and it is the
-// assertion that caught this. But it only catches it when the planner HAPPENS to choose
-// the nested-loop shape, which depends on table statistics — the defect shipped
-// undetected precisely because on a small table the planner usually chooses a hash
-// semi-join and the bound appears to hold. So the guard here is on the STATEMENT rather
-// than on one execution of it: a MATERIALIZED CTE is evaluated exactly once, which makes
-// the bound a property of the query instead of a property of the plan.
-//
-// Nothing about this test needs a database, which is the point — it holds on every
-// machine and in every run, including the ones where the planner would hide the bug.
+// Every one of these statements leases rows and every one bounds the lease with a
+// LIMIT.
 func TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet(t *testing.T) {
 	for name, query := range eventOutboxClaimQueries {
 		t.Run(name, func(t *testing.T) {
@@ -8288,14 +7149,9 @@ func TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet
 	}
 }
 
-// TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB asserts the LIMIT
-// is honoured against a real table, and that repeated bounded claims DRAIN the backlog in
-// occurrence order.
-//
-// This is the relay's actual access pattern — a bounded batch once per poll interval —
-// and it is the combination the FIFO guarantee has to survive: ordering must hold ACROSS
-// batches, not merely within one. Sorting only inside a batch would let a later-occurring
-// event in batch one overtake an earlier-occurring event stranded in batch two.
+// TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB asserts the
+// LIMIT is honoured against a real table, and that repeated bounded claims DRAIN the
+// backlog in occurrence order.
 func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -8342,19 +7198,12 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 		"repeated bounded claims must drain the backlog in occurrence order; ordering has to hold ACROSS batches, not only within one")
 }
 
-// TestListDeadLetterInventory_PagesNewestFirst_RealDB asserts the ordering and paging the
-// dead-letter API relies on, against real SQL.
+// TestListDeadLetterInventory_PagesNewestFirst_RealDB asserts the ordering and paging
+// the dead-letter API relies on, against real SQL.
 //
-// Triage starts from the most recent failures, so the listing is newest-first. The paging
-// assertion matters just as much as the ordering: with a non-deterministic tie-break a
-// row can appear on two pages or on none, and an operator working through a dead-letter
-// backlog would silently skip events.
+// Triage starts from the most recent failures, so the listing is newest-first.
 //
-// PERF-P08: the walk is by CURSOR. That is not merely a translation of the old offset walk —
-// it is a stronger assertion, because a keyset page is stable under concurrent inserts and an
-// offset page is not. A shared database with sibling runs inserting rows is exactly the
-// condition under which the offset walk would have repeated and skipped rows, and this test
-// would have been the one flaking.
+// The walk is by CURSOR.
 func TestListDeadLetterInventory_PagesNewestFirst_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -8392,21 +7241,20 @@ func TestListDeadLetterInventory_PagesNewestFirst_RealDB(t *testing.T) {
 		return mine
 	}
 
-	// THE WHOLE INVENTORY, PAGED BY CURSOR, not one large page. A single page cannot be relied
-	// on to hold this run's fixtures: the database is shared, other runs leave dead-lettered rows
-	// behind, and the listing is newest-first — so once the table holds more than one page of
-	// them these fixtures are not on page one and the ordering assertion below compares against
-	// somebody else's rows. Walking to the end is bounded and fails on non-termination, which is
-	// the only reading that cannot pass or fail on who else is running.
+	// THE WHOLE INVENTORY, PAGED BY CURSOR, not one large page. A single page cannot be
+	// relied on to hold this run's fixtures: the database is shared, other runs leave
+	// dead-lettered rows behind, and the listing is newest-first — so once the table holds
+	// more than one page of them these fixtures are not on page one and the ordering
+	// assertion below compares against somebody else's rows.
 	all := model.DeadLetterInventoryPage{
 		Entries: walkDeadLetterInventory(t, ds, ctx, maxDeadLetterPageSize),
 	}
 	assert.Equal(t, newestFirst, mineFrom(all.Entries),
 		"the dead-letter inventory must be ordered newest occurrence first, because triage starts from the most recent failures")
 
-	// The narrow projection reaches the real driver intact: the size is reported and the body
-	// is not read (PERF-P06). Asserted against PostgreSQL because octet_length on a BYTEA
-	// column is the thing a mock cannot prove.
+	// The narrow projection reaches the real driver intact: the size is reported and the
+	// body is not read. Asserted against PostgreSQL because octet_length on a BYTEA column
+	// is the thing a mock cannot prove.
 	require.NotEmpty(t, all.Entries)
 	for _, entry := range all.Entries {
 		if entry.AggregateID != marker+"agg" {
@@ -8416,10 +7264,11 @@ func TestListDeadLetterInventory_PagesNewestFirst_RealDB(t *testing.T) {
 			"octet_length must report the stored body's size; a zero would mean the projection read nothing")
 	}
 
-	// Walk the fixtures a SMALL page at a time and assert every one appears exactly once across
-	// the pages. Two per page against five fixtures forces several cursor hand-offs, which is
-	// where a non-deterministic tie-break shows up; the same helper walks it, so the termination
-	// bound is the same one the whole-inventory read above relies on.
+	// Walk the fixtures a SMALL page at a time and assert every one appears exactly once
+	// across the pages. Two per page against five fixtures forces several cursor
+	// hand-offs, which is where a non-deterministic tie-break shows up; the same helper
+	// walks it, so the termination bound is the same one the whole-inventory read above
+	// relies on.
 	seen := map[string]int{}
 	for _, eventID := range mineFrom(walkDeadLetterInventory(t, ds, ctx, 2)) {
 		seen[eventID]++
@@ -8429,9 +7278,10 @@ func TestListDeadLetterInventory_PagesNewestFirst_RealDB(t *testing.T) {
 			"event %s appeared %d times across the pages; a non-deterministic tie-break makes an operator skip or repeat events", eventID, seen[eventID])
 	}
 
-	// The cursor is STABLE across a concurrent insert, which is what the offset it replaced
-	// could not be. A row inserted between two pages shifted every later offset by one, so an
-	// offset-paged operator silently skipped a row for every row that arrived while they read.
+	// The cursor is STABLE across a concurrent insert, which is what the offset it
+	// replaced could not be. A row inserted between two pages shifted every later offset
+	// by one, so an offset-paged operator silently skipped a row for every row that
+	// arrived while they read.
 	first, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{Limit: 2})
 	require.NoError(t, err)
 	require.True(t, first.HasMore, "five fixtures against a page of two must leave more")
@@ -8460,32 +7310,16 @@ func TestListDeadLetterInventory_PagesNewestFirst_RealDB(t *testing.T) {
 		"a row NEWER than the cursor belongs to a page already served, so a keyset walk must not show it again")
 }
 
-// TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB proves the filter contract
-// against real PostgreSQL, which is the only place it can be proved.
+// TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB proves the filter
+// contract against real PostgreSQL, which is the only place it can be proved.
 //
-// # What was wrong, and why a mock could not have caught it
+// Two consequences followed, and a client could detect neither.
 //
-// The narrowing used to be applied ABOVE the repository: the service paged the inventory and
-// tested each row in Go, up to a fixed 5,000-row scan ceiling. Two consequences followed, and
-// a client could detect neither.
-//
-//   - A page that hit the ceiling was returned looking exactly like a complete one. Only a
-//     log line said otherwise. On an inventory larger than the ceiling — which is precisely
-//     the incident an operator is triaging — a filter would report a subset of the matches as
-//     though it were all of them.
-//   - An exact total was impossible. The only count available was a whole-table per-status
-//     aggregate that knew nothing about the event-type or topic filter, so the endpoint had
-//     to REFUSE include_count for those filters rather than return a total describing a
-//     different set than the page.
-//
-// This test therefore asserts three things that only real SQL can establish: that each
-// predicate actually selects, that the offset is an offset into the FILTERED set, and that
-// the count and the page agree — including agreeing when they are both wrong to agree, which
-// is why the count is compared against the length of an unpaged listing rather than against a
-// number written here by hand.
-//
-// The occurrence window is exercised with bounds INSIDE the fixture spread, so a window that
-// silently degraded to no window would return more rows and fail.
+//   - A page that hit the ceiling was returned looking exactly like a complete one.
+//   - An exact total was impossible. The only count available was a whole-table
+//     per-status aggregate that knew nothing about the event-type or topic filter, so
+//     the endpoint had to REFUSE include_count for those filters rather than return a
+//     total describing a different set than the page.
 func TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -8669,10 +7503,10 @@ func TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB(t *testing.T)
 			total, err := ds.CountDeadLetteredEvents(ctx, query)
 			require.NoError(t, err)
 
-			// The table is shared, so the count covers rows this run did not seed. The
-			// invariant that holds regardless is that the total is never SHORT of what the
-			// same predicate listed — a count over a narrower predicate than the page is
-			// the exact defect this method exists to rule out.
+			// The table is shared, so the count covers rows this run did not seed. The invariant
+			// that holds regardless is that the total is never SHORT of what the same predicate
+			// listed — a count over a narrower predicate than the page is the exact defect this
+			// method exists to rule out.
 			assert.GreaterOrEqual(t, total, int64(len(listed)),
 				"the total must never be short of the page the same predicate returned")
 		}
@@ -8695,12 +7529,7 @@ func TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB(t *testing.T)
 }
 
 // ===========================================================================
-// Subscriber registry — SEC-04, SEC-03, SSRF-01, SECRET-01, AUTH-01, RETAIN-01
-//
-// These live in this file rather than beside database/event_subscriber.go because
-// there is no database/event_subscriber_test.go in this checkpoint's scope. They are
-// in the same package, so the unexported validators are reachable, and the subject
-// they guard — the event-outbox and subscriber repositories — is this file's subject.
+// Subscriber registry
 // ===========================================================================
 
 // canonicalSubscriber returns a registry row whose identity is derived correctly, so
@@ -8722,14 +7551,8 @@ func canonicalSubscriber(t *testing.T) *model.EventSubscriber {
 	}
 }
 
-// TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne is the SEC-04
+// TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne is the derived-identity
 // guard at the persistence boundary.
-//
-// The principal is what every ACL binding is granted TO and the consumer group is
-// what the group binding is granted OVER, so a row that stores a principal not
-// derived from its subscriber ID means the boundary provisioned is not the boundary
-// the registry appears to describe — and it fails silently, because both the row and
-// the resulting ACL look internally consistent.
 func TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne(t *testing.T) {
 	t.Run("derives principal and group when neither is supplied", func(t *testing.T) {
 		subscriber := &model.EventSubscriber{SubscriberID: "acme_prod", Name: "Acme"}
@@ -8764,9 +7587,9 @@ func TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne(t *tes
 	})
 
 	t.Run("refuses a principal differing only by whitespace", func(t *testing.T) {
-		// The comparison is EXACT rather than trimmed: a trimmed comparison would
-		// accept this and then store the untrimmed value, so the ACL would name a
-		// principal indistinguishable from the intended one in every log line.
+		// The comparison is EXACT rather than trimmed: a trimmed comparison would accept this
+		// and then store the untrimmed value, so the ACL would name a principal
+		// indistinguishable from the intended one in every log line.
 		subscriber := canonicalSubscriber(t)
 		subscriber.KafkaPrincipal = " blnk-sub-acme_prod"
 		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
@@ -8810,12 +7633,8 @@ func TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne(t *tes
 	}
 }
 
-// TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist is SEC-03 at the
+// TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist is the grantable-topic allowlist at the
 // persistence boundary.
-//
-// The check is here as well as in the provisioning path because the ROW OUTLIVES ANY
-// SINGLE REQUEST: a topic accepted now is granted at the next issuance, whichever
-// code path performs it.
 func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.T) {
 	assert.NoError(t, requireGrantableTopics(nil),
 		"an empty grant is the fail-closed default of a fresh registration")
@@ -8831,9 +7650,9 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		"the system dead-letter":    "blnk.system.dlt",
 		// The singular form of a real category: the category is `balances`, so `blnk.balance`
 		// is the plausible typo and a name nothing creates. `blnk.ledgers` is the same shape
-		// of mistake — a fifth category the published catalogue does not have.
-		"the singular form of a real category":              "blnk.balance",
-		"a category withdrawn from the published catalogue": "blnk.ledgers",
+		// of mistake — a category the published catalogue does not have.
+		"the singular form of a real category":       "blnk.balance",
+		"a category outside the published catalogue": "blnk.ledgers",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -8841,34 +7660,16 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS REFUSED AT THIS LAYER TOO BY DEFAULT, and it is worth saying so
-	// here rather than leaving it as one entry in the table above.
-	//
-	// `blnk.system` carries `system.error`, whose payload is the FROZEN legacy body and
-	// therefore renders the error text as it comes — a PostgreSQL error names schema, table,
-	// column and routine; a broker error names internal addresses — and R-8 forbids narrowing
-	// that body. It is also the catalogue's catch-all. So it is an OPERATOR topic unless the
-	// deployment says otherwise, and that decision lives in one place,
-	// model.SubscriberPrivilegedEventCategories resolved against
-	// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, which the DTO, this persistence boundary and the
-	// ACL provisioner all read.
-	//
-	// This layer matters because it is the door a caller reaches WITHOUT the DTO: a service, CLI
-	// or migration caller writing a row directly. Such a caller cannot supply the answer either
-	// — subscriberInternalTopicAccessDeclared reads the deployment's own configuration rather
-	// than taking an argument — so the acknowledgement is the deployment's and not the caller's.
-	//
-	// `ledger.created` shares this topic, so withholding it does cost a subscriber that event
-	// unless the deployment declares the acknowledgement — the documented cost of the
-	// four-category catalogue, stated in docs/event-streaming.md rather than worked around.
+	// THE SYSTEM CATEGORY IS REFUSED AT THIS LAYER TOO BY DEFAULT, and it is worth saying
+	// so here rather than leaving it as one entry in the table above.
 	t.Run("refuses the internal system category by default", func(t *testing.T) {
 		requireAPIError(t, requireGrantableTopics([]string{"blnk.system"}), apierror.ErrInvalidInput)
 	})
 
 	t.Run("accepts the internal system category once the deployment declares it", func(t *testing.T) {
 		// The complement, and the reason the refusal above is not vacuous: a boundary that
-		// refused the topic under EVERY configuration would pass the refusal case while making
-		// the acknowledgement a variable that does nothing.
+		// refused the topic under EVERY configuration would pass the refusal case while
+		// making the acknowledgement a variable that does nothing.
 		storeSubscriberInternalTopicAccess(t, true)
 
 		assert.NoError(t, requireGrantableTopics([]string{"blnk.system"}),
@@ -8885,10 +7686,10 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 	})
 
 	t.Run("the persistence allowlist matches the model allowlist exactly", func(t *testing.T) {
-		// One answer to "which topics may a subscriber be granted?", checked rather
-		// than assumed: drift between layers means a topic one refuses and another
-		// grants. Asserted in BOTH deployment states, because the allowlist is now a
-		// function of one and a layer that ignored it would agree in one state only.
+		// One answer to "which topics may a subscriber be granted?", checked rather than
+		// assumed: drift between layers means a topic one refuses and another grants.
+		// Asserted in BOTH deployment states, because the allowlist is now a function of one
+		// and a layer that ignored it would agree in one state only.
 		for name, declared := range map[string]bool{
 			"undeclared": false,
 			"declared":   true,
@@ -8909,7 +7710,7 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 	})
 }
 
-// TestRequireSafeWebhookURL_AppliesTheDestinationPolicy is SSRF-01 at the persistence
+// TestRequireSafeWebhookURL_AppliesTheDestinationPolicy is the destination policy at the persistence
 // boundary, so a URL arriving by a path that skipped the DTO is still refused.
 func TestRequireSafeWebhookURL_AppliesTheDestinationPolicy(t *testing.T) {
 	// The parameter is *string because the column is nullable and a nil pointer means
@@ -8935,9 +7736,10 @@ func TestRequireSafeWebhookURL_AppliesTheDestinationPolicy(t *testing.T) {
 		"an unqualified hostname": "https://postgres/blnk",
 		// SURROUNDING WHITESPACE, and it belongs in this list rather than being trimmed away.
 		// The column is written VERBATIM, so trimming for validation and storing the original
-		// would persist a destination that passed a check the stored bytes do not satisfy — and
-		// the API DTO already refuses these, so tolerating them here would give a service, CLI
-		// or migration caller a laxer policy than an HTTP caller for the same column.
+		// would persist a destination that passed a check the stored bytes do not satisfy —
+		// and the API DTO already refuses these, so tolerating them here would give a
+		// service, CLI or migration caller a laxer policy than an HTTP caller for the same
+		// column.
 		"a leading space":    " https://hooks.example.com/blnk",
 		"a trailing space":   "https://hooks.example.com/blnk ",
 		"a trailing newline": "https://hooks.example.com/blnk\n",
@@ -8959,7 +7761,7 @@ func TestRequireSafeWebhookURL_AppliesTheDestinationPolicy(t *testing.T) {
 }
 
 // TestRecordSubscriberCredential_RefusesAnythingThatIsNotADerivedReference is the
-// SECRET-01 guard.
+// secret-handling guard.
 //
 // The column must never hold a value anyone could authenticate with, and the guard is
 // structural rather than advisory: a plaintext secret is refused even though it is a
@@ -9004,7 +7806,7 @@ func TestRecordSubscriberCredential_RefusesAnythingThatIsNotADerivedReference(t 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace is the AUTH-01 guard.
+// TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace is the guard.
 //
 // Issuance is not idempotent — each call mints a new secret and the broker keeps only
 // the last one written — so two concurrent issuances would otherwise both return 200
@@ -9082,9 +7884,9 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 	})
 
 	t.Run("requires no credential when expected is nil", func(t *testing.T) {
-		// A separate arm, because `credential_reference = NULL` is never true in SQL:
-		// folding the two into one predicate would make an empty-string reference
-		// collide with the no-credential case.
+		// A separate arm, because `credential_reference = NULL` is never true in SQL: folding
+		// the two into one predicate would make an empty-string reference collide with the
+		// no-credential case.
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
@@ -9106,13 +7908,6 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 		// ...and the row exists under THIS caller's claim with no revocation pending, so the
 		// only remaining explanation is that the reference moved: a race, not a 404 and not a
 		// lost fence.
-		//
-		// ONE follow-up query, not two. describeFencedWriteMiss reads both facts in a single
-		// round trip — whether the claim is still this caller's and whether a revocation is
-		// pending — and a second expectation stacked below this one was an earlier
-		// generation's (exists, held) shape that nothing consumes. sqlmock does not object to
-		// an unconsumed expectation until ExpectationsWereMet, so the subtest reached the right
-		// verdict and then failed on the leftover.
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
 				AddRow(true, false))
@@ -9128,24 +7923,15 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 	})
 
 	t.Run("distinguishes a LOST FENCE from a superseded credential", func(t *testing.T) {
-		// AUTH-01 + the fence: both predicates can fail, and the caller's remedy differs.
-		// A superseded credential means this issuance simply lost a race. A lost claim
-		// means another operation may be running right now and cannot know about the
-		// credential this one already wrote at the broker, so this one MUST compensate.
-		// Reporting them with the same error would silently skip that compensation.
+		// REVOKE-BEFORE-DELETE plus the fence: both predicates can fail, and the caller's remedy differs. A
+		// superseded credential means this issuance simply lost a race.
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
 		mock.ExpectExec("UPDATE blnk.event_subscribers").
 			WillReturnResult(sqlmock.NewResult(0, 0))
-		// The row is there but the claim is not this caller's any more, which is the ONE query
-		// describeFencedWriteMiss issues and the two booleans it selects.
-		//
-		// A bare ExpectQuery("SELECT") returning a full subscriber row sat here first, from a
-		// generation that re-read the row to diagnose the miss. Being bare, it matched the
-		// describe query — which also starts with SELECT — and handed fifteen columns to a
-		// two-column Scan, so the diagnosis failed at the driver and a deliberate CONFLICT
-		// surfaced as INTERNAL_SERVER_ERROR: the exact conflation this subtest exists to rule out.
+		// The row is there but the claim is not this caller's any more, which is the ONE
+		// query describeFencedWriteMiss issues and the two booleans it selects.
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
 				AddRow(false, false))
@@ -9160,11 +7946,11 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 	})
 
 	t.Run("refuses a blank claim token before any statement", func(t *testing.T) {
-		// A blank token would either turn the ownership condition into a comparison
-		// against the empty string, which matches nothing and presents as a spurious
-		// conflict, or — if the condition were ever dropped — match every row. Refusing
-		// it here makes "this write happened under a live claim" a property of the
-		// statement rather than of the caller's discipline.
+		// A blank token would either turn the ownership condition into a comparison against
+		// the empty string, which matches nothing and presents as a spurious conflict, or —
+		// if the condition were ever dropped — match every row. Refusing it here makes "this
+		// write happened under a live claim" a property of the statement rather than of the
+		// caller's discipline.
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
@@ -9210,9 +7996,9 @@ func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		// Both columns in one statement, because together they are one issuance
-		// record: a reference without a timestamp cannot be audited, and a timestamp
-		// without a reference asserts an issuance it cannot identify.
+		// Both columns in one statement, because together they are one issuance record: a
+		// reference without a timestamp cannot be audited, and a timestamp without a
+		// reference asserts an issuance it cannot identify.
 		mock.ExpectExec("credential_reference = NULL").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -9252,20 +8038,16 @@ func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
 	})
 
 	t.Run("a row that vanished is a LOST FENCE, not a not-found", func(t *testing.T) {
-		// The write is fence-protected, so "no row matched" no longer means "there is no
-		// such subscriber". A row that disappeared under a caller holding a claim means
-		// something else removed it concurrently — and that caller has just revoked a
-		// credential at the broker. Reporting not-found would read as "nothing to clean
-		// up" and suppress the compensation, which is the dangerous direction.
+		// The write is fence-protected, so "no row matched" no longer means "there is no such
+		// subscriber". A row that disappeared under a caller holding a claim means something
+		// else removed it concurrently — and that caller has just revoked a credential at the
+		// broker.
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
 		mock.ExpectExec("UPDATE blnk.event_subscribers").
 			WillReturnResult(sqlmock.NewResult(0, 0))
-		// describeFencedWriteMiss reads (holds_claim, revocation_pending) in ONE query. The
-		// two-column (exists, held) shape that stood here is an earlier generation's, and with a
-		// false in the first column it decoded as "the claim is not yours" rather than as the row
-		// having vanished — the same verdict by luck, from the wrong reading.
+		// describeFencedWriteMiss reads (holds_claim, revocation_pending) in ONE query.
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
 				AddRow(false, false))
@@ -9338,10 +8120,9 @@ func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
 
 // newEventSubscriberRows builds a sqlmock row set over the FULL registry projection.
 //
-// It exists because two tests used to spell the row out as a positional literal, and adding a
-// column to eventSubscriberColumns then made them panic on an arity mismatch rather than fail on
-// the behaviour they were about. Here the projection decides the width: named values are placed
-// by column, and every other column is NULL.
+// It exists so no test spells the row out as a positional literal: adding a column to
+// eventSubscriberColumns then makes that test panic on an arity mismatch rather than fail
+// on the behaviour it was about.
 //
 // Parameters:
 //   - t *testing.T: for the fatal on an unknown column name.
@@ -9374,13 +8155,11 @@ func newEventSubscriberRows(t *testing.T, values map[string]driver.Value) *sqlmo
 	return sqlmock.NewRows(columns).AddRow(row...)
 }
 
-// TestTakeEventSubscriber_ReturnsTheRowItDeleted is the AUTH-01 deletion-propagation
+// TestTakeEventSubscriber_ReturnsTheRowItDeleted is the revoke-before-delete deletion-propagation
 // guard.
 //
-// Revoking at the broker needs the principal and the authorised topics, and those
-// exist only on the row being deleted. Returning it is what makes the revocation
-// target exactly what was removed, instead of a value read beforehand that may since
-// have changed.
+// Revoking at the broker needs the principal and the authorised topics, and those exist
+// only on the row being deleted.
 func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 	t.Run("hands back the principal and the grant", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -9417,11 +8196,11 @@ func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 		source := Datasource{Conn: db}
 
 		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
-		// The row genuinely is not there, so this is a not-found rather than a lost fence — and
-		// "not there" is expressed as the describe query returning NO ROWS, which is the only
-		// reading that yields subscriberFenceMissRowGone. The earlier (exists=false, held=false)
-		// shape returned a row saying the claim was not the caller's, which is a LOST FENCE and
-		// resolved to the 409 this subtest exists to distinguish from a 404.
+		// The row genuinely is not there, so this is a not-found rather than a lost fence —
+		// and "not there" is expressed as the describe query returning NO ROWS, which is the
+		// only reading that yields subscriberFenceMissRowGone. The earlier (exists=false,
+		// held=false) shape returned a row saying the claim was not the caller's, which is a
+		// LOST FENCE and resolved to the 409 this subtest exists to distinguish from a 404.
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnError(sql.ErrNoRows)
 
@@ -9499,12 +8278,8 @@ func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 	})
 }
 
-// TestPurgeMigratedSubscriberWebhookURLs_ExpiresTheDualRunArtefact is the RETAIN-01
+// TestPurgeMigratedSubscriberWebhookURLs_ExpiresTheDualRunArtefact is the dual-run retention
 // guard.
-//
-// Once a subscriber has migrated, webhook_url holds a third party's endpoint with no
-// remaining purpose — retention without a reason, and a destination that becomes a
-// request Blnk makes the moment any sender is wired to it.
 func TestPurgeMigratedSubscriberWebhookURLs_ExpiresTheDualRunArtefact(t *testing.T) {
 	t.Run("nulls the URL of migrated subscribers before the cut-off", func(t *testing.T) {
 		db, mock := newSQLMock(t)
@@ -9542,12 +8317,8 @@ func TestPurgeMigratedSubscriberWebhookURLs_ExpiresTheDualRunArtefact(t *testing
 	})
 }
 
-// TestSubscriberRepository_DoesNotLeakDriverDetail is the DATA-01 guard for the
-// subscriber repository.
-//
-// A raw *pq.Error attached to APIError.Details serialises its Schema, Table, Column,
-// Constraint, File, Line and Routine straight into the response body, describing the
-// database's internal structure to any caller who can provoke an error.
+// TestSubscriberRepository_DoesNotLeakDriverDetail is the guard for the subscriber
+// repository.
 func TestSubscriberRepository_DoesNotLeakDriverDetail(t *testing.T) {
 	hostile := &pq.Error{
 		Severity: "ERROR", Code: "23505",
@@ -9598,12 +8369,10 @@ func TestSubscriberRepository_DoesNotLeakDriverDetail(t *testing.T) {
 }
 
 // assertNoDatabaseDetailLeak proves an error carries none of the driver's structural
-// detail, checked through BOTH renderings a caller can reach: the error string, and
-// the JSON an API response is built from.
+// detail, checked through BOTH renderings a caller can reach: the error string, and the
+// JSON an API response is built from.
 //
-// Both are needed because they fail differently. A struct attached to Details is
-// invisible in %v — APIError.Error() prints only the code and message — and fully
-// visible once marshalled. Checking one alone would pass while the other leaked.
+// Both are needed because they fail differently.
 func assertNoDatabaseDetailLeak(t *testing.T, err error) {
 	t.Helper()
 
@@ -9626,15 +8395,15 @@ func assertNoDatabaseDetailLeak(t *testing.T, err error) {
 }
 
 // ---------------------------------------------------------------------------------------
-// The broker coordinate and the zero-loss audit — OBS-02
+// The broker coordinate and the zero-loss audit
 // ---------------------------------------------------------------------------------------
 
 // eventOutboxBrokerRecord builds a coordinate that is unique to one test run.
 //
-// The topic is per-run because the coordinate carries a PARTIAL UNIQUE INDEX: two rows naming
-// the same (topic, partition, offset) is refused by the database, which is the guarantee the
-// audit rests on — and which would otherwise make two tests, or two runs of one test, collide
-// on a shared literal.
+// The topic is per-run because the coordinate carries a PARTIAL UNIQUE INDEX: two rows
+// naming the same (topic, partition, offset) is refused by the database, which is the
+// guarantee the audit rests on — and which would otherwise make two tests, or two runs
+// of one test, collide on a shared literal.
 func eventOutboxBrokerRecord(markerPrefix string, partition int, offset int64) model.BrokerRecord {
 	return model.BrokerRecord{
 		Topic:     "blnk.transactions." + markerPrefix,
@@ -9643,12 +8412,7 @@ func eventOutboxBrokerRecord(markerPrefix string, partition int, offset int64) m
 	}
 }
 
-// TestMarkEventDispatched_PersistsTheBrokerCoordinate is the OBS-02 write-side guard.
-//
-// Every marking transition binds the coordinate, and the SQL is asserted directly because the
-// column list and the COALESCE are the whole mechanism: a transition that assigned instead of
-// COALESCEd would erase the record a webhook-only retry pass has no coordinate for, and one that
-// bound nothing would leave every row an unconfirmed publication with nothing failing to say so.
+// TestMarkEventDispatched_PersistsTheBrokerCoordinate is the broker-coordinate write-side guard.
 func TestMarkEventDispatched_PersistsTheBrokerCoordinate(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9680,11 +8444,6 @@ func TestMarkEventDispatched_PersistsTheBrokerCoordinate(t *testing.T) {
 }
 
 // TestMarkEventDispatched_BindsNullForAnUnconfirmedCoordinate pins the absence case.
-//
-// Partition 0 and offset 0 are an ordinary location — the first record on a fresh partition — so
-// binding zeroes for an absent coordinate would write a row claiming to name a record it never
-// produced, and an operator following it would find somebody else's event. An absent coordinate
-// must be SQL NULL, which is also what the all-or-nothing check constraint requires.
 func TestMarkEventDispatched_BindsNullForAnUnconfirmedCoordinate(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9709,10 +8468,8 @@ func TestMarkEventDispatched_BindsNullForAnUnconfirmedCoordinate(t *testing.T) {
 
 // TestMarkEventDeadLettered_AssignsTheDeadLetterCoordinate covers the asymmetry.
 //
-// A dead-lettered row's record is on the `.dlt` topic, and the original publish is what FAILED —
-// so there is no record of it to name. The coordinate is therefore ASSIGNED rather than
-// COALESCEd: a stale coordinate on the main topic would send an operator looking for a record
-// the retries never produced.
+// A dead-lettered row's record is on the `.dlt` topic, and the original publish is what
+// FAILED — so there is no record of it to name.
 func TestMarkEventDeadLettered_AssignsTheDeadLetterCoordinate(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9748,10 +8505,8 @@ func TestMarkEventDeadLettered_AssignsTheDeadLetterCoordinate(t *testing.T) {
 
 // TestMarkEventWebhookPending_CoalescesTheCoordinate covers the third transition.
 //
-// A webhook-only retry pass publishes NOTHING — the row's Kafka leg is already done — so it
-// carries no coordinate, and the statement must leave the stored one intact. This is the exact
-// case COALESCE exists for, and an assignment here would erase the record of a row that is
-// otherwise perfectly healthy.
+// This is the exact case COALESCE exists for, and an assignment here would erase the
+// record of a row that is otherwise perfectly healthy.
 func TestMarkEventWebhookPending_CoalescesTheCoordinate(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9774,24 +8529,21 @@ func TestMarkEventWebhookPending_CoalescesTheCoordinate(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestAuditEventRecordsInIntervals_ClassifiesAgainstTheMeasuredWindows pins the audit query,
-// which IS the finding's resolution.
+// TestAuditEventRecordsInIntervals_ClassifiesAgainstTheMeasuredWindows pins the audit
+// query, which IS the mechanism.
 //
 // Every element asserted here is load-bearing:
 //
-//   - The windows arrive as four PARALLEL ARRAYS zipped by unnest, so one statement serves any
-//     number of partitions. Interpolating them would be an injection surface on values that
-//     ultimately come from a broker response.
-//   - The join is a LEFT JOIN. An inner join would silently DROP every row whose partition was
-//     not measured, inflating the corroborated fraction — the exact failure the classification
-//     exists to prevent.
-//   - The five CASE arms are the classification, and their ORDER matters: the coordinate-less
-//     test comes first because a NULL offset would compare false against every bound, and the
-//     beyond-end test comes before the aged-out one so a truncated partition is never reported
-//     as retention.
-//   - The predicate must include webhook_pending rows through kafka_dispatched_at. Restricting
-//     it to the terminal statuses would leave their records unaccounted for on the outbox side
-//     and loosen the reconciliation during exactly the dual-delivery window it matters most in.
+//   - The windows arrive as four PARALLEL ARRAYS zipped by unnest, so one statement
+//     serves any number of partitions.
+//   - The join is a LEFT JOIN. An inner join would silently DROP every row whose
+//     partition was not measured, inflating the corroborated fraction — the exact
+//     failure the classification exists to prevent.
+//   - The five CASE arms are the classification, and their ORDER matters: the
+//     coordinate-less test comes first because a NULL offset would compare false
+//     against every bound, and the beyond-end test comes before the aged-out one so a
+//     truncated partition is never reported as retention.
+//   - The predicate must include webhook_pending rows through kafka_dispatched_at.
 func TestAuditEventRecordsInIntervals_ClassifiesAgainstTheMeasuredWindows(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9863,14 +8615,8 @@ func TestAuditEventRecordsInIntervals_ClassifiesAgainstTheMeasuredWindows(t *tes
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestAuditEventRecordsInIntervals_NormalisesTheWindowsItIsGiven covers the three window
-// readings that must not reach SQL as-is.
-//
-// Each one would otherwise misclassify rows rather than merely being untidy: a blank topic and a
-// negative partition can match no stored coordinate but would still occupy an array slot, and a
-// NEGATIVE first offset — kafka-go's "unknown" reading — would compare below every stored offset
-// and so could never be exceeded, silently turning an unknown lower bound into "nothing has aged
-// out". Zero is the widest defensible reading and is the only one that cannot invent a fact.
+// TestAuditEventRecordsInIntervals_NormalisesTheWindowsItIsGiven covers the three
+// window readings that must not reach SQL as-is.
 func TestAuditEventRecordsInIntervals_NormalisesTheWindowsItIsGiven(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9897,10 +8643,8 @@ func TestAuditEventRecordsInIntervals_NormalisesTheWindowsItIsGiven(t *testing.T
 // TestAuditEventRecordsInIntervals_WithNoWindowsCorroboratesNothing is the guard on the
 // broker-less path.
 //
-// With no windows every confirmed row classifies as unmeasured, so the verdict is inconclusive.
-// That is the only honest reading — nothing was measured, so nothing was corroborated — and the
-// alternative is the dangerous one: an audit that treated "no windows" as "no constraints"
-// would report a green reconciliation precisely when the broker could not be read.
+// With no windows every confirmed row classifies as unmeasured, so the verdict is
+// inconclusive.
 func TestAuditEventRecordsInIntervals_WithNoWindowsCorroboratesNothing(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9927,12 +8671,8 @@ func TestAuditEventRecordsInIntervals_WithNoWindowsCorroboratesNothing(t *testin
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestAuditEventRecordsInIntervals_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict
-// honest.
-//
-// A zero audit reads as "nothing has been published", which is a legitimate state on a fresh
-// deployment — so returning one on a failed read would let a reconciliation conclude that
-// everything is accounted for precisely when it could not measure.
+// TestAuditEventRecordsInIntervals_ReportsAFailureRatherThanAnEmptyAudit keeps the
+// verdict honest.
 func TestAuditEventRecordsInIntervals_ReportsAFailureRatherThanAnEmptyAudit(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -9960,13 +8700,8 @@ func auditIntervalRows(published, corroborated, distinct, unconfirmed, unmeasure
 	)
 }
 
-// TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB proves the coordinate survives the
-// write and the read, against the real schema.
-//
-// The mock tests above assert the statements; only the real database can show that the columns
-// exist, that the check constraint accepts a complete coordinate, and that the projection and
-// scanner agree on where the three columns sit — a scan-order mistake no compiler catches and
-// that surfaces only as mis-assigned field values.
+// TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB proves the coordinate
+// survives the write and the read, against the real schema.
 func TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -9991,13 +8726,8 @@ func TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB(t *testing.T) {
 	assert.Equal(t, model.EventOutboxStatusDispatched, stored.Status)
 }
 
-// TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB proves the guarantee the audit's
-// integrity check rests on.
-//
-// One record is produced by one acknowledged write of one row, so two rows naming the same
-// coordinate is impossible in reality — and the partial unique index is what makes it impossible
-// in the schema too. Without it, two rows could share one record's corroboration, which is the
-// same double-counting the whole mapping exists to remove.
+// TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB proves the guarantee the
+// audit's integrity check rests on.
 func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -10029,24 +8759,11 @@ func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
 			"the audit count one record twice, which is the double-counting the mapping removes")
 }
 
-// TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB is the audit's own
-// round trip, and the only place the classification meets a real planner.
+// TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB is the audit's
+// own round trip, and the only place the classification meets a real planner.
 //
-// It builds every shape the classification has to separate — a dispatched row whose coordinate
-// sits INSIDE the measured window, a webhook_pending row whose Kafka leg completed, a
-// dispatched row with no coordinate at all, a row whose offset is BELOW the window (retention
-// has deleted its record), a row whose offset is AT OR ABOVE the window (the partition was
-// truncated or the topic recreated), a row on a partition NOTHING measured, and a row that has
-// not been published at all — and requires each to land in its own bucket.
-//
-// A mock cannot prove any of this: it replays a scripted result and has no join, no CASE and no
-// planner. The buckets are what the verdict is computed from, so a classification that put a
-// truncated partition's rows under retention, or dropped an unmeasured partition's rows
-// entirely, would produce a confident verdict about a set that is not the outbox.
-//
-// Isolation is on the marker-scoped TOPIC recorded in kafka_topic, which is a free-form column
-// rather than the validated `topic` column, so the windows below can be asserted exactly
-// against a shared table.
+// A mock cannot prove any of this: it replays a scripted result and has no join, no
+// CASE and no planner.
 func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -10139,19 +8856,8 @@ func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *t
 		"a row on a partition nothing measured must be COUNTED, not dropped: dropping it is what "+
 			"would inflate the corroborated fraction")
 
-	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that says
-	// so unconditionally.
-	//
-	// COUNT(DISTINCT (topic, partition, offset)) counts the all-NULL row constructor as a
-	// distinct value, so without the filter the unconfirmed row would contribute a phantom
-	// record — unless some earlier test had already left a coordinate-less published row that
-	// contributed it first, which is how the unfiltered form passed on residue and failed the
-	// moment fixtures started cleaning up after themselves.
-	//
-	// Stated as an INVARIANT rather than a delta because that is the contract both readers rely
-	// on: FullyCorroborated requires no duplication, and ReconcileAgainstOutbox derives
-	// duplication from the difference, so DistinctCorroboratedRecords exceeding
-	// CorroboratedRows is not a smaller version of the same answer — it is a wrong one.
+	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that
+	// says so unconditionally.
 	assert.LessOrEqual(t, after.DistinctCorroboratedRecords, after.CorroboratedRows,
 		"a row that names no coordinate names no record: the distinct count may never exceed the "+
 			"corroborated one, or a healthy outbox is reported inconclusive and the verdict derives "+
@@ -10192,20 +8898,17 @@ func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *t
 	})
 }
 
-// TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt covers the transition the relay
-// takes when the publisher reports a failure NO FURTHER ATTEMPT CAN CHANGE — an unauthorised
-// principal, a destination outside the topic catalogue, bytes that will never parse, a message
-// over the size limit.
+// TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt covers the transition the
+// relay takes when the publisher reports a failure NO FURTHER ATTEMPT CAN CHANGE — an
+// unauthorised principal, a destination outside the topic catalogue, bytes that will
+// never parse, a message over the size limit.
 //
-// It is a separate statement from MarkEventFailed rather than a flag on it, because the two
-// decisions are taken in different places. MarkEventFailed asks the DATABASE whether the budget
-// is spent, which is what stops two racing instances both concluding they were last; this one
-// carries a verdict the publisher already reached about the broker's answer. Before it existed
-// the relay had nowhere to put that verdict, so a topic-authorisation failure spent all five
-// attempts and ~17 seconds of backoff per event proving the broker meant it.
+// It is a separate statement from MarkEventFailed rather than a flag on it, because the
+// two decisions are taken in different places.
 //
-// The three properties asserted are the ones the dead-letter hand-off depends on: no budget
-// test in the statement, the attempt counted honestly, and the claim token retained.
+// The three properties asserted are the ones the dead-letter hand-off depends on: no
+// budget test in the statement, the attempt counted honestly, and the claim token
+// retained.
 func TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -10277,10 +8980,7 @@ func TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt(t *testing.T) {
 // TestMarkEventPermanentlyFailed_LostClaimIsAConflict mirrors the guard on every other
 // conditional transition.
 //
-// Matching no row means the lease expired and another instance owns the row. Reporting that as
-// success would let the stale worker go on to write the event to the dead-letter topic — a
-// second copy of an event the new owner is also working on, which is precisely the outcome the
-// retained claim token exists to prevent.
+// Matching no row means the lease expired and another instance owns the row.
 func TestMarkEventPermanentlyFailed_LostClaimIsAConflict(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -10302,31 +9002,23 @@ func TestMarkEventPermanentlyFailed_LostClaimIsAConflict(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Exclusive use of the shared blnk.event_outbox
 //
-// This is the DATABASE-package half of a pair. Its twin is lockEventOutboxTier in the root
-// package's event_recovery_integration_test.go, which carries the full explanation; the short
-// version is that two live tiers in two packages work this one table and neither can be scoped
-// to its own rows:
+// This is the DATABASE-package half of a pair. Its twin is lockEventOutboxTier in the
+// root package's event_recovery_integration_test.go, which carries the full
+// explanation; the short version is that two live tiers in two packages work this one
+// table and neither can be scoped to its own rows:
 //
-//   - The ROOT tiers CLAIM. ClaimPendingEventOutbox takes the oldest pending rows in the whole
-//     table, whoever wrote them, because that is what the relay does in production.
-//   - THIS tier RETIRES every claim-visible row that is not its own and then asserts there are
-//     none, so that its claim assertions read a table it controls.
-//
-// Each therefore breaks the other, and they do not share a process: `go test ./...` runs one
-// binary per package, in parallel, so an in-process mutex is not even available. Observed
-// directly — the root tier timing out on rows this tier had retired, and this tier's straggler
-// assertion tripping on a row the root tier inserted a moment after the retire — failing 3/3 at
-// default parallelism and passing 2/2 under -p 1.
-//
-// A POSTGRES ADVISORY LOCK, held in the same database as the table it protects, is the one
-// mechanism that reaches across processes without changing the production claim query.
+//   - The ROOT tiers CLAIM. ClaimPendingEventOutbox takes the oldest pending rows in
+//     the whole table, whoever wrote them, because that is what the relay does in
+//     production.
+//   - THIS tier RETIRES every claim-visible row that is not its own and then asserts
+//     there are none, so that its claim assertions read a table it controls.
 // ---------------------------------------------------------------------------
 
 // eventOutboxTierLockKey identifies the advisory lock the live outbox tiers share.
 //
 // It MUST BE THE SAME VALUE as the constant of the same name in the root package's
-// event_recovery_integration_test.go: two different keys are two different locks and would
-// protect nothing at all.
+// event_recovery_integration_test.go: two different keys are two different locks and
+// would protect nothing at all.
 const eventOutboxTierLockKey int64 = 0x424c4e4b4f5542 // "BLNKOUB"
 
 // eventOutboxTierLockBudget bounds how long this tier waits for the lock. Longer than the
@@ -10339,14 +9031,9 @@ const eventOutboxTierLockPoll = 200 * time.Millisecond
 
 // eventOutboxTierLock holds this process's side of the advisory lock.
 //
-// The DEDICATED CONNECTION is load-bearing: a Postgres advisory lock belongs to a SESSION, and
-// database/sql hands out an arbitrary pooled connection per statement, so a lock taken on a pool
-// is released the moment that connection is recycled — a lock that looks held and is not.
-// MaxOpenConns(1) pins one session for the lock's lifetime.
-//
-// The refcount makes acquisition REENTRANT within the process: every _RealDB test in this file
-// calls quiesceEventOutbox, and a test that quiesced twice would otherwise take the lock on two
-// sessions and deadlock against itself.
+// The refcount makes acquisition REENTRANT within the process: every _RealDB test in
+// this file calls quiesceEventOutbox, and a test that quiesced twice would otherwise
+// take the lock on two sessions and deadlock against itself.
 var eventOutboxTierLock struct {
 	mu       sync.Mutex
 	holders  int
@@ -10357,10 +9044,10 @@ var eventOutboxTierLock struct {
 // lockEventOutboxTier takes exclusive use of blnk.event_outbox until the test finishes.
 //
 // Parameters:
-//   - t *testing.T: the test, for cleanup registration and for failing when the lock cannot be
-//     taken.
-//   - pool *sql.DB: the pool whose database holds the outbox. Its DSN is reused for the lock's
-//     own session; the pool itself is never locked on.
+//   - t *testing.T: the test, for cleanup registration and for failing when the lock
+//     cannot be taken.
+//   - pool *sql.DB: the pool whose database holds the outbox. Its DSN is reused for the
+//     lock's own session; the pool itself is never locked on.
 func lockEventOutboxTier(t *testing.T, pool *sql.DB) {
 	t.Helper()
 
@@ -10380,9 +9067,9 @@ func lockEventOutboxTier(t *testing.T, pool *sql.DB) {
 
 // acquireEventOutboxTierLock opens the lock session and blocks until the lock is held.
 //
-// The DSN comes from the same resolution openRealTestDB uses — TEST_DATABASE_URL, falling back
-// to defaultRealTestDSN — so the lock is always taken in the database the tier is working, not
-// in whichever one a configuration store happens to hold.
+// The DSN comes from the same resolution openRealTestDB uses — TEST_DATABASE_URL,
+// falling back to defaultRealTestDSN — so the lock is always taken in the database the
+// tier is working, not in whichever one a configuration store happens to hold.
 func acquireEventOutboxTierLock(t *testing.T) {
 	t.Helper()
 
@@ -10451,9 +9138,9 @@ func releaseEventOutboxTierLock() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Unlocked explicitly AND the session closed. Closing alone would release it — a session
-	// ending drops its advisory locks — but an explicit unlock releases it at a known instant
-	// rather than whenever the pool decides to close the connection.
+	// Unlocked explicitly AND the session closed. Closing alone would release it — a
+	// session ending drops its advisory locks — but an explicit unlock releases it at a
+	// known instant rather than whenever the pool decides to close the connection.
 	if _, err := eventOutboxTierLock.conn.ExecContext(ctx,
 		`SELECT pg_advisory_unlock($1)`, eventOutboxTierLockKey); err != nil {
 		logrus.WithError(err).Warn("releasing the event outbox tier advisory lock")
@@ -10470,22 +9157,11 @@ func releaseEventOutboxTierLock() {
 // openLockedEventOutboxDB opens the real test database AND takes exclusive use of
 // blnk.event_outbox for the test's duration.
 //
-// Every _RealDB test in this file goes through it rather than through openRealTestDB directly,
-// and the reason is that the lock has to be held for the WHOLE test, not for the part that
-// happens to quiesce.
-//
-// The audit tests are what made that concrete. They take a GLOBAL before-count, insert their
-// fixtures, transition them, take a global after-count and assert on the DELTA — and they
-// quiesce only in cleanup, so with the lock taken by quiesceEventOutbox alone they ran their
-// whole body unprotected. The root package's relay dispatched one row inside that window and
-// the delta came back as 3 where 2 was asserted: a real defect report about a count that was
-// correct.
-//
-// Acquisition is refcounted, so a test that also quiesces takes the lock once and releases it
-// once.
+// The audit tests are what made that concrete.
 //
 // Returns:
-//   - Datasource: the real-database datasource, with the outbox exclusively this test's.
+//   - Datasource: the real-database datasource, with the outbox exclusively this
+//     test's.
 func openLockedEventOutboxDB(t *testing.T) Datasource {
 	t.Helper()
 
@@ -10495,24 +9171,10 @@ func openLockedEventOutboxDB(t *testing.T) Datasource {
 	return ds
 }
 
-// TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB proves the fix against real
-// SQL, which is the only place it can be proved.
+// TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB proves the fix against
+// real SQL, which is the only place it can be proved.
 //
-// # What was wrong
-//
-// The dead-letter listing used to return unfiltered pages and let the service above it test
-// each row in Go, abandoning the walk after 5,000 scanned rows. A filter whose matches lay
-// beyond that ceiling produced an ordinary empty page, so the endpoint answered "nothing
-// matches" while entries matched — and no offset could reach them. Separately, no
-// filter-aware count existed, so a total could only be offered for an UNFILTERED page.
-//
-// # What is asserted, and why against a real database
-//
-// A fake can be made to agree with any predicate. These are the assertions that only real
-// SQL can settle: that the WHERE clause narrows on the columns claimed, that both terminal
-// failure states remain in scope so a filter cannot escape them, that OFFSET pages the
-// MATCHING set, and that COUNT(*) over the same predicate agrees with the rows returned. The
-// last is the one an operator depends on: paging to the total must exhaust the matches.
+// A fake can be made to agree with any predicate.
 func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -10544,9 +9206,8 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 		entry.Topic = spec.topic
 		entry.OccurredAt = base.Add(time.Duration(i) * time.Second)
 		if !spec.deadLetter {
-			// A one-attempt budget so a single failure spends it and the row lands in
-			// `failed` with dlt_topic still NULL — the state whose only surviving copy is
-			// the outbox row.
+			// A one-attempt budget so a single failure spends it and the row lands in `failed`
+			// with dlt_topic still NULL — the state whose only surviving copy is the outbox row.
 			entry.MaxAttempts = 1
 		}
 		insertRealEventOutbox(t, ds, entry)
@@ -10584,9 +9245,7 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 	// clone running the same suite against this database can therefore have rows in the
 	// same states at the same time, so every assertion on a RETURNED SET is filtered to
 	// this test's own marker, and every assertion on a COUNT is a lower bound rather than
-	// an equality. That is the honest form: the count is genuinely a count of the whole
-	// table, and pretending otherwise would make this test pass or fail on who else is
-	// running.
+	// an equality.
 
 	t.Run("the event-type filter narrows on the column", func(t *testing.T) {
 		entries, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
@@ -10665,9 +9324,9 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 			require.Len(t, ids, 1, "each page must land on a match")
 			seen = append(seen, ids...)
 
-			// Taken from the row just returned rather than from NextCursor, because the LAST page
-			// of an exactly-divided walk reports no further page and so carries no cursor — and
-			// the position past the final match is what the assertion after the loop needs.
+			// Taken from the row just returned rather than from NextCursor, because the LAST
+			// page of an exactly-divided walk reports no further page and so carries no cursor —
+			// and the position past the final match is what the assertion after the loop needs.
 			last := page.Entries[len(page.Entries)-1]
 			resume = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
 		}
@@ -10702,10 +9361,9 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 			})
 			require.NoError(t, err)
 
-			// The count spans every row in the table, so it is compared against this
-			// test's own rows by counting with the aggregate scoped the same way: the
-			// difference between the two counts must be attributable entirely to rows
-			// this test did not create.
+			// The count spans every row in the table, so it is compared against this test's own
+			// rows by counting with the aggregate scoped the same way: the difference between
+			// the two counts must be attributable entirely to rows this test did not create.
 			total, err := ds.CountDeadLetterInventory(ctx, query)
 			require.NoError(t, err)
 			assert.GreaterOrEqualf(t, total, int64(len(mine(entries))),
@@ -10723,10 +9381,9 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 	})
 
 	t.Run("the full-row read and the projection describe ONE inventory", func(t *testing.T) {
-		// Two entry points, two shapes, one set. The replay path needs the stored bytes and reads
-		// full rows; the operator's listing needs the triage coordinate and reads the projection.
-		// If they can disagree, an event visible in one is invisible in the other, and the
-		// listing an operator replays from is not the inventory the replay draws on.
+		// Two entry points, two shapes, one set. The replay path needs the stored bytes and
+		// reads full rows; the operator's listing needs the triage coordinate and reads the
+		// projection.
 		rows, err := ds.ListDeadLetteredEvents(ctx, model.DeadLetterQuery{Limit: maxDeadLetterPageSize})
 		require.NoError(t, err)
 
@@ -10748,16 +9405,7 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
-// The driver seam
-//
-// Two properties of the paired read cannot be observed from outside the call: that a write
-// committed BETWEEN its two statements is invisible to the second one, and that the
-// transaction it opens is the isolation level and access mode it documents. Both live below
-// database/sql, so the test reaches them by wrapping the driver rather than by inference.
-//
-// This is a test-only seam and it exists for exactly one test. It intercepts nothing and
-// changes nothing by default: every method delegates, and the hook fires only for a
-// statement the test named and only while the test has armed it.
+// The driver seam. This is a test-only seam and it exists for exactly one test.
 // ---------------------------------------------------------------------------
 
 // snapshotProbe is the recording and injection point a probed connection reports to.
@@ -10786,13 +9434,8 @@ func newSnapshotProbe() *snapshotProbe {
 	return &snapshotProbe{seen: make([]string, 0, 8), options: make([]driver.TxOptions, 0, 2)}
 }
 
-// beforeCountOn arms the probe to run hook immediately before the dead-letter COUNT statement.
-//
-// The predicate is deliberately narrow — the count is the only statement in this repository
-// that counts blnk.event_outbox rows — and deliberately structural rather than an exact
-// string, so that a whitespace change in the query does not silently disarm the probe. A
-// change that removes the statement entirely disarms it loudly instead, because firings() then
-// returns zero and the test requires one.
+// beforeCountOn arms the probe to run hook immediately before the dead-letter COUNT
+// statement.
 func (probe *snapshotProbe) beforeCountOn(hook func()) {
 	probe.mu.Lock()
 	defer probe.mu.Unlock()
@@ -10806,9 +9449,7 @@ func (probe *snapshotProbe) beforeCountOn(hook func()) {
 
 // observe records a statement and, when it is the one the hook precedes, runs the hook.
 //
-// The hook runs with the probe's lock RELEASED. It commits on another connection and would
-// otherwise be holding a lock that connection's own bookkeeping may need, and a test that
-// deadlocks in its instrumentation is worse than one that does not exist.
+// The hook runs with the probe's lock RELEASED.
 func (probe *snapshotProbe) observe(statement string) {
 	probe.mu.Lock()
 	probe.seen = append(probe.seen, statement)
@@ -10858,9 +9499,9 @@ func (probe *snapshotProbe) transactions() []driver.TxOptions {
 
 // probedConnector hands out connections that report to a probe.
 //
-// A connector rather than a registered driver name, so the probe is reached through the value
-// the test owns instead of through a package-level registry: two tests can hold two probes at
-// once and neither can observe the other's statements.
+// A connector rather than a registered driver name, so the probe is reached through the
+// value the test owns instead of through a package-level registry: two tests can hold
+// two probes at once and neither can observe the other's statements.
 type probedConnector struct {
 	base  driver.Connector
 	probe *snapshotProbe
@@ -10880,14 +9521,10 @@ func (connector probedConnector) Connect(ctx context.Context) (driver.Conn, erro
 // bookkeeping, which has no interest in the probe.
 func (connector probedConnector) Driver() driver.Driver { return connector.base.Driver() }
 
-// probedConn delegates every operation to a real lib/pq connection, reporting the statement
-// texts and transaction options to the probe on the way through.
+// probedConn delegates every operation to a real lib/pq connection, reporting the
+// statement texts and transaction options to the probe on the way through.
 //
-// Every optional interface lib/pq implements is implemented here too. That completeness is
-// load-bearing rather than tidy: a missing QueryerContext sends database/sql down the
-// prepare-then-execute path, where the statement text is seen at a different moment, and a
-// missing ConnBeginTx would make BeginTx fall back to a plain BEGIN and silently discard the
-// isolation level this test exists to assert.
+// Every optional interface lib/pq implements is implemented here too.
 type probedConn struct {
 	inner driver.Conn
 	probe *snapshotProbe
@@ -10998,10 +9635,8 @@ func (conn *probedConn) IsValid() bool {
 
 // openProbedEventOutboxDB returns a Datasource whose statements pass through a probe.
 //
-// It opens its OWN pool rather than wrapping the shared one, because the injection has to
-// commit on a connection that is not the one holding the snapshot. The caller keeps using the
-// locked datasource for fixtures and cleanup; only the call under observation goes through
-// this one.
+// It opens its OWN pool rather than wrapping the shared one, because the injection has
+// to commit on a connection that is not the one holding the snapshot.
 //
 // Parameters:
 //   - t *testing.T: owns the pool's lifetime.
@@ -11031,19 +9666,12 @@ func openProbedEventOutboxDB(t *testing.T, probe *snapshotProbe) Datasource {
 	return Datasource{Conn: db}
 }
 
-// TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB is the property a
-// shared predicate could never deliver on its own.
+// TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB is the
+// property a shared predicate could never deliver on its own.
 //
-// The page and its total were two statements on two connections. Both applied the same filters,
-// and the response said so — but an entry dead-lettered between the two reads is counted by one
-// and absent from the other, so the total described a set the page was not a slice of. On a
-// triage endpoint that reads as a different amount of stuck work than there is, and a client
-// comparing the page against the total does not terminate.
+// The page and its total were two statements on two connections.
 //
-// The test writes a row BETWEEN the two reads of the pair. It can do that because a REPEATABLE
-// READ snapshot is taken at the transaction's first statement, and the insert here happens on a
-// second connection after that statement has run: under two independent reads the second one
-// sees the new row, and under one snapshot neither does. That distinction is the whole test.
+// The test writes a row BETWEEN the two reads of the pair.
 func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -11102,23 +9730,6 @@ func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(
 	t.Run("a row committed BETWEEN the page and the count is in neither answer", func(t *testing.T) {
 		// THIS IS THE ONLY ARRANGEMENT THAT DISCRIMINATES, and the reason is worth stating
 		// plainly because the obvious arrangement does not.
-		//
-		// Writing a row between two COMPLETE invocations proves nothing. Two autocommit reads
-		// per invocation would pass it just as readily: each pair runs its page and its count
-		// microseconds apart with nothing writing in between, so the two answers agree by
-		// coincidence of timing and the assertion never fires. The property under test is not
-		// "the pair agrees when nothing changes" — it is "the pair agrees WHEN SOMETHING DOES",
-		// and the only place something can change is INSIDE one invocation, after its first
-		// statement and before its second.
-		//
-		// So the write is injected at the driver seam. The probe fires immediately before the
-		// count statement leaves for the server, commits a fourth matching row on a SEPARATE
-		// connection, and returns. In PostgreSQL a REPEATABLE READ snapshot is taken by the
-		// transaction's FIRST statement — BEGIN ISOLATION LEVEL ... acquires none — so the page
-		// has already fixed the snapshot and the count must still see three. Under two
-		// independent reads the count sees four and the pair contradicts itself by exactly the
-		// row the relay dead-lettered in between, which is the production symptom: a triage
-		// endpoint that reports 41 entries and a total of 40.
 		probe := newSnapshotProbe()
 		probed := openProbedEventOutboxDB(t, probe)
 
@@ -11131,9 +9742,8 @@ func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(
 			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize, EventType: eventType})
 		require.NoError(t, err)
 
-		// NON-VACUITY FIRST. Everything below is a claim about a write that landed between two
-		// statements, and it is worthless if the write did not land there. The probe reports
-		// how many times it fired, and the row is separately proved to exist.
+		// NON-VACUITY FIRST. Everything below is a claim about a write that landed between
+		// two statements, and it is worthless if the write did not land there.
 		require.Equalf(t, 1, probe.firings(),
 			"the probe must have fired exactly once, immediately before the count statement. "+
 				"Zero firings means the count no longer matches the statement this probe "+
@@ -11165,7 +9775,6 @@ func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(
 		// THE ISOLATION IS ASSERTED AT THE SEAM, not inferred from the outcome. A pair that
 		// happened to agree for some other reason — one statement doing both jobs, a cached
 		// count — would satisfy the assertions above while the documented mechanism was gone.
-		// The driver records what BeginTx was actually asked for.
 		options := probe.transactions()
 		require.Lenf(t, options, 1,
 			"the paired read must open EXACTLY ONE transaction; %d means the page and the count "+
@@ -11207,27 +9816,11 @@ func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(
 	})
 }
 
-// TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB is the durable half of making the
-// zero-loss reconciliation honest.
+// TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB is the durable half of
+// making the zero-loss reconciliation honest.
 //
-// # Why a deleted row has to leave a record
-//
-// A Kafka end offset counts every record ever appended to a partition and never decreases.
-// The outbox side of the reconciliation counts rows that still exist. The two describe the
-// same interval only until retention deletes its first terminal row; after that the broker
-// counts all of history and the outbox counts a suffix of it.
-//
-// The difference is undetectable by inspection, because the comparison already EXPECTS a
-// surplus — a redelivery, a replay and a dead-letter copy each append a record no row
-// claims. A purge-inflated surplus therefore looks exactly like healthy overhead, and it can
-// offset a genuine shortfall precisely, at which point the endpoint answers a confident "no
-// loss detected" while events are missing. Nothing in the numbers hints at it.
-//
-// A deleted row leaves no trace, so "how many terminal rows has retention removed" is
-// unanswerable unless the purge itself records it. These assertions are what make the answer
-// trustworthy: the counts must describe exactly the rows that left, the confirmed subset must
-// be tracked separately because it restores a different baseline, and a sweep that removes
-// nothing must write nothing.
+// A Kafka end offset counts every record ever appended to a partition and never
+// decreases.
 func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -11238,20 +9831,7 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 
 	// DRAIN THE ELIGIBLE ROWS FIRST, and take the baseline after.
 	//
-	// A delta is not sufficient isolation on its own. The delete is TABLE-WIDE by design —
-	// retention sweeps the outbox, not one test's fixtures — so any terminal row already older
-	// than the cutoff is removed by this test's own purge and counted in the same log row.
-	// quiesceEventOutbox cannot prevent that: it removes rows carrying THIS test's marker, and
-	// the rows in question belong to whatever ran before.
-	//
-	// It happened. A suite run left 36 dispatched rows dated a year back, and the confirmed-
-	// subset assertion below read 38 where it expected 2 — a failure that says nothing about the
-	// purge log and everything about the table it ran against.
-	//
-	// Draining first makes the later delta attributable, WITHOUT weakening the assertion: the
-	// exact `+2` is still asserted, over a table whose only eligible rows are the two fixtures
-	// this test inserts. The loop is bounded because a delete that keeps reporting removals
-	// while the table never empties is a defect to fail on, not to spin on.
+	// A delta is not sufficient isolation on its own.
 	for sweep := 0; ; sweep++ {
 		require.Less(t, sweep, 200,
 			"draining the pre-existing eligible rows must terminate; a purge that keeps "+
@@ -11289,12 +9869,6 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 	// Three PURGEABLE rows — two carrying a broker coordinate and one without, so the
 	// confirmed subset is provably tracked rather than assumed equal to the total — plus a
 	// `failed` row that retention must NOT touch, and a recent row the cutoff must spare.
-	//
-	// Only dispatched and dead_lettered are purgeable, and the exclusion of `failed` is
-	// deliberate rather than an oversight: such a row's retry budget is spent while its
-	// dead-letter write has not landed, so the outbox row is the event's ONLY surviving
-	// copy. Deleting it would destroy the event, which is the exact failure the whole
-	// zero-loss criterion exists to prevent. It is asserted below.
 	type fixture struct {
 		age       time.Duration
 		status    string
@@ -11332,10 +9906,10 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 			require.NoError(t, failErr)
 			require.True(t, outcome.Exhausted)
 		case model.EventOutboxStatusDeadLettered:
-			// DEAD-LETTERED AND THEREFORE SPARED, however old it is (SEC-08). It is the only
-			// record that a ledger event went undelivered, so age must never remove it: it
-			// leaves the inventory by being REPLAYED, which makes it dispatched, and only then
-			// is it a receipt this sweep may delete.
+			// DEAD-LETTERED AND THEREFORE SPARED, however old it is. It is the only record that
+			// a ledger event went undelivered, so age must never remove it: it leaves the
+			// inventory by being REPLAYED, which makes it dispatched, and only then is it a
+			// receipt this sweep may delete.
 			require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt",
 				json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), record))
 		}
@@ -11378,9 +9952,9 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 	assert.Equal(t, model.EventOutboxStatusFailed, surviving.Status)
 
 	// And so is the dead-lettered one, at 37 days against a 30-day cutoff. This is the
-	// assertion that fails if eligibility is ever widened back to the terminal SET: the row
-	// carries the failure metadata an operator triages from and the bytes a replay is driven
-	// from, and no timer may take them.
+	// assertion that fails if eligibility is ever widened back to the terminal SET: the
+	// row carries the failure metadata an operator triages from and the bytes a replay is
+	// driven from, and no timer may take them.
 	spared, err := ds.GetEventByID(ctx, survivors[model.EventOutboxStatusDeadLettered])
 	require.NoError(t, err,
 		"retention must never purge a dead-lettered row; it is the only record that a ledger "+
@@ -11432,11 +10006,8 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 // auditCoordinatesByPartition reads the audit and returns the coordinates of ONE topic,
 // keyed by partition.
 //
-// It exists so a test can find out what a shared blnk.event_outbox already claims before it
-// adds claims of its own. The audit is a whole-table aggregate and the topic namespace is
-// closed — model.IsBlnkEventTopic admits only `<prefix>.<category>` and its `.dlt` sibling —
-// so a test cannot isolate itself by inventing a topic; it has to place its fixtures where
-// nothing else has, and that requires reading first.
+// It exists so a test can find out what a shared blnk.event_outbox already claims
+// before it adds claims of its own.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -11445,8 +10016,8 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 //   - topic string: the topic whose partitions are wanted.
 //
 // Returns:
-//   - map[int]model.EventRecordCoordinate: one entry per partition the audit reports for
-//     topic. Empty when it reports none, which is the answer a virgin table gives.
+//   - map[int]model.EventRecordCoordinate: one entry per partition the audit reports
+//     for topic.
 func auditCoordinatesByPartition(
 	t *testing.T,
 	ctx context.Context,
@@ -11468,15 +10039,11 @@ func auditCoordinatesByPartition(
 	return byPartition
 }
 
-// TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB covers the audit that
-// turns the reconciliation from an inference into a check.
+// TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB covers the audit
+// that turns the reconciliation from an inference into a check.
 //
-// Counting alone cannot tell a surplus of redeliveries from a surplus concealing an equal
-// number of losses — ten of each produce the totals of a healthy pipeline. A coordinate can
-// be CHECKED against the partition's live bounds: a claim at or beyond the end offset names
-// a record the log does not contain. This asserts the audit supplies what that check needs —
-// grouped per (topic, partition), with the extremes that bound the claims — and that rows
-// claiming nothing are excluded rather than silently counted as verified.
+// Counting alone cannot tell a surplus of redeliveries from a surplus concealing an
+// equal number of losses — ten of each produce the totals of a healthy pipeline.
 func TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -11485,29 +10052,10 @@ func TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB(t *testing
 
 	// THE COORDINATE SPACE THIS TEST WILL ASSERT ON, READ BEFORE ANYTHING IS INSERTED.
 	//
-	// The audit is a WHOLE-TABLE aggregate — the comment on the identity assertion at the
-	// end of this test says so, and that assertion depends on it — so a (topic, partition)
-	// group this test writes into may already hold rows: from an earlier run of this suite,
-	// from the root package's live tiers, or from a shared development database. Two of the
-	// assertions below used to be exact equalities against the literal 7 on partition 3,
-	// which can only hold on a virgin table; on a shared one they read another writer's
-	// largest claim (8514 was observed) and reported a defect in an audit that was correct.
-	//
-	// The third hazard is worse than a false failure. (kafka_topic, kafka_partition,
-	// kafka_offset) is UNIQUE wherever an offset is present, so a hardcoded offset another
-	// row already claims makes MarkEventDispatched fail outright — the test then fails on
-	// its own fixture rather than on anything it is measuring.
+	// The third hazard is worse than a false failure.
 	//
 	// Reading the table first removes both, and it removes them without weakening a single
-	// assertion. Because the topic namespace is closed — model.IsBlnkEventTopic admits only
-	// `<prefix>.<category>` and its `.dlt` sibling, so a run-unique topic is not available
-	// as an isolation mechanism — isolation has to be found inside the coordinate space
-	// instead: the multi-claim fixtures are placed ABOVE the busy partition's existing
-	// claims so the reported maximum is this test's largest claim exactly, and the
-	// single-claim case is given a partition the audit does not currently report at all so
-	// that BOTH of its extremes are that one claim and can be asserted exactly. The tier
-	// lock openLockedEventOutboxDB holds is what makes the reading still true when the
-	// assertions run.
+	// assertion.
 	const auditTopic = "blnk.transactions"
 
 	occupied := auditCoordinatesByPartition(t, ctx, ds, auditTopic)
@@ -11610,13 +10158,6 @@ func TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB(t *testing
 	// The unconfirmed row claims no record, so nothing may account for it. Its absence is
 	// what leaves it to be counted as unconfirmed — which is what makes the verdict
 	// inconclusive while any such row exists.
-	//
-	// The check is against SQL rather than against a predicted partition set, because the
-	// audit covers the WHOLE table: other rows, from other tests in this suite or another
-	// clone running it, legitimately claim partitions this test knows nothing about.
-	// Asserting a partition list would make the test pass or fail on who else is running.
-	// What is invariant is the identity below — the audit accounts for exactly the rows
-	// that carry a coordinate, no more and no fewer.
 	assert.GreaterOrEqual(t, audit.TotalRows(), int64(len(claims)))
 
 	var rowsWithACoordinate int64
@@ -11635,16 +10176,11 @@ func TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB(t *testing
 		"the fixture must genuinely carry no coordinate, or this test proves nothing")
 }
 
-// TestOldestDeadLetterAgeByTopic_IsOneGroupedAggregate is the PERF-P07 guard.
+// TestOldestDeadLetterAgeByTopic_IsOneGroupedAggregate is the guard.
 //
-// The age gauge used to COUNT the whole inventory, derive a tail offset from that count, and
-// then read up to 5,000 WHOLE rows from that deep offset every collection interval to find a
-// minimum — three compounding costs to compute one number per topic, and past its scan cap it
-// reported a LOWER BOUND, which is an age an alert cannot fire on.
-//
-// One MIN per group replaces all of it, exactly, and the group key is the resolved dead-letter
-// topic so a row stranded in `failed` with no dlt_topic yet is attributed to the sibling it is
-// owed rather than dropped.
+// One MIN per group replaces all of it, exactly, and the group key is the resolved
+// dead-letter topic so a row stranded in `failed` with no dlt_topic yet is attributed
+// to the sibling it is owed rather than dropped.
 func TestOldestDeadLetterAgeByTopic_IsOneGroupedAggregate(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -11718,21 +10254,16 @@ func TestOldestDeadLetterAgeByTopic_ErrorsAreWrapped(t *testing.T) {
 }
 
 // planNodeReferencing returns the plan node that reaches needle: the scan line PLUS the
-// qualification lines that belong to it — Index Cond, Recheck Cond, Filter — which are the
-// more-indented lines that follow it before the next node.
-//
-// The qualifications are what decide whether a scan is confined, and the scan line alone cannot
-// say. `Index Scan using <a status-leading index>` reads the whole partial set or three narrow
-// key ranges depending entirely on whether an Index Cond restricts the status, and those are
-// completely different costs — so an assertion about confinement has to read the condition.
+// qualification lines that belong to it — Index Cond, Recheck Cond, Filter — which are
+// the more-indented lines that follow it before the next node.
 //
 // Parameters:
 //   - planText string: the whole EXPLAIN output.
 //   - needle string: the relation reference identifying the node.
 //
 // Returns:
-//   - string: the node and its qualifications, newline-joined, or empty when the relation is
-//     not reached at all.
+//   - string: the node and its qualifications, newline-joined, or empty when the
+//     relation is not reached at all.
 func planNodeReferencing(planText, needle string) string {
 	lines := strings.Split(planText, "\n")
 
@@ -11765,20 +10296,15 @@ func planNodeReferencing(planText, needle string) string {
 	return ""
 }
 
-// planScanIsConfinedToBlockingStates reports whether a plan node can only reach rows in the
-// relay's blocking states.
+// planScanIsConfinedToBlockingStates reports whether a plan node can only reach rows in
+// the relay's blocking states.
 //
 // TWO ways to satisfy it, and both are genuine:
 //
-//   - the scan reads a PARTIAL index whose predicate is the blocking-state set, so terminal
-//     rows are not in the index at all; or
-//   - the scan carries an Index Cond restricting status to the blocking states, so terminal
-//     rows are in the index but in other key ranges and are never read.
-//
-// Asserting the PROPERTY rather than a list of index names is what stops this from testing the
-// planner's mood. It is also the stronger statement: a name list admits any plan through a named
-// index, including a full partial-index scan with no condition at all, and rejects a plan that
-// honours the guarantee through an index the list has not heard of.
+//   - the scan reads a PARTIAL index whose predicate is the blocking-state set, so
+//     terminal rows are not in the index at all; or
+//   - the scan carries an Index Cond restricting status to the blocking states, so
+//     terminal rows are in the index but in other key ranges and are never read.
 //
 // Parameters:
 //   - node string: the plan node and its qualifications, from planNodeReferencing.
@@ -11797,9 +10323,9 @@ func planScanIsConfinedToBlockingStates(node string) bool {
 		}
 	}
 
-	// An index condition on status confines the scan by key range. It must name ONLY blocking
-	// states: a condition mentioning a terminal literal would be reading exactly what the
-	// guarantee forbids.
+	// An index condition on status confines the scan by key range. It must name ONLY
+	// blocking states: a condition mentioning a terminal literal would be reading exactly
+	// what the guarantee forbids.
 	for _, line := range strings.Split(node, "\n") {
 		if !strings.HasPrefix(line, "Index Cond:") || !strings.Contains(line, "status") {
 			continue
@@ -11828,11 +10354,8 @@ func planScanIsConfinedToBlockingStates(node string) bool {
 
 // TestPlanScanIsConfinedToBlockingStates covers the confinement rule directly.
 //
-// It exists because the assertion that uses it lives in a _RealDB test whose plan depends on the
-// planner, so the rule itself has to be provable without one. Every case below is a plan shape
-// PostgreSQL actually produces for the claim query, and the rule has to get all of them right:
-// the whole point of replacing a list of index names was to stop admitting plans that read
-// terminal rows and stop rejecting plans that do not.
+// It exists because the assertion that uses it lives in a _RealDB test whose plan
+// depends on the planner, so the rule itself has to be provable without one.
 func TestPlanScanIsConfinedToBlockingStates(t *testing.T) {
 	t.Parallel()
 
@@ -11907,11 +10430,8 @@ func TestPlanScanIsConfinedToBlockingStates(t *testing.T) {
 	}
 }
 
-// TestPlanNodeReferencing_CarriesTheQualificationsWithTheScan covers the node extractor.
-//
-// The qualification lines are the whole reason this exists: the scan line alone cannot say
-// whether the scan is confined, so an extractor that returned only that line would make the
-// confinement rule unable to tell the two plans in the cases above apart.
+// TestPlanNodeReferencing_CarriesTheQualificationsWithTheScan covers the node
+// extractor.
 func TestPlanNodeReferencing_CarriesTheQualificationsWithTheScan(t *testing.T) {
 	t.Parallel()
 
@@ -11948,16 +10468,15 @@ func TestPlanNodeReferencing_CarriesTheQualificationsWithTheScan(t *testing.T) {
 
 // TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration pins the audit query.
 //
-// The three counts and the predicate ARE the finding's resolution, so each is asserted against
-// the SQL rather than only against a result:
+// The three counts and the predicate ARE the mechanism, so each is asserted
+// against the SQL rather than only against a result:
 //
-//   - COUNT(kafka_offset) is what separates a claim that names a record from one that does not.
-//     SQL COUNT of an expression ignores NULLs, which is why the confirmed count needs no CASE.
-//   - COUNT(DISTINCT (…)) is the schema-integrity check: two rows naming one record would make
-//     it lower than the confirmed count, which the partial unique index should make impossible.
-//   - The predicate must include webhook_pending rows through kafka_dispatched_at. Restricting
-//     it to the terminal statuses would leave their records unaccounted for on the broker side
-//     and loosen the reconciliation during exactly the dual-delivery window it matters most in.
+//   - COUNT(kafka_offset) is what separates a claim that names a record from one that
+//     does not.
+//   - COUNT(DISTINCT (…)) is the schema-integrity check: two rows naming one record
+//     would make it lower than the confirmed count, which the partial unique index
+//     should make impossible.
+//   - The predicate must include webhook_pending rows through kafka_dispatched_at.
 func TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -11990,7 +10509,7 @@ func TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration(t *testing.
 		"a row constructor of all NULLs is not NULL in PostgreSQL, so without the filter every "+
 			"coordinate-less row collapses into one phantom record and DistinctRecords exceeds ConfirmedRows")
 
-	// PERF-P05: the audit is WINDOWED, and both arms of the window are load-bearing.
+	// The audit is WINDOWED, and both arms of the window are load-bearing.
 	assert.Contains(t, issued, "WHERE kafka_dispatched_at >= $2",
 		"the publication instant is what has to fall inside the window for the row to be comparable "+
 			"against records the broker wrote inside it")
@@ -12003,7 +10522,7 @@ func TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration(t *testing.
 }
 
 // TestAuditTerminalEventRecords_NormalisesTheWindow pins the same correction the status count
-// applies, for the same reason: an unbounded audit is the cost PERF-P05 is about, and a future
+// applies, for the same reason: an unbounded audit is the cost the window exists to bound, and a future
 // window would report zero published rows and read as total loss.
 func TestAuditTerminalEventRecords_NormalisesTheWindow(t *testing.T) {
 	for _, given := range []time.Time{{}, time.Now().UTC().Add(time.Hour)} {
@@ -12028,11 +10547,8 @@ func TestAuditTerminalEventRecords_NormalisesTheWindow(t *testing.T) {
 	}
 }
 
-// TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict honest.
-//
-// A zero audit reads as "nothing has been published", which is a legitimate state on a fresh
-// deployment — so returning one on a failed read would let a reconciliation conclude that
-// everything is accounted for precisely when it could not measure.
+// TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict
+// honest.
 func TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -12047,13 +10563,8 @@ func TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit(t *test
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB is the audit's own round trip.
-//
-// It builds each of the three shapes the predicate has to cover — a dispatched row that names its
-// record, a webhook_pending row whose Kafka leg completed, and a dispatched row with no
-// coordinate — and requires the audit to count them the way the reconciliation depends on. The
-// webhook_pending case is the one most easily got wrong: it is not terminal, but it IS on the
-// topic.
+// TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB is the audit's own
+// round trip.
 func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -12062,7 +10573,7 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 	t.Cleanup(func() { quiesceEventOutbox(t, ds, marker) })
 
 	// One window for both readings, so the deltas below measure the same population twice
-	// (PERF-P05). Wide enough to contain every fixture this test publishes.
+	// Wide enough to contain every fixture this test publishes.
 	window := time.Now().UTC().Add(-time.Hour)
 
 	before, err := ds.AuditTerminalEventRecords(ctx, window)
@@ -12111,20 +10622,8 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 	assert.Equal(t, int64(2), after.DistinctRecords-before.DistinctRecords,
 		"and those two coordinates are distinct")
 
-	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that says
-	// so unconditionally.
-	//
-	// The delta above used to be 3 on an EMPTY table and 2 on a polluted one, because
-	// COUNT(DISTINCT (topic, partition, offset)) counts the all-NULL row constructor as a
-	// distinct value: the unconfirmed row contributed one, unless some earlier test had already
-	// left a coordinate-less published row that contributed it first. So the test passed on
-	// residue and failed the moment fixtures started cleaning up after themselves.
-	//
-	// Stated as an INVARIANT rather than a delta because that is the contract both readers of
-	// this audit rely on: FullyConfirmed requires the two to be equal, and
-	// ReconcileAgainstOutbox derives duplication from their difference, so DistinctRecords
-	// exceeding ConfirmedRows is not a smaller version of the same answer — it is a
-	// wrong one.
+	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that
+	// says so unconditionally.
 	assert.LessOrEqual(t, after.DistinctRecords, after.ConfirmedRows,
 		"a row that names no coordinate names no record: DistinctRecords may never exceed "+
 			"ConfirmedRows, or FullyConfirmed reports an inconclusive verdict on a healthy outbox "+
@@ -12136,15 +10635,11 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 		"one row claims a publication it cannot name a record for, so the count is not trustworthy")
 }
 
-// TestListDeadLetteredEvents_CoversBothTerminalFailureStates asserts the filter includes
-// failed AS WELL AS dead_lettered.
+// TestListDeadLetteredEvents_CoversBothTerminalFailureStates asserts the filter
+// includes failed AS WELL AS dead_lettered.
 //
-// A row becomes failed the moment its retry budget is spent, and dead_lettered only once
-// the event has additionally been written to its <topic>.dlt sibling. Listing only the
-// latter would HIDE events that exhausted their retries but whose dead-letter publication
-// itself failed — which are exactly the events an operator most needs to see, because they
-// are the ones sitting nowhere at all. The partial index idx_event_outbox_failed covers
-// both literals for this reason.
+// A row becomes failed the moment its retry budget is spent, and dead_lettered only
+// once the event has additionally been written to its <topic>.dlt sibling.
 func TestListDeadLetteredEvents_CoversBothTerminalFailureStates(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -12184,20 +10679,11 @@ func TestListDeadLetteredEvents_CoversBothTerminalFailureStates(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL is the SEC-09 guard.
+// TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL is the guard.
 //
-// # The defect
-//
-// A filtered page used to be assembled by reading UNFILTERED pages from the repository and
-// applying the predicates in Go, abandoning the walk after five thousand rows and logging a
-// warning. An operator filtering for a stuck event type therefore received a short page
-// that was indistinguishable from a complete one, and the only record that the scan had
-// given up was a log line they were not reading. During a loss investigation "nothing more
-// is stuck" is the most dangerous wrong answer this endpoint can give.
-//
-// The test asserts the predicates reach SQL, because that is what removes the bound rather
-// than reporting it: with a WHERE clause there is no walk to truncate, and LIMIT/OFFSET
-// pages the FILTERED set so an offset still skips matches rather than rows.
+// An operator filtering for a stuck event type therefore received a short page that was
+// indistinguishable from a complete one, and the only record that the scan had given up
+// was a log line they were not reading.
 func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T) {
 	cases := []struct {
 		name string
@@ -12232,9 +10718,9 @@ func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T)
 			forbidden: []string{"topic = $", "resolved_at"},
 		},
 		{
-			// The STORED topic column, matched exactly. topic is NOT NULL and
-			// CHECK-constrained non-blank, so this is equivalent to the Go-side
-			// original-topic resolution it replaced for every row the table can hold.
+			// The STORED topic column, matched exactly. topic is NOT NULL and CHECK-constrained
+			// non-blank, so this is equivalent to the Go-side original-topic resolution it
+			// replaced for every row the table can hold.
 			name:        "original topic",
 			filter:      model.DeadLetterInventoryFilter{Topic: "blnk.transactions"},
 			wantClauses: []string{"topic = $3", "LIMIT $4 OFFSET $5"},
@@ -12245,10 +10731,10 @@ func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T)
 			forbidden: []string{"event_type = $"},
 		},
 		{
-			// A status filter REPLACES the two-literal population rather than being added
-			// to it: the requested status is one of those two, so the wider predicate
-			// beside it would be redundant. The narrowing is what is asserted — that the
-			// statement selects one state and not both.
+			// A status filter REPLACES the two-literal population rather than being added to it:
+			// the requested status is one of those two, so the wider predicate beside it would
+			// be redundant. The narrowing is what is asserted — that the statement selects one
+			// state and not both.
 			name:        "status narrows the population further",
 			filter:      model.DeadLetterInventoryFilter{Status: model.EventOutboxStatusFailed},
 			wantClauses: []string{"status = $1", "LIMIT $2 OFFSET $3"},
@@ -12327,14 +10813,11 @@ func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T)
 	}
 }
 
-// TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages is the other half of
-// SEC-09.
+// TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages pins the count
+// against the population the listing pages.
 //
-// include_count used to be REFUSED alongside an event_type or topic filter, because no
-// filter-aware count existed. That refusal removed the one check that would have caught the
-// truncated walk: an operator could not compare their page against a total. The count must
-// therefore render the IDENTICAL predicate the listing renders — which it does by sharing
-// the builder, and which this test pins by comparing the two statements clause for clause.
+// That refusal removed the one check that would have caught the truncated walk: an
+// operator could not compare their page against a total.
 func TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages(t *testing.T) {
 	filter := model.DeadLetterInventoryFilter{
 		EventType: "transaction.applied",
@@ -12383,9 +10866,9 @@ func whereClauseOf(t *testing.T, statement string) string {
 	require.NotEqual(t, -1, idx, "statement has no WHERE clause: %s", statement)
 
 	clause := statement[idx+len("WHERE "):]
-	// RETURNING is cut for the same reason the rest are: an UPDATE's projection legitimately
-	// names every column of the row, so a predicate assertion made over the whole statement
-	// would assert the opposite of what it reads as.
+	// RETURNING is cut for the same reason the rest are: an UPDATE's projection
+	// legitimately names every column of the row, so a predicate assertion made over the
+	// whole statement would assert the opposite of what it reads as.
 	for _, keyword := range []string{"ORDER BY", "LIMIT", "GROUP BY", "RETURNING"} {
 		if cut := strings.Index(clause, keyword); cut != -1 {
 			clause = clause[:cut]
@@ -12397,10 +10880,6 @@ func whereClauseOf(t *testing.T, statement string) string {
 
 // TestListDeadLetteredEvents_NormalisesPagination asserts a malformed page request
 // degrades to a sane one rather than scanning the table or failing.
-//
-// The upper cap is the load-bearing half: without it a caller could turn a triage
-// endpoint into a full table scan of an outbox that grows without bound, which is a
-// denial-of-service surface reachable from an authenticated operator endpoint.
 func TestListDeadLetteredEvents_NormalisesPagination(t *testing.T) {
 	cases := []struct {
 		name                  string
@@ -12478,13 +10957,10 @@ func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 	}
 }
 
-// TestListDeadLetteredEvents_PagesNewestFirst_RealDB asserts the ordering and paging the
-// dead-letter API relies on, against real SQL.
+// TestListDeadLetteredEvents_PagesNewestFirst_RealDB asserts the ordering and paging
+// the dead-letter API relies on, against real SQL.
 //
-// Triage starts from the most recent failures, so the listing is newest-first. The paging
-// assertion matters just as much as the ordering: with a non-deterministic tie-break a
-// row can appear on two pages or on none, and an operator working through a dead-letter
-// backlog would silently skip events.
+// Triage starts from the most recent failures, so the listing is newest-first.
 func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -12546,53 +11022,21 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 }
 
 // requireColdHistoryExcludingIndex asserts that the index a plan line reaches the table
-// through is PARTIAL and excludes the dispatched state, which is the guarantee the claim's
-// index set exists to provide.
+// through is PARTIAL and excludes the dispatched state, which is the guarantee the
+// claim's index set exists to provide.
 //
-// # Why the property and not a name
-//
-// This replaced a list of index names that had to be widened twice, each time by a plan that
-// honoured the guarantee completely. Three indexes on blnk.event_outbox qualify —
-// idx_event_outbox_claim, idx_event_outbox_effective_key_inflight and
-// idx_event_outbox_status_open — and PostgreSQL chooses between them on cost, which moves with
-// heap compaction, statistics freshness and host load. A name list therefore encoded a guess
-// about the planner rather than a requirement on the schema, and it failed as a test while the
-// system was correct.
-//
-// The requirement is that the poll's cost does not grow with the outbox's history. The cold
-// history seeded by the caller is three thousand DISPATCHED rows against a working set of
-// twenty, so an index whose predicate excludes dispatched cannot be read past its working set
-// however large that history becomes. That is checked against pg_indexes rather than inferred
-// from a name, so a non-partial index — or a partial one whose predicate admits dispatched —
-// fails here even if it is added tomorrow under a name nobody thought to forbid.
-//
-// A note on what is deliberately NOT required: that the predicate exclude every terminal
-// state. idx_event_outbox_status_open admits failed and dead_lettered, and that is acceptable
-// because those rows are the dead-letter inventory an operator is expected to clear — bounded
-// by triage, alerted on by blnk_dlt_oldest_message_age_seconds, and orders of magnitude
-// smaller than the dispatched history in any healthy pipeline. Requiring their exclusion would
-// reject a legitimate index for a population the system already has a control for.
-//
-// # Why the predicate is EVALUATED rather than parsed
-//
-// A predecessor read the same predicate out of pg_indexes — which was the right move, and the
-// reason it replaced the name list — and then decided whether it admitted the dispatched state
-// with a four-arm switch over its TEXT. Both of that switch's failure modes pointed the wrong
-// way: its verdict started at "admits dispatched" and only the four recognised spellings
-// cleared it, so a correct predicate written a fifth way was reported as a defect; and its
-// `status = ANY (ARRAY[...])` arm left the verdict standing whenever the list could not be cut
-// out of the string, turning a rendering change into a failure. Splicing the predicate into a
-// COUNT over the seeded rows needs none of those cases and cannot be defeated by a rewrite,
-// because the evaluator that answers the question is the one that decides what the index holds.
+// The requirement is that the poll's cost does not grow with the outbox's history.
 //
 // Parameters:
 //   - t *testing.T: the test.
 //   - ds Datasource: used for its connection to read pg_indexes.
 //   - planLine string: the EXPLAIN line reaching the relation under assertion.
-//   - planText string: the whole plan, included in a failure so it can be read in context.
+//   - planText string: the whole plan, included in a failure so it can be read in
+//     context.
 //   - subject string: what the line is doing, for the failure message.
-//   - marker string: the caller's row-id prefix, so the predicate is evaluated against THIS
-//     test's seeded rows and not against whatever a concurrent run left in the shared table.
+//   - marker string: the caller's row-id prefix, so the predicate is evaluated against
+//     THIS test's seeded rows and not against whatever a concurrent run left in the
+//     shared table.
 func requireColdHistoryExcludingIndex(
 	t *testing.T,
 	ds Datasource,
@@ -12620,22 +11064,10 @@ func requireColdHistoryExcludingIndex(
 			"terminal history on every tick and its cost grows with the whole table.\nIndex was: %s",
 		subject, index, definition)
 
-	// EVALUATED BY POSTGRESQL, not pattern-matched. The predicate is spliced into a count over
-	// the rows this test seeded, so the question asked is the one that matters — "can a
-	// dispatched row be in this index?" — and it is answered by the same expression evaluator
-	// that decides what the index actually contains.
-	//
-	// A textual check cannot do this. The first attempt asserted the predicate did not mention
-	// 'dispatched' and failed on `status <> 'dispatched'`, which is the predicate that excludes
-	// it most explicitly of all. Every equivalent rewrite — a negation, an ANY over the
-	// complement, a NOT IN — would have needed its own special case, and each one is a chance to
-	// accept a predicate that admits the history. Counting is exact and needs none of them.
-	//
-	// Splicing SQL is safe here and only here: the text comes from pg_indexes for one fixed
-	// table in a test, so there is no untrusted input and no user-facing query involved.
-	// Both counts in one round trip, and the denominator is MEASURED rather than restated from
-	// the caller's constant: the message then reports what the table actually held when the plan
-	// was taken, which is the only number a reader can act on.
+	// EVALUATED BY POSTGRESQL, not pattern-matched. The predicate is spliced into a count
+	// over the rows this test seeded, so the question asked is the one that matters — "can
+	// a dispatched row be in this index?" — and it is answered by the same expression
+	// evaluator that decides what the index actually contains.
 	var seededCold, coldInIndex int
 	require.NoError(t, ds.Conn.QueryRow(`
 		SELECT COUNT(*) FILTER (WHERE status = 'dispatched'),
@@ -12660,16 +11092,12 @@ func requireColdHistoryExcludingIndex(
 
 // indexPredicate returns the WHERE clause of an index definition.
 //
-// The clause is read out of pg_indexes' own rendering rather than being reconstructed, so the
-// assertion above compares against what PostgreSQL says the index is, not against what a
-// migration file says it should be — which is the difference between checking the database and
-// checking a document.
-//
 // Parameters:
 //   - definition string: an indexdef as pg_indexes reports it.
 //
 // Returns:
-//   - string: the predicate text, without the WHERE keyword. Empty when the index is total.
+//   - string: the predicate text, without the WHERE keyword. Empty when the index is
+//     total.
 //   - bool: whether the index is partial at all.
 func indexPredicate(definition string) (string, bool) {
 	_, after, found := strings.Cut(definition, " WHERE ")
@@ -12680,31 +11108,11 @@ func indexPredicate(definition string) (string, bool) {
 	return strings.TrimSpace(after), true
 }
 
-// TestTerminalTransitionsHoldTheSettlementLease_RealDB is the two-claimant hand-off, walked
-// against the real table for BOTH terminal transitions.
-//
-// # The race it closes
+// TestTerminalTransitionsHoldTheSettlementLease_RealDB is the two-claimant hand-off,
+// walked against the real table for BOTH terminal transitions.
 //
 // A worker that exhausts a row's retry budget still owes two things: the write to the
-// `<topic>.dlt` sibling, and the MarkEventDeadLettered that records it. Its claim token is
-// retained so that only it may perform them. That was not enough, because the dead-letter
-// repair claim admits any failed row with no dlt_topic whose lease is released — and both
-// terminal transitions released the lease. A second relay could therefore claim the row, stamp
-// its own token and publish the event to the dead-letter topic while the owner was still
-// publishing it there. The database refused the owner's now-stale MarkEventDeadLettered, so the
-// TABLE stayed consistent and the TOPIC did not: the same failed event appeared twice, and an
-// operator triaging a backlog cannot distinguish that from a genuinely repeated failure.
-//
-// # What is asserted, and why in this order
-//
-// Exclusivity first, recovery second. Exclusivity alone would be a wall rather than a window —
-// an owner that dies mid-settlement would strand the event in the only table that holds it — so
-// the expiry case is asserted immediately afterwards to pin that the lease is a lease.
-//
-// Both transitions are covered because they reach the terminal state by different routes:
-// MarkEventFailed by spending the budget, MarkEventPermanentlyFailed by the publisher's verdict
-// with budget to spare. Fixing one and not the other would leave the race live on whichever was
-// missed, and nothing else in the suite would notice.
+// `<topic>.dlt` sibling, and the MarkEventDeadLettered that records it.
 func TestTerminalTransitionsHoldTheSettlementLease_RealDB(t *testing.T) {
 	cases := map[string]struct {
 		maxAttempts int
@@ -12808,30 +11216,10 @@ func TestTerminalTransitionsHoldTheSettlementLease_RealDB(t *testing.T) {
 }
 
 // TestListDeadLetteredEvents_WindowIsAnIndexConditionRatherThanAFilter_RealDB is the
-// performance half of the window, and it asserts the one property that is this query's to
-// guarantee: both bounds reach the index as an INDEX CONDITION, so the scan starts and stops
-// at the window instead of reading the terminal-state rows and discarding most of them.
-//
-// # Why the assertion is on the index condition and not on the absence of a Seq Scan
-//
-// Whether the planner reaches for the index at all is a COST decision that depends on how
-// many rows the table holds and how many of them are in a terminal failure state. On a small
-// or freshly migrated table a sequential scan is genuinely cheaper and choosing it is
-// correct, so "the plan contains no Seq Scan" reports a defect on an empty database that is
-// not one — the same reasoning the claim-index assertion records for not pinning an index
-// name.
-//
-// What must hold at every table size is that the predicate is SARGABLE: written so that the
-// planner CAN push it into an index traversal. That is what the nullable-parameter form
-// (`$5 IS NULL OR occurred_at >= $5`) has to earn — a bound wrapped in a function, compared
-// against a differently-typed value, or written so the NULL guard cannot be folded away would
-// still return the right rows while degrading into a post-scan Filter, and only a plan
-// assertion catches that. Index paths are made preferable for the duration of one transaction
-// so the choice is decided rather than guessed at; the setting is LOCAL and the transaction is
-// rolled back, so it cannot leak to another test or another connection.
-//
-// The foreign-index guard applies here for the same reason it applies to the claim index: a
-// shared database may carry an index this repository does not declare.
+// performance half of the window, and it asserts the one property that is this query's
+// to guarantee: both bounds reach the index as an INDEX CONDITION, so the scan starts
+// and stops at the window instead of reading the terminal-state rows and discarding
+// most of them.
 func TestListDeadLetteredEvents_WindowIsAnIndexConditionRatherThanAFilter_RealDB(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -12929,42 +11317,30 @@ func TestListDeadLetteredEvents_WindowIsAnIndexConditionRatherThanAFilter_RealDB
 	}
 }
 
-// Three window tests that arrived with this feature are GONE, and the property each pinned is
-// asserted elsewhere in this file against the shape the repository actually has.
+// Three window tests that arrived with this feature are GONE, and the property each
+// pinned is asserted elsewhere in this file against the shape the repository actually
+// has.
 //
-// They were written for a listing whose window was two fixed placeholders bound from *time.Time,
-// and for a count that returned a per-status map. This repository narrows through
-// model.DeadLetterQuery and deadLetterFilterClause, which builds ONE predicate — status, event
-// type, topic, resolution AND the occurrence window — used by the page, the count and the age
-// gauge alike, and returns a single total:
+// They were written for a listing whose window was two fixed placeholders bound from
+// *time.Time, and for a count that returned a per-status map. This repository narrows
+// through model.DeadLetterQuery and deadLetterFilterClause, which builds ONE predicate
+// — status, event type, topic, resolution AND the occurrence window — used by the page,
+// the count and the age gauge alike, and returns a single total:
 //
-//   - the binding of the bounds is covered by TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL
-//     and TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL, which assert the whole
-//     predicate rather than the window alone;
-//   - the count agreeing with the page is covered by TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage
-//     and TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages — the stronger form
-//     of the same guarantee, since sharing the clause is what makes them agree;
-//   - UTC normalisation of a supplied window is covered by TestCountEventOutboxByStatus_NormalisesTheWindow.
-//
-// The EXPLAIN test below is kept, because nothing else proves the bounds are INDEX CONDITIONS
-// rather than post-scan filters, and that is a property of the schema no unit test can reach.
+//   - the binding of the bounds is covered by
+//     TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL and
+//     TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL, which assert the
+//     whole predicate rather than the window alone;
+//   - the count agreeing with the page is covered by
+//     TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage and
+//     TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages — the stronger
+//     form of the same guarantee, since sharing the clause is what makes them agree;
+//   - UTC normalisation of a supplied window is covered by
+//     TestCountEventOutboxByStatus_NormalisesTheWindow.
 
-// unknownEventOutboxIndexIn reports the first index named in a plan line that no migration
-// in this repository creates, or "" when every index in the line is one this repository
-// declares.
-//
-// # Why this is derived from the migrations rather than listed here
-//
-// A hardcoded list of "our indexes" would be a second copy of the migrations, and the copy
-// that goes stale is the one nobody runs. Reading the embedded migration source means an
-// index added by a future migration is recognised the moment that migration exists, and an
-// index that only ever existed in somebody's shared database never is.
-//
-// It reads ../sql from disk rather than the embedded blnk.SQLFiles, and only because it must:
-// the root blnk package imports this one, so this in-package test file cannot import it back.
-// The two are the same bytes by construction — blnk.SQLFiles is `//go:embed sql/*.sql` over
-// that very directory — and the path is relative to the package directory, which is where `go
-// test` runs it.
+// unknownEventOutboxIndexIn reports the first index named in a plan line that no
+// migration in this repository creates, or "" when every index in the line is one this
+// repository declares.
 //
 // Parameters:
 //   - t *testing.T: for the fatal on an unreadable migration source, which is a broken
@@ -13005,12 +11381,13 @@ func unknownEventOutboxIndexIn(t *testing.T, ctx context.Context, ds Datasource,
 	return ""
 }
 
-// readMigrationSource concatenates every migration, so a name can be looked for across the
-// whole schema definition at once.
+// readMigrationSource concatenates every migration, so a name can be looked for across
+// the whole schema definition at once.
 //
 // Returns:
 //   - string: every migration's text, joined.
-//   - error: a read failure, which means a broken checkout rather than a schema problem.
+//   - error: a read failure, which means a broken checkout rather than a schema
+//     problem.
 func readMigrationSource(t *testing.T) (string, error) {
 	t.Helper()
 
@@ -13039,14 +11416,11 @@ func readMigrationSource(t *testing.T) (string, error) {
 	return joined.String(), nil
 }
 
-// TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB is what keeps the
-// foreign-index guard from making the claim-index assertion vacuous.
+// TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB is what
+// keeps the foreign-index guard from making the claim-index assertion vacuous.
 //
 // A guard that answered "foreign" for everything would skip on every database, and the
-// assertion it protects would never run again while still looking present. So both directions
-// are pinned against the real catalog: an index this repository's migrations declare is NOT
-// reported, and a name that exists in neither the catalog nor the migrations is not reported
-// either — only an index that IS in the catalog and is NOT in the migrations.
+// assertion it protects would never run again while still looking present.
 func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -13062,17 +11436,8 @@ func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t 
 	t.Run("an index in the catalog that no migration declares is foreign", func(t *testing.T) {
 		// THE FOREIGN INDEX IS CREATED HERE RATHER THAN LOOKED FOR.
 		//
-		// This subtest used to scan pg_indexes for an index no migration declares and SKIP when
-		// it found none — which is the state of every correctly migrated database, including
-		// every CI database. So the positive direction of the guard, the direction that decides
-		// whether a plan assertion is skipped or trusted, ran only on a developer's machine that
-		// happened to have another checkout's migrations applied to it. It was reported as a
-		// pass everywhere else, and a skip is not a pass.
-		//
-		// Creating the condition makes the assertion unconditional. The index is dropped in
-		// cleanup on every path, and its name is deliberately unmistakable so a leaked one is
-		// identifiable rather than mysterious: nothing in sql/ declares it, and the guard it
-		// feeds treats exactly that as foreign.
+		// Scanning pg_indexes for an index no migration declares and SKIPPING when none is
+		// found would skip on every correctly migrated database, including every CI database.
 		//
 		// It is safe on a shared database for as long as it exists, which is the duration of
 		// this subtest: it is an ordinary btree on one column, it changes no plan this suite
@@ -13094,9 +11459,9 @@ func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t 
 					"assertion skip on this database for every later run")
 		})
 
-		// THE PREMISE, asserted rather than assumed: the name must genuinely be absent from every
-		// migration, or the guard would be right to ignore it and this subtest would be testing
-		// nothing.
+		// THE PREMISE, asserted rather than assumed: the name must genuinely be absent from
+		// every migration, or the guard would be right to ignore it and this subtest would be
+		// testing nothing.
 		migrationSQL, err := readMigrationSource(t)
 		require.NoError(t, err)
 		require.NotContains(t, migrationSQL, foreign,
@@ -13118,24 +11483,9 @@ func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t 
 	})
 }
 
-// TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey is the structural half of PERF-C02:
-// that the claim's earlier-same-key exclusion compares the key the PUBLISHER uses and not the
-// stored column.
-//
-// # Why the column was the wrong key
-//
-// The Kafka message key is model.EffectivePartitionKey — the row's ledger where it has one, its
-// stored partition_key where it does not — because requirement R-6 partitions by ledger id. The
-// exclusion is the statement "at most one row per Kafka partition key is in flight", and written
-// against partition_key it was a statement about a different value. The two disagree on exactly
-// the rows the schema permits: a row written before the ledger reached its call site, or one
-// whose partition key was derived from the payload before the ledger was resolved. Two such rows
-// of ONE ledger have different stored keys, so the exclusion did not hold them apart — while the
-// publisher hashed both to one partition, letting two relay replicas append them in either order.
-//
-// This asserts over the query text, which needs no database and cannot be satisfied by a fake:
-// the guarantee is a property of the SQL. The behavioural proof, with two relays and a real
-// broker, is TestEventOrdering_DivergentStoredKeysStaySerialisedAcrossRelayReplicas.
+// TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey is the structural half of the
+// exclusion: the claim's earlier-same-key predicate compares the key the PUBLISHER uses
+// and not the stored column.
 func TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey(t *testing.T) {
 	t.Parallel()
 
@@ -13164,19 +11514,11 @@ func TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey(t *testing.T) {
 		"the exclusion must compare occurrence order, with the surrogate key breaking ties")
 }
 
-// TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB closes the gap between a
-// correct predicate and a usable one.
+// TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB closes the gap
+// between a correct predicate and a usable one.
 //
-// A partial expression index is usable ONLY when the query spells its expression identically.
-// A difference does not produce a wrong answer, which is what makes it dangerous: the claim
-// still serialises correctly and simply stops being index-backed, so every poll degrades into a
-// sequential scan of a table that grows by 43.2 million rows a day at the acceptance rate. That
-// is the same outage by a slower route, and nothing in a functional test would notice.
-//
-// So the index's definition is read out of pg_indexes and the query's own expression is required
-// to appear in it. Reading the catalogue rather than the migration text is deliberate: it is the
-// applied schema that decides whether the planner has an index, and a migration that was written
-// but never applied is exactly the state this would otherwise miss.
+// A partial expression index is usable ONLY when the query spells its expression
+// identically.
 func TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -13194,9 +11536,9 @@ func TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB(t *test
 			"earlier-same-key exclusion an index probe rather than a scan of the key's whole "+
 			"history. Apply sql/1781252000.sql.")
 
-	// pg_indexes renders the expression with the columns UNQUALIFIED, because an index belongs to
-	// one relation. The query's expression is qualified by an alias, so the comparison is made
-	// against the unqualified rendering of the same rule.
+	// pg_indexes renders the expression with the columns UNQUALIFIED, because an index
+	// belongs to one relation. The query's expression is qualified by an alias, so the
+	// comparison is made against the unqualified rendering of the same rule.
 	unqualified := strings.ReplaceAll(eventOutboxEffectiveKeySQL(""), ".", "")
 	unqualified = strings.ReplaceAll(unqualified, "''", "''::text")
 

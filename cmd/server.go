@@ -46,42 +46,20 @@ import (
 )
 
 // eventTopicAssuranceTimeout bounds the Kafka topic assurance performed at start-up.
-//
-// It is a bound rather than a preference: assurance is a synchronous round trip to a broker
-// that may not be listening yet, and an unbounded one would hold the process short of serving
-// traffic for as long as the broker stayed unreachable. Fifteen seconds is comfortably longer
-// than creating the topic catalogue takes on a healthy cluster and short enough that a broker which
-// is not there yet costs one log line instead of a stalled deployment.
 const eventTopicAssuranceTimeout = 15 * time.Second
 
-// A BOUNDED BOOT-TIME RETRY USED TO LIVE HERE — three attempts a few seconds apart, inside the
-// synchronous start-up path — and it is superseded by the BACKGROUND retry below, which is
-// governed by eventTopicAssuranceRetryBase and eventTopicAssuranceRetryMax.
-//
-// Both answered the same failure: on a first deploy the broker's StatefulSet and the server's
-// Deployment come up together and the server frequently wins, so a single attempt left the
-// topics unassured for the life of the process — every event then failed to publish AND failed
-// to dead-letter, because the .dlt sibling was missing for the same reason, and the only remedy
-// was a restart. The background form is strictly the better answer: it keeps retrying for as
-// long as it takes, with a growing backoff, without holding start-up for a single second, so a
-// broker that is minutes away costs a delay rather than a stalled deployment.
-//
-// The ONE property the bounded form had that the background form did not is kept, in
-// retryEventTopicAssurance: a geometry refusal is PERMANENT and must not be retried at all.
-
-/*
-serveTLS starts an HTTPS server with TLS enabled using CertMagic for automatic certificate management.
-It accepts a gin.Engine instance as the router and a ServerConfig struct for server configurations.
-If no domain is specified, the server will default to running on localhost.
-*/
-// resolveCertStoragePath returns the configured certificate storage path,
-// outcome rather than the exceptional one.
+// serverShutdownTimeout bounds the graceful drain: in-flight requests are given this
+// long to finish before the listener is closed and the process moves on. A clean stop is
+// the ordinary outcome rather than the exceptional one.
 const serverShutdownTimeout = 20 * time.Second
 
-// would notice.
+// telemetryFlushTimeout bounds the final span and metric flush on the way out. Long
+// enough that a collector on the far side of a slow link still receives the last batch,
+// and short enough that nobody waiting on the process would notice.
 const telemetryFlushTimeout = 10 * time.Second
 
-// flight and nothing is owed, so it is short.
+// Bounds on the HTTP server itself, every one stated explicitly so the whole exposure is
+// visible in one place rather than inherited from a library default.
 const (
 	// httpReadHeaderTimeout bounds how long a peer may take to send its request headers.
 	httpReadHeaderTimeout = 15 * time.Second
@@ -105,23 +83,18 @@ const (
 	httpMaxHeaderBytes = 1 << 20
 )
 
-// not be noticed for hours.
+// Retry pacing for start-up topic assurance. Every attempt is logged, because a broker
+// that never becomes reachable must be visible in the log rather than not be noticed for
+// hours.
 const (
 	eventTopicAssuranceRetryBase = 5 * time.Second
 	eventTopicAssuranceRetryMax  = 60 * time.Second
 )
 
-// Leadership timings for the event maintenance work. PERF-P13.
+// Leadership timings for the event maintenance work.
 const (
-	// eventMaintenanceRetryInterval is how often a replica that is NOT the leader tries again.
-	//
-	// Retrying at all is what makes this failover rather than a one-off election. Without it,
-	// the replicas that lost the first attempt would never try again, so the death of the
-	// leader would stop all measurement and all deletion until something restarted a pod —
-	// and the symptom of that is silence, which is indistinguishable from health.
-	//
-	// Thirty seconds bounds how long the pipeline is unmeasured after a leader dies, against a
-	// cost of one non-blocking statement per replica per interval.
+	// eventMaintenanceRetryInterval is how often a replica that is NOT the leader tries
+	// again.
 	eventMaintenanceRetryInterval = 30 * time.Second
 
 	// eventMaintenanceVerifyInterval is how often the leader re-confirms with the database
@@ -130,13 +103,10 @@ const (
 	eventMaintenanceVerifyInterval = 30 * time.Second
 
 	// eventMaintenanceLeaseOpTimeout bounds one acquire, verify or release.
-	//
-	// Short: these are single statements on an already-open connection, so anything slower
-	// than this means the database is in trouble — and the right response to that is to stop
-	// believing this replica is the leader, not to wait.
 	eventMaintenanceLeaseOpTimeout = 5 * time.Second
 )
 
+// resolveCertStoragePath returns the configured certificate storage path,
 // falling back to the default location when unset.
 func resolveCertStoragePath(conf config.ServerConfig) string {
 	if conf.CertStoragePath == "" {
@@ -154,6 +124,11 @@ func resolveTLSDomains(conf config.ServerConfig) []string {
 	return []string{conf.Domain}
 }
 
+/*
+serveTLS starts an HTTPS server with TLS enabled using CertMagic for automatic certificate management.
+It accepts a gin.Engine instance as the router and a ServerConfig struct for server configurations.
+If no domain is specified, the server will default to running on localhost.
+*/
 func serveTLS(r *gin.Engine, conf config.ServerConfig) error {
 	// Configure CertMagic's ACME (Automatic Certificate Management Environment) for automatic TLS
 	certmagic.DefaultACME.Agreed = true      // Agree to ACME TOS
@@ -174,13 +149,6 @@ func serveTLS(r *gin.Engine, conf config.ServerConfig) error {
 	}
 
 	// Create and configure the HTTPS server.
-	//
-	// HARDENED THROUGH THE SAME HELPER AS THE PLAINTEXT SERVER (PERF-P25), because this is the
-	// listener that faces the internet. Without the bounds an idle or deliberately slow peer
-	// holds a connection, its goroutine and its read buffer indefinitely, and TLS makes that
-	// worse rather than better: a handshake allocates before any request line is read, so a
-	// slow-loris here costs more per held connection than on the plaintext port. Constructing
-	// this one by hand was how it came to be the only server in the process without timeouts.
 	server := hardenHTTPServer(&http.Server{
 		Addr:      ":" + conf.Port, // Server address and port
 		Handler:   r,               // Handler for HTTP requests (gin router)
@@ -189,15 +157,6 @@ func serveTLS(r *gin.Engine, conf config.ServerConfig) error {
 
 	logrus.Errorf("Starting HTTPS server on %s\n", conf.Port)
 	// Start the HTTPS server with automatic certificate management.
-	//
-	// RETURNED, never fatal. logrus.Fatalf calls os.Exit, which runs no deferred function
-	// anywhere on the stack — so a TLS listener that failed to bind used to terminate the
-	// process with the event relay, the retention sweeper, the metrics collector, the lineage
-	// processor, the database pool and the tracing exporter all still open. The relay's
-	// claimed rows kept their leases until they expired, the exporter dropped whatever it had
-	// buffered, and the pool's connections were closed by the server rather than by us. This
-	// function already returns an error and its caller already handles one; the exit was
-	// simply skipping both.
 	if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("failed to start the HTTPS server on port %s: %w", conf.Port, err)
 	}
@@ -379,35 +338,31 @@ func initializePostHog() (posthog.Client, string) {
 	return client, heartbeatID
 }
 
-// startServer serves the API and blocks until the signal context is cancelled or the listener
-// fails.
+// startServer serves the API and blocks until the signal context is cancelled or the
+// listener fails.
 //
-// It installs NO signal handler of its own, which is the whole of the lifecycle fix here. A
-// private signal.Notify meant a SIGTERM was seen by exactly one participant: every background
-// processor only discovered it indirectly, when the deferred stops ran after this drain had
-// already completed. Watching the shared context instead means they all begin winding down the
-// instant the signal lands, CONCURRENTLY with the drain, so the deferred stops are joins on work
-// already finishing rather than the start of it.
+// It installs NO signal handler of its own, which is the whole of the lifecycle fix
+// here. A private signal.Notify meant a SIGTERM was seen by exactly one participant:
+// every background processor only discovered it indirectly, when the deferred stops ran
+// after this drain had already completed.
 //
 // Parameters:
 //   - ctx context.Context: the signal context. Cancelling it drains and returns.
 //   - router *gin.Engine: the handler.
-//   - port string: the port to bind. "0" lets the kernel choose, which is what a test uses.
+//   - port string: the port to bind. "0" lets the kernel choose, which is what a test
+//     uses.
 //
 // Returns:
-//   - error: the listener's failure, named, or the drain's error. Nil on a clean shutdown.
+//   - error: the listener's failure, named, or the drain's error. Nil on a clean
+//     shutdown.
 func startServer(ctx context.Context, router *gin.Engine, port string) error {
 	server := newHTTPServer(router, port)
 
-	// A listener that fails on its OWN — the port is taken, the socket cannot be bound — used to
-	// call logrus.Fatalf from inside this goroutine. That is os.Exit, from a goroutine, so every
-	// deferred stop above it was skipped: the relay was never stopped, the scheduled cleanups were
-	// never drained, and the database pool was never closed.
-	//
-	// Reported on a channel instead, so the failure travels back to the caller and the caller's
-	// ordered shutdown runs. Written to only for a REAL error — the ErrServerClosed that Shutdown
-	// causes is the expected end of a healthy life — and CLOSED on the way out, which is what
-	// tells the drain that the listener stopped cleanly.
+	// A listener that fails on its OWN — the port is taken, the socket cannot be bound —
+	// must NOT be reported with logrus.Fatalf from inside this goroutine. That is os.Exit
+	// from a goroutine, so every deferred stop above it would be skipped: the relay never
+	// stopped, the scheduled cleanups never drained, the database pool never closed. The
+	// failure travels out on this channel instead.
 	listenErr := make(chan error, 1)
 
 	go func() {
@@ -439,36 +394,22 @@ func newHTTPServer(router *gin.Engine, port string) *http.Server {
 	})
 }
 
-// gracefulShutdown blocks until either a signal arrives on quit or the listener fails, then
-// shuts the server down, giving outstanding requests up to timeout to complete.
+// gracefulShutdown blocks until either a signal arrives on quit or the listener fails,
+// then shuts the server down, giving outstanding requests up to timeout to complete.
 //
-// # Why it waits on two things
-//
-// A signal is the expected way to stop, and it is followed by a drain. A LISTENER FAILURE is
-// the other way, and there is nothing to drain — the listener never accepted anything. Both
-// have to end this function, or the process sits for ever waiting for a signal while serving
-// nothing: that was the state the removed logrus.Fatalf concealed, since exiting the process
-// is one way to avoid noticing that you are blocked.
-//
-// The listener error is RETURNED rather than logged, so it reaches the Cobra command and
-// becomes the process's exit status, and it is returned in PREFERENCE to the shutdown error:
-// the failure to bind is the cause, and the shutdown of a server that never served is not
-// interesting next to it.
-//
-// A closed listenErr channel with no value means the listener stopped cleanly, which is what
-// http.ErrServerClosed is — the normal consequence of the Shutdown below. Reading a nil error
-// from a closed channel is therefore correct rather than a case to guard against.
+// A signal is the expected way to stop, and it is followed by a drain. A LISTENER
+// FAILURE is the other way, and there is nothing to drain — the listener never accepted
+// anything.
 //
 // Parameters:
 //   - server *http.Server: the server to shut down.
 //   - quit <-chan os.Signal: signalled on SIGINT or SIGTERM.
-//   - listenErr <-chan error: carries the listener's failure, if any. May be nil, in which
-//     case only a signal ends the wait.
+//   - listenErr <-chan error: carries the listener's failure, if any.
 //   - timeout time.Duration: how long outstanding requests get to finish.
 //
 // Returns:
-//   - error: the listener's error when it failed, the shutdown error when the drain did not
-//     finish in time, otherwise nil.
+//   - error: the listener's error when it failed, the shutdown error when the drain did
+//     not finish in time, otherwise nil.
 func gracefulShutdown(
 	server *http.Server,
 	quit <-chan os.Signal,
@@ -521,19 +462,9 @@ func gracefulShutdown(
 // operator needs, and it is the ONLY way this file should put an error into a line.
 //
 // The "cause" field is redacted — network topology and secret values removed, control
-// characters stripped, length bounded — and is what a deployment writes at info, warn and
-// error. The "cause_verbatim" field carries the unredacted text and is attached ONLY when the
-// standard logger is at debug, which is the restricted sink.
-//
-// It matters most here of anywhere. These are START-UP lines: a broker that cannot be reached,
-// an admin client that cannot be built, topic assurance that failed. Their errors are the ones
-// richest in topology — broker addresses, resolver addresses, TLS server names — and start-up
-// output is the part of a log most likely to be pasted into an issue, a chat message or a
-// support ticket.
-//
-// It is the counterpart of the identically named helpers in packages blnk, api and database,
-// and all four delegate to internal/logsafe, so one failure is redacted identically wherever
-// it surfaces.
+// characters stripped, length bounded — and is what a deployment writes at info, warn
+// and error. The "cause_verbatim" field carries the unredacted text and is attached
+// ONLY when the standard logger is at debug, which is the restricted sink.
 //
 // Parameters:
 //   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one.
@@ -564,42 +495,6 @@ func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
 // revocations, subscriber consumer lag, and the collector's own collection health — and
 // returns the function that stops it and releases what it opened.
 //
-// A cleanup FUNCTION rather than a deferred stop inside this helper, because a defer here
-// would fire the moment this function returned and the collector would stop before it ever
-// ticked. The caller defers the returned function for the process lifetime, and it is
-// never nil so that defer needs no guard.
-//
-// # Nothing here may prevent the server from serving
-//
-// A metrics collector is an observer. Every failure below is logged and degraded past
-// rather than propagated: an admin client that cannot be built costs the consumer-lag gauges
-// and nothing else, while every gauge read from PostgreSQL — the outbox backlog, the
-// dead-letter age, and the subscriber revocation, settlement and orphan gauges, none of which
-// need a broker — still publishes on every tick, zeros included. Failing start-up because
-// telemetry could not be wired would trade a monitoring gap for an outage.
-//
-// # The collector is bounded in time as well as in work
-//
-// Every collection runs under DefaultMetricsCollectionTickBudget and every individual
-// dependency call under DefaultMetricsCollectionCallBudget, so a broker that accepts a
-// connection and then never answers, or a database that stops responding mid-sweep, costs
-// one degraded tick rather than freezing the refresh of every gauge indefinitely. That
-// matters because a collector stuck inside one call leaves EVERY gauge at its last value
-// while continuing to look healthy — the series are present, they are just frozen — which
-// is the failure mode alerts on stale telemetry exist to catch. The collector publishes its
-// own last-collection and last-success ages so that condition is observable rather than
-// inferred.
-//
-// # Lag coverage is budgeted and rotates
-//
-// Consumer lag costs two broker round trips per authorised topic per subscriber, so one
-// sweep examines at most Kafka.MetricsSubscriberBudget registry rows
-// (EVENT_METRICS_SUBSCRIBER_BUDGET, defaulted and clamped by config). A registry larger
-// than the budget is NOT permanently truncated: the sweep resumes from where the previous
-// one stopped, so coverage rotates and every subscriber is measured within a bounded number
-// of ticks, and the collector publishes whether the latest sweep covered the whole registry
-// so a partial inventory is never mistaken for a complete one.
-//
 // Parameters:
 //   - ctx context.Context: cancelling it stops the collector.
 //   - instance *blnk.Blnk: the service container, for its datasource and its configured
@@ -608,7 +503,6 @@ func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
 //
 // Returns:
 //   - func(): stops the collector and closes the admin client and dead-letter service.
-//     Never nil, so the caller can defer it unconditionally.
 func startEventMetricsCollector(
 	ctx context.Context,
 	instance *blnk.Blnk,
@@ -637,19 +531,7 @@ func startEventMetricsCollector(
 		admin = kafkaAdmin
 	}
 
-	// THE MEASUREMENT BUDGET IS CONFIGURED, not left at the collector's default. SEC-10.
-	//
-	// The collector caps how many subscribers one tick measures lag for, and a subscriber
-	// past that cap gets NO lag series at all — so the consumer-lag alert cannot fire for it
-	// however far behind it is. The cap was reachable only through WithSubscriberBudget and
-	// nothing called it, so every deployment ran on the built-in 200 with no way to raise it
-	// short of a code change. A registry larger than that measured its first two hundred
-	// subscribers and left the rest silently unalerted.
-	//
-	// setRelayDefaults guarantees a positive value, so this never trips the configurator's
-	// own non-positive fallback. The shortfall, whatever the budget, is published on
-	// blnk.kafka.subscribers_unmeasured under reason="budget" and alerted on by
-	// SubscriberLagCoverageIncomplete.
+	// THE MEASUREMENT BUDGET IS CONFIGURED, not left at the collector's default.
 	collector := blnk.NewBlnkEventMetricsCollector(instance, deadLetters, admin).
 		WithSubscriberBudget(cfg.Relay.SubscriberMetricsBudget)
 	collector.Start(ctx)
@@ -673,62 +555,26 @@ func startEventMetricsCollector(
 	}
 }
 
-// startEventRelay assures the Kafka topics exist and starts the transactional event outbox
-// relay, returning the function that stops it and the startup obstacle, if any.
-//
-// # Without this the pipeline has no production driver at all
-//
-// The relay is the ONLY thing that publishes captured event rows to Kafka, whether the row
-// was captured inside its mutation's transaction — the ordinary transaction, ledger,
-// identity and balance creation paths — or standalone after the mutation committed, as
-// balance monitor alerts, bulk batch summaries and system errors are. Without this call a
-// deployment with KAFKA_BROKERS set accumulates outbox rows indefinitely and delivers
-// nothing, with no error anywhere, because capturing the row succeeded every time.
+// startEventRelay assures the Kafka topics exist and starts the transactional event
+// outbox relay, returning the function that stops it and the startup obstacle, if any.
 //
 // It runs in the SERVER role, beside the lineage outbox processor and the event metrics
-// collector, because that is where this codebase already puts outbox background work. Putting
-// it in the worker role would mean a fourth asynq server and two roles that both had to be
-// deployed for events to flow.
+// collector, because that is where this codebase already puts outbox background work.
+// Putting it in the worker role would mean a fourth asynq server and two roles that
+// both had to be deployed for events to flow.
 //
-// # Topic assurance comes FIRST, and a failure does not stop the relay
-//
-// Assurance is what gives the topics their required partition count and replication factor;
-// a topic auto-created by the broker would have neither, and per-aggregate ordering depends on
-// the partition count. So it runs before the first publish can happen.
-//
-// A failure is logged and stepped past rather than fatal, and that is deliberate. The usual
-// cause is a broker that is not listening yet — a compose stack coming up, a rolling restart —
-// and refusing to start the relay would mean events stayed unpublished until somebody
-// restarted the process, converting a transient condition into an outage. The relay retries
-// every publish and dead-letters what it cannot deliver, so a genuinely missing topic surfaces
-// as dead letters and the 15-minute dead-letter alert, not as silence.
-//
-// # No brokers is a legitimate steady state
-//
-// With KAFKA_BROKERS unset there is nothing to relay to and the producers deliver over the
-// legacy webhook transport directly. That is reported at info level once, not treated as a
-// misconfiguration: it is how every deployment runs before it opts into Kafka, and it is what
-// the graceful-degradation contract promises. It returns a NIL error, because nothing is
-// wrong: this branch is a supported steady state, not a refusal.
-//
-// # A refused relay is returned, not swallowed
-//
-// The relay refuses on a configuration or construction fault — a missing dependency, the
-// no-op publisher, or a dual-delivery window that has not opened or cannot be read. For a
-// deployment that reached this function, KAFKA_BROKERS IS set, so a refusal means every
-// producer keeps capturing outbox rows while NEITHER transport delivers: no Kafka publish
-// because the relay is not running, and no legacy webhook because the relay is the only thing
-// that enqueues one during the window. That state does not self-heal — the obstacle is
-// evaluated once per process — so the error is returned to runServer, which refuses to serve
-// over it rather than accumulating undeliverable rows behind a boot-time log line.
-//
-// The stopper is returned ALONGSIDE the error and is always callable, so the caller's
-// `defer stop()` is correct whether the relay started or not: topic assurance may have
-// started a background pass before the relay refused, and that pass still has to be stopped.
+// The relay refuses on a configuration or construction fault — a missing dependency,
+// the no-op publisher, or a dual-delivery window that has not opened or cannot be read.
+// For a deployment that reached this function, KAFKA_BROKERS IS set, so a refusal means
+// every producer keeps capturing outbox rows while NEITHER transport delivers: no Kafka
+// publish because the relay is not running, and no legacy webhook because the relay is
+// the only thing that enqueues one during the window.
 //
 // Returns:
-//   - func(): stops the relay and topic assurance. Never nil, and safe to call after a refusal.
-//   - error: the relay's startup obstacle, or nil when it is running or deliberately not run.
+//   - func(): stops the relay and topic assurance. Never nil, and safe to call after a
+//     refusal.
+//   - error: the relay's startup obstacle, or nil when it is running or deliberately
+//     not run.
 func startEventRelay(
 	ctx context.Context,
 	instance *blnk.Blnk,
@@ -749,17 +595,10 @@ func startEventRelay(
 	probeKeyScopeGateway(ctx, cfg)
 
 	// THE CLAIM GATE. Assurance above is allowed to fail and be stepped past, because the
-	// usual cause is a broker that is not listening yet and refusing to start the relay would
-	// turn that into an outage needing a human. This is the other half of that decision: the
-	// relay starts, so recovery is automatic, but it CLAIMS NOTHING until every destination
-	// topic is known to exist.
-	//
-	// Without the gate, starting anyway had a real cost. Claiming leases a row; publishing to
-	// a topic that does not exist fails, because auto-creation is disabled; the row retries on
-	// the backoff schedule until its budget is spent; and the dead-letter write then fails FOR
-	// THE SAME REASON, because the dead-letter sibling is missing too. The row ends failed with
-	// no dead-letter topic recorded, and a boot against an unprovisioned broker could do that
-	// to every pending row before anyone noticed the topics were absent.
+	// usual cause is a broker that is not listening yet and refusing to start the relay
+	// would turn that into an outage needing a human. This is the other half of that
+	// decision: the relay starts, so recovery is automatic, but it CLAIMS NOTHING until
+	// every destination topic is known to exist.
 	relay := blnk.NewEventRelayProcessor(instance).
 		WithCatalogueGate(blnk.NewTopicCatalogueGate(cfg))
 	startErr := relay.Start(ctx)
@@ -787,58 +626,25 @@ func startEventRelay(
 	return stop, nil
 }
 
-// reportStrandedTopicPrefixes names, at start-up, any topic namespace that outbox rows still
-// name and this deployment no longer owns.
+// reportStrandedTopicPrefixes names, at start-up, any topic namespace that outbox rows
+// still name and this deployment no longer owns.
 //
-// # Why it is reported here and reported loudly
+// An outbox row records its destination topic at insert time, so changing
+// KAFKA_TOPIC_PREFIX leaves committed rows naming the previous generation's topics.
+// Those rows stay publishable only while the old prefix is declared in
+// KAFKA_HISTORICAL_TOPIC_PREFIXES.
 //
-// An outbox row records its destination topic at insert time, so changing KAFKA_TOPIC_PREFIX
-// leaves committed rows naming the previous generation's topics. Those rows stay publishable
-// only while the old prefix is declared in KAFKA_HISTORICAL_TOPIC_PREFIXES. Declare nothing
-// and the publisher refuses each of those topics: the rows stay claimable for ever, their
-// dead-letter writes and replays are refused too, and every status count still reads as
-// ordinary outstanding work. The events are safe; delivery has stopped; and the only evidence
-// is a topic name on rows nobody is reading.
+// Credential issuance attests every key-scoped binding against this component and
+// refuses when it cannot, so the boundary is safe without this function. What the probe
+// buys is WHEN an operator finds out.
 //
-// Start-up is the right moment because that is when the prefix is read. A rename reaches a
-// process on its next restart, which is exactly this call, so the finding lands in the same
-// boot log as the configuration that caused it — with the variable to set and the number of
-// events waiting behind it.
-//
-// # Why it does not stop the server
-//
-// Blocking the prefix change until the old rows drain is the other sanctioned answer and the
-// wrong one for a running ledger: the refusal would land on a rolling restart, taking down a
-// server whose ledger and API are healthy over a condition that affects event delivery alone
-// and is fixed by adding one variable. The relay starts, every other topic keeps draining,
-// and the log names what is not.
+// Nothing is probed when no component is declared: that is the shipped default and
+// every key-scoped subscriber is refused a credential under it, which config validation
+// has already announced.
 //
 // Parameters:
 //   - ctx context.Context: cancels the query.
 //   - instance *blnk.Blnk: the service the audit reads its outbox through.
-//
-// probeKeyScopeGateway reports, at start-up, whether the declared key-scope enforcement
-// component answers and claims to be enforcing (SEC-01).
-//
-// # Why a probe exists at all when issuance already verifies
-//
-// Credential issuance attests every key-scoped binding against this component and refuses when it
-// cannot, so the boundary is safe without this function. What the probe buys is WHEN an operator
-// finds out. Without it, the first evidence that a declared component is unreachable — a
-// certificate expired, a token rotated on one side, a sidecar that did not come up — is a 409 on
-// somebody's credential request, possibly weeks later, and the operator learns it from the
-// subscriber.
-//
-// # It is DELIBERATELY NON-FATAL, and reported at WARNING
-//
-// A failing probe means key-scoped issuance will refuse; it does not mean the ledger, the relay
-// or any publishing path is impaired, and nothing about event delivery depends on this component.
-// Refusing to start the server over it would convert a subscriber-management degradation into a
-// total outage, which is the same trade assureEventTopics already declines for the same reason.
-//
-// Nothing is probed when no component is declared: that is the shipped default and every
-// key-scoped subscriber is refused a credential under it, which config validation has already
-// announced.
 //
 // Parameters:
 //   - ctx context.Context: the server's context. The probe is bounded by the configured
@@ -916,26 +722,17 @@ func reportStrandedTopicPrefixes(ctx context.Context, instance *blnk.Blnk) {
 	}
 }
 
-// assureEventTopics creates or grows the event topics to the configured geometry, logging what
-// it did and what it could not do.
+// assureEventTopics creates or grows the event topics to the configured geometry,
+// logging what it did and what it could not do.
 //
-// It is separated from startEventRelay so the admin client's lifetime is exactly this call:
-// assurance is a one-shot startup operation, and holding its connections open for the process
-// lifetime would keep a SASL session per broker for something that never runs again.
-//
-// # It self-guards on an unconfigured broker list
-//
-// There is nothing to assure without brokers, and asking anyway is not harmless: the admin
-// client answers "no brokers are configured", which this function would report at ERROR as an
-// assurance failure — on the shipped default, in a supported steady state, and alongside a
-// claim that "the relay still starts" which is not true on that path either. Its caller
-// already declines to run in that state; the guard is here as well so a future call site
-// cannot reintroduce the same misreport. Debug rather than info, because startEventRelay says
-// it once at info and two lines for one condition is how a log stops being read.
+// It is separated from startEventRelay so the admin client's lifetime is exactly this
+// call: assurance is a one-shot startup operation, and holding its connections open for
+// the process lifetime would keep a SASL session per broker for something that never
+// runs again.
 //
 // Parameters:
-//   - ctx context.Context: bounded here, because assurance must not delay startup indefinitely
-//     against an unreachable broker.
+//   - ctx context.Context: bounded here, because assurance must not delay startup
+//     indefinitely against an unreachable broker.
 //   - cfg *config.Configuration: read for the broker list and the topic geometry.
 func assureEventTopics(ctx context.Context, instance *blnk.Blnk, cfg *config.Configuration) func() {
 	if cfg == nil || !blnk.KafkaBrokersConfigured(cfg.Kafka.Brokers) {
@@ -947,20 +744,20 @@ func assureEventTopics(ctx context.Context, instance *blnk.Blnk, cfg *config.Con
 		return func() {}
 	}
 
-	// ONE SYNCHRONOUS ATTEMPT FIRST, so that on a healthy cluster the topics exist before the
-	// relay's first publish — the ordering the relay depends on, since auto-creation is disabled
-	// and a publish to a missing topic fails, retries, and then fails to dead-letter because the
-	// .dlt topic is missing for the same reason.
+	// ONE SYNCHRONOUS ATTEMPT FIRST, so that on a healthy cluster the topics exist before
+	// the relay's first publish — the ordering the relay depends on, since auto-creation
+	// is disabled and a publish to a missing topic fails, retries, and then fails to
+	// dead-letter because the .dlt topic is missing for the same reason.
 	if attemptEventTopicAssurance(ctx, instance) == nil {
 		return func() {}
 	}
 
-	// IT FAILED, SO KEEP TRYING (PERF-P18). This used to be the end of the road: one attempt,
-	// logged at error, and never revisited. On a first deploy that is the ordinary case rather
-	// than an edge case — the broker's StatefulSet and the server's Deployment come up together,
-	// so the server frequently wins — and the consequence was permanent: the topics were never
-	// created, so every event failed to publish and then failed to dead-letter, and the only
-	// remedy was to restart the pod. Retrying converts a permanent outage into a delay.
+	// IT FAILED, SO KEEP TRYING. On a first deploy that is the ordinary case rather than
+	// an edge case — the broker's StatefulSet and the server's Deployment come up
+	// together, so the server frequently wins — and the consequence was permanent: the
+	// topics were never created, so every event failed to publish and then failed to
+	// dead-letter, and the only remedy was to restart the pod. Retrying converts a
+	// permanent outage into a delay.
 	stop := make(chan struct{})
 	done := make(chan struct{})
 
@@ -980,12 +777,6 @@ func assureEventTopics(ctx context.Context, instance *blnk.Blnk, cfg *config.Con
 
 // attemptEventTopicAssurance makes one bounded assurance pass.
 //
-// It borrows the PROCESS-OWNED administrative client (PERF-P10) rather than building and
-// closing one of its own. Two reasons: assurance now runs repeatedly, so a per-attempt client
-// would mean a fresh transport, TCP connection and SASL/SCRAM handshake on every retry against
-// a broker that is by definition already struggling; and the process-owned client is closed
-// exactly once, by Blnk.Close(), so this code must not close what it did not open.
-//
 // Parameters:
 //   - ctx context.Context: parent for the bounded attempt.
 //   - instance *blnk.Blnk: the service container, for its shared administrative client.
@@ -1004,10 +795,11 @@ func attemptEventTopicAssurance(ctx context.Context, instance *blnk.Blnk) error 
 		return err
 	}
 	// NOT CLOSED HERE. Blnk.KafkaAdmin returns the container's own cached client, so this
-	// function borrows it rather than owning it — and closing a borrowed client is worse than
-	// leaking one: the retry loop calls this again after a failure, the credential-issuance
-	// endpoint and the metrics collector share the same handle, and every one of them would
-	// then be working against a closed connection. The container closes it on shutdown.
+	// function borrows it rather than owning it — and closing a borrowed client is worse
+	// than leaking one: the retry loop calls this again after a failure, the
+	// credential-issuance endpoint and the metrics collector share the same handle, and
+	// every one of them would then be working against a closed connection. The container
+	// closes it on shutdown.
 
 	assurance, cancel := context.WithTimeout(ctx, eventTopicAssuranceTimeout)
 	defer cancel()
@@ -1043,23 +835,21 @@ func attemptEventTopicAssurance(ctx context.Context, instance *blnk.Blnk) error 
 	return nil
 }
 
-// retryEventTopicAssurance retries assurance with capped exponential backoff until it succeeds.
+// retryEventTopicAssurance retries assurance with capped exponential backoff until it
+// succeeds.
 //
-// # Why it does not give up
+// There is no attempt count, deliberately. The condition being waited on is "the broker
+// is reachable and will accept administrative requests", and there is no number of
+// attempts after which the right answer changes: a cluster that is thirty minutes into
+// a rolling restart still needs its topics when it comes back.
 //
-// There is no attempt count, deliberately. The condition being waited on is "the broker is
-// reachable and will accept administrative requests", and there is no number of attempts after
-// which the right answer changes: a cluster that is thirty minutes into a rolling restart still
-// needs its topics when it comes back. Exhausting a retry budget would recreate exactly the
-// permanent failure this exists to remove, only later and harder to diagnose.
-//
-// What bounds it instead is the process lifetime: ctx is the signal context and stop is closed
-// by the relay's shutdown, so this ends when the server does.
+// A GEOMETRY REFUSAL IS THE ONE EXCEPTION: it is permanent, so it is not retried at all.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it ends the retry loop.
-//   - stop <-chan struct{}: closing it ends the loop even when ctx is live, which is what a
-//     listener failure needs — it unwinds the defers without cancelling the context.
+//   - stop <-chan struct{}: closing it ends the loop even when ctx is live, which is
+//     what a listener failure needs — it unwinds the defers without cancelling the
+//     context.
 //   - instance *blnk.Blnk: the service container.
 func retryEventTopicAssurance(ctx context.Context, stop <-chan struct{}, instance *blnk.Blnk) {
 	backoff := eventTopicAssuranceRetryBase
@@ -1089,13 +879,13 @@ func retryEventTopicAssurance(ctx context.Context, stop <-chan struct{}, instanc
 			return
 		}
 
-		// A GEOMETRY REFUSAL IS NOT TRANSIENT, so this stops instead of restating it for ever.
-		// A topic that already holds records and needs more partitions refuses identically on
-		// every attempt, and an inadequate replication factor is a property of the cluster:
-		// neither is something another attempt can achieve, and growing a live topic is a
-		// planned migration rather than a retry. Retrying would print the same refusal on a
-		// widening schedule for the life of the process, which buries the one line an operator
-		// has to act on under copies of itself.
+		// A GEOMETRY REFUSAL IS NOT TRANSIENT, so this stops instead of restating it for
+		// ever. A topic that already holds records and needs more partitions refuses
+		// identically on every attempt, and an inadequate replication factor is a property of
+		// the cluster: neither is something another attempt can achieve, and growing a live
+		// topic is a planned migration rather than a retry. Retrying would print the same
+		// refusal on a widening schedule for the life of the process, which buries the one
+		// line an operator has to act on under copies of itself.
 		if errors.Is(err, blnk.ErrPartitionGrowthRefused) ||
 			errors.Is(err, blnk.ErrReplicationFactorInadequate) {
 			withLoggableCause(logrus.WithField("attempt", attempt), err).Error(
@@ -1144,8 +934,9 @@ It sets up the API routes, traces, and TypeSense client before launching the ser
 */
 // serverCommands builds the `start` command, which runs the server role.
 //
-// The command layer owns the SIGNAL and the EXIT STATUS; runServer owns the lifecycle. That is
-// the same split cmd/workers.go uses, and it is what makes the lifecycle testable.
+// The command layer owns the SIGNAL and the EXIT STATUS; runServer owns the lifecycle.
+// That is the same split cmd/workers.go uses, and it is what makes the lifecycle
+// testable.
 //
 // Parameters:
 //   - b *blnkInstance: the service container the role serves from.
@@ -1163,25 +954,12 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 		Short: "start blnk server", // Short description of the command
 		// RunE, not Run, and that is the whole of the lifecycle fix at this level.
 		//
-		// Every failure in this role used to end in logrus.Fatal, which calls os.Exit and
-		// therefore runs NO deferred function: the event relay, the retention sweeper, the
-		// event metrics collector, the lineage processor, the hash-chain processor, the service
-		// container, the database pool, the PostHog client and the tracing exporter were all
-		// left open, and the process died holding relay leases that had to expire on their own.
-		// Returning the error instead unwinds the stack through every defer in runServer, in
-		// reverse registration order, and Cobra reports it and sets a non-zero exit status.
-		//
-		// SilenceUsage is set on the root command's side of this contract: a runtime failure is
-		// not a usage error, and printing the help text after one buries the reason.
+		// SilenceUsage is set on the root command's side of this contract: a runtime failure
+		// is not a usage error, and printing the help text after one buries the reason.
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// ONE signal context for the whole process. Everything that has to stop when this
 			// process is asked to stop reads this context and nothing else: every background
 			// processor, and the HTTP listener inside runServer.
-			//
-			// Previously the processors were handed context.Background() — a context that is
-			// never cancelled — and the listener installed a private signal.Notify. So a
-			// SIGTERM was seen by exactly one participant, and the processors only discovered
-			// it indirectly, when the deferred stops ran after the drain had completed.
 			ctx, stopSignals := signal.NotifyContext(
 				context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stopSignals()
@@ -1201,34 +979,12 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 
 	// --require-kafka EXISTS SO THAT THE DECISION IS MADE BY THE CODE THAT KNOWS.
 	//
-	// startEventRelay is conditional on brokers being configured: with an empty list it logs one
-	// info line and starts nothing, so the server comes up entirely healthy while every captured
-	// event stays pending in blnk.event_outbox. Nothing is wrong with that as a steady state —
-	// it is the documented pre-migration mode — but a deployment that MEANT to run the relay has
-	// no way to say so, and the failure is silence.
-	//
-	// The alternative that was tried was a shell guard in the makefile which resolved the broker
-	// list itself, and it could not agree with the loader — three ways, each of which made the
-	// target ANNOUNCE a relay that would not start:
-	//
-	//   It took the FIRST NON-EMPTY of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and
-	//   BLNK_KAFKA_BROKERS, in that order. The loader's precedence is the reverse at the top:
-	//   BLNK_KAFKA_BROKERS wins, then KAFKA_BROKERS, then the derived key, then the file. So
-	//   `BLNK_KAFKA_BROKERS= KAFKA_BROKERS=host:9092 make run_relay` was announced as configured
-	//   from the bare name while the loader resolved NO brokers — the empty higher-precedence
-	//   name being exactly how an operator turns Kafka off for one run.
-	//
 	//   It tested the config file with `grep '"brokers"'`, which reads `"brokers": []` as
 	//   configured.
 	//
 	//   And nothing in a first-non-empty scan can express that an explicitly EMPTY value at a
 	//   higher-precedence name CLEARS a list a lower one supplied, because that is a property of
 	//   the overlay rather than of any single source.
-	//
-	// A flag on the binary has none of those problems, because it asks the question after the
-	// same load, of the same struct, with the same predicate the relay's own gate uses. There is
-	// one resolution and one definition of "configured", so the guard cannot drift from the
-	// behaviour it guards.
 	cmd.Flags().BoolVar(&requireKafka, "require-kafka", false,
 		"refuse to start unless this deployment's own configuration resolves to at least one "+
 			"Kafka broker, so a server that would silently run without the event relay fails "+
@@ -1237,40 +993,27 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 	return cmd
 }
 
-// requireKafkaBrokersConfigured refuses to start the server role when the effective configuration
-// resolves to no Kafka broker.
+// requireKafkaBrokersConfigured refuses to start the server role when the effective
+// configuration resolves to no Kafka broker.
 //
-// # It reads the same resolution the relay does
+// config.Fetch returns the configuration the whole process shares — blnk.json decoded,
+// then the environment overlaid by envconfig, then defaults applied — and
+// blnk.KafkaBrokersConfigured is the same predicate startEventRelay gates on. Nothing
+// here re-implements or re-validates: a malformed topic prefix or a half-configured
+// SASL principal is refused by config's own validation during the load that has already
+// happened by the time this runs, and this function answers exactly one question that
+// validation deliberately does not, because the answer is legitimately "none" in a
+// deployment that has not migrated.
 //
-// config.Fetch returns the configuration the whole process shares — blnk.json decoded, then the
-// environment overlaid by envconfig, then defaults applied — and blnk.KafkaBrokersConfigured is
-// the same predicate startEventRelay gates on. Nothing here re-implements or re-validates: a
-// malformed topic prefix or a half-configured SASL principal is refused by config's own
-// validation during the load that has already happened by the time this runs, and this function
-// answers exactly one question that validation deliberately does not, because the answer is
-// legitimately "none" in a deployment that has not migrated.
-//
-// # What the message has to say, and why
-//
-// The operator who sees this has already asked for the relay, so the useful information is where a
-// broker list can come from and which spelling wins. The order below is config's documented
-// precedence — see eventStreamingEnvOverride — and it was confirmed by loading this package under
-// each combination rather than read off the comment:
-//
-//	BLNK_KAFKA_BROKERS        wins over everything; it is the conventional prefixed name and is
-//	                          applied as an overlay after the rest of the environment
-//	KAFKA_BROKERS             the R-10 deployment contract name
-//	BLNK_KAFKA_KAFKA_BROKERS  the key envconfig derives from the nested struct, still honoured
-//	kafka.brokers in the configuration file, used when no environment name is set
-//
-// And the fact that is easiest to get wrong: a name that is SET AND EMPTY is not absent. An empty
-// value at a higher-precedence name CLEARS what a lower one supplied — that is how an operator
-// turns Kafka off for a single run — which is why `KAFKA_BROKERS= blnk start --require-kafka` is
-// refused here rather than falling back to the configuration file.
+// And the fact that is easiest to get wrong: a name that is SET AND EMPTY is not
+// absent. An empty value at a higher-precedence name CLEARS what a lower one supplied —
+// that is how an operator turns Kafka off for a single run — which is why
+// `KAFKA_BROKERS= blnk start --require-kafka` is refused here rather than falling back
+// to the configuration file.
 //
 // Returns:
-//   - error: nil when at least one usable broker address is configured; otherwise a refusal
-//     naming the sources, so Cobra reports it and the process exits non-zero.
+//   - error: nil when at least one usable broker address is configured; otherwise a
+//     refusal naming the sources, so Cobra reports it and the process exits non-zero.
 func requireKafkaBrokersConfigured() error {
 	cfg, err := config.Fetch()
 	if err != nil {
@@ -1301,29 +1044,13 @@ func requireKafkaBrokersConfigured() error {
 	)
 }
 
-// runServer starts the API listener and every background processor the server role owns, blocks
-// until ctx is cancelled or the listener fails, and then shuts everything down in order.
+// runServer starts the API listener and every background processor the server role
+// owns, blocks until ctx is cancelled or the listener fails, and then shuts everything
+// down in order.
 //
-// # The shutdown order, and why it is this order
-//
-// Go runs defers last-in-first-out, so the registration order below IS the shutdown order,
-// reversed. Read from the bottom up it is: the background processors stop, then the service
-// container closes, then the database pool closes, then telemetry flushes.
-//
-// That order is not cosmetic. The processors write to the database and the broker, so stopping
-// them first means nothing is in flight when the things they use go away. Blnk.Close() then
-// drains the scheduled subscriber cleanups and closes the shared Kafka administrative client
-// and the publisher — work that still needs the DATABASE, which is why it must come before the
-// pool is closed and not after. Telemetry is flushed last so the shutdown itself is observable.
-//
-// # Why the cancellation overlaps the drain
-//
-// Every processor is started with ctx, the signal context. So the instant the signal lands they
-// all begin winding down, CONCURRENTLY with the HTTP drain that startServer is performing. The
-// deferred Stop() calls that follow are then joins on work already finishing rather than the
-// start of it. Serialised — drain fully, then ask each processor to stop and wait — the total
-// regularly exceeded the termination grace and the remainder was SIGKILLed, which is precisely
-// what leaves a claimed outbox row locked until its lease expires.
+// Go runs defers last-in-first-out, so the registration order below IS the shutdown
+// order, reversed. Read from the bottom up it is: the background processors stop, then
+// the service container closes, then the database pool closes, then telemetry flushes.
 //
 // Parameters:
 //   - ctx context.Context: the signal context. Cancelling it shuts the whole role down.
@@ -1348,9 +1075,9 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 		defer func() {
 			// A FRESH bounded context, not ctx. By the time this defer runs, ctx IS the
 			// cancelled signal context, and an exporter flush on a cancelled context returns
-			// immediately without exporting — so the telemetry describing the shutdown would
-			// be the telemetry most reliably lost, exactly when it is wanted. Same
-			// ten-second budget the worker role already uses for this.
+			// immediately without exporting — so the telemetry describing the shutdown would be
+			// the telemetry most reliably lost, exactly when it is wanted. Same ten-second
+			// budget the worker role already uses for this.
 			flush, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
 			defer cancel()
 
@@ -1363,8 +1090,8 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 		defer func() {
 			// Logged rather than discarded. PostHog's Close flushes its queued batch, so an
 			// error here means product telemetry from this run was dropped — which is not worth
-			// failing a shutdown over, but is worth being able to see rather than inferring
-			// from a gap in the data.
+			// failing a shutdown over, but is worth being able to see rather than inferring from
+			// a gap in the data.
 			if err := phClient.Close(); err != nil {
 				withLoggableCause(nil, err).
 					Warn("Error closing the PostHog client; queued telemetry from this run may be lost")
@@ -1394,26 +1121,7 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 		}
 	}()
 
-	// Close the service container (PERF-P17).
-	//
-	// Blnk.Close() existed and no production command ever called it, so on every shutdown the
-	// process leaked what it owns: the Kafka writer per topic and their broker connections, the
-	// shared administrative client, and the asynq client. It also, since PERF-P09, DRAINS the
-	// scheduled subscriber cleanups — a credential revocation owed after a failed issuance, a
-	// provisioning fence still held — so skipping it does not merely leak sockets, it abandons
-	// compensating work and leaves a subscriber fenced until its lease expires.
-	//
-	// REGISTERED HERE, between the pool's defer and the processors' defers, and the position is
-	// the whole point of where it sits. Defers run last-in-first-out, so this runs AFTER every
-	// processor has stopped — nothing is publishing when the publisher closes — and BEFORE the
-	// connection pool closes, which the drained cleanups still need to write through. Moved
-	// either side of those two and it would either close the publisher under a live relay or
-	// drain database work against a closed pool.
-	//
-	// The work is in a NAMED HELPER rather than an inline closure, for the reason the three
-	// start* helpers around it are: runServer cannot be executed in a unit test, so anything
-	// written inline here is only ever assertable as source text. See closeServiceContainer,
-	// which is reachable from a test and carries the nil handling.
+	// Close the service container.
 	defer closeServiceContainer(b)
 
 	// Start lineage outbox processor
@@ -1422,81 +1130,16 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 	lineageProcessor.Start(ctx)
 	defer lineageProcessor.Stop()
 
-	// Start the event metrics collector. It is the ONLY production maintainer of the
-	// event pipeline's gauges, and without it every one of them is declared, initialised
-	// and never recorded — so no rule in alerts/blnk-kafka-alerts.yml can fire whatever
-	// the system is doing.
-	//
-	// The gauges are deliberately NOT counted here. Naming a number is how a comment
-	// comes to disagree with the instrument list it describes, and this one already has
-	// twice; startEventMetricsCollector's own documentation enumerates them, and
-	// internal/metrics/metrics.go declares them.
-	//
-	// It runs in the SERVER role only, beside the lineage processor and for the
-	// same reason: this is where the outbox background work already lives.
-	// Starting it in the worker role as well would have two processes writing the
-	// same gauges, each zeroing the other's series as stale.
-	//
-	// It is unconditional as to KAFKA, and it stays useful without it. A deployment with
-	// no Kafka captures no event rows, so the gauges read from PostgreSQL report ZERO
-	// rather than a backlog — and reporting zero is what lets a resolved alert resolve
-	// instead of firing for ever on a series that simply stopped being written. The
-	// gauges that need an admin client are not exported without one; the collector skips
-	// the measurements it has no dependency for rather than declining to run.
-	//
-	// It is NOT unconditional as to REPLICAS (PERF-P13). The collector and the
-	// retention sweeper are now started behind a singleton lease, because they are
-	// maintenance of a shared table rather than serving: N replicas would publish N
-	// series for one truth, each retiring the others' as stale, and issue N
-	// competing sets of deletes. The relay below is deliberately left outside the
-	// lease — its FOR UPDATE SKIP LOCKED claim divides work between replicas rather
-	// than duplicating it. The sweeper's own start-up conditions are unchanged and
-	// still evaluated inside the starter this now wraps.
+	// Start the event metrics collector. It is the ONLY production maintainer of the event
+	// pipeline's gauges, and without it every one of them is declared, initialised and
+	// never recorded — so no rule in alerts/blnk-kafka-alerts.yml can fire whatever the
+	// system is doing.
 	stopEventMaintenance := startEventMaintenance(ctx, b, cfg)
 	defer stopEventMaintenance()
 
 	// Start the Kafka event outbox relay. It is the ONLY thing that publishes captured
-	// event rows, so without it a Kafka-configured deployment fills blnk.event_outbox
-	// and delivers nothing.
-	//
-	// "Captured" covers both routes, and the relay does not distinguish them: rows
-	// enrolled in their mutation's own transaction — the transaction, ledger, identity
-	// and balance paths — and rows written standalone once the mutation had already
-	// committed, as a balance monitor alert, a bulk batch summary and a system error are.
-	//
-	// EXACTLY ONE CALL, and this is it. The relay used also to be constructed and
-	// started inline a few lines above, which meant one process ran TWO relays: two
-	// topic-assurance passes, two sets of broker connections, two dual-delivery
-	// enqueue paths, and a duplicated start/stop pair in the log that made the
-	// lifecycle unreadable during incident triage. Worse, the inline copy did not
-	// guard on the broker list, so the shipped Kafka-less default — a legitimate
-	// steady state — reported itself twice at ERROR level while the guarded helper
-	// reported the same condition at info. A second call here is not redundancy; it
-	// is a second relay.
-	//
-	// Topic assurance runs first, INSIDE the helper, and the order is the point: the
-	// relay's first publish must not be the thing that discovers a missing topic,
-	// because auto-creation is disabled and a publish to a topic that does not exist
-	// fails, retries, and then fails to dead-letter for the same reason. See the
-	// helper's documentation for why a failure there is logged and stepped past
-	// rather than fatal, and for why no brokers at all is answered with a single
-	// info line and no relay.
-	//
-	// The relay belongs to the SERVER role, beside the lineage processor and the
-	// event metrics collector, following this repository's convention that outbox
-	// relays live where the outbox background work already is. Starting it in the
-	// worker role as well would have two processes claiming the same rows — which
-	// the FOR UPDATE SKIP LOCKED claim tolerates, but it would double the broker
-	// connections and the dual-delivery enqueues for no gain.
-	//
-	// A REFUSAL IS FATAL TO THIS PROCESS, and the defer is registered before the check so
-	// the topic-assurance pass the helper may already have started is still stopped on the
-	// way out. The obstacle set is configuration and construction faults only — see the
-	// helper — so there is nothing to wait for and nothing that a retry would fix; a
-	// transient broker is covered by assurance being stepped past and by the catalogue gate,
-	// neither of which reaches here. Serving anyway is the CR-2 failure itself: with brokers
-	// configured and no relay, every producer captures a row that neither transport will ever
-	// deliver, and the process reports itself healthy while doing it.
+	// event rows, so without it a Kafka-configured deployment fills blnk.event_outbox and
+	// delivers nothing.
 	stopEventRelay, relayErr := startEventRelay(ctx, b.blnk, cfg)
 	defer stopEventRelay()
 
@@ -1504,44 +1147,32 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 		return relayErr
 	}
 
-	// The retention sweeper is NOT started here. Without it blnk.event_outbox grows without
-	// bound — every delivered and every dead-lettered row stays for ever, so the table the
-	// relay's claim query scans keeps getting larger and the oldest rows are kept long past any
-	// replay window — but it is maintenance of a shared table, so it is started by
-	// startEventMaintenance above, behind the singleton lease, together with the metrics
-	// collector (PERF-P13). It remains a no-op unless RELAY_EVENT_RETENTION_DAYS is set.
+	// The retention sweeper is NOT started here. Without it blnk.event_outbox grows
+	// without bound — every delivered and every dead-lettered row stays for ever, so the
+	// table the relay's claim query scans keeps getting larger and the oldest rows are
+	// kept long past any replay window — but it is maintenance of a shared table, so it is
+	// started by startEventMaintenance above, behind the singleton lease, together with
+	// the metrics collector. It remains a no-op unless RELAY_EVENT_RETENTION_DAYS is set.
 
-	// The settlement processor runs beside the relay and the sweeper, in the same role and with
-	// the same lifecycle. It is what finishes the broker-side work a subscriber operation could
-	// not: an authorization change that pruned the broker and then failed to persist, a
-	// credential written whose compensating revocation also failed, a credential revoked whose
-	// registry record could not be cleared. Each of those is recorded durably on the subscriber
-	// row, and without this nothing ever discharges them — the obligations accumulate and the
-	// registry stays diverged from the broker.
-	//
-	// It is a no-op when no broker is configured, which is a legitimate steady state: with no
-	// broker there is no broker-side state to reconcile.
+	// The settlement processor runs beside the relay and the sweeper, in the same role and
+	// with the same lifecycle. It is what finishes the broker-side work a subscriber
+	// operation could not: an authorization change that pruned the broker and then failed
+	// to persist, a credential written whose compensating revocation also failed, a
+	// credential revoked whose registry record could not be cleared. Each of those is
+	// recorded durably on the subscriber row, and without this nothing ever discharges
+	// them — the obligations accumulate and the registry stays diverged from the broker.
 	stopSubscriberSettlement := startSubscriberSettlement(ctx, b.blnk)
 	defer stopSubscriberSettlement()
 
-	// THE BALANCE-MONITOR HANDOFF DRAINER, and it is NOT optional maintenance. Every ledger
-	// transaction that moves a monitored balance records a handoff row inside its own
-	// transaction — an intent saying "these monitors have not been judged yet", carrying both
-	// inputs the judgement depends on: the balance as written and the monitor definitions in
-	// force when it was written, so draining late cannot change the verdict — and the
-	// post-commit evaluation stands down whenever the handoff is in play. This processor is
-	// therefore the SOLE owner of `balance.monitor`: without it the rows accumulate
-	// unevaluated, no monitor alert is ever published, and the only symptom is silence.
-	//
-	// It belongs beside the relay and the settlement processor rather than behind the
-	// maintenance lease, because it is not maintenance of a shared table — it is the
-	// evaluation half of a ledger write, and every server instance may take its share of it.
-	// The claim is FOR UPDATE SKIP LOCKED, so N instances divide the work rather than
-	// duplicating it.
-	//
-	// It declines to start when no broker is configured, which is the same predicate the
-	// writer uses to decide whether to record a handoff at all — so a Kafka-less deployment
-	// keeps the post-commit evaluation and has nothing to drain.
+	// THE BALANCE-MONITOR HANDOFF DRAINER, and it is NOT optional maintenance. Every
+	// ledger transaction that moves a monitored balance records a handoff row inside its
+	// own transaction — an intent saying "these monitors have not been judged yet",
+	// carrying both inputs the judgement depends on: the balance as written and the
+	// monitor definitions in force when it was written, so draining late cannot change the
+	// verdict — and the post-commit evaluation stands down whenever the handoff is in
+	// play. This processor is therefore the SOLE owner of `balance.monitor`: without it
+	// the rows accumulate unevaluated, no monitor alert is ever published, and the only
+	// symptom is silence.
 	stopBalanceMonitorHandoff := startBalanceMonitorHandoff(ctx, b.blnk, cfg)
 	defer stopBalanceMonitorHandoff()
 
@@ -1560,25 +1191,11 @@ func runServer(ctx context.Context, b *blnkInstance) error {
 	return startServer(ctx, router, cfg.Server.Port)
 }
 
-// startSubscriberSettlement starts the subscriber settlement processor and returns the function
-// that stops it.
+// startSubscriberSettlement starts the subscriber settlement processor and returns the
+// function that stops it.
 //
-// # The two obstacles are logged differently, and the difference matters
-//
-// NO BROKER CONFIGURED is logged at info. It is a legitimate steady state — the AAP requires the
-// whole event-streaming feature to degrade to a no-op without Kafka — and with no broker there is
-// no broker-side state that could diverge from the registry. Reporting it as a warning on every
-// start-up of every Kafka-less deployment would train an operator to ignore the one message that
-// IS a warning.
-//
-// ANYTHING ELSE is logged at warning, because it means a broker IS configured and the settlement
-// pass is not running. The symptom of that is silent: obligations accumulate on subscriber rows,
-// the registry and the broker stay diverged, and the only visible trace is the settlement gauges
-// climbing — which is exactly why the absence has to be said out loud at start-up.
-//
-// A cleanup FUNCTION rather than a deferred stop, for the reason every other starter here returns
-// one: a defer inside this helper would fire on return and stop the processor before it ever
-// ticked.
+// NO BROKER CONFIGURED is logged at info. It is a legitimate steady state — and with no
+// broker there is no broker-side state that could diverge from the registry.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it stops the processor.
@@ -1625,19 +1242,14 @@ type serviceContainerCloser interface {
 
 // closeServiceContainer releases the service container held by the CLI instance.
 //
-// It is what the server command defers. The nil checks are HERE rather than at the call site
-// so that the deferred call reads as one line and cannot be made unsafe by an edit to that
-// line: the CLI reaches the server command only after preRun has built the container, but
-// tests construct a blnkInstance with no container at all, and Close dereferences the
-// container's fields.
-//
-// The typed-nil check is not redundant with the one inside closeContainer. A nil *blnk.Blnk
-// placed in an interface produces a NON-nil interface holding a nil pointer, so passing it
-// through would defeat that check and panic on the call.
+// It is what the server command defers. The nil checks are HERE rather than at the call
+// site so that the deferred call reads as one line and cannot be made unsafe by an edit
+// to that line: the CLI reaches the server command only after preRun has built the
+// container, but tests construct a blnkInstance with no container at all, and Close
+// dereferences the container's fields.
 //
 // Parameters:
-//   - instance *blnkInstance: the CLI instance whose container to close. A nil instance and a
-//     nil container are both no-ops.
+//   - instance *blnkInstance: the CLI instance whose container to close.
 func closeServiceContainer(instance *blnkInstance) {
 	if instance == nil || instance.blnk == nil {
 		return
@@ -1648,15 +1260,12 @@ func closeServiceContainer(instance *blnkInstance) {
 
 // closeContainer closes one service container and reports the outcome.
 //
-// The error is LOGGED rather than returned or discarded. It cannot be returned: this runs from
-// a defer during shutdown, after the command's result is already decided. It must not be
-// discarded, because the thing a failing close reports is a LOST FLUSH — a kafka.Writer that
-// could not produce what it had batched — and those events are already marked dispatched in
-// the outbox. A silent `_ =` would make that indistinguishable from a clean shutdown, which is
-// exactly the failure the close exists to prevent.
+// The error is LOGGED rather than returned or discarded. It cannot be returned: this
+// runs from a defer during shutdown, after the command's result is already decided.
 //
 // Parameters:
-//   - container serviceContainerCloser: the container to close. A nil container is a no-op.
+//   - container serviceContainerCloser: the container to close. A nil container is a
+//     no-op.
 func closeContainer(container serviceContainerCloser) {
 	if container == nil {
 		return
@@ -1677,20 +1286,12 @@ func closeContainer(container serviceContainerCloser) {
 	}
 }
 
-// startEventRetention starts the event outbox retention sweeper and returns the function
-// that stops it.
+// startEventRetention starts the event outbox retention sweeper and returns the
+// function that stops it.
 //
-// # The two obstacles are logged differently, and the difference matters
-//
-// RETENTION DISABLED is the default and is logged at INFO, naming the variable so an operator
-// who believes retention is on can discover that it is not. Warning on the shipped default
-// would train them to ignore the one message that is a warning.
-//
-// ANYTHING ELSE is logged at WARNING: retention IS configured and is not running, so the
-// control the operator asked for is absent and the symptom is a table that quietly grows.
-//
-// It returns a cleanup FUNCTION for the reason the other two starters do — a defer inside this
-// helper would fire on return and stop the sweeper before it ever ticked.
+// RETENTION DISABLED is the default and is logged at INFO, naming the variable so an
+// operator who believes retention is on can discover that it is not. Warning on the
+// shipped default would train them to ignore the one message that is a warning.
 func startEventRetention(ctx context.Context, instance *blnk.Blnk) func() {
 	sweeper := blnk.NewEventRetentionSweeper(instance)
 
@@ -1719,38 +1320,13 @@ func startEventRetention(ctx context.Context, instance *blnk.Blnk) func() {
 	return sweeper.Stop
 }
 
-// startBalanceMonitorHandoff starts the balance-monitor handoff processor and returns the
-// function that stops it.
+// startBalanceMonitorHandoff starts the balance-monitor handoff processor and returns
+// the function that stops it.
 //
-// # What it owns, and why nothing else can
-//
-// A handoff row is an INTENT — "these monitors have not been judged yet" — and this processor
-// is the only thing that acts on one. It evaluates the snapshot with the unchanged condition
-// logic and writes the resulting alerts and the handoff's completion in one database
-// transaction.
-//
-// It is NO LONGER on the path of a new movement. The atomic writers now evaluate a moved
-// balance's monitors inside their own transaction and insert the canonical alert row there
-// (database.recordBalanceMonitorEvaluation), which is requirement R-2 met without any handoff
-// at all. What this processor drains is the finite, real population that remains: rows written
-// by releases that predate that capture, and rows written by a process that has no alert
-// capture registered. Starting it is therefore an UPGRADE obligation rather than a
-// steady-state one — a server that skipped it would strand whatever was in flight across the
-// upgrade, which is exactly the loss the handoff was built to prevent.
-//
-// The post-commit evaluation in transaction_execution.go stands down whenever the writer owns
-// evaluation, so this is not a second opinion on any row it claims. The no-broker case is
-// answered by the writer capturing nothing in the first place rather than by starting this and
-// hoping.
-//
-// # The obstacle is logged at INFO, not at WARN
-//
-// No Kafka broker is a legitimate, shipped steady state, not a misconfiguration. Such a
-// deployment writes no handoffs — database.recordBalanceMonitorEvaluation reads the same
-// predicate — and keeps the post-commit evaluation, so declining to start here is the
-// correct and complete behaviour and there is nothing for an operator to fix. Logging it
-// at WARN would make every Kafka-less deployment emit a warning on every start for
-// behaving exactly as documented.
+// A handoff row is an INTENT — "these monitors have not been judged yet" — and this
+// processor is the only thing that acts on one. It evaluates the snapshot with the
+// unchanged condition logic and writes the resulting alerts and the handoff's
+// completion in one database transaction.
 //
 // Parameters:
 //   - ctx context.Context: cancelled to stop the processor.
@@ -1788,13 +1364,14 @@ func startBalanceMonitorHandoff(ctx context.Context, instance *blnk.Blnk, cfg *c
 
 // hardenHTTPServer applies the shared connection-lifetime bounds to srv and returns it.
 //
-// One helper rather than the same five fields written out at each listener, so the API server
-// and the worker monitoring server cannot drift apart — a listener hardened in one place and
-// not the other is the same exposure as no hardening at all, and harder to notice.
+// One helper rather than the same five fields written out at each listener, so the API
+// server and the worker monitoring server cannot drift apart — a listener hardened in
+// one place and not the other is the same exposure as no hardening at all, and harder
+// to notice.
 //
 // Parameters:
-//   - srv *http.Server: the server to bound. Nil is returned unchanged, so a caller that may
-//     not have built a server need not branch.
+//   - srv *http.Server: the server to bound. Nil is returned unchanged, so a caller
+//     that may not have built a server need not branch.
 //
 // Returns:
 //   - *http.Server: srv, with the bounds applied.
@@ -1812,29 +1389,13 @@ func hardenHTTPServer(srv *http.Server) *http.Server {
 	return srv
 }
 
-// startEventMaintenance runs the leader-elected maintenance work and returns the function that
-// stops it. PERF-P13.
+// startEventMaintenance runs the leader-elected maintenance work and returns the
+// function that stops it.
 //
-// # What is gated and what is not
-//
-// GATED: the event metrics collector and the retention sweeper. Both are maintenance of a
-// shared table, and running N of each is not N times the benefit — for the collector it is N
-// competing answers to one question, and for the sweeper it is N processes contending for the
-// same row locks. See database/event_maintenance.go for the full reasoning.
-//
-// NOT GATED, and started unconditionally by runServer: the relay. Its claim is FOR UPDATE SKIP
-// LOCKED, which divides work between replicas instead of duplicating it, so gating it would
-// discard the horizontal scaling the outbox pattern is for.
-//
-// # Degradation is towards RUNNING, deliberately
-//
-// If the lease cannot be evaluated at all — no configuration, no pool — this starts the
-// maintenance work anyway, ungated, and says so at warning. The alternative fails towards
-// silence: no gauges, so no rule in alerts/blnk-kafka-alerts.yml can fire, and no
-// sweeper, so the outbox grows without bound. A duplicated gauge series on a multi-replica
-// deployment is a monitoring nuisance that an operator can see; unmeasured and unbounded
-// growth is neither visible nor bounded. Single-replica deployments — the common case, and the
-// only one the shipped manifests default to — are unaffected either way.
+// GATED: the event metrics collector and the retention sweeper. Both are maintenance of
+// a shared table, and running N of each is not N times the benefit — for the collector
+// it is N competing answers to one question, and for the sweeper it is N processes
+// contending for the same row locks.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it stops the loop and whatever it started.
@@ -1842,9 +1403,7 @@ func hardenHTTPServer(srv *http.Server) *http.Server {
 //   - cfg *config.Configuration: read for the datasource and the Kafka broker list.
 //
 // Returns:
-//   - func(): stops the loop, stops the maintenance work and releases the lease. Never nil,
-//     and it does NOT depend on ctx having been cancelled — a listener failure unwinds the
-//     defers with a live context, so a stop that waited only on ctx would deadlock there.
+//   - func(): stops the loop, stops the maintenance work and releases the lease.
 func startEventMaintenance(ctx context.Context, b *blnkInstance, cfg *config.Configuration) func() {
 	ds, err := database.GetDBConnection(cfg)
 	if err != nil || ds == nil {
@@ -1880,12 +1439,12 @@ func startEventMaintenance(ctx context.Context, b *blnkInstance, cfg *config.Con
 	}
 }
 
-// runEventMaintenanceLoop competes for the maintenance lease and runs the work while it holds
-// it, until ctx is cancelled or stop is closed.
+// runEventMaintenanceLoop competes for the maintenance lease and runs the work while it
+// holds it, until ctx is cancelled or stop is closed.
 //
-// The shape is: try to become the leader; if you are, run the work and hold the lease; if you
-// lose the lease, stop the work and go back to competing. A replica that is not the leader
-// spends one non-blocking statement per interval and nothing else.
+// The shape is: try to become the leader; if you are, run the work and hold the lease;
+// if you lose the lease, stop the work and go back to competing. A replica that is not
+// the leader spends one non-blocking statement per interval and nothing else.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it ends the loop.
@@ -1953,11 +1512,9 @@ func runEventMaintenanceLoop(
 
 // acquireEventMaintenanceLease makes one non-blocking attempt at the lease.
 //
-// The two ways of not getting it are reported differently on purpose. Losing to another replica
-// is the expected answer on N-1 replicas of N and is logged at debug, because logging it at
-// info would produce a line per replica per interval for ever. Failing to ASK is a fault and is
-// logged at warning, because it means this replica cannot participate at all and, if every
-// replica is in the same state, nothing is maintaining the pipeline.
+// The two ways of not getting it are reported differently on purpose. Losing to another
+// replica is the expected answer on N-1 replicas of N and is logged at debug, because
+// logging it at info would produce a line per replica per interval for ever.
 //
 // Parameters:
 //   - ctx context.Context: parent for the bounded attempt.

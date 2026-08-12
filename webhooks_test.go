@@ -55,8 +55,8 @@ import (
 //     not that an assertion needs relaxing.
 //
 // Scope deliberately held elsewhere: payload equivalence between the two transports is
-// event_dual_delivery_test.go's subject (acceptance criterion V-8), the sunset date
-// arithmetic is event_sunset_test.go's, and no Kafka CLIENT is imported here — the
+// event_dual_delivery_test.go's subject, the sunset date arithmetic is
+// event_sunset_test.go's, and no Kafka CLIENT is imported here — the
 // configured-broker case names a black-holed address precisely so that nothing dials.
 
 func TestSendWebhook(t *testing.T) {
@@ -1132,8 +1132,7 @@ func legacyWebhookInspector(t *testing.T, redisDSN string) *asynq.Inspector {
 // EnqueueLegacyWebhookDelivery sets an asynq task ID, so a task carrying the event id came from
 // the row, and the identity is also what suppresses a duplicate after a re-claim. The task BODY is
 // the row's stored bytes rather than an equal-looking re-serialisation. Comparing those bytes
-// against what Kafka received is criterion V-8's job in event_dual_delivery_test.go, not this
-// test's.
+// against what Kafka received is event_dual_delivery_test.go's job, not this test's.
 //
 // The queue and the task type must both equal the configured Queue.WebhookQueue AND equal each
 // other: the worker's mux dispatches on the TYPE while asynq.Queue routes to the QUEUE, so a task

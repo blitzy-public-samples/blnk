@@ -35,16 +35,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file covers the webhook retirement guard, which is the HTTP half of requirement R-12:
+// This file covers the webhook retirement guard, which is the HTTP half of requirement
 // after the configured instant the webhook REST API answers 410 Gone on EVERY request.
-//
-// The behaviour lives here, in the guard's own package, rather than in an end-to-end API test,
-// because the case that was broken cannot be reached through a route at all. Gin decides which
-// handlers run by matching method AND path, so a guard attached per route only ever sees the
-// methods somebody registered — and the methods nobody registered were exactly the ones
-// answering 404 and 405 about a surface that had been retired. Driving the guard
-// behind a router with no route for PATCH, OPTIONS or HEAD is what proves those now answer 410,
-// and it needs no database to do it.
 
 // deprecatedWebhookPath is a request path on the retired surface.
 const deprecatedWebhookPath = "/subscribers/sub_01HXYZ/webhook-subscription"
@@ -67,11 +59,8 @@ var everyHTTPMethod = []string{
 	"PROPFIND",
 }
 
-// storeSunsetWindow publishes a deprecation window, restoring whatever was there afterwards.
-//
-// The whole configuration is replaced because that is how the store works — an atomic value
-// holding one document — and the previous contents are restored on cleanup so a test cannot
-// leak its window into the next one.
+// storeSunsetWindow publishes a deprecation window, restoring whatever was there
+// afterwards.
 func storeSunsetWindow(t *testing.T, start, sunset time.Time) {
 	t.Helper()
 
@@ -91,14 +80,8 @@ func storeSunsetWindow(t *testing.T, start, sunset time.Time) {
 	})
 }
 
-// sunsetTestRouter builds a router carrying the guard exactly as api.Router installs it:
-// GLOBALLY, and before anything else.
-//
-// The four deprecated methods get handlers, as they do in production during the window, and
-// every other method deliberately gets none — so an unguarded request to one of those reaches
-// Gin's own 404/405 answer, which is the behaviour this guard exists to replace. A marker
-// handler records that the request got past the guard, because "did the handler run" is the
-// question for the pre-retirement case and 200 alone does not answer it.
+// sunsetTestRouter builds a router carrying the guard exactly as api.Router installs
+// it: GLOBALLY, and before anything else.
 func sunsetTestRouter() (*gin.Engine, *bool) {
 	gin.SetMode(gin.TestMode)
 
@@ -131,22 +114,10 @@ func sunsetTestRouter() (*gin.Engine, *bool) {
 	return router, &reached
 }
 
-// TestWebhookSunsetGuard_AnswersGoneOnEveryMethodAfterTheSunset is the criterion itself.
+// TestWebhookSunsetGuard_AnswersGoneOnEveryMethodAfterTheSunset is the criterion
+// itself.
 //
-// # What was wrong
-//
-// The guard was attached per route, to the four deprecated methods that had handlers. Gin
-// matches method AND path to choose handlers, so PATCH, OPTIONS, HEAD and anything else to the
-// same path matched no route and were answered by the ROUTER: 404, or 405 with an Allow header
-// listing the four verbs that "work". Both are false about a surface that has been permanently
-// removed, and the 405 actively tells a client to try again with a different verb.
-//
-// # Why the fix is a global guard rather than more routes
-//
-// Registering the remaining verbs would be an endless list — the last entry below is a method
-// nobody has ever heard of — and it would put handlers on a surface being removed. Gin includes
-// the global chain in its no-route and no-method handler lists, so one global guard that matches
-// the PATH answers for every verb that exists and every verb that does not.
+// The guard was attached per route, to the four deprecated methods that had handlers.
 func TestWebhookSunsetGuard_AnswersGoneOnEveryMethodAfterTheSunset(t *testing.T) {
 	now := time.Now()
 	// A window that closed yesterday: the retirement has passed.
@@ -196,20 +167,11 @@ func TestWebhookSunsetGuard_AnswersGoneOnEveryMethodAfterTheSunset(t *testing.T)
 	}
 }
 
-// TestWebhookSunsetGuard_PerRouteAttachmentCannotAnswerForUnregisteredMethods pins down WHY the
-// installation position is the fix, by demonstrating the shape that was wrong.
+// TestWebhookSunsetGuard_PerRouteAttachmentCannotAnswerForUnregisteredMethods pins down
+// WHY the installation position is the fix, by demonstrating the shape that was wrong.
 //
-// The guard's own logic was never the problem — the same handler is used here, unmodified, and
-// it answers 410 correctly for the four methods somebody registered. What it cannot do from this
-// position is answer for a method that has no route, because Gin never runs a route's handler
-// chain for a request that matched no route. So this test builds the OLD wiring and asserts the
-// leak: 404 or 405 for PATCH, OPTIONS and HEAD, about a surface that is permanently gone.
-//
-// Keeping it makes the suite above impossible to satisfy by accident. Every assertion in
-// TestWebhookSunsetGuard_AnswersGoneOnEveryMethodAfterTheSunset for an unregistered method fails
-// under this wiring and passes under the global one, so the two tests together demonstrate that
-// the global installation is what does the work rather than something incidental about the
-// handler.
+// The guard's own logic was never the problem — the same handler is used here,
+// unmodified, and it answers 410 correctly for the four methods somebody registered.
 func TestWebhookSunsetGuard_PerRouteAttachmentCannotAnswerForUnregisteredMethods(t *testing.T) {
 	now := time.Now()
 	storeSunsetWindow(t, now.AddDate(0, 0, -31), now.AddDate(0, 0, -1))
@@ -235,7 +197,7 @@ func TestWebhookSunsetGuard_PerRouteAttachmentCannotAnswerForUnregisteredMethods
 			"%s had a route, so even the per-route attachment refused it", method)
 	}
 
-	// The unregistered ones are the finding. Gin answers them itself, and its answer is a
+	// The unregistered ones are the interesting half. Gin answers them itself, and its answer is a
 	// statement about routing rather than about retirement.
 	for _, method := range []string{http.MethodPatch, http.MethodOptions, http.MethodHead} {
 		recorder := httptest.NewRecorder()
@@ -253,13 +215,8 @@ func TestWebhookSunsetGuard_PerRouteAttachmentCannotAnswerForUnregisteredMethods
 	}
 }
 
-// TestWebhookSunsetGuard_IsTransparentBeforeTheSunset asserts the other side of the boundary.
-//
-// A guard that answered 410 early would end the dual-delivery window ahead of the date
-// published to subscribers, which is a worse failure than the one being fixed: subscribers who
-// have not migrated lose their transport with the configured date still claiming otherwise. The
-// advisory headers are present throughout, so a client still succeeding is warned by the very
-// responses it is succeeding with.
+// TestWebhookSunsetGuard_IsTransparentBeforeTheSunset asserts the other side of the
+// boundary.
 func TestWebhookSunsetGuard_IsTransparentBeforeTheSunset(t *testing.T) {
 	now := time.Now()
 	sunset := now.AddDate(0, 0, 15)
@@ -302,19 +259,16 @@ func TestWebhookSunsetGuard_IsTransparentBeforeTheSunset(t *testing.T) {
 	})
 }
 
-// TestWebhookSunsetGuard_LeavesEveryOtherRouteAlone is the blast-radius assertion, and it is the
-// half a global middleware makes worth checking.
+// TestWebhookSunsetGuard_LeavesEveryOtherRouteAlone is the blast-radius assertion, and
+// it is the half a global middleware makes worth checking.
 //
-// Attaching the guard globally is what lets it answer for unregistered methods; the risk it
-// introduces is retiring something healthy. Two families must be untouched, and both would be
-// caught by a prefix match rather than an exact one:
+// Attaching the guard globally is what lets it answer for unregistered methods; the
+// risk it introduces is retiring something healthy. Two families must be untouched, and
+// both would be caught by a prefix match rather than an exact one:
 //
 //   - /hooks, a different and fully supported feature: synchronous PRE_TRANSACTION and
-//     POST_TRANSACTION callouts whose responses influence transaction processing. Only the
-//     asynchronous notification transport is being retired.
-//   - the rest of /subscribers, which is the REPLACEMENT for the retired surface. A guard that
-//     matched the prefix would retire the migration path along with the thing being migrated
-//     away from — including the credential endpoint a subscriber needs in order to leave.
+//     POST_TRANSACTION callouts whose responses influence transaction processing.
+//   - the rest of /subscribers, which is the REPLACEMENT for the retired surface.
 func TestWebhookSunsetGuard_LeavesEveryOtherRouteAlone(t *testing.T) {
 	now := time.Now()
 	storeSunsetWindow(t, now.AddDate(0, 0, -31), now.AddDate(0, 0, -1))
@@ -355,11 +309,8 @@ func TestWebhookSunsetGuard_LeavesEveryOtherRouteAlone(t *testing.T) {
 	}
 }
 
-// TestIsDeprecatedWebhookSubscriptionPath_MatchesOneExactShape is the matcher's boundary.
-//
-// The matcher IS the blast radius of a global guard, so its width is the property that matters:
-// too narrow and a retired path keeps answering, too wide and a live feature is retired by a
-// middleware nobody attached to it.
+// TestIsDeprecatedWebhookSubscriptionPath_MatchesOneExactShape is the matcher's
+// boundary.
 func TestIsDeprecatedWebhookSubscriptionPath_MatchesOneExactShape(t *testing.T) {
 	matches := []string{
 		"/subscribers/sub_1/webhook-subscription",
@@ -396,12 +347,8 @@ func TestIsDeprecatedWebhookSubscriptionPath_MatchesOneExactShape(t *testing.T) 
 	}
 }
 
-// TestWebhookSunsetGuard_UnconfiguredRetirementKeepsAnswering asserts the shipped default.
-//
-// No retirement instant configured is a legitimate steady state — it is how every deployment
-// runs before it opts into the migration — so the guard must be invisible, headers included.
-// The verdict comes from the root package's single decision point, which is what stops this
-// guard and the relay's dual-delivery branch forming different opinions about the window.
+// TestWebhookSunsetGuard_UnconfiguredRetirementKeepsAnswering asserts the shipped
+// default.
 func TestWebhookSunsetGuard_UnconfiguredRetirementKeepsAnswering(t *testing.T) {
 	previous := config.ConfigStore.Load()
 	t.Cleanup(func() {
@@ -427,45 +374,20 @@ func TestWebhookSunsetGuard_UnconfiguredRetirementKeepsAnswering(t *testing.T) {
 			"configured")
 }
 
-// TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication is the wiring half.
+// TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication is the wiring
+// half.
 //
-// # Why it is asserted against the source
+// The two properties that make the fix work are POSITIONAL, and position is invisible
+// from a response: a guard attached per route answers correctly for the four registered
+// methods and wrongly for every other one, and a guard installed after authentication
+// answers 401 instead of 410 to an unauthenticated caller.
 //
-// The two properties that make the fix work are POSITIONAL, and position is invisible from a
-// response: a guard attached per route answers correctly for the four registered methods and
-// wrongly for every other one, and a guard installed after authentication answers 401 instead
-// of 410 to an unauthenticated caller. Both look fine from any test that authenticates and uses
-// a registered verb. The behavioural matrix above proves what the guard does; this proves where
-// api.Router puts it, which is what decides whether the guard is ever consulted.
+// Being installed globally and before authentication is not enough.
 //
-// # It also pins the barrier's position relative to the middleware that can end a request
+// There are two guards and they are not interchangeable.
 //
-// Being installed globally and before authentication is not enough. The chain is assembled by TWO
-// functions — NewAPI, then Router on the engine NewAPI returned — so every Use in Router runs
-// after every Use in NewAPI. The barrier lived in Router while RateLimitMiddleware lived in
-// NewAPI, which meant a throttled request to a retired route was answered 429 and never reached
-// either guard. That position is invisible from any response that is not itself throttled, so it
-// is asserted here against the source.
-//
-// # Two layers, and which one may be global
-//
-// There are two guards and they are not interchangeable. WebhookSunsetPreAuthGuard matches the
-// path and the method itself BEFORE authentication runs, so it is the one that may be — and
-// must be — installed globally: only there can it answer a verb that routes nowhere and a caller
-// whose credential has also lapsed. WebhookSunsetGuard tests the path too, so a global
-// installation of it would be harmless rather than catastrophic; what it cannot do is answer
-// ahead of authentication or for a request that matches no route, because a per-route handler
-// runs only after gin has matched one. Installing IT globally therefore does not retire the API
-// — it merely does the pre-auth guard's job a second time, in the one position where that job
-// cannot be done. Both facts are asserted below.
-// # Why it reads the syntax tree rather than the text
-//
-// The first version of this test matched strings, and it passed against an api.go whose
-// installation had been COMMENTED OUT — the comment still contained the text being searched for.
-// A test that a disabled line satisfies is worse than no test, because it reports the property
-// as covered. Parsing gives the real thing: a commented-out call is not a call, so it is simply
-// absent from the tree, and the ordering assertion compares actual statement positions rather
-// than positions in a file that may not all be code.
+// A test that a disabled line satisfies is worse than no test, because it reports the
+// property as covered.
 func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *testing.T) {
 	fileSet := token.NewFileSet()
 	parsed, err := parser.ParseFile(fileSet, "../api.go", nil, parser.SkipObjectResolution)
@@ -484,9 +406,8 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 	type installation struct {
 		callee string
 		// enclosing is the function the installation sits in. It matters because the chain is
-		// assembled by TWO functions — NewAPI first, then Router on the engine NewAPI returned —
-		// so a file position only orders two installations that share a function. Across
-		// functions, "which function" IS the order.
+		// assembled by TWO functions — NewAPI first, then Router on the engine NewAPI
+		// returned — so a file position only orders two installations that share a function.
 		enclosing string
 		at        token.Pos
 	}
@@ -511,16 +432,14 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 	var preAuthInstallations []installation
 	var routeAttachments []installation
 	var authInstallations []installation
-	// The middlewares that can END a request before a later one is reached. The barrier must
-	// precede every one of them, or the refusal THEY issue becomes the answer a retired route
-	// gives. They end a request by different means, and both count:
+	// The middlewares that can END a request before a later one is reached. The barrier
+	// must precede every one of them, or the refusal THEY issue becomes the answer a
+	// retired route gives.
 	//
-	//   - RateLimitMiddleware aborts outright with 429. This is the one M-5 was raised about.
-	//   - RequestSizeLimit does not abort; it swaps the body for a MaxBytesReader, so the 413
-	//     arrives later when something reads it. Ordering the barrier ahead of it is not strictly
-	//     required today for that reason, and it is asserted anyway: the guard reads no body, so
-	//     nothing is lost, and if this middleware is ever changed to refuse up front the barrier
-	//     is already in front of it.
+	//   - RateLimitMiddleware aborts outright with 429. This is the one the ordering rule was raised
+	//     about.
+	//   - RequestSizeLimit does not abort; it swaps the body for a MaxBytesReader, so the
+	//     413 arrives later when something reads it.
 	abortingInstallations := map[string]*installation{
 		"middleware.RequestSizeLimit":    nil,
 		"middleware.RateLimitMiddleware": nil,
@@ -575,15 +494,8 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 			"are the migration path away from the retired surface. Got %q",
 		preAuthInstallations[0].callee)
 
-	// M-5: THE BARRIER MUST PRECEDE EVERY MIDDLEWARE THAT CAN ABORT, and it is installed in
+	// THE BARRIER MUST PRECEDE EVERY MIDDLEWARE THAT CAN ABORT, and it is installed in
 	// NewAPI precisely so that it does.
-	//
-	// It used to be installed in Router. Every Use in Router runs AFTER every Use in NewAPI, and
-	// NewAPI installs RequestSizeLimit and RateLimitMiddleware — both of which abort — so a
-	// throttled or oversized request to a retired route was answered 429 or 413 and never reached
-	// either sunset guard. A caller told to slow down and retry would retry a surface that is
-	// gone, forever. R-12 says every request answers 410, and "every request except the throttled
-	// ones" is not that.
 	require.Equal(t, "NewAPI", preAuthInstallations[0].enclosing,
 		"the barrier must be installed in NewAPI, which is the only function that runs before the "+
 			"aborting middleware it has to precede. Got %q", preAuthInstallations[0].enclosing)
@@ -601,10 +513,9 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 				"barrier lived in Router", name, name)
 	}
 
-	// BEFORE AUTHENTICATION, still. Across functions the enclosing function IS the order: NewAPI
-	// builds the engine and returns it, Router then installs the authenticator on that same
-	// engine, so anything NewAPI installed necessarily runs first. Comparing file positions here
-	// would assert the wrong thing — Router is declared above NewAPI in this file.
+	// BEFORE AUTHENTICATION, still. Across functions the enclosing function IS the order:
+	// NewAPI builds the engine and returns it, Router then installs the authenticator on
+	// that same engine, so anything NewAPI installed necessarily runs first.
 	require.Equal(t, "Router", authInstallations[0].enclosing,
 		"the authenticator is expected in Router; if it moves into NewAPI this test must compare "+
 			"positions instead of functions. Got %q", authInstallations[0].enclosing)
@@ -615,18 +526,10 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 			"that is never coming back. Nothing is disclosed by answering first: the path is "+
 			"published in the migration guide and the body is a fixed sentence")
 
-	// THE SECOND LAYER, and the assertion is that it is exactly the second layer. The per-route
-	// guard is the retirement's local statement at each registration and would still refuse if
-	// the global middleware were removed from the chain; both read the same predicate, so they
-	// cannot disagree about when the window closes.
-	//
-	// WHAT MUST NEVER HAPPEN is router.Use of THIS guard AS THE ONLY BARRIER. It runs after gin
-	// has matched a route, so globally installed it still cannot answer an unregistered verb or
-	// an unauthenticated caller — the two cases the retirement has to cover and the two that a
-	// response-level test cannot distinguish from success. It would not retire the API: the guard
-	// tests the path, and this package's own tests install it globally to prove it leaves /hooks
-	// and the rest of /subscribers alone. The assertion below is about POSITION, which is the
-	// property no behavioural test can see.
+	// THE SECOND LAYER, and the assertion is that it is exactly the second layer. The
+	// per-route guard is the retirement's local statement at each registration and would
+	// still refuse if the global middleware were removed from the chain; both read the
+	// same predicate, so they cannot disagree about when the window closes.
 	require.Len(t, routeAttachments, 4,
 		"the per-route guard belongs on exactly the four retired verbs. Found: %v", routeAttachments)
 
@@ -651,8 +554,8 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 }
 
 // sunsetTestConfig installs a configuration whose only relevant field is the retirement
-// instant, and restores nothing: config.MockConfig replaces the whole snapshot, which is what
-// every other test in this package relies on.
+// instant, and restores nothing: config.MockConfig replaces the whole snapshot, which
+// is what every other test in this package relies on.
 //
 // Parameters:
 //   - t *testing.T: the test, for require.
@@ -672,13 +575,11 @@ func sunsetTestConfig(t *testing.T, sunset string) {
 	require.NoError(t, err, "the sunset fixture configuration must load")
 }
 
-// sunsetPreAuthRouter builds a router in the SAME ORDER api/api.go does: the pre-auth guard
-// first, then a stand-in for Authenticate() that refuses everything, then the routes.
+// sunsetPreAuthRouter builds a router in the SAME ORDER api/api.go does: the pre-auth
+// guard first, then a stand-in for Authenticate() that refuses everything, then the
+// routes.
 //
-// The stand-in refusing everything is the point. It reproduces the state the finding was about
-// — a caller whose key is missing, malformed, revoked or wrongly scoped — so a route that
-// answers 410 here can only have been answered BEFORE authentication, and a route that answers
-// 401 proves the guard did not reach it.
+// The stand-in refusing everything is the point.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -730,13 +631,9 @@ func sunsetRequest(router *gin.Engine, method, path string) *httptest.ResponseRe
 	return recorder
 }
 
-// TestWebhookSunset_PreAuthGuardAnswersGoneWithoutACredential is the R-12 assertion: after the
-// retirement instant EVERY request to the deprecated surface is answered 410, including the
-// unauthenticated ones.
-//
-// Before this guard existed those requests were refused 401 by the global authentication
-// middleware, which gin runs ahead of any per-route middleware, so the retirement was invisible
-// to exactly the callers most likely to have stopped maintaining their integration.
+// TestWebhookSunset_PreAuthGuardAnswersGoneWithoutACredential is the assertion: after
+// the retirement instant EVERY request to the deprecated surface is answered 410,
+// including the unauthenticated ones.
 func TestWebhookSunset_PreAuthGuardAnswersGoneWithoutACredential(t *testing.T) {
 	sunsetTestConfig(t, time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339))
 
@@ -762,8 +659,8 @@ func TestWebhookSunset_PreAuthGuardAnswersGoneWithoutACredential(t *testing.T) {
 				"the RFC 8594 Sunset header must state the instant the surface was retired")
 			// The RFC 9745 Deprecation field, in the RFC 9651 sf-date form. Asserted as that
 			// exact rendering rather than merely non-empty, because two guards answering the
-			// same retirement with different spellings is the divergence this pairing exists
-			// to rule out.
+			// same retirement with different spellings is the divergence this pairing exists to
+			// rule out.
 			deprecated, _, configured := blnk.WebhookDeprecationWindow()
 			require.True(t, configured, "the fixture configures the window, so it must resolve")
 			assert.Equal(t, formatDeprecationDate(deprecated),
@@ -773,12 +670,9 @@ func TestWebhookSunset_PreAuthGuardAnswersGoneWithoutACredential(t *testing.T) {
 	}
 }
 
-// TestWebhookSunset_PreAuthGuardLeavesEveryOtherRouteToAuthentication is the containment
-// assertion, and it is the one that makes the guard safe to install globally.
-//
-// A pre-authentication guard is a hole in the authentication boundary by construction, so its
-// reach has to be proven rather than asserted in a comment. Every neighbour here must still be
-// refused by the authentication stand-in — 401, not 410 — even with the retirement long past.
+// TestWebhookSunset_PreAuthGuardLeavesEveryOtherRouteToAuthentication is the
+// containment assertion, and it is the one that makes the guard safe to install
+// globally.
 func TestWebhookSunset_PreAuthGuardLeavesEveryOtherRouteToAuthentication(t *testing.T) {
 	sunsetTestConfig(t, time.Now().Add(-48*time.Hour).UTC().Format(time.RFC3339))
 
@@ -810,12 +704,9 @@ func TestWebhookSunset_PreAuthGuardLeavesEveryOtherRouteToAuthentication(t *test
 	}
 }
 
-// TestWebhookSunset_PreAuthGuardIsTransparentInsideTheWindow asserts the other side of the
-// boundary: while the window is open the guard must change nothing at all, so the deprecated
-// routes are still authenticated exactly like every other route.
-//
-// Getting this wrong in the permissive direction would let an unauthenticated caller read or
-// rewrite a subscriber's recorded webhook URL for the whole 30-day window.
+// TestWebhookSunset_PreAuthGuardIsTransparentInsideTheWindow asserts the other side of
+// the boundary: while the window is open the guard must change nothing at all, so the
+// deprecated routes are still authenticated exactly like every other route.
 func TestWebhookSunset_PreAuthGuardIsTransparentInsideTheWindow(t *testing.T) {
 	sunsetTestConfig(t, time.Now().Add(21*24*time.Hour).UTC().Format(time.RFC3339))
 
@@ -848,13 +739,10 @@ func TestWebhookSunset_PreAuthGuardIsInertWithNoConfiguredInstant(t *testing.T) 
 		"there is no instant to advertise, so no header may claim one")
 }
 
-// TestWebhookSunset_PreAuthGuardMatchesExactlyTheDeprecatedRoutes proves the predicate against
-// route templates rather than against the guard's documentation.
+// TestWebhookSunset_PreAuthGuardMatchesExactlyTheDeprecatedRoutes proves the predicate
+// against route templates rather than against the guard's documentation.
 //
-// The false cases are the ones that matter. A prefix or substring test on the path would retire
-// the credential-issuance endpoint and any unregistered child of the deprecated route, and an
-// empty template — every unmatched request, which gin answers 404 or 405 — must never match,
-// because there is no deprecated handler behind it to shield.
+// The false cases are the ones that matter.
 func TestWebhookSunset_PreAuthGuardMatchesExactlyTheDeprecatedRoutes(t *testing.T) {
 	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete} {
 		assert.True(t, IsDeprecatedWebhookSubscriptionRequest(DeprecatedWebhookSubscriptionRoute, method),
@@ -884,30 +772,17 @@ func TestWebhookSunset_PreAuthGuardMatchesExactlyTheDeprecatedRoutes(t *testing.
 	}
 }
 
-// TestSunsetGuards_EachResolveTheWindowExactlyOnce is the guard-level half of M-4.
+// TestSunsetGuards_EachResolveTheWindowExactlyOnce is the guard-level half of the one-resolution rule.
 //
-// # Why this is asserted against the source
+// The property is "one resolution per request", and a response cannot show how many
+// times the configuration store was read to produce it. Both guards answered correctly
+// under every existing test in this package while each made TWO resolutions:
 //
-// The property is "one resolution per request", and a response cannot show how many times the
-// configuration store was read to produce it. Both guards answered correctly under every existing
-// test in this package while each made TWO resolutions:
-//
-//   - WebhookSunsetPreAuthGuard called WebhookDeprecationWindow for its headers and then
-//     WebhookSunsetPassed(time.Now()) for its verdict.
+//   - WebhookSunsetPreAuthGuard called WebhookDeprecationWindow for its headers and
+//     then WebhookSunsetPassed(time.Now()) for its verdict.
 //   - WebhookSunsetGuard took a snapshot for its verdict but still called
-//     WebhookDeprecationWindow for the Deprecation header and for the decision of whether to
-//     render headers at all.
-//
-// Each of those calls re-reads a store whose contents are replaced wholesale on reload, so a
-// reload landing between them produced a response advertising one window while refusing under
-// another — and, because the window's two ends are two independently configured fields, a
-// Deprecation instant that can fall AFTER the Sunset instant beside it, which RFC 9745 §4 forbids.
-// The race is narrow, cannot be reproduced on demand, and would never be caught by watching for
-// it, which is exactly why the structural property is pinned instead.
-//
-// The two forbidden helpers are not deprecated in general — WebhookDeprecationWindow is the right
-// call for a startup log line, which resolves once and is not composing a response. They are
-// forbidden HERE, where something else has already been resolved in the same request.
+//     WebhookDeprecationWindow for the Deprecation header and for the decision of
+//     whether to render headers at all.
 func TestSunsetGuards_EachResolveTheWindowExactlyOnce(t *testing.T) {
 	fileSet := token.NewFileSet()
 	parsed, err := parser.ParseFile(fileSet, "sunset.go", nil, parser.SkipObjectResolution)

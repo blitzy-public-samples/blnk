@@ -40,33 +40,14 @@ import (
 // Every assertion in this file compares against an EXACT expected string, never merely
 // against "something non-empty". Topic naming has no runtime failure mode: a wrong name
 // is a perfectly valid Kafka topic that simply nobody reads, so a test that only checks
-// for a non-empty result would pass while every event went nowhere. Exact expectations
-// are also what makes the file resistant to mutation testing, which plants one-line
-// changes — a flipped separator, a dropped suffix, a swapped category — that a
-// non-empty check cannot detect.
-//
-// The event catalogue below is written out LONGHAND on purpose. Deriving the
-// expectations from the table under test, or from model.EventCategory, would make the
-// test agree with any table, including one that had quietly lost an entry. Spelling all
-// thirteen event strings and all four topic names by hand is what makes this file a
-// second, independent statement of the routing contract.
+// for a non-empty result would pass while every event went nowhere.
 
 // eventCatalogueSize is the number of event strings Blnk emits: thirteen.
 //
-// It is spelled as a number, separately from the catalogue itself, so that the catalogue
-// cannot silently shrink. `assert.Len(eventCatalogue, len(eventCatalogue))` would be a
-// tautology; comparing against an independently written constant is not.
+// It is spelled as a number, separately from the catalogue itself, so that the
+// catalogue cannot silently shrink.
 //
-// Thirteen is a CONTRACTUAL figure, not an incidental one. The coverage requirement is
-// that every event type which reached the legacy webhook sender reaches Kafka, with zero
-// exceptions, and thirteen is what an exhaustive sweep of the producer call sites found:
-// seven transaction lifecycle events from getEventFromStatus, the runtime-composed bulk
-// transaction family, two balance events, one identity event, one ledger event, and the
-// system error raised through the registered webhook-sender indirection.
-//
-// Changing this number is therefore a deliberate act. A fourteenth event type is welcome,
-// but it must arrive with a catalogue row, a topic assertion and — if it needs one — a new
-// category, which is exactly what failing here forces whoever adds it to do.
+// Thirteen is a CONTRACTUAL figure, not an incidental one.
 const eventCatalogueSize = 13
 
 // eventCatalogueEntry is one row of the event catalogue: an event string Blnk emits,
@@ -78,17 +59,6 @@ type eventCatalogueEntry struct {
 	eventType string
 
 	// vocabularyKey is how this event appears in model.EventCategory's SOURCE.
-	//
-	// For twelve of the thirteen entries it is identical to eventType, because the
-	// mapping matches those by exact equality and each one is a literal in a case
-	// clause. For the bulk transaction family it is the bare "bulk_transaction." prefix,
-	// because those names are composed at runtime from the batch status: there is no
-	// exhaustive literal to name, and the implementation matches them by prefix.
-	//
-	// The field exists so the count assertion can compare this hand-written catalogue
-	// against the vocabulary actually present in the implementation. Without it, the
-	// comparison would have to guess which rows are exact matches and which are
-	// families.
 	vocabularyKey string
 
 	// topic is the fully-qualified category topic, with the default prefix applied.
@@ -98,30 +68,19 @@ type eventCatalogueEntry struct {
 	// derived, so that a change to either the topic or the suffix fails here.
 	deadLetterTopic string
 
-	// category is the bare token model.EventCategory must resolve eventType to. It
-	// catches a category rename, which would otherwise only show up as a changed topic
-	// name and could be mistaken for an intended renaming of the namespace.
+	// category is the bare token model.EventCategory must resolve eventType to. It catches
+	// a category rename, which would otherwise only show up as a changed topic name and
+	// could be mistaken for an intended renaming of the namespace.
 	category string
 }
 
 // eventCatalogue is the complete, independently written statement of the routing
-// contract: all thirteen event strings Blnk emits, the four category topics they route to and their
-// four dead-letter siblings.
-//
-// EVERY VALUE HERE IS A LITERAL, and that is the single most important property of this
-// file. Nothing is computed from model.EventCategory, from TopicForEvent, or from the
-// prefix and separator constants. A table built by asking the implementation what it
-// thinks would agree with the implementation no matter what the implementation said —
-// including after an entry had been deleted, a category renamed or the separator changed.
-// Writing the expectations out by hand is what makes this a second opinion rather than an
-// echo, and it is what makes the file resistant to mutation testing.
-//
-// The order is the order the events are documented in: the transaction family, then
-// balances, then identities, then the two events that motivate the one extra category.
+// contract: all thirteen event strings Blnk emits, the four category topics they route
+// to and their four dead-letter siblings.
 var eventCatalogue = []eventCatalogueEntry{
-	// The seven transaction lifecycle events. All seven originate in
-	// getEventFromStatus, the transaction event-string vocabulary, which now lives in
-	// event_topics.go — relocated out of the legacy transport ahead of its retirement.
+	// The seven transaction lifecycle events. All seven originate in getEventFromStatus,
+	// the transaction event-string vocabulary, which now lives in event_topics.go —
+	// relocated out of the legacy transport ahead of its retirement.
 	{
 		eventType:       "transaction.queued",
 		vocabularyKey:   "transaction.queued",
@@ -164,10 +123,10 @@ var eventCatalogue = []eventCatalogueEntry{
 		deadLetterTopic: "blnk.transactions.dlt",
 		category:        "transactions",
 	},
-	// transaction.unknown is reachable, not hypothetical: the COMMIT status has no case
-	// in getEventFromStatus and falls through to it. That behaviour is preserved
-	// deliberately so the dual-delivery payload comparison stays exact, so the event
-	// name must route like any other.
+	// transaction.unknown is reachable, not hypothetical: the COMMIT status has no case in
+	// getEventFromStatus and falls through to it. That behaviour is preserved deliberately
+	// so the dual-delivery payload comparison stays exact, so the event name must route
+	// like any other.
 	{
 		eventType:       "transaction.unknown",
 		vocabularyKey:   "transaction.unknown",
@@ -175,9 +134,9 @@ var eventCatalogue = []eventCatalogueEntry{
 		deadLetterTopic: "blnk.transactions.dlt",
 		category:        "transactions",
 	},
-	// The eighth transaction event is a FAMILY, composed at runtime as
-	// "bulk_transaction." + batch status. One concrete member stands for it here; the
-	// open suffix set is covered exhaustively by the prefix test.
+	// The eighth transaction event is a FAMILY, composed at runtime as "bulk_transaction."
+	// + batch status. One concrete member stands for it here; the open suffix set is
+	// covered exhaustively by the prefix test.
 	{
 		eventType:       "bulk_transaction.applied",
 		vocabularyKey:   "bulk_transaction.",
@@ -214,14 +173,13 @@ var eventCatalogue = []eventCatalogueEntry{
 	// away" and a subscriber filtering that topic is now receiving events it never
 	// subscribed to.
 	//
-	// BOTH ARE ON blnk.system, which is the published four-category catalogue. system.error
-	// carries Blnk's own error text verbatim in a payload R-8 freezes, so the topic is held by
-	// a subscriber only where the deployment has declared
+	// BOTH ARE ON blnk.system, which is the published four-category catalogue.
+	// system.error carries Blnk's own error text verbatim in a frozen payload, so the
+	// topic is held by a subscriber only where the deployment has declared
 	// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS — and because ledger.created shares it, that
-	// declaration plus an explicit grant is also how ledger.created stays reachable after the
-	// webhook transport retires. A revision that moved it to a fifth grantable blnk.ledgers
-	// category was withdrawn: the catalogue is a contract subscribers build against.
-	// docs/event-streaming.md states the resulting contract and its cost.
+	// declaration plus an explicit grant is also how ledger.created stays reachable after
+	// the webhook transport retires. docs/event-streaming.md states that contract and its
+	// cost.
 	{
 		eventType:       "ledger.created",
 		vocabularyKey:   "ledger.created",
@@ -240,14 +198,9 @@ var eventCatalogue = []eventCatalogueEntry{
 
 // catalogueEventTypes returns just the event strings from the catalogue.
 //
-// It exists so that a test asserting membership does not have to rebuild the projection
-// inline, and it deliberately returns the eventType column rather than vocabularyKey: the
-// question being asked is "is this a name a producer emits", not "is this how the mapping
-// spells it".
-//
 // Returns:
-//   - []string: a fresh slice the caller may append to or mutate; the catalogue itself is
-//     never handed out, so no test can reorder or truncate it for another.
+//   - []string: a fresh slice the caller may append to or mutate; the catalogue itself
+//     is never handed out, so no test can reorder or truncate it for another.
 func catalogueEventTypes() []string {
 	eventTypes := make([]string, 0, len(eventCatalogue))
 	for _, entry := range eventCatalogue {
@@ -267,10 +220,6 @@ func catalogueEventTypes() []string {
 // configuration without a data-source and Redis DSN (the test's value would be silently
 // dropped) and which would also apply the topic-prefix default itself — defeating the
 // point of a test that has to observe an unset prefix.
-//
-// That is not a workaround, it is the condition under test. Storing directly reproduces
-// exactly the situation the production code has to survive: a configuration that never
-// passed through the defaulting path, and therefore carries an empty prefix.
 func storeKafkaTopicPrefix(t *testing.T, prefix string) {
 	t.Helper()
 
@@ -281,9 +230,9 @@ func storeKafkaTopicPrefix(t *testing.T, prefix string) {
 
 			return
 		}
-		// Nothing was published before this test. Leaving the test's prefix in place
-		// could influence later tests, so publish an empty configuration — strictly
-		// closer to the original state than a configured prefix.
+		// Nothing was published before this test. Leaving the test's prefix in place could
+		// influence later tests, so publish an empty configuration — strictly closer to the
+		// original state than a configured prefix.
 		config.ConfigStore.Store(&config.Configuration{})
 	})
 
@@ -292,13 +241,9 @@ func storeKafkaTopicPrefix(t *testing.T, prefix string) {
 	})
 }
 
-// storeSubscriberInternalTopicAccess publishes a configuration in which this deployment has —
-// or has not — acknowledged that a subscriber may hold the internal category topic.
-//
-// It is the only way to reach the privileged half of the grant allowlist from a test, because
-// the acknowledgement is deployment configuration rather than a request field: that is the
-// point of it. The prefix is published alongside so the composed names are the default ones the
-// literals in these tests are written with.
+// storeSubscriberInternalTopicAccess publishes a configuration in which this deployment
+// has — or has not — acknowledged that a subscriber may hold the internal category
+// topic.
 func storeSubscriberInternalTopicAccess(t *testing.T, acknowledged bool) {
 	t.Helper()
 
@@ -319,11 +264,6 @@ func storeSubscriberInternalTopicAccess(t *testing.T, acknowledged bool) {
 
 // withUnloadedConfiguration makes the configuration read fail for the duration of one
 // test, exercising the "configuration has not been loaded" branch of prefix resolution.
-//
-// The branch is otherwise unreachable in a test binary: config.ConfigStore is an
-// atomic.Value, and once any earlier test has published a configuration it can never be
-// emptied again. Swapping the package's configuration seam is the only way to reach it,
-// and the seam exists for precisely that reason.
 func withUnloadedConfiguration(t *testing.T) {
 	t.Helper()
 
@@ -407,30 +347,11 @@ func constStringValue(parsed *ast.File, name string) (string, bool) {
 // returns it as a set of vocabulary keys, directly comparable with eventCatalogue's
 // vocabularyKey column.
 //
-// # Why the source is read rather than the function called
-//
-// This is what makes the thirteen-event count assertion mean something. model.EventCategory
-// answers for ANY input — its catch-all routes an unmapped event to the system category
-// without complaint — so no amount of calling it can reveal that an event string was
-// deleted from its table, nor that a fourteenth was added. Both are invisible
-// behaviourally and both are plainly visible in the source.
-//
-// The alternative, exporting the table from model so a test could count it, would put the
-// count under the control of the code being counted: an entry removed from the table would
-// be removed from the count too and the test would agree with the loss. Reading the source
-// keeps the test's thirteen literals as the only authority.
-//
-// # What counts as one entry in the vocabulary
-//
 // Two forms, matching the two ways the implementation matches:
 //
-//   - Every string literal in a case clause of EventCategory's switch. These are the
-//     exact-match names, twelve of the thirteen.
-//   - The prefix constant used by the single strings.HasPrefix guard, which stands for the
-//     whole runtime-composed bulk transaction family. The constant is resolved through the
-//     identifier the guard actually names, so renaming it breaks nothing here; removing the
-//     guard, or adding a second one, does — a second prefix family is a routing rule this
-//     test has never been told about.
+//   - Every string literal in a case clause of EventCategory's switch.
+//   - The prefix constant used by the single strings.HasPrefix guard, which stands for
+//     the whole runtime-composed bulk transaction family.
 func discoverEventVocabulary(t *testing.T) []string {
 	t.Helper()
 
@@ -485,10 +406,7 @@ func discoverEventVocabulary(t *testing.T) []string {
 // discovered from the parsed source.
 //
 // It exists so that the event vocabulary is read from the ONE table the implementation
-// consults instead of being re-spelled in a test. A key added to that table without a
-// routing expectation, or an expectation left behind after a key was removed, is then a
-// failure here rather than a silent divergence — the catch-all absorbs an orphaned event
-// type without complaining, so nothing observable would otherwise show it.
+// consults instead of being re-spelled in a test.
 //
 // Parameters:
 //   - file *ast.File: the parsed source file.
@@ -550,14 +468,8 @@ func mapLiteralKeys(t *testing.T, file *ast.File, name string) []string {
 	return keys
 }
 
-// TestTopicForEvent_RoutesEveryEmittedEventString pins the routing of all thirteen event
-// strings Blnk emits to their exact topic names.
-//
-// This is the coverage requirement made executable: every event type that used to reach
-// the legacy webhook sender must reach Kafka, with zero exceptions. The thirteen strings
-// and the four topics are spelled out here independently of the implementation, so a
-// table that lost an entry, or a category that was renamed, fails this test rather than
-// silently agreeing with itself.
+// TestTopicForEvent_RoutesEveryEmittedEventString pins the routing of all thirteen
+// event strings Blnk emits to their exact topic names.
 func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -572,15 +484,15 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 			assert.Equal(t, entry.deadLetterTopic, DeadLetterTopicForEvent(entry.eventType),
 				"%q must dead-letter to %q", entry.eventType, entry.deadLetterTopic)
 
-			// The category is asserted separately from the topic so that a renamed
-			// category is distinguishable from a renamed namespace. Both change the
-			// topic name; only one of them is ever intended.
+			// The category is asserted separately from the topic so that a renamed category is
+			// distinguishable from a renamed namespace. Both change the topic name; only one of
+			// them is ever intended.
 			assert.Equal(t, entry.category, model.EventCategory(entry.eventType),
 				"%q must resolve to the %q category", entry.eventType, entry.category)
 
-			// A category topic must never itself look like a dead-letter topic: that
-			// would mean events were being published directly onto a dead-letter topic,
-			// which no subscriber reads and every alert treats as a failure.
+			// A category topic must never itself look like a dead-letter topic: that would mean
+			// events were being published directly onto a dead-letter topic, which no subscriber
+			// reads and every alert treats as a failure.
 			assert.False(t, IsDeadLetterTopic(entry.topic),
 				"%q is a category topic and must not carry the dead-letter suffix", entry.topic)
 			assert.True(t, IsDeadLetterTopic(entry.deadLetterTopic),
@@ -588,9 +500,9 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 		})
 	}
 
-	// Coverage of the category topics is asserted from the catalogue's own rows, so an event
-	// silently rerouted away from a topic — leaving that topic with no producers at all —
-	// fails here as well as in its own subtest.
+	// Coverage of the category topics is asserted from the catalogue's own rows, so an
+	// event silently rerouted away from a topic — leaving that topic with no producers at
+	// all — fails here as well as in its own subtest.
 	routed := make(map[string][]string, len(eventCatalogue))
 	for _, entry := range eventCatalogue {
 		routed[entry.topic] = append(routed[entry.topic], entry.eventType)
@@ -607,22 +519,17 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 			"mapping table does not recognise is routed")
 }
 
-// TestTopicForEvent_CoversEveryEventTypeTheMappingKnows is the count assertion, and it is
-// the assertion that makes the coverage requirement enforceable rather than merely stated.
+// TestTopicForEvent_CoversEveryEventTypeTheMappingKnows is the count assertion, and it
+// is the assertion that makes the coverage requirement enforceable rather than merely
+// stated.
 //
-// It compares the thirteen event strings written out by hand in eventCatalogue against the
-// vocabulary actually present in model.EventCategory's source, in BOTH directions:
+// It compares the thirteen event strings written out by hand in eventCatalogue against
+// the vocabulary actually present in model.EventCategory's source, in BOTH directions:
 //
 //   - An event string in the implementation but not in the catalogue means a fourteenth
-//     event type was added without a routing expectation. That is the case the requirement
-//     is worried about: the new event would route somewhere, nobody would have said where,
-//     and no test would have disagreed.
-//   - An event string in the catalogue but not in the implementation means a mapping was
-//     deleted. Behaviourally that is invisible — the catch-all quietly absorbs the orphaned
-//     event onto the system topic — so nothing but a source-level comparison catches it.
-//
-// Neither direction is detectable by calling the mapping, because the mapping answers for
-// every input. See discoverEventVocabulary for why the vocabulary is read from source.
+//     event type was added without a routing expectation.
+//   - An event string in the catalogue but not in the implementation means a mapping
+//     was deleted.
 func TestTopicForEvent_CoversEveryEventTypeTheMappingKnows(t *testing.T) {
 	expected := make([]string, 0, len(eventCatalogue))
 	for _, entry := range eventCatalogue {
@@ -653,19 +560,9 @@ func TestTopicForEvent_CoversEveryEventTypeTheMappingKnows(t *testing.T) {
 	assert.Len(t, seen, eventCatalogueSize)
 }
 
-// TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic joins the two
-// halves of transaction event routing: the status-to-event-name mapping that produces the
-// names, and the name-to-topic mapping that routes them.
-//
-// Testing them separately is not enough. getEventFromStatus is the ONLY producer of the
-// seven transaction event strings, and it is declared in webhooks.go — a file scheduled for
-// deletion. If it ever emitted a name the routing table does not know, the event would land
-// on the system catch-all: transaction events arriving on a topic no transaction subscriber
-// reads, with no error, no log line and no alert. Driving the real status constants through
-// the real function and asserting the real topic is the only way to close that gap.
-//
-// The statuses are taken from the constants rather than re-spelled, so a change to a status
-// value is carried into this test automatically instead of being hidden by a stale literal.
+// TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic joins the
+// two halves of transaction event routing: the status-to-event-name mapping that
+// produces the names, and the name-to-topic mapping that routes them.
 func TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -679,22 +576,20 @@ func TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic(t
 		{status: StatusInflight, eventType: "transaction.inflight"},
 		{status: StatusVoid, eventType: "transaction.void"},
 		{status: StatusRejected, eventType: "transaction.rejected"},
-		// COMMIT has no case in getEventFromStatus and falls through to the default.
-		// That is a PRE-EXISTING behaviour, preserved on purpose: correcting it here
-		// would make the dual-delivery payload comparison differ for a reason that has
-		// nothing to do with the transport. It is documented for correction as a
-		// separate, intentional change. Until then transaction.unknown is a real event
-		// name reached by a real status, so it must route like any other.
+		// COMMIT has no case in getEventFromStatus and falls through to the default. That is
+		// a PRE-EXISTING behaviour, preserved on purpose: correcting it here would make the
+		// dual-delivery payload comparison differ for a reason that has nothing to do with
+		// the transport.
 		{status: StatusCommit, eventType: "transaction.unknown"},
 	} {
 		t.Run(testCase.status, func(t *testing.T) {
 			assert.Equal(t, testCase.eventType, getEventFromStatus(testCase.status),
 				"the %q status must produce the %q event", testCase.status, testCase.eventType)
 
-			// The event name produced from the status must be one the catalogue knows.
-			// This is the join: a name that routes correctly but is not in the catalogue
-			// is a name nobody asserted, and a name in neither is an event that silently
-			// reaches the catch-all.
+			// The event name produced from the status must be one the catalogue knows. This is
+			// the join: a name that routes correctly but is not in the catalogue is a name
+			// nobody asserted, and a name in neither is an event that silently reaches the
+			// catch-all.
 			assert.Contains(t, catalogueEventTypes(), testCase.eventType,
 				"the event name produced from the %q status must appear in the catalogue", testCase.status)
 
@@ -721,19 +616,16 @@ func TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic(t
 // TestTopicForEvent_DelegatesTheMappingToModel enforces the single-source-of-truth
 // split: model.EventCategory owns the event-type mapping and this file owns the naming.
 //
-// The composition is asserted from the outside — prefix, separator, category — for every
-// emitted event string. If a second mapping table were ever introduced into
-// event_topics.go, it would only have to disagree with model.EventCategory on one event
-// for this test to fail, which is the earliest possible detection of a divergence that
-// otherwise shows up as missing events on a subscriber's topic.
+// The composition is asserted from the outside — prefix, separator, category — for
+// every emitted event string.
 func TestTopicForEvent_DelegatesTheMappingToModel(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
-	// The catalogue supplies the inputs deliberately, and it is safe for it to do so:
-	// the EXPECTATION here is computed from model.EventCategory, not from the catalogue,
-	// so this test asserts the composition rule rather than the mapping values. Driving
-	// it from the catalogue also means a fourteenth event type inherits this check for
-	// free once its row is added.
+	// The catalogue supplies the inputs deliberately, and it is safe for it to do so: the
+	// EXPECTATION here is computed from model.EventCategory, not from the catalogue, so
+	// this test asserts the composition rule rather than the mapping values. Driving it
+	// from the catalogue also means a fourteenth event type inherits this check for free
+	// once its row is added.
 	for _, eventType := range append(catalogueEventTypes(), "bulk_transaction.failed") {
 		expected := "blnk" + "." + model.EventCategory(eventType)
 		assert.Equal(t, expected, TopicForEvent(eventType),
@@ -745,11 +637,7 @@ func TestTopicForEvent_DelegatesTheMappingToModel(t *testing.T) {
 // matched by PREFIX and not by exact equality.
 //
 // Their names are composed at runtime as "bulk_transaction." + batch status, so the
-// suffix set is open-ended. An exact-match-only table would route every one of them to
-// the catch-all system topic — no error, no log line, just transaction events arriving
-// on the wrong topic. Statuses that exist today and statuses that do not are both
-// asserted, because the whole point of prefix matching is that tomorrow's status needs
-// no code change.
+// suffix set is open-ended.
 func TestTopicForEvent_BulkTransactionMatchesByPrefix(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -785,23 +673,18 @@ func TestTopicForEvent_BulkTransactionMatchesByPrefix(t *testing.T) {
 		"and it must be reported as uncatalogued, which is what makes the mis-spelling visible instead of looking like a routed event")
 }
 
-// TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic pins the chosen behaviour for
-// an event type that is not in the catalogue, and pins WHICH topic it is.
+// TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic pins the chosen behaviour
+// for an event type that is not in the catalogue, and pins WHICH topic it is.
 //
 // Two requirements meet here, and both must hold of the one destination:
 //
 //   - The routing must be TOTAL. The relay publishes to whatever topic it is handed, so
 //     returning an empty string would strand a committed event — no topic, no publish,
 //     no dead-letter entry, nothing to replay — and dropping it would lose it outright.
-//   - The destination must be the least surprising one. An event type nobody mapped must
-//     not appear in the middle of a domain stream a subscriber filters on and reasons
-//     about; it belongs with Blnk's own material, on the topic an operator grants
-//     deliberately.
-//
-// blnk.system satisfies both, and the fallback stays OBSERVABLE rather than becoming a
-// hiding place: model.IsCataloguedEventType reports the same input as uncatalogued and the
-// publisher logs at warning level when it routes one, so the fix is always to extend the
-// catalogue.
+//   - The destination must be the least surprising one. An event type nobody mapped
+//     must not appear in the middle of a domain stream a subscriber filters on and
+//     reasons about; it belongs with Blnk's own material, on the topic an operator
+//     grants deliberately.
 func TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -817,12 +700,8 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic(t *testing.T) {
 		"Balance.Created",
 		// A longer string that merely starts with an emitted name is not that event.
 		"transaction.applied.v2",
-		// Unusual characters. None of these is a realistic event name, and that is the
-		// point: routing has to be TOTAL. Anything a caller can hand this function must
-		// come back as a usable topic, because the relay publishes to whatever name it is
-		// given and has no branch for "no topic". A panic, an empty string or a
-		// half-composed name here would each strand the event, so the awkward inputs are
-		// asserted rather than assumed.
+		// Unusual characters. None of these is a realistic event name, and that is the point:
+		// routing has to be TOTAL.
 		"événement.créé",             // non-ASCII letters
 		"事件.已创建",                     // multi-byte, no ASCII at all
 		"transaction.applied.💥",      // an emoji outside the Basic Multilingual Plane
@@ -845,21 +724,19 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic(t *testing.T) {
 		assert.True(t, IsBlnkOwnedTopic(TopicForEvent(eventType)),
 			"the catch-all topic must be one Blnk owns and provisions, or an unrecognised event has nowhere to land")
 
-		// The event's own name must never leak into the topic name. Composing the event
-		// into the topic would create a topic per event type on demand — unprovisioned,
+		// The event's own name must never leak into the topic name. Composing the event into
+		// the topic would create a topic per event type on demand — unprovisioned,
 		// single-partition, wrongly replicated, and read by nobody.
 		assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent(eventType),
 			"and its dead-letter sibling must be the system topic's, not one derived from %q", eventType)
 	}
 }
 
-// TestDLTFor_DerivesEveryDeadLetterTopic asserts the exact dead-letter names for
-// every category topic.
+// TestDLTFor_DerivesEveryDeadLetterTopic asserts the exact dead-letter names for every
+// category topic.
 //
 // Three of these four strings are the literal names the requirements specify, so they
-// must match byte for byte. They are also the names the local provisioning path creates,
-// the names the alert rules label and the names the operator runbooks tell a human to
-// look at, which is why they are written out here rather than derived.
+// must match byte for byte.
 func TestDLTFor_DerivesEveryDeadLetterTopic(t *testing.T) {
 	assert.Equal(t, "blnk.transactions.dlt", DLTFor("blnk.transactions"))
 	assert.Equal(t, "blnk.balances.dlt", DLTFor("blnk.balances"))
@@ -871,14 +748,8 @@ func TestDLTFor_DerivesEveryDeadLetterTopic(t *testing.T) {
 	assert.Equal(t, ".dlt", DeadLetterTopicSuffix)
 }
 
-// TestDLTFor_IsIdempotent proves a second application is absorbed rather than compounded.
-//
-// Double application is a real hazard, not a theoretical one: the dead-letter writer
-// resolves a name, persists it on the outbox row, and the replay path reads it back, so
-// there are several places a second call could creep in. The result would be
-// blnk.transactions.dlt.dlt — a topic that Kafka will happily create, that no consumer
-// subscribes to and that no alert covers. Absorbing the second application makes the
-// whole class of bug impossible.
+// TestDLTFor_IsIdempotent proves a second application is absorbed rather than
+// compounded.
 func TestDLTFor_IsIdempotent(t *testing.T) {
 	for _, topic := range []string{
 		"blnk.transactions",
@@ -899,9 +770,7 @@ func TestDLTFor_IsIdempotent(t *testing.T) {
 // TestDLTFor_BlankTopicYieldsTheEmptyString pins the empty-input behaviour.
 //
 // There is nothing to derive a sibling from, and returning a bare ".dlt" would name a
-// real topic consisting only of a suffix. The empty result makes the caller's own publish
-// fail visibly instead, since Kafka rejects an empty topic — the correct outcome for what
-// is a programming error at the call site.
+// real topic consisting only of a suffix.
 func TestDLTFor_BlankTopicYieldsTheEmptyString(t *testing.T) {
 	for _, blank := range []string{"", " ", "\t", "\n", "  \t\n "} {
 		assert.Equal(t, "", DLTFor(blank),
@@ -909,11 +778,8 @@ func TestDLTFor_BlankTopicYieldsTheEmptyString(t *testing.T) {
 	}
 }
 
-// TestDLTFor_IgnoresSurroundingWhitespace documents the tolerance and, more importantly,
-// pins that the whitespace is not carried into the derived name.
-//
-// A topic name with a leading or trailing space is a name Kafka rejects, so silently
-// preserving it would turn a recoverable configuration slip into an unpublishable event.
+// TestDLTFor_IgnoresSurroundingWhitespace documents the tolerance and, more
+// importantly, pins that the whitespace is not carried into the derived name.
 func TestDLTFor_IgnoresSurroundingWhitespace(t *testing.T) {
 	assert.Equal(t, "blnk.transactions.dlt", DLTFor("  blnk.transactions  "))
 	assert.Equal(t, "blnk.system.dlt", DLTFor("\tblnk.system\n"))
@@ -921,13 +787,11 @@ func TestDLTFor_IgnoresSurroundingWhitespace(t *testing.T) {
 		"whitespace around an already-derived name must be trimmed without a second suffix")
 }
 
-// TestDeadLetterTopicForEvent_RoutesEveryEmittedEventString pins the dead-letter name for
-// each of the thirteen event strings.
+// TestDeadLetterTopicForEvent_RoutesEveryEmittedEventString pins the dead-letter name
+// for each of the thirteen event strings.
 //
 // A dead-lettered event has to be replayable to the topic it failed to reach, so the
-// dead-letter topic must always be the sibling of the event's own category topic. Getting
-// this wrong would scatter failures across the wrong dead-letter topics and make the
-// triage runbook point at the wrong place.
+// dead-letter topic must always be the sibling of the event's own category topic.
 func TestDeadLetterTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -954,8 +818,7 @@ func TestDeadLetterTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 // TestDeadLetterTopicForEvent_IsDLTForOfTopicForEvent pins the composition order.
 //
 // DLTFor(TopicForEvent(x)) is the only correct order, and the helper exists so callers
-// cannot get it wrong. Asserting the equality here is what keeps the helper honest if
-// either half changes.
+// cannot get it wrong.
 func TestDeadLetterTopicForEvent_IsDLTForOfTopicForEvent(t *testing.T) {
 	storeKafkaTopicPrefix(t, "acme")
 
@@ -974,10 +837,6 @@ func TestDeadLetterTopicForEvent_IsDLTForOfTopicForEvent(t *testing.T) {
 }
 
 // TestIsDeadLetterTopic_DistinguishesTheTwoKindsOfTopic covers the suffix predicate.
-//
-// Callers use it to avoid republishing a dead-letter entry onto a dead-letter topic and
-// to label metrics and operator output, so it has to answer for any configured namespace
-// — hence the non-default prefix cases — and it must not answer true for a blank name.
 func TestIsDeadLetterTopic_DistinguishesTheTwoKindsOfTopic(t *testing.T) {
 	assert.True(t, IsDeadLetterTopic("blnk.transactions.dlt"))
 	assert.True(t, IsDeadLetterTopic("blnk.balances.dlt"))
@@ -999,11 +858,6 @@ func TestIsDeadLetterTopic_DistinguishesTheTwoKindsOfTopic(t *testing.T) {
 }
 
 // TestTopicPrefix_DefaultsToBlnkWhenUnset pins the documented default.
-//
-// The default matters more than it looks: a configuration published without passing
-// through the defaulting path carries an empty prefix, and composing from an empty prefix
-// would produce ".transactions" — a valid Kafka topic that no provisioning script creates
-// and no subscriber reads.
 func TestTopicPrefix_DefaultsToBlnkWhenUnset(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1022,10 +876,6 @@ func TestTopicPrefix_DefaultsToBlnkWhenUnset(t *testing.T) {
 // TestTopicPrefix_HonoursAConfiguredOverride proves the whole namespace is
 // configuration-driven, which is the reason no topic name may be spelled as a literal
 // anywhere else in the codebase.
-//
-// Asserting the accessor alone would be far too weak: it would pass even if a name
-// somewhere were hardcoded to "blnk.". Every derived name is therefore checked against
-// the override.
 func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 	storeKafkaTopicPrefix(t, "acme.events")
 
@@ -1074,13 +924,11 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 	}
 }
 
-// TestTopicPrefix_ThenUnsetReturnsToTheDefault proves the prefix is re-read on every call
-// rather than cached.
+// TestTopicPrefix_ThenUnsetReturnsToTheDefault proves the prefix is re-read on every
+// call rather than cached.
 //
-// A cached prefix would keep answering from configuration that no longer exists, because
-// the configuration store is re-published whenever configuration is (re)loaded. The
-// override-then-unset sequence is the smallest observation that distinguishes a live read
-// from a cached one.
+// A cached prefix would keep answering from configuration that no longer exists,
+// because the configuration store is re-published whenever configuration is (re)loaded.
 func TestTopicPrefix_ThenUnsetReturnsToTheDefault(t *testing.T) {
 	storeKafkaTopicPrefix(t, "acme")
 	require.Equal(t, "acme", TopicPrefix())
@@ -1094,12 +942,7 @@ func TestTopicPrefix_ThenUnsetReturnsToTheDefault(t *testing.T) {
 
 // TestTopicPrefix_TrimsWhitespaceAndStraySeparators covers the normalisation.
 //
-// Both halves of the cutset earn their place. Whitespace, because the configuration
-// loader trims only a fixed set of fields and the topic prefix is not one of them, so a
-// trailing newline from an environment file would be carried into every topic name.
-// Separators, because KAFKA_TOPIC_PREFIX=acme. is the natural mistake and would otherwise
-// compose "acme..transactions" — which Kafka accepts as a topic distinct from the intended
-// one, so nothing fails and no subscriber ever receives anything.
+// Both halves of the cutset earn their place.
 func TestTopicPrefix_TrimsWhitespaceAndStraySeparators(t *testing.T) {
 	for _, raw := range []string{
 		" acme ",
@@ -1140,11 +983,6 @@ func TestTopicPrefix_TrimsWhitespaceAndStraySeparators(t *testing.T) {
 
 // TestTopicPrefix_DefaultsWhenConfigurationIsNotLoaded pins the unloaded-configuration
 // branch.
-//
-// Answering with the default keeps topic naming total — every event still resolves to a
-// real topic name — which matters because naming is exercised by tests, by tooling and by
-// early start-up paths that have no reason to have loaded a full configuration. Returning
-// an empty prefix or panicking here would break all three.
 func TestTopicPrefix_DefaultsWhenConfigurationIsNotLoaded(t *testing.T) {
 	withUnloadedConfiguration(t)
 
@@ -1180,11 +1018,9 @@ func TestTopicPrefixFrom_ResolvesTheDefaultForEveryAbsentForm(t *testing.T) {
 
 // TestDefaultTopicPrefix_MatchesTheConfigurationDefault pins the two defaults equal.
 //
-// The value is declared in two places out of necessity: the configuration package applies
-// it on the validate-and-default path, and this file applies it for configurations that
-// never took that path. Two independent declarations of one value can drift, and a drift
-// would mean the topics the code writes to depend on how configuration happened to be
-// loaded. Comparing them against each other is the only way to catch that.
+// The value is declared in two places out of necessity: the configuration package
+// applies it on the validate-and-default path, and this file applies it for
+// configurations that never took that path.
 func TestDefaultTopicPrefix_MatchesTheConfigurationDefault(t *testing.T) {
 	previous := config.ConfigStore.Load()
 	t.Cleanup(func() {
@@ -1196,14 +1032,8 @@ func TestDefaultTopicPrefix_MatchesTheConfigurationDefault(t *testing.T) {
 		config.ConfigStore.Store(&config.Configuration{})
 	})
 
-	// MockConfig runs the real validate-and-default path, so the prefix below is filled
-	// by the configuration package's own default rather than by anything in this file.
-	//
-	// The two DSNs are the only fields that path requires, and it merely checks they are
-	// non-empty — nothing is dialled here. They are therefore written without credentials
-	// of any kind, deliberately: a test fixture must never carry a credential-shaped
-	// string, not even a fake one, so that a secret scan over this repository has nothing
-	// to triage.
+	// MockConfig runs the real validate-and-default path, so the prefix below is filled by
+	// the configuration package's own default rather than by anything in this file.
 	config.MockConfig(&config.Configuration{
 		DataSource: config.DataSourceConfig{Dns: "postgres://localhost:5432/blnk?sslmode=disable"},
 		Redis:      config.RedisConfig{Dns: "localhost:6379"},
@@ -1241,11 +1071,11 @@ func TestAllTopics_IsEveryCategoryTopicInCanonicalOrder(t *testing.T) {
 	}
 }
 
-// TestAllDeadLetterTopics_IsEverySiblingInCanonicalOrder pins the dead-letter
-// inventory and its index alignment with AllTopics.
+// TestAllDeadLetterTopics_IsEverySiblingInCanonicalOrder pins the dead-letter inventory
+// and its index alignment with AllTopics.
 //
-// The alignment lets a caller zip the two slices to pair a topic with its sibling, which
-// the admin path and the triage runbook both rely on.
+// The alignment lets a caller zip the two slices to pair a topic with its sibling,
+// which the admin path and the triage runbook both rely on.
 func TestAllDeadLetterTopics_IsEverySiblingInCanonicalOrder(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1270,13 +1100,8 @@ func TestAllDeadLetterTopics_IsEverySiblingInCanonicalOrder(t *testing.T) {
 // TestAllTopicsWithDeadLetters_IsTheProvisionedInventory pins the complete inventory —
 // the single source of truth shared by the Go admin path and the provisioning script.
 //
-// These names, in this order, are what the provisioning script creates; the parity itself is
-// enforced by TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns. If this list and
-// the provisioning script ever disagree, the failure is silent in the worst way: the
-// script creates topics the code never writes to, and the code writes to topics the script
-// never created, which either fails on an unprovisioned topic or auto-creates one with a
-// single partition and the wrong replication factor — quietly discarding the ordering and
-// durability guarantees.
+// These names, in this order, are what the provisioning script creates; the parity
+// itself is enforced by TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns.
 func TestAllTopicsWithDeadLetters_IsTheProvisionedInventory(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1320,15 +1145,8 @@ func TestAllTopicsWithDeadLetters_IsTheProvisionedInventory(t *testing.T) {
 // TestTopicInventory_ContainsNoEmptyOrMalformedName is the guard against a name that is
 // present in the inventory but unusable.
 //
-// The list equality assertions above prove the names are right for the default prefix, and
-// for the one override they exercise. This test asserts the structural properties for every
-// accessor under both, because the inventory is consumed by topic creation and by
-// provisioning: an empty entry would be an attempt to create a topic with no name, and an
-// entry with a stray separator or surrounding whitespace would create a topic adjacent to
-// the intended one that nothing reads.
-//
-// It is deliberately about SHAPE, not about specific names — the specific names are pinned
-// by the exact list comparisons — so it holds for any configured namespace.
+// The list equality assertions above prove the names are right for the default prefix,
+// and for the one override they exercise.
 func TestTopicInventory_ContainsNoEmptyOrMalformedName(t *testing.T) {
 	for _, prefix := range []string{"", "acme.events"} {
 		storeKafkaTopicPrefix(t, prefix)
@@ -1371,9 +1189,7 @@ func TestTopicInventory_ContainsNoEmptyOrMalformedName(t *testing.T) {
 // TestTopicInventory_ReturnsFreshSlicesCallersMayMutate proves the accessors hand back
 // copies rather than shared package state.
 //
-// The admin path sorts and filters these lists. If any accessor returned a slice backed by
-// a package-level array, one caller's sort would silently reorder the inventory for every
-// other caller — including the order this file's own tests depend on.
+// The admin path sorts and filters these lists.
 func TestTopicInventory_ReturnsFreshSlicesCallersMayMutate(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1403,11 +1219,6 @@ func TestTopicInventory_ReturnsFreshSlicesCallersMayMutate(t *testing.T) {
 // The tokens are compared against the model constants they are built from, so the
 // enumeration cannot drift from the vocabulary, and the literal list pins the ORDER —
 // which the provisioning script and the operator documentation are diffed against.
-//
-// There is exactly ONE declaration of this list, in model.AllEventCategories. It used to
-// be declared twice, here and in model, and a second copy of an enumeration is a second
-// thing to forget: adding a category to the routing table without adding it to the topic
-// inventory produces a topic that events route to and that nothing provisions.
 func TestEventCategories_IsTheCanonicalTokenListInOrder(t *testing.T) {
 	assert.Equal(t, []string{
 		"transactions",
@@ -1437,11 +1248,6 @@ func TestEventCategories_IsTheCanonicalTokenListInOrder(t *testing.T) {
 
 // TestEventCategories_ContainsNoCategoryNamedDLT enforces the invariant that DLFor's
 // idempotency implies.
-//
-// A category named "dlt" would compose blnk.dlt, which is indistinguishable from an
-// already-derived dead-letter name, so it could never be given a sibling of its own — its
-// failures would have nowhere to go. Equally, a category token containing the separator
-// would add an unintended topic segment.
 func TestEventCategories_ContainsNoCategoryNamedDLT(t *testing.T) {
 	for _, category := range EventCategories() {
 		assert.NotEqual(t, strings.TrimPrefix(DeadLetterTopicSuffix, "."), category,
@@ -1460,12 +1266,6 @@ func TestEventCategories_ContainsNoCategoryNamedDLT(t *testing.T) {
 
 // TestTopicForCategory_BlankCategoryFallsBackToTheSystemTopic pins the guard against
 // composing a name with an empty final segment, and pins where the fallback goes.
-//
-// "<prefix>." is a topic Kafka would accept and nothing would read, so a blank category
-// must still compose a usable name — the same never-drop-an-event policy the event
-// mapping's own catch-all implements. It falls back to the SYSTEM topic, which is the
-// catch-all model.EventCategory itself uses, so an event the caller could not classify
-// lands on a topic that is provisioned, monitored and has a dead-letter sibling.
 func TestTopicForCategory_BlankCategoryFallsBackToTheSystemTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1478,12 +1278,11 @@ func TestTopicForCategory_BlankCategoryFallsBackToTheSystemTopic(t *testing.T) {
 	}
 }
 
-// TestTopicForCategory_ComposesAnUnknownCategoryAsGiven documents that this function is a
-// name composer and not a validator.
+// TestTopicForCategory_ComposesAnUnknownCategoryAsGiven documents that this function is
+// a name composer and not a validator.
 //
-// A category added to the event mapping must work here with no edit, which is what keeps
-// the two files from having to change in lockstep. An unprovisioned topic then surfaces
-// loudly on the admin path, which is the right place for it.
+// A category added to the event mapping must work here with no edit, which is what
+// keeps the two files from having to change in lockstep.
 func TestTopicForCategory_ComposesAnUnknownCategoryAsGiven(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1496,36 +1295,14 @@ func TestTopicForCategory_ComposesAnUnknownCategoryAsGiven(t *testing.T) {
 	assert.Equal(t, "blnk.system", TopicForCategory(model.EventCategorySystem))
 }
 
-// TestSubscriberGrantableTopics_ExcludesDeadLettersAndTheInternalTopic is the test for the
-// authorization allowlist, and it is the one that stops an over-broad grant.
-//
-// Before the allowlist existed, both the request-validation layer and the ACL
-// provisioning simply trimmed whatever topic list the caller supplied and granted what
-// remained. An authorized request could therefore name the literal wildcard, a
-// dead-letter topic, an internal topic, or a topic belonging to another system entirely,
-// and receive a real ACL binding over it. Every rejected value below is one of those.
+// TestSubscriberGrantableTopics_ExcludesDeadLettersAndTheInternalTopic is the test for
+// the authorization allowlist, and it is the one that stops an over-broad grant.
 func TestSubscriberGrantableTopics_ExcludesDeadLettersAndTheInternalTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
-	// FOUR topics: the tenant categories, and nothing else. Two classes of Blnk-owned name are
-	// withheld from this list, and both are operator surfaces read under the master key.
-	//
-	// The dead-letter exclusion is STRUCTURAL rather than listed — the allowlist is composed as
-	// "<prefix>.<category>", so a ".dlt" name can never be a member of it, and no deployment
-	// declaration changes that.
-	//
-	// blnk.system is withheld by an explicit decision in model.SubscriberGrantableEventCategories.
-	// It carries system.error, whose payload is the frozen legacy body and therefore renders
-	// Blnk's error text verbatim, and it is the catalogue's catch-all, so a grant of it would
-	// also stand over every event type nobody has catalogued yet. An operator rule one PUT can
-	// violate is not a boundary, so reaching it takes the deployment-level acknowledgement
-	// KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS — which this test does not set, so the resolved list
-	// here is the default one. ledger.created shares that topic, so it is reachable by a
-	// subscriber only through the same acknowledgement — the documented cost of the
-	// four-category catalogue.
-	//
-	// WHAT THIS LIST IS NOT is a grant. It says which topics a subscriber MAY be authorised for;
-	// which ones it IS authorised for is its authorized_topics, decided per subscriber.
+	// FOUR topics: the tenant categories, and nothing else. Two classes of Blnk-owned name
+	// are withheld from this list, and both are operator surfaces read under the master
+	// key.
 	assert.Equal(t, []string{
 		"blnk.transactions",
 		"blnk.balances",
@@ -1577,8 +1354,8 @@ func TestSubscriberGrantableTopics_ExcludesDeadLettersAndTheInternalTopic(t *tes
 			"%s (%q) must not be grantable to a subscriber", name, topic)
 	}
 
-	// Trailing and leading whitespace on an otherwise valid name IS tolerated, because
-	// an operator pasting a topic name is a routine mistake and the trimmed value is
+	// Trailing and leading whitespace on an otherwise valid name IS tolerated, because an
+	// operator pasting a topic name is a routine mistake and the trimmed value is
 	// unambiguous. Nothing else is normalised.
 	assert.True(t, IsSubscriberGrantableTopic("  blnk.transactions  "),
 		"surrounding whitespace on an exact match is trimmed, which is the only normalisation applied")
@@ -1600,11 +1377,6 @@ func TestSubscriberGrantableTopics_ExcludesDeadLettersAndTheInternalTopic(t *tes
 
 // TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse pins the broader check the
 // publisher and the repository apply.
-//
-// The two predicates answer different questions and must not be confused:
-// IsBlnkOwnedTopic answers "may WE write here?", which includes the dead-letter names
-// because Blnk legitimately writes to all of them; IsSubscriberGrantableTopic answers
-// "may a SUBSCRIBER read here?", which does not.
 func TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -1617,10 +1389,11 @@ func TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse(t *testing.T) {
 	for _, topic := range SubscriberGrantableTopics() {
 		assert.True(t, IsBlnkOwnedTopic(topic))
 	}
-	// The system topic is OWNED and NOT GRANTABLE, which is the pair that makes "owned" and
-	// "grantable" different questions: Blnk writes ledger.created, system.error and every
-	// unrecognised event type to it, and no subscriber may be granted it, because system.error's
-	// frozen payload renders internal error text verbatim and the category is the catch-all.
+	// The system topic is OWNED and NOT GRANTABLE, which is the pair that makes "owned"
+	// and "grantable" different questions: Blnk writes ledger.created, system.error and
+	// every unrecognised event type to it, and no subscriber may be granted it, because
+	// system.error's frozen payload renders internal error text verbatim and the category
+	// is the catch-all.
 	assert.True(t, IsBlnkOwnedTopic("blnk.system"),
 		"Blnk writes to the system topic, so it must be inside the owned inventory")
 	assert.False(t, IsSubscriberGrantableTopic("blnk.system"),
@@ -1637,11 +1410,8 @@ func TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse(t *testing.T) {
 	}
 
 	// THE INVENTORY IS CLOSED AT THE FIVE CATALOGUED CATEGORIES, so a plausible-looking
-	// sixth name is refused rather than tolerated. Two are worth watching: "blnk.quarantine",
-	// because an earlier design routed uncatalogued events to a topic of that name, and
-	// "blnk.ledger", because the singular of a real category is the near-miss a reader is most
-	// likely to write. Admitting a name Blnk never creates would let the ACL pruner treat
-	// another team's bindings on it as its own to delete.
+	// sixth name is refused rather than tolerated. Admitting a name Blnk never creates
+	// would let the ACL pruner treat another team's bindings on it as its own to delete.
 	for _, topic := range []string{
 		"", "   ", "*", "blnk", "blnk.", "blnk.orders", "__consumer_offsets",
 		"blnk.transactions.dlt.dlt", "blnk.transactions.replayed", "BLNK.TRANSACTIONS",
@@ -1653,13 +1423,8 @@ func TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse(t *testing.T) {
 	}
 }
 
-// TestEventTopicsSource_HardcodesNoComposedTopicName is a structural guarantee that every
-// topic name really is derived from configuration.
-//
-// A behavioural test cannot prove this on its own: a hardcoded "blnk.transactions"
-// somewhere would pass every default-prefix assertion in this file and only fail under an
-// override, and only if that particular call site happened to be exercised. Scanning the
-// AST's string literals proves it for the whole file at once.
+// TestEventTopicsSource_HardcodesNoComposedTopicName is a structural guarantee that
+// every topic name really is derived from configuration.
 //
 // Only string literals are inspected, so the documentation is free to spell the topic
 // names out — which it must, to be useful — while executable code may not.
@@ -1696,8 +1461,7 @@ func TestEventTopicsSource_HardcodesNoComposedTopicName(t *testing.T) {
 //
 // Topic naming is the one decision the whole pipeline depends on, so it must stay
 // exercisable to the last branch by a unit test with no broker, no network and no
-// fixtures. A Kafka import here would be the first step towards naming logic that can
-// only be tested with a live cluster.
+// fixtures.
 func TestEventTopicsSource_ImportsNoKafkaClient(t *testing.T) {
 	parsed := parseEventTopicsSource(t)
 
@@ -1710,25 +1474,20 @@ func TestEventTopicsSource_ImportsNoKafkaClient(t *testing.T) {
 	}
 }
 
-// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary protects the receiving half
-// of the sunset procedure, now that the relocation has been performed.
+// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary pins WHERE
+// getEventFromStatus is declared. It produces seven of the thirteen event strings — the
+// vocabulary this file routes — and it must not migrate into webhooks.go, the file the
+// sunset deletes.
 //
-// getEventFromStatus produces seven of the thirteen event strings — the vocabulary this file
-// routes — and it used to be declared in webhooks.go, the file the sunset deletes. STEP 1 of
-// that procedure required moving it out FIRST, and it has been moved here. This test is the
-// guard on the result, and it asserts the invariant in both directions:
+//   - It IS declared in event_topics.go, exactly once. A dropped declaration would
+//     otherwise only surface as a build failure in whichever file still called it.
+//   - It is NOT declared in webhooks.go. Two declarations in package blnk do not
+//     compile, so this is the assertion that fails if someone restores the old
+//     declaration.
 //
-//   - It IS declared in event_topics.go, exactly once. A relocation that got reverted, or a
-//     merge that dropped the moved declaration, would otherwise only surface as a build
-//     failure in whichever file still called it.
-//   - It is NOT declared in webhooks.go. A relocation that ADDED without REMOVING would be a
-//     duplicate declaration in package blnk and would fail the build outright — which is why
-//     the previous version of this test asserted the function was absent here. That
-//     assertion has been inverted rather than deleted: the risk it named is real, it has
-//     simply moved to the other side of the move.
-//
-// The documentation record is asserted too, because the reason this function lives beside
-// topic resolution rather than beside a transport is a fact only a comment carries.
+// The documentation record is asserted too, because the reason this function lives
+// beside topic resolution rather than beside a transport is a fact only a comment
+// carries.
 func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) {
 	parsed := parseEventTopicsSource(t)
 
@@ -1738,17 +1497,13 @@ func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) 
 	}
 	documentation := comments.String()
 
-	// Each fragment is one part of the record: the symbol, the fact that it had to outlive
-	// its former host, and the pointer to where the ordered procedure is kept. Losing any one
-	// of them leaves a reader with no way back to the other two.
-	//
-	// Each is checked with strings.Contains behind assert.True rather than assert.Contains so
-	// that a failure reports the missing fragment instead of dumping the whole file's
-	// documentation — roughly twenty thousand characters — into the test output.
+	// Each fragment is one part of the record: the symbol, what it is, and where the table
+	// it delegates to lives. Losing any one of them leaves a reader with no way back to
+	// the other two.
 	for _, fragment := range []string{
 		"getEventFromStatus",
-		"outlive the transport that once hosted it",
-		"sunset procedure at the foot of webhooks.go",
+		"transaction event-string vocabulary",
+		"model.EventTypeForTransactionStatus",
 	} {
 		assert.True(t, strings.Contains(documentation, fragment),
 			"event_topics.go's documentation must still contain %q; it is the only record of why the transaction event vocabulary lives here rather than beside a transport", fragment)
@@ -1767,13 +1522,12 @@ func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) 
 	}
 
 	assert.Equal(t, 1, declarations,
-		"getEventFromStatus must be declared exactly once in event_topics.go: it was relocated here from webhooks.go ahead of that file's deletion, and it is the vocabulary that decides which topic a transaction event is published to")
+		"getEventFromStatus must be declared exactly once in event_topics.go: it is the vocabulary that decides which topic a transaction event is published to, so it must outlive the HTTP transport")
 
-	// AND NOT IN ITS FORMER HOME. Two declarations in package blnk would not compile, so this
-	// asserts the move was a move rather than a copy — and it is the assertion that fails if
-	// someone restores the old declaration while merging.
+	// AND NOT IN THE TRANSPORT. Two declarations in package blnk would not compile, so this is
+	// the assertion that fails if someone restores the old declaration while merging.
 	assert.NotContains(t, readRepoFile(t, "webhooks.go"), "func getEventFromStatus(",
-		"webhooks.go must no longer declare getEventFromStatus; the relocation is STEP 1 of the sunset procedure and a second declaration in package blnk breaks the build")
+		"webhooks.go must not declare getEventFromStatus; a second declaration in package blnk breaks the build, and the vocabulary must outlive that file")
 
 	// It must still behave identically from its new home, which is what the transaction
 	// producer call sites depend on.
@@ -1784,17 +1538,8 @@ func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------------------
-// Consequences of topic ownership — VALID-01 and DATA-01
-//
-// The rest of this file establishes WHICH topics Blnk owns. These tests cover what follows
-// from that answer at the two places it is load-bearing outside naming: the publisher's
-// refusal to write to a topic outside the namespace, and the bounding of stored strings
-// before they become metric labels.
-//
-// They live here rather than beside the publisher because event_publisher_test.go belongs to
-// a later checkpoint and is not in this scope, and because both behaviours are questions
-// about ownership — this file is the authority on that. None of them performs I/O: a
-// kafka.Writer is constructed lazily and no case below reaches a write.
+// Consequences of topic ownership. The rest of this file establishes WHICH topics Blnk
+// owns.
 // ---------------------------------------------------------------------------------------
 
 // newOwnershipPublisher builds a real Kafka-backed publisher with no broker contact.
@@ -1815,18 +1560,9 @@ func newOwnershipPublisher(t *testing.T) *kafkaPublisher {
 	return publisher
 }
 
-// TestWriterFor_RefusesATopicBlnkDoesNotOwn is the VALID-01 guard on the publish path.
+// TestWriterFor_RefusesATopicBlnkDoesNotOwn is the guard on the publish path.
 //
-// The destination of a publish comes from a STORED OUTBOX ROW. Writer creation used to grow
-// lazily with no membership test, so ANY topic name that reached the table was created as a
-// writer and published to — using Blnk's own producer credentials, on Blnk's own broker, at
-// the direction of stored data. A row carrying "attacker.transactions", or a name with an
-// injected segment, was delivered exactly as asked.
-//
-// Persistence now rejects such a row at insert, and this is the second half of that defence:
-// a row would have to bypass validation AND survive this check to reach a foreign topic. The
-// refusal is asserted to happen WITHOUT caching the writer, because a rejected name that
-// entered the map would be admitted by the fast path on the next attempt.
+// The destination of a publish comes from a STORED OUTBOX ROW.
 func TestWriterFor_RefusesATopicBlnkDoesNotOwn(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -1857,11 +1593,9 @@ func TestWriterFor_RefusesATopicBlnkDoesNotOwn(t *testing.T) {
 
 // TestWriterFor_ServesEveryPreCreatedTopic covers the fast path.
 //
-// The pre-created set comes from AllTopicsWithDeadLetters — Blnk's own configuration — and under
-// a fixed prefix it is already the whole owned namespace, since ownership is exactly
-// prefix.<known-category> and its `.dlt` sibling. Every one must be served, and the writer must
-// carry the topic it was asked for: a per-topic writer bound to the wrong topic would publish
-// silently to the wrong audience, which no runtime error would reveal.
+// The pre-created set comes from AllTopicsWithDeadLetters — Blnk's own configuration —
+// and under a fixed prefix it is already the whole owned namespace, since ownership is
+// exactly prefix.<known-category> and its `.dlt` sibling.
 func TestWriterFor_ServesEveryPreCreatedTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -1876,19 +1610,11 @@ func TestWriterFor_ServesEveryPreCreatedTopic(t *testing.T) {
 	}
 }
 
-// TestWriterFor_GrowsForANewPrefixAndKeepsServingTheOld covers the ONE situation in which lazy
-// growth is reachable, and the reason it does not strand a committed event.
+// TestWriterFor_GrowsForANewPrefixAndKeepsServingTheOld covers the ONE situation in
+// which lazy growth is reachable, and the reason it does not strand a committed event.
 //
-// The prefix is re-read from live configuration on every naming call, so a reload starts
-// resolving events to names this publisher was never constructed with. Those are owned under the
-// new prefix, so they are admitted and cached — and asserting the cache grew by exactly one, and
-// that a second call returns the SAME writer, is what proves growth is shared rather than
-// per-publish.
-//
-// Meanwhile a row stored before the change still names a pre-created topic, so it is still
-// served. That is the case the membership test must not break: the row recorded its destination
-// precisely so the event would reach the topic it was bound for, and the process holds a writer
-// for it built from its own configuration.
+// The prefix is re-read from live configuration on every naming call, so a reload
+// starts resolving events to names this publisher was never constructed with.
 func TestWriterFor_GrowsForANewPrefixAndKeepsServingTheOld(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 	publisher := newOwnershipPublisher(t)
@@ -1916,13 +1642,15 @@ func TestWriterFor_GrowsForANewPrefixAndKeepsServingTheOld(t *testing.T) {
 	assert.ErrorIs(t, err, ErrTopicNotOwned)
 }
 
-// TestBoundedTopicLabel_CollapsesEveryNameBlnkDoesNotOwn is the DATA-01 cardinality guard.
+// TestBoundedTopicLabel_CollapsesEveryNameBlnkDoesNotOwn is the cardinality
+// guard.
 //
-// Every value that reaches this label arrives from an outbox row, and the FAILURE path records
-// an attempt for a topic that was rejected — precisely the case where the name is not Blnk's.
-// An unbounded label is two defects at once: each distinct value creates a time series, so a
-// stream of odd names is a storage attack on the metrics pipeline with no request rate to limit;
-// and the label publishes whatever string was stored to anyone who can read /metrics.
+// Every value that reaches this label arrives from an outbox row, and the FAILURE path
+// records an attempt for a topic that was rejected — precisely the case where the name
+// is not Blnk's. An unbounded label is two defects at once: each distinct value creates
+// a time series, so a stream of odd names is a storage attack on the metrics pipeline
+// with no request rate to limit; and the label publishes whatever string was stored to
+// anyone who can read /metrics.
 func TestBoundedTopicLabel_CollapsesEveryNameBlnkDoesNotOwn(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -1944,14 +1672,11 @@ func TestBoundedTopicLabel_CollapsesEveryNameBlnkDoesNotOwn(t *testing.T) {
 	}
 }
 
-// TestBoundedEventTypeLabel_CollapsesEveryUncataloguedType is the other half of the same guard.
+// TestBoundedEventTypeLabel_CollapsesEveryUncataloguedType is the other half of the
+// same guard.
 //
-// The catalogue is the bound: a recognised event type is one of a fixed set this repository
-// emits. An unrecognised one is a name that could be arbitrary — a stored row from a producer
-// that was never catalogued.
-//
-// Collapsing does not hide the condition: a non-zero count on the collapsed label is the signal
-// that something is publishing an uncatalogued event, and the capture-time warning names it.
+// The catalogue is the bound: a recognised event type is one of a fixed set this
+// repository emits.
 func TestBoundedEventTypeLabel_CollapsesEveryUncataloguedType(t *testing.T) {
 	for _, eventType := range []string{
 		"transaction.queued", "transaction.applied", "transaction.scheduled",
@@ -1973,31 +1698,8 @@ func TestBoundedEventTypeLabel_CollapsesEveryUncataloguedType(t *testing.T) {
 	}
 }
 
-// TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns pins the parity between the
-// Go topic catalogue and the shell script that provisions it.
-//
-// # Why this test exists rather than a comment
-//
-// event_admin.go states that AllTopicsWithDeadLetters is "the single source of truth shared
-// with scripts/kafka-provision.sh", and the script states that its own list "is
-// eventCategoryOrder". Both claims were true when written and neither was enforced, so when
-// a category was added to the Go side the script kept provisioning the older, shorter set —
-// and nothing anywhere failed. The drift is invisible in every unit test, invisible in every
-// build, and visible only against a real broker, as a publish to a topic that does not
-// exist.
-//
-// # Why a missing topic is not a cosmetic problem
-//
-// Against a broker with auto.create.topics.enable=false — the correct production setting,
-// because auto-creation would silently manufacture a topic with the wrong partition count
-// and the wrong replication factor — a publish to an unprovisioned topic FAILS. The row
-// retries until its budget is spent and the dead-letter write then fails too, because the
-// missing category's `.dlt` sibling is missing for the same reason. The event is stranded.
-//
-// That lands hardest on the system category, which is the one whose provisioning is easiest
-// to think optional: besides ledger.created and system.error it is where an event type the
-// mapping table does not recognise is routed, which is the whole of the zero-exceptions
-// coverage guarantee. An unprovisioned system topic turns that guarantee into its opposite.
+// TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns pins the parity between
+// the Go topic catalogue and the shell script that provisions it.
 func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 	script, err := os.ReadFile(filepath.Join(moduleRootDir(t), "scripts", "kafka-provision.sh"))
 	require.NoError(t, err, "scripts/kafka-provision.sh must be readable to compare its catalogue")
@@ -2027,9 +1729,10 @@ func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 	})
 
 	t.Run("the script's grantable set matches the code's", func(t *testing.T) {
-		// THE ALLOWLIST, which is a POLICY: which categories a subscriber may ever be granted. A
-		// second, hand-kept copy of it is a second thing to forget, so this holds it equal to the
-		// one the API and the ACL provisioner enforce, in the same canonical order.
+		// THE ALLOWLIST, which is a POLICY: which categories a subscriber may ever be
+		// granted. A second, hand-kept copy of it is a second thing to forget, so this holds
+		// it equal to the one the API and the ACL provisioner enforce, in the same canonical
+		// order.
 		declaration := regexp.MustCompile(`(?m)^readonly SUBSCRIBER_GRANTABLE_CATEGORIES=\(([^)]*)\)`)
 		match := declaration.FindSubmatch(script)
 		require.NotNil(t, match,
@@ -2042,15 +1745,8 @@ func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 				"the script mints a grant the API would refuse, or refuses one the API would allow")
 	})
 
-	// MD-6. The sample principal's DEFAULT grant is a different question from the allowlist, and
+	// The sample principal's DEFAULT grant is a different question from the allowlist, and
 	// conflating the two is what this subtest exists to prevent.
-	//
-	// The array it reads was REFERENCED AND NEVER DEFINED. Two loops in the script expanded it to
-	// compose the sample's default topics, and bash expands an undefined array to nothing even
-	// under `set -u`, so the list came out EMPTY — and the empty case is not the one the script
-	// validates, because resolve_subscriber_topics only refuses an empty result on the override
-	// path. Provisioning reported a sample subscriber that had been granted nothing, and the first
-	// symptom was a demo consumer receiving no records with every ACL apparently in place.
 	t.Run("the sample principal's default grant is defined and is a subset of the allowlist", func(t *testing.T) {
 		declaration := regexp.MustCompile(`(?m)^readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=\(([^)]*)\)`)
 		match := declaration.FindSubmatch(script)
@@ -2065,10 +1761,10 @@ func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 			"an empty default grant is the exact outcome the missing declaration produced, so an "+
 				"empty declaration is no better than none")
 
-		// A SUBSET, not a copy. Every default must be grantable — the script checks its overrides
-		// against the allowlist and would otherwise refuse its own default — while the allowlist
-		// may legitimately be wider, because what a subscriber MAY hold and what a sample IS given
-		// are different decisions.
+		// A SUBSET, not a copy. Every default must be grantable — the script checks its
+		// overrides against the allowlist and would otherwise refuse its own default — while
+		// the allowlist may legitimately be wider, because what a subscriber MAY hold and
+		// what a sample IS given are different decisions.
 		grantable := model.SubscriberGrantableEventCategories()
 		for _, category := range sampleDefault {
 			assert.Contains(t, grantable, category,
@@ -2077,21 +1773,16 @@ func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 				category)
 		}
 
-		// LEAST PRIVILEGE, asserted as itself. The system category carries system.error, whose
-		// payload is an internal error message, so no principal this script mints reads it — and
-		// the allowlist above no longer offers it to any subscriber either. Asserting it here as
-		// well is what catches the edit that puts it back into BOTH lists at once.
+		// LEAST PRIVILEGE, asserted as itself. The system category carries system.error,
+		// whose payload is an internal error message, so no principal this script mints reads
+		// it — and the allowlist above no longer offers it to any subscriber either.
 		assert.NotContains(t, sampleDefault, model.EventCategorySystem,
 			"the sample default must not include the system category: it carries system.error, and "+
 				"it is not on the subscriber allowlist at all")
 
-		// A SUBSET, not necessarily a strict one. It used to be strictly narrower, and the one
-		// category that made it so was `system`; now that no subscriber may be granted that
-		// category, the narrowing that mattered lives in the allowlist itself and the sample's
-		// default may legitimately be the whole of it — every remaining category is tenant data
-		// and a local walkthrough consumer has nobody on this stack to be isolated from.
-		// Asserting strict narrowness here would force an arbitrary category out of the demo
-		// grant to satisfy an invariant that no longer describes a boundary.
+		// A SUBSET, not necessarily a strict one. Asserting strict narrowness here would
+		// force an arbitrary category out of the demo grant to satisfy an invariant that no
+		// longer describes a boundary.
 		assert.LessOrEqual(t, len(sampleDefault), len(grantable),
 			"the sample default must never be WIDER than the allowlist: the script checks operator "+
 				"overrides against that list and would refuse its own default")
@@ -2124,33 +1815,11 @@ func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 	})
 }
 
-// TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows pins the parity between the
-// Go GRANT allowlist and the shell script that mints the sample subscriber's ACLs.
-//
-// # The defect this replaces
-//
-// An operator-supplied override used to be accepted verbatim, with no allowlist at all, so
-// KAFKA_SAMPLE_SUBSCRIBER_TOPICS could name a dead-letter topic or a topic belonging to
-// another system entirely and receive a real ACL binding. model.SubscriberGrantableTopics
-// refuses both, and the subscriber DTO validation and the Kafka ACL request check against it,
-// so the script was minting grants the API would have refused: the same principal requested
-// through POST /subscribers/{id}/kafka-credentials could not have obtained them.
-//
-// # Why an over-granted sample principal is not merely untidy
-//
-// The dead-letter siblings hold the full payload of every event Blnk failed to publish, for
-// every subscriber, together with failure metadata naming broker addresses and internal error
-// reasons — and they are what the isolation acceptance criterion asserts a principal CANNOT
-// read. A principal granted one makes that assertion vacuous.
-//
-// # Why this test runs the script instead of reading it
+// TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows pins the parity between
+// the Go GRANT allowlist and the shell script that mints the sample subscriber's ACLs.
 //
 // The catalogue half of this parity is checkable by reading a declaration, because a
-// declaration is what it is. The GRANT half is a decision made by code, and a test that
-// grepped for the code would agree with whatever the code said — including with a broken
-// version of it. So the refusals below EXECUTE scripts/kafka-provision.sh and assert on what
-// it does. Every case stops in resolve_subscriber_topics, which runs before any network call,
-// so no broker, no credential and no Kafka CLI is involved.
+// declaration is what it is.
 func TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows(t *testing.T) {
 	root := moduleRootDir(t)
 	scriptPath := filepath.Join(root, "scripts", "kafka-provision.sh")
@@ -2168,11 +1837,11 @@ func TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows(t *testing.T)
 		"a topic under a different prefix":   "other.transactions",
 		"a topic that does not exist at all": prefix + ".invented",
 		// The singular form of a real category: <prefix>.balance for <prefix>.balances is the
-		// plausible typo and a name nothing creates — the shape of mistake that used to be
-		// accepted verbatim.
+		// plausible typo and a name nothing creates — the shape of mistake a name check has to
+		// catch rather than accept verbatim.
 		"the singular form of a real category": prefix + ".balance",
-		// The internal category. Unlike every other entry here it EXISTS and is published
-		// to, and a subscriber CAN be granted it — but only through the subscriber API on a
+		// The internal category. Unlike every other entry here it EXISTS and is published to,
+		// and a subscriber CAN be granted it — but only through the subscriber API on a
 		// deployment that has declared KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS, because that
 		// grant is a deliberate entitlement decision about operator diagnostics. A bring-up
 		// script has made no such decision, so it must refuse rather than mint it.
@@ -2223,18 +1892,10 @@ func TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows(t *testing.T)
 	})
 }
 
-// runKafkaProvisionDecisionPhase executes scripts/kafka-provision.sh far enough to reach its
-// pure-decision phase, and returns its combined output and exit code.
+// runKafkaProvisionDecisionPhase executes scripts/kafka-provision.sh far enough to
+// reach its pure-decision phase, and returns its combined output and exit code.
 //
-// The environment is built from EMPTY rather than inherited. A developer with KAFKA_BROKERS,
-// a real KAFKA_SASL_ADMIN_SECRET or a KAFKA_CLIENT_CONFIG exported would otherwise run a
-// different script than CI does — and in the worst case would reach the network and start
-// provisioning a real broker from a unit test. Only PATH and the case's own variables are
-// passed, and KAFKA_CONTAINER names a container that cannot exist so the delegation branch
-// fails immediately instead of finding a live broker.
-//
-// KAFKA_BOOTSTRAP_SERVER is set because the script's very first action is to skip entirely
-// when Kafka is unconfigured; without it every case would exit 0 having decided nothing.
+// The environment is built from EMPTY rather than inherited.
 func runKafkaProvisionDecisionPhase(t *testing.T, scriptPath string, env map[string]string) (string, int) {
 	t.Helper()
 
@@ -2264,8 +1925,8 @@ func runKafkaProvisionDecisionPhase(t *testing.T, scriptPath string, env map[str
 		// at a port that refuses immediately.
 		"KAFKA_SASL_ADMIN_USER=provision-test-admin",
 		// At least 32 characters and drawn from the allowed alphabet, because the script
-		// enforces both — a rule worth complying with rather than relaxing, since it is
-		// what stopped a one-character password passing the old alphabet-only check.
+		// enforces both — a rule worth complying with rather than relaxing, since it is what
+		// stopped a one-character password passing the old alphabet-only check.
 		"KAFKA_SASL_ADMIN_SECRET=provisionTestNotARealSecret0123456789",
 	}
 	for key, value := range env {
@@ -2289,31 +1950,11 @@ func runKafkaProvisionDecisionPhase(t *testing.T, scriptPath string, env map[str
 	return string(output), exitCode
 }
 
-// TestKafkaProvisionScript_NeverGeneratesACredentialItCannotDeliverSafely is the credential
-// -disclosure guard.
+// TestKafkaProvisionScript_NeverGeneratesACredentialItCannotDeliverSafely is the
+// credential -disclosure guard.
 //
-// # What was wrong
-//
-// A generated sample password was printed to stdout in a banner captioned "shown once, not
-// stored". The caption was true of the banner and false of everything downstream: this script
-// runs as the compose kafka-init service, so its stdout is a container log that retains the
-// credential for the container's lifetime, hands it to anyone who can run
-// `docker compose logs`, forwards it to whatever collects the host's logs, and cannot be
-// redacted after the fact. A password printed once into a permanent log is not a password
-// shown once.
-//
-// # What replaced it, and what this test pins
-//
-// Generation now needs a nominated mode-0600 destination; with none, an explicitly supplied
-// secret is used or the principal is skipped. The one case that must FAIL rather than skip is
-// an explicit rotation with nowhere to deliver the result — the operator asked for a new
-// credential in so many words, and quietly doing nothing would leave them believing the old
-// one had been replaced. For the PRODUCER it is worse: a rotation that half-succeeded leaves
-// the running server and worker presenting a password nobody holds.
-//
-// The refusal is asserted to happen in the pure-decision phase, BEFORE any broker contact, so
-// this test needs no broker — and so an operator reads the diagnosis immediately instead of
-// after a successful topic run and a thirty-second readiness wait.
+// A generated sample password was printed to stdout in a banner captioned "shown once,
+// not stored".
 func TestKafkaProvisionScript_NeverGeneratesACredentialItCannotDeliverSafely(t *testing.T) {
 	scriptPath := filepath.Join(moduleRootDir(t), "scripts", "kafka-provision.sh")
 
@@ -2408,23 +2049,12 @@ func TestKafkaProvisionScript_NeverGeneratesACredentialItCannotDeliverSafely(t *
 	})
 }
 
-// TestStackInit_WritesSecretsOnlyIntoAPrivateFile is the secret-storage guard for stack.sh.
+// TestStackInit_WritesSecretsOnlyIntoAPrivateFile is the secret-storage guard for
+// stack.sh.
 //
-// # What was wrong
-//
-// `--init` copied .env.example — a committed template, correctly mode 0644 because it holds no
-// secrets — with plain `cp`, which creates the destination under the process umask. On a
-// typical developer machine that is 022, so .env was created WORLD-READABLE and every
-// credential generated into it was written into a world-readable file: a PostgreSQL password
-// and a Kafka SUPERUSER password, on a stack whose broker is published to the host.
-//
-// # Why the test forces a permissive umask
-//
-// Because the defect is invisible under a strict one. A developer running with umask 077 would
-// have seen 0600 and concluded the code was fine; the bug only appears under the umask most
-// machines actually have. So the umask is set to 022 deliberately, and the assertion is on the
-// resulting mode rather than on the presence of a chmod call — a chmod placed after the writes
-// would satisfy a source scan while still leaving a window in which the file existed readable.
+// The script is run under umask 022, a default developer machine, because a .env created
+// without an explicit 0600 looks private under a strict umask and is world-readable under
+// this one.
 func TestStackInit_WritesSecretsOnlyIntoAPrivateFile(t *testing.T) {
 	root := moduleRootDir(t)
 	workDir := t.TempDir()
@@ -2462,9 +2092,9 @@ func TestStackInit_WritesSecretsOnlyIntoAPrivateFile(t *testing.T) {
 	require.NoError(t, err)
 	rendered := string(contents)
 
-	// Every credential --init is responsible for must actually have been generated. A .env with
-	// the right mode and an empty secret is a stack that cannot start, and asserting the mode
-	// alone would pass over it.
+	// Every credential --init is responsible for must actually have been generated. A .env
+	// with the right mode and an empty secret is a stack that cannot start, and asserting
+	// the mode alone would pass over it.
 	for _, key := range []string{
 		"POSTGRES_PASSWORD",
 		"KAFKA_SASL_ADMIN_USER",
@@ -2480,10 +2110,10 @@ func TestStackInit_WritesSecretsOnlyIntoAPrivateFile(t *testing.T) {
 				"the service reads the brace text itself as its password", key)
 	}
 
-	// The two generated Kafka secrets must be DIFFERENT values. The administrative principal is
-	// a cluster superuser and the producer is not; reusing one value for both would make the
-	// least-privilege split cosmetic, because compromising the publisher would hand over the
-	// administrative credential too.
+	// The two generated Kafka secrets must be DIFFERENT values. The administrative
+	// principal is a cluster superuser and the producer is not; reusing one value for both
+	// would make the least-privilege split cosmetic, because compromising the publisher
+	// would hand over the administrative credential too.
 	assert.NotEqual(t,
 		envValueOf(t, rendered, "KAFKA_SASL_ADMIN_SECRET"),
 		envValueOf(t, rendered, "KAFKA_PRODUCER_SECRET"),
@@ -2491,9 +2121,9 @@ func TestStackInit_WritesSecretsOnlyIntoAPrivateFile(t *testing.T) {
 			"value would mean a compromised publisher is a compromised superuser, which is the "+
 			"whole thing the separate principal exists to prevent")
 
-	// base64 pads with "=", which is outside the credential alphabet kafka-bootstrap.sh and
-	// kafka-provision.sh share — Kafka's --add-scram grammar has no escape for it — so a padded
-	// password is refused and the broker never bootstraps.
+	// base64 pads with "=", which is outside the credential alphabet kafka-bootstrap.sh
+	// and kafka-provision.sh share — Kafka's --add-scram grammar has no escape for it — so
+	// a padded password is refused and the broker never bootstraps.
 	for _, key := range []string{"KAFKA_SASL_ADMIN_SECRET", "KAFKA_PRODUCER_SECRET", "KAFKA_SAMPLE_SUBSCRIBER_SECRET"} {
 		assert.NotContains(t, envValueOf(t, rendered, key), "=",
 			"%s must not contain base64 padding: the value grammar Kafka's --add-scram accepts has "+
@@ -2544,14 +2174,8 @@ func storeKafkaTopicPrefixes(t *testing.T, current string, historical ...string)
 	})
 }
 
-// TestOwnedTopicPrefixes_LeadsWithTheConfiguredPrefixAndAppendsTheDeclaredHistory is the
-// resolution order every owned-topic reader depends on.
-//
-// The configured prefix leads because that is where NEW events go, so a caller composing an
-// inventory builds the live generation first — matching the provisioning script and the
-// documentation — and a caller resolving one name finds the common case on the first
-// comparison. The list is distinct and blank-free so that an inventory composed from it has
-// no duplicates and no holes.
+// TestOwnedTopicPrefixes_LeadsWithTheConfiguredPrefixAndAppendsTheDeclaredHistory is
+// the resolution order every owned-topic reader depends on.
 func TestOwnedTopicPrefixes_LeadsWithTheConfiguredPrefixAndAppendsTheDeclaredHistory(t *testing.T) {
 	t.Run("no history declared is the ordinary case", func(t *testing.T) {
 		storeKafkaTopicPrefix(t, DefaultTopicPrefix)
@@ -2581,14 +2205,10 @@ func TestOwnedTopicPrefixes_LeadsWithTheConfiguredPrefixAndAppendsTheDeclaredHis
 	})
 }
 
-// TestAllOwnedTopicsAcrossPrefixes_CoversEveryGenerationInInventoryOrder is the inventory the
-// publisher pre-creates and topic assurance keeps present.
+// TestAllOwnedTopicsAcrossPrefixes_CoversEveryGenerationInInventoryOrder is the
+// inventory the publisher pre-creates and topic assurance keeps present.
 //
-// Both callers need every generation. The publisher, because a row captured before a rename
-// names the previous generation's topic and must be served from the fast path after a restart;
-// assurance, because a historical topic that was deleted — or is absent on a broker restored
-// from elsewhere — would otherwise fail every publish of the rows naming it, or silently
-// auto-create a topic with one partition and the wrong replication factor.
+// Both callers need every generation.
 func TestAllOwnedTopicsAcrossPrefixes_CoversEveryGenerationInInventoryOrder(t *testing.T) {
 	storeKafkaTopicPrefixes(t, "acme", "blnk")
 
@@ -2617,14 +2237,8 @@ func TestAllOwnedTopicsAcrossPrefixes_CoversEveryGenerationInInventoryOrder(t *t
 	}
 }
 
-// TestIsOwnedTopicUnderAnyConfiguredPrefix_IsExactPerDeclaredNamespace is the security boundary
-// of the historical allowlist.
-//
-// Widening the ownership test is what keeps a stored old-prefix row publishable, and writer
-// resolution is the one place a stored string becomes an outbound connection carrying Blnk's
-// own producer credentials. So the widening must be EXACTLY the declared namespaces: a prefix
-// comparison rather than an equality would turn "blnk" into a licence for
-// "blnkfinance.transactions", and a form test would admit any third party's topic.
+// TestIsOwnedTopicUnderAnyConfiguredPrefix_IsExactPerDeclaredNamespace is the security
+// boundary of the historical allowlist.
 func TestIsOwnedTopicUnderAnyConfiguredPrefix_IsExactPerDeclaredNamespace(t *testing.T) {
 	storeKafkaTopicPrefixes(t, "acme", "blnk")
 
@@ -2671,24 +2285,11 @@ func (s *strandedAuditStore) ListUndrainedEventTopics(
 	return s.backlogs, nil
 }
 
-// TestAuditStrandedTopicPrefixes_NamesTheUndeclaredGenerationAndNothingElse is the audit that
-// makes a stranded prefix visible at all.
+// TestAuditStrandedTopicPrefixes_NamesTheUndeclaredGenerationAndNothingElse is the
+// audit that makes a stranded prefix visible at all.
 //
-// # What it is for
-//
-// A row records its destination topic at insert time, so changing KAFKA_TOPIC_PREFIX leaves
-// committed rows naming the previous generation's topics. They stay publishable only while
-// that prefix is declared in KAFKA_HISTORICAL_TOPIC_PREFIXES. Declare nothing and the rows are
-// stranded: the publisher refuses each topic, the rows stay claimable for ever, their
-// dead-letter writes and replays are refused with them — and every status count still reads as
-// ordinary outstanding work. The only evidence is a topic name on rows nobody is reading, so
-// this audit exists to turn that into a prefix an operator can act on.
-//
-// # Why the negative cases matter as much as the finding
-//
-// The audit's output becomes advice to widen the owned namespace, so it must not name a
-// namespace that is already owned (nothing to fix) or one parsed out of a malformed row
-// (advice to admit a topic on the strength of one bad value).
+// A row records its destination topic at insert time, so changing KAFKA_TOPIC_PREFIX
+// leaves committed rows naming the previous generation's topics.
 func TestAuditStrandedTopicPrefixes_NamesTheUndeclaredGenerationAndNothingElse(t *testing.T) {
 	older := time.Now().UTC().Add(-72 * time.Hour)
 	newer := older.Add(time.Hour)
@@ -2744,9 +2345,9 @@ func TestAuditStrandedTopicPrefixes_NamesTheUndeclaredGenerationAndNothingElse(t
 			{Topic: "__consumer_offsets", UndeliveredRows: 1, OldestOccurredAt: older},
 			{Topic: "transactions", UndeliveredRows: 1, OldestOccurredAt: older},
 			// A near miss rather than an obvious foreign name: "balance" singular, where the
-			// category is "balances". The suffix has to fail category membership for the
-			// prefix to be unrecommendable, and a name that differs by one character is the
-			// case a suffix-tolerant parse would wave through.
+			// category is "balances". The suffix has to fail category membership for the prefix
+			// to be unrecommendable, and a name that differs by one character is the case a
+			// suffix-tolerant parse would wave through.
 			{Topic: "blnk.balance", UndeliveredRows: 1, OldestOccurredAt: older},
 			{Topic: "", UndeliveredRows: 1, OldestOccurredAt: older},
 		}}
@@ -2784,16 +2385,9 @@ func TestAuditStrandedTopicPrefixes_NamesTheUndeclaredGenerationAndNothingElse(t
 //   - The routing must be TOTAL. The relay publishes to whatever topic it is handed, so
 //     returning an empty string would strand a committed event — no topic, no publish,
 //     no dead-letter entry, nothing to replay — and dropping it would lose it outright.
-//   - The destination must be the NARROWEST topic in the catalogue, because a producer added
-//     without extending the mapping lands its payload there — plausibly a balance or an
-//     identity record — and whoever is reading that topic was not expecting it.
-//
-// blnk.system satisfies both: the event is published, observable and replayable, and the
-// system category is the one an operator grants deliberately and rarely, only to a subscriber
-// that needs ledger events (see model.EventCategorySystem for what such a grant discloses).
-// Containment here is therefore a matter of WHO WAS GRANTED the topic rather than of the
-// topic being ungrantable, and the capture-time warning below is what makes the omission
-// visible so the mapping gets fixed rather than relied on.
+//   - The destination must be the NARROWEST topic in the catalogue, because a producer
+//     added without extending the mapping lands its payload there — plausibly a balance
+//     or an identity record — and whoever is reading that topic was not expecting it.
 func TestTopicForEvent_UnrecognisedEventRoutesToTheInternalSystemTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
@@ -2809,12 +2403,8 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheInternalSystemTopic(t *testin
 		"Balance.Created",
 		// A longer string that merely starts with an emitted name is not that event.
 		"transaction.applied.v2",
-		// Unusual characters. None of these is a realistic event name, and that is the
-		// point: routing has to be TOTAL. Anything a caller can hand this function must
-		// come back as a usable topic, because the relay publishes to whatever name it is
-		// given and has no branch for "no topic". A panic, an empty string or a
-		// half-composed name here would each strand the event, so the awkward inputs are
-		// asserted rather than assumed.
+		// Unusual characters. None of these is a realistic event name, and that is the point:
+		// routing has to be TOTAL.
 		"événement.créé",             // non-ASCII letters
 		"事件.已创建",                     // multi-byte, no ASCII at all
 		"transaction.applied.💥",      // an emoji outside the Basic Multilingual Plane
@@ -2838,8 +2428,8 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheInternalSystemTopic(t *testin
 			"the catch-all must stay the system topic: routing an unmapped event to a category "+
 				"topic subscribers hold broadly would hand its payload to every one of them")
 
-		// The event's own name must never leak into the topic name. Composing the event
-		// into the topic would create a topic per event type on demand — unprovisioned,
+		// The event's own name must never leak into the topic name. Composing the event into
+		// the topic would create a topic per event type on demand — unprovisioned,
 		// single-partition, wrongly replicated, and read by nobody.
 		assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent(eventType),
 			"and its dead-letter sibling must be the system topic's, not one derived from %q", eventType)
@@ -2847,14 +2437,8 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheInternalSystemTopic(t *testin
 }
 
 // TestTopicForCategory_BlankCategoryFallsBackToTheInternalSystemTopic pins the guard
-// against composing a name with an empty final segment, and pins where the fallback goes.
-//
-// "<prefix>." is a topic Kafka would accept and nothing would read, so a blank category
-// must still compose a usable name — the same never-drop-an-event policy the event
-// mapping's own catch-all implements. It falls back to the SYSTEM topic, which is the
-// catch-all model.EventCategory itself uses: a blank category means the caller could not
-// classify the event, so its audience is unknown, and the system topic is the one an operator
-// grants deliberately rather than by default.
+// against composing a name with an empty final segment, and pins where the fallback
+// goes.
 func TestTopicForCategory_BlankCategoryFallsBackToTheInternalSystemTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 

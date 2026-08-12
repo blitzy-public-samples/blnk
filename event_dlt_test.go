@@ -54,20 +54,6 @@ import (
 // event_dlt_test.go covers the three operations event_dlt.go owns — dead-letter
 // publication, listing and replay — plus the two metrics they maintain.
 //
-// Every test here runs with NO KAFKA BROKER AND NO DATABASE. The implementation
-// depends on two small seams for exactly this reason: eventDeadLetterStore for the
-// repository and deadLetterWriterResolver for the transport, both substituted below by
-// in-memory fakes. The end-to-end proofs of the same guarantees live in
-// event_replay_fidelity_test.go and the integration tests; asserting them at unit level
-// here is what catches a regression without infrastructure, on every `go test -short`.
-//
-// # SCOPE BOUNDARY: Blnk publishes the `<topic>.dlt` naming convention and NOTHING MORE
-//
-// "Dead letter" throughout this file means BLNK'S OWN dead-letter topics. Blnk owns the
-// `.dlt` sibling of every topic it owns, and it publishes that naming convention
-// externally for one reason: so that a subscriber building its own consumer-side
-// dead-lettering does not collide with a Blnk-owned topic name.
-//
 // Blnk therefore does NOT implement, and no test in this file may imply that it
 // implements, any of the following:
 //
@@ -75,19 +61,8 @@ import (
 //   - subscriber-side dead-letter management — creating, reading, draining or replaying
 //     a dead-letter topic that a SUBSCRIBER owns,
 //   - a consumer error-handling or poison-message framework.
-//
-// A subscriber's consumption failures are the subscriber's own to handle. Consistently
-// with that, nothing under test here reads from Kafka at all: the listing and the replay
-// both work from the outbox ROW, which carries dlt_topic and failure_metadata precisely
-// so that no consumer is needed. TestEventDeadLetterSource_BuildsNoConsumerSurface
-// enforces that boundary over the source itself rather than trusting this comment.
 
 // dltFixedNow is the instant every dead-letter test measures against.
-//
-// The service's clock is a field, so it is replaced wholesale rather than tolerated with
-// a delta: an age gauge asserted "within a second or so" would pass with the newest entry
-// reported instead of the oldest, which is the exact defect the 15-minute alert depends
-// on catching.
 var dltFixedNow = time.Date(2026, time.April, 11, 9, 30, 0, 0, time.UTC)
 
 // dltOccurredAt is the occurrence instant of the fixture event. Its sub-second component
@@ -112,8 +87,8 @@ var dltOccurredAt = time.Date(2026, time.April, 11, 8, 15, 26, 535897000, time.U
 //
 // A byte-for-byte assertion against this payload therefore PROVES the pass-through
 // property rather than merely being consistent with it. It is the same object shape the
-// legacy webhook body has — the two-key {"event", "data"} envelope — because that is what
-// LedgerEvent.payload carries verbatim.
+// legacy webhook body has — the two-key {"event", "data"} envelope — because that is
+// what LedgerEvent.payload carries verbatim.
 const dltTrapPayload = `{"event":"transaction.applied","data":{"z_last":1,"a_first": 2,` +
 	`"amount":1.500,"html":"<b>&</b>","big":10000000000000000000000.5,` +
 	`"nested":{"y":1,"x": 2}}}`
@@ -121,8 +96,8 @@ const dltTrapPayload = `{"event":"transaction.applied","data":{"z_last":1,"a_fir
 // dltPublishFailureReason is the failure text carried into the metadata.
 //
 // It is long, and that is the point: the requirement is that the reason is the ACTUAL
-// publish error and is not truncated to uselessness, so the assertion compares the whole
-// string. A truncating implementation passes a short-string test and fails this one.
+// publish error and is not truncated to uselessness, so the assertion compares the
+// whole string.
 const dltPublishFailureReason = "blnk: writing event to topic blnk.transactions: " +
 	"[7] Request Timed Out: the request exceeded the user-specified time limit in the request; " +
 	"the leader for partition 3 did not receive acknowledgements from the required number of " +
@@ -141,15 +116,11 @@ type dltCategoryRoute struct {
 	deadLetterTopic string
 }
 
-// dltCategoryRoutes is the dead-letter routing expectation for all four categories, with
-// every topic name SPELLED OUT AS A LITERAL.
+// dltCategoryRoutes is the dead-letter routing expectation for all four categories,
+// with every topic name SPELLED OUT AS A LITERAL.
 //
 // Deriving these from DLTFor would make the test agree with the implementation by
-// construction and prove nothing. Three of the four dead-letter names —
-// blnk.transactions.dlt, blnk.balances.dlt and blnk.identities.dlt — are verbatim
-// user-supplied examples from the requirement and must match byte for byte. The fourth,
-// blnk.system.dlt, carries ledger.created, system.error and every event whose type the
-// catalogue does not recognise, and follows the identical convention.
+// construction and prove nothing.
 var dltCategoryRoutes = []dltCategoryRoute{
 	{
 		eventType:       "transaction.applied",
@@ -195,12 +166,11 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	// The system category's sibling. That category holds ledger.created, system.error and every event
-	// whose type the catalogue does not recognise, and those last are exactly the events
-	// most likely to fail to publish, so its dead-letter topic must be covered by the age
-	// gauge like any other — a stalled entry there being invisible would hide the failure
-	// of an event that was already a routing defect. A dead-letter topic is never
-	// grantable, whatever its category is.
+	// The system category's sibling. That category holds ledger.created, system.error and
+	// every event whose type the catalogue does not recognise, and those last are exactly
+	// the events most likely to fail to publish, so its dead-letter topic must be covered
+	// by the age gauge like any other — a stalled entry there being invisible would hide
+	// the failure of an event that was already a routing defect.
 	"blnk.system.dlt",
 }
 
@@ -210,11 +180,6 @@ var dltAllDeadLetterTopics = []string{
 
 // dltMarkRecord is one recorded MarkEventDeadLettered call: the row it named, the
 // dead-letter topic it recorded, and the metadata bytes it stored.
-//
-// The metadata is kept as the exact bytes the service passed, not as a decoded struct,
-// because one of the properties asserted below is that the bytes stored on the row and the
-// bytes spliced into the message are the SAME bytes rather than merely equivalent
-// documents.
 type dltMarkRecord struct {
 	id         int64
 	claimToken string
@@ -231,9 +196,7 @@ type dltMarkRecord struct {
 //
 // It is the repository's own narrowing contract rather than a limit/offset pair of this
 // file's own invention, because that is now the WHOLE of what the service asks the
-// repository for. Recording anything narrower would make the test unable to see the
-// defect it exists to prevent: a filter that the service accepts and then fails to pass
-// down would be invisible if only the page were captured.
+// repository for.
 type dltPageRequest = model.DeadLetterQuery
 
 // dltFakeStore is an in-memory eventDeadLetterStore.
@@ -248,18 +211,14 @@ type dltPageRequest = model.DeadLetterQuery
 //     newest occurrence first — so offset arithmetic is exercised the way production
 //     exercises it, including the oldest-end walk the age gauge performs.
 //   - ListDeadLetteredEventsFiltered and CountDeadLetteredEvents apply the filter
-//     PREDICATES THEMSELVES, mirroring deadLetterFilterClause: exact comparison, a status
-//     filter replacing the two-state default, limit and offset counting MATCHES rather
-//     than rows, and both narrowing off the same inventory so the listing and the count
-//     cannot silently describe different sets. Modelling the predicates here rather than
-//     in the service is the point — it is what makes a service that filtered in Go fail
-//     these tests.
-//   - MarkEventDispatched MUTATES the row to dispatched and DROPS IT from the inventory,
-//     which is what the real query does implicitly by filtering on the two terminal
-//     failure states. That is what makes "a replayed event is no longer listed" and "a
-//     second replay is refused" observable here at all.
-//
-// It is mutex-guarded so the whole file is safe under `go test -race`.
+//     PREDICATES THEMSELVES, mirroring deadLetterFilterClause: exact comparison, a
+//     status filter replacing the two-state default, limit and offset counting MATCHES
+//     rather than rows, and both narrowing off the same inventory so the listing and
+//     the count cannot silently describe different sets.
+//   - MarkEventDispatched MUTATES the row to dispatched and DROPS IT from the
+//     inventory, which is what the real query does implicitly by filtering on the two
+//     terminal failure states. That is what makes "a replayed event is no longer
+//     listed" and "a second replay is refused" observable here at all.
 type dltFakeStore struct {
 	mu sync.Mutex
 
@@ -273,11 +232,6 @@ type dltFakeStore struct {
 	counts map[string]int64
 
 	// Injectable failures, each covering one documented error path.
-	//
-	// listErr covers BOTH listing entry points, because both are the same statement to a
-	// caller: a repository that cannot page the inventory cannot page a filtered slice of
-	// it either, and a fake that failed only one would let a propagation test pass while
-	// the path the API actually uses swallowed the error.
 	getErr              error
 	listErr             error
 	countErr            error
@@ -304,24 +258,24 @@ type dltFakeStore struct {
 	// than being applied above it.
 	inventoryQueries []model.DeadLetterQuery
 
-	// inventoryPages records the KEYSET request each inventory read was made with, so a test can
-	// assert the limit the repository was asked for and the cursor it was handed — neither of
-	// which survives the narrowing recorded above.
+	// inventoryPages records the KEYSET request each inventory read was made with, so a
+	// test can assert the limit the repository was asked for and the cursor it was handed
+	// — neither of which survives the narrowing recorded above.
 	inventoryPages []model.DeadLetterInventoryQuery
 	countQueries   []model.DeadLetterQuery
 
-	// ageCalls counts the grouped age reads and ageErr drives their failure, so the gauge's
-	// degraded path is reachable and the aggregate is provably read once per refresh rather
-	// than once per topic.
+	// ageCalls counts the grouped age reads and ageErr drives their failure, so the
+	// gauge's degraded path is reachable and the aggregate is provably read once per
+	// refresh rather than once per topic.
 	ageCalls int
 	ageErr   error
 
 	replayClaims  []string
 	replayRelease []dltReleaseRecord
 
-	// nextClaimToken is the token ClaimEventForReplay hands out. It is a field rather
-	// than a generated value so a test can assert that the token the service presents to
-	// its follow-up transition is EXACTLY the one the claim issued — which is the whole
+	// nextClaimToken is the token ClaimEventForReplay hands out. It is a field rather than
+	// a generated value so a test can assert that the token the service presents to its
+	// follow-up transition is EXACTLY the one the claim issued — which is the whole
 	// mechanism, and a generated token would make it unassertable.
 	nextClaimToken string
 }
@@ -329,8 +283,8 @@ type dltFakeStore struct {
 // dltDispatchRecord is one MarkEventDispatched call, with the token it presented.
 //
 // The token is recorded because a transition that ignored it would be indistinguishable
-// from one that honoured it if only the row id were captured — and ignoring it is exactly
-// the defect the token exists to prevent.
+// from one that honoured it if only the row id were captured — and ignoring it is
+// exactly the defect the token exists to prevent.
 type dltDispatchRecord struct {
 	id         int64
 	claimToken string
@@ -348,8 +302,9 @@ type dltReleaseRecord struct {
 	replayErr  string
 
 	// contextErr is what the context reported at the moment the release was entered. It is
-	// what proves the release did not inherit the caller's cancellation: the service runs it
-	// on context.WithoutCancel, so this must be nil even when the caller's context is dead.
+	// what proves the release did not inherit the caller's cancellation: the service runs
+	// it on context.WithoutCancel, so this must be nil even when the caller's context is
+	// dead.
 	contextErr error
 
 	// hasDeadline and deadline record the bound the release was given. Detachment alone is
@@ -383,10 +338,11 @@ func (s *dltFakeStore) withRow(row model.EventOutbox) *dltFakeStore {
 	stored := row
 	s.rows[row.EventID] = &stored
 
-	// BOTH failure states join the inventory, matching ListDeadLetterInventory, which covers
-	// dead_lettered and failed. failed especially: a failed row whose dlt_topic is still NULL
-	// is the "dead-letter write is owed" state, so while it sits there its event exists in no
-	// topic at all, which makes it the one an operator most needs to see.
+	// BOTH failure states join the inventory, matching ListDeadLetterInventory, which
+	// covers dead_lettered and failed. failed especially: a failed row whose dlt_topic is
+	// still NULL is the "dead-letter write is owed" state, so while it sits there its
+	// event exists in no topic at all, which makes it the one an operator most needs to
+	// see.
 	switch row.Status {
 	case model.EventOutboxStatusDeadLettered,
 		model.EventOutboxStatusFailed:
@@ -433,14 +389,8 @@ func (s *dltFakeStore) GetEventByID(_ context.Context, eventID string) (*model.E
 // ListDeadLetteredEvents applies the query's narrowing and then pages what matches,
 // newest first.
 //
-// The FILTERING HAPPENS HERE, in the fake repository, because that is where it happens in
-// production: the predicates are rendered into the SQL WHERE clause. It used to happen in
-// the service, above this boundary, and a fake that still filtered above would let a
-// service which silently dropped a filter pass.
-//
-// The consequence for the page arithmetic is the one that matters: limit and offset are
-// applied to the MATCHING rows, so a filtered page is a page of the filtered set rather
-// than a filtered page of the unfiltered one.
+// The FILTERING HAPPENS HERE, in the fake repository, because that is where it happens
+// in production: the predicates are rendered into the SQL WHERE clause.
 func (s *dltFakeStore) ListDeadLetteredEvents(_ context.Context, query model.DeadLetterQuery) ([]model.EventOutbox, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -481,9 +431,9 @@ func (s *dltFakeStore) ListDeadLetteredEvents(_ context.Context, query model.Dea
 
 // CountDeadLetteredEvents counts what the SAME narrowing matches, ignoring the page.
 //
-// It is deliberately driven from matchingLocked, the same predicate the listing uses, so
-// this fake cannot exhibit the very defect the production count exists to rule out — a
-// total describing a different set than the page it accompanies.
+// It is deliberately driven from matchingLocked, the same predicate the listing uses,
+// so this fake cannot exhibit the very defect the production count exists to rule out —
+// a total describing a different set than the page it accompanies.
 func (s *dltFakeStore) CountDeadLetteredEvents(_ context.Context, query model.DeadLetterQuery) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -500,10 +450,8 @@ func (s *dltFakeStore) CountDeadLetteredEvents(_ context.Context, query model.De
 // matchingLocked returns the inventory rows the query's predicates admit, in repository
 // order. The caller must hold the mutex.
 //
-// Comparison is exact and case-sensitive throughout, and the topic predicate is applied to
-// the row's ORIGINAL topic column, both matching the SQL. The occurrence window is
-// inclusive at both ends, so a window whose bounds are equal selects the events at exactly
-// that instant.
+// Comparison is exact and case-sensitive throughout, and the topic predicate is applied
+// to the row's ORIGINAL topic column, both matching the SQL.
 func (s *dltFakeStore) matchingLocked(query model.DeadLetterQuery) []model.EventOutbox {
 	matching := make([]model.EventOutbox, 0, len(s.inventory))
 	for _, eventID := range s.inventory {
@@ -518,9 +466,9 @@ func (s *dltFakeStore) matchingLocked(query model.DeadLetterQuery) []model.Event
 
 // CountUnresolvedEventOutbox returns a copy of the status counts.
 //
-// It takes no window, matching the aggregate the dead-letter seam now declares (PERF-M05): the
-// `failed` count this service reads is exact and complete for all time, and the dispatched
-// history the previous windowed aggregate also counted was read by nobody.
+// It takes no window, matching the aggregate the dead-letter seam now declares: the
+// `failed` count this service reads is exact and complete for all time, and the
+// dispatched history the previous windowed aggregate also counted was read by nobody.
 func (s *dltFakeStore) CountUnresolvedEventOutbox(_ context.Context) (map[string]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -641,10 +589,6 @@ func (s *dltFakeStore) MarkEventDispatched(
 
 // ClaimEventForReplay is the atomic dead_lettered -> replaying transition, faithful to
 // the repository's discrimination between the two failure causes.
-//
-// It is a CLAIM and not a lookup, and modelling that faithfully in the fake is what lets
-// the concurrency test mean anything: the second claim of one row must fail because the
-// FIRST one moved it, not because the fake was told to fail.
 func (s *dltFakeStore) ClaimEventForReplay(
 	_ context.Context,
 	eventID string,
@@ -658,9 +602,9 @@ func (s *dltFakeStore) ClaimEventForReplay(
 	if s.claimReplayErr != nil {
 		return nil, s.claimReplayErr
 	}
-	// getErr models a database that is unreachable, and the CLAIM is now the first read
-	// a replay performs — so it has to fail the same way GetEventByID would, or a
-	// database outage would be reported as a missing event.
+	// getErr models a database that is unreachable, and the CLAIM is now the first read a
+	// replay performs — so it has to fail the same way GetEventByID would, or a database
+	// outage would be reported as a missing event.
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
@@ -685,7 +629,8 @@ func (s *dltFakeStore) ClaimEventForReplay(
 
 	// The status count moves with the row, exactly as a real GROUP BY would. Leaving it on
 	// dead_lettered would make the age gauge keep reporting an entry that is no longer in
-	// that state, so the fake's bookkeeping has to be as faithful as the transition itself.
+	// that state, so the fake's bookkeeping has to be as faithful as the transition
+	// itself.
 	if s.counts[model.EventOutboxStatusDeadLettered] > 0 {
 		s.counts[model.EventOutboxStatusDeadLettered]--
 	}
@@ -697,18 +642,8 @@ func (s *dltFakeStore) ClaimEventForReplay(
 
 // ReleaseEventReplay is the rollback: replaying -> dead_lettered, recording the reason.
 //
-// # It OBSERVES the context, and that is not incidental
-//
-// The release runs on a context the service DETACHES from the caller's cancellation and bounds
-// with its own timeout, because the commonest way a replay fails is the caller going away —
-// a closed browser tab, a proxy timeout, a deploy taking the process down mid-replay. Run on
-// the caller's context instead, the rollback fails for exactly the reason the replay did, every
-// time, and the row is left in `replaying` holding a token nobody has.
-//
-// A fake that ignored the context could not tell those two implementations apart: both call
-// this method with the same arguments and both record the same release. So this one behaves
-// like the database — it REFUSES a cancelled context — and records the deadline it was given,
-// which is what lets a test assert the detachment rather than trust it.
+// A fake that ignored the context could not tell those two implementations apart: both
+// call this method with the same arguments and both record the same release.
 func (s *dltFakeStore) ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error {
 	deadline, hasDeadline := ctx.Deadline()
 
@@ -722,9 +657,10 @@ func (s *dltFakeStore) ReleaseEventReplay(ctx context.Context, id int64, claimTo
 		deadline:    deadline,
 	})
 
-	// A REAL DATABASE CALL FAILS ON A DEAD CONTEXT, so this one does too. lib/pq checks the
-	// context before it writes and cancels the statement if it is already done, so a release
-	// handed a cancelled context does not perform the update — it returns the cancellation.
+	// A REAL DATABASE CALL FAILS ON A DEAD CONTEXT, so this one does too. lib/pq checks
+	// the context before it writes and cancels the statement if it is already done, so a
+	// release handed a cancelled context does not perform the update — it returns the
+	// cancellation.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -868,11 +804,6 @@ func dltContainsString(values []string, target string) bool {
 
 // dltWrittenMessage is one message the fake transport was asked to write, together with
 // the topic whose writer wrote it.
-//
-// The topic is recorded alongside the message rather than read from it because the
-// production writers are per-topic and kafka-go rejects a message that names a topic when
-// its writer already has one — so kafka.Message.Topic is legitimately empty, and asserting
-// on it would assert the wrong thing.
 type dltWrittenMessage struct {
 	topic   string
 	message kafka.Message
@@ -882,8 +813,7 @@ type dltWrittenMessage struct {
 //
 // It answers a deadLetterWriterResolver and hands back a per-topic writer, which is the
 // same shape the production resolver has: the Kafka publisher returns the writer it
-// already holds for that topic. Every resolution and every write is recorded, so the
-// destination, the key and the message BYTES are all assertable with no broker.
+// already holds for that topic.
 type dltFakeTransport struct {
 	mu sync.Mutex
 
@@ -971,15 +901,6 @@ func (w *dltFakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) 
 }
 
 // dltFakePublisher is a TopicEventPublisher that records what it was asked to publish.
-//
-// It reproduces the real publisher's RESULT SHAPE by resolving the topic, key and attempt
-// through the very functions the Kafka implementation uses, so a caller reading the result
-// sees the same fields either way and an assertion on the result is an assertion about
-// production behaviour rather than about this fake.
-//
-// Deliberately, it is neither the Kafka publisher nor the no-op, which is what makes it
-// usable to exercise the third arm of publisherWriterResolver: a publisher that cannot be
-// written to with a composed message must be refused loudly rather than silently skipped.
 type dltFakePublisher struct {
 	mu sync.Mutex
 
@@ -990,10 +911,10 @@ type dltFakePublisher struct {
 	// closes counts Close calls, so publisher ownership can be asserted.
 	closes int
 
-	// onPublish runs before the request is recorded, for a test that needs something to happen
-	// at the one instant the row is claimed and the replay is not yet over. Cancelling the
-	// caller's context from here is the only way to reach the rollback path with a dead caller,
-	// which is the state that path exists for.
+	// onPublish runs before the request is recorded, for a test that needs something to
+	// happen at the one instant the row is claimed and the replay is not yet over.
+	// Cancelling the caller's context from here is the only way to reach the rollback path
+	// with a dead caller, which is the state that path exists for.
 	onPublish func()
 }
 
@@ -1073,10 +994,6 @@ type dltCounterRecord struct {
 
 // dltRecordedCounter stands in for a shared Int64Counter so that both the number of
 // increments AND their attributes can be asserted.
-//
-// embedded.Int64Counter is EMBEDDED rather than implemented: that is how the OpenTelemetry
-// API intends a third-party implementation of an instrument interface to be written, and it
-// is what keeps this compiling if the interface gains a method.
 type dltRecordedCounter struct {
 	embedded.Int64Counter
 
@@ -1205,38 +1122,22 @@ func dltAttributeMap(pairs []attribute.KeyValue) map[string]string {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// dltPinTopicPrefix publishes a configuration carrying only the default topic prefix, so
-// every derived topic name in a test is deterministic.
+// dltPinTopicPrefix publishes a configuration carrying only the default topic prefix,
+// so every derived topic name in a test is deterministic.
 //
 // It delegates to the shared storeKafkaTopicPrefix helper, which SAVES AND RESTORES
-// config.ConfigStore through t.Cleanup. That restoration is what keeps this file from
-// leaking state into the rest of the package's tests: the configuration store is an
-// atomic.Value shared by the whole test binary, and a prefix left behind would silently
-// rename the topics another test asserts on.
+// config.ConfigStore through t.Cleanup.
 func dltPinTopicPrefix(t *testing.T) {
 	t.Helper()
 
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 }
 
-// dltExhaustedRow builds the outbox row of an event that has just spent its entire retry
-// budget — the row the relay hands to the dead-letter path.
+// dltExhaustedRow builds the outbox row of an event that has just spent its entire
+// retry budget — the row the relay hands to the dead-letter path.
 //
-// Its status is FAILED with dlt_topic still EMPTY, and that pair is the whole point of the
-// fixture. It is exactly what the relay's exhaustion arm writes, and it is the state that
-// means "the retry budget is spent and the dead-letter write is still owed". The pair is NOT
-// terminal: the row keeps its lease so no second worker writes the same event to a .dlt
-// topic, and once that lease lapses ClaimFailedEventOutboxForDeadLetter re-claims it, which is
-// what keeps a failed dead-letter write recoverable instead of stranding the event. Seeding
-// dead_lettered here would model a hand-off that has already completed and would certify the
-// opposite of what these tests exist to prove. The dead-letter listing covers failed and
-// dead_lettered alike, so an operator sees the row in either state.
-//
-// The attempt window is genuinely SPREAD: the first attempt is 31 seconds before the last,
-// which is what the documented backoff schedule (1s, 2s, 4s, 8s, 16s across five attempts)
-// produces. Two distinct instants are essential rather than cosmetic — a fixture whose
-// first and last attempts coincided would pass even if the implementation assigned them
-// the wrong way round.
+// Its status is FAILED with dlt_topic still EMPTY, and that pair is the whole point of
+// the fixture.
 //
 // Parameters:
 //   - eventID: the business event id, which is also the subscriber idempotency key.
@@ -1256,14 +1157,9 @@ func dltExhaustedRow(t *testing.T, eventID, eventType, topic string) model.Event
 		AggregateID: "txn_9c2f4a17",
 		// THREE DIFFERENT VALUES in the three columns, deliberately.
 		//
-		// A real transaction row looks exactly like this: the partition key is the
-		// source balance the transaction moved value from, the aggregate is the
-		// transaction itself, and the ledger column is populated only when the payload
-		// carries a ledger. Making all three distinct is what lets an assertion on the
-		// message key mean something — a fixture that left the partition key blank, or
-		// set it equal to the ledger, would pass whether the implementation keyed on
-		// partition_key, ledger_id or aggregate_id, which is precisely how the key
-		// diverging from the column the claim query serialises on went unnoticed.
+		// A real transaction row looks exactly like this: the partition key is the source
+		// balance the transaction moved value from, the aggregate is the transaction itself,
+		// and the ledger column is populated only when the payload carries a ledger.
 		PartitionKey:     "bln_7d3ac6f1",
 		LedgerID:         "ldg_5f1b8e04",
 		Topic:            topic,
@@ -1285,11 +1181,9 @@ func dltExhaustedRow(t *testing.T, eventID, eventType, topic string) model.Event
 
 // dltStampCanonicalEnvelope fills event_raw the way PrepareEventOutbox does at capture.
 //
-// The column is NOT NULL and it is what every transport reads, so a fixture without it is a
-// row the database cannot hold and a scenario that exercises the compatibility fallback rather
-// than the live path. It is stamped LAST, after every envelope member is final, because the
-// stored bytes and the columns they were composed from must agree — a fixture that changed
-// occurred_at after stamping would describe a row no writer could produce.
+// The column is NOT NULL and it is what every transport reads, so a fixture without it
+// is a row the database cannot hold and a scenario that exercises the compatibility
+// fallback rather than the live path.
 func dltStampCanonicalEnvelope(t *testing.T, row *model.EventOutbox) {
 	t.Helper()
 
@@ -1299,11 +1193,6 @@ func dltStampCanonicalEnvelope(t *testing.T, row *model.EventOutbox) {
 }
 
 // dltRowID derives a stable, strictly positive surrogate key from an event id.
-//
-// Distinct ids per fixture matter rather than being tidiness: the store's state transitions are
-// addressed BY ROW ID, so two fixtures sharing one id would let a transition mutate the wrong
-// row — a defect that would surface as an intermittent failure depending on map iteration order.
-// Deriving the id from the event id keeps every fixture distinct and every run identical.
 func dltRowID(eventID string) int64 {
 	// FNV-1a, spelled out so the value is obviously deterministic and obviously positive.
 	hash := uint64(14695981039346656037)
@@ -1317,11 +1206,6 @@ func dltRowID(eventID string) int64 {
 
 // dltNewService builds a dead-letter service on a fixed clock with the fake transport
 // installed.
-//
-// withTransport is the seam the implementation declares for exactly this: it installs the
-// publisher and the writer resolver as ONE assignment, so transport() never falls through
-// to building a real publisher from configuration and no test can accidentally dial a
-// broker.
 func dltNewService(store eventDeadLetterStore, publisher TopicEventPublisher, transport *dltFakeTransport) *EventDeadLetterService {
 	service := NewEventDeadLetterService(store, nil)
 	service.now = func() time.Time { return dltFixedNow }
@@ -1332,8 +1216,8 @@ func dltNewService(store eventDeadLetterStore, publisher TopicEventPublisher, tr
 
 // dltCaptureDeadLetterCounter swaps the shared dead-letter counter for a recorder.
 //
-// Swapping the package-level instrument keeps the test local: no global meter provider is
-// installed, so no other test in the binary is affected, and the real instrument is
+// Swapping the package-level instrument keeps the test local: no global meter provider
+// is installed, so no other test in the binary is affected, and the real instrument is
 // restored on cleanup.
 func dltCaptureDeadLetterCounter(t *testing.T) *dltRecordedCounter {
 	t.Helper()
@@ -1346,12 +1230,8 @@ func dltCaptureDeadLetterCounter(t *testing.T) *dltRecordedCounter {
 	return recorder
 }
 
-// dltCaptureBrokerAcknowledgements swaps the shared broker-acknowledgement counter for a
-// recorder, so the PURPOSE a dead-letter write is counted under can be asserted.
-//
-// The instrument is shared with the ordinary publish path, which is the whole point: the
-// counter's value is that the three purposes are summable on one query, and a dead-letter
-// write that recorded nothing left the documented triage breakdown permanently unanswerable.
+// dltCaptureBrokerAcknowledgements swaps the shared broker-acknowledgement counter for
+// a recorder, so the PURPOSE a dead-letter write is counted under can be asserted.
 func dltCaptureBrokerAcknowledgements(t *testing.T) *dltRecordedCounter {
 	t.Helper()
 
@@ -1376,12 +1256,9 @@ func dltCapturePublishAttempts(t *testing.T) *dltRecordedCounter {
 	return recorder
 }
 
-// dltCapturePublishDuration swaps the shared publish-duration histogram for a recorder, so
-// the attempt token and the measured duration a dead-letter write records can be asserted.
-//
-// It reuses the recorder declared beside the publisher's own tests rather than redeclaring
-// one: both files exercise the same instrument, and two recorders would let the two files
-// disagree about what a recorded observation looks like.
+// dltCapturePublishDuration swaps the shared publish-duration histogram for a recorder,
+// so the attempt token and the measured duration a dead-letter write records can be
+// asserted.
 func dltCapturePublishDuration(t *testing.T) *publisherRecordedHistogram {
 	t.Helper()
 
@@ -1407,10 +1284,9 @@ func dltCaptureAgeGauge(t *testing.T) *dltRecordedFloatGauge {
 
 // dltOriginalEnvelope returns the bytes the FIRST publish of this row produced.
 //
-// It goes through the production path — the row-to-request conversion and the value resolution
-// the Kafka publisher itself performs — so it is the real message value and not a test's idea of
-// one. For a row carrying event_raw, which every fixture here does, that resolution returns the
-// STORED envelope. Every byte-fidelity assertion in this file is stated against it.
+// It goes through the production path — the row-to-request conversion and the value
+// resolution the Kafka publisher itself performs — so it is the real message value and
+// not a test's idea of one.
 func dltOriginalEnvelope(t *testing.T, row model.EventOutbox) []byte {
 	t.Helper()
 
@@ -1420,13 +1296,9 @@ func dltOriginalEnvelope(t *testing.T, row model.EventOutbox) []byte {
 	return envelope
 }
 
-// dltDeadLetterRow returns the row as it stands AFTER a dead-lettering, as the repository
-// would have left it: dead-lettered, with the dead-letter topic and the metadata bytes
-// recorded.
-//
-// The metadata bytes are the ones the outcome carries, not a re-serialisation of the
-// decoded record, because the point of the replay assertions is that the STORED bytes are
-// what a replay reads.
+// dltDeadLetterRow returns the row as it stands AFTER a dead-lettering, as the
+// repository would have left it: dead-lettered, with the dead-letter topic and the
+// metadata bytes recorded.
 func dltDeadLetterRow(row model.EventOutbox, outcome DeadLetterOutcome) model.EventOutbox {
 	row.Status = model.EventOutboxStatusDeadLettered
 	row.DLTTopic = outcome.DeadLetterTopic
@@ -1437,10 +1309,6 @@ func dltDeadLetterRow(row model.EventOutbox, outcome DeadLetterOutcome) model.Ev
 
 // dltAPIError extracts the typed APIError from an error, failing the test when there is
 // none.
-//
-// APIError is a VALUE type in this codebase and does not unwrap to the error it wrapped, so
-// the CODE is what has to be inspected — which is precisely why every assertion below reads
-// the code rather than matching on a message.
 func dltAPIError(t *testing.T, err error) apierror.APIError {
 	t.Helper()
 
@@ -1452,18 +1320,11 @@ func dltAPIError(t *testing.T, err error) apierror.APIError {
 	return apiErr
 }
 
-// dltAssertCodeAndStatus asserts both halves of the error convention at once: the domain
-// returned the intended CODE, and that code has an explicit statusByCode entry resolving to
-// the intended HTTP STATUS.
+// dltAssertCodeAndStatus asserts both halves of the error convention at once: the
+// domain returned the intended CODE, and that code has an explicit statusByCode entry
+// resolving to the intended HTTP STATUS.
 //
-// Both halves are needed. An unmapped code silently resolves to 500, so a test that checked
-// only the code would pass while the API contract was wrong.
-//
-// Codes are compared through Normalize because internal layers in this codebase still
-// construct the pre-catalog generic codes — the row-validation guard returns INVALID_INPUT —
-// while a response always surfaces the canonical GEN_* replacement. Comparing the canonical
-// forms asserts the contract a caller actually observes, and the status is asserted for BOTH
-// the raw code and its canonical form so neither can be the one missing its mapping.
+// Both halves are needed.
 func dltAssertCodeAndStatus(t *testing.T, err error, code apierror.ErrorCode, status int) {
 	t.Helper()
 
@@ -1502,15 +1363,8 @@ func dltReadSource(t *testing.T, elements ...string) string {
 	return string(contents)
 }
 
-// dltReadCode returns a Go file's source with EVERY COMMENT REMOVED, so a structural assertion
-// judges the code rather than the prose about it.
-//
-// The distinction is not pedantic: event_dlt.go deliberately WARNS in a comment that reaching for
-// a kafka.Reader would mean the scope boundary has been misread, and it names the ".dlt" literal
-// in a comment explaining why a blank topic is guarded. A naive substring search over the raw file
-// would flag both and would therefore have to be weakened to the point of proving nothing.
-// Parsing without comment collection and printing the AST back leaves exactly the executable
-// source.
+// dltReadCode returns a Go file's source with EVERY COMMENT REMOVED, so a structural
+// assertion judges the code rather than the prose about it.
 func dltReadCode(t *testing.T, elements ...string) string {
 	t.Helper()
 
@@ -1531,17 +1385,8 @@ func dltReadCode(t *testing.T, elements ...string) string {
 // Dead-letter routing
 // ---------------------------------------------------------------------------
 
-// TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic is the routing guarantee.
-//
-// An event that has spent its retry budget must land on the `.dlt` sibling of the category
-// topic it failed to reach — never on another category's, and never on a name assembled
-// some other way. The four expected names are spelled out as LITERALS in dltCategoryRoutes:
-// three of them are verbatim user-supplied examples from the requirement, and deriving them
-// from DLTFor would make this test agree with the implementation by construction.
-//
-// The message key is asserted at the same time, because a dead-letter topic that lost the
-// key would spread one aggregate's failures across partitions and give up the ordering the
-// category topic has.
+// TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic is the routing
+// guarantee.
 func TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1582,10 +1427,8 @@ func TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic(t *testing.T
 // TestDeadLetterRouting_DerivesTheTopicFromTheEventTypeWhenTheRowRecordsNone covers the
 // documented fallback.
 //
-// A row inserted before the topic column was populated, or built by a caller that left it
-// empty, must still reach the right dead-letter topic. The fallback runs through the same
-// event-type-to-category mapping the first publish would have used, so an event can never be
-// stranded for want of a recorded destination.
+// A row inserted before the topic column was populated, or built by a caller that left
+// it empty, must still reach the right dead-letter topic.
 func TestDeadLetterRouting_DerivesTheTopicFromTheEventTypeWhenTheRowRecordsNone(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1610,10 +1453,8 @@ func TestDeadLetterRouting_DerivesTheTopicFromTheEventTypeWhenTheRowRecordsNone(
 // TestDeadLetterRouting_RecordsTheDeadLetterTopicOnTheOutboxRow is what makes the API
 // possible at all.
 //
-// The listing and the replay both read the ROW, not the topic — Blnk implements no consumer.
-// If the dead-letter topic were only on the message and not in the dlt_topic column, an
-// operator could see nothing and replay nothing, and the event would be preserved in a place
-// no Blnk code can reach.
+// The listing and the replay both read the ROW, not the topic — Blnk implements no
+// consumer.
 func TestDeadLetterRouting_RecordsTheDeadLetterTopicOnTheOutboxRow(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1641,22 +1482,19 @@ func TestDeadLetterRouting_RecordsTheDeadLetterTopicOnTheOutboxRow(t *testing.T)
 		"the SAME metadata bytes must be stored on the row as were spliced into the message")
 }
 
-// TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet is the "cannot loop
-// forever" guarantee.
+// TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet is the "cannot
+// loop forever" guarantee.
 //
-// A dead-lettered row that the relay could claim again would be republished, fail again,
-// and be dead-lettered again, indefinitely — a loop that produces duplicate dead-letter
-// messages and an ever-growing inventory. The row is protected by TWO independent conditions
-// in the claim query, either of which alone would suffice, and both are asserted here
-// because losing one silently halves the protection:
+// A dead-lettered row that the relay could claim again would be republished, fail
+// again, and be dead-lettered again, indefinitely — a loop that produces duplicate
+// dead-letter messages and an ever-growing inventory. The row is protected by TWO
+// independent conditions in the claim query, either of which alone would suffice, and
+// both are asserted here because losing one silently halves the protection:
 //
 //  1. the claim restricts to the pending and processing statuses, and dead_lettered is
 //     neither, and
-//  2. the claim requires attempts < max_attempts, and an exhausted row has spent its budget.
-//
-// The claim query is a package-private constant in database/, so the guarantee is asserted
-// over the source text. That is deliberate: it holds for the real SQL rather than for a
-// fake's approximation of it, and it needs no database.
+//  2. the claim requires attempts < max_attempts, and an exhausted row has spent its
+//     budget.
 func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *testing.T) {
 	source := dltReadSource(t, "database", "event_outbox.go")
 
@@ -1667,10 +1505,10 @@ func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *test
 	require.NotEqual(t, -1, claimEnd, "the claim query must be followed by its method documentation")
 	claimQuery := source[claimStart : claimStart+claimEnd]
 
-	// The SQL body only, not the surrounding documentation. The doc comment now
-	// discusses the dead-lettered state at length — explaining why a dead-lettered row
-	// does not block its partition key forever — and asserting over the comment text
-	// would fail on prose rather than on behaviour.
+	// The SQL body only, not the surrounding documentation. The doc comment now discusses
+	// the dead-lettered state at length — explaining why a dead-lettered row does not
+	// block its partition key forever — and asserting over the comment text would fail on
+	// prose rather than on behaviour.
 	sqlStart := strings.Index(claimQuery, "`")
 	require.NotEqual(t, -1, sqlStart, "the claim query constant must have a raw string body")
 	claimSQL := claimQuery[sqlStart:]
@@ -1693,19 +1531,10 @@ func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *test
 
 // TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow pins the store seam.
 //
-// MarkEventFailed increments the attempts counter. Calling it from the dead-letter path would
-// spend a sixth attempt against a five-attempt budget and make the attempt count in the
-// failure metadata disagree with the configured maximum — which is exactly the number an
-// operator reads to decide whether the retry policy is working. The absence is enforced over
-// the interface's method set, so it cannot be reintroduced quietly.
+// MarkEventFailed increments the attempts counter.
 //
-// The same check covers the claim methods: a surface that could claim a row could take part
-// in the relay's job, and dead-lettering is emphatically not that.
-//
-// The seam is asserted as a CLOSED SET rather than as a list of forbidden names, so every
-// addition to it has to be justified here in writing. That is deliberate: the value of the
-// assertion is the argument each entry has to survive, not the count — so the count in the
-// comment below is a consequence of the arguments, never a target to be edited to match.
+// The same check covers the claim methods: a surface that could claim a row could take
+// part in the relay's job, and dead-lettering is emphatically not that.
 func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 	seam := reflect.TypeOf((*eventDeadLetterStore)(nil)).Elem()
 
@@ -1720,43 +1549,23 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 	//
 	// Two are the replay CLAIM and its rollback, which are not "claim methods" in the
 	// relay's sense — neither can take a pending row or take part in publishing new
-	// events. ClaimEventForReplay moves a row that is ALREADY dead-lettered into
-	// replaying, which is what makes a replay atomic instead of a read followed by a check
-	// that two concurrent requests could both pass.
+	// events.
 	//
-	// CountDeadLetteredEvents is a READ counted over the same predicate as the listing. It
-	// is what makes an exact total available for a filtered page; it cannot mutate a row or
-	// reach a claimable one.
+	// CountDeadLetteredEvents is a READ counted over the same predicate as the listing.
 	//
 	// ListDeadLetterInventory is the NARROW TRIAGE PROJECTION the operator listing reads,
-	// paged by keyset. It earns its place by being the cheap read: it returns each entry's
-	// coordinate and the SIZE of its payload instead of the payload, so an inventory of
-	// large events costs a page of metadata, and the cursor keeps that cost flat at any
-	// depth. The full-row listing beside it stays because the age accounting and the replay
-	// path need the stored bytes. Neither can mutate a row.
+	// paged by keyset.
 	//
-	// CountDeadLetterInventory is the count driven from the INVENTORY predicate, the twin of
-	// CountDeadLetteredEvents at the repository layer: one finding — a filtered listing that
-	// could not be given a total — was answered twice, once over each of the two listing
-	// predicates, and both answers are exercised by the repository's own tests. Keeping the twin
-	// on the seam costs nothing a reviewer should worry about: it is a COUNT(*), so it cannot
-	// mutate a row, cannot claim one, and cannot spend an attempt. What it must never become is a
-	// second, drifting definition of "the inventory" — which is why both counts are required to
-	// share their listing's predicate rather than to re-state it.
+	// CountDeadLetterInventory is the count driven from the INVENTORY predicate, the twin
+	// of CountDeadLetteredEvents at the repository layer: one finding — a filtered listing
+	// that could not be given a total — was answered twice, once over each of the two
+	// listing predicates, and both answers are exercised by the repository's own tests.
 	//
-	// ListAndCountDeadLetterInventory is the PAIRED read a listing that asked for a total goes
-	// through, and it is on the seam because sharing a predicate was never enough on its own: two
-	// statements on two connections observe two populations, so an entry dead-lettered between
-	// them is counted by one and absent from the other and the total then describes a set the page
-	// is not a slice of. It is two COUNT-and-SELECT reads inside one read-only REPEATABLE READ
-	// transaction — read-only at the database level, not merely by convention, so it cannot mutate
-	// a row, claim one or spend an attempt any more than its two halves can.
-	//
-	// OldestDeadLetterAgeByTopic is the grouped aggregate the age gauge is computed from
-	// (PERF-P07). It replaced a bounded backwards walk over the whole inventory, which read
-	// thousands of rows per refresh to report one instant per topic and understated the age
-	// outright once the inventory outgrew its budget. It is a GROUP BY that returns one row
-	// per dead-letter topic; it reads no payload and writes nothing.
+	// ListAndCountDeadLetterInventory is the PAIRED read a listing that asked for a total
+	// goes through, and it is on the seam because sharing a predicate was never enough on
+	// its own: two statements on two connections observe two populations, so an entry
+	// dead-lettered between them is counted by one and absent from the other and the total
+	// then describes a set the page is not a slice of.
 	assert.ElementsMatch(t, []string{
 		"GetEventByID",
 		"ListDeadLetteredEvents",
@@ -1764,9 +1573,9 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 		"ListAndCountDeadLetterInventory",
 		"CountDeadLetteredEvents",
 		"CountDeadLetterInventory",
-		// The UNRESOLVED aggregate, not the windowed one (PERF-M05). This service reads only
-		// the `failed` count, which the unresolved reading gives exactly and for all time,
-		// and the windowed reading additionally counted a day of dispatched history — 43.2
+		// The UNRESOLVED aggregate, not the windowed one. This service reads only the
+		// `failed` count, which the unresolved reading gives exactly and for all time, and
+		// the windowed reading additionally counted a day of dispatched history — 43.2
 		// million index entries at the target rate — that nothing here looked at.
 		"CountUnresolvedEventOutbox",
 		"MarkEventDeadLettered",
@@ -1809,23 +1618,11 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 		"the row's own attempts counter must be untouched by dead-lettering")
 }
 
-// TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker is the DLT-01 guard.
+// TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker is the guard.
 //
-// This test used to assert the opposite, and the behaviour it asserted lost events. With no
-// transport the service returned success, the caller marked the row dead_lettered, and the
-// dead-letter counter was incremented — while nothing had been written anywhere. The row's
-// only copy of the event was the row itself, dead_lettered is terminal so the relay would
-// never claim it again, and both the row and the metric reported the event as safely
-// preserved. Every signal an operator could read said the event was on a dead-letter topic;
-// none of them was true.
-//
-// The contract now: no broker means NO DEAD-LETTERING. An error is returned, the row is left
-// exactly as the caller had it — non-terminal, still in the inventory, still completable once
-// a transport exists — and nothing is counted. The composed message is still returned on the
-// partial outcome, so a caller can show what would have been written.
-//
-// The transport is the REAL production resolver wrapped around the REAL no-op publisher, so
-// this asserts the wiring rather than a fake's imitation of it.
+// With no transport the service returned success, the caller marked the row
+// dead_lettered, and the dead-letter counter was incremented — while nothing had been
+// written anywhere.
 func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1862,16 +1659,10 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T
 		"the dead-letter counter must not claim a dead-lettering that did not happen")
 }
 
-// TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRead is the second
-// half of the DLT-01 guard, and it covers the more dangerous of the two paths.
+// TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRead is the
+// second half of the guard, and it covers the more dangerous of the two paths.
 //
-// "No brokers configured" is at least an observed fact. "Configuration could not be read" is
-// an UNKNOWN, and it used to be silently downgraded to the first: a transient configuration
-// failure in a deployment that runs Kafka every day produced a row marked dead_lettered, a
-// counter increment, and no message. The event was gone, in a deployment where a broker was
-// sitting there ready to take it.
-//
-// It now fails, for the same reason and with the same consequences as the no-broker case.
+// "No brokers configured" is at least an observed fact.
 func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRead(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1906,13 +1697,11 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRe
 	assert.Zero(t, counter.total())
 }
 
-// TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor covers the third arm of
-// the writer resolution.
+// TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor covers the third
+// arm of the writer resolution.
 //
-// Only the Kafka publisher can be handed a composed dead-letter message; the no-op is the
-// documented "no transport" case. Anything else must fail LOUDLY, because silently skipping
-// the write would lose the dead-letter message while reporting success — the one outcome
-// worth failing over.
+// Only the Kafka publisher can be handed a composed dead-letter message; the no-op is
+// the documented "no transport" case.
 func TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1933,9 +1722,8 @@ func TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor(t *testin
 // TestDeadLetterRouting_RejectsARowWithoutADatabaseIdentity keeps an unrecordable
 // dead-letter from being written.
 //
-// A row with no id cannot be recorded, and an unrecorded dead-letter is invisible to the
-// listing and unreachable by replay. Failing BEFORE the write is what keeps "it is on the
-// dead-letter topic" and "an operator can find it" from diverging.
+// A row with no id cannot be recorded, and an unrecorded dead-letter is invisible to
+// the listing and unreachable by replay.
 func TestDeadLetterRouting_RejectsARowWithoutADatabaseIdentity(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1950,13 +1738,10 @@ func TestDeadLetterRouting_RejectsARowWithoutADatabaseIdentity(t *testing.T) {
 	assert.Empty(t, transport.snapshotWritten(), "nothing may be written for an unrecordable row")
 }
 
-// TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory pins the order of
-// operations.
+// TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory pins the order
+// of operations.
 //
-// The write happens first and the row is recorded second, deliberately. When the write fails
-// the row is left in the failed state the relay already put it in — which the dead-letter
-// listing covers — so the event stays visible to an operator instead of being reported as
-// safely dead-lettered when its message never left the process.
+// The write happens first and the row is recorded second, deliberately.
 func TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -1992,14 +1777,9 @@ func TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory(t *t
 
 // TestFailureMetadata_CarriesExactlyTheFiveContractFields pins the published shape.
 //
-// The requirement names five fields, and the metadata must carry EXACTLY those five: the
-// original topic, the error reason, the attempt count, and the first- and last-attempted
-// instants. A sixth would not be a harmless addition — the metadata is a published shape
-// that the triage runbook and the API projection both read — and a missing one leaves an
-// operator without an answer they were promised.
-//
-// The JSON tags are asserted alongside the field names because the tags are the wire
-// contract; renaming a tag while keeping the Go field would silently break every reader.
+// The requirement names five fields, and the metadata must carry EXACTLY those five:
+// the original topic, the error reason, the attempt count, and the first- and
+// last-attempted instants.
 func TestFailureMetadata_CarriesExactlyTheFiveContractFields(t *testing.T) {
 	metadataType := reflect.TypeOf(model.FailureMetadata{})
 
@@ -2048,11 +1828,6 @@ func TestFailureMetadata_CarriesExactlyTheFiveContractFields(t *testing.T) {
 
 // TestFailureMetadata_AssertsEveryFieldIndividually is the field-by-field assertion the
 // requirement asks for.
-//
-// Each of the five is checked against a distinct expected value, so a metadata builder that
-// populated the right SHAPE with the wrong CONTENT — the classic copy-paste defect, where
-// one field is assigned from another's source — fails here. Asserting only that the struct is
-// non-empty would catch none of that.
 func TestFailureMetadata_AssertsEveryFieldIndividually(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2082,19 +1857,10 @@ func TestFailureMetadata_AssertsEveryFieldIndividually(t *testing.T) {
 	assert.Equal(t, metadata, stored, "the serialised metadata must round-trip to the same record")
 }
 
-// TestFailureMetadata_ReportsTheConfiguredMaximumAfterExhaustion pins the attempt count to
-// the number an operator reads.
+// TestFailureMetadata_ReportsTheConfiguredMaximumAfterExhaustion pins the attempt count
+// to the number an operator reads.
 //
-// After exhaustion the count must equal the CONFIGURED MAXIMUM — five by default. Two
-// specific wrong answers are excluded explicitly, because both are natural off-by-one
-// mistakes and both would misrepresent the retry policy: maximum plus one (counting the
-// dead-letter write itself as an attempt) and the retry INDEX (four, counting only the
-// retries after the first attempt).
-//
-// The three fallback arms are covered too, since each is separately reachable on a real row:
-// the caller states nothing and the row's counter answers; neither states anything and the
-// budget answers; and a stale caller count is overridden by the larger row counter, because
-// both are lower bounds on the truth.
+// After exhaustion the count must equal the CONFIGURED MAXIMUM — five by default.
 func TestFailureMetadata_ReportsTheConfiguredMaximumAfterExhaustion(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2145,15 +1911,6 @@ func TestFailureMetadata_ReportsTheConfiguredMaximumAfterExhaustion(t *testing.T
 
 // TestFailureMetadata_DistinguishesTheFirstAttemptFromTheLast is the swapped-assignment
 // catcher.
-//
-// The two instants are asserted against a window that is genuinely 31 seconds wide — the span
-// the documented backoff schedule produces over five attempts — so an implementation that
-// assigned them the wrong way round fails. A fixture whose attempts coincided would pass
-// either way, which is why the fixture is built with a real spread.
-//
-// The window is also asserted to run FORWARDS, because the pair is what an operator subtracts
-// to tell a momentary broker blip from a sustained outage, and a negative duration answers
-// neither question.
 func TestFailureMetadata_DistinguishesTheFirstAttemptFromTheLast(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2225,11 +1982,9 @@ func TestFailureMetadata_DistinguishesTheFirstAttemptFromTheLast(t *testing.T) {
 
 // TestFailureMetadata_CarriesTheWholePublishErrorText keeps the reason useful.
 //
-// The reason is compared in FULL against a long, realistic broker error, so an implementation
-// that truncated it to a fixed width — or replaced it with a generic sentence — fails. The
-// three-step fallback chain is covered as well, and the last step matters most: an EMPTY
-// reason answers nothing while looking like a successful read of a missing value, which is
-// the exact failure mode the explicit sentence exists to prevent.
+// The reason is compared in FULL against a long, realistic broker error, so an
+// implementation that truncated it to a fixed width — or replaced it with a generic
+// sentence — fails.
 func TestFailureMetadata_CarriesTheWholePublishErrorText(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2267,19 +2022,20 @@ func TestFailureMetadata_CarriesTheWholePublishErrorText(t *testing.T) {
 	})
 }
 
-// TestFailureMetadata_IsAttachedAdditivelySoTheOriginalBytesSurvive is the precondition for
-// byte-faithful replay, asserted directly.
+// TestFailureMetadata_IsAttachedAdditivelySoTheOriginalBytesSurvive is the precondition
+// for byte-faithful replay, asserted directly.
 //
-// The dead-letter message must be the original envelope followed by ONE extra member. Three
-// things are asserted, and together they leave no room for a re-encode:
+// The dead-letter message must be the original envelope followed by ONE extra member.
+// Three things are asserted, and together they leave no room for a re-encode:
 //
 //  1. every byte of the envelope UP TO ITS CLOSING BRACE is a byte-exact prefix of the
 //     dead-letter message — the splice replaces only that final brace,
 //  2. the remainder is EXACTLY `,"failure_metadata":<metadata>}` and nothing else, and
 //  3. stripping the member returns the original bytes, byte for byte.
 //
-// If the implementation folded the metadata into the envelope — decode, add a key, re-encode
-// — the prefix property would fail immediately, and replay could never be byte-exact.
+// If the implementation folded the metadata into the envelope — decode, add a key,
+// re-encode — the prefix property would fail immediately, and replay could never be
+// byte-exact.
 func TestFailureMetadata_IsAttachedAdditivelySoTheOriginalBytesSurvive(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2338,14 +2094,15 @@ func TestFailureMetadata_IsAttachedAdditivelySoTheOriginalBytesSurvive(t *testin
 	assert.Len(t, members, 7, "the dead-letter message is the six envelope members plus exactly one")
 }
 
-// TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent covers the recovery primitive on
-// its own.
+// TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent covers the recovery
+// primitive on its own.
 //
-// It is idempotent by design so a caller need not know whether it is holding an original or a
-// dead-lettered message, which is what makes it safe to apply on the way into a comparison.
-// The last-occurrence search is covered too: a payload that happens to contain the same member
-// name deeper inside must not be mistaken for the attachment, and that is a realistic case
-// because the payload is opaque, subscriber-supplied JSON.
+// It is idempotent by design so a caller need not know whether it is holding an
+// original or a dead-lettered message, which is what makes it safe to apply on the way
+// into a comparison. The last-occurrence search is covered too: a payload that happens
+// to contain the same member name deeper inside must not be mistaken for the
+// attachment, and that is a realistic case because the payload is opaque,
+// subscriber-supplied JSON.
 func TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2391,12 +2148,12 @@ func TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent(t *testing.T) {
 	})
 }
 
-// TestComposeDeadLetterMessage_RefusesMetadataItCannotSpliceSafely covers the composition
-// guard.
+// TestComposeDeadLetterMessage_RefusesMetadataItCannotSpliceSafely covers the
+// composition guard.
 //
-// Splicing invalid bytes would emit a message that breaks every subscriber's parser, and no
-// retry turns malformed bytes into valid ones — so the composition fails instead, exactly as
-// the publisher refuses an invalid payload.
+// Splicing invalid bytes would emit a message that breaks every subscriber's parser,
+// and no retry turns malformed bytes into valid ones — so the composition fails
+// instead, exactly as the publisher refuses an invalid payload.
 func TestComposeDeadLetterMessage_RefusesMetadataItCannotSpliceSafely(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2432,7 +2189,7 @@ func dltMustStrip(t *testing.T, message []byte) []byte {
 }
 
 // ---------------------------------------------------------------------------
-// Replay fidelity — acceptance criterion V-9
+// Replay fidelity.
 // ---------------------------------------------------------------------------
 
 // dltReplayFixture is a dead-lettered event ready to be replayed, together with everything
@@ -2450,16 +2207,12 @@ type dltReplayFixture struct {
 // dltNewReplayFixture dead-letters an event for real and then presents it as a stored,
 // replayable row.
 //
-// The dead-lettering is performed rather than hand-written, which matters: the metadata the
-// replay reads is the metadata the implementation produced, and the "original" bytes are the
-// bytes the first publish would actually have written. A fixture assembled by hand could
-// agree with neither.
-//
 // Parameters:
 //   - eventType: the event name.
 //   - topic: the destination recorded on the row.
-//   - metadataTopic: when non-empty, the original_topic REWRITTEN into the stored metadata, so
-//     that a replay honouring the record can be told apart from one re-deriving the topic.
+//   - metadataTopic: when non-empty, the original_topic REWRITTEN into the stored
+//     metadata, so that a replay honouring the record can be told apart from one
+//     re-deriving the topic.
 func dltNewReplayFixture(t *testing.T, eventType, topic, metadataTopic string) *dltReplayFixture {
 	t.Helper()
 
@@ -2500,12 +2253,9 @@ func dltNewReplayFixture(t *testing.T, eventType, topic, metadataTopic string) *
 
 // replayedMessage returns the bytes the recorded replay would have put on the wire.
 //
-// It resolves the captured request through the SAME function the Kafka publisher resolves its
-// message value with, so the comparison is against the real message value rather than against a
-// reconstruction of it. That means the stored envelope where the request carries one, which is
-// the case for every row read out of the outbox. This is the assertion criterion V-9 is decided
-// by, and resolving rather than re-serialising is what keeps it from being decided between two
-// rebuilt values.
+// It resolves the captured request through the SAME function the Kafka publisher
+// resolves its message value with, so the comparison is against the real message value
+// rather than against a reconstruction of it.
 func (f *dltReplayFixture) replayedMessage(t *testing.T) []byte {
 	t.Helper()
 
@@ -2528,16 +2278,11 @@ func (f *dltReplayFixture) request(t *testing.T) PublishRequest {
 	return requests[0]
 }
 
-// TestReplayDeadLetteredEvent_ReproducesTheOriginalMessageByteForByte is acceptance criterion
-// V-9, asserted at unit level.
+// asserted at unit level.
 //
-// A replayed dead-lettered event must match the original BYTE FOR BYTE aside from the failure
-// metadata, and the comparison here is on RAW BYTES rather than on unmarshalled maps. That
-// distinction is the whole point: a map comparison discards key order, collapses number
-// formatting and normalises escaping, so it would pass while the real guarantee was broken.
-//
-// event_replay_fidelity_test.go proves the same criterion end to end against a broker. This
-// asserts it with no infrastructure at all, so the regression is caught on every `go test`.
+// A replayed dead-lettered event must match the original BYTE FOR BYTE aside from the
+// failure metadata, and the comparison here is on RAW BYTES rather than on unmarshalled
+// maps.
 func TestReplayDeadLetteredEvent_ReproducesTheOriginalMessageByteForByte(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2565,9 +2310,9 @@ func TestReplayDeadLetteredEvent_ReproducesTheOriginalMessageByteForByte(t *test
 	assert.Equal(t, model.PublishStatusDispatched, outcome.Status)
 	assert.True(t, outcome.Recorded)
 
-	// Under -v the three messages are printed side by side, so the criterion can be confirmed by
-	// eye as well as by assertion. It is gated on verbosity because the payload can be large and
-	// a passing run should stay quiet.
+	// Under -v the three messages are printed side by side, so the criterion can be
+	// confirmed by eye as well as by assertion. It is gated on verbosity because the
+	// payload can be large and a passing run should stay quiet.
 	if testing.Verbose() {
 		t.Logf("original    : %s", fixture.original)
 		t.Logf("dead-letter : %s", fixture.outcome.Message)
@@ -2577,18 +2322,12 @@ func TestReplayDeadLetteredEvent_ReproducesTheOriginalMessageByteForByte(t *test
 	}
 }
 
-// TestReplayDeadLetteredEvent_DoesNotReMarshalThePayload turns "we intended to pass the bytes
-// through" into a PROVEN property.
+// TestReplayDeadLetteredEvent_DoesNotReMarshalThePayload turns "we intended to pass the
+// bytes through" into a PROVEN property.
 //
-// The fixture payload is built so that a round trip through a Go map or a typed struct would
-// change it visibly in five independent ways at once — key order, trailing zeros, HTML
-// escaping, large-number formatting and interior whitespace. Each is asserted separately, so a
-// failure names which transformation crept in rather than only reporting that the bytes
-// differ.
-//
-// This is what makes the byte-for-byte guarantee achievable rather than aspirational: replay
-// re-publishes the STORED payload bytes, spliced into a freshly-composed envelope, and never
-// decodes them.
+// This is what makes the byte-for-byte guarantee achievable rather than aspirational:
+// replay re-publishes the STORED payload bytes, spliced into a freshly-composed
+// envelope, and never decodes them.
 func TestReplayDeadLetteredEvent_DoesNotReMarshalThePayload(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2636,15 +2375,8 @@ func TestReplayDeadLetteredEvent_DoesNotReMarshalThePayload(t *testing.T) {
 // TestReplayDeadLetteredEvent_TargetsTheTopicRecordedInTheStoredMetadata proves the
 // destination is RECOVERED rather than re-derived.
 //
-// The stored metadata's original_topic is the authoritative record of where the event was
-// headed. Re-deriving the destination from the event type would be wrong the moment
-// KAFKA_TOPIC_PREFIX changed after the event was stored — the row would be replayed to a topic
-// it was never destined for, and the subscriber waiting on the original topic would never see
-// it.
-//
-// The fixture makes the two answers DIFFER on purpose: the metadata records
-// "legacy.transactions" while the event type maps to "blnk.transactions" today. An
-// implementation that re-derived would land on the latter and fail here.
+// The stored metadata's original_topic is the authoritative record of where the event
+// was headed.
 func TestReplayDeadLetteredEvent_TargetsTheTopicRecordedInTheStoredMetadata(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2693,14 +2425,8 @@ func TestReplayDeadLetteredEvent_TargetsTheTopicRecordedInTheStoredMetadata(t *t
 	})
 }
 
-// TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged is the ordering guarantee applied to
-// the replay itself.
-//
-// The key is whatever the ORIGINAL publish used — the ledger the row records under requirement
-// R-6, falling back to its stored partition key — and keying by it with a stable hash balancer
-// is what pins every event sharing that key to one partition. A replay published under a
-// different key, or under none, would land on a different partition, and the replay would
-// itself violate the per-aggregate ordering the pipeline exists to preserve.
+// TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged is the ordering guarantee
+// applied to the replay itself.
 func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2752,12 +2478,13 @@ func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 	})
 }
 
-// TestReplayDeadLetteredEvent_KeepsTheEventIdUnchanged protects the subscriber's duplicate
-// suppression.
+// TestReplayDeadLetteredEvent_KeepsTheEventIdUnchanged protects the subscriber's
+// duplicate suppression.
 //
-// event_id is the idempotency key. A replay that minted a new one would be indistinguishable
-// from a brand-new event, and every subscriber that deduplicates on it would process the
-// replayed event a second time — turning an operator's recovery action into a double-apply.
+// event_id is the idempotency key. A replay that minted a new one would be
+// indistinguishable from a brand-new event, and every subscriber that deduplicates on
+// it would process the replayed event a second time — turning an operator's recovery
+// action into a double-apply.
 func TestReplayDeadLetteredEvent_KeepsTheEventIdUnchanged(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2780,13 +2507,11 @@ func TestReplayDeadLetteredEvent_KeepsTheEventIdUnchanged(t *testing.T) {
 	assert.Equal(t, fixture.row.OccurredAt.UTC(), envelope.OccurredAt.UTC())
 }
 
-// TestReplayDeadLetteredEvent_LabelsTheAttemptPastTheExhaustedBudget keeps a replay out of the
-// first-attempt latency reading.
+// TestReplayDeadLetteredEvent_LabelsTheAttemptPastTheExhaustedBudget keeps a replay out
+// of the first-attempt latency reading.
 //
 // The publish-latency target is read as the p99 of the duration histogram filtered to
-// attempt="1". An operator-triggered replay of an event that has been sitting in a dead-letter
-// topic for hours is emphatically not a first attempt, and labelling it as one would poison
-// the very number the target is measured against.
+// attempt="1".
 func TestReplayDeadLetteredEvent_LabelsTheAttemptPastTheExhaustedBudget(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2803,24 +2528,11 @@ func TestReplayDeadLetteredEvent_LabelsTheAttemptPastTheExhaustedBudget(t *testi
 		"the label must be past the budget so it cannot collide with a real attempt")
 }
 
-// TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery is the other half of PERF-P21.
+// TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery is the other half of
+// the dispatch-counting guard.
 //
-// The per-event delivery counter, blnk.events.dispatched.total, is incremented at the durable
-// dispatched transition — and a successful replay takes that same transition. It must
-// nevertheless NOT be counted, because this event has already been accounted for as
-// dead-lettered and a counter never decrements. Counting it here would put one event in both
-// terminal counters, so their sum would exceed the population; the dead-letter rate derived from
-// them would then FALL as an operator worked through the inventory, reporting the pipeline as
-// healthier the more triage was being done.
-//
-// The replay is not invisible: it is recorded on the per-attempt instruments under the fixed
-// `replay` attempt label, which is where re-delivery belongs, and that is asserted alongside so
-// the absence above cannot be satisfied by a replay that records nothing at all.
-//
-// The structural half matters as much as the behavioural one. This absence is not observable
-// from a passing replay — a stray increment added on any other branch of this file would be
-// invisible to a test that only drove the happy path — so the file is also asserted to make no
-// reference to the instrument by any spelling.
+// The per-event delivery counter, blnk.events.dispatched.total, is incremented at the
+// durable dispatched transition — and a successful replay takes that same transition.
 func TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2855,14 +2567,8 @@ func TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery(t *testing.T) 
 // State transitions and repeat replay
 // ---------------------------------------------------------------------------
 
-// TestReplayDeadLetteredEvent_MovesTheRowToDispatchedAndClearsTheInventory pins the state
-// transition event_dlt.go documents.
-//
-// A successful replay moves the row to DISPATCHED — the same terminal success state an ordinary
-// publish reaches — and three consequences follow, all intended: the row leaves the dead-letter
-// inventory so it is no longer presented as needing attention; its dlt_topic and
-// failure_metadata are RETAINED so the history of what went wrong is not erased; and the status
-// precondition for a second replay no longer holds.
+// TestReplayDeadLetteredEvent_MovesTheRowToDispatchedAndClearsTheInventory pins the
+// state transition event_dlt.go documents.
 func TestReplayDeadLetteredEvent_MovesTheRowToDispatchedAndClearsTheInventory(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2903,13 +2609,11 @@ func TestReplayDeadLetteredEvent_MovesTheRowToDispatchedAndClearsTheInventory(t 
 
 // TestReplayDeadLetteredEvent_RefusesASecondReplay pins the repeat-replay decision.
 //
-// The two acceptable designs were "explicitly idempotent" and "explicitly rejected", and
-// event_dlt.go documents the latter: the status precondition no longer holds once the row is
-// dispatched, so a second replay is REFUSED with ErrEventNotDeadLettered. Silently duplicating
-// the event is the outcome neither design permits, and it is what this test exists to exclude.
-//
-// The message is asserted too, because "not dead-lettered" alone would send an operator looking
-// for the wrong problem; the implementation names the already-replayed case specifically.
+// The two acceptable designs were "explicitly idempotent" and "explicitly rejected",
+// and event_dlt.go documents the latter: the status precondition no longer holds once
+// the row is dispatched, so a second replay is REFUSED with ErrEventNotDeadLettered.
+// Silently duplicating the event is the outcome neither design permits, and it is what
+// this test exists to exclude.
 func TestReplayDeadLetteredEvent_RefusesASecondReplay(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2932,13 +2636,10 @@ func TestReplayDeadLetteredEvent_RefusesASecondReplay(t *testing.T) {
 		"and must not repeat the bookkeeping either")
 }
 
-// TestReplayDeadLetteredEvent_ReportsARepublishWhoseBookkeepingFailed covers the one case where
-// a successful publish still returns an error.
+// TestReplayDeadLetteredEvent_ReportsARepublishWhoseBookkeepingFailed covers the one
+// case where a successful publish still returns an error.
 //
-// The event HAS been republished; only the row update failed. An error is returned rather than
-// swallowed precisely because the operator must know the entry has not cleared — reporting
-// success would leave a phantom in the inventory with nobody looking for it. The outcome is
-// still populated, with Recorded false, so a caller can log what actually happened.
+// The event HAS been republished; only the row update failed.
 func TestReplayDeadLetteredEvent_ReportsARepublishWhoseBookkeepingFailed(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2966,12 +2667,10 @@ func TestReplayDeadLetteredEvent_ReportsARepublishWhoseBookkeepingFailed(t *test
 
 // TestDeadLetterErrorCodes_ResolveToTheirIntendedHTTPStatuses is the mapping proof.
 //
-// A typed code with NO statusByCode entry silently resolves to 500. Every one of the codes the
-// dead-letter surface returns is therefore checked against the status its endpoint contract
-// promises — the domain logic can be perfect and the API still wrong without these entries.
+// A typed code with NO statusByCode entry silently resolves to 500.
 //
-// The codes are listed as literals with their intended statuses so removing an entry from
-// statusByCode fails here rather than surfacing as a 500 in production.
+// The codes are listed as literals with their intended statuses so removing an entry
+// from statusByCode fails here rather than surfacing as a 500 in production.
 func TestDeadLetterErrorCodes_ResolveToTheirIntendedHTTPStatuses(t *testing.T) {
 	expected := map[apierror.ErrorCode]int{
 		apierror.ErrEventNotFound:        http.StatusNotFound,
@@ -2995,12 +2694,10 @@ func TestDeadLetterErrorCodes_ResolveToTheirIntendedHTTPStatuses(t *testing.T) {
 	assert.Equal(t, apierror.ErrorCode("EVENT_KAFKA_UNAVAILABLE"), apierror.ErrKafkaUnavailable)
 }
 
-// TestReplayDeadLetteredEvent_RejectsAnEventThatIsNotDeadLettered covers the precondition for
-// every non-terminal state.
+// TestReplayDeadLetteredEvent_RejectsAnEventThatIsNotDeadLettered covers the
+// precondition for every non-terminal state.
 //
-// Only a dead-lettered row has a dead-letter message to replay from. A failed row has exhausted
-// its budget but never reached a dead-letter topic — PublishToDeadLetter is what moves it on —
-// and a pending, processing or dispatched row was never a failure at all.
+// Only a dead-lettered row has a dead-letter message to replay from.
 func TestReplayDeadLetteredEvent_RejectsAnEventThatIsNotDeadLettered(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3031,14 +2728,9 @@ func TestReplayDeadLetteredEvent_RejectsAnEventThatIsNotDeadLettered(t *testing.
 
 // TestReplayDeadLetteredEvent_RejectsAMissingEvent covers the not-found classification.
 //
-// Both shapes a store can report a missing row in are exercised, because the classifier has to
-// cope with both: the repository wraps sql.ErrNoRows in a typed APIError whose CODE is what must
-// be inspected — APIError does not unwrap to the error it wrapped — and a direct store
-// implementation may report the bare sql.ErrNoRows.
-//
-// A genuine failure is deliberately NOT reclassified: a database that is down must not be
-// reported as "no such event", which would send an operator looking for a typo instead of an
-// outage.
+// A genuine failure is deliberately NOT reclassified: a database that is down must not
+// be reported as "no such event", which would send an operator looking for a typo
+// instead of an outage.
 func TestReplayDeadLetteredEvent_RejectsAMissingEvent(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3084,22 +2776,8 @@ func TestReplayDeadLetteredEvent_RejectsAMissingEvent(t *testing.T) {
 
 // TestReplayDeadLetteredEvent_ReportsAFailedRepublish covers the publish-failure arm.
 //
-// The publisher's own error is wrapped in ErrEventReplayFailed rather than surfaced raw, so the
-// endpoint has one code to document.
-//
-// # DATA-01: what the caller receives, and what it must not
-//
-// This test used to require the opposite of what it now requires: that the broker's own error
-// text stay reachable in the API error's Details. That text is produced by the Kafka client,
-// so it routinely carries the broker's address and port ("write tcp 10.0.0.4:9092: broken
-// pipe") and its protocol state, and Details is serialised into the response body. An endpoint
-// reporting that one event failed to republish was therefore also publishing the deployment's
-// internal broker topology.
-//
-// The detail is now a bounded EventTransportErrorDetail: a fixed reason, the caller's own
-// event identifiers, the topic, and the transient classification — which is the one part a
-// caller can act on. The cause is not lost, it is redirected: it is logged with the error
-// attached at the failure site, which is where an operator reads it.
+// The publisher's own error is wrapped in ErrEventReplayFailed rather than surfaced
+// raw, so the endpoint has one code to document.
 func TestReplayDeadLetteredEvent_ReportsAFailedRepublish(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3135,12 +2813,8 @@ func TestReplayDeadLetteredEvent_ReportsAFailedRepublish(t *testing.T) {
 		"the event stays dead-lettered so it can be replayed again once the broker recovers")
 }
 
-// TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller is the dead-letter half of the
-// same DATA-01 boundary.
-//
-// The dead-letter write is the other place a Kafka client error becomes an API error, and it
-// is reached by the operator-facing path as well as by the relay, so it gets the same
-// treatment and the same guard.
+// TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller is the dead-letter half of
+// the same disclosure boundary.
 func TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3148,9 +2822,9 @@ func TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller(t *testing.T) {
 	store := newDltFakeStore().withRow(row)
 
 	transport := &dltFakeTransport{
-		// The exact shape a refused dial produces: a *net.OpError whose exported Addr
-		// field carries the broker's address, wrapping the syscall error the transient
-		// classifier recognises.
+		// The exact shape a refused dial produces: a *net.OpError whose exported Addr field
+		// carries the broker's address, wrapping the syscall error the transient classifier
+		// recognises.
 		writeErr: &net.OpError{
 			Op:   "dial",
 			Net:  "tcp",
@@ -3182,13 +2856,11 @@ func TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller(t *testing.T) {
 		"a refused write leaves the row non-terminal, exactly as the no-broker case does")
 }
 
-// TestReplayDeadLetteredEvent_RefusesToReplayWithoutABroker covers the deliberate asymmetry
-// with dead-lettering.
+// TestReplayDeadLetteredEvent_RefusesToReplayWithoutABroker covers the deliberate
+// asymmetry with dead-lettering.
 //
-// Dead-lettering degrades quietly when no broker is configured, because it is a background write
-// and the event must stay visible. A replay is an explicit, operator-triggered request, so
-// reporting success while publishing nothing would be a lie — it fails closed with
-// ErrKafkaUnavailable instead.
+// Dead-lettering degrades quietly when no broker is configured, because it is a
+// background write and the event must stay visible.
 func TestReplayDeadLetteredEvent_RefusesToReplayWithoutABroker(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3232,12 +2904,8 @@ func TestReplayDeadLetteredEvent_RejectsABlankEventId(t *testing.T) {
 	})
 }
 
-// TestDeadLetterOperations_ReportAMissingDatasourceLegibly covers the nil-store construction
-// that NewBlnk(nil) makes reachable.
-//
-// Every operation must report it with a clear error rather than dereferencing nil, because a
-// service built from such an instance is a real, if unusual, state and a panic in a handler is
-// never an acceptable answer to it.
+// TestDeadLetterOperations_ReportAMissingDatasourceLegibly covers the nil-store
+// construction that NewBlnk(nil) makes reachable.
 func TestDeadLetterOperations_ReportAMissingDatasourceLegibly(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3259,26 +2927,14 @@ func TestDeadLetterOperations_ReportAMissingDatasourceLegibly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Metrics — acceptance criteria V-3 (dead-letter rate) and V-4 (alerting)
+// Metrics.
 // ---------------------------------------------------------------------------
 
-// TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce is what criterion V-3 rests on.
+// TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce is what the acceptance
+// criterion rests on.
 //
-// The dead-letter RATE this counter is the numerator of must stay under 0.1%, and its
-// denominator is the SUM of this counter and the published-events counter, not the published
-// counter alone: the two PARTITION a captured event's terminal outcomes — an event is either
-// delivered or dead-lettered, never both — so their sum is the population. Dividing by the
-// successes would report dead-letters as a fraction of successes, overstating the rate and
-// diverging without bound as failures rise.
-//
-// A double count would therefore report twice the real rate and fail a perfectly healthy system;
-// a missing count would hide a genuine incident. "Exactly once" is asserted as exactly one
-// increment of exactly one, not merely as "non-zero".
-//
-// The attribution is asserted at the same time: the counter carries the ORIGINAL category topic,
-// never the `.dlt` sibling, which is what puts it in the same label space as the published-events
-// counter. Attributing it to the `.dlt` name would leave the two terms of that sum in different
-// label spaces and make the ratio uncomputable.
+// A double count would therefore report twice the real rate and fail a perfectly
+// healthy system; a missing count would hide a genuine incident.
 func TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3314,13 +2970,11 @@ func TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce(t *testing.T) 
 	})
 }
 
-// TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete keeps the numerator
-// honest.
+// TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete keeps the
+// numerator honest.
 //
-// The counter answers "how many events ENDED UP dead-lettered", so it is incremented only after
-// the row is recorded. Counting a failed write would inflate the rate with events that are still
-// in the failed state and still being retried, and counting a write whose bookkeeping had to be
-// retried would double-count the same event.
+// The counter answers "how many events ENDED UP dead-lettered", so it is incremented
+// only after the row is recorded.
 func TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3356,21 +3010,20 @@ func TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete(t *tes
 // TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration pins the
 // contract of the shared attempt instruments for the dead-letter path.
 //
-// A dead-letter write is a real publish, so it belongs on those instruments — and it belongs
-// there whichever way it ends. Three properties are asserted, and each was a defect:
+// A dead-letter write is a real publish, so it belongs on those instruments — and it
+// belongs there whichever way it ends. Three properties are asserted, and each was a
+// defect:
 //
-//   - EVERY write is recorded, success and failure alike. Recording only successes made the
-//     two signals an operator needs during a dead-letter outage invisible: the attempts
-//     counter showed no failing writes and the histogram had no observations for the path
-//     that was timing out, so "the dead-letter topic is unreachable" looked exactly like
-//     "nothing is being dead-lettered".
-//   - The OUTCOME is dead_lettered for an acknowledged write, because the pipeline-level
-//     statement about the event is that it ended its life on a dead-letter topic, and failed
-//     for a write that did not land.
-//   - The ATTEMPT attribute is the fixed `dead_letter` token, which requires the purpose to
-//     be carried. Without it the token is the attempt count from the ORIGINAL retry sequence,
-//     which both misdescribes the observation and drops dead-letter latency into the
-//     attempt="5" population the first-attempt latency target is read against.
+//   - EVERY write is recorded, success and failure alike. Recording only successes made
+//     the two signals an operator needs during a dead-letter outage invisible: the
+//     attempts counter showed no failing writes and the histogram had no observations
+//     for the path that was timing out, so "the dead-letter topic is unreachable"
+//     looked exactly like "nothing is being dead-lettered".
+//   - The OUTCOME is dead_lettered for an acknowledged write, because the
+//     pipeline-level statement about the event is that it ended its life on a
+//     dead-letter topic, and failed for a write that did not land.
+//   - The ATTEMPT attribute is the fixed `dead_letter` token, which requires the
+//     purpose to be carried.
 func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3451,17 +3104,10 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 	})
 }
 
-// TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry is what criterion V-4's 15-minute
-// alert depends on.
+// TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry is what the acceptance
+// criterion 15-minute alert depends on.
 //
-// The gauge must report the age of the OLDEST unresolved entry. Reporting the newest would keep
-// it near zero and the alert would never fire, while the queue quietly grew — a failure mode that
-// looks healthy on every dashboard. The inventory therefore holds two entries of genuinely
-// different ages on the same topic, and the assertion is on the older one.
-//
-// Rows in the FAILED state are included and attributed to the dead-letter topic they are bound
-// for, because an event whose dead-letter write keeps failing is the most urgent entry in the
-// inventory and excluding it would let it age indefinitely unnoticed.
+// The gauge must report the age of the OLDEST unresolved entry.
 func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3512,19 +3158,13 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 		"45 minutes must exceed the 900-second alert threshold, which is what makes the rule fire")
 
 	t.Run("the age is exact however large the inventory is", func(t *testing.T) {
-		// WHAT THIS REPLACED (PERF-P07). The gauge used to walk rows under a 5,000-row bound,
-		// so past that bound it reported a LOWER BOUND on the age and set a Truncated flag. An
-		// alert cannot fire on a lower bound: the true age crossing fifteen minutes is exactly
-		// the case where the reported one might not.
-		//
-		// A grouped MIN has no such bound, so the assertion is now the stronger one — the age
-		// of the oldest entry is reported exactly, and the cost of saying so does not grow with
-		// the inventory, because the aggregate is answered from an index rather than from rows.
+		// WHY THE INVENTORY SIZE MATTERS. A gauge that walked rows under a bounded scan would
+		// report a LOWER BOUND on the age past that bound and set a truncated flag.
 		crowded := newDltFakeStore()
 		for i := range 10_000 {
-			// Every bulk row is YOUNGER than the 45-minute fixture, so the expected answer
-			// stays the one the outer test named and the assertion is about the inventory's
-			// SIZE rather than about which row happens to be oldest.
+			// Every bulk row is YOUNGER than the 45-minute fixture, so the expected answer stays
+			// the one the outer test named and the assertion is about the inventory's SIZE
+			// rather than about which row happens to be oldest.
 			crowded = crowded.withRow(dltAgedRow(t,
 				fmt.Sprintf("evt_age_bulk_%05d", i), "transaction.applied", "blnk.transactions",
 				model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt",
@@ -3560,12 +3200,10 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	})
 }
 
-// TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains is the other half of criterion
-// V-4, and it is the half that is easy to get wrong.
+// TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains is the other half of
+// alerting contract, and it is the half that is easy to get wrong.
 //
-// An unset gauge KEEPS ITS LAST VALUE in the exporter. An inventory that was just cleared would
-// therefore keep alerting on an age that no longer exists — a permanent, unclearable alert for a
-// problem that is over. Every dead-letter topic must be actively published as zero.
+// An unset gauge KEEPS ITS LAST VALUE in the exporter.
 func TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3614,32 +3252,11 @@ func TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains(t *testing.T) 
 	})
 }
 
-// TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish is the STATE-01
-// proof under genuine concurrency.
+// TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish is the
+// stale-lease proof under genuine concurrency.
 //
-// # Why the sequential test below is not this test
-//
-// TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish runs its two
-// replays one after the other, and what it establishes is that a row the first replay has
-// ALREADY moved cannot be claimed again. That is a real property and it is not this one. It
-// holds under an implementation with no atomicity at all — read the row, check the status in
-// Go, publish — because by the time the second request runs, the first has finished and the
-// stored status has changed. Two requests that arrive TOGETHER are the case that
-// implementation breaks on: both read `dead_lettered`, both pass the check, and both publish.
-//
-// The duplicate that produces is byte-identical, because a replay republishes the stored
-// bytes, so a subscriber deduplicating on event_id discards one. That is not a defence. It
-// occupies a partition slot, it inflates every offset-based reconciliation, and leaning on
-// consumer behaviour to cover a publishing-side defect is the opposite of a guarantee.
-//
-// # The arrangement
-//
-// Both requests are released from one barrier, and the WINNER IS PARKED inside the publisher —
-// it blocks there, holding the claim, until the loser has been refused. So the loser makes its
-// attempt at the moment the row is `replaying` and the first publish has not completed, which
-// is precisely the window a read-check-publish implementation is wrong in. Exactly one publish
-// must reach the writer, the loser must get a typed conflict, and only the winner may record a
-// terminal state.
+// The duplicate that produces is byte-identical, because a replay republishes the
+// stored bytes, so a subscriber deduplicating on event_id discards one.
 func TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish(t *testing.T) {
 	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
 	fixture.store.nextClaimToken = "the-only-valid-token"
@@ -3658,9 +3275,9 @@ func TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish(
 	})
 
 	fixture.publisher.onPublish = func() {
-		// The winner arrives here holding the claim. Waiting means the loser's claim attempt is
-		// made while the row is `replaying` and this publish is still outstanding — the exact
-		// interleaving a non-atomic check cannot survive.
+		// The winner arrives here holding the claim. Waiting means the loser's claim attempt
+		// is made while the row is `replaying` and this publish is still outstanding — the
+		// exact interleaving a non-atomic check cannot survive.
 		select {
 		case <-loserSettled:
 		case <-time.After(10 * time.Second):
@@ -3748,29 +3365,20 @@ func TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish(
 }
 
 // TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish is the
-// SEQUENTIAL half of the STATE-01 proof on the replay path.
+// SEQUENTIAL half of the stale-lease proof on the replay path.
 //
-// # The defect this guards against
+// Two requests for one event could both read a dead_lettered row, both pass the check,
+// and both publish — so an operator double-clicking, or two operators working the same
+// dead-letter backlog, put two copies of the event on the topic.
 //
-// A replay used to be a READ followed by a CHECK followed by a PUBLISH: fetch the row,
-// confirm it is dead-lettered, publish. Two requests for one event could both read a
-// dead_lettered row, both pass the check, and both publish — so an operator
-// double-clicking, or two operators working the same dead-letter backlog, put two copies
-// of the event on the topic. Because a replay re-publishes the STORED bytes, those copies
-// are byte-identical, so a subscriber deduplicating on event_id discards one; but the
-// duplicate is real, it occupies a partition slot, and leaning on consumer behaviour to
-// paper over a publishing-side defect is not a guarantee.
+// The precondition lives INSIDE the transition, so a row a previous replay has already
+// moved cannot be claimed again: exactly one of two SEQUENTIAL replays claims the row,
+// and the second is refused before reaching the publisher. The claim is asserted to
+// have been attempted twice — proving the second request really did try — while the
+// publisher saw one message.
 //
-// # What is asserted, and what is NOT
-//
-// The precondition lives INSIDE the transition, so a row a previous replay has already moved
-// cannot be claimed again: exactly one of two SEQUENTIAL replays claims the row, and the second
-// is refused before reaching the publisher. The claim is asserted to have been attempted twice —
-// proving the second request really did try — while the publisher saw one message.
-//
-// This says nothing about two requests arriving together, which is the harder case and the one
-// a non-atomic check actually fails.
-// TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish covers it.
+// This says nothing about two requests arriving together, which is the harder case and
+// the one a non-atomic check actually fails.
 func TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish(t *testing.T) {
 	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
 	fixture.store.nextClaimToken = "the-only-valid-token"
@@ -3798,17 +3406,11 @@ func TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublis
 		"a successful replay reaches dispatched and must not release the claim back to dead_lettered")
 }
 
-// TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails is the other half of the
-// replay claim, and without it the claim would be a trap rather than a fix.
+// TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails is the other half of
+// the replay claim, and without it the claim would be a trap rather than a fix.
 //
-// A claimed row sits in the replaying state, which is outside BOTH the relay's claimable
-// set and the dead-letter inventory. So a replay that claims a row and then fails to
-// publish would strand the event where nothing at all would pick it up again — the fix for
-// duplication would have introduced a way to lose an event's replayability entirely.
-//
-// Every exit path from a claimed row must therefore end in either a terminal transition or
-// a release. Both failure shapes are covered: the publish failing, and the bookkeeping
-// failing after a successful publish.
+// A claimed row sits in the replaying state, which is outside BOTH the relay's
+// claimable set and the dead-letter inventory.
 func TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails(t *testing.T) {
 	t.Run("a failed publish returns the row to dead_lettered", func(t *testing.T) {
 		fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
@@ -3856,31 +3458,9 @@ func TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails(t *testing.T
 	})
 }
 
-// TestReplayDeadLetteredEvent_ReleasesTheClaimEvenWhenTheCallerHasAlreadyGoneAway is the
-// property releaseReplayClaim's detached context exists for, and the one the release tests
-// above cannot reach.
-//
-// # Why the other release tests do not establish it
-//
-// TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails proves the release HAPPENS on
-// both failure shapes. It runs on context.Background(), which is never cancelled, so it holds
-// identically whether the release inherits the caller's cancellation or not — and inheritance is
-// exactly the defect. The commonest way a replay fails is the caller going away: an operator
-// closing the tab, a proxy timing the request out, a rolling deploy taking the process down
-// mid-replay. On the caller's context the rollback then fails for precisely the reason the replay
-// did, every single time, and the row is left in `replaying` holding a token nobody has —
-// invisible to the relay's claimable set AND to the dead-letter inventory.
-//
-// # The arrangement
-//
-// The caller's context is cancelled from inside the publisher, which is the one instant at which
-// the row is claimed and the replay is not yet over. Then the publish fails. Everything after
-// that point runs with a dead caller, so a release that inherited the cancellation could not
-// perform its update at all — and the fake store refuses a dead context exactly as lib/pq does,
-// so an inherited cancellation is a failed release rather than a silently passing one.
-//
-// What is required: the release ran, it saw a LIVE context, that context was BOUNDED, the row is
-// dead-lettered again with the reason recorded, and it is replayable.
+// TestReplayDeadLetteredEvent_ReleasesTheClaimEvenWhenTheCallerHasAlreadyGoneAway is
+// the property releaseReplayClaim's detached context exists for, and the one the
+// release tests above cannot reach.
 func TestReplayDeadLetteredEvent_ReleasesTheClaimEvenWhenTheCallerHasAlreadyGoneAway(t *testing.T) {
 	failures := []struct {
 		name string
@@ -3981,19 +3561,11 @@ func TestReplayDeadLetteredEvent_ReleasesTheClaimEvenWhenTheCallerHasAlreadyGone
 	}
 }
 
-// TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen closes the one gap the
-// straightforward fixture above cannot close.
+// TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen closes the one gap
+// the straightforward fixture above cannot close.
 //
-// The inventory is ordered by OCCURRENCE, while an entry's age is measured from its LAST ATTEMPT —
-// and those two orderings genuinely disagree. An event can occur late and be given up on almost
-// immediately, while an older event sits in a relay backlog and is only given up on minutes ago.
-// When that happens the entry appearing LATER in the page is NEWER by age.
-//
-// So the per-topic reduction has to be a MAXIMUM. An implementation that simply assigned each age
-// in turn would report whichever row it happened to see last — two minutes here — and the
-// 15-minute alert would never fire for the entry that has genuinely been stuck for 45. A fixture
-// whose occurrence and age orderings agreed would pass either way, which is exactly why this case
-// is written out separately.
+// The inventory is ordered by OCCURRENCE, while an entry's age is measured from its
+// LAST ATTEMPT — and those two orderings genuinely disagree.
 func TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4003,9 +3575,9 @@ func TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen(t *testi
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 45*time.Minute)
 	stale.OccurredAt = dltFixedNow.Add(-50 * time.Minute)
 
-	// Occurred 90 minutes ago but sat in a relay backlog, so its final attempt was only two
-	// minutes ago. It occurred EARLIER, so it sorts later in the occurrence-ordered inventory,
-	// yet it is far newer by age.
+	// Occurred 90 minutes ago but sat in a relay backlog, so its final attempt was only
+	// two minutes ago. It occurred EARLIER, so it sorts later in the occurrence-ordered
+	// inventory, yet it is far newer by age.
 	lateRetry := dltAgedRow(t, "evt_age_late_retry", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
 	lateRetry.OccurredAt = dltFixedNow.Add(-90 * time.Minute)
@@ -4034,12 +3606,11 @@ func TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen(t *testi
 		"the published value must cross the 900-second threshold the alert rule is written against")
 }
 
-// TestDeadLetterAgeGauge_IsTheOnlyMaintainerOfTheAgeGauge keeps the newest entry from being
-// published as the oldest.
+// TestDeadLetterAgeGauge_IsTheOnlyMaintainerOfTheAgeGauge keeps the newest entry from
+// being published as the oldest.
 //
-// The dead-letter path only ever sees the event being given up on RIGHT NOW, which is the newest
-// entry. Setting the age gauge there would report an age near zero every time, silently defeating
-// the 15-minute alert while looking healthy.
+// The dead-letter path only ever sees the event being given up on RIGHT NOW, which is
+// the newest entry.
 func TestDeadLetterAgeGauge_IsTheOnlyMaintainerOfTheAgeGauge(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4055,16 +3626,11 @@ func TestDeadLetterAgeGauge_IsTheOnlyMaintainerOfTheAgeGauge(t *testing.T) {
 		"dead-lettering an event must not touch the oldest-message-age gauge")
 }
 
-// dltAgedRow builds an inventory entry of a known age, in a known terminal failure state.
+// dltAgedRow builds an inventory entry of a known age, in a known terminal failure
+// state.
 //
-// The age is expressed as a duration before the fixed clock and applied to the LAST ATTEMPT,
-// which is the instant an entry's age is measured from: the moment the event was given up on, and
-// therefore the moment it started sitting in a dead-letter topic.
-//
-// A dead-lettered entry also carries its failure metadata, because that is what the repository
-// holds for such a row and what the listing hands to the API projection. A failed entry carries
-// none — it has not reached a dead-letter topic yet — which is itself a state the inventory has to
-// present.
+// A dead-lettered entry also carries its failure metadata, because that is what the
+// repository holds for such a row and what the listing hands to the API projection.
 func dltAgedRow(
 	t *testing.T,
 	eventID, eventType, topic, status, dltTopic string,
@@ -4083,8 +3649,8 @@ func dltAgedRow(
 	row.DLTTopic = dltTopic
 
 	// Re-stamped because occurred_at moved: the stored envelope carries that instant, so
-	// leaving the inherited bytes behind would describe a row whose event_raw disagrees with
-	// its own columns — a state no writer produces.
+	// leaving the inherited bytes behind would describe a row whose event_raw disagrees
+	// with its own columns — a state no writer produces.
 	dltStampCanonicalEnvelope(t, &row)
 
 	if status == model.EventOutboxStatusDeadLettered {
@@ -4106,16 +3672,11 @@ func dltAgedRow(
 // Listing the dead-letter inventory
 // ---------------------------------------------------------------------------
 
-// TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic is a design commitment, not an
-// implementation detail.
+// TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic is a design
+// commitment, not an implementation detail.
 //
-// Blnk implements NO CONSUMER — building one is explicitly out of scope — and it does not need
-// one, because the outbox row already carries dlt_topic and failure_metadata. The listing is
-// therefore available with the broker down, which is precisely when an operator wants it.
-//
-// The proof is behavioural: the transport is rigged so that ANY attempt to resolve a writer fails
-// the test, and the publisher counts every call. A listing that consumed a topic — or that even
-// resolved a transport speculatively — would trip one of them.
+// Blnk implements NO CONSUMER — building one is explicitly out of scope — and it does
+// not need one, because the outbox row already carries dlt_topic and failure_metadata.
 func TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4173,12 +3734,11 @@ func TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic(t *testing.
 	})
 }
 
-// TestListDeadLetterEvents_CoversBothTerminalFailureStates keeps the events most in need of
-// attention from being hidden.
+// TestListDeadLetterEvents_CoversBothTerminalFailureStates keeps the events most in
+// need of attention from being hidden.
 //
-// A row becomes FAILED the moment its retry budget is spent, and DEAD_LETTERED only once the
-// event has additionally reached its `.dlt` sibling. Listing only the latter would hide exactly
-// the events whose dead-letter write itself failed.
+// A row becomes FAILED the moment its retry budget is spent, and DEAD_LETTERED only
+// once the event has additionally reached its `.dlt` sibling.
 func TestListDeadLetterEvents_CoversBothTerminalFailureStates(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4201,13 +3761,12 @@ func TestListDeadLetterEvents_CoversBothTerminalFailureStates(t *testing.T) {
 
 // TestListDeadLetterEvents_PagesWithTheDocumentedBounds pins the page arithmetic.
 //
-// A caller asking for a page that is too large has made a recoverable mistake, and degrading to
-// a sane page is more useful than an error. The ceiling matters operationally: without it a
-// triage endpoint becomes a full-table scan.
+// A caller asking for a page that is too large has made a recoverable mistake, and
+// degrading to a sane page is more useful than an error.
 //
-// The cursor is passed through VERBATIM rather than normalised (PERF-P08). It names a position
-// and there is nothing to clamp; the offset it replaced was clamped at zero and unbounded above,
-// which bounded nothing that mattered.
+// The cursor is passed through VERBATIM rather than normalised. It names a position and
+// there is nothing to clamp; the offset it replaced was clamped at zero and unbounded
+// above, which bounded nothing that mattered.
 func TestListDeadLetterEvents_PagesWithTheDocumentedBounds(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4273,17 +3832,8 @@ func TestListDeadLetterEvents_PagesWithTheDocumentedBounds(t *testing.T) {
 	assert.Equal(t, 500, maxDeadLetterListLimit, "the page ceiling is a published bound")
 }
 
-// TestListDeadLetterEvents_AppliesTheExposedFilters covers each filter and the combination.
-//
-// The topic filter is applied to the ORIGINAL topic rather than to the `.dlt` sibling, which is
-// what makes "show me the transaction events that are stuck" expressible without the caller
-// having to know the suffix convention.
-//
-// Paging over a FILTERED set resumes from the last MATCH rather than from a row position, so a
-// filtered page behaves like a page of the filtered set rather than a filtered page of the
-// unfiltered set — the latter would return short, unstable pages as the filter's hit rate varied.
-// PERF-P06 moved the filters into the SQL statement, so this is now the statement's WHERE clause
-// being exercised through the fake rather than an application-side match loop.
+// TestListDeadLetterEvents_AppliesTheExposedFilters covers each filter and the
+// combination.
 func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4388,11 +3938,11 @@ func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 	})
 
 	t.Run("every filter reaches the repository rather than being applied above it", func(t *testing.T) {
-		// The defect this closes: the service used to filter IN MEMORY by paging the
-		// inventory up to a fixed scan ceiling, so a page that hit the ceiling was returned
-		// looking exactly like a complete one and an exact total was impossible. Both were
-		// properties of WHERE the filtering happened, which is why the assertion is about
-		// what the repository was asked for and not only about what came back.
+		// What this closes: filtering IN MEMORY by paging the inventory up to a fixed scan
+		// ceiling returns a page that hit the ceiling looking exactly like a complete one, and
+		// makes an exact total impossible. Both are properties of WHERE the filtering happens,
+		// which is why the assertion is about what the repository was asked for and not only
+		// about what came back.
 		resume := &model.DeadLetterCursor{OccurredAt: time.Now().UTC().Add(-time.Hour), ID: 512}
 		narrowing := DeadLetterListOptions{
 			EventType: "transaction.applied",
@@ -4419,19 +3969,11 @@ func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 	})
 }
 
-// TestListDeadLetterEvents_AppliesTheOccurrenceWindow covers the filter an operator reaches
-// for during an incident.
-//
-// "What is stuck from the twenty minutes the broker was down" is the question actually
-// asked, and before this filter existed the only way to answer it was to page the whole
-// inventory and read timestamps by eye — the endpoint refused the parameter outright. The
-// window bounds occurred_at, the instant the ledger mutation happened, which is what
-// correlates against an incident timeline and is also the column the inventory is ordered by.
+// TestListDeadLetterEvents_AppliesTheOccurrenceWindow covers the filter an operator
+// reaches for during an incident.
 //
 // Both ends are inclusive, so a window stated from an incident's first to last second
-// contains the events at both edges. A REVERSED window is refused rather than returning an
-// empty page, for the same reason an unrecognised status is: an empty page reads to an
-// operator as "nothing is stuck".
+// contains the events at both edges.
 func TestListDeadLetterEvents_AppliesTheOccurrenceWindow(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4527,14 +4069,8 @@ func TestListDeadLetterEvents_AppliesTheOccurrenceWindow(t *testing.T) {
 
 // TestListAndCountDeadLetterEvents_IsOneReadNotTwo pins the shape of the paired read.
 //
-// The page and the total used to be two service calls, and no amount of shared predicate makes
-// two reads observe one population: an entry dead-lettered between them is counted by one and
-// absent from the other, and the total then describes a set the page is not a slice of.
-//
-// The assertion is on the CALLS rather than on the numbers, because the numbers agree in a quiet
-// fixture either way. What distinguishes the fixed shape from the broken one is that the pair
-// leaves the service through a single seam method — the one the repository answers from a single
-// REPEATABLE READ snapshot.
+// The assertion is on the CALLS rather than on the numbers, because the numbers agree
+// in a quiet fixture either way.
 func TestListAndCountDeadLetterEvents_IsOneReadNotTwo(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4560,8 +4096,8 @@ func TestListAndCountDeadLetterEvents_IsOneReadNotTwo(t *testing.T) {
 			"backlog it is walking")
 
 	// ONE NARROWING, REACHING BOTH HALVES. The fake records what the count was asked for
-	// separately from what the page was, so a paired read that filtered only the page would be
-	// visible here.
+	// separately from what the page was, so a paired read that filtered only the page
+	// would be visible here.
 	counted := store.snapshotInventoryCountQueries()
 	require.Len(t, counted, 1, "the paired read must count exactly once")
 	assert.Empty(t, store.snapshotCountQueries(),
@@ -4579,11 +4115,10 @@ func TestListAndCountDeadLetterEvents_IsOneReadNotTwo(t *testing.T) {
 	assert.Equal(t, "transaction.applied", paged[0].EventType)
 }
 
-// TestListAndCountDeadLetterEvents_RefusesTheSameNarrowingTheSingleReadsDo keeps validation in
-// front of the paired read.
+// TestListAndCountDeadLetterEvents_RefusesTheSameNarrowingTheSingleReadsDo keeps
+// validation in front of the paired read.
 //
-// A third entry point into the inventory is a third place a bad filter could slip past. The
-// normalisation is shared rather than repeated, and this is the assertion that it actually runs.
+// A third entry point into the inventory is a third place a bad filter could slip past.
 func TestListAndCountDeadLetterEvents_RefusesTheSameNarrowingTheSingleReadsDo(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4620,37 +4155,27 @@ func TestListAndCountDeadLetterEvents_ReportsAMissingDatasource(t *testing.T) {
 // The dead-letter count, stated ONCE
 // ---------------------------------------------------------------------------------------
 
-// TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom is the whole count contract, in
-// one place.
-//
-// # Why this suite is one suite
-//
-// It replaces FOUR test functions that asserted the same contract over four different fixture
-// sets — CountsTheFilteredSet, CountsTheSameNarrowingAsThePage, CountsTheSameSetTheListingReturns
-// and IsAboutTheSamePopulationAsThePage — plus two more that overlapped on the refusals. Between
-// them they ran the same six narrowings four times, re-derived "the page does not affect the
-// total" three times, and asserted the shared-predicate property in three slightly different
-// ways. That is not additional coverage. It is one contract with four owners, and the cost is
-// paid on every change: a seventh narrowing has to be added in four places, and the reader who
-// finds only three of them cannot tell whether the fourth is a deliberate exception.
+// TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom is the whole count
+// contract, in one place.
 //
 // Everything the four asserted is asserted here, and each property exactly once:
 //
-//   - The count answers each filter dimension, their combination, and zero for a narrowing that
-//     matches nothing.
+//   - The count answers each filter dimension, their combination, and zero for a
+//     narrowing that matches nothing.
 //   - The count agrees with the page it accompanies when the page can hold every match.
 //   - LIMIT and OFFSET have no bearing on it, because a count is of the SET.
 //   - The narrowing reaches the repository, TRIMMED, as one query per request.
-//   - The count and the listing narrow by the same predicate — compared field by field, with the
-//     page bounds zeroed, because the page a listing asks for is legitimately not the page a
-//     count asks for.
+//   - The count and the listing narrow by the same predicate — compared field by field,
+//     with the page bounds zeroed, because the page a listing asks for is legitimately
+//     not the page a count asks for.
 func TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	// ONE fixture set, chosen so every dimension distinguishes something and no two narrowings
-	// select the same rows: two event types on one topic, a third on another, and both terminal
-	// failure states represented — `failed` included because it is the entry an operator most
-	// needs to see, its retry budget spent while its dead-letter write has not landed.
+	// ONE fixture set, chosen so every dimension distinguishes something and no two
+	// narrowings select the same rows: two event types on one topic, a third on another,
+	// and both terminal failure states represented — `failed` included because it is the
+	// entry an operator most needs to see, its retry budget spent while its dead-letter
+	// write has not landed.
 	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
 	void := dltAgedRow(t, "evt_count_void", "transaction.void", "blnk.transactions",
@@ -4761,10 +4286,10 @@ func TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom(t *testing.T) 
 		require.Len(t, listQueries, 1)
 		require.Len(t, countQueries, 1)
 
-		// Compared on the NARROWING alone, with the bounds zeroed: the page a listing asks for is
-		// legitimately not the page a count asks for, and it is the predicate that has to be
-		// identical. Two independently assembled predicates would let a total describe a
-		// population the page was not drawn from.
+		// Compared on the NARROWING alone, with the bounds zeroed: the page a listing asks
+		// for is legitimately not the page a count asks for, and it is the predicate that has
+		// to be identical. Two independently assembled predicates would let a total describe
+		// a population the page was not drawn from.
 		listed, counted := listQueries[0], countQueries[0]
 		listed.Limit, listed.Offset = 0, 0
 		counted.Limit, counted.Offset = 0, 0
@@ -4773,14 +4298,11 @@ func TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom(t *testing.T) 
 	})
 }
 
-// TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes is the count's failure
-// contract, also in one place.
+// TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes is the count's
+// failure contract, also in one place.
 //
-// It replaces the refusal halves of the four consolidated suites plus two dedicated ones. The
-// property being defended throughout is that the count NEVER answers zero for a question it
-// could not answer: zero is a real and reassuring number — "the backlog is empty" — so returning
-// it for a rejected filter, a database outage or an uninitialised service would report a healthy
-// dead-letter inventory in exactly the situations where nobody knows what the inventory holds.
+// It replaces the refusal halves of the four consolidated suites plus two dedicated
+// ones.
 func TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4840,26 +4362,14 @@ func TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes(t *te
 }
 
 // ---------------------------------------------------------------------------------------
-// SEC-09 — the filtered inventory is complete, and its total says so
+// The filtered inventory is complete, and its total says so
 // ---------------------------------------------------------------------------------------
 
-// TestListDeadLetterEvents_PushesEveryPredicateToTheRepository is the SEC-09 guard at the
+// TestListDeadLetterEvents_PushesEveryPredicateToTheRepository is the guard at the
 // service layer.
 //
-// # The defect
-//
-// The service used to serve a filtered page by WALKING the repository's unfiltered pages and
-// applying the predicates in Go, abandoning the walk after five thousand rows and logging a
-// warning. The page it returned was then indistinguishable from a complete one, and the only
-// record that the scan had given up was a log line the operator was not reading. During a loss
-// investigation "nothing more is stuck" is the most dangerous wrong answer this endpoint gives.
-//
-// # What is asserted, and why it is the repository CALL rather than the result
-//
-// A result-only assertion would pass against the old walk too: with a small fixture the walk
-// never reached its bound and returned the right rows. What distinguishes the two designs is
-// WHAT THE SERVICE ASKS THE DATABASE FOR — one filtered query, or many unfiltered ones. So the
-// recorded calls are the assertion.
+// A result-only assertion would pass against the old walk too: with a small fixture the
+// walk never reached its bound and returned the right rows.
 func TestListDeadLetterEvents_PushesEveryPredicateToTheRepository(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4880,9 +4390,9 @@ func TestListDeadLetterEvents_PushesEveryPredicateToTheRepository(t *testing.T) 
 	})
 	require.NoError(t, err)
 
-	// THE INVENTORY READ is what the listing issues: a narrow, keyset-paged projection that
-	// never reads a payload (PERF-P06). It is recorded twice — once as the narrowing and once
-	// as the page — because the two are asserted separately below.
+	// THE INVENTORY READ is what the listing issues: a narrow, keyset-paged projection
+	// that never reads a payload. It is recorded twice — once as the narrowing and once as
+	// the page — because the two are asserted separately below.
 	require.Len(t, store.inventoryQueries, 1,
 		"ONE query, filtered. A walk would issue a page request per lap, and it is the number "+
 			"of requests — not the rows they returned — that tells the two designs apart")
@@ -4904,14 +4414,8 @@ func TestListDeadLetterEvents_PushesEveryPredicateToTheRepository(t *testing.T) 
 			"page that was filtered afterwards")
 }
 
-// TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory is the regression test for
-// the five-thousand-row bound itself.
-//
-// It builds an inventory larger than deadLetterScanMaxRows in which every MATCHING entry sits
-// past the old bound, which is the exact shape that produced a silently empty page: the walk
-// scanned five thousand non-matching rows, gave up, and reported success with nothing in it.
-// The entry now comes back, and the total confirms it — because the database applied the
-// predicate before the page was taken.
+// TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory is the regression
+// test for the five-thousand-row bound itself.
 func TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4947,19 +4451,12 @@ func TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory(t *testin
 }
 
 // ---------------------------------------------------------------------------------------
-// SEC-08 — retention may only ever delete a receipt
+// Retention may only ever delete a receipt
 // ---------------------------------------------------------------------------------------
 
 // TestRefreshDeadLetterAgeGauge_CountsEveryOutstandingEntry is what keeps the
-// DeadLetterMessageStuck alert honest, and it is the counterpart of the retention rule: an
-// entry leaves this gauge by being REPLAYED and by nothing else.
-//
-// A `resolve` endpoint used to exempt an entry from the gauge — and from the retention purge —
-// on an operator's word alone, without anything having been delivered. It has been removed: it
-// was a fourteenth management route on a thirteen-route surface, and it could not compose with
-// replay, because a resolved row whose re-publish the broker acknowledged could not then be
-// marked dispatched. So the gauge counts every outstanding entry, and a successful replay is
-// what takes one out of it.
+// DeadLetterMessageStuck alert honest, and it is the counterpart of the retention rule:
+// an entry leaves this gauge by being REPLAYED and by nothing else.
 func TestRefreshDeadLetterAgeGauge_CountsEveryOutstandingEntry(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -4982,10 +4479,11 @@ func TestRefreshDeadLetterAgeGauge_CountsEveryOutstandingEntry(t *testing.T) {
 	// got. Reporting the newest would keep a permanently stuck event permanently invisible.
 	assert.GreaterOrEqual(t, report.OldestByTopic["blnk.transactions.dlt"], 40*time.Hour)
 
-	// ONE GROUPED AGGREGATE, and no walk at all: the answer is computed in the statement rather
-	// than by paging the inventory and filtering in Go, which is what makes the age exact at any
-	// backlog size instead of a lower bound drawn from a bounded scan. Asserting the call COUNT
-	// is how the two designs are told apart: a walk would issue a page request per lap.
+	// ONE GROUPED AGGREGATE, and no walk at all: the answer is computed in the statement
+	// rather than by paging the inventory and filtering in Go, which is what makes the age
+	// exact at any backlog size instead of a lower bound drawn from a bounded scan.
+	// Asserting the call COUNT is how the two designs are told apart: a walk would issue a
+	// page request per lap.
 	assert.Equal(t, 1, store.ageCalls,
 		"the age gauge must be one grouped aggregate per refresh, not a walk whose cost grows "+
 			"with the backlog it is measuring")
@@ -4993,12 +4491,10 @@ func TestRefreshDeadLetterAgeGauge_CountsEveryOutstandingEntry(t *testing.T) {
 		"no row may be fetched to compute an age: the aggregate answers it in the database")
 }
 
-// TestListDeadLetterEvents_ReturnsAnEmptyPageRatherThanNil covers the normalisation on the
-// unfiltered path.
+// TestListDeadLetterEvents_ReturnsAnEmptyPageRatherThanNil covers the normalisation on
+// the unfiltered path.
 //
-// The repository returns a nil slice for an empty page. Normalising it means a caller can range
-// over the result without a nil check and a handler renders [] rather than null — a difference
-// every JSON client notices.
+// The repository returns a nil slice for an empty page.
 func TestListDeadLetterEvents_ReturnsAnEmptyPageRatherThanNil(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -5016,11 +4512,8 @@ func TestListDeadLetterEvents_ReturnsAnEmptyPageRatherThanNil(t *testing.T) {
 	assert.Equal(t, "[]", string(encoded))
 }
 
-// TestListDeadLetterEvents_RejectsAnUnsupportedStatusFilter is the one filter that is validated
-// rather than clamped.
-//
-// A filter that quietly matched nothing would answer "nothing is stuck" to an operator who asked
-// a different question — which is exactly the wrong answer to give during an incident.
+// TestListDeadLetterEvents_RejectsAnUnsupportedStatusFilter is the one filter that is
+// validated rather than clamped.
 func TestListDeadLetterEvents_RejectsAnUnsupportedStatusFilter(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -5053,17 +4546,10 @@ func TestListDeadLetterEvents_RejectsAnUnsupportedStatusFilter(t *testing.T) {
 	})
 }
 
-// TestListDeadLetterEvents_DelegatesFilteringToTheRepository asserts the service asks for a
-// FILTERED page rather than filtering a page it was given.
+// TestListDeadLetterEvents_DelegatesFilteringToTheRepository asserts the service asks
+// for a FILTERED page rather than filtering a page it was given.
 //
-// This is the shape of the fix, and the shape is what makes the guarantee. Filtering used to
-// happen here: the service asked for unfiltered pages of 500, applied the predicates in Go, and
-// stopped after a fixed row budget. So one filtered request meant many repository requests, and
-// the answer was a prefix of the matches with nothing to say so.
-//
-// Exactly ONE request, carrying the caller's page and the caller's filter, is therefore the
-// assertion. A service that walked again would fail on the count of requests; one that dropped
-// the predicates would fail on the recorded filter.
+// This is the shape of the fix, and the shape is what makes the guarantee.
 func TestListDeadLetterEvents_DelegatesFilteringToTheRepository(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -5091,14 +4577,11 @@ func TestListDeadLetterEvents_DelegatesFilteringToTheRepository(t *testing.T) {
 		"the status narrowing must reach the repository rather than being applied above it")
 }
 
-// TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden is the regression
-// test for the silent truncation.
+// TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden is the
+// regression test for the silent truncation.
 //
-// The inventory here is deliberately LARGER than deadLetterScanMaxRows and every match sits
-// past that bound. Under the walk this returned an empty page with a 200 — an operator asking
-// "what identity events are stuck" was told "none" while three were — and no field in the
-// response distinguished that from an exhausted scan. WithScanLimit is set to something small
-// as well, to state that the gauge's bound is not the listing's bound: the listing has none.
+// The inventory here is deliberately LARGER than deadLetterScanMaxRows and every match
+// sits past that bound.
 func TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -5156,17 +4639,10 @@ func TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden(t
 // Scope boundary
 // ---------------------------------------------------------------------------
 
-// TestEventDeadLetterSource_BuildsNoConsumerSurface enforces the MUST NOT boundary structurally.
+// TestEventDeadLetterSource_BuildsNoConsumerSurface enforces the MUST NOT boundary
+// structurally.
 //
-// Blnk publishes the `<topic>.dlt` naming convention AND NOTHING MORE. It does not build a
-// consumer or consumer-group library, it does not manage a subscriber's own dead-letter topics,
-// and it implements no consumer error-handling or poison-message framework — a subscriber's
-// consumption failures are the subscriber's to handle.
-//
-// Asserted over the source text rather than left to review, because the boundary is easy to cross
-// with a single well-intentioned import: a kafka.Reader here would be the moment Blnk started
-// owning consumption. The listing and the replay read the outbox ROW precisely so that no
-// consumer is ever needed.
+// Blnk publishes the `<topic>.dlt` naming convention AND NOTHING MORE.
 func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
 	code := dltReadCode(t, "event_dlt.go")
 
@@ -5184,9 +4660,9 @@ func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
 				"replay both read the outbox row so that none is needed", consumerSurface)
 	}
 
-	// The boundary is documented in the file itself, so the next contributor reads it before
-	// reaching for a reader. This one is asserted against the raw source, because a comment is
-	// exactly what is being required.
+	// The boundary is documented in the file itself, so the next contributor reads it
+	// before reaching for a reader. This one is asserted against the raw source, because a
+	// comment is exactly what is being required.
 	assert.Contains(t, dltReadSource(t, "event_dlt.go"), "subscriber-side dead-lettering is NOT Blnk's",
 		"the scope boundary must stay documented at the top of event_dlt.go")
 
@@ -5210,30 +4686,12 @@ func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Kafka transport policy — CRYPTO-01 and PRIV-01
-//
-// These tests cover NewKafkaTransport, which is the security boundary BOTH Kafka clients
-// dial through: the producer that publishes ledger events, and the administrative client
-// that mints credentials. Two decisions live there and nowhere else — whether the connection
-// is encrypted, and which principal it authenticates as.
-//
-// They live in this file rather than beside the publisher because event_publisher_test.go
-// belongs to a later checkpoint and is not in this scope, while the dead-letter path is an
-// in-scope consumer of exactly this transport: every dead-letter write and every replay goes
-// over it. Placing the guards here keeps them running now instead of waiting for a file
-// another author owns.
-//
-// Nothing here performs I/O. Building a transport reads TLS material from disk and prepares a
-// SCRAM mechanism, both local, so every case below is decided before a socket would open —
-// which is the point: a misconfiguration must be refused at construction, not discovered on
-// the first publish hours later.
+// Kafka transport policy. Nothing here performs I/O.
 // ---------------------------------------------------------------------------------------
 
-// kafkaTransportConfig builds a Kafka configuration with a valid producer credential pair and
-// TLS explicitly disabled-with-acknowledgement, which is the local development posture.
-//
-// Each test then changes the ONE field it is about, so a failure names the field rather than
-// leaving the reader to diff two literals.
+// kafkaTransportConfig builds a Kafka configuration with a valid producer credential
+// pair and TLS explicitly disabled-with-acknowledgement, which is the local development
+// posture.
 func kafkaTransportConfig() config.KafkaConfig {
 	return config.KafkaConfig{
 		Brokers:          []string{"localhost:9092"},
@@ -5244,17 +4702,15 @@ func kafkaTransportConfig() config.KafkaConfig {
 	}
 }
 
-// TestNewKafkaTransport_RefusesPlaintextUnlessLocalDevIsAcknowledged is the CRYPTO-01 guard.
+// TestNewKafkaTransport_RefusesPlaintextUnlessLocalDevIsAcknowledged is the guard.
 //
-// SASL/SCRAM authenticates the client to the broker. It does not encrypt the connection and it
-// does not authenticate the broker to the client, so over SASL_PLAINTEXT the SCRAM exchange and
-// every produce request travel in the clear — including identity events carrying names, email
-// addresses, phone numbers, postal addresses and dates of birth.
+// SASL/SCRAM authenticates the client to the broker.
 //
-// The transport therefore refuses to dial without TLS unless an operator has explicitly said
-// this is a local development broker. The refusal is what makes plaintext an opt-in rather than
-// the accident of an unset variable: a deployment that simply never set KAFKA_TLS_ENABLED fails
-// at construction instead of silently shipping ledger data unencrypted.
+// The transport therefore refuses to dial without TLS unless an operator has explicitly
+// said this is a local development broker. The refusal is what makes plaintext an
+// opt-in rather than the accident of an unset variable: a deployment that simply never
+// set KAFKA_TLS_ENABLED fails at construction instead of silently shipping ledger data
+// unencrypted.
 func TestNewKafkaTransport_RefusesPlaintextUnlessLocalDevIsAcknowledged(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.InsecureLocalDev = false
@@ -5275,13 +4731,11 @@ func TestNewKafkaTransport_RefusesPlaintextUnlessLocalDevIsAcknowledged(t *testi
 	}
 }
 
-// TestNewKafkaTransport_AcceptsAcknowledgedPlaintextForTheLocalStack covers the one supported
-// route to an unencrypted connection.
+// TestNewKafkaTransport_AcceptsAcknowledgedPlaintextForTheLocalStack covers the one
+// supported route to an unencrypted connection.
 //
-// The local single-broker KRaft stack listens on SASL_PLAINTEXT and only on that, so the escape
-// hatch has to exist. It is deliberately named for what it is, and a nil TLS configuration is
-// what makes kafka-go dial in the clear — asserted here so the acknowledgement is proven to
-// have an effect rather than merely being accepted.
+// The local single-broker KRaft stack listens on SASL_PLAINTEXT and only on that, so
+// the escape hatch has to exist.
 func TestNewKafkaTransport_AcceptsAcknowledgedPlaintextForTheLocalStack(t *testing.T) {
 	transport, err := NewKafkaTransport(kafkaTransportConfig(), KafkaTransportRoleProducer)
 	require.NoError(t, err)
@@ -5293,9 +4747,9 @@ func TestNewKafkaTransport_AcceptsAcknowledgedPlaintextForTheLocalStack(t *testi
 
 // TestNewKafkaTransport_BuildsAVerifiedTLSConfiguration covers the production posture.
 //
-// Three properties are asserted because each one is separately capable of being wrong while the
-// connection still appears to work: the protocol floor, the server name used for verification,
-// and that verification is on.
+// Three properties are asserted because each one is separately capable of being wrong
+// while the connection still appears to work: the protocol floor, the server name used
+// for verification, and that verification is on.
 func TestNewKafkaTransport_BuildsAVerifiedTLSConfiguration(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.InsecureLocalDev = false
@@ -5312,14 +4766,11 @@ func TestNewKafkaTransport_BuildsAVerifiedTLSConfiguration(t *testing.T) {
 	assert.False(t, transport.TLS.InsecureSkipVerify, "verification must be on by default")
 }
 
-// TestNewKafkaTransport_RefusesToSkipVerificationOutsideLocalDev covers the subtler half of
-// CRYPTO-01.
+// TestNewKafkaTransport_RefusesToSkipVerificationOutsideLocalDev covers the subtler
+// half of TLS misconfiguration: verification disabled rather than TLS absent.
 //
-// TLS with verification disabled still encrypts, so it looks like a working secure deployment.
-// It stops a passive reader and does nothing whatsoever about an active one: an interposed
-// broker is indistinguishable from the real one, and it collects the SCRAM handshake. A
-// deployment that set this would believe it had a protection it does not have, which is why it
-// is refused rather than warned about.
+// TLS with verification disabled still encrypts, so it looks like a working secure
+// deployment.
 func TestNewKafkaTransport_RefusesToSkipVerificationOutsideLocalDev(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.InsecureLocalDev = false
@@ -5331,13 +4782,8 @@ func TestNewKafkaTransport_RefusesToSkipVerificationOutsideLocalDev(t *testing.T
 	assert.Contains(t, err.Error(), "KAFKA_TLS_INSECURE_SKIP_VERIFY")
 }
 
-// TestNewKafkaTransport_RefusesAnUnusableCertificateAuthorityFile covers the trust-pool trap.
-//
-// An empty x509.CertPool is not an empty trust decision: with no certificates appended, the TLS
-// stack falls back to the SYSTEM roots, so a CA file that parsed to nothing would silently widen
-// trust from "the one authority this deployment issued its broker certificate from" to "every
-// authority the host trusts". The failure has to be at load time, because afterwards it is
-// indistinguishable from a correct configuration.
+// TestNewKafkaTransport_RefusesAnUnusableCertificateAuthorityFile covers the trust-pool
+// trap.
 func TestNewKafkaTransport_RefusesAnUnusableCertificateAuthorityFile(t *testing.T) {
 	caPath := filepath.Join(t.TempDir(), "ca.pem")
 	require.NoError(t, os.WriteFile(caPath, []byte("this is not a certificate\n"), 0o600))
@@ -5372,10 +4818,9 @@ func TestNewKafkaTransport_RefusesAMissingCertificateAuthorityFile(t *testing.T)
 
 // TestNewKafkaTransport_RefusesHalfAClientCertificate covers mutual TLS.
 //
-// A certificate without its key, or a key without its certificate, does not produce weaker
-// mutual TLS — it produces NO mutual TLS, silently, while the operator believes the broker is
-// authenticating them. Both orderings are tested because a check written for one field is easy
-// to write in a way that misses the other.
+// A certificate without its key, or a key without its certificate, does not produce
+// weaker mutual TLS — it produces NO mutual TLS, silently, while the operator believes
+// the broker is authenticating them.
 func TestNewKafkaTransport_RefusesHalfAClientCertificate(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "client.pem")
@@ -5400,16 +4845,10 @@ func TestNewKafkaTransport_RefusesHalfAClientCertificate(t *testing.T) {
 	}
 }
 
-// TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal is the PRIV-01 guard.
+// TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal is the guard.
 //
-// The producer used to authenticate as KAFKA_SASL_ADMIN_USER — the principal that creates
-// topics, alters SCRAM credentials and manages ACLs. Every ledger event was published by the
-// most privileged identity in the deployment, so a leaked producer credential handed an
-// attacker the cluster's authorization state rather than the ability to publish, and the
-// broker's audit trail could not tell routine publishing from administration.
-//
-// The dedicated pair must win whenever it is set, even with admin credentials also present —
-// which is the realistic case, since the same process configuration often carries both.
+// Authenticating the producer as KAFKA_SASL_ADMIN_USER would hand the busiest process
+// the principal that creates topics, alters SCRAM credentials and manages ACLs.
 func TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.SASLAdminUser, cfg.SASLAdminSecret = "blnk-admin", "admin-secret"
@@ -5425,23 +4864,17 @@ func TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal(t *testing.T) 
 	assert.Equal(t, "admin-secret", adminSecret)
 }
 
-// TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal replaces a test that asserted
-// the opposite, because the behaviour it pinned was itself the defect (PRIV-01).
+// TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal pins the refusal.
 //
-// The previous version required the producer role to FALL BACK to the admin pair, in the name of
-// letting a single-credential deployment keep publishing across an upgrade. It warned while doing
-// it, and that was the flaw in the reasoning: a warning is advice, the code went on publishing as
-// the principal that can create topics, alter SCRAM credentials and manage ACLs, and so a leaked
-// producer credential compromised the cluster's authorization state rather than merely allowing
-// events to be published.
+// A warning is not a substitute for it: the admin principal can create topics, alter
+// SCRAM credentials and manage ACLs, so publishing as it would turn a leaked producer
+// credential into compromise of the cluster's authorization state rather than merely
+// into unauthorised events. Refusing to publish costs availability; publishing as the
+// administrator costs the cluster, and the two are not symmetric.
 //
-// The two failure modes are not symmetric. A deployment that has not provisioned a producer
-// principal loses nothing by failing to start — it is a configuration step away from working —
-// whereas one that quietly publishes as the administrator has already accepted a serious risk
-// without being asked. So the fallback is gone, and its absence is what this test pins.
-//
-// TestKafkaTransportCredentials_RefusesToPublishAsTheAdministrator in event_admin_test.go covers
-// the refusal's message and the three configurations that remain legitimate.
+// TestKafkaTransportCredentials_RefusesToPublishAsTheAdministrator in
+// event_admin_test.go covers the refusal's message and the three configurations that
+// remain legitimate.
 func TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.SASLUser, cfg.SASLSecret = "", ""
@@ -5460,14 +4893,8 @@ func TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal(t *testing.
 	assert.Empty(t, secret)
 }
 
-// TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAllowed covers the
-// escape hatch.
-//
-// It exists for one case: an existing single-credential deployment must be able to keep
-// publishing while it provisions a producer principal, rather than stop dead on an upgrade. That
-// case is real, so the path is retained — but it must be ASKED FOR, so that the allowance lives
-// in the configuration where a reviewer can see it instead of being inferred from two absent
-// variables. The publisher warns on every construction that takes it.
+// TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAllowed
+// covers the escape hatch.
 func TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAllowed(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.SASLUser, cfg.SASLSecret = "", ""
@@ -5482,18 +4909,20 @@ func TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAll
 		"the administrative principal is what it borrows; there is nothing else configured")
 	assert.Equal(t, "admin-secret", secret)
 
-	// And the whole transport builds, so the deployment keeps publishing while the producer
-	// principal is provisioned. The allowance is not silent: kafkaTransportCredentials warns at
-	// every construction that takes this path, naming KAFKA_ALLOW_ADMIN_PRODUCER, so the
-	// arrangement stays visible for as long as it lasts.
+	// And the whole transport builds, so the deployment keeps publishing while the
+	// producer principal is provisioned. The allowance is not silent:
+	// kafkaTransportCredentials warns at every construction that takes this path, naming
+	// KAFKA_ALLOW_ADMIN_PRODUCER, so the arrangement stays visible for as long as it
+	// lasts.
 	transport, transportErr := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
 	require.NoError(t, transportErr)
 	require.NotNil(t, transport)
 
-	// THE FLAG IS THE ONLY THING THAT ADMITS IT, which is the property that makes the escape
-	// hatch an escape hatch rather than the default. Cleared, the identical configuration is
-	// refused — see TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal for the
-	// refusal's own assertions.
+	// THE FLAG IS THE ONLY THING THAT ADMITS IT, which is the property that makes the
+	// escape hatch an escape hatch rather than the default. Cleared, the identical
+	// configuration is refused — see
+	// TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal for the refusal's
+	// own assertions.
 	cfg.AllowAdminProducer = false
 	_, _, refused := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
 	require.Error(t, refused)
@@ -5502,9 +4931,8 @@ func TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAll
 
 // TestKafkaTransportCredentials_RefusesAHalfConfiguredPair covers both roles.
 //
-// A username with no secret cannot authenticate, and neither can a secret with no username. The
-// refusal happens at construction so the operator learns about it at startup rather than through
-// an authentication failure on the first publish, in a log nobody is watching, hours later.
+// A username with no secret cannot authenticate, and neither can a secret with no
+// username.
 func TestKafkaTransportCredentials_RefusesAHalfConfiguredPair(t *testing.T) {
 	t.Run("producer user without secret", func(t *testing.T) {
 		cfg := kafkaTransportConfig()
@@ -5534,10 +4962,10 @@ func TestKafkaTransportCredentials_RefusesAHalfConfiguredPair(t *testing.T) {
 	})
 
 	t.Run("a producer with no pair still validates the admin pair", func(t *testing.T) {
-		// The admin pair is the only available evidence that the cluster authenticates at all,
-		// which is what decides whether a missing producer pair is a misconfiguration or a
-		// legitimately unauthenticated broker. So it is still validated on the producer path —
-		// and a half-configured admin pair is reported as that, ahead of the PRIV-01 refusal,
+		// The admin pair is the only available evidence that the cluster authenticates at
+		// all, which is what decides whether a missing producer pair is a misconfiguration or
+		// a legitimately unauthenticated broker. So it is still validated on the producer
+		// path — and a half-configured admin pair is reported as that, ahead of the refusal,
 		// because it is the more specific fault.
 		cfg := kafkaTransportConfig()
 		cfg.SASLUser, cfg.SASLSecret = "", ""
@@ -5549,13 +4977,11 @@ func TestKafkaTransportCredentials_RefusesAHalfConfiguredPair(t *testing.T) {
 	})
 }
 
-// TestKafkaTransportCredentials_NoCredentialsIsNotAnError covers the unauthenticated local
-// broker.
+// TestKafkaTransportCredentials_NoCredentialsIsNotAnError covers the unauthenticated
+// local broker.
 //
-// Both values empty is a legitimate configuration — an unauthenticated development broker — and
-// it is distinguishable from a half-configured pair, which is not. The transport reports the
-// combination of unauthenticated AND unencrypted with a warning rather than an error, because
-// the local-dev acknowledgement has already been given for the encryption half.
+// Both values empty is a legitimate configuration — an unauthenticated development
+// broker — and it is distinguishable from a half-configured pair, which is not.
 func TestKafkaTransportCredentials_NoCredentialsIsNotAnError(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.SASLUser, cfg.SASLSecret = "", ""
@@ -5570,13 +4996,8 @@ func TestKafkaTransportCredentials_NoCredentialsIsNotAnError(t *testing.T) {
 	assert.Nil(t, transport.SASL, "no credentials means no SASL mechanism, not an empty one")
 }
 
-// TestSaslCredentialError_NamesTheRolesOwnVariables covers the diagnostic, which is the whole
-// value of the function.
-//
-// A credential that SASLprep rejects produces an error from the SCRAM client whose message
-// EMBEDS THE PLAINTEXT PASSWORD, which is why that error is deliberately not wrapped. What
-// replaces it has to be at least as useful, and pointing an operator at KAFKA_SASL_ADMIN_USER
-// when the producer pair is at fault sends them to the wrong line of their configuration.
+// TestSaslCredentialError_NamesTheRolesOwnVariables covers the diagnostic, which is the
+// whole value of the function.
 func TestSaslCredentialError_NamesTheRolesOwnVariables(t *testing.T) {
 	// U+0007 is a prohibited control character under SASLprep, so preparing it fails while
 	// the value itself is not a secret.
@@ -5600,15 +5021,14 @@ func TestSaslCredentialError_NamesTheRolesOwnVariables(t *testing.T) {
 		"the message must state that the secret was withheld, so its absence is not read as a bug")
 }
 
-// TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit pins the mapper
-// itself, independently of the service that calls it.
+// TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit pins the
+// mapper itself, independently of the service that calls it.
 //
-// Two things are asserted that the service-level tests below cannot see. First, that each
-// code resolves to its intended status through an explicit statusByCode entry — an unmapped
-// code silently becomes 500, which would collapse the split this test exists to prove.
-// Second, that the message accompanying each code names the right culprit: a 503 that said
-// "failed to replay the event" would tell an operator to investigate Blnk while the broker
-// was down.
+// Two things are asserted that the service-level tests below cannot see: that each code
+// resolves to its intended status through an explicit statusByCode entry, an unmapped
+// code silently becoming 500; and that each message names the right culprit, since a 503
+// reading "failed to replay the event" points an operator at Blnk while the broker is
+// down.
 func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit(t *testing.T) {
 	unavailableCode, unavailableMessage := replayFailureOutcome(kafka.LeaderNotAvailable)
 	assert.Equal(t, apierror.ErrKafkaUnavailable, unavailableCode)
@@ -5627,10 +5047,9 @@ func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit
 	assert.NotEqual(t, unavailableMessage, failedMessage,
 		"the two outcomes must be distinguishable by message as well as by code")
 
-	// The third arm. An abandoned replay is neither of the two above, and it used to be reported
-	// as the first — a 503 whose message named a healthy broker as the culprit. It answers the
-	// approved EVENT_REPLAY_FAILED code and is told apart from a genuine Blnk-owned failure by
-	// its message, because the published taxonomy has no separate timeout code to answer with.
+	// The third arm. It answers the approved EVENT_REPLAY_FAILED code and is told apart
+	// from a genuine Blnk-owned failure by its message, because the published taxonomy has
+	// no separate timeout code to answer with.
 	abandonedCode, abandonedMessage := replayFailureOutcome(
 		fmt.Errorf("waiting for acknowledgement: %w", context.Canceled))
 	assert.Equal(t, apierror.ErrEventReplayFailed, abandonedCode)
@@ -5659,22 +5078,19 @@ func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit
 		"an unreachable broker must not be reclassified as an abandoned request")
 }
 
-// TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect pins the classifier the mapper
-// reads, case by case.
+// TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect pins the classifier the
+// mapper reads, case by case.
 //
-// It is table-driven over the whole taxonomy because each entry closes a specific way the
-// classification could go wrong, and several of them are counter-intuitive:
+// It is table-driven over the whole taxonomy because each entry closes a specific way
+// the classification could go wrong, and several of them are counter-intuitive:
 //
-//   - BrokerNotAvailable and ReplicaNotAvailable are NOT in kafka-go's retriable set, so
-//     they are only classified correctly because the implementation names them.
-//   - MessageSizeTooLarge, InvalidTopic and RecordListTooLarge ARE Kafka protocol errors,
-//     and they must still be defects. This is the case an interface test against net.Error
-//     would break: kafka.Error implements Error, Timeout and Temporary, so it satisfies
-//     net.Error, and classifying by that interface would turn every protocol error into an
+//   - BrokerNotAvailable and ReplicaNotAvailable are NOT in kafka-go's retriable set,
+//     so they are only classified correctly because the implementation names them.
+//   - MessageSizeTooLarge, InvalidTopic and RecordListTooLarge ARE Kafka protocol
+//     errors, and they must still be defects.
+//   - A PublishError's own verdict wins over any re-derivation, in BOTH directions —
+//     except that a TRANSIENT verdict whose only cause is context termination is not an
 //     outage.
-//   - A PublishError's own verdict wins over any re-derivation, in BOTH directions — except
-//     that a TRANSIENT verdict whose only cause is context termination is not an outage. See
-//     TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation.
 func TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect(t *testing.T) {
 	unavailable := map[string]error{
 		"no leader available":                      kafka.LeaderNotAvailable,
@@ -5726,31 +5142,11 @@ func TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect(t *testing.T) {
 	assert.False(t, IsBrokerUnavailableError(nil), "a nil error is not a failure at all")
 }
 
-// TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation is TAXONOMY-01, and it
-// is the half of the classification the delegation used to get wrong.
+// TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation is
+// the failure taxonomy, and it is the half of the classification a delegation can get
+// wrong.
 //
-// # The defect this pins closed
-//
-// brokerUnavailable was `return classifyTransientPublishError(err)`, and that classifier calls
-// context termination RETRYABLE — correctly, because a write abandoned by a shutdown, a lost
-// outbox lease or a spent request budget is worth attempting again. Reading the same verdict as
-// "the broker is the reason" made every such failure an outage: the replay endpoint answered
-// EVENT_KAFKA_UNAVAILABLE with 503 and a message telling the operator to retry once the broker
-// recovered, for a broker that had never stopped answering.
-//
-// # What is asserted, and why both halves are needed
-//
-// Each case must be RETRYABLE and NOT AN OUTAGE at the same time. Asserting only the second half
-// would pass for a fix that had also stopped retrying these failures — which would dead-letter
-// every event a graceful shutdown interrupted, exactly the regression RETRY-01 exists to
-// prevent. The pair states the invariant precisely: the retryable set is strictly wider than the
-// outage set, and context termination is the difference between them.
-//
-// The last case is the one that keeps the fix honest in the other direction. Go's net package
-// maps a dial cancelled or timed out by its context onto errors that satisfy
-// errors.Is(err, context.DeadlineExceeded), wrapped in a *net.OpError — so a broker that
-// blackholes connections produces a genuine outage whose chain also looks like cancellation. It
-// must still be classified as an outage, which is why the concrete signatures are tested first.
+// Each case must be RETRYABLE and NOT AN OUTAGE at the same time.
 func TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation(t *testing.T) {
 	local := map[string]error{
 		"the caller cancelled":              context.Canceled,
@@ -5791,31 +5187,11 @@ func TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation(t *
 			"a local cancellation just because its chain matches context.DeadlineExceeded")
 }
 
-// TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable covers the publish-failure
-// arm for every way the BROKER can be the reason.
+// TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable covers the
+// publish-failure arm for every way the BROKER can be the reason.
 //
-// All of them resolve to ErrKafkaUnavailable and 503, which is the same answer the
-// no-transport branch gives, and for the same reason: the event is intact, nothing about
-// Blnk is broken, and the correct response is to repeat the request once the broker
-// recovers. Answering 500 here — as a single catch-all replay code would — would classify a
-// rolling restart as an internal defect, send an operator hunting for a bug that does not
-// exist, and tell a client that retrying is pointless at the one moment it is the only
-// thing that helps.
-//
-// The cases are the real SIGNALS rather than error text, because text is not a contract: a
-// leaderless partition, a broker declaring itself unavailable (a code kafka-go does NOT
-// mark retriable, so it has to be named explicitly), the publisher's own transient verdict,
-// a batch whose members failed, a refused TCP connection, an expired deadline, and a
-// transport that has been closed.
-//
-// # The detail travels with the status, and still says nothing about the broker
-//
-// Two guarantees are asserted together here because they are easy to satisfy separately and
-// wrong separately. The bounded EventTransportErrorDetail reports transient TRUE, from the
-// same verdict that chose the status, so nothing tells a client to retry and not to retry
-// in one response. And it still carries no broker address, port or protocol text, so
-// classifying an outage correctly does not become a way to describe the deployment's
-// topology to whoever asked for the replay.
+// Two guarantees are asserted together here because they are easy to satisfy separately
+// and wrong separately.
 func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -5841,18 +5217,19 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 		"the broker host does not resolve": &net.DNSError{
 			Err: "no such host", Name: "kafka.internal", IsNotFound: true,
 		},
-		// A dial whose own deadline fired. Its chain matches context.DeadlineExceeded as well as
-		// carrying a *net.OpError, and it belongs HERE rather than on the abandonment arm: the
-		// broker did not answer a connection attempt, which is an outage.
+		// A dial whose own deadline fired. Its chain matches context.DeadlineExceeded as well
+		// as carrying a *net.OpError, and it belongs HERE rather than on the abandonment arm:
+		// the broker did not answer a connection attempt, which is an outage.
 		"the dial timed out": &net.OpError{
 			Op: "dial", Net: "tcp",
 			Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
 			Err:  os.ErrDeadlineExceeded,
 		},
-		// The broker's OWN acknowledgement timeout, which arrives as a protocol code rather than
-		// as a context error. A bare context expiry no longer resolves here — see
-		// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker — because it means this
-		// process stopped waiting, not that the broker failed to answer.
+		// The broker's OWN acknowledgement timeout, which arrives as a protocol code rather
+		// than as a context error. A bare context expiry no longer resolves here — see
+		// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker —
+		// because it means this process stopped waiting, not that the broker failed to
+		// answer.
 		"the broker did not acknowledge in time": kafka.RequestTimedOut,
 		"the transport is closed":                fmt.Errorf("resolving a writer: %w", ErrEventPublisherClosed),
 	}
@@ -5873,7 +5250,7 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 			assert.Equal(t, fixture.row.EventID, detail.EventID)
 			assert.Equal(t, "blnk.transactions", detail.Topic)
 
-			// DATA-01 still holds on this arm. Rendered every way a handler might render it.
+			// The disclosure rule still holds on this arm. Rendered every way a handler might render it.
 			marshalled, marshalErr := json.Marshal(dltAPIError(t, err))
 			require.NoError(t, marshalErr)
 			for _, leak := range []string{"10.9.8.7", "9092", "kafka.internal", "Leader Not Available"} {
@@ -5893,25 +5270,8 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 	}
 }
 
-// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker is the third arm
-// of the split, at the endpoint.
-//
-// # What was wrong
-//
-// A replay whose context was cancelled — the caller disconnected, or the request's deadline
-// expired — resolved to EVENT_KAFKA_UNAVAILABLE and 503, with a message stating that the Kafka
-// broker was unavailable and asking the operator to retry once it recovered. The broker was
-// healthy in every one of those cases; the request had been abandoned on this side. An operator
-// following that message goes looking at Kafka, and a client's retry policy is told a dependency
-// is down when nothing is.
-//
-// # What is asserted
-//
-// The code — the approved EVENT_REPLAY_FAILED rather than the availability code — the status it
-// must resolve to through an explicit statusByCode entry, and the message, which must not accuse
-// the broker and must say the event is still dead-lettered, because that is what makes repeating
-// the request obviously safe. The row's terminal state is asserted for the same reason it is on
-// the other two arms: an abandoned replay must leave the event replayable.
+// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker is the
+// third arm of the split, at the endpoint.
 func TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroker(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -5951,18 +5311,16 @@ func TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayWithoutAccusingTheBroke
 	}
 }
 
-// TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect covers the other
-// half of the split.
+// TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect covers the
+// other half of the split.
 //
-// ErrEventReplayFailed and its 500 are RESERVED for a failure this service owns, where a
-// retry changes nothing: a message the broker will never accept at its current size, a
-// topic name that is not valid, bytes that could not be marshalled, or a failure that
-// cannot be attributed to the broker at all. The last case is the deliberately conservative
-// direction of the classifier — an unrecognised error stays visible as a fault here rather
-// than being written off as somebody else's outage.
+// ErrEventReplayFailed and its 500 are RESERVED for a failure this service owns, where
+// a retry changes nothing: a message the broker will never accept at its current size,
+// a topic name that is not valid, bytes that could not be marshalled, or a failure that
+// cannot be attributed to the broker at all.
 //
-// The detail reports transient FALSE on this arm, again from the same verdict as the status,
-// so the two halves of the response cannot advise a caller differently.
+// The detail reports transient FALSE on this arm, again from the same verdict as the
+// status, so the two halves of the response cannot advise a caller differently.
 func TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -6008,21 +5366,15 @@ func TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect(t
 // TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError is the
 // disclosure boundary of the dead-letter path, expressed as a test.
 //
-// Every log line this file emits — three at Error, one at Warn, one at Info — is built from
-// this projection, and the severities most likely to be shipped to an aggregator with a
-// weaker access boundary than the ledger itself are exactly the ones it appears on. Two of
-// its fields cannot be published verbatim:
+// Every log line this file emits — three at Error, one at Warn, one at Info — is built
+// from this projection, and the severities most likely to be shipped to an aggregator
+// with a weaker access boundary than the ledger itself are exactly the ones it appears
+// on. Two of its fields cannot be published verbatim:
 //
-//   - The PARTITION KEY names the ledger or balance the event belongs to. It is reported as
-//     the same stable hash PublishResult.LogFields reports, so two lines about one aggregate
-//     remain correlatable across the publish and dead-letter paths, and the plaintext value
-//     stays on the outbox row where the database's access control governs it.
-//   - The ERROR REASON is a broker or client-library string: unbounded, and free to contain
-//     newlines that forge a second log line, control characters that corrupt a structured-log
-//     parser, and a broker address the library chose to interpolate.
-//
-// The row and the stored failure metadata are deliberately unaffected: the API that serves
-// triage reads them, and this is only about what reaches a log.
+//   - The PARTITION KEY names the ledger or balance the event belongs to.
+//   - The ERROR REASON is a broker or client-library string: unbounded, and free to
+//     contain newlines that forge a second log line, control characters that corrupt a
+//     structured-log parser, and a broker address the library chose to interpolate.
 func TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError(t *testing.T) {
 	const partitionKey = "bln_7d3ac6f1"
 
@@ -6069,29 +5421,10 @@ func TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError(
 	assert.Equal(t, 5, fields["attempt_count"])
 }
 
-// dltInventoryMatches applies the SAME predicate the repository's SQL applies, and it is the
-// ONLY narrowing on this double.
+// dltInventoryMatches applies the SAME predicate the repository's SQL applies, and it
+// is the ONLY narrowing on this double.
 //
-// It is deliberately an exact mirror rather than a convenient approximation, because the
-// service now delegates ALL narrowing to the database and a fake that filtered more
-// loosely — or that derived a missing topic from the event type, as the deleted Go-side
-// predicate used to — would let the service pass here while the real query returned a
-// different set. Comparisons are exact and case-sensitive on the stored columns, and the
-// topic is the row's stored topic with no derivation: the real column is NOT NULL under
-// CHECK (btrim(topic) <> ”), so a stored row cannot need one.
-//
-// # Why there is one of these and not three
-//
-// This store answered the same narrowing question from three places: the full-row listing and
-// its count shared one matcher, the narrow projection had a second, and a free function stood
-// beside both agreeing with neither. Three matchers over one predicate is worse than one loose
-// matcher, because whichever a test happens to reach decides what it asserts over, and the
-// answer stops being a statement about the statement at all. The survivor is the one that both
-// TRIMS its predicates and constrains the population, because deadLetterFilterClause does both.
-//
-// The three string predicates are TRIMMED for that reason. A padded filter narrows to nothing in
-// SQL, so a double comparing raw values would agree with the statement on a clean filter and
-// disagree on a padded one.
+// The three string predicates are TRIMMED for that reason.
 func dltInventoryMatches(row model.EventOutbox, query model.DeadLetterQuery) bool {
 	status := strings.TrimSpace(query.Status)
 	eventType := strings.TrimSpace(query.EventType)
@@ -6119,13 +5452,8 @@ func dltInventoryMatches(row model.EventOutbox, query model.DeadLetterQuery) boo
 	return true
 }
 
-// ListDeadLetterInventory pages the MATCHING rows newest first, applying the filters, the
-// occurrence window and the keyset cursor exactly as the SQL does.
-//
-// The predicates and the cursor are honoured HERE rather than assumed away, because they live in
-// the query rather than in the service: a fake that ignored them would let the service pass its
-// filtering tests while the statement did the filtering, which is precisely the thing under
-// test.
+// ListDeadLetterInventory pages the MATCHING rows newest first, applying the filters,
+// the occurrence window and the keyset cursor exactly as the SQL does.
 func (s *dltFakeStore) ListDeadLetterInventory(
 	_ context.Context,
 	query model.DeadLetterInventoryQuery,
@@ -6155,9 +5483,9 @@ func (s *dltFakeStore) ListDeadLetterInventory(
 
 // inventoryPageLocked builds the page. The caller holds the mutex.
 //
-// It is separate from ListDeadLetterInventory so that the paired read can build the page and the
-// total under ONE lock acquisition, which is the fake's stand-in for the repository's single
-// snapshot.
+// It is separate from ListDeadLetterInventory so that the paired read can build the
+// page and the total under ONE lock acquisition, which is the fake's stand-in for the
+// repository's single snapshot.
 func (s *dltFakeStore) inventoryPageLocked(
 	query model.DeadLetterInventoryQuery,
 	filter model.DeadLetterQuery,
@@ -6224,15 +5552,9 @@ func (s *dltFakeStore) CountDeadLetterInventory(
 	return int64(len(s.matchingLocked(query))), nil
 }
 
-// ListAndCountDeadLetterInventory answers the page and the total from ONE observation of the
-// fake's state, which is what the repository's read-only REPEATABLE READ transaction gives the
-// real store.
-//
-// It delegates to the two single-purpose methods under a SINGLE lock acquisition rather than
-// calling them — they each take the mutex — so the two answers are drawn from one state. A fake
-// that called them in turn would release the lock between them and reproduce exactly the two-
-// snapshot defect this method exists to close, and the test would then pass against a store that
-// does not hold the property.
+// ListAndCountDeadLetterInventory answers the page and the total from ONE observation
+// of the fake's state, which is what the repository's read-only REPEATABLE READ
+// transaction gives the real store.
 func (s *dltFakeStore) ListAndCountDeadLetterInventory(
 	_ context.Context,
 	query model.DeadLetterInventoryQuery,
@@ -6262,17 +5584,8 @@ func (s *dltFakeStore) ListAndCountDeadLetterInventory(
 
 // snapshotInventoryQueries returns the queries the service handed the FILTERED listing.
 //
-// The whole query is captured rather than a page request, because the property under test is
-// that the narrowing REACHED THE DATABASE. A service that accepted a filter and then applied
-// it in Go would issue an unfiltered query here and still return the right rows for a small
-// fixture — passing a test that only checked the returned entries, while behaving exactly as
-// the defect did on a real inventory.
-// snapshotInventoryCountQueries returns a copy of the narrowings the INVENTORY-predicate count
-// was asked for, which is the one the paired read uses.
-//
-// It is distinct from snapshotCountQueries, which records the full-row count: the two are
-// separate recorders because the two counts are separate repository methods, and a test asserting
-// that a paired read counted once must not be satisfied by a call to the other one.
+// The whole query is captured rather than a page request, because the property under
+// test is that the narrowing REACHED THE DATABASE.
 func (s *dltFakeStore) snapshotInventoryCountQueries() []model.DeadLetterQuery {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -6304,26 +5617,15 @@ func (s *dltFakeStore) snapshotInventoryQueries() []model.DeadLetterQuery {
 	return queries
 }
 
-// TestListDeadLetterEvents_NarrowingIsAppliedInSQLRatherThanAboveIt is the finding itself.
+// TestListDeadLetterEvents_NarrowingIsAppliedInSQLRatherThanAboveIt pins WHERE the
+// narrowing happens.
 //
-// # What was wrong
+// Applying it above the SQL costs two things, and neither is visible to the caller:
 //
-// A filtered listing used to be served by WALKING the unfiltered inventory in 500-row pages
-// and testing each row in Go, abandoning the walk after 5,000 scanned rows. Two things
-// followed, and neither was visible to the caller:
-//
-//   - A filter whose matches all lay beyond the ceiling returned an ordinary EMPTY page with
-//     a 200. An operator asking "which transaction events are stuck" was told "none" while
-//     transaction events were stuck. The likelihood of that answer rose with the size of the
-//     inventory, which is exactly backwards for a tool reached during an incident.
-//   - Those matches were unreachable by paging at all: no offset could get past the ceiling.
-//
-// # What is asserted here
-//
-// That the SERVICE DOES NOT NARROW. The fixture is small, so a service filtering in Go would
-// return the same rows and pass any test that only inspected the result — which is precisely
-// how the defect survived. So the assertion is on the query handed to the repository: the
-// filters must be in it, and the unfiltered walk must not be used at all.
+//   - a filter whose matches all lie beyond the scan ceiling returns an ordinary EMPTY
+//     page with a 200;
+//   - those matches are unreachable by paging at all, because no offset gets past the
+//     ceiling.
 func TestListDeadLetterEvents_NarrowingIsAppliedInSQLRatherThanAboveIt(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -6362,10 +5664,8 @@ func TestListDeadLetterEvents_NarrowingIsAppliedInSQLRatherThanAboveIt(t *testin
 // TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory asserts that a
 // filtered page is a page of the FILTERED set.
 //
-// Skipping rows before filtering would make a page short and unstable as the filter's hit
-// rate varied — a caller stepping offset by its limit would see gaps. The database applies
-// predicate and page together, so offset counts matches; this pins that end to end and, with
-// the deep offset, pins that a match past the front of the inventory is reachable.
+// Skipping rows before filtering would make a page short and unstable as the filter's
+// hit rate varied — a caller stepping offset by its limit would see gaps.
 func TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -6403,10 +5703,6 @@ func TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory(t *tes
 		// RESUMED FROM THE LAST MATCH, not from a row position. That is what makes a filtered
 		// walk exact: an offset counts rows the filter rejected, so it skipped matches and
 		// repeated others as soon as the filter removed anything.
-		//
-		// Taken from the last ENTRY rather than from NextCursor, because the final page of an
-		// exactly-divided walk reports no further page and therefore carries no cursor — and the
-		// position past the last match is exactly what the tail assertion below needs.
 		last := page.Entries[len(page.Entries)-1]
 		filter.Cursor = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
 	}
@@ -6426,7 +5722,7 @@ func TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory(t *tes
 
 // dltInventoryEntryOf projects a stored row into the NARROW inventory entry the repository
 // returns, dropping the body and carrying only its size — the same projection the SQL performs
-// with octet_length (PERF-P06).
+// with octet_length.
 func dltInventoryEntryOf(row model.EventOutbox) model.DeadLetterInventoryEntry {
 	return model.DeadLetterInventoryEntry{
 		ID:               row.ID,
@@ -6450,7 +5746,7 @@ func dltInventoryEntryOf(row model.EventOutbox) model.DeadLetterInventoryEntry {
 }
 
 // OldestDeadLetterAgeByTopic reports the oldest outstanding entry per dead-letter topic, as
-// the repository's grouped aggregate does (PERF-P07).
+// the repository's grouped aggregate does.
 func (s *dltFakeStore) OldestDeadLetterAgeByTopic(
 	_ context.Context,
 	deadLetterSuffix string,
@@ -6469,9 +5765,10 @@ func (s *dltFakeStore) OldestDeadLetterAgeByTopic(
 		row := s.rows[eventID]
 
 		// EVERY OUTSTANDING ROW COUNTS, with no exemption, mirroring the statement. An entry
-		// leaves this aggregate by being REPLAYED — a re-publish the broker acknowledges makes
-		// it dispatched, and dispatched is not one of the two states the inventory holds — so
-		// the gauge keeps reporting until the event has actually reached a subscriber.
+		// leaves this aggregate by being REPLAYED — a re-publish the broker acknowledges
+		// makes it dispatched, and dispatched is not one of the two states the inventory
+		// holds — so the gauge keeps reporting until the event has actually reached a
+		// subscriber.
 
 		topic := row.DLTTopic
 		if topic == "" {
@@ -6502,9 +5799,9 @@ func (s *dltFakeStore) OldestDeadLetterAgeByTopic(
 
 // snapshotAgeCalls returns how many times the grouped age aggregate was read.
 //
-// The COUNT is the assertion, not the result (PERF-P07): the answer looks identical whether it
-// came from one aggregate or from a per-topic query in a loop, and the difference between those
-// two is the finding.
+// The COUNT is the assertion, not the result: the answer looks identical whether it
+// came from one aggregate or from a per-topic query in a loop, and the difference
+// between those two is the point.
 func (s *dltFakeStore) snapshotAgeCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -6515,9 +5812,7 @@ func (s *dltFakeStore) snapshotAgeCalls() int {
 // ListDeadLetteredEventsFiltered pages the inventory, newest first, applying the filter
 // the way SQL does: to the WHOLE population before the page is taken.
 //
-// Filtering before paging is what makes the double faithful. The old Go-side walk filtered
-// AFTER paging and skipped Offset matches by hand; if this double did that, a test would
-// pass against an implementation that had pushed a filter into SQL incorrectly.
+// Filtering before paging is what makes the double faithful.
 func (s *dltFakeStore) ListDeadLetteredEventsFiltered(
 	_ context.Context,
 	filter model.DeadLetterInventoryFilter,
@@ -6553,49 +5848,27 @@ func (s *dltFakeStore) ListDeadLetteredEventsFiltered(
 	return page, nil
 }
 
-// Four occurrence-window tests that arrived with this feature are GONE, and three of them are
-// moot rather than merely duplicated.
-//
-// They were written for a service with TWO read paths — a single LIMIT/OFFSET query for a
-// request the repository could answer exactly, and a bounded in-memory walk for the filters it
-// could not — and they pinned which path a window took, on the reasoning that routing a
-// windowed request through the walk would cap an index-served answer at the scan budget.
-//
-// That reasoning was right and this service acted on it further: there is ONE path now, and
-// every narrowing including the window is applied in SQL (see DeadLetterListOptions.filtered,
-// which survives as observability only). With no walk left there is no routing to assert, and
-// asserting it against the offset-paged reader records pages the listing no longer reads.
+// Four occurrence-window tests that arrived with this feature are GONE, and three of
+// them are moot rather than merely duplicated.
 //
 // What they pinned that still matters is kept:
 //
-//   - the bounds reaching the repository, both bounds inclusive, one-sided windows, the window
-//     combining with the other filters, and a reversed window refused BEFORE any read — all in
-//     TestListDeadLetterEvents_AppliesTheOccurrenceWindow above, against the keyset query the
-//     listing actually issues;
-//   - the refusal NAMING the two parameters, which was this feature's own improvement, now
-//     asserted there and stated in the message itself;
-//   - UTC normalisation of a supplied bound, which deadLetterFilterClause performs when it
-//     binds, covered by database.TestCountEventOutboxByStatus_NormalisesTheWindow;
+//   - the bounds reaching the repository, both bounds inclusive, one-sided windows, the
+//     window combining with the other filters, and a reversed window refused BEFORE any
+//     read — all in TestListDeadLetterEvents_AppliesTheOccurrenceWindow above, against
+//     the keyset query the listing actually issues;
+//   - the refusal NAMING the two parameters, which was this feature's own improvement,
+//     now asserted there and stated in the message itself;
+//   - UTC normalisation of a supplied bound, which deadLetterFilterClause performs when
+//     it binds, covered by database.TestCountEventOutboxByStatus_NormalisesTheWindow;
 //   - the age gauge scanning UNWINDOWED, which is a property of a different read and is
 //     retained below in its own test, retargeted onto the inventory query.
 
-// TestDeadLetterAgeGauge_ReadsNoWindowAtAll guards the one read that must never carry a window,
-// and it pins a deliberate ABSENCE.
+// TestDeadLetterAgeGauge_ReadsNoWindowAtAll guards the one read that must never carry a
+// window, and it pins a deliberate ABSENCE.
 //
-// The gauge exists to find the OLDEST outstanding entry, which is the value the 15-minute alert is
-// written against. Any lower bound on that read would cap the age it could ever report, so an
-// entry stuck for a day would be published as younger than the window — the gauge would look
-// healthy at exactly the moment it is supposed to fire.
-//
-// # Why this asserts what is NOT read
-//
-// The property arrived as "the age scan's pages must be unbounded", written for a gauge that
-// walked the inventory. This gauge does not walk it: OldestDeadLetterAgeByTopic is a grouped
-// aggregate that takes no window and no page, so an unwindowed read is guaranteed by the shape of
-// the call rather than by every page of it being checked. The assertion follows the property to
-// where it now lives — one aggregate call, and no listing read that a window could be attached
-// to. A future refactor that answered the gauge by paging the inventory would fail here, which is
-// exactly when the original concern becomes live again.
+// The gauge exists to find the OLDEST outstanding entry, which is the value the
+// 15-minute alert is written against.
 func TestDeadLetterAgeGauge_ReadsNoWindowAtAll(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -6620,27 +5893,11 @@ func TestDeadLetterAgeGauge_ReadsNoWindowAtAll(t *testing.T) {
 		"nor the offset-paged listing, for the same reason")
 }
 
-// TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement is OBS-06.
+// TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement is the broker-acknowledgement count.
 //
-// # The gap this closes
-//
-// blnk.events.broker_acknowledgements.total is declared "by topic, event type and purpose", the
-// publisher's increment site states that EVERY purpose is counted because "a replay and a
-// dead-letter write are both real acknowledgements", and docs/metrics.md tells an operator to
-// break the counter out by purpose to see how much of the broker traffic is triage. The
-// increment existed only on the ordinary publish path, so purpose="dead_letter" was never
-// written: four acknowledged dead-letter writes produced four dead_lettered attempt records,
-// four rows carrying a dlt_topic and four records on the `.dlt` topics, and a triage query that
-// returned nothing at all. An absent series reads as no dead-letter traffic, which is
-// indistinguishable from a pipeline with nothing wrong.
-//
-// # Why the two counters are asserted together
-//
-// EventsDeadLetteredTotal counts EVENTS whose dead-lettering is complete and is attributed to
-// the ORIGINAL category topic; this counter counts WRITES the broker accepted and is attributed
-// to the `.dlt` sibling that received them. Both are asserted here so the pair cannot be
-// collapsed into one increment on one topic, which would break the dead-letter RATE query — it
-// divides EventsDeadLetteredTotal against EventsPublishedTotal on matching topic names.
+// EventsDeadLetteredTotal counts EVENTS whose dead-lettering is complete and is
+// attributed to the ORIGINAL category topic; this counter counts WRITES the broker
+// accepted and is attributed to the `.dlt` sibling that received them.
 func TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -6680,10 +5937,10 @@ func TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement(t *t
 	})
 
 	t.Run("a write the broker refused is not counted as an acknowledgement", func(t *testing.T) {
-		// The counter measures traffic the broker ACCEPTED. Counting a refused write here would
-		// make acknowledgements run ahead of deliveries, which is the pipeline's documented
-		// leading indicator of duplicate delivery — a false reading of the one signal that is
-		// supposed to catch rows not being marked.
+		// The counter measures traffic the broker ACCEPTED. Counting a refused write here
+		// would make acknowledgements run ahead of deliveries, which is the pipeline's
+		// documented leading indicator of duplicate delivery — a false reading of the one
+		// signal that is supposed to catch rows not being marked.
 		row := dltExhaustedRow(t, "evt_ack_refused", "balance.created", "blnk.balances")
 		store := newDltFakeStore().withRow(row)
 		transport := &dltFakeTransport{writeErr: errors.New("broken pipe")}
@@ -6721,23 +5978,18 @@ func TestDeadLetterRouting_CountsTheDeadLetterWriteAsABrokerAcknowledgement(t *t
 	})
 }
 
-// TestDeadLetterOutcomeLogFields_RedactsBrokerTopologyFromTheFailureReason is DATA-02.
+// TestDeadLetterOutcomeLogFields_RedactsBrokerTopologyFromTheFailureReason is the log-and-span redaction rule.
 //
-// # The disclosure this closes
+// The failure reason was SANITIZED — control characters stripped, length capped — and
+// not REDACTED, so its content reached the log intact.
 //
-// The failure reason was SANITIZED — control characters stripped, length capped — and not
-// REDACTED, so its content reached the log intact. Every line built from this projection
-// therefore named the broker's host and port, and a resolution failure named the internal DNS
-// resolver's address as well, at the default info level and in the two lines a failing pipeline
-// emits most: "the Kafka broker did not acknowledge a dead-letter message" and "ledger event
-// dead-lettered and preserved on its dead-letter topic".
-//
-// docs/kafka-operations.md §"Reading the logs" publishes the policy as a three-row table, and
-// the two rows that are NOT the log line are asserted elsewhere: the row's last_error and the
-// dead-letter message's failure_metadata.error_reason keep the verbatim text, because both are
-// reachable only behind the master key. This test covers the row that was wrong — the log line —
-// and it asserts the diagnosis survives, because redaction that took the diagnosis with it would
-// lengthen every outage it protected.
+// docs/kafka-operations.md §"Reading the logs" publishes the policy as a three-row
+// table, and the two rows that are NOT the log line are asserted elsewhere: the row's
+// last_error and the dead-letter message's failure_metadata.error_reason keep the
+// verbatim text, because both are reachable only behind the master key. This test
+// covers the row that was wrong — the log line — and it asserts the diagnosis survives,
+// because redaction that took the diagnosis with it would lengthen every outage it
+// protected.
 func TestDeadLetterOutcomeLogFields_RedactsBrokerTopologyFromTheFailureReason(t *testing.T) {
 	for name, reason := range map[string]struct {
 		text      string

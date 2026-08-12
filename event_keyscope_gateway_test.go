@@ -32,18 +32,8 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// keyScopeGatewayDouble is a CONFORMANCE DOUBLE for the key-authorising component a deployment
-// declares in front of its brokers.
-//
-// Blnk does not ship that component — it is a custom Kafka authorizer plugin or a protocol-aware
-// proxy, with its own lifecycle — so a double is the only way to exercise the integration end to
-// end. What it doubles is the CONTROL plane, which is the whole of the contract Blnk owns: the
-// authenticated bind-and-attest, the revoke and the health probe. It filters no records, because
-// neither does Blnk.
-//
-// It implements the published contract literally rather than helpfully, and that is deliberate:
-// a double that normalised the prefix, or that answered from the request rather than from what it
-// had stored, would hide exactly the class of defect these tests exist to catch.
+// keyScopeGatewayDouble is a CONFORMANCE DOUBLE for the key-authorising component a
+// deployment declares in front of its brokers.
 type keyScopeGatewayDouble struct {
 	mu sync.Mutex
 
@@ -51,18 +41,18 @@ type keyScopeGatewayDouble struct {
 	// which is what proves Blnk authenticates rather than merely posting.
 	token string
 
-	// bindings is what the double has been told to enforce, keyed by principal. Attestation
-	// answers FROM THIS MAP, so a component that was never told about a prefix cannot confirm
-	// one.
+	// bindings is what the double has been told to enforce, keyed by principal.
+	// Attestation answers FROM THIS MAP, so a component that was never told about a prefix
+	// cannot confirm one.
 	bindings map[string]string
 
 	// enforcing is the component's own answer to "do you enforce key scopes at all?". Setting it
 	// false is how the "declared but not enforcing" case is exercised.
 	enforcing bool
 
-	// prefixOverride, when non-empty, is echoed INSTEAD of the prefix that was sent. It is the
-	// misbehaving-component case that matters most: a proxy that trims, lower-cases or truncates
-	// a prefix is enforcing a wider boundary than the registry records.
+	// prefixOverride, when non-empty, is echoed INSTEAD of the prefix that was sent. It is
+	// the misbehaving-component case that matters most: a proxy that trims, lower-cases or
+	// truncates a prefix is enforcing a wider boundary than the registry records.
 	prefixOverride string
 
 	// principalOverride, when non-empty, is echoed instead of the principal that was sent — the
@@ -234,12 +224,8 @@ func (d *keyScopeGatewayDouble) authorizationHeader() string {
 	return d.lastAuthorization
 }
 
-// keyScopeGatewayConfiguration publishes a configuration declaring the double as the enforcement
-// point, and returns it.
-//
-// The gateway BOOTSTRAP list is deliberately distinct from the broker list, because
-// config.KafkaConfig.KeyScopeGateway reads an identical list as no declaration at all — a
-// component that IS the brokers cannot be evaluating keys.
+// keyScopeGatewayConfiguration publishes a configuration declaring the double as the
+// enforcement point, and returns it.
 func keyScopeGatewayConfiguration(t *testing.T, endpoint, token string) *config.Configuration {
 	t.Helper()
 
@@ -256,19 +242,11 @@ func keyScopeGatewayConfiguration(t *testing.T, endpoint, token string) *config.
 	}
 }
 
-// TestKeyScopeAttestation_IsRequiredForEnforcementToBeActive is the configuration half of SEC-01.
+// TestKeyScopeAttestation_IsRequiredForEnforcementToBeActive is the configuration half
+// of the attestation rule.
 //
-// # What was wrong
-//
-// Enforcement was "active" on the strength of two values: a mode and a bootstrap list distinct
-// from the brokers. Both are assertions a deployment makes about itself, and any address
-// satisfied them — so a deployment could declare a component that did not exist and Blnk would
-// mint a credential declaring an enforced key boundary.
-//
-// Enforcement now additionally requires a usable CONTROL endpoint, because that is the only part
-// of the declaration Blnk can verify. The direction of the change is what matters: an incomplete
-// declaration is read as NO declaration, so key-scoped subscribers are refused rather than issued
-// something unverified.
+// Enforcement was "active" on the strength of two values: a mode and a bootstrap list
+// distinct from the brokers.
 func TestKeyScopeAttestation_IsRequiredForEnforcementToBeActive(t *testing.T) {
 	base := func() config.KafkaConfig {
 		return config.KafkaConfig{
@@ -392,12 +370,8 @@ func TestKeyScopeAttestation_IsRequiredForEnforcementToBeActive(t *testing.T) {
 	})
 }
 
-// TestKeyScopeGatewayClient_AttestsOnlyTheExactRecordedBinding is the verification half of
-// SEC-01, and the prefix comparison is its centre.
-//
-// A component that answers "yes" to everything, or that returns a normalised form of the prefix,
-// is enforcing a DIFFERENT and wider boundary than the registry records — and the credential
-// response would describe the registry's. Every arm below is a way that could happen.
+// TestKeyScopeGatewayClient_AttestsOnlyTheExactRecordedBinding is the verification half
+// of the attestation rule, and the prefix comparison is its centre.
 func TestKeyScopeGatewayClient_AttestsOnlyTheExactRecordedBinding(t *testing.T) {
 	binding := KeyScopeBinding{
 		Principal:           "blnk-sub-acme",
@@ -437,10 +411,10 @@ func TestKeyScopeGatewayClient_AttestsOnlyTheExactRecordedBinding(t *testing.T) 
 
 	t.Run("a normalised prefix is refused", func(t *testing.T) {
 		// The subtle one, and the reason the comparison is `==` rather than a trimmed or
-		// case-insensitive test. A component that upper-cases, pads or truncates is not "close
-		// enough": Kafka message keys are bytes, so it would be filtering on a different set of
-		// records from the one the registry row and the credential response describe — and in
-		// every case below, a WIDER one or a disjoint one.
+		// case-insensitive test. A component that upper-cases, pads or truncates is not
+		// "close enough": Kafka message keys are bytes, so it would be filtering on a
+		// different set of records from the one the registry row and the credential response
+		// describe — and in every case below, a WIDER one or a disjoint one.
 		for _, override := range []string{
 			strings.ToUpper(binding.PartitionKeyPrefix),
 			" " + binding.PartitionKeyPrefix,
@@ -676,11 +650,8 @@ func TestKeyScopeGatewayClient_RefusesToFollowARedirect(t *testing.T) {
 		"the bearer credential must never be presented to a host a redirect named")
 }
 
-// TestNewKeyScopeGatewayClient_ReportsAnUndeclaredComponent pins the sentinel callers branch on.
-//
-// It matters because the two answers lead to different behaviour: "no component declared" is a
-// state refusal an operator can act on, while a transport failure against a declared component is
-// a different message with a different remedy.
+// TestNewKeyScopeGatewayClient_ReportsAnUndeclaredComponent pins the sentinel callers
+// branch on.
 func TestNewKeyScopeGatewayClient_ReportsAnUndeclaredComponent(t *testing.T) {
 	_, err := NewKeyScopeGatewayClient(nil)
 	assert.ErrorIs(t, err, ErrKeyScopeGatewayNotConfigured,
@@ -702,10 +673,6 @@ func TestNewKeyScopeGatewayClient_ReportsAnUndeclaredComponent(t *testing.T) {
 }
 
 // requireKeyScopeUnattested asserts the typed refusal and its retryability.
-//
-// The retryable flag is asserted rather than ignored because it is the difference between an
-// operator repeating a request and an operator changing something: a component that was briefly
-// unreachable will answer next time, and one that holds a different prefix never will.
 func requireKeyScopeUnattested(t *testing.T, err error, retryable bool) {
 	t.Helper()
 

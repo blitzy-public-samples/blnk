@@ -54,39 +54,42 @@ spec:
               subPath: pgdata
       restartPolicy: Always
   volumeClaimTemplates:
-    # PERF-C03: SIZED FROM THE MEASURED COST OF blnk.event_outbox, NOT FROM A ROUND NUMBER.
+    # SIZED FROM THE MEASURED COST OF blnk.event_outbox, NOT FROM A ROUND NUMBER. A retention
+    # period is not a storage policy on its own, and the volume that loses if the two
+    # disagree is the one the LEDGER lives on.
     #
-    # This was 10Gi against a shipped event-outbox retention of 90 days, which is a steady
-    # state of 8.4 TiB — the two settings were roughly 858x apart, and the volume that loses
-    # is the one the LEDGER lives on. A retention period is not a storage policy on its own.
+    # THE DERIVATION, from the measurement and the query recorded in sql/1781248800.sql. Both
+    # columns are the same event type; they differ only in the size of the caller's payload:
     #
-    # THE DERIVATION, from the measurement recorded in sql/1781248800.sql:
+    #                              minimal body   populated body
+    #     measured row cost, on disk  2,427 bytes   3,619 bytes  (heap + TOAST + 17 indexes)
+    #     load-tested throughput        500 events/second
+    #     rows/day                   43,200,000
+    #     bytes/day                        98 GiB      146 GiB
+    #     retention                          3 days   (RELAY_EVENT_RETENTION_DAYS)
+    #     bloat/vacuum factor              1.5x       (every row is UPDATEd twice, non-HOT)
+    #     ---------------------------------------------------------------------------------
+    #     event outbox steady state       439 GiB      655 GiB
     #
-    #     measured row cost      2,372 bytes   (heap 2,048 + all 17 indexes 323; no TOAST)
-    #     validated throughput     500 events/second   (acceptance criterion V-1)
-    #     rows/day              43,200,000
-    #     bytes/day                 95.4 GiB
-    #     retention                    3 days   (RELAY_EVENT_RETENTION_DAYS in blnk-config.yaml)
-    #     bloat/vacuum factor        1.5x       (every row is UPDATEd twice, non-HOT)
-    #     ---------------------------------------------------------------------------
-    #     event outbox steady state  429 GiB
+    # 900Gi is the POPULATED figure — the one that has to fit — plus roughly a fifth of the
+    # volume left for everything else on it: the ledger's own tables and indexes, WAL up to
+    # max_wal_size, and the filesystem's reserve. Measure your own row cost and confirm it
+    # before production.
     #
-    # 600Gi is that 429 GiB plus roughly 170 GiB for everything else on this volume: the
-    # ledger's own tables and indexes, WAL up to max_wal_size, and the filesystem's reserve.
-    #
-    # THE LEDGER'S GROWTH IS NOT BOUNDED BY ANY OF THIS, and 170 GiB is an allowance rather
-    # than a projection. Transactions and balances are never purged, so their tables grow for
-    # the life of the deployment and only YOU can project them from your own transaction rate
-    # and history requirements. Do that projection before going to production and add it to
-    # this figure. The 429 GiB above is the part this feature is responsible for and the part
-    # that has a ceiling.
+    # THE LEDGER'S GROWTH IS NOT BOUNDED BY ANY OF THIS. Transactions and balances are never
+    # purged, so their tables grow for the life of the deployment and only YOU can project
+    # them from your own transaction rate and history requirements. Do that projection before
+    # going to production and add it to the figures above, which are the part this feature is
+    # responsible for and the part that has a ceiling.
     #
     # RESCALING, in either direction:
     #
-    #   * a different event rate scales linearly — `GiB/day = rate x 86400 x 2372 / 1024^3`;
-    #   * each extra retention day is +143 GiB at 500 events/second;
-    #   * a deployment running at, say, 20 events/second needs 3.8 GiB/day, so the outbox
-    #     share is 17 GiB and this volume is far larger than it has to be. Size it down.
+    #   * a different event rate scales linearly —
+    #     `GiB/day = rate x 86400 x measured_bytes_per_row / 1024^3`;
+    #   * each extra retention day is one day's worth of that figure times 1.5;
+    #   * a deployment running at, say, 20 events/second needs 5.4 GiB/day on the full-bodied
+    #     figure, so the outbox share is 24 GiB and this volume is far larger than it has to
+    #     be. Size it down.
     #
     # Growing it later requires a StorageClass with allowVolumeExpansion: true. Set that up
     # BEFORE you need it: expanding a claim whose class forbids it means a restore, and the
@@ -97,4 +100,4 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 600Gi
+            storage: 900Gi

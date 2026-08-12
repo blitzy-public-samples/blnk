@@ -32,7 +32,7 @@ import (
 // CreateLedger inserts a new ledger record into the database, ensuring metadata is properly marshaled into JSON format.
 // It assigns a unique ledger ID with a suffix and captures the current timestamp as the creation time.
 //
-// # Atomic event capture (requirement R-2)
+// # Atomic event capture
 //
 // When a caller supplies an EventPreparer, the ledger INSERT and the ledger.created event
 // row are written inside ONE transaction: the preparer is handed the finished ledger — the

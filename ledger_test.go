@@ -83,21 +83,6 @@ func TestCreateLedger(t *testing.T) {
 	metaDataJSON, _ := json.Marshal(ledger.MetaData)
 
 	// Set expectations on mock.
-	//
-	// NO TRANSACTION IS SCRIPTED, and that is the graceful-degradation criterion rather than
-	// an omission.
-	//
-	// The entity writers open a transaction only when they are HANDED AN EVENT PREPARER, which
-	// the service layer supplies only when event publishing is configured. This instance has no
-	// KAFKA_BROKERS, so no preparer is passed, the writer takes its single-statement path, and
-	// the behaviour is exactly what it was before this feature existed — which is what
-	// §0.7.2's "with KAFKA_BROKERS unset, the service must process transactions exactly as
-	// before" asks for, and what keeps every deployment that never adopts Kafka from paying for
-	// a transaction it has no second statement to put in.
-	//
-	// The transactional path is covered where it can actually be observed: with a preparer
-	// supplied, by event_producer_atomicity_test.go here and by
-	// database/{ledger,identity,balance}_test.go at the repository layer.
 	mock.ExpectExec("INSERT INTO blnk.ledgers").
 		WithArgs(metaDataJSON, ledger.Name, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -195,15 +180,15 @@ func TestUpdateLedger(t *testing.T) {
 		AddRow(testID, originalName, testTime, `{"key":"value"}`)
 
 	// The existence check reads on the pooled connection, deliberately, so it is scripted
-	// BEFORE the transaction opens: it is a not-found check, and the UPDATE is what enforces
-	// the row's existence.
+	// BEFORE the transaction opens: it is a not-found check, and the UPDATE is what
+	// enforces the row's existence.
 	mock.ExpectQuery("SELECT ledger_id, name, created_at, meta_data FROM blnk.ledgers WHERE ledger_id =").
 		WithArgs(testID).
 		WillReturnRows(row)
 
 	// Mock the UPDATE query, on the pooled connection. No transaction is scripted, for the
-	// reason set out in TestCreateLedger above: with no event publishing configured no preparer
-	// is supplied, so the writer issues its single statement without one.
+	// reason set out in TestCreateLedger above: with no event publishing configured no
+	// preparer is supplied, so the writer issues its single statement without one.
 	mock.ExpectExec("UPDATE blnk.ledgers SET name = \\$1 WHERE ledger_id = \\$2").
 		WithArgs(newName, testID).
 		WillReturnResult(sqlmock.NewResult(1, 1))

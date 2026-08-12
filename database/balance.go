@@ -194,7 +194,7 @@ func scanRow(row *sql.Row, include []string) (*model.Balance, error) {
 // CreateBalance inserts a new balance record into the `blnk.balances` table in the database.
 // It handles the generation of a unique balance ID, default values for fields, and any necessary error handling.
 //
-// # Atomic event capture (requirement R-2)
+// # Atomic event capture
 //
 // When a caller supplies an EventPreparer, the balance INSERT and the balance.created event
 // row are written inside ONE transaction: the preparer is handed the finished balance — the
@@ -206,7 +206,7 @@ func scanRow(row *sql.Row, include []string) (*model.Balance, error) {
 // idempotent-create contract: the balance the caller asked for already exists under that
 // indicator, and no new balance was created. No event is captured on that path, because
 // balance.created would then announce a creation that did not happen — which is what the
-// non-atomic post-commit capture used to do, publishing an event whose payload was an empty
+// non-atomic post-commit capture would do, publishing an event whose payload is an empty
 // balance.
 //
 // With no preparer the behaviour is EXACTLY as before: one statement and no transaction,

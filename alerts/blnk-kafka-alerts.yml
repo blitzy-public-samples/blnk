@@ -12,103 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Prometheus alerting rules for Blnk's Kafka event-publishing pipeline. Every
-# gauge referenced here is declared in internal/metrics/metrics.go and exposed on
-# /metrics; Prometheus loads this file through the rule_files: stanza in
-# prometheus.yml. A gauge nothing evaluates is never alerted on, and a rule whose
-# series is never recorded can never fire, so both halves have to be in place.
+# Prometheus alerting rules for Blnk's Kafka event-publishing pipeline. Every gauge
+# referenced here is declared in internal/metrics/metrics.go and exposed on /metrics;
+# Prometheus loads this file through the rule_files: stanza in prometheus.yml. A gauge
+# nothing evaluates is never alerted on, and a rule whose series is never recorded can
+# never fire, so both halves have to be in place.
 #
 # THIRTEEN rules, in one group, and they divide in two. SEVEN are CONDITION rules —
-# something in the pipeline is wrong — of which two are the thresholds the
-# requirement names: DeadLetterMessageStuck on dead-letter age and
-# SubscriberConsumerLagHigh on consumer lag. The remaining five conditions are
-# SubscriberRevocationOutstanding, SubscriberCredentialOrphaned,
-# SubscriberRevocationRefused, SubscriberSettlementNotProgressing and
-# SubscriberSettlementOutstanding. The other SIX are MEASURABILITY rules —
-# ConsumerLagMeasurementDegraded, SubscriberLagCoverageStale,
-# SubscriberLagCoverageIncomplete, EventMetricsCollectionStale,
-# EventMetricsCollectionFailing and EventMetricsCollectionAbsent — and they exist
-# because a threshold alert can only fire on a number that was measured, and
-# because two states that look alike in a log line need different work.
+# something in the pipeline is wrong — of which two are the thresholds the requirement
+# names: DeadLetterMessageStuck on dead-letter age and SubscriberConsumerLagHigh on
+# consumer lag.
 #
 # Four of them carry the reasoning that is least obvious from the expression alone:
 #
 #   * ConsumerLagMeasurementDegraded covers the gap the lag threshold leaves.
-#     Consumer lag is a sum over partitions, so a partition the broker will not
-#     report contributes nothing and the total silently becomes a lower bound —
-#     which would RESOLVE SubscriberConsumerLagHigh at exactly the moment the
-#     system is least able to tell whether it should fire. So an incompletely
-#     measured topic publishes no lag at all, and this rule fires instead.
-#   * SubscriberRevocationOutstanding covers broker-side credential revocation
-#     Blnk still owes. That debt is durable registry state rather than a
-#     measurement of the pipeline, so no throughput or age threshold can see it,
-#     and until it is settled a principal may still be able to authenticate while
-#     nothing records an issuance for it.
+#   * SubscriberRevocationOutstanding covers broker-side credential revocation Blnk
+#     still owes.
 #   * SubscriberCredentialOrphaned covers the SAME exposure arriving by a different
-#     route, and it is a separate rule because the rule above CANNOT fire on it.
-#     SubscriberRevocationOutstanding reads the revocation tombstone, which only a
-#     DEREGISTRATION stamps. A credential orphaned by a failed ISSUANCE never gets
-#     that marker, so before this rule existed the most dangerous residue in the
-#     subscriber lifecycle — a credential that authenticates for a principal no row
-#     records an issuance for — was measured by nothing at all. The remedies also
-#     differ: an orphan is settled by RE-ISSUING (which replaces it, since Kafka
-#     stores one credential per principal) while a pending revocation is settled by
-#     retrying the deregistration, and issuance is refused for a pending row.
+#     route, and it is a separate rule because the rule above CANNOT fire on it. The
+#     remedies also differ: an orphan is settled by RE-ISSUING (which replaces it, since
+#     Kafka stores one credential per principal) while a pending revocation is settled
+#     by retrying the deregistration, and issuance is refused for a pending row.
 #
 # The count is stated because it is checkable: `promtool check rules` prints it —
 # "SUCCESS: 13 rules found" — /rules shows thirteen under blnk-kafka-alerts, and the
-# prometheus-config ConfigMap in infrastructure/k8s-manifests carries a verbatim copy
-# of this group that has to agree. It states thirteen too, in its own
-# blnk-kafka-alerts group, alongside a separate blnk-infra-alerts group holding the
-# one rule that only exists on Kubernetes. Every other file that describes this set
-# is reconciled against this one by TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere,
-# so adding a rule fails that test with the list of places to update rather than
-# silently invalidating them; this header is the one statement the test cannot check,
-# because it is prose about the file the test derives its expectations from.
+# prometheus-config ConfigMap in infrastructure/k8s-manifests carries a verbatim copy of
+# this group that has to agree. It states thirteen too, in its own blnk-kafka-alerts
+# group, alongside a separate blnk-infra-alerts group holding the one rule that only
+# exists on Kubernetes.
 
-# EVERY runbook_url IS ABSOLUTE, and each points at the SECTION for its own alert.
-# They were repository-relative paths ("docs/kafka-operations.md"), which resolve
-# against nothing where they are actually read: Alertmanager renders the value as a
-# link in an email, a Slack message or a PagerDuty incident, and the person on call
-# has a notification rather than a checkout. A relative path there is either
-# unclickable or resolves against the notification host, so the one field whose job
-# is to shorten an incident silently did not work. Deep-linking to the per-alert
-# section rather than to the top of the runbook saves the same reader a scroll
-# through a thousand-line document while they are being paged.
-#
-# THE DEFAULT BASE TRACKS A BRANCH, NOT A RELEASE, and that is worth knowing before you
-# rely on it. It resolves against .../blob/main/docs/kafka-operations.md, so the page an
-# on-call engineer opens is the runbook at HEAD — which can describe a procedure the
-# DEPLOYED release does not have, either a step that does not exist yet or one that was
-# withdrawn. It is the right default because it is always reachable and needs no
-# per-deployment configuration; it is the wrong thing to page against once a deployment is
-# pinned to a release.
-#
-# PIN IT WITH THE runbook_base_url EXTERNAL LABEL. That is the supported per-deployment
-# override and it needs no edit to these thirteen rules: set it in prometheus.yml, or in the
-# prometheus-config ConfigMap on Kubernetes, to a release-tagged or internally published
-# copy — for example .../blob/v0.9.0/docs/kafka-operations.md, or
-# https://runbooks.internal.example/blnk/kafka. Each rule then renders
-# "<that base>#<alert name lowercased>" and nothing else about the rule changes.
-#
-# A fork serving its own documentation sets the same label rather than rewriting these
-# thirteen URLs; the anchors are the alert names, lowercased, so they follow the rule names.
+# EVERY runbook_url IS ABSOLUTE, and each points at the SECTION for its own alert. They
+# were repository-relative paths ("docs/kafka-operations.md"), which resolve against
+# nothing where they are actually read: Alertmanager renders the value as a link in an
+# email, a Slack message or a PagerDuty incident, and the person on call has a
+# notification rather than a checkout. A relative path there is either unclickable or
+# resolves against the notification host, so the one field whose job is to shorten an
+# incident silently did not work.
 
-# `check rules` PROVES THESE PARSE; alerts/tests/blnk-kafka-alerts_test.yml
-# proves one of them fires. The two are independent, and the difference cost a
-# real rule: SubscriberSettlementNotProgressing was valid PromQL that could
-# never fire on a settlement pass which had never settled anything, because
-# its right-hand counter has no series until it does. Run both when changing a
-# rule:
+# `check rules` PROVES THESE PARSE; alerts/tests/blnk-kafka-alerts_test.yml proves one
+# of them fires. The two are independent, and the difference cost a real rule:
+# SubscriberSettlementNotProgressing was valid PromQL that could never fire on a
+# settlement pass which had never settled anything, because its right-hand counter has
+# no series until it does.
 #
 #     promtool check rules alerts/blnk-kafka-alerts.yml
 #     cd alerts/tests && promtool test rules blnk-kafka-alerts_test.yml
-#
-# The test file is in a SUBDIRECTORY because prometheus.yml loads rules with
-# the glob /etc/prometheus/alerts/*.yml, which would match it — and a promtool
-# test file is not a rule file, so Prometheus would refuse the entire
-# configuration and load none of these thirteen rules. The glob does not
-# recurse.
 
 groups:
   # One group: every rule covers the same domain and shares one cadence, and a
@@ -124,29 +72,23 @@ groups:
       # Retry-exhausted events nobody has cleared. In a financial ledger that
       # means mutations are not reaching subscribers, so this pages.
       - alert: DeadLetterMessageStuck
-        # 900 is the 15 minute threshold the requirement states, as a literal so
-        # it is greppable. blnk_dlt_oldest_message_age_seconds is the age of the
-        # OLDEST unresolved retry-exhausted event, so one comparison covers the
-        # whole inventory. That inventory is every outbox row in the
-        # dead_lettered or failed state, so an event whose dead-letter write
-        # itself failed is included, reported under the .dlt topic it was
-        # destined for. Left bare on purpose: no label matcher, so the rule keeps
-        # whatever attributes the gauge carries.
+        # 900 is the 15 minute threshold, written as a literal so it is greppable. blnk_dlt_oldest_message_age_seconds is the age of the OLDEST
+        # unresolved retry-exhausted event, so one comparison covers the whole
+        # inventory. That inventory is every outbox row in the dead_lettered or failed
+        # state, so an event whose dead-letter write itself failed is included, reported
+        # under the .dlt topic it was destined for. Left bare on purpose: no label
+        # matcher, so the rule keeps whatever attributes the gauge carries.
         #
-        # THE TWO STATES NEED DIFFERENT ACTIONS, which is why the description
-        # below is written in two branches rather than one. Only a dead_lettered
-        # entry is replayable; a failed entry's dead-letter write has not
-        # completed, so replay refuses it with EVENT_NOT_DEAD_LETTERED and the
-        # actual fix is upstream. A single "replay it" instruction sent an
-        # operator to an endpoint that would reject them, on the more urgent of
-        # the two states. Splitting the SIGNAL was considered and rejected: the
-        # age is one per-topic maximum, two gauges would double the series for
-        # one question, and an operator has to read the entry's status to triage
-        # it either way.
+        # THE TWO STATES NEED DIFFERENT ACTIONS, which is why the description below is
+        # written in two branches rather than one. Only a dead_lettered entry is
+        # replayable; a failed entry's dead-letter write has not completed, so replay
+        # refuses it with EVENT_NOT_DEAD_LETTERED and the actual fix is upstream. A
+        # single "replay it" instruction sent an operator to an endpoint that would
+        # reject them, on the more urgent of the two states.
         expr: blnk_dlt_oldest_message_age_seconds > 900
         # Deliberately zero, not omitted: the threshold already carries the 15
         # minutes, and a dwell here would double-count it and push the first
-        # notification past the boundary the requirement fixes.
+        # notification past the 15 minute boundary.
         for: 0m
         labels:
           severity: critical
@@ -159,16 +101,15 @@ groups:
       # A subscriber falling behind. The events are durably in Kafka and the
       # consumer catches up on its own, so this is degradation, not loss.
       - alert: SubscriberConsumerLagHigh
-        # blnk_kafka_consumer_lag is computed in-process by differencing
-        # committed offsets against log end offsets and is already summed across
-        # a topic's partitions, so it is compared bare — no sum(), no
-        # clamp_min() — which also keeps the subscriber, group and topic
-        # attributes on the notification.
-        # The series carries only COMPLETE measurements, which is what makes the
-        # comparison trustworthy: a topic with unreadable partitions is withheld
-        # from this gauge rather than reported at its partial sum, so this rule can
-        # never be resolved by a measurement failure. The gap that withholding
-        # leaves is what ConsumerLagMeasurementDegraded below covers.
+        # blnk_kafka_consumer_lag is computed in-process by differencing committed
+        # offsets against log end offsets and is already summed across a topic's
+        # partitions, so it is compared bare — no sum(), no clamp_min() — which also
+        # keeps the subscriber, group and topic attributes on the notification. The
+        # series carries only COMPLETE measurements, which is what makes the comparison
+        # trustworthy: a topic with unreadable partitions is withheld from this gauge
+        # rather than reported at its partial sum, so this rule can never be resolved by
+        # a measurement failure. The gap that withholding leaves is what
+        # ConsumerLagMeasurementDegraded below covers.
         expr: blnk_kafka_consumer_lag > 10000
         # Four consecutive evaluations at the interval above. Unlike an age,
         # consumer lag is legitimately spiky, so a short dwell avoids paging on a
@@ -178,48 +119,26 @@ groups:
           severity: warning
           component: event-streaming
         annotations:
-          # The subscriber and group values are PSEUDONYMS — a stable truncated SHA-256 of
-          # the registry identifier — and never customer-chosen names, deliberately: an
-          # annotation is rendered into notifications and incident tickets, so a
-          # name-derived label would export a customer's identity into places it cannot be
-          # recalled from. Even Blnk's own opaque 'sub_<uuid>' identifier is withheld,
-          # because a label carries no access control and the registry is the right place
-          # for the correlation capability to live. Resolve one with the registry's own
-          # resolver — GET /subscribers?subscriber_id_hash=<token>, which searches every
-          # page — or search the service logs for the matching subscriber_id_hash field.
-          # Do NOT fetch one page and hash the rows locally: that reports "no match" for
-          # subscribers it never read.
-          #
-          # Three collapse tokens can appear in place of a pseudonym, each meaning
-          # something different, and none of them is hashed because none is anyone's name:
-          # 'unattributed' — the reading came from a query that named no subscriber;
-          # 'unregistered' — a value was named but is not one Blnk issued, which is itself
-          # worth investigating; 'other' — the topic is not one Blnk owns. See
-          # consumerLagSample in event_admin.go and the resolvers in
-          # event_metrics_support.go.
+          # The subscriber and group values are PSEUDONYMS — a stable truncated SHA-256
+          # of the registry identifier — and never customer-chosen names, deliberately:
+          # an annotation is rendered into notifications and incident tickets, so a
+          # name-derived label would export a customer's identity into places it cannot
+          # be recalled from. Even Blnk's own opaque 'sub_<uuid>' identifier is
+          # withheld, because a label carries no access control and the registry is the
+          # right place for the correlation capability to live. Resolve one with the
+          # registry's own resolver — GET /subscribers?subscriber_id_hash=<token>, which
+          # searches every page — or search the service logs for the matching
+          # subscriber_id_hash field.
           summary: "Subscriber consumer group lag is above 10,000 messages"
           description: "Subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) is {{ $value | humanize }} messages behind the end of topic {{ $labels.topic }}. Confirm the consumer is running and keeping up before Kafka's retention window is reached. The subscriber and group labels are PSEUDONYMS, not names: each is a truncated SHA-256 of the identifier, so a metric label never carries a subscriber name into a dashboard or a notification. They are stable, so the same subscriber always produces the same label. Resolve one by listing the registry through GET /subscribers and hashing each subscriber_id the same way, or search the service logs for the matching subscriber_id_hash field."
           runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberconsumerlaghigh"
 
-      # AUTH-01 — a subscriber credential Blnk could not revoke.
+      # A subscriber credential Blnk could not revoke.
       #
-      # Provisioning writes a subscriber's SCRAM credential BEFORE its ACL
-      # bindings, because a binding for a principal that does not exist is inert
-      # while a credential without bindings AUTHENTICATES. A binding failure is
-      # therefore compensated by revoking the credential — and when that
-      # compensation also fails, a live means of authenticating to the event bus
-      # exists at the broker for a principal the registry records no issuance for.
-      #
-      # THE AGE, NOT THE COUNT, is what this fires on. A marker cleared within a
-      # minute by a retry is routine: the automatic settlement paths — re-issuing,
-      # which replaces the orphan credential by construction, and deprovisioning,
-      # which revokes it — are working. One outstanding for an hour means neither
-      # has been exercised and a human has to revoke it. Alerting on the count
-      # alone would page on every transient broker error.
-      #
-      # The age is measured from when the obligation was FIRST recorded and is
-      # never reset by a later failed attempt, so it is the age of the EXPOSURE
-      # rather than of the last try.
+      # THE AGE, NOT THE COUNT, is what this fires on. A marker cleared within a minute
+      # by a retry is routine: the automatic settlement paths — re-issuing, which
+      # replaces the orphan credential by construction, and deprovisioning, which
+      # revokes it — are working.
       - alert: SubscriberRevocationOutstanding
         expr: blnk_subscribers_oldest_revocation_age_seconds > 3600
         # Zero dwell. The gauge is already an age, so the expression itself
@@ -259,25 +178,25 @@ groups:
       # administrative principal's grants or the broker's reachability must be fixed
       # before ANY retry can succeed, so retrying without that is wasted effort.
       - alert: SubscriberRevocationRefused
-        # Fifteen minutes rather than an hour, and on the AGE of the refusal. The
-        # marker is cleared at the start of every new attempt, so a value that
-        # persists means no attempt has even been made since the refusal — and unlike
-        # the two rules above, waiting does not help here, because the cause is at the
-        # broker. Fifteen minutes matches the dead-letter rule's window: long enough
-        # that a transient broker outage settles itself, short enough that a lost
-        # administrative grant is surfaced the same shift.
+        # Fifteen minutes rather than an hour, and on the AGE of the refusal. The marker
+        # is cleared at the start of every new attempt, so a value that persists means
+        # no attempt has even been made since the refusal — and unlike the two rules
+        # above, waiting does not help here, because the cause is at the broker. Fifteen
+        # minutes matches the dead-letter rule's window: long enough that a transient
+        # broker outage settles itself, short enough that a lost administrative grant is
+        # surfaced the same shift.
         expr: blnk_subscribers_oldest_revocation_failure_age_seconds > 900
         for: 0m
         labels:
           severity: warning
           component: event-streaming
         annotations:
-          # WARNING rather than critical, deliberately, and it is not a softening of
-          # the exposure. Every row counted here also carries the revocation
-          # tombstone, so SubscriberRevocationOutstanding already pages on the same
-          # subscriber once the debt reaches an hour. This rule's job is to arrive
-          # EARLIER with the extra fact that page will not carry: the broker said no,
-          # so fix the broker side before retrying.
+          # WARNING rather than critical, deliberately, and it is not a softening of the
+          # exposure. Every row counted here also carries the revocation tombstone, so
+          # SubscriberRevocationOutstanding already pages on the same subscriber once
+          # the debt reaches an hour. This rule's job is to arrive EARLIER with the
+          # extra fact that page will not carry: the broker said no, so fix the broker
+          # side before retrying.
           summary: "The broker refused a subscriber credential revocation"
           description: "Blnk's most recent attempt to revoke a subscriber's SASL/SCRAM credential was refused by the broker {{ $value | humanizeDuration }} ago (instance {{ $labels.instance }}), and no attempt has been made since. RETRYING ALONE WILL NOT HELP: a CLUSTER_AUTHORIZATION_FAILED means the administrative principal is not in super.users or has lost its grants, and a transport error means the broker is unreachable. Fix that first, then retry with DELETE /subscribers/<id>. Find the rows with GET /subscribers and read revocation_failed_at, which the registry projects. These rows also carry revocation_pending_at, so SubscriberRevocationOutstanding will page on them once the debt passes an hour."
           runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberrevocationrefused"
@@ -286,72 +205,40 @@ groups:
       # cannot tell what the lag IS, which is a distinct and more urgent condition
       # because every other consumer-lag signal is unreliable while it holds.
       - alert: ConsumerLagMeasurementDegraded
-        # Any non-zero value. There is no "acceptable" number of unreadable
-        # partitions: one is enough to make the topic's lag a lower bound, and the
-        # lag series for that topic disappears while this holds, so a threshold
-        # above zero would leave a range in which lag is both unmeasured and
-        # unalerted. Compared bare so the subscriber, group and topic attributes
-        # reach the notification — they are the same three labels
-        # blnk_kafka_consumer_lag carries, deliberately, so the two series join.
+        # Any non-zero value. There is no "acceptable" number of unreadable partitions:
+        # one is enough to make the topic's lag a lower bound, and the lag series for
+        # that topic disappears while this holds, so a threshold above zero would leave
+        # a range in which lag is both unmeasured and unalerted. Compared bare so the
+        # subscriber, group and topic attributes reach the notification — they are the
+        # same three labels blnk_kafka_consumer_lag carries, deliberately, so the two
+        # series join.
         expr: blnk_kafka_consumer_lag_unmeasured_partitions > 0
         # Longer than the lag rule's dwell. A partition is briefly unreadable during
         # ordinary cluster events — a leader election, a broker restart, a partition
         # reassignment — and those resolve without intervention well inside five
-        # minutes. Paging on them would make this the noisiest rule in the file and
-        # so the first one silenced, which is the opposite of the intent. Five
-        # minutes is ten consecutive evaluations at the interval above, and it stays
-        # comfortably inside the fifteen-minute window the dead-letter rule uses, so
-        # a genuine metadata fault is still surfaced promptly.
+        # minutes. Paging on them would make this the noisiest rule in the file and so
+        # the first one silenced, which is the opposite of the intent.
         for: 5m
         labels:
           severity: warning
           component: event-streaming
         annotations:
-          # Deliberately NOT critical, even though it degrades observability: the
-          # events themselves are unaffected — they are durably in Kafka and the
-          # relay is unaware of this — so nothing is being lost. What is lost is the
-          # ability to see a lagging consumer, which is a warning that needs an
-          # operator today rather than a page tonight.
-          #
-          # The subscriber and group values are opaque registry-issued identifiers
-          # for the same reason they are on SubscriberConsumerLagHigh: an annotation
-          # is rendered into notifications and incident tickets, so a name-derived
-          # label would export a customer's identity into places it cannot be
-          # recalled from.
+          # Deliberately NOT critical, even though it degrades observability: the events
+          # themselves are unaffected — they are durably in Kafka and the relay is
+          # unaware of this — so nothing is being lost. What is lost is the ability to
+          # see a lagging consumer, which is a warning that needs an operator today
+          # rather than a page tonight.
           summary: "Consumer lag cannot be fully measured for a subscriber topic"
           description: "{{ $value }} partition(s) of topic {{ $labels.topic }} could not be read when subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) was last measured, so its lag is a lower bound and is WITHHELD from blnk_kafka_consumer_lag — SubscriberConsumerLagHigh cannot fire for this topic while this alert holds. Check broker and partition health first; the partial total is in the event-metrics log line. The subscriber and group values are opaque registry identifiers: resolve them through the subscriber registry."
           runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#consumerlagmeasurementdegraded"
 
-      # Lag that is measured too rarely to alert on. This is a COVERAGE rule,
-      # and it exists because the lag signal cannot report its own blind spots
-      # (PERF-P22).
-      #
-      # Measuring every registered subscriber on every tick would spend a
-      # broker round trip per subscriber per tick, so Blnk measures a bounded
-      # slice each tick and rotates through the registry, retaining each
-      # reading for ten minutes so a subscriber's series stays exported
-      # between the ticks that refresh it. SubscriberConsumerLagHigh is
-      # reliable only while the rotation returns to a subscriber inside that
-      # retention.
-      #
-      # When it does not, the failure is INVISIBLE IN THE LAG SERIES: the
-      # reading expires, the series stops being exported, and an absent series
-      # breaches no threshold. So a registry that has outgrown the measurement
-      # budget reports no lag problem for precisely the subscribers it can no
-      # longer see.
+      # Lag that is measured too rarely to alert on. This is a COVERAGE rule, and it
+      # exists because the lag signal cannot report its own blind spots
       - alert: SubscriberLagCoverageStale
-        # max_over_time is the whole point of the expression. The gauge is
-        # reset to zero every time a rotation completes, so its instantaneous
-        # value is whatever point of a rotation the last scrape landed on —
-        # the MAXIMUM over a window is the rotation latency, which is the
-        # quantity to compare.
-        #
-        # 600 is the ten-minute reading retention, as a literal so it is
-        # greppable and so this rule and that constant are visibly the same
-        # number. A rotation slower than the retention expires readings before
-        # returning to them. The window is 30m: three retention periods, long
-        # enough that a single slow rotation does not fire and a persistently
-        # slow one does.
+        # max_over_time is the whole point of the expression. The gauge is reset to zero
+        # every time a rotation completes, so its instantaneous value is whatever point
+        # of a rotation the last scrape landed on — the MAXIMUM over a window is the
+        # rotation latency, which is the quantity to compare.
         expr: >-
           max_over_time(blnk_kafka_consumer_lag_pass_age_seconds[30m]) > 600
         # No dwell needed. max_over_time already integrates over thirty
@@ -367,27 +254,17 @@ groups:
           description: "The consumer-lag rotation on {{ $labels.instance }} has taken up to {{ $value | humanizeDuration }} to get back round the subscriber registry, against a ten-minute reading retention. A subscriber the rotation does not return to inside that retention has its reading EXPIRE, so its blnk_kafka_consumer_lag series stops being exported — and an absent series breaches no threshold, so SubscriberConsumerLagHigh reports nothing wrong for exactly the subscribers it can no longer see. Read blnk_kafka_consumer_lag_covered_subscribers against blnk_subscribers_registered to see how much of the registry is currently exported, then raise EVENT_METRICS_SUBSCRIBER_BUDGET so one tick measures more of it, and narrow over-broad subscriber grants, because the cost is one round trip per authorised topic per subscriber per tick. Do NOT reach for the collection interval: it is fixed at 15 seconds and is not operator-configurable, and lengthening it would make every reading staler, which is the condition this alert reports. A rotation that is slow because measurements are FAILING shows up on blnk_kafka_subscribers_unmeasured{reason=\"measure_failed\"} instead, and needs the broker rather than the budget."
           runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberlagcoveragestale"
 
-      # Subscribers the sweep did not measure at all. ConsumerLagMeasurementDegraded
-      # above covers a partition inside a measurement; this covers a whole subscriber
-      # that never got one, which nothing could previously see.
+      # Subscribers the sweep did not measure at all.
       - alert: SubscriberLagCoverageIncomplete
         # The lag inventory is WHOLE-SET: what a sweep publishes is exactly what is
-        # exported, so a subscriber the sweep never reached has no series at all
-        # rather than a stale one. Nothing can alert per-subscriber on a series that
-        # does not exist, which is why coverage is published as its own boolean and
-        # evaluated here. Zero means at least one registered subscriber's lag is not
-        # being measured, for any of the reasons broken out by
+        # exported, so a subscriber the sweep never reached has no series at all rather
+        # than a stale one. Nothing can alert per-subscriber on a series that does not
+        # exist, which is why coverage is published as its own boolean and evaluated
+        # here. Zero means at least one registered subscriber's lag is not being
+        # measured, for any of the reasons broken out by
         # blnk_kafka_subscribers_unmeasured.
         expr: blnk_kafka_consumer_lag_inventory_complete == 0
         # THIRTY MINUTES, and the long dwell is the point rather than caution.
-        #
-        # Incompleteness is EXPECTED transiently on a registry larger than the
-        # per-tick measurement budget: the sweep resumes from a rotating cursor, so
-        # coverage completes over several ticks and any single tick legitimately
-        # reports 0. A short dwell here would fire permanently on a correctly
-        # configured large deployment and be the first rule silenced. Thirty minutes
-        # is long enough that only a registry the rotation cannot get through, or a
-        # persistent failure, still holds — both of which need the operator.
         for: 30m
         labels:
           severity: warning
@@ -399,41 +276,15 @@ groups:
 
       # The settlement pass itself has stopped.
       #
-      # Distinct from the rule above, and more urgent in one specific way: that one
-      # fires when an obligation is OLD, which requires an obligation to exist. This
-      # one fires when work is outstanding and NOTHING is being discharged, which is
-      # the signature of a pass that is not running at all — a server role started
-      # without a broker configured while subscribers were provisioned against one,
-      # a processor that failed its wiring check, or a loop that has died.
-      #
-      # It fires an hour earlier than the age rule by design, so the "the mechanism
-      # is broken" signal precedes the "this specific obligation is stale" signal
-      # rather than arriving with it.
+      # It fires an hour earlier than the age rule by design, so the "the mechanism is
+      # broken" signal precedes the "this specific obligation is stale" signal rather
+      # than arriving with it.
       - alert: SubscriberSettlementNotProgressing
-        # Work outstanding AND nothing settled in the last half hour. Both halves
-        # are required: the backlog alone is normal — an obligation raised a minute
-        # ago is expected to be outstanding — and a zero settlement rate alone is
-        # the healthy steady state, because most deployments never fail a subscriber
-        # operation at all.
-        #
-        # WRITTEN WITH `unless` RATHER THAN `and ... == 0`, AND THAT IS THE
-        # WHOLE RULE. The settled counter has NO SERIES until the pass
-        # discharges its first obligation — OpenTelemetry exports the attribute
-        # sets that have been written, not every instrument declared — so `and
-        # rate(...) == 0` matched against an empty vector and produced an empty
-        # result. The rule could therefore never fire on the one deployment that
-        # needs it: a pass that has never settled anything, which is exactly
-        # what "not progressing" means. `unless` inverts the failure: the left
-        # side survives when the right has nothing to match, so a real backlog
-        # alerts before the counter's first sample.
-        #
-        # The vector matching is unchanged. `unless` is a set operator like
-        # `and` and matches on the full label set, so instance and job still
-        # pair the backlog with its own process's settle rate, and because
-        # `unless` returns the LEFT side, $value and $labels in the annotation
-        # below mean what they meant before. Suppression is now expressed as "a
-        # positive settle rate exists" instead of "the rate equals zero", which
-        # is the same condition whenever the series exists at all.
+        # Work outstanding AND nothing settled in the last half hour. Both halves are
+        # required: the backlog alone is normal — an obligation raised a minute ago is
+        # expected to be outstanding — and a zero settlement rate alone is the healthy
+        # steady state, because most deployments never fail a subscriber operation at
+        # all.
         expr: blnk_subscribers_settlement_outstanding > 0
           unless rate(blnk_subscribers_obligations_settled_total[30m]) > 0
         # Ten consecutive evaluations at the interval above. Long enough that a pass
@@ -468,11 +319,11 @@ groups:
       # this holds, so it is the rule that says the other rules cannot be trusted.
       - alert: EventMetricsCollectionStale
         # Observed from a stored timestamp at scrape time rather than written by the
-        # collector, deliberately: a gauge only the collector could update would
-        # freeze at its last age and read as permanently fresh precisely when the
-        # collector had stopped. 120 seconds is eight collection intervals and four
-        # times the per-tick deadline, so an ordinary slow tick cannot reach it while
-        # a loop that has genuinely stopped passes it within two minutes.
+        # collector, deliberately: a gauge only the collector could update would freeze
+        # at its last age and read as permanently fresh precisely when the collector had
+        # stopped. 120 seconds is eight collection intervals and four times the per-tick
+        # deadline, so an ordinary slow tick cannot reach it while a loop that has
+        # genuinely stopped passes it within two minutes.
         expr: blnk_event_metrics_last_collection_age_seconds > 120
         # Four consecutive evaluations. The gauge is already an age, so the dwell only
         # guards against a single scrape landing inside one unusually long tick.
@@ -489,12 +340,12 @@ groups:
       # and invisible to it: the loop is healthy, so the collection age stays near
       # zero throughout while the gauges it could not compute go stale.
       - alert: EventMetricsCollectionFailing
-        # The last collection that completed with NO failure in any of its
-        # collections. A collector whose database is refusing connections ticks
-        # perfectly on schedule, so this is the only signal that separates "nothing
-        # to report" from "could not compute anything to report". 300 seconds is
-        # twenty consecutive intervals: well past any transient failure, and inside
-        # the fifteen-minute window the dead-letter rule uses.
+        # The last collection that completed with NO failure in any of its collections.
+        # A collector whose database is refusing connections ticks perfectly on
+        # schedule, so this is the only signal that separates "nothing to report" from
+        # "could not compute anything to report". 300 seconds is twenty consecutive
+        # intervals: well past any transient failure, and inside the fifteen-minute
+        # window the dead-letter rule uses.
         expr: blnk_event_metrics_last_success_age_seconds > 300
         # Zero dwell. The expression is already an age over twenty intervals, so a
         # dwell would only delay a condition that has by then held for five minutes.
@@ -511,16 +362,10 @@ groups:
       # stated explicitly rather than inferred from a missing condition series.
       - alert: EventMetricsCollectionAbsent
         # SCOPED TO THE SERVER JOB, which is not optional. The collector runs in the
-        # server role only — two processes writing the same gauges would each retire
-        # the other's series as stale — so this gauge is legitimately absent from
-        # every blnk-worker target and an unscoped absent() would fire for ever on a
-        # correctly deployed stack.
-        #
-        # This is the rule that makes the whole file trustworthy. Without it a
-        # deployment where /metrics is unarmed, or where the server never started its
-        # collector, exports no event series at all — and every other rule here
-        # evaluates against nothing, which cannot fire and is indistinguishable from
-        # a healthy system.
+        # server role only — two processes writing the same gauges would each retire the
+        # other's series as stale — so this gauge is legitimately absent from every
+        # blnk-worker target and an unscoped absent() would fire for ever on a correctly
+        # deployed stack.
         expr: absent(blnk_event_metrics_last_collection_age_seconds{job="blnk-server"})
         # Ten minutes, so a rolling deployment or a restart does not page. The
         # collector runs its first collection immediately on Start, so a server that

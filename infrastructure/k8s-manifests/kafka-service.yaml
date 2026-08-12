@@ -1,5 +1,5 @@
-# The Kafka broker's Service surface. It is SEVERAL Services in ONE file by
-# design, and they serve three different audiences:
+# The Kafka broker's Service surface. It is SEVERAL Services in ONE file by design, and
+# they serve three different audiences:
 #
 #   kafka             the INTERNAL client-facing ClusterIP Service. KAFKA_BROKERS
 #                     names it bare as kafka:9092, exactly as data_source.dns
@@ -12,30 +12,6 @@
 #   kafka-external-N  one per BROKER, carrying the externally advertised listener
 #                     that SUBSCRIBERS connect to. KAFKA_SUBSCRIBER_BROKERS names
 #                     these, never the ClusterIP above.
-#
-# # Why a subscriber cannot be given kafka:9092
-#
-# The ClusterIP Service resolves only inside the cluster, so a credential naming
-# it is valid and unusable from anywhere a subscriber actually runs. That is not
-# merely a DNS detail: a Kafka client bootstraps against any broker, receives the
-# metadata response, and then connects DIRECTLY to the leader of each partition
-# using the ADDRESS THAT BROKER ADVERTISES for the listener the client arrived
-# on. An in-cluster listener advertises an in-cluster name, so an external client
-# that somehow reached it would be redirected straight back to an unresolvable
-# address. External access therefore needs its own listener with its own
-# advertised address — which is why config.KafkaConfig carries two broker lists
-# and the credential endpoint returns only the subscriber-facing one.
-#
-# BOTH SERVICES MUST BE DEPLOYED. Clients resolve the broker through the
-# load-balanced `kafka` name, while the brokers themselves need the per-pod names
-# only the headless Service provides, for their advertised listeners and their
-# KRaft voter set. Whether the two live in one file or two is immaterial; applying
-# only one of them is not.
-#
-# Nothing else belongs here. Consumer lag is measured in-process by
-# event_admin.go, differencing OffsetFetch against ListOffsets over the internal
-# Service below, so this deployment needs no lag-exporter workload and no
-# Service to expose one.
 apiVersion: v1
 kind: Service
 metadata:
@@ -48,23 +24,11 @@ metadata:
   name: kafka
   namespace: blnk
 spec:
-  # ONLY the SASL client listener, 9092 — the port docker-compose.yaml
-  # advertises as BROKER://kafka:9092 and .env.example documents as
-  # KAFKA_BROKERS=kafka:9092. Keep this number, the broker's client listener in
-  # kafka-statefulset.yaml and that variable in step; a Service pointing at a
-  # port the broker does not serve fails like a broken broker, not like a typo.
-  #
-  # The KRaft controller listener, 9093, is deliberately ABSENT from this
-  # Service. It carries quorum traffic between brokers, speaks its own security
-  # protocol and authenticates with its own credential, so publishing it beside
-  # the client port would invite a client to dial the wrong listener and fail in
-  # a way that reads as a rejected password. It is served by kafka-headless
-  # below, where only the brokers use it.
-  #
-  # No `type:` key, so this is a plain ClusterIP Service like postgres, redis
-  # and typesense. Load-balancing across the broker pods is correct for clients:
-  # a producer dials any broker to bootstrap and the metadata response then
-  # redirects it to the leader of each partition it writes to.
+  # ONLY the SASL client listener, 9092 — the port docker-compose.yaml advertises as
+  # BROKER://kafka:9092 and .env.example documents as KAFKA_BROKERS=kafka:9092. Keep
+  # this number, the broker's client listener in kafka-statefulset.yaml and that
+  # variable in step; a Service pointing at a port the broker does not serve fails like
+  # a broken broker, not like a typo.
   ports:
     - name: "9092"
       port: 9092
@@ -74,20 +38,14 @@ spec:
 status:
   loadBalancer: {}
 # --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
-# WHAT FOLLOWS IS A SECOND SERVICE, not a second copy of the first, and BOTH
-# must be deployed:
+# WHAT FOLLOWS IS A SECOND SERVICE, not a second copy of the first, and BOTH must be
+# deployed:
 #
-#   * clients — the event publisher, the outbox relay and
-#     scripts/kafka-provision.sh — dial the load-balanced `kafka` above;
+#   * clients — the event publisher, the outbox relay and scripts/kafka-provision.sh —
+#     dial the load-balanced `kafka` above;
 #   * the brokers themselves cannot. Their advertised listeners and their KRaft
-#     controller.quorum.voters have to name one specific pod each, and only a
-#     headless Service publishes a per-pod name.
-#
-# The `---` below is a document separator, deliberate rather than a stray
-# marker. Splitting the two Services into separate files is harmless as long as
-# both are applied; deploying only one is not.
-# --------------------------------------------------------------------------
+#     controller.quorum.voters have to name one specific pod each, and only a headless
+#     Service publishes a per-pod name.
 # --------------------------------------------------------------------------
 ---
 apiVersion: v1
@@ -102,24 +60,16 @@ metadata:
   name: kafka-headless
   namespace: blnk
 spec:
-  # No virtual IP and no load balancing: this name resolves to the broker pod
-  # addresses themselves, and each pod additionally answers to
+  # No virtual IP and no load balancing: this name resolves to the broker pod addresses
+  # themselves, and each pod additionally answers to
   # kafka-<ordinal>.kafka-headless.blnk.svc.cluster.local.
-  #
-  # kafka-statefulset.yaml MUST carry `serviceName: kafka-headless` for those
-  # per-pod records to exist. Pointing it at the plain `kafka` Service — the
-  # shape postgres-statefulset.yaml uses, adequate there only because that
-  # workload is a single replica — would leave a three-broker cluster unable
-  # to name its own members: a quorum voter must be a specific broker, and an
-  # advertised listener must resolve back to the one pod holding the partition
-  # leadership it just claimed.
   clusterIP: None
-  # Both listeners, unlike the client-facing Service above: 9092 carries client
-  # and inter-broker traffic, 9093 carries the KRaft controller quorum. Being
-  # reachable on either by a per-pod name is this Service's whole purpose, so
-  # both belong here. These are Kubernetes port names following this folder's
-  # Kompose idiom of the quoted port number — they are not Kafka listener
-  # names; BROKER and CONTROLLER are configured on the broker itself.
+  # Both listeners, unlike the client-facing Service above: 9092 carries client and
+  # inter-broker traffic, 9093 carries the KRaft controller quorum. Being reachable on
+  # either by a per-pod name is this Service's whole purpose, so both belong here. These
+  # are Kubernetes port names following this folder's Kompose idiom of the quoted port
+  # number — they are not Kafka listener names; BROKER and CONTROLLER are configured on
+  # the broker itself.
   ports:
     - name: "9092"
       port: 9092
@@ -127,46 +77,27 @@ spec:
     - name: "9093"
       port: 9093
       targetPort: 9093
-  # Quorum formation happens BEFORE any broker can pass a readiness probe, so
-  # the voters must be resolvable before then. Left at its default, DNS omits
-  # not-ready pods and a cold start deadlocks: readiness waits on the quorum,
-  # the quorum waits on DNS, and DNS waits on readiness. Every Kafka and etcd
-  # operator sets this for exactly that reason.
+  # Quorum formation happens BEFORE any broker can pass a readiness probe, so the voters
+  # must be resolvable before then. Left at its default, DNS omits not-ready pods and a
+  # cold start deadlocks: readiness waits on the quorum, the quorum waits on DNS, and
+  # DNS waits on readiness. Every Kafka and etcd operator sets this for exactly that
+  # reason.
   publishNotReadyAddresses: true
   # Identical to the client Service's selector, and to the StatefulSet's
-  # selector.matchLabels: both Services front the same three broker pods and
-  # differ only in how they are addressed.
+  # selector.matchLabels: both Services front the same three broker pods and differ only
+  # in how they are addressed.
   #
-  # THREE PODS MEANS THREE VOLUMES, and it is worth saying here because this is
-  # the file that establishes the broker count. Per-pod identity is what makes
-  # per-pod STORAGE possible: kafka-statefulset.yaml declares a
-  # `volumeClaimTemplates` entry named `kafka-data`, so Kubernetes materialises
-  # kafka-data-kafka-0, -1 and -2 and re-binds each to the same ordinal across
-  # restarts.
+  # THREE PODS MEANS THREE VOLUMES, and it is worth saying here because this is the file
+  # that establishes the broker count. Per-pod identity is what makes per-pod STORAGE
+  # possible: kafka-statefulset.yaml declares a `volumeClaimTemplates` entry named
+  # `kafka-data`, so Kubernetes materialises kafka-data-kafka-0, -1 and -2 and re-binds
+  # each to the same ordinal across restarts.
   #
-  # THE SINGLETON PVC MANIFEST WAS REMOVED; THREE OPTIONAL PER-ORDINAL CLAIMS
-  # REPLACED IT. This folder used to carry a Kompose-generated
-  # kafka-data-persistentvolumeclaim.yaml declaring ONE 10Gi ReadWriteOnce claim
-  # named `kafka-data`, and that object is gone: nothing mounted it, so applying
-  # the folder provisioned storage nobody read, and its name collided confusingly
-  # with the per-ordinal claims the template really creates. It could never have
-  # been the brokers' storage either — one ReadWriteOnce claim is mountable by one
-  # node at a time, whereas each broker needs its own KRaft metadata log, and three
-  # brokers writing into one log directory corrupt it rather than reporting an
-  # error.
-  #
-  # WHAT EXISTS NOW, under the same file name, is three claims — kafka-data-kafka-0,
-  # -1 and -2 — matching the names Kubernetes derives from the template, and they
-  # are OPTIONAL: applying that file BEFORE this StatefulSet pre-provisions them and
-  # the StatefulSet adopts each one, while applying it afterwards or not at all is
-  # equally valid because the StatefulSet creates the same three itself. Its reason
-  # for existing is pre-provisioning — a chosen storageClassName, a bound volume
-  # verified before the brokers start — not being the source of the claim shape.
-  #
-  # So the volumeClaimTemplates entry remains the single definition of a broker
-  # volume's shape, and kafka-data-persistentvolumeclaim.yaml is a pre-provisioning
-  # convenience that must agree with it. Change the size in one and change it in the
-  # other.
+  # THERE IS NO SINGLETON `kafka-data` CLAIM. The volumeClaimTemplates entry is the single
+  # definition of a broker volume's shape, and
+  # kafka-data-persistentvolumeclaim.yaml holds three OPTIONAL per-ordinal claims as a
+  # pre-provisioning convenience that must agree with it. Change the size in one and
+  # change it in the other.
   selector:
     io.kompose.service: kafka
 status:
@@ -174,67 +105,11 @@ status:
 # --------------------------------------------------------------------------
 # THE SUBSCRIBER-FACING LISTENER, ONE SERVICE PER BROKER.
 #
-# These three Services are what KAFKA_SUBSCRIBER_BROKERS names, and they are the
-# only addresses POST /subscribers/{id}/kafka-credentials may hand out. Blnk
-# refuses to issue a credential while that variable is empty rather than
-# returning the internal ClusterIP name, so this surface is a PREREQUISITE for
-# subscriber onboarding — not an optional extra.
-#
-# # Why one per broker rather than one load-balanced Service
-#
-# A single Service in front of three brokers is correct for BOOTSTRAP and wrong
-# for everything after it. A client dials any broker to fetch metadata and then
-# talks directly to the leader of each partition at the address that broker
-# advertised. Round-robining every connection across three brokers would send
-# produce and fetch requests to brokers that do not hold the partition, and the
-# advertised address could only ever name one of them — so each broker needs its
-# own externally reachable address, and each must advertise its own.
-#
-# # WHAT THE BROKER MUST BE CONFIGURED WITH (kafka-statefulset.yaml)
-#
-# These Services expose port 29092, which the broker must serve as a SECOND
-# listener beside the internal 9092 — one listener cannot advertise two
-# addresses. The StatefulSet's broker configuration therefore needs, per pod:
-#
-#   listeners=BROKER://:9092,EXTERNAL://:29092,CONTROLLER://:9093
-#   advertised.listeners=BROKER://kafka-<ordinal>.kafka-headless.blnk.svc.cluster.local:9092,\
-#                        EXTERNAL://<the address of that pod's kafka-external-<ordinal>>:29092
-#   listener.security.protocol.map=BROKER:SASL_SSL,EXTERNAL:SASL_SSL,CONTROLLER:SASL_PLAINTEXT
-#   inter.broker.listener.name=BROKER
-#   authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
-#
-# SASL_SSL rather than SASL_PLAINTEXT on the external listener is not a
-# preference: SCRAM proves knowledge of a password without encrypting the
-# session, so an unencrypted external listener exposes the ledger and identity
-# payloads this system exists to protect, and the authorizer line is what makes
-# the per-subscriber ACLs actually enforced instead of merely accepted.
-#
-# The EXTERNAL address is deployment-specific and cannot be committed here: it is
-# whatever the provisioned load balancer answers on. Fill it into the
-# StatefulSet's per-pod configuration and into KAFKA_SUBSCRIBER_BROKERS together
-# — a comma-separated list of all three, so a subscriber can bootstrap against
-# any of them.
-#
-# # type: LoadBalancer, and how to change it
-#
-# LoadBalancer is used because it needs no knowledge of node addresses and works
-# on every managed cluster. On a cluster without a load-balancer controller,
-# change each of these to `type: NodePort` with a distinct `nodePort:` per broker
-# and advertise <node-address>:<nodePort> instead. What must NOT change is the
-# one-Service-per-broker shape or the per-pod selector below.
-#
-# # The selector is per POD, not per workload
-#
-# statefulset.kubernetes.io/pod-name is set automatically by the StatefulSet
-# controller on every pod it creates, and it is the only label that identifies
-# ONE broker. Selecting on io.kompose.service like the Services above would put
-# all three brokers behind all three addresses, which is precisely the
-# round-robin failure this surface exists to avoid.
-#
-# ONE SERVICE PER REPLICA: if kafka-statefulset.yaml's replica count changes,
-# this list changes with it. A broker with no external Service is unreachable by
-# subscribers holding partitions it leads, and an external Service with no broker
-# is an address that never answers.
+# These three Services are what KAFKA_SUBSCRIBER_BROKERS names, and they are the only
+# addresses POST /subscribers/{id}/kafka-credentials may hand out. Blnk refuses to issue
+# a credential while that variable is empty rather than returning the internal ClusterIP
+# name, so this surface is a PREREQUISITE for subscriber onboarding — not an optional
+# extra.
 # --------------------------------------------------------------------------
 ---
 apiVersion: v1

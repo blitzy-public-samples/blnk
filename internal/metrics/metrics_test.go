@@ -17,47 +17,25 @@ limitations under the License.
 package metrics
 
 // This is the first test file for package metrics. It exists to guard a specific,
-// easy-to-break structural property of the package rather than to exercise
-// business logic — there is none here.
+// easy-to-break structural property of the package rather than to exercise business
+// logic — there is none here.
 //
-// metrics.go is deliberately flat: one package-level meter, an init() that calls
-// Init() and log.Fatalf's if it returns an error, a flat set of exported instrument
-// variables, and an Init() that assigns every one of them in declaration order and
-// returns on the first error. Two consequences follow, and both are what the tests
-// below assert:
+// metrics.go is deliberately flat: one package-level meter, an init() that calls Init()
+// and log.Fatalf's if it returns an error, a flat set of exported instrument variables,
+// and an Init() that assigns every one of them in declaration order and returns on the
+// first error. Two consequences follow, and both are what the tests below assert:
 //
-//  1. Every instrument is constructed at package-IMPORT time. A meter that
-//     rejected an instrument would therefore kill the process at load, and it
-//     would take down every package that imports this one — the API server, the
-//     workers, the CLI. "The test binary ran at all" is itself evidence that
-//     construction succeeded; these tests turn that implicit evidence into
-//     explicit assertions with failure messages that name the culprit.
+//  1. Every instrument is constructed at package-IMPORT time. A meter that rejected an
+//     instrument would therefore kill the process at load, and it would take down every
+//     package that imports this one — the API server, the workers, the CLI.
 //
-//  2. A declaration whose matching assignment block is missing from Init() stays
-//     nil forever. Nothing catches that: the variable exists, the package builds
-//     cleanly, and the first production call site panics on a nil interface. The
-//     non-nil tests are the only mechanical defence against such an orphaned
-//     declaration — precisely the mistake that appending new instruments to an
-//     existing list invites.
+//  2. A declaration whose matching assignment block is missing from Init() stays nil
+//     forever.
 //
 //     The two inventory functions below, preExistingInstruments and
 //     eventStreamingInstruments, ARE that defence, and they are hand-maintained: an
 //     instrument absent from both has no orphan guard at all. Adding an instrument
 //     to metrics.go therefore means adding it to one of them.
-//
-// The tests are in package metrics (an internal test package) rather than
-// metrics_test, so the unexported meter every instrument is built from is in
-// scope and can be asserted on directly.
-//
-// Scope note: instrument names are asserted here only indirectly, through Init()
-// returning a nil error. The instrument-name-to-Prometheus-series transform is the
-// exporter's behaviour, not this package's, and is verified out-of-process against
-// real /metrics output. Asserting a guessed series name here would produce a test
-// that passes while the endpoint disagrees.
-//
-// None of these tests calls t.Parallel(). Init() writes the package-level
-// instrument variables that the other tests read, and CI runs the suite under the
-// race detector, so the tests are kept strictly serial.
 
 import (
 	"context"
@@ -85,19 +63,7 @@ import (
 
 // Compile-time instrument-kind guards for the event-streaming instruments.
 //
-// DO NOT DELETE THESE AS "UNUSED". They are pure static type checks and they are
-// the primary defence against an instrument-kind mix-up. Each metric.* kind embeds
-// a distinct unexported marker interface — embedded.Int64Gauge declares
-// int64Gauge(), embedded.Int64Histogram declares int64Histogram(), and so on — so
-// no two kinds are mutually assignable, not even Int64Gauge and Int64Histogram,
-// which expose an identical Record(context.Context, int64, ...RecordOption)
-// method. Changing any declaration in metrics.go to the wrong kind therefore fails
-// to COMPILE right here, long before a test could run and long before a dashboard
-// silently renders a counter as a gauge.
-//
-// These are value assignments rather than type assertions on purpose: they check
-// the declared static type and never touch the runtime value, so they hold whether
-// or not Init() has run.
+// DO NOT DELETE THESE AS "UNUSED".
 var (
 	_ metric.Int64Counter     = EventsPublishedTotal
 	_ metric.Int64Counter     = EventBrokerAcknowledgementsTotal
@@ -112,14 +78,12 @@ var (
 	_ metric.Int64Counter     = EventRepairsCompletedTotal
 	_ metric.Int64Gauge       = EventRepairSaturated
 
-	// The two lag instruments are ASYNCHRONOUS, and the distinction this guard enforces
-	// is the whole cardinality fix rather than a stylistic preference. A synchronous
-	// Int64Gauge is a write whose aggregator retains every attribute set it has ever
-	// been written with, and it has no delete — so with a dynamic label set, subscriber
-	// churn grows the series count without bound and no zero written afterwards can
-	// retire a series. An Int64ObservableGauge exports exactly what its callback observes
-	// per collection, so the series set IS the current inventory. The two kinds are not
-	// mutually assignable, so reverting either declaration fails to compile here.
+	// The two lag instruments are ASYNCHRONOUS, and the distinction this guard enforces is
+	// the whole cardinality fix rather than a stylistic preference. A synchronous
+	// Int64Gauge is a write whose aggregator retains every attribute set it has ever been
+	// written with, and it has no delete — so with a dynamic label set, subscriber churn
+	// grows the series count without bound and no zero written afterwards can retire a
+	// series.
 	_ metric.Int64ObservableGauge = SubscriberConsumerLag
 	_ metric.Int64ObservableGauge = ConsumerLagUnmeasuredPartitions
 
@@ -128,9 +92,7 @@ var (
 	// collector itself, which may have STOPPED. A synchronous gauge can only be written by
 	// the component being observed, so a stalled collector would freeze its own freshness
 	// gauge at whatever age it last reported and the series would read as permanently
-	// current — the single failure these two instruments exist to make visible. Observed
-	// from a stored timestamp at collection time, the age instead rises on every scrape
-	// with no participation from the stalled component.
+	// current — the single failure these two instruments exist to make visible.
 	_ metric.Float64ObservableGauge = EventMetricsLastCollectionAgeSeconds
 	_ metric.Float64ObservableGauge = EventMetricsLastSuccessAgeSeconds
 
@@ -144,56 +106,29 @@ var (
 )
 
 // publishOutcomes is the complete vocabulary of the "outcome" attribute carried by
-// EventPublishAttemptsTotal and EventPublishDuration, matching the documented
-// attribute list on their declarations in metrics.go.
+// EventPublishAttemptsTotal and EventPublishDuration, matching the documented attribute
+// list on their declarations in metrics.go.
 //
-// Note the UNDERSCORE in dead_lettered. Surrounding prose spells the concept
-// "dead-lettered" with a hyphen; that is not the attribute value, and a metric
-// consumer filtering on the hyphenated spelling would match nothing.
-//
-// The vocabulary is THREE values. "failed" is NOT one of them: a fourth outcome once
-// carried "this attempt will not be retried", and it was removed because it widened
-// the three-value publish-status vocabulary that model.PublishStatus, the API
-// responses and docs/event-streaming.md all state. That fact is now reported on the
-// separate `terminal` dimension below, so the three values remain mutually exclusive
-// and exhaustive and their sum is still the total number of attempted writes.
-//
-// Spelled as literals deliberately: this test file stays as dependency-free as the
-// package it covers, so it does not import the model package merely to obtain three
-// strings.
+// Note the UNDERSCORE in dead_lettered.
 var publishOutcomes = []string{"dispatched", "retrying", "dead_lettered"}
 
 // publishTerminalValues is the closed domain of the "terminal" attribute that
 // accompanies the outcome on EventPublishAttemptsTotal.
 //
 // It exists because the outcome vocabulary is frozen at three values, which makes a
-// failure that will be retried and one that never will BOTH outcome="retrying". This
-// dimension is what keeps "how many events are actually stuck" answerable —
-// {outcome="retrying",terminal="true"} — and it is the reason the attempts counter's
-// series count is the PRODUCT of two domains rather than the outcome domain alone.
-//
-// Two literals and no more. The values are the strings the publisher emits, not Go
-// bools rendered by fmt, so that a query written against the exporter matches.
+// failure that will be retried and one that never will BOTH outcome="retrying".
 var publishTerminalValues = []string{"true", "false"}
 
 // maxRelayRetryAttempts is the relay's attempt budget CEILING
 // (config.MaxRelayRetryAttempts, which RELAY_MAX_RETRY_ATTEMPTS is clamped to),
-// bounding the numeric values the "attempt" attribute can take: 1 through 5
-// inclusive, rendered as strings. Mirrored as a literal for the same reason as
-// publishOutcomes — this package reads no configuration, and neither does its test.
+// bounding the numeric values the "attempt" attribute can take: 1 through 5 inclusive,
+// rendered as strings. Mirrored as a literal for the same reason as publishOutcomes —
+// this package reads no configuration, and neither does its test.
 const maxRelayRetryAttempts = 5
 
-// publishAttemptLabels is the COMPLETE, closed domain of the "attempt" attribute:
-// the five numeric attempts, one overflow bucket, and one fixed token for each of the
-// two publishes that are not part of a retry sequence.
-//
-// The domain has to be closed because this attribute is carried by a histogram, whose
-// series count is its label cardinality multiplied by its bucket count. "over" is what
-// a row whose per-row max_attempts was raised directly in the database collapses into,
-// and "replay" and "dead_letter" keep operator-triggered replays and dead-letter writes
-// out of the attempt="1" population the latency target is read from — rather than
-// extending the numeric domain past the budget, which is what an attempt-count label
-// on a replay would do.
+// publishAttemptLabels is the COMPLETE, closed domain of the "attempt" attribute: the
+// five numeric attempts, one overflow bucket, and one fixed token for each of the two
+// publishes that are not part of a retry sequence.
 var publishAttemptLabels = []string{"1", "2", "3", "4", "5", "over", "replay", "dead_letter"}
 
 // namedInstrument pairs an instrument with the name of the variable holding it, so
@@ -207,22 +142,7 @@ type namedInstrument struct {
 // eventStreamingInstruments returns EVERY instrument added for the Kafka
 // event-publishing pipeline, each labelled with its variable name.
 //
-// It is exhaustive by intent, and the count is deliberately not stated in this comment: a
-// number here would go stale the first time an instrument was added, and the assertions that
-// matter — that every declared instrument is assigned in Init() and exported under the name an
-// alert rule matches — are only true if this list is complete. An instrument omitted here is one
-// nothing checks, which is the exact failure mode the event pipeline has already hit twice:
-// gauges declared, initialised and never recorded, leaving a rule permanently inactive with
-// healthy-looking rule health.
-//
-// This is a FUNCTION and not a package-level table for a load-bearing reason. Go
-// initialises every package-level variable before it runs any init() function, and
-// metrics.go declares its instruments with no initialiser — they are assigned
-// inside Init(), which init() calls. A package-level table would therefore capture
-// the pre-init() zero values and freeze nil into the fixtures, making every
-// non-nil assertion either fail spuriously or assert nothing at all. Reading the
-// variables inside a function body defers the read until the test runs, which is
-// after all package initialisation has completed.
+// This is a FUNCTION and not a package-level table for a load-bearing reason.
 func eventStreamingInstruments() []namedInstrument {
 	return []namedInstrument{
 		{"EventsPublishedTotal", EventsPublishedTotal},
@@ -263,25 +183,14 @@ func eventStreamingInstruments() []namedInstrument {
 	}
 }
 
-// There are no subscriber-record-delivery instruments in this inventory, and their absence
-// is the access model rather than an omission.
-//
-// SubscriberStreamRecordsDelivered and SubscriberStreamRecordsWithheld were declared for a
-// Blnk-hosted subscriber read path and are removed with it. Blnk serves no subscriber records
-// — there is no data-plane route under /subscribers — so no per-record counter it could
-// increment exists. A key-scoped subscriber's records are delivered by the key-authorising
-// component the deployment declares in front of the brokers, and per-record evidence that
-// the boundary filtered anything has to come from THAT component's own instrumentation.
-// docs/kafka-operations.md says so where the triage table used to read these two series.
+// There are no subscriber-record-delivery instruments in this inventory, and their
+// absence is the access model rather than an omission.
 
 // preExistingInstruments returns the sixteen instruments that predate the
-// event-streaming work, each labelled with its variable name. Enumerated
-// exhaustively so that a new assignment block spliced into the wrong place in
-// Init() — above an existing block's early return, say — cannot silently orphan an
-// instrument that used to work.
+// event-streaming work, each labelled with its variable name.
 //
-// See eventStreamingInstruments for why this is a function rather than a
-// package-level table.
+// See eventStreamingInstruments for why this is a function rather than a package-level
+// table.
 func preExistingInstruments() []namedInstrument {
 	return []namedInstrument{
 		{"TransactionTotal", TransactionTotal},
@@ -303,55 +212,30 @@ func preExistingInstruments() []namedInstrument {
 	}
 }
 
-// TestInit_ReturnsNilForEveryInstrument asserts that Init() walks its whole
-// assignment chain — every instrument, the sixteen that predate the event pipeline and
-// every event-streaming addition — without the meter refusing to build one.
-//
-// Init() has ALREADY run once, from the package's own init(), before this function
-// was reached. Calling it a second time here is intentional and is not a bug:
-// Init() keeps no state of its own and only re-assigns the package-level instrument
-// variables from the same meter, so it is idempotent by construction. A repeat call
-// produces an equivalent set of instruments and cannot leave the package in a worse
-// state than it found it, which is also why no other test in this file depends on
-// whether this one has run.
-//
-// What a nil error does and does not prove: it proves the chain completed and every
-// variable was assigned, because Init() returns early on the first failure. It does
-// not prove the names survive a real SDK meter's validation — that is checked
-// out-of-process against the live /metrics endpoint, for the reason given in the
-// scope note at the top of this file.
+// TestInit_ReturnsNilForEveryInstrument asserts that Init() walks its whole assignment
+// chain — every instrument, the sixteen that predate the event pipeline and every
+// event-streaming addition — without the meter refusing to build one.
 func TestInit_ReturnsNilForEveryInstrument(t *testing.T) {
-	// The meter is the source of every instrument, so a nil meter would make the
-	// rest of this test meaningless. Reachable only because these tests live in
-	// package metrics rather than metrics_test.
+	// The meter is the source of every instrument, so a nil meter would make the rest of
+	// this test meaningless. Reachable only because these tests live in package metrics
+	// rather than metrics_test.
 	require.NotNil(t, meter, "the package meter must be constructed before Init runs")
 
 	require.NoError(t, Init(),
 		"Init must build every instrument without the meter rejecting one; a non-nil error here is fatal at import and would kill any process importing this package")
 
-	// A nil error is necessary but not sufficient. Init() returns on the FIRST
-	// error, so an assignment block that was never written at all also yields nil.
-	// Re-reading the variables after the call proves each one was genuinely
-	// assigned rather than merely not-failing.
+	// A nil error is necessary but not sufficient. Init() returns on the FIRST error, so
+	// an assignment block that was never written at all also yields nil.
 	for _, instrument := range append(eventStreamingInstruments(), preExistingInstruments()...) {
 		assert.NotNil(t, instrument.value,
 			"%s returned from Init nil: its declaration has no matching assignment block", instrument.name)
 	}
 }
 
-// TestEventStreamingInstruments_AreNonNilAfterPackageLoad asserts that importing
-// this package is by itself enough to leave EVERY event-streaming instrument
-// usable.
+// TestEventStreamingInstruments_AreNonNilAfterPackageLoad asserts that importing this
+// package is by itself enough to leave EVERY event-streaming instrument usable.
 //
-// This test deliberately does NOT call Init(). Its entire subject is the state the
-// package reaches on its own, through init(), at import time — which is the state
-// every production call site actually observes, because nothing in the codebase
-// calls Init() a second time. A nil here means the declaration in metrics.go has no
-// matching assignment block in Init(): an orphaned declaration that the compiler
-// accepts happily and that becomes a nil-interface panic at the first call site.
-//
-// Reaching this function at all is itself the proof that init() did not
-// log.Fatalf, since a fatal at load aborts the test binary before any test runs.
+// This test deliberately does NOT call Init().
 func TestEventStreamingInstruments_AreNonNilAfterPackageLoad(t *testing.T) {
 	for _, instrument := range eventStreamingInstruments() {
 		t.Run(instrument.name, func(t *testing.T) {
@@ -361,16 +245,9 @@ func TestEventStreamingInstruments_AreNonNilAfterPackageLoad(t *testing.T) {
 	}
 }
 
-// TestPreExistingInstruments_RemainNonNilAfterEventStreamingAppend asserts that
-// the event-streaming additions did not disturb any of the sixteen
-// instruments that came before them.
-//
-// Init() is a single linear chain of assignments, each followed by an early return
-// on error. Appending to that chain is safe; splicing into the middle of it is not,
-// and an assignment block accidentally placed inside another block's error branch —
-// or a declaration left behind when its block moved — orphans an instrument that
-// used to work. Nothing else in the build catches that, so all sixteen are
-// enumerated by name here.
+// TestPreExistingInstruments_RemainNonNilAfterEventStreamingAppend asserts that the
+// event-streaming additions did not disturb any of the sixteen instruments that came
+// before them.
 func TestPreExistingInstruments_RemainNonNilAfterEventStreamingAppend(t *testing.T) {
 	instruments := preExistingInstruments()
 	require.Len(t, instruments, 16,
@@ -385,16 +262,10 @@ func TestPreExistingInstruments_RemainNonNilAfterEventStreamingAppend(t *testing
 }
 
 // TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType makes the
-// instrument-kind table readable and executable, and checks it one level deeper
-// than the compile-time guards above do.
+// instrument-kind table readable and executable, and checks it one level deeper than
+// the compile-time guards above do.
 //
-// The guards check the DECLARED static type. This test checks the DYNAMIC type the
-// meter actually handed back, and labels each check with the variable name so a
-// failure points straight at the offending declaration instead of at a build error
-// on a blank identifier. Both matter: a counter recorded as a gauge produces a
-// series that looks plausible and is arithmetically meaningless, and neither
-// alerting rule in the event pipeline — dead-letter age and consumer lag — survives
-// its gauge being built as anything else.
+// The guards check the DECLARED static type.
 func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *testing.T) {
 	tests := []struct {
 		name string
@@ -516,18 +387,8 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 // TestEventStreamingInstruments_RecordWithoutPanic drives one representative
 // measurement through every event-streaming instrument.
 //
-// Each call reproduces the shape the production call sites use — an attributed
-// Add for counters (as in queue.go), an attributed Record for the histogram (as in
-// cmd/workers.go), and a bare Record for the unattributed gauge (as in
-// chain_worker.go) — so the intended attribute KEYS for each instrument are
-// documented in executable form and drift from them shows up as a test edit rather
-// than as a quietly relabelled series.
-//
 // Recording is expected to be safe here: with no global MeterProvider installed the
 // instruments are delegating no-ops whose Add and Record are nil-delegate guarded.
-// That makes NotPanics a real assertion rather than a formality — it fails loudly
-// if an instrument is nil, which is the state an orphaned declaration leaves behind
-// and the exact failure a production call site would hit.
 func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 	ctx := context.Background()
 
@@ -543,8 +404,8 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 	t.Run("EventBrokerAcknowledgementsTotal", func(t *testing.T) {
 		require.NotPanics(t, func() {
 			// The purpose attribute is what keeps a replay and a dead-letter write separable
-			// from a first delivery here, since unlike EventsPublishedTotal this counter
-			// records every acknowledgement the broker gave.
+			// from a first delivery here, since unlike EventsPublishedTotal this counter records
+			// every acknowledgement the broker gave.
 			EventBrokerAcknowledgementsTotal.Add(ctx, 1, metric.WithAttributes(
 				attribute.String("topic", "blnk.transactions"),
 				attribute.String("event_type", "transaction.applied"),
@@ -572,10 +433,10 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 
 	t.Run("EventCaptureToDispatchDuration", func(t *testing.T) {
 		require.NotPanics(t, func() {
-			// 1.75 seconds: an event that waited for a poll tick and then published,
-			// which is the shape this instrument exists to measure and the per-write
-			// histogram above cannot see. No outcome attribute — only an acknowledged
-			// publish has an end-to-end age at all.
+			// 1.75 seconds: an event that waited for a poll tick and then published, which is
+			// the shape this instrument exists to measure and the per-write histogram above
+			// cannot see. No outcome attribute — only an acknowledged publish has an end-to-end
+			// age at all.
 			EventCaptureToDispatchDuration.Record(ctx, 1.75, metric.WithAttributes(
 				attribute.String("topic", "blnk.transactions"),
 				attribute.String("attempt", "1"),
@@ -585,10 +446,9 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 
 	t.Run("EventsDeadLetteredTotal", func(t *testing.T) {
 		require.NotPanics(t, func() {
-			// The topic attribute deliberately carries the ORIGINAL category
-			// topic rather than its .dlt sibling, so this counter stays directly
-			// comparable with EventsPublishedTotal and their ratio is the
-			// dead-letter rate.
+			// The topic attribute deliberately carries the ORIGINAL category topic rather than
+			// its .dlt sibling, so this counter stays directly comparable with
+			// EventsPublishedTotal and their ratio is the dead-letter rate.
 			EventsDeadLetteredTotal.Add(ctx, 1, metric.WithAttributes(
 				attribute.String("topic", "blnk.transactions"),
 				attribute.String("event_type", "transaction.applied"),
@@ -598,10 +458,9 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 
 	t.Run("DLTOldestMessageAgeSeconds", func(t *testing.T) {
 		require.NotPanics(t, func() {
-			// This gauge measures a message sitting ON a dead-letter topic, so
-			// here the topic attribute is the .dlt name. 930 seconds is just past
-			// the 900-second alerting threshold, which is the value that matters
-			// operationally.
+			// This gauge measures a message sitting ON a dead-letter topic, so here the topic
+			// attribute is the .dlt name. 930 seconds is just past the 900-second alerting
+			// threshold, which is the value that matters operationally.
 			DLTOldestMessageAgeSeconds.Record(ctx, 930, metric.WithAttributes(
 				attribute.String("topic", "blnk.transactions.dlt"),
 			))
@@ -609,11 +468,10 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 	})
 
 	t.Run("the asynchronous lag gauges", func(t *testing.T) {
-		// These two are OBSERVABLE, so there is no Record to drive. The equivalent
-		// operation is publishing an inventory and letting the registered callback
-		// observe it, which is what this exercises: 10001 messages is just past the
-		// 10000-message alerting threshold, and the second sample is the incomplete
-		// case whose lag must be withheld.
+		// These two are OBSERVABLE, so there is no Record to drive. The equivalent operation
+		// is publishing an inventory and letting the registered callback observe it, which is
+		// what this exercises: 10001 messages is just past the 10000-message alerting
+		// threshold, and the second sample is the incomplete case whose lag must be withheld.
 		require.NotPanics(t, func() {
 			PublishConsumerLagInventory([]ConsumerLagSample{
 				{
@@ -637,9 +495,9 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 			require.NoError(t, observeConsumerLagInventory(ctx, observer))
 
 			// THE WITHHOLDING CONTRACT, asserted at the layer that decides it. Both samples
-			// contribute an unmeasured-partition reading, and only the complete one
-			// contributes a lag — because a partial sum is a lower bound and exporting it
-			// would resolve the >10000 alert with a figure known to be too small.
+			// contribute an unmeasured-partition reading, and only the complete one contributes
+			// a lag — because a partial sum is a lower bound and exporting it would resolve the
+			// >10000 alert with a figure known to be too small.
 			assert.Equal(t, []int64{10001}, observer.int64For(SubscriberConsumerLag),
 				"only the completely measured topic may export a lag")
 			assert.Equal(t, []int64{0, 2}, observer.int64For(ConsumerLagUnmeasuredPartitions),
@@ -651,28 +509,27 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 
 	t.Run("OutboxPendingBacklog", func(t *testing.T) {
 		require.NotPanics(t, func() {
-			// Unattributed by design: the relay's backlog is a single global
-			// number, recorded exactly the way chain_worker.go records
-			// ChainBacklog.
+			// Unattributed by design: the relay's backlog is a single global number, recorded
+			// exactly the way chain_worker.go records ChainBacklog.
 			OutboxPendingBacklog.Record(ctx, 42)
 		})
 	})
 
 	t.Run("EventsPurgedTotal", func(t *testing.T) {
 		require.NotPanics(t, func() {
-			// Unattributed, matching event_retention.go: the sweep reports how many rows
-			// it deleted, and it deletes across every topic in one pass, so there is no
-			// per-topic number to attribute.
+			// Unattributed, matching event_retention.go: the sweep reports how many rows it
+			// deleted, and it deletes across every topic in one pass, so there is no per-topic
+			// number to attribute.
 			EventsPurgedTotal.Add(ctx, 5)
 		})
 	})
 
 	t.Run("the revocation backlog gauges", func(t *testing.T) {
 		require.NotPanics(t, func() {
-			// Both unattributed, matching event_metrics.go: the backlog is a single
-			// global pair, and attributing it per subscriber would publish a series per
-			// subscriber ever revoked — unbounded cardinality for a number whose only
-			// consumer is one alert threshold.
+			// Both unattributed, matching event_metrics.go: the backlog is a single global pair,
+			// and attributing it per subscriber would publish a series per subscriber ever
+			// revoked — unbounded cardinality for a number whose only consumer is one alert
+			// threshold.
 			SubscriberRevocationsPending.Record(ctx, 4)
 			OldestSubscriberRevocationAgeSeconds.Record(ctx, 7200)
 		})
@@ -681,12 +538,6 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 
 // TestPublishConsumerLagInventory_ReplacesRatherThanMerges pins the property the whole
 // cardinality fix rests on.
-//
-// A merging publication would reproduce the exact defect the asynchronous gauges were adopted
-// to remove: series would accumulate across ticks and the count would become the union of every
-// inventory the process had ever seen. REPLACEMENT is what makes the exported series set equal
-// to the current one, and it is why the collector must pass its whole measured set on every tick
-// rather than a delta.
 func TestPublishConsumerLagInventory_ReplacesRatherThanMerges(t *testing.T) {
 	t.Cleanup(func() { PublishConsumerLagInventory(nil) })
 
@@ -777,19 +628,8 @@ func TestPublishConsumerLagInventory_ReplacesRatherThanMerges(t *testing.T) {
 // TestEventPublishAttemptsTotal_AcceptsEveryPublishOutcome records one attempt per
 // value of the "outcome" attribute vocabulary.
 //
-// The point is not that the no-op instrument tolerates arbitrary strings — it
-// tolerates anything — but that the vocabulary is pinned in one place, in the same
-// spelling the relay emits and the alerting rules filter on. dead_lettered in
-// particular is easy to get wrong: the hyphenated "dead-lettered" reads more
-// naturally in prose and matches nothing at query time.
-//
-// The vocabulary is THREE values, and the accompanying `terminal` dimension is what
-// carries the fourth fact the retired outcome used to carry. Both domains are pinned
-// together here, because they are only meaningful as a pair: a failure that will be
-// retried and one that never will are different operational states, and after the
-// fourth outcome was removed the ONLY thing distinguishing them is `terminal`. Any
-// change to either list is a change to a published attribute domain and has to be made
-// deliberately here, on the instrument's declaration, and in anything querying it.
+// The vocabulary is THREE values, and the accompanying `terminal` dimension carries the
+// fourth fact: whether any further attempt is possible.
 func TestEventPublishAttemptsTotal_AcceptsEveryPublishOutcome(t *testing.T) {
 	ctx := context.Background()
 
@@ -819,14 +659,11 @@ func TestEventPublishAttemptsTotal_AcceptsEveryPublishOutcome(t *testing.T) {
 	}
 }
 
-// TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget records a duration
-// for every attempt number the relay's retry budget can produce.
+// TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget records a duration for
+// every attempt number the relay's retry budget can produce.
 //
-// The attempt attribute carries the attempt NUMBER as a string, which is what lets
-// a p99 latency query exclude retried publishes by filtering attempt="1" — the
-// distinction the throughput-and-latency acceptance criterion is stated in terms
-// of. Every value from the first attempt through the budget's last must therefore
-// be a legal label.
+// The attempt attribute carries the attempt NUMBER as a string, which is what lets a
+// p99 latency query exclude retried publishes by filtering attempt="1".
 func TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget(t *testing.T) {
 	ctx := context.Background()
 
@@ -834,13 +671,12 @@ func TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget(t *testing.T) 
 		label := strconv.Itoa(attempt)
 		t.Run("attempt="+label, func(t *testing.T) {
 			require.NotPanics(t, func() {
-				// The WHOLE declared tuple, outcome included, even though this test asserts
-				// only that the attempt label is legal. Recording a subset would put a series
-				// with two of the instrument's three keys into the process, and once a
-				// MeterProvider is installed — which the tests below the SDK line do, once, for
-				// the lifetime of the binary — that series is a second, off-contract shape of
-				// an instrument whose attribute keys are a published contract. It is also what
-				// the exported-attribute-keys assertion used to trip over.
+				// The WHOLE declared tuple, outcome included, even though this test asserts only
+				// that the attempt label is legal. Recording a subset would put a series with two
+				// of the instrument's three keys into the process, and once a MeterProvider is
+				// installed — which the tests below the SDK line do, once, for the lifetime of the
+				// binary — that series is a second, off-contract shape of an instrument whose
+				// attribute keys are a published contract.
 				EventPublishDuration.Record(ctx, float64(attempt)*0.25, metric.WithAttributes(
 					attribute.String("topic", "blnk.transactions"),
 					attribute.String("attempt", label),
@@ -854,11 +690,7 @@ func TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget(t *testing.T) 
 // TestDLTOldestMessageAgeSeconds_AcceptsZeroWhenDeadLetterTopicIsEmpty asserts that
 // zero is a legal recorded value for the dead-letter age gauge.
 //
-// This is not a redundant edge case. An age gauge that is only ever written when a
-// dead-lettered message exists would keep reporting its last non-zero reading after
-// the queue drained, and the 900-second alert would stay latched on a backlog that
-// no longer exists. Returning the gauge to zero on an empty dead-letter topic is
-// what clears the alert, so zero has to round-trip.
+// This is not a redundant edge case.
 func TestDLTOldestMessageAgeSeconds_AcceptsZeroWhenDeadLetterTopicIsEmpty(t *testing.T) {
 	ctx := context.Background()
 
@@ -882,72 +714,21 @@ func TestOutboxPendingBacklog_AcceptsZeroWhenOutboxIsDrained(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Exported-contract assertions, made against a real SDK reader
-//
-// Everything above this line runs against the no-op instruments a process gets
-// when no MeterProvider is installed, and that is all those tests can do: a
-// delegating no-op discards its measurements and exposes no descriptor, so
-// "does not panic" is the strongest statement available. It is not enough for
-// the properties an alert or a latency query actually depends on — the metric
-// NAME the exporter publishes, the UNIT it publishes it in, the explicit
-// BUCKET BOUNDARIES that decide whether a p99 near two seconds is measurable
-// at all, and the ATTRIBUTE KEYS the alert annotations interpolate. A rename,
-// a unit slip, or a silent fall back to OTel's millisecond-scale default
-// buckets would leave every test above passing.
-//
-// The tests below therefore install a real SDK MeterProvider backed by a
-// manual reader, re-run Init() so the instruments are constructed through it,
-// record one representative measurement per instrument, collect, and assert on
-// the collected metricdata. That is the same path the Prometheus exporter
-// takes, so what is asserted here is what is exported.
-//
-// Global-state note: otel.SetMeterProvider delegates the package's meter
-// permanently — the delegation is a sync.Once — so it is done exactly once, in
-// installSDKReader, and the tests that share it are strictly serial (no
-// t.Parallel anywhere in this file). Delegation is harmless to the tests above:
-// their measurements simply land in a reader nobody collects.
 // ---------------------------------------------------------------------------
 
 // sharedReader and installOnce back installSDKReader.
 //
-// They are package-level and guarded by a sync.Once because the installation CANNOT be
-// repeated: otel delegates the global meter to the first provider set and does so under
-// its own sync.Once, so a second provider installed by a second test would never receive
-// this package's measurements — the meter stays bound to the first. Installing per test
-// therefore does not isolate the tests, it silently blinds all but the first of them.
-// One installation, shared, with the tests kept serial, is the only arrangement that
-// works.
-//
-// The provider is deliberately never shut down. A shut-down provider drops
-// measurements while the meter remains delegated to it, which would leave every
-// subsequent test collecting an empty snapshot.
+// The provider is deliberately never shut down.
 var (
 	sharedReader *sdkmetric.ManualReader
 	installOnce  sync.Once
 )
 
-// perTestTemporality makes the shared reader report DELTA sums and histograms and cumulative
-// gauges.
-//
-// # Why the shared reader cannot be cumulative
+// perTestTemporality makes the shared reader report DELTA sums and histograms and
+// cumulative gauges.
 //
 // A shared reader is forced on this file by the once-only meter delegation above, and a
-// CUMULATIVE one accumulates for the lifetime of the process. Every assertion of the form "this
-// measurement landed in exactly one bucket" therefore held only on the FIRST iteration:
-// `go test -count=2` doubled the bucket counts and the file failed with `expected: 0x1, actual:
-// 0x2`, and `-count=3` tripled them. Scoping a data point by a topic value of the test's own —
-// which these tests already did — separates them from EACH OTHER but not from the previous
-// iteration of THEMSELVES, so it could not fix this.
-//
-// Delta resets the accumulation on every collect and drops the series that had no measurements
-// in the interval, which combined with the drain in installSDKReader gives each test a
-// collection containing exactly what that test recorded. That is repeat-safe and
-// order-independent by construction rather than by convention.
-//
-// # Why gauges stay cumulative
-//
-// A gauge reports a LAST VALUE, and delta would retire it from the collection as soon as it had
-// been read once. The descriptor and attribute-key assertions need the gauge present, and its
-// value is not an accumulation, so there is nothing for delta to fix.
+// CUMULATIVE one accumulates for the lifetime of the process.
 func perTestTemporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
 	switch kind {
 	case sdkmetric.InstrumentKindCounter,
@@ -960,27 +741,8 @@ func perTestTemporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
 }
 
 // installSDKReader returns the shared SDK-backed manual reader, installing the provider
-// and rebuilding every instrument through it on first use, and DRAINING whatever was recorded
-// before this test began.
-//
-// Init() is called AFTER the provider is installed, which is what makes the instruments
-// real SDK instruments rather than delegating no-ops: an instrument created before
-// delegation replays its creation, but creating it afterwards is direct and leaves no room
-// for the replay to lose an option — and the option that matters most here, the explicit
-// bucket boundaries, is exactly the kind of thing a replay could drop.
-//
-// # The drain is the isolation
-//
-// Every test above the SDK line records measurements too, and once the provider is installed
-// those land in this reader as well — TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget
-// in particular records the publish-duration histogram with only two of its three attribute
-// keys. From the second iteration onwards, or under any -shuffle order that ran it later, those
-// measurements were still in the reader when a contract assertion collected, and a test reading
-// "the exported attribute keys" could pick up that shape instead of its own.
-//
-// Discarding one collection here draws a line: everything before this test is gone, so the next
-// collection holds this test's measurements and nothing else. Combined with delta temporality
-// above, that makes the file idempotent across iterations.
+// and rebuilding every instrument through it on first use, and DRAINING whatever was
+// recorded before this test began.
 //
 // Returns:
 //   - *sdkmetric.ManualReader: the reader to collect from, drained.
@@ -1007,14 +769,8 @@ func installSDKReader(t *testing.T) *sdkmetric.ManualReader {
 // capturingObserver is a metric.Observer that keeps what a callback observed, so the
 // asynchronous gauges' contract can be asserted without an SDK.
 //
-// It is the asynchronous counterpart of a fake instrument: an observable gauge has no Record
-// to intercept, so the interception point is the OBSERVER the callback is handed. What matters
-// operationally is not only the values but WHICH instrument received them — a sample whose lag
-// is withheld still observes its unmeasured-partition count — and that is a distinction only an
-// observer-level capture can make.
-//
-// embedded.Observer is embedded, not implemented: that is how the OpenTelemetry API intends
-// third-party implementations of its interfaces to be written.
+// embedded.Observer is embedded, not implemented: that is how the OpenTelemetry API
+// intends third-party implementations of its interfaces to be written.
 type capturingObserver struct {
 	embedded.Observer
 
@@ -1068,12 +824,7 @@ func (o *capturingObserver) int64For(instrument metric.Int64Observable) []int64 
 }
 
 // recordEveryEventInstrument drives one representative measurement through each of the
-// event-streaming instruments, using the attribute keys their declarations
-// document.
-//
-// It exists so the descriptor assertions below have something to collect: the SDK
-// reports a metric only once it has a data point, so an instrument that is never
-// recorded is indistinguishable from one that was never declared.
+// event-streaming instruments, using the attribute keys their declarations document.
 func recordEveryEventInstrument(ctx context.Context) {
 	EventsPublishedTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("topic", "blnk.transactions"),
@@ -1109,10 +860,10 @@ func recordEveryEventInstrument(ctx context.Context) {
 	DLTOldestMessageAgeSeconds.Record(ctx, 901, metric.WithAttributes(
 		attribute.String("topic", "blnk.transactions.dlt"),
 	))
-	// The two lag gauges are ASYNCHRONOUS: publishing the inventory is the measurement, and
-	// the registered callback observes it when the reader collects. Both instruments are fed
-	// from this one sample, so a single complete entry produces a lag point and a zero
-	// unmeasured-partition point.
+	// The two lag gauges are ASYNCHRONOUS: publishing the inventory is the measurement,
+	// and the registered callback observes it when the reader collects. Both instruments
+	// are fed from this one sample, so a single complete entry produces a lag point and a
+	// zero unmeasured-partition point.
 	PublishConsumerLagInventory([]ConsumerLagSample{{
 		Subscriber:  "sub_0f6e2c8a",
 		Group:       "blnk-grp-0f6e2c8a1b944106b4d6793e838afcbf",
@@ -1123,9 +874,9 @@ func recordEveryEventInstrument(ctx context.Context) {
 
 	OutboxPendingBacklog.Record(ctx, 7)
 
-	// The three REPAIR instruments, recorded under BOTH legs because the attribute domain is
-	// closed at two and the assertions below read the exported key set. Recording one leg would
-	// let the other's spelling drift.
+	// The three REPAIR instruments, recorded under BOTH legs because the attribute domain
+	// is closed at two and the assertions below read the exported key set. Recording one
+	// leg would let the other's spelling drift.
 	for _, leg := range []string{"dead_letter", "legacy_webhook"} {
 		attributes := metric.WithAttributes(attribute.String("leg", leg))
 		EventRepairBacklog.Record(ctx, 12, attributes)
@@ -1138,18 +889,18 @@ func recordEveryEventInstrument(ctx context.Context) {
 	SubscriberRevocationsPending.Record(ctx, 2)
 	OldestSubscriberRevocationAgeSeconds.Record(ctx, 3601)
 
-	// The four settlement gauges are recorded together because they are published together, as
-	// one reading of one aggregate. Recording only some of them here would let a rename of the
-	// others past the descriptor assertions below.
+	// The four settlement gauges are recorded together because they are published
+	// together, as one reading of one aggregate. Recording only some of them here would
+	// let a rename of the others past the descriptor assertions below.
 	SubscriberSettlementOutstanding.Record(ctx, 3)
 	SubscriberGrantReconcilePending.Record(ctx, 2)
 	SubscriberCredentialCleanupPending.Record(ctx, 2)
 	OldestSubscriberSettlementAgeSeconds.Record(ctx, 3601)
 	SubscriberObligationsSettledTotal.Add(ctx, 5)
 
-	// The credential-orphan and revocation-failure pairs. Each is a marker plus the age the
-	// age-based alert is stated over, so both halves are recorded together: a rename of the age
-	// alone would otherwise slip past the descriptor assertions.
+	// The credential-orphan and revocation-failure pairs. Each is a marker plus the age
+	// the age-based alert is stated over, so both halves are recorded together: a rename
+	// of the age alone would otherwise slip past the descriptor assertions.
 	SubscriberCredentialOrphans.Record(ctx, 1)
 	OldestSubscriberCredentialOrphanAgeSeconds.Record(ctx, 3601)
 	SubscriberRevocationFailures.Record(ctx, 1)
@@ -1168,10 +919,10 @@ func recordEveryEventInstrument(ctx context.Context) {
 	SubscriberLagPassAgeSeconds.Record(ctx, 12)
 	SubscriberLagCoveredSubscribers.Record(ctx, 2)
 
-	// The collector's own health. The counter is synchronous; the two ages are ASYNCHRONOUS and
-	// are published by observeEventMetricsCollectionAges, which returns nothing at all until a
-	// collection has been recorded — so this call is what makes those two series exist for the
-	// descriptor and series-name assertions to find.
+	// The collector's own health. The counter is synchronous; the two ages are
+	// ASYNCHRONOUS and are published by observeEventMetricsCollectionAges, which returns
+	// nothing at all until a collection has been recorded — so this call is what makes
+	// those two series exist for the descriptor and series-name assertions to find.
 	EventMetricsCollectionFailuresTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("collection", "outbox_backlog"),
 	))
@@ -1205,15 +956,7 @@ func collectScopeMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[strin
 // TestEventStreamingInstruments_ExportedDescriptors asserts the name, description and
 // unit of every event-streaming instrument as the exporter sees them.
 //
-// The names are the load-bearing part. Alert rules and dashboards reference the
-// PROMETHEUS forms of these names — dots become underscores and the unit suffix is
-// appended — so alerts/blnk-kafka-alerts.yml matching on
-// blnk_dlt_oldest_message_age_seconds and blnk_kafka_consumer_lag depends on the OTel
-// names below being exactly what they are. A rename here does not fail a build and does
-// not fail promtool; it silently makes the rule evaluate against nothing, which cannot
-// fire and cannot be distinguished from "no problem". The units matter for the same
-// reason: the Prometheus exporter derives a series suffix from them, so a unit change is
-// a rename.
+// The names are the load-bearing part.
 func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 	reader := installSDKReader(t)
 	recordEveryEventInstrument(context.Background())
@@ -1227,13 +970,6 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 		{
 			// UNIT {event}, NOT {write}, and the description says events. The unit is part of
 			// the exported name, so this pairing is a published contract.
-			//
-			// The increment is on the token-fenced transition that records the Kafka leg, NOT on
-			// the broker acknowledgement — so a republish after a crash cannot count one event
-			// twice, and this stays the per-event measure the V-1 throughput verdict and the
-			// V-3 dead-letter rate are read from. The write-side signal has its own instrument
-			// two entries below; it once shared this one, and the description promised a
-			// contract the increment did not keep.
 			name: "blnk.events.published.total",
 			unit: "{event}",
 			description: "Total original ledger events whose Kafka leg is durably recorded, " +
@@ -1243,8 +979,7 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			// ALSO PER-EVENT, and deliberately not a second opinion on the row above. This one
 			// is incremented at the terminal dispatched state, which for a row still owing a
 			// legacy webhook happens on a later pass — so it answers "how many events are
-			// completely settled" rather than "how many are on their topic". The two converge
-			// at the sunset, when the webhook_pending state is removed.
+			// completely settled" rather than "how many are on their topic".
 			name: "blnk.events.dispatched.total",
 			unit: "{event}",
 			description: "Total ledger events whose delivery is durably recorded, counted once " +
@@ -1253,9 +988,7 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 		{
 			// THE WRITE-SIDE SIGNAL, and the unit says so: {write}, not {event}. It counts what
 			// the broker accepted, for EVERY purpose — original, replay, dead-letter — so a
-			// republished event is counted again, which is the whole point. The gap between it
-			// and published.total is rows that reached Kafka and could not be marked, which is
-			// the leading indicator of duplicate delivery.
+			// republished event is counted again, which is the whole point.
 			name:        "blnk.events.broker_acknowledgements.total",
 			unit:        "{write}",
 			description: "Total event publishes acknowledged by the broker, by topic, event type and purpose",
@@ -1266,21 +999,20 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			description: "Total number of event publish attempts by outcome, retries included",
 		},
 		{
-			// THE CLAIM is the start of this interval, and the description says so. It is
-			// the broker write in relative isolation, which is the useful thing for it to
-			// be: subtracted from the end-to-end figure below, the difference is the queue
-			// wait, and that is what distinguishes a slow cluster from an under-provisioned
-			// relay. Either instrument alone sends an operator to the wrong system.
+			// THE CLAIM is the start of this interval, and the description says so. It is the
+			// broker write in relative isolation, which is the useful thing for it to be:
+			// subtracted from the end-to-end figure below, the difference is the queue wait, and
+			// that is what distinguishes a slow cluster from an under-provisioned relay.
 			name:        "blnk.events.publish.duration",
 			unit:        "s",
 			description: "Duration of a single event publish attempt, from outbox claim to broker acknowledgement",
 		},
 		{
-			// THE ACCEPTANCE CRITERION IS READ FROM THIS ONE. V-1 is stated over
-			// "outbox-to-Kafka publish latency", and only this instrument starts its clock
-			// at the durable capture: timing from the claim excludes the poll delay and the
-			// backlog, so a relay an hour behind would report the same sub-second p99 as an
-			// idle one and would certify a target the system was missing.
+			// THE PUBLISH-LATENCY OBJECTIVE IS READ FROM THIS ONE. It is stated over
+			// "outbox-to-Kafka publish latency", and only this instrument starts its clock at
+			// the durable capture: timing from the claim excludes the poll delay and the
+			// backlog, so a relay an hour behind would report the same sub-second p99 as an idle
+			// one and would certify a target the system was missing.
 			name:        "blnk.events.capture_to_dispatch.duration",
 			unit:        "s",
 			description: "End-to-end age of a published event, from its capture in the transactional outbox to broker acknowledgement",
@@ -1409,8 +1141,8 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 				"and the measurement budget's headroom is visible before it is exhausted",
 		},
 		{
-			// The other half of that headroom. Exported because the query used to name the
-			// DEFAULT as a literal, which is wrong on every deployment that raised the budget.
+			// The other half of that headroom. Exported so the headroom query can name it as a
+			// SERIES: a literal default is wrong on every deployment that raised the budget.
 			name: "blnk.subscribers.measurement_budget",
 			unit: "{subscriber}",
 			description: "Subscribers one consumer-lag sweep may measure, as configured, so headroom is a " +
@@ -1468,21 +1200,11 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 	}
 }
 
-// TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets is the assertion the
-// latency acceptance criterion rests on.
+// TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets is the assertion the latency
+// acceptance criterion rests on.
 //
 // OTel's DEFAULT histogram boundaries are 0, 5, 10, 25, 50, 75, 100, 250, 500, 750,
-// 1000, 2500, 5000, 7500, 10000 — chosen for milliseconds. This instrument records
-// SECONDS, so under those defaults every realistic publish latency falls in the single
-// bucket [0, 5] and histogram_quantile can only interpolate inside a five-second span:
-// the sub-two-second p99 target would be unmeasurable, and a regression from 50 ms to
-// 4 s would not move the reported quantile at all. Nothing about that failure is
-// visible in a build, in promtool, or in a "does not panic" test.
-//
-// So this test asserts the boundaries actually in force on the collected data point,
-// and asserts specifically that 2 is one of them: with a bucket edge exactly at the
-// threshold, "is p99 under 2 seconds" is answered from bucket counts rather than
-// estimated across it.
+// 1000, 2500, 5000, 7500, 10000 — chosen for milliseconds.
 func TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets(t *testing.T) {
 	reader := installSDKReader(t)
 
@@ -1536,15 +1258,7 @@ func TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets(t *testing.T) {
 }
 
 // TestEventCaptureToDispatchDuration_BracketsTheTargetAndKeepsABacklogOnScale is the
-// bucket assertion for the instrument acceptance criterion V-1 is ACTUALLY read from.
-//
-// The per-write histogram cannot answer V-1 — its clock starts after the outbox claim, so it
-// excludes the pending wait and the poll interval, and a relay stalled for a minute still
-// reported a five-millisecond publish. This instrument spans capture to acknowledgement, and
-// its boundaries therefore have to do two things the per-write set does not: put an edge
-// exactly at the two-second target, and keep a genuinely backlogged pipeline on the scale
-// instead of collapsing every stalled event into +Inf, where one minute behind and five are
-// indistinguishable.
+// bucket assertion for the instrument the acceptance criterion is ACTUALLY read from.
 func TestEventCaptureToDispatchDuration_BracketsTheTargetAndKeepsABacklogOnScale(t *testing.T) {
 	reader := installSDKReader(t)
 
@@ -1613,12 +1327,6 @@ func indexOfBound(bounds []float64, bound float64) int {
 
 // TestEventStreamingInstruments_ExportedAttributeKeys asserts the attribute KEYS that
 // reach the exporter on each instrument.
-//
-// These keys are a published contract, not an implementation detail: the two alert
-// rules interpolate {{ $labels.topic }}, {{ $labels.subscriber }} and
-// {{ $labels.group }} into the notification an operator is paged with, and the latency
-// query selects on attempt and outcome. A renamed key leaves the alert firing with an
-// empty interpolation, or leaves the query selecting nothing.
 func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 	reader := installSDKReader(t)
 	recordEveryEventInstrument(context.Background())
@@ -1629,14 +1337,14 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		keys   []string
 	}{
 		{metric: "blnk.events.published.total", keys: []string{"topic", "event_type"}},
-		// The terminal counter, attributed exactly as the published counter is. The pair is what
-		// makes "how many events are still mid-flight" a subtraction rather than a guess, and a
-		// divergence in labels would make the two unsubtractable.
+		// The terminal counter, attributed exactly as the published counter is. The pair is
+		// what makes "how many events are still mid-flight" a subtraction rather than a
+		// guess, and a divergence in labels would make the two unsubtractable.
 		{metric: "blnk.events.dispatched.total", keys: []string{"topic", "event_type"}},
-		// Both dimensions. `terminal` is not decoration: with the outcome vocabulary frozen at
-		// three values it is the ONLY thing separating a failure that will be retried from one
-		// that never will, so a counter that lost it could no longer answer the question the
-		// dead-letter triage runbook opens with.
+		// Both dimensions. `terminal` is not decoration: with the outcome vocabulary frozen
+		// at three values it is the ONLY thing separating a failure that will be retried from
+		// one that never will, so a counter that lost it could no longer answer the question
+		// the dead-letter triage runbook opens with.
 		{metric: "blnk.events.publish.attempts.total", keys: []string{"outcome", "terminal"}},
 		{metric: "blnk.events.publish.duration", keys: []string{"topic", "attempt", "outcome"}},
 		// No outcome: only an acknowledged publish has an end-to-end age to report, so the
@@ -1660,8 +1368,7 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// necessary — the two legs fill under different conditions and have different
 		// remedies, so a summed backlog would tell an operator neither which one is owed nor
 		// which knob to reach for — and it is CLOSED at two values, so it adds no unbounded
-		// cardinality. Nothing else is attributed: a topic or an event-type breakdown would
-		// multiply the series by a dimension no repair decision is made on.
+		// cardinality.
 		{metric: "blnk.events.repair.backlog", keys: []string{"leg"}},
 		{metric: "blnk.events.repair.completed.total", keys: []string{"leg"}},
 		{metric: "blnk.events.repair.saturated", keys: []string{"leg"}},
@@ -1718,8 +1425,8 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		{metric: "blnk.subscribers.grant_reconcile_pending", keys: nil},
 		{metric: "blnk.subscribers.credential_cleanup_pending", keys: nil},
 		{metric: "blnk.subscribers.oldest_settlement_age_seconds", keys: nil},
-		// A COUNTER, and unattributed: SubscriberSettlementNotProgressing takes a rate over it
-		// to separate a stuck pass from a busy one, and that question has no per-subject
+		// A COUNTER, and unattributed: SubscriberSettlementNotProgressing takes a rate over
+		// it to separate a stuck pass from a busy one, and that question has no per-subject
 		// breakdown.
 		{metric: "blnk.subscribers.obligations_settled.total", keys: nil},
 		// NO blnk.subscriber_stream.* PAIR, for the reason recorded on eventStreamingInstruments:
@@ -1743,24 +1450,12 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 	}
 }
 
-// attributeKeysOf returns the attribute keys a collected metric's data points carry, and
-// requires that EVERY data point agrees on them.
+// attributeKeysOf returns the attribute keys a collected metric's data points carry,
+// and requires that EVERY data point agrees on them.
 //
-// The agreement is asserted rather than assumed. Reading the first data point and trusting it
-// was the original shape of this helper, and the order of data points in a collection is not
-// defined — so with more than one series present the answer was whichever the SDK happened to
-// emit first. That made the attribute-key contract assertions nondeterministic the moment
-// anything else had recorded the same instrument with a different key set, which is exactly what
-// happened from the second `-count` iteration onwards.
+// The agreement is asserted rather than assumed.
 //
-// Requiring one key set across every point is also the stronger statement. These keys are a
-// PUBLISHED contract — the alert rules interpolate them and the latency queries select on them —
-// and a second series of the same instrument carrying a different tuple means one of the two
-// producers is off-contract. A helper that reads one point cannot see that at all.
-//
-// The four aggregation shapes are handled explicitly rather than through reflection so
-// that an instrument whose KIND changed — a counter declared as a gauge, say — fails
-// here with a message naming the aggregation it actually produced.
+// Requiring one key set across every point is also the stronger statement.
 func attributeKeysOf(t *testing.T, m metricdata.Metrics) []string {
 	t.Helper()
 
@@ -1816,13 +1511,7 @@ func attributeSetKeys(set attribute.Set) []string {
 // bounded attributes and asserts the resulting series count is exactly the size of the
 // declared domains.
 //
-// This is a CARDINALITY BUDGET expressed as a test. The attempt attribute sits on a
-// histogram, so each of its values costs a full set of buckets; letting an unbounded
-// value in — an attempt number straight from a row whose max_attempts was raised in the
-// database, or an attempt count invented for a replay — is how a single instrument comes
-// to dominate the exporter. Recording the whole domain and counting the result is what
-// makes an accidental widening visible: a new value shows up as this count being wrong,
-// which is a test edit rather than a silent production cost.
+// This is a CARDINALITY BUDGET expressed as a test.
 func TestEventPublishTelemetry_LabelDomainsStayClosed(t *testing.T) {
 	reader := installSDKReader(t)
 	ctx := context.Background()
@@ -1879,26 +1568,18 @@ func TestEventPublishTelemetry_LabelDomainsStayClosed(t *testing.T) {
 	assert.True(t, attempts.IsMonotonic, "an attempts counter must be monotonic")
 }
 
-// TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary pins the domain of the one
-// attribute an alert's REMEDIATION branches on.
+// TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary pins the domain of
+// the one attribute an alert's REMEDIATION branches on.
 //
-// SubscriberLagCoverageIncomplete does not tell an operator to go and investigate; it names each
-// reason and gives each its own action, because the five mean five different faults in five
-// different places — the budget, the registry row, the broker, the registry query and the topic
-// provisioning. That makes this vocabulary a published contract rather than a set of log-ish
-// strings, and it has two failure modes worth mechanically excluding.
+// SubscriberLagCoverageIncomplete does not tell an operator to go and investigate; it
+// names each reason and gives each its own action, because the five mean five different
+// faults in five different places — the budget, the registry row, the broker, the
+// registry query and the topic provisioning.
 //
-// A reason ADDED here and not added to the remediation leaves an operator holding a series with a
-// reason the runbook does not explain. A reason RENAMED leaves the remediation describing a value
-// that no longer exists while saying nothing about the one that does. Neither breaks a build,
-// neither fails promtool, and both are only ever discovered mid-incident — so the enumeration is
-// asserted exactly, and event_metrics_test.go asserts that the alert text still names every
-// member of it.
+// A reason ADDED here and not added to the remediation leaves an operator holding a
+// series with a reason the runbook does not explain.
 //
-// The duplicate and empty checks are not padding. The collector writes the gauge once per value
-// returned here, so a duplicate would record the same series twice per tick — the second write
-// silently overwriting the first with a different number — and an empty string would export a
-// series whose reason cannot be read at all.
+// The duplicate and empty checks are not padding.
 func TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary(t *testing.T) {
 	reasons := SubscriberUnmeasuredReasons()
 
@@ -1924,9 +1605,9 @@ func TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary(t *testing
 		seen[reason] = struct{}{}
 	}
 
-	// A FRESH SLICE, so a caller cannot mutate the vocabulary for every other caller in the
-	// process. The collector iterates this on every tick; a handler that sorted or truncated the
-	// returned slice in place would change what is published from then on.
+	// A FRESH SLICE, so a caller cannot mutate the vocabulary for every other caller in
+	// the process. The collector iterates this on every tick; a handler that sorted or
+	// truncated the returned slice in place would change what is published from then on.
 	first := SubscriberUnmeasuredReasons()
 	first[0] = "mutated-by-a-caller"
 	assert.Equal(t, reasons, SubscriberUnmeasuredReasons(),
@@ -1934,27 +1615,10 @@ func TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary(t *testing
 			"later tick publishes")
 }
 
-// TestEventStreamingInstruments_ExportedPrometheusSeriesNames asserts the names the ALERT RULES
-// actually match on, as the Prometheus exporter produces them.
+// TestEventStreamingInstruments_ExportedPrometheusSeriesNames asserts the names the
+// ALERT RULES actually match on, as the Prometheus exporter produces them.
 //
-// # Why the OTel name is not enough
-//
-// Every other test in this file checks the OTel instrument name. The rules do not use that name:
-// they use the exporter's translation of it, and the translation is not a mechanical
-// dot-to-underscore substitution. The exporter also appends a suffix DERIVED FROM THE UNIT — a
-// unit of "1" becomes "_ratio", "s" becomes "_seconds", a monotonic counter gains "_total" — so
-// a unit is part of a series name whether or not anybody intended it to be.
-//
-// That is not hypothetical here. blnk.kafka.consumer_lag_inventory_complete was declared with the
-// UCUM unit "1", which is correct for a dimensionless value and which the exporter renders as
-// blnk_kafka_consumer_lag_inventory_complete_ratio. SubscriberLagCoverageIncomplete matched the
-// unsuffixed name, so it evaluated against a series that did not exist — and a rule over a
-// missing series cannot fire and is indistinguishable from a system with nothing wrong. The Go
-// build passed, every OTel-name assertion passed, and promtool validated the rule.
-//
-// So the exporter is run for real and the exposition text is searched for the exact names the
-// rule files use. A unit or name change that moves a series now fails HERE, at the boundary the
-// alerting depends on, rather than silently in production.
+// Every other test in this file checks the OTel instrument name.
 func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	exporter, err := promexporter.New(promexporter.WithRegisterer(registry))
@@ -1966,8 +1630,8 @@ func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
 	})
 
 	// A meter from THIS provider, and every instrument rebuilt on it: the package-level
-	// instruments belong to whatever provider was installed at import time, so recording through
-	// them would not reach this exporter.
+	// instruments belong to whatever provider was installed at import time, so recording
+	// through them would not reach this exporter.
 	restore := swapMeter(t, provider.Meter("blnk"))
 	defer restore()
 
@@ -1976,18 +1640,18 @@ func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
 
 	exposition := scrapeRegistry(t, registry)
 
-	// Exactly the names alerts/blnk-kafka-alerts.yml and docs/metrics.md use. Written out as
-	// literals rather than derived from the instrument names, because deriving them would
-	// reproduce the very assumption that broke.
+	// Exactly the names alerts/blnk-kafka-alerts.yml and docs/metrics.md use. Written out
+	// as literals rather than derived from the instrument names, because deriving them
+	// would reproduce the very assumption that broke.
 	for _, series := range []string{
 		"blnk_events_published_total",
 		"blnk_events_broker_acknowledgements_total",
 		"blnk_events_dispatched_total",
 		"blnk_events_publish_attempts_total",
 		// HISTOGRAMS ARE ASSERTED ON THEIR _bucket SERIES, because that is the series the
-		// documented p99 queries feed to histogram_quantile — a histogram exports
-		// _bucket, _sum and _count and no bare sample at all, so asserting the bare name
-		// would fail for a correctly exported instrument.
+		// documented p99 queries feed to histogram_quantile — a histogram exports _bucket,
+		// _sum and _count and no bare sample at all, so asserting the bare name would fail
+		// for a correctly exported instrument.
 		"blnk_events_publish_duration_seconds_bucket",
 		"blnk_events_capture_to_dispatch_duration_seconds_bucket",
 		"blnk_events_dead_lettered_total",
@@ -2014,9 +1678,9 @@ func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
 	}
 
 	t.Run("the success age is published even when no collection has ever succeeded", func(t *testing.T) {
-		// The worst state there is, and the one absence would hide: failing since start-up. The
-		// gauge must still carry a value, or EventMetricsCollectionFailing has no series to
-		// evaluate for precisely the collector that has never worked.
+		// The worst state there is, and the one absence would hide: failing since start-up.
+		// The gauge must still carry a value, or EventMetricsCollectionFailing has no series
+		// to evaluate for precisely the collector that has never worked.
 		resetEventMetricsCollectionHealth(t)
 		RecordEventMetricsCollection(time.Now().Add(-10*time.Minute), false)
 
@@ -2031,8 +1695,8 @@ func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
 // swapMeter points the package meter at a different one for the duration of a test.
 //
 // Returns:
-//   - func(): restores the original meter. Also registered with t.Cleanup, so a test that
-//     forgets to call it still cannot leak the swap into another test.
+//   - func(): restores the original meter. Also registered with t.Cleanup, so a test
+//     that forgets to call it still cannot leak the swap into another test.
 func swapMeter(t *testing.T, replacement metric.Meter) func() {
 	t.Helper()
 
@@ -2045,10 +1709,6 @@ func swapMeter(t *testing.T, replacement metric.Meter) func() {
 }
 
 // resetEventMetricsCollectionHealth clears the recorded collection timestamps.
-//
-// Necessary because they are process-global and monotonic: a success recorded by an earlier test
-// cannot be undone by recording an older failure, so the "never succeeded" case is only reachable
-// from a cleared state.
 func resetEventMetricsCollectionHealth(t *testing.T) {
 	t.Helper()
 
@@ -2062,17 +1722,6 @@ func resetEventMetricsCollectionHealth(t *testing.T) {
 
 // scrapeRegistry gathers a Prometheus registry and returns the set of SERIES NAMES the
 // exposition format would carry for it.
-//
-// It derives the names from the gathered metric families rather than rendering the exposition
-// body, because the property under test is naming and nothing else: which series a rule or a
-// documented query can match on. A family contributes its own name for a counter or a gauge,
-// and the `_bucket`/`_sum`/`_count` triple for a histogram (`_sum`/`_count` plus the bare
-// quantile series for a summary) — which is exactly the suffix set the text format emits, and
-// the reason a histogram is asserted on its `_bucket` series rather than on its bare name.
-//
-// The family kind is read through the generated accessors (GetHistogram, GetSummary,
-// GetCounter, GetGauge) instead of the type enum, so this helper needs no protobuf import of
-// its own and the package's dependency surface stays exactly what production code needs.
 //
 // Returns:
 //   - map[string]bool: every series name the registry would export, ready for lookup.
@@ -2110,9 +1759,9 @@ func scrapeRegistry(t *testing.T, registry *prometheus.Registry) map[string]bool
 
 // expositionHasSeries reports whether an exported series set carries the given name.
 //
-// The match is on the WHOLE name, so a name which is a PREFIX of another cannot satisfy the
-// assertion — which is the whole failure mode being guarded, since the suffix the exporter
-// appends is what moves a series.
+// The match is on the WHOLE name, so a name which is a PREFIX of another cannot satisfy
+// the assertion — which is the whole failure mode being guarded, since the suffix the
+// exporter appends is what moves a series.
 func expositionHasSeries(exposition map[string]bool, series string) bool {
 	return exposition[series]
 }
@@ -2121,10 +1770,7 @@ func expositionHasSeries(exposition map[string]bool, series string) bool {
 // package-level variable whose declared type comes from the otel metric package.
 //
 // It reads the source rather than using reflection because the property under test is a
-// property of the DECLARATIONS, not of the values. Reflection can only see variables a
-// test already names, which is precisely the blind spot this helper exists to remove: an
-// instrument nobody enumerated is invisible to a reflective walk for the same reason it is
-// invisible to the enumeration tables.
+// property of the DECLARATIONS, not of the values.
 func declaredInstrumentNames(t *testing.T) []string {
 	t.Helper()
 
@@ -2170,27 +1816,17 @@ func declaredInstrumentNames(t *testing.T) []string {
 	return names
 }
 
-// TestInstrumentTables_CoverEveryDeclaredInstrumentExactlyOnce is the guard that keeps the
-// two enumeration tables — and every count stated in this file's prose — honest.
-//
-// Both tables are written out by hand on purpose: that is what makes every non-nil
-// assertion above a real assertion rather than a tautology against the thing under test.
-// The cost of a hand-written table is that it can fall behind the code, and it did: an
-// instrument was declared, assigned in Init() and used in production while appearing in
-// NEITHER table, so the orphan guard silently covered one fewer instrument than its own
-// documentation claimed. Nothing failed, because a table that omits an entry cannot notice
-// the omission.
+// TestInstrumentTables_CoverEveryDeclaredInstrumentExactlyOnce is the guard that keeps
+// the two enumeration tables — and every count stated in this file's prose — honest.
 //
 // This test closes that loop from the other direction. It derives the truth from the
 // declarations in metrics.go and asserts a bidirectional match:
 //
 //   - every declared instrument appears in exactly one table, so a newly declared
 //     instrument cannot be added without being brought under the non-nil guard, and
-//   - every table entry corresponds to a real declaration, so a removed instrument cannot
-//     leave a stale name behind that would fail to compile only after someone else's change.
-//
-// The failure messages name the specific instrument and the specific table to update,
-// because "the counts disagree" is not actionable at the moment the test goes red.
+//   - every table entry corresponds to a real declaration, so a removed instrument
+//     cannot leave a stale name behind that would fail to compile only after someone
+//     else's change.
 func TestInstrumentTables_CoverEveryDeclaredInstrumentExactlyOnce(t *testing.T) {
 	declared := declaredInstrumentNames(t)
 

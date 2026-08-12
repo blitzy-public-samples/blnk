@@ -16,29 +16,13 @@ limitations under the License.
 
 // Tests for what the subscriber service RETURNS when something outside Blnk fails.
 //
-// # The defect these guard against, and why a careful log was not enough
+// The service was already careful with its logs: every failure path builds its fields
+// through sanitizeLogValue before writing them.
 //
-// The service was already careful with its logs: every failure path builds its fields through
-// sanitizeLogValue before writing them. It then handed the raw cause to
-// apierror.NewAPIError, and that function does two things with what it is given —
-// `logrus.WithField("details", details).Error("API error")` and a `Details interface{}` field
-// tagged `json:"details,omitempty"` on the returned struct. So the cause was logged a second
-// time unsanitized AND serialised into the HTTP response. The sanitizer was bypassed on both
-// sides at once, and the response side is the more serious of the two because it leaves the
-// deployment.
+// The causes are not innocuous.
 //
-// The causes are not innocuous. A Kafka client error renders as
-// "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe", and *net.OpError is a struct with
-// exported Op, Net and Addr fields, so marshalling one publishes broker topology as structured
-// JSON rather than merely as text. A Postgres error renders with schema, table, column,
-// constraint, source file and routine. A TLS material error names a path inside the container.
-//
-// # What is asserted, and why it is asserted against the marshalled bytes
-//
-// Every test here checks the JSON the caller would actually receive, not just the field values.
-// A field-by-field assertion would pass while the cause sat in some other member, and the
-// failure mode being guarded is precisely "something reaches the response body", so the bytes
-// are the honest thing to look at.
+// Every test here checks the JSON the caller would actually receive, not just the field
+// values.
 package blnk
 
 import (
@@ -58,12 +42,8 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// subscriberHostileCause is a cause of the exact shape the Kafka client produces, carrying
-// every kind of value that must not reach a response.
-//
-// It is a *net.OpError rather than a formatted string on purpose: that is what the client
-// really returns, it is a struct with exported fields, and it is what makes the difference
-// between "the cause is not in the text" and "the cause is not in the response at all".
+// subscriberHostileCause is a cause of the exact shape the Kafka client produces,
+// carrying every kind of value that must not reach a response.
 func subscriberHostileCause() error {
 	return &net.OpError{
 		Op:  "write",
@@ -87,8 +67,8 @@ func subscriberHostileFragments() []string {
 // requireNoHostileFragments asserts that none of the hostile strings survives into the
 // marshalled form of an error, and returns the marshalled bytes for further assertions.
 //
-// Marshalling is the operation under test: an APIError's Details member is serialised into the
-// response body, so what json.Marshal produces IS what a caller receives.
+// Marshalling is the operation under test: an APIError's Details member is serialised
+// into the response body, so what json.Marshal produces IS what a caller receives.
 func requireNoHostileFragments(t *testing.T, err error) string {
 	t.Helper()
 
@@ -108,10 +88,6 @@ func requireNoHostileFragments(t *testing.T, err error) string {
 }
 
 // newSubscriberErrorFixture returns a service and a registry row for the failure paths.
-//
-// The service holds no store and no administrative client, which is legitimate — NewBlnk(nil)
-// is a supported construction in this codebase — and none of the paths under test touches
-// either: they are all reached after a broker call has already failed.
 func newSubscriberErrorFixture(t *testing.T) (*EventSubscriberService, *model.EventSubscriber) {
 	t.Helper()
 
@@ -133,12 +109,10 @@ func newSubscriberErrorFixture(t *testing.T) (*EventSubscriberService, *model.Ev
 	}
 }
 
-// TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch is the finding's cited site.
+// TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch is the bounded-detail
+// guard.
 //
-// All four branches of provisioningFailure passed the raw cause. They are asserted together
-// because they share the defect and because each has a DIFFERENT correct answer for the
-// caller: the two that cannot say what the broker did must report themselves retryable, and
-// the two that describe a decision already taken must not.
+// All four branches of provisioningFailure must bound the cause rather than pass it raw.
 func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 	cases := []struct {
 		name               string
@@ -159,17 +133,9 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 		},
 		{
 			name: "budget expired",
-			// RETRYABLE, and the flag is the whole answer: the log says a retry
-			// re-provisions the same boundary idempotently, so the detail has to say the
-			// same thing or the caller cannot act on it.
-			//
-			// SUBSCRIBER_PROVISIONING_FAILED, not EVENT_KAFKA_UNAVAILABLE: a spent budget is
-			// not the broker being unreachable, and answering with the broker's code would
-			// send an operator to a Kafka that never stopped responding. It is the SAME code
-			// the registry half of this issuance reports for the identical condition — one
-			// wall clock running out — so a client does not have to know which internal
-			// dependency was slow. The published taxonomy carries no separate timeout code,
-			// so the spent budget is named in the message and the reason fragment below.
+			// RETRYABLE, and the flag is the whole answer: the log says a retry re-provisions
+			// the same boundary idempotently, so the detail has to say the same thing or the
+			// caller cannot act on it.
 			cause:              fmt.Errorf("provisioning: %w", context.DeadlineExceeded),
 			result:             SubscriberProvisioningResult{CredentialWritten: true},
 			wantCode:           apierror.ErrSubscriberProvisioningFailed,
@@ -179,10 +145,10 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 		},
 		{
 			name: "caller cancelled",
-			// Also the provisioning-failure code, and retryable for the same reason. The
-			// partial broker state stays in the DETAIL, which is where it always was and the
-			// only place it could be — a status code cannot say whether a credential the
-			// caller does not hold may already exist.
+			// Also the provisioning-failure code, and retryable for the same reason. The partial
+			// broker state stays in the DETAIL, which is where it always was and the only place
+			// it could be — a status code cannot say whether a credential the caller does not
+			// hold may already exist.
 			cause:              fmt.Errorf("provisioning: %w", context.Canceled),
 			wantCode:           apierror.ErrSubscriberProvisioningFailed,
 			wantRetryable:      true,
@@ -222,12 +188,12 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			service, subscriber := newSubscriberErrorFixture(t)
 
-			// ctx and a claim token are threaded in because provisioningFailure now SETTLES
-			// what the broker was left holding before it classifies the failure. The fixture's
-			// store has no claim on this row, so the settlement write is refused — which is
-			// deliberate here: this table is about the typed error each outcome produces, and
-			// the settlement behaviour has its own tests. A refused settlement must not change
-			// the answer the caller receives, and that is exactly what this asserts.
+			// ctx and a claim token are threaded in because provisioningFailure now SETTLES what
+			// the broker was left holding before it classifies the failure. The fixture's store
+			// has no claim on this row, so the settlement write is refused — which is deliberate
+			// here: this table is about the typed error each outcome produces, and the
+			// settlement behaviour has its own tests. A refused settlement must not change the
+			// answer the caller receives, and that is exactly what this asserts.
 			err := service.provisioningFailure(
 				context.Background(), subscriber, "settlement-fence-token", tc.result, tc.cause,
 			)
@@ -251,10 +217,9 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 				"what reached the broker is the fact a caller cannot otherwise learn")
 			assert.Equal(t, tc.wantCompensated, detail.Compensated)
 
-			// THE PRINCIPAL IS NOT IN THE RESPONSE. It is in the log, where the failure
-			// paths name it deliberately so a human knows what to revoke, but a response
-			// body naming a principal whose provisioning just failed tells a reader which
-			// identity to attack.
+			// THE PRINCIPAL IS NOT IN THE RESPONSE. It is in the log, where the failure paths
+			// name it deliberately so a human knows what to revoke, but a response body naming a
+			// principal whose provisioning just failed tells a reader which identity to attack.
 			body := requireNoHostileFragments(t, err)
 			assert.NotContains(t, body, subscriber.KafkaPrincipal,
 				"the response must not name the Kafka principal")
@@ -262,13 +227,11 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 	}
 }
 
-// TestNewSubscriberErrorDetail_CannotCarryACause pins the property that makes the guarantee
-// structural rather than a matter of care at each call site.
+// TestNewSubscriberErrorDetail_CannotCarryACause pins the property that makes the
+// guarantee structural rather than a matter of care at each call site.
 //
-// The constructor takes no cause, so there is no argument through which one could arrive. That
-// is asserted here by reflection over the STRUCT rather than by inspecting one instance,
-// because a member added later — an `Err error`, say — would reintroduce the whole defect
-// silently, and every existing assertion would still pass.
+// The constructor takes no cause, so there is no argument through which one could
+// arrive.
 func TestNewSubscriberErrorDetail_CannotCarryACause(t *testing.T) {
 	detail := NewSubscriberErrorDetail("something failed", "sub_0f6e2c8a", true)
 
@@ -318,27 +281,15 @@ func TestNewSubscriberErrorDetail_CannotCarryACause(t *testing.T) {
 }
 
 // TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath covers the three
-// AUTHORIZATION-RECONCILIATION paths, which kept the defect after provisioningFailure was fixed.
+// AUTHORIZATION-RECONCILIATION paths, which kept the defect after provisioningFailure
+// was fixed.
 //
-// # Why these three were missed
+// The cause here is not a tidy sentence.
 //
-// provisioningFailure is the path a credential ISSUANCE fails on, and it was the finding's cited
-// site. The three below fail on the same kind of call — an administrative request to the broker —
-// but from UpdateSubscriber and DeregisterSubscriber, and each passed the wrapped cause straight
-// into apierror.NewAPIError. That function logs what it is given through logrus AND serialises it
-// into the response's `details` member, so a single argument defeated the sanitizing done on the
-// line immediately above it, twice over.
-//
-// The cause here is not a tidy sentence. A refused administrative request comes back from the
-// Kafka client with the whole request appended to it, and a transport failure arrives as a
-// *net.OpError — a struct with exported Op, Net and Addr fields, so marshalling one publishes
-// broker topology as structured JSON rather than merely as text. subscriberHostileCause is
-// exactly that value, and the assertion is made against the MARSHALLED bytes because those are
-// what a caller receives.
-//
-// Every one of the three is reported RETRYABLE, and that is a claim about state rather than
-// optimism: the prune runs before the registry is written, the grant runs after it and is
-// additive, and revocation is idempotent at the broker with a tombstone left on the row.
+// Every one of the three is reported RETRYABLE, and that is a claim about state rather
+// than optimism: the prune runs before the registry is written, the grant runs after it
+// and is additive, and revocation is idempotent at the broker with a tombstone left on
+// the row.
 func TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath(t *testing.T) {
 	renamed := "reconciliation probe"
 
@@ -363,11 +314,10 @@ func TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath(t *tes
 			name:          "creating the new grants",
 			failingMethod: "GrantSubscriberAccess",
 			invoke: func(run *subscriberLifecycle) error {
-				// AN AUTHORIZATION CHANGE, not a rename. ADMIN-02 means the broker is touched
-				// only when the recorded authorization could have moved, so a rename no longer
-				// reaches the grant step at all — see
+				// AN AUTHORIZATION CHANGE, not a rename. The broker is touched only
+				// when the recorded authorization could have moved, so a rename no longer reaches
+				// the grant step at all — see
 				// TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved.
-				// Supplying the topic list is what puts this case on the path it is testing.
 				_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
 					SubscriberUpdate{
 						Name:             &renamed,
@@ -421,10 +371,11 @@ func TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath(t *tes
 // TestSubscriberService_AdminConstructionFailureWithholdsTheCause covers the
 // administrative-client path, which is the most disclosure-prone in the file.
 //
-// Building the client reads TLS material from disk and prepares a SCRAM mechanism, so the
-// failure can name a filesystem path inside the container or the administrative principal —
-// and because the transport REFUSES plaintext by returning an error, an ordinary
-// misconfiguration reaches this branch on a normal deployment rather than only in a disaster.
+// Building the client reads TLS material from disk and prepares a SCRAM mechanism, so
+// the failure can name a filesystem path inside the container or the administrative
+// principal — and because the transport REFUSES plaintext by returning an error, an
+// ordinary misconfiguration reaches this branch on a normal deployment rather than only
+// in a disaster.
 func TestSubscriberService_AdminConstructionFailureWithholdsTheCause(t *testing.T) {
 	// Brokers configured but neither TLS nor the local-dev acknowledgement, which is the
 	// refusal NewKafkaTransport documents. No broker is contacted.
@@ -455,22 +406,19 @@ func TestSubscriberService_AdminConstructionFailureWithholdsTheCause(t *testing.
 	require.NoError(t, marshalErr)
 
 	body := string(encoded)
-	// The transport's refusal names the environment variables and explains the exposure. That
-	// is exactly the right message for an operator reading a log and exactly the wrong one for
-	// a response body: it confirms to a caller what the deployment's transport posture is.
+	// The transport's refusal names the environment variables and explains the exposure.
+	// That is exactly the right message for an operator reading a log and exactly the
+	// wrong one for a response body: it confirms to a caller what the deployment's
+	// transport posture is.
 	assert.NotContains(t, body, "KAFKA_INSECURE_LOCAL_DEV",
 		"the transport's own refusal text must not reach the caller")
 	assert.NotContains(t, body, "KAFKA_TLS_ENABLED")
 	assert.NotContains(t, body, "10.0.0.7")
 }
 
-// storeSubscriberErrorConfiguration makes the package's configuration seam return a Kafka
-// block that names brokers but permits no transport, so building the administrative client
-// fails without any I/O.
-//
-// The SEAM is swapped rather than the configuration store, because provisioner reads through
-// fetchConfiguration and that is the seam every event file shares — swapping it here keeps this
-// test consistent with the rest of the package and leaves the shared store untouched.
+// storeSubscriberErrorConfiguration makes the package's configuration seam return a
+// Kafka block that names brokers but permits no transport, so building the
+// administrative client fails without any I/O.
 func storeSubscriberErrorConfiguration(t *testing.T) {
 	t.Helper()
 

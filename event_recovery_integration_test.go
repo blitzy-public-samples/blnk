@@ -15,7 +15,7 @@
 */
 
 // Crash recovery for the transactional event outbox and its Kafka relay — acceptance
-// criterion V-7, "no duplicate and no lost events after a mid-batch relay restart".
+// the acceptance criterion, "no duplicate and no lost events after a mid-batch relay restart".
 //
 // # STATE THE GUARANTEE HONESTLY BEFORE READING AN ASSERTION
 //
@@ -100,10 +100,10 @@
 //
 // # WHAT IS NOT HERE
 //
-// Ordering is event_ordering_integration_test.go (V-6), subscriber isolation is
-// event_isolation_integration_test.go (V-5), dual-delivery payload equality is
-// event_dual_delivery_test.go (V-8) and replay fidelity is
-// event_replay_fidelity_test.go (V-9). This file asserts none of them, so a failure here
+// Ordering is event_ordering_integration_test.go, subscriber isolation is
+// event_isolation_integration_test.go, dual-delivery payload equality is
+// event_dual_delivery_test.go and replay fidelity is
+// event_replay_fidelity_test.go. This file asserts none of them, so a failure here
 // points at recovery and nothing else.
 package blnk
 
@@ -1380,7 +1380,7 @@ func (f *recoveryFixture) claimMine(ctx context.Context, want int, lease time.Du
 //
 // It pages rather than reading the first page, because a shared database holds other runs'
 // dead-lettered events and this run's row is not guaranteed to be on page one. It pages by
-// CURSOR (PERF-P08), which is what the operator API does now — an offset walk would have cost
+// CURSOR, which is what the operator API does now — an offset walk would have cost
 // more per page the deeper this run's row happened to sit.
 func (f *recoveryFixture) inDeadLetterInventory(ctx context.Context, eventID string) bool {
 	f.t.Helper()
@@ -2094,11 +2094,11 @@ func recoveryRequireNoGoroutineLeak(t *testing.T, baseline int) {
 }
 
 // ---------------------------------------------------------------------------
-// V-7: the mid-batch restart
+// the mid-batch restart
 // ---------------------------------------------------------------------------
 
 // TestEventRecovery_MidBatchRestartLosesNoEventsAndDuplicatesAreDedupableByEventID is
-// acceptance criterion V-7.
+// the acceptance criterion.
 //
 // It interrupts the relay in the MIDDLE of a claimed batch, restarts it, and asserts the two halves
 // separately: nothing was lost, and after de-duplicating on event_id the delivered set is exactly
@@ -3382,7 +3382,7 @@ func (f *recoveryFixture) topicEndOffsets(ctx context.Context, admin *KafkaAdmin
 
 	admin.InvalidateOffsetSnapshot()
 
-	// A zero instant asks for end offsets only (PERF-P05): this reads where the log HEAD is,
+	// A zero instant asks for end offsets only: this reads where the log HEAD is,
 	// and a window would add a round trip whose answer nothing here reads.
 	report, err := admin.TopicEndOffsets(ctx, time.Time{}, f.topic)
 	if err != nil {

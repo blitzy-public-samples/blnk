@@ -1,97 +1,42 @@
-# THE BROKER'S STORAGE CLAIMS, ONE PER BROKER (AAP-M03).
-#
+# THE BROKER'S STORAGE CLAIMS, ONE PER BROKER.
 # ==========================================================================
-# READ THIS BEFORE APPLYING OR EDITING: these three claims are OPTIONAL, and
-# they are the pre-provisioning half of the StatefulSet's storage.
+# READ THIS BEFORE APPLYING OR EDITING: these three claims are OPTIONAL, and they are
+# the pre-provisioning half of the StatefulSet's storage.
 # ==========================================================================
-#
 # kafka-statefulset.yaml declares a volumeClaimTemplate named `kafka-data`, and
-# Kubernetes materialises one claim per pod from it. The names it uses are
-# derived, not chosen:
+# Kubernetes materialises one claim per pod from it. The names it uses are derived, not
+# chosen:
 #
 #     <template name>-<StatefulSet name>-<ordinal>
 #     kafka-data      -kafka             -0 / -1 / -2
 #
-# Those are exactly the three objects below. Applying this file BEFORE the
-# StatefulSet pre-provisions them; the StatefulSet then ADOPTS each one rather
-# than creating a second, because a claim of that name already exists. Applying
-# it after, or not at all, is equally valid — the StatefulSet creates the same
-# three itself.
+# Those are exactly the three objects below. Applying this file BEFORE the StatefulSet
+# pre-provisions them; the StatefulSet then ADOPTS each one rather than creating a
+# second, because a claim of that name already exists.
 #
-# # Why pre-provisioning is worth having
+# It is the only way to control the storage of an individual broker. Because the claim
+# exists before any pod does, you can bind a specific PersistentVolume to a specific
+# ordinal — a named local NVMe disk, a pre-existing cloud disk restored from a snapshot,
+# or a different StorageClass for one broker — none of which a single template can
+# express.
 #
-# It is the only way to control the storage of an individual broker. Because the
-# claim exists before any pod does, you can bind a specific PersistentVolume to
-# a specific ordinal — a named local NVMe disk, a pre-existing cloud disk
-# restored from a snapshot, or a different StorageClass for one broker — none of
-# which a single template can express. Add `volumeName:` or `storageClassName:`
-# to one entry below and only that broker is affected.
-#
-# It also makes the storage REVIEWABLE as an object rather than as a field
-# inside a workload: `kubectl get pvc -n blnk` before the brokers start tells
-# you whether the cluster can actually provision 3 x 200Gi, which is a much
-# better time to find out than during a cold start.
-#
-# # Why this is NOT one claim, which is the mistake it replaces
-#
-# A file at this path once held a SINGLE claim named `kafka-data`, 10Gi,
-# ReadWriteOnce — and it was deleted rather than corrected, because a singleton
-# is worse than useless here. A PersistentVolumeClaim is one claim bound to one
-# volume, and ReadWriteOnce means one node may mount it at a time. Three
-# brokers each need their OWN KRaft metadata log and their own partition
-# segments; three sharing one claim would either fail to schedule onto separate
-# nodes or, far worse, write concurrently into one log directory, which corrupts
-# the metadata log rather than reporting an error. So nothing ever mounted it,
-# and applying this folder provisioned an idle volume an operator would later
-# find and have to reason about.
-#
-# The names below are what make the difference: a claim the StatefulSet will
-# adopt is a claim that gets used. Nothing here is idle.
-#
-# # FIVE THINGS THAT MUST STAY TRUE, or these claims stop being adopted
-#
-#   1. THE NAMES. `kafka-data-kafka-<n>` and nothing else. Renaming the
-#      StatefulSet or its volumeClaimTemplate silently orphans all three: the
-#      set creates its own claims under the new names and these sit unbound and
-#      unused, which is the original defect with extra steps.
-#   2. THE COUNT. One entry per replica. The StatefulSet declares 3 — the KRaft
-#      quorum needs three voters to tolerate one loss — so raising `replicas`
-#      requires adding an entry here in the same change, or the new broker's
-#      claim is created from the template while its siblings came from this file
-#      and the two can differ.
-#   3. THE SIZE. 200Gi, identical to the volumeClaimTemplate. Kubernetes does
-#      NOT reconcile a pre-existing claim against the template — it adopts what
-#      it finds — so a claim smaller than the template is adopted at the
-#      smaller size, silently, and the broker's retention arithmetic no longer
-#      fits its disk. See the template for the derivation: 48 partitions x 2 GiB
-#      of log.retention.bytes = 96 GiB, which is 48% of 200Gi.
-#      TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate asserts this
-#      correspondence so it cannot drift.
-#   4. THE ACCESS MODE. ReadWriteOnce, matching the template. A claim the
-#      scheduler treats differently from what the workload expects is a
-#      scheduling failure at the worst moment.
-#   5. THE STORAGE CLASS. Omitted here and in the template, so both take the
-#      cluster's default. Set it on one and not the other and the adopted claim
-#      is backed by storage the template never asked for. If you name a class,
-#      name the same one in both places — or name it ONLY here, deliberately,
-#      to give one broker different storage.
-#
-# # Binding mode, and why Pending is the expected state
-#
-# On a cluster whose default StorageClass uses `WaitForFirstConsumer` — which
-# is the norm for zonal block storage, and the right choice here — these three
-# claims stay **Pending** until the brokers are scheduled. That is correct, not
-# a fault: the volume is provisioned in whichever zone the pod lands in, which
-# is what keeps a broker able to reattach its own disk after rescheduling.
-# With `Immediate` binding they provision at once and are still adopted.
-#
-# # Deleting them deletes the cluster's metadata
-#
-# The StatefulSet's default persistentVolumeClaimRetentionPolicy is Retain, so
-# these survive the StatefulSet. That is deliberate — a broker returning with an
-# empty volume has lost its KRaft metadata and its share of every partition —
-# and it means `kubectl delete -f` on this file is a destructive act on a
-# running cluster, not a cleanup.
+#   1. THE NAMES. `kafka-data-kafka-<n>` and nothing else. Renaming the StatefulSet or
+#      its volumeClaimTemplate silently orphans all three: the set creates its own
+#      claims under the new names and these sit unbound and unused, which is the
+#      original defect with extra steps.
+#   2. THE COUNT. One entry per replica. The StatefulSet declares 3 — the KRaft quorum
+#      needs three voters to tolerate one loss — so raising `replicas` requires adding
+#      an entry here in the same change, or the new broker's claim is created from the
+#      template while its siblings came from this file and the two can differ.
+#   3. THE SIZE. 200Gi, identical to the volumeClaimTemplate. Kubernetes does NOT
+#      reconcile a pre-existing claim against the template — it adopts what it finds —
+#      so a claim smaller than the template is adopted at the smaller size, silently,
+#      and the broker's retention arithmetic no longer fits its disk.
+#   4. THE ACCESS MODE. ReadWriteOnce, matching the template. A claim the scheduler
+#      treats differently from what the workload expects is a scheduling failure at the
+#      worst moment.
+#   5. THE STORAGE CLASS. Omitted here and in the template, so both take the cluster's
+#      default.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

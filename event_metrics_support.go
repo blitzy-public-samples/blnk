@@ -26,12 +26,12 @@ import (
 )
 
 // This file holds the label and log-sanitisation primitives the event pipeline's
-// observability shares. They sit here rather than beside either consumer because both the
-// RECORDING path (recordConsumerLag in event_admin.go) and the BOOKKEEPING path
-// (EventMetricsCollector in event_metrics.go) have to resolve a series' attributes the same
-// way: a series is cleared by writing zero to the identical label tuple, so if the two
-// resolved labels differently the collector would zero a series nobody ever published and
-// leave the real one standing at its last reading for ever.
+// observability shares. They sit here rather than beside either consumer because both
+// the RECORDING path (recordConsumerLag in event_admin.go) and the BOOKKEEPING path
+// (EventMetricsCollector in event_metrics.go) have to resolve a series' attributes the
+// same way: a series is cleared by writing zero to the identical label tuple, so if the
+// two resolved labels differently the collector would zero a series nobody ever
+// published and leave the real one standing at its last reading for ever.
 
 // These three are the package-local names for the caps and the truncation marker. They
 // are ALIASES of the canonical values in internal/logsafe rather than second copies,
@@ -71,25 +71,18 @@ const (
 	lagLabelOtherTopic = "other"
 )
 
-// sanitizeLogValue makes an untrusted string safe to log: it strips the characters that let
-// a value forge log structure, and it caps the length.
+// sanitizeLogValue makes an untrusted string safe to log: it strips the characters that
+// let a value forge log structure, and it caps the length.
 //
-// Both halves matter. Newlines and carriage returns become spaces because a value carrying
-// them SPLITS a line, and in a line-oriented log a forged newline followed by a plausible
-// prefix is a fabricated entry — this pipeline logs values that arrive from a broker and
-// from HTTP request parameters. Other control characters are removed because they corrupt
-// terminals and confuse structured-log parsers. The length cap then bounds what remains.
-//
-// Truncation is marked rather than silent, so nobody reads a shortened broker error as the
-// whole of it, and it happens on a RUNE boundary so a multi-byte character is never cut in
-// half into invalid UTF-8.
+// Both halves matter. Newlines and carriage returns become spaces because a value
+// carrying them SPLITS a line, and in a line-oriented log a forged newline followed by
+// a plausible prefix is a fabricated entry — this pipeline logs values that arrive from
+// a broker and from HTTP request parameters.
 //
 // Parameters:
 //   - value string: the untrusted text.
-//   - max int: the maximum number of runes to keep. Values below 1 yield an empty string.
-//
-// The implementation lives in internal/logsafe so that package api sanitizes request
-// values by exactly the same rules; this remains the name package blnk calls.
+//   - max int: the maximum number of runes to keep. Values below 1 yield an empty
+//     string.
 //
 // Returns:
 //   - string: the sanitized, bounded text.
@@ -97,25 +90,18 @@ func sanitizeLogValue(value string, max int) string {
 	return logsafe.Value(value, max)
 }
 
-// redactLogValue is sanitizeLogValue with NETWORK TOPOLOGY REDACTED: the rendering for a
-// dependency's own words when they arrive as a STRING rather than as an error.
+// redactLogValue is sanitizeLogValue with NETWORK TOPOLOGY REDACTED: the rendering for
+// a dependency's own words when they arrive as a STRING rather than as an error.
 //
-// It is to sanitizeLogValue what loggableCause is to an error, and the distinction is the
-// same one: sanitizeLogValue makes a value's FORM safe, while a broker or driver message
-// whose form is perfectly safe still names the broker's address, the resolver's address or
-// the connection string it failed on. That is reconnaissance for anybody who can read the
-// log and is not needed to know that the broker is unreachable.
-//
-// The reason it is needed at all is that not every failure reaches a log site as an error.
-// A dead-lettered event's reason has already been recorded — on the row's last_error and in
-// the dead-letter message's failure_metadata — before it is logged, so what the log site
-// holds is text. Those two durable copies deliberately keep the verbatim address, because
-// both are reachable only behind the master key; the LOG is the copy with the wider
-// audience, and it gets this rendering.
+// The reason it is needed at all is that not every failure reaches a log site as an
+// error. A dead-lettered event's reason has already been recorded — on the row's
+// last_error and in the dead-letter message's failure_metadata — before it is logged,
+// so what the log site holds is text.
 //
 // Parameters:
 //   - value string: the untrusted text.
-//   - max int: the maximum number of runes to keep. Values below 1 yield an empty string.
+//   - max int: the maximum number of runes to keep. Values below 1 yield an empty
+//     string.
 //
 // Returns:
 //   - string: the redacted, sanitized, bounded text.
@@ -125,13 +111,6 @@ func redactLogValue(value string, max int) string {
 
 // loggableCause renders an error for an operational log line at a normal level: control
 // characters stripped, NETWORK TOPOLOGY REDACTED, and length bounded.
-//
-// It exists as a distinct helper from sanitizeLogValue because the two protect against
-// different things and the difference is easy to lose. sanitizeLogValue makes a value's
-// FORM safe; a Kafka or database error whose form is perfectly safe still names the
-// broker's address, the resolver's address, or the connection string it failed on. That
-// is reconnaissance for anybody who can read the log, and it is not needed to know that
-// the broker is unreachable.
 //
 // Every operational log line in the event pipeline that carries a dependency's error
 // goes through here, and the verbatim text is reachable through the debug-level
@@ -159,12 +138,9 @@ func loggableCause(err error) string {
 // broker investigation needs, so the detail stays reachable behind an explicit,
 // auditable act (BLNK_LOG_LEVEL=debug) instead of being on by default.
 //
-// Using logrus.WithError instead is the defect this replaces: it renders err.Error()
-// verbatim into the "error" field at whatever level the line is emitted at.
-//
 // Parameters:
-//   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one so
-//     a caller never has to guard.
+//   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one
+//     so a caller never has to guard.
 //   - err error: the error to attach. A nil error leaves the entry untouched.
 //
 // Returns:
@@ -187,13 +163,13 @@ func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
 	return entry
 }
 
-// isRegistrySubscriberIdentifier reports whether a subscriber business identifier is one the
-// registry's canonical form admits.
+// isRegistrySubscriberIdentifier reports whether a subscriber business identifier is
+// one the registry's canonical form admits.
 //
-// It delegates to model.CanonicalizeSubscriberIdentifier rather than restating the rule,
-// because that function is the single definition the schema's CHECK constraints, the
-// repository and the Kafka principal derivation all agree on. A second opinion here is
-// exactly how a value could be measurable but unstorable, or vice versa.
+// It delegates to model.CanonicalizeSubscriberIdentifier rather than restating the
+// rule, because that function is the single definition the schema's CHECK constraints,
+// the repository and the Kafka principal derivation all agree on. A second opinion here
+// is exactly how a value could be measurable but unstorable, or vice versa.
 //
 // Parameters:
 //   - identifier string: the raw identifier, already trimmed by the caller.
@@ -206,17 +182,9 @@ func isRegistrySubscriberIdentifier(identifier string) bool {
 	return err == nil && canonical == identifier
 }
 
-// consumerGroupRoot reduces a runtime consumer group id to the subscriber-scoped root Blnk
-// issued, and reports whether the group lies inside a namespace Blnk reserves at all.
-//
-// A subscriber's runtime group id legitimately EXTENDS its namespace: the provisioned ACL
-// grants Read on the group with a prefixed pattern type, so a subscriber running three
-// consumer instances may commit under 'blnk-sub-<id>.worker-1' and siblings. Those are one
-// subscriber and must be ONE series — the alert says "this subscriber is behind", and
-// splitting it per worker suffix would both multiply the series and let each split sit below
-// the threshold while the subscriber as a whole was far past it. Reducing to the root also
-// drops the suffix, which is the only part of the string the subscriber chose and therefore
-// the only part that could carry a name.
+// consumerGroupRoot reduces a runtime consumer group id to the subscriber-scoped root
+// Blnk issued, and reports whether the group lies inside a namespace Blnk reserves at
+// all.
 //
 // Parameters:
 //   - group string: the raw, possibly suffixed consumer group id.
@@ -244,8 +212,8 @@ func consumerGroupRoot(group string) (string, bool) {
 	return model.SubscriberPrincipalNamespace + identifier, true
 }
 
-// isRegistryConsumerGroupID reports whether a consumer group id lies inside the namespace
-// Blnk reserves for a canonical subscriber identifier.
+// isRegistryConsumerGroupID reports whether a consumer group id lies inside the
+// namespace Blnk reserves for a canonical subscriber identifier.
 //
 // Parameters:
 //   - group string: the raw consumer group id, already trimmed by the caller.
@@ -258,46 +226,20 @@ func isRegistryConsumerGroupID(group string) bool {
 	return ok
 }
 
-// subscriberLagLabel resolves the 'subscriber' gauge attribute to a bounded, PSEUDONYMOUS
-// value.
+// subscriberLagLabel resolves the 'subscriber' gauge attribute to a bounded,
+// PSEUDONYMOUS value.
 //
-// # Why a tenant's own identifier must not be the label
-//
-// A metric label is the most widely readable thing this process emits. It is scraped into a
-// time-series database, rendered on dashboards, quoted in alert notifications and forwarded to
-// wherever those notifications go — a chat channel, an on-call phone, a paging vendor. A
-// subscriber identifier is a TENANT NAME: "acme-payments-eu" on a lag alert discloses to
-// everyone with dashboard access that Acme is a customer, roughly how much volume it consumes
-// and when its integration is unhealthy. None of those readers was granted access to the
-// ledger, and none of them needs the tenant's name to act.
-//
-// What monitoring actually needs from the label is that ONE SUBSCRIBER IS ONE SERIES: that
-// its lag can be tracked over time, alerted on, and told apart from every other
-// subscriber's. A stable hash gives exactly that. Correlating a series back to a tenant stays
-// possible for whoever holds the registry — hash the identifier and match — which is the right
-// place for that capability to live.
-//
-// # The two collapse tokens are NOT hashed
-//
-// "unattributed" and "unregistered" are classifications rather than identifiers: they say the
-// measurement had no subject, or a subject the registry does not admit. Hashing them would
-// turn two meaningful, greppable states into two opaque tokens and disclose nothing in
-// exchange, since neither is anyone's name.
-//
-// # This function is the SINGLE resolver, and that is a correctness requirement
-//
-// The collector clears a stale series by writing zero to the identical label tuple. If the
-// publish path and the clear path resolved a label differently, the clear would zero a tuple
-// nobody published and leave the real series standing at its last reading for ever — an alert
-// firing about a subscriber that no longer exists, which nothing could clear. Both paths call
-// this.
+// A metric label is the most widely readable thing this process emits. It is scraped
+// into a time-series database, rendered on dashboards, quoted in alert notifications
+// and forwarded to wherever those notifications go — a chat channel, an on-call phone,
+// a paging vendor.
 //
 // Parameters:
 //   - subscriber string: the raw subscriber id.
 //
 // Returns:
-//   - string: a stable pseudonymous token for a registry-admissible id, otherwise one of the
-//     two collapse tokens.
+//   - string: a stable pseudonymous token for a registry-admissible id, otherwise one
+//     of the two collapse tokens.
 func subscriberLagLabel(subscriber string) string {
 	trimmed := strings.TrimSpace(subscriber)
 	if trimmed == "" {
@@ -325,11 +267,12 @@ func consumerGroupLagLabel(group string) string {
 	}
 
 	if root, ok := consumerGroupRoot(trimmed); ok {
-		// PSEUDONYMISED for the reason the subscriber label is: a consumer group id is derived
-		// from the subscriber id, so publishing the group root publishes the tenant's name by
-		// another route and would defeat hashing the subscriber label beside it. The root is
-		// hashed rather than the raw group, so every group a subscriber runs still collapses to
-		// ONE series — which is what bounds the cardinality — and that series is stable.
+		// PSEUDONYMISED for the reason the subscriber label is: a consumer group id is
+		// derived from the subscriber id, so publishing the group root publishes the tenant's
+		// name by another route and would defeat hashing the subscriber label beside it. The
+		// root is hashed rather than the raw group, so every group a subscriber runs still
+		// collapses to ONE series — which is what bounds the cardinality — and that series is
+		// stable.
 		return hashLogIdentifier(root)
 	}
 
@@ -337,34 +280,26 @@ func consumerGroupLagLabel(group string) string {
 }
 
 // ---------------------------------------------------------------------------------------
-// OBS-16: a log line must carry the SAME pseudonym the metric carries
+// a log line must carry the SAME pseudonym the metric carries
 //
-// The two resolvers above pseudonymise the subscriber and the group for a metric label, for
-// the reasons documented on subscriberLagLabel. Log lines about the same measurements carried
-// the identifiers IN PLAINTEXT, length-bounded and nothing more — so every reason the label
-// was hashed applied verbatim to the log, and the log is the more widely shipped of the two.
-// Worse than merely leaking, the asymmetry made the two UNJOINABLE: a lag alert names a hash
-// and the log line explaining it named a tenant, so nothing tied the alert to its cause
-// without the registry in hand.
+// The two resolvers above pseudonymise the subscriber and the group for a metric label,
+// for the reasons documented on subscriberLagLabel. Log lines about the same
+// measurements carried the identifiers IN PLAINTEXT, length-bounded and nothing more —
+// so every reason the label was hashed applied verbatim to the log, and the log is the
+// more widely shipped of the two. Worse than merely leaking, the asymmetry made the two
+// UNJOINABLE: a lag alert names a hash and the log line explaining it named a tenant,
+// so nothing tied the alert to its cause without the registry in hand.
 //
-// The two functions below are what a log line uses. They resolve to the same token as the
-// metric label for every identifier the registry admits, which is the only case a pivot has
-// to work for, and they differ deliberately in one case:
+// The two functions below are what a log line uses. They resolve to the same token as
+// the metric label for every identifier the registry admits, which is the only case a
+// pivot has to work for, and they differ deliberately in one case:
 //
 //   - AN IDENTIFIER THE REGISTRY WOULD NOT ADMIT is HASHED here and collapsed to
-//     "unregistered" on the metric. The metric collapses it to bound cardinality — an
-//     unadmitted id is caller-shaped data and could take unbounded values — while a log line
-//     has no cardinality budget and does have to keep two different rogue identifiers apart,
-//     which one shared collapse token would destroy. Nothing is lost for the pivot, because
-//     an id the registry does not admit is not in the registry to be resolved.
-//
-// The pivot itself is published rather than described: SubscriberResponse carries
-// subscriber_id_hash, so GET /subscribers resolves a token from a log or an alert to the
-// subscriber, and docs/kafka-operations.md publishes the shell one-liner that computes the
-// same token from an identifier. See HashLogIdentifier for the rule.
+//     "unregistered" on the metric.
 // ---------------------------------------------------------------------------------------
 
-// subscriberLogLabel resolves a subscriber identifier to the pseudonym a LOG FIELD carries.
+// subscriberLogLabel resolves a subscriber identifier to the pseudonym a LOG FIELD
+// carries.
 //
 // Parameters:
 //   - subscriber string: the raw subscriber id. May be empty.
@@ -381,13 +316,13 @@ func subscriberLogLabel(subscriber string) string {
 	return hashLogIdentifier(trimmed)
 }
 
-// consumerGroupLogLabel resolves a consumer group identifier to the pseudonym a LOG FIELD
-// carries.
+// consumerGroupLogLabel resolves a consumer group identifier to the pseudonym a LOG
+// FIELD carries.
 //
-// The subscriber-scoped ROOT is hashed when the group has one, exactly as the metric label
-// does, so every group a subscriber runs resolves to one token and that token is the same on
-// both sides. A group with no recognisable root is hashed whole rather than collapsed, for the
-// reason OBS-16 documents above.
+// The subscriber-scoped ROOT is hashed when the group has one, exactly as the metric
+// label does, so every group a subscriber runs resolves to one token and that token is
+// the same on both sides. A group with no recognisable root is hashed whole rather than
+// collapsed, for the reason the banner above gives.
 //
 // Parameters:
 //   - group string: the raw, possibly suffixed group id. May be empty.
@@ -426,8 +361,8 @@ func topicLagLabel(topic string) string {
 
 	// Across every owned prefix. A subscriber authorised before a topic-prefix rename is
 	// still consuming the previous generation's topic while its rows drain, and collapsing
-	// that name would hide exactly the lag an operator managing the migration needs to see.
-	// The set stays bounded because the historical allowlist is bounded by
+	// that name would hide exactly the lag an operator managing the migration needs to
+	// see. The set stays bounded because the historical allowlist is bounded by
 	// config.MaxHistoricalTopicPrefixes.
 	for _, owned := range AllOwnedTopicsAcrossPrefixes() {
 		if trimmed == owned {

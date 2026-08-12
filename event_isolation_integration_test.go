@@ -16,122 +16,59 @@ limitations under the License.
 
 package blnk
 
-// This file owns ONE acceptance criterion and nothing else: subscriber isolation.
-//
-//	V-5 — "Credentials cannot read or list topics, partitions, or DLTs outside their
+//	"Credentials cannot read or list topics, partitions, or DLTs outside their
 //	       ACL grant."
 //
-// It proves that by provisioning a real Kafka principal through the real issuance path
-// and then, using that principal's OWN SASL/SCRAM credentials, attempting every read,
-// list, group and write operation that its grant does not cover — and requiring the
-// broker to refuse each one with a genuine authorization error.
-//
-// # THE MOST IMPORTANT THING IN THIS FILE
-//
-// This test is only meaningful against a broker configured with the KRaft
-// StandardAuthorizer. In KRaft mode a broker started WITHOUT
-//
-//	authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
-//
-// ACCEPTS EVERY ACL BINDING AND APPLIES NONE OF THEM. Provisioning succeeds, the bindings are
-// listable with kafka-acls, and every principal can read every topic — including every other
-// subscriber's topics and all the dead-letter topics.
-//
-// WHAT THAT DOES TO A TEST DEPENDS ENTIRELY ON WHAT THE TEST ASSERTS. A test that provisions a
-// principal and then checks that the expected bindings EXIST passes vacuously on such a broker:
-// the bindings are all there, and the test never asks whether they do anything. The assertions
-// below are not of that kind. They assert REFUSALS — a principal reading outside its grant must be
-// denied — so an unenforcing broker makes them FAIL rather than pass.
-//
-// That failure is the right outcome but a confusing one to debug, since it looks like an isolation
-// defect in Blnk rather than a broker that was never enforcing anything. So the broker's
-// configuration is PART OF THE CRITERION, and enforcement is established explicitly, twice, before
-// any isolation assertion is read. A failure of either is a TEST FAILURE naming the broker as the
-// cause — never a skip and never a silent pass:
+// That failure is the right outcome but a confusing one to debug, since it looks like
+// an isolation defect in Blnk rather than a broker that was never enforcing anything.
+// So the broker's configuration is PART OF THE CRITERION, and enforcement is
+// established explicitly, twice, before any isolation assertion is read.
 //
 //  1. DECLARATIVELY, by asking the broker: KafkaAdminClient.AuthorizerActive probes
 //     DescribeACLs and reports whether the broker answers SECURITY_DISABLED.
 //  2. EMPIRICALLY, by trying it: a freshly provisioned principal must actually be
-//     REFUSED on a topic outside its grant. A broker that allows that read has no
-//     enforcement regardless of what it claims, and eventIsolationRequireEnforcement
-//     fails the test with the reason spelled out.
+//     REFUSED on a topic outside its grant.
 //
-// ProvisionSubscriberPrincipal applies the same rule from the other side — it refuses to
-// write a credential at all unless enforcement is confirmed (its SEC-02 gate) — so an
-// issuance that fails with ErrAuthorizerNotEnforcing is likewise surfaced here as the
-// authorizer diagnostic rather than as an environment skip.
+// ProvisionSubscriberPrincipal applies the same rule from the other side — it refuses
+// to write a credential at all unless enforcement is confirmed — so an issuance that
+// fails with ErrAuthorizerNotEnforcing is likewise surfaced here as the authorizer
+// diagnostic rather than as an environment skip.
 //
-// docker-compose.yaml and docker-compose.dev.yaml both set authorizer.class.name to the KRaft
-// StandardAuthorizer in the server.properties their kafka service renders — grep for
-// authorizer.class.name rather than for a line number, which shifts — and
-// scripts/kafka-bootstrap.sh warns when the broker configuration it is pointed at does not.
-// All three exist for exactly the reason above.
+// The test SKIPS unless a broker is configured, so `go test -short ./...` — what `make
+// test` runs, and what CI depends on passing with no broker — is unaffected. To
+// actually run it:
 //
-// Note that those two services now sit behind the "kafka" Compose profile, so bringing the
-// broker up is `docker compose --profile kafka up -d kafka kafka-init` rather than a bare
-// `docker compose up`. Without the profile there is no broker and this test skips.
-//
-// # How to run it
-//
-// The test SKIPS unless a broker is configured, so `go test -short ./...` — what `make test` runs,
-// and what CI depends on passing with no broker — is unaffected. To actually run it:
-//
-//  1. Bring the local stack up:            docker compose --profile kafka up -d kafka kafka-init
+//  1. Bring the local stack up: docker compose --profile kafka up -d kafka kafka-init
 //     (or the equivalent for your stack; scripts/kafka-bootstrap.sh formats KRaft
-//     storage with the bootstrap SCRAM admin credential, and
-//     scripts/kafka-provision.sh creates the category topics and their .dlt siblings.)
+//     storage with the bootstrap SCRAM admin credential, and scripts/kafka-provision.sh
+//     creates the category topics and their .dlt siblings.)
 //  2. Export the administrative credentials, which are the same variables the service
-//     itself reads (AAP R-10) and are deliberately NOT hardcoded in this file:
+//     itself reads and are deliberately NOT hardcoded in this file:
 //
 //     export KAFKA_BROKERS=localhost:9092
 //     export KAFKA_SASL_ADMIN_USER=...
 //     export KAFKA_SASL_ADMIN_SECRET=...
 //     export KAFKA_INSECURE_LOCAL_DEV=true   # the local broker listens SASL_PLAINTEXT
 //
-//  3. go test -run TestEventIsolation -count=1 .
+//  3. go test -run TestEventIsolation -count=1.
 //
-// A missing broker, missing administrative credentials or unprovisioned topics are reported as
-// skips that NAME what is absent; a broker that is present but does not enforce ACLs is reported as
-// a FAILURE. The first means "this machine cannot answer the question", the second "the answer is
-// no".
+// The Kafka client here exists FOR VERIFICATION ONLY: Blnk ships no consumer library
+// and no subscriber-side error handling or dead-lettering. Nothing here may be promoted
+// into the package.
 //
-// KEEP THE `.` IN STEP 3. Those exported KAFKA_* variables are read by envconfig for the whole
-// process, so with them set the config and cmd package tests fail — they assert on configuration
-// loaded from a file, which envconfig then overrides. That is a pre-existing property of how this
-// repository loads configuration; it just means the two invocations do not mix. Under the
-// documented full-suite invocation every test here skips, which is intended rather than a gap.
+// The credential this test mints is RETURNED BY ISSUANCE AND NEVER PERSISTED: the
+// registry keeps a non-reversible reference and an issuance timestamp, so once the
+// issuance result is discarded the secret cannot be retrieved from Blnk at all. It
+// lives only in this test's memory for the lifetime of the result value, and the
+// accessor on that value may be read as often as the test needs — "issued once" is a
+// statement about where the secret is stored, not a one-shot read.
 //
-// # Scope boundary
-//
-// The Kafka client here exists FOR VERIFICATION ONLY: Blnk ships no consumer library and no
-// subscriber-side error handling or dead-lettering, which is an explicit MUST NOT of the
-// requirement (AAP §0.1.2, §0.6.2). Nothing here may be promoted into the package.
-//
-// Owned elsewhere: ordering (V-6) by event_ordering_integration_test.go, crash recovery (V-7) by
-// event_recovery_integration_test.go, dual delivery and replay (V-8, V-9) by
-// event_dual_delivery_test.go and event_replay_fidelity_test.go, and the HTTP credential endpoint
-// with its master-key gate by api/subscribers_api_test.go.
-//
-// # Secret handling
-//
-// The credential this test mints is RETURNED BY ISSUANCE AND NEVER PERSISTED: the registry keeps a
-// non-reversible reference and an issuance timestamp, so once the issuance result is discarded the
-// secret cannot be retrieved from Blnk at all. It lives only in this test's memory for the
-// lifetime of the result value, and the accessor on that value may be read as often as the test
-// needs — "issued once" is a statement about where the secret is stored, not a one-shot read.
-//
-// It is never logged, never written to a file or a fixture, and never placed in an assertion
-// message or a failure operand: assertions about it are boolean predicates with secret-free
-// messages rather than NotContains, because a failing NotContains prints both operands. The
-// principal and its bindings are revoked in teardown so a leaked SCRAM user cannot accumulate in
-// the broker's metadata log and make a later run pass for the wrong reason.
-//
-// # Conventions this file follows
-//
-// The repository's own: tests beside the source they exercise, package blnk,
-// Test<Subject>_<Behaviour> naming, testify assertions, a short-mode guard as
-// lineage_integration_test.go uses, the Apache-2.0 header above, and the secret-handling posture
-// described just above.
+// It is never logged, never written to a file or a fixture, and never placed in an
+// assertion message or a failure operand: assertions about it are boolean predicates
+// with secret-free messages rather than NotContains, because a failing NotContains
+// prints both operands. The principal and its bindings are revoked in teardown so a
+// leaked SCRAM user cannot accumulate in the broker's metadata log and make a later run
+// pass for the wrong reason.
 
 import (
 	"context"
@@ -164,21 +101,12 @@ import (
 )
 
 // Every identifier in this file carries the eventIsolation prefix.
-//
-// package blnk is one namespace shared by the whole root package and by its sibling
-// integration tests, several of which are authored alongside this one. A helper called
-// something as tempting as `provision` or `subscriberClient` would collide the moment a
-// neighbour reached for the same obvious name, and a redeclaration breaks the build for
-// every test in the package rather than just this file.
 
 // The environment variables this test reads. They are the SAME variables the service
-// itself reads (AAP R-10), so a machine that can run Blnk against Kafka can run this
-// test with no extra configuration.
+// itself reads, so a machine that can run Blnk against Kafka can run this test with no
+// extra configuration.
 //
-// The administrative secret is deliberately NOT defaulted. A plausible-looking default
-// in a committed test file is a credential in the repository, and the fact that it only
-// works against a local broker today is not a property anybody can rely on tomorrow. An
-// absent secret is an environment gap and is reported as a skip that names the variable.
+// The administrative secret is deliberately NOT defaulted.
 const (
 	eventIsolationBrokersEnv           = "KAFKA_BROKERS"
 	eventIsolationSubscriberBrokersEnv = "KAFKA_SUBSCRIBER_BROKERS"
@@ -193,15 +121,14 @@ const (
 	eventIsolationInsecureLocalDevEnv  = "KAFKA_INSECURE_LOCAL_DEV"
 )
 
-// Timeouts. Every broker operation in this file runs under an explicit deadline, because
-// the failure mode worth designing against is not a refusal — a refusal is the answer the
-// test wants — but a broker that accepts the connection and then stops answering. Without
-// a deadline that hangs the whole package until the go test timeout kills it with no
-// diagnostic at all.
+// Timeouts. Every broker operation in this file runs under an explicit deadline,
+// because the failure mode worth designing against is not a refusal — a refusal is the
+// answer the test wants — but a broker that accepts the connection and then stops
+// answering.
 const (
-	// eventIsolationSetupTimeout bounds registration, issuance and the enforcement
-	// probes. It is generously larger than SubscriberCredentialIssuanceBudget so that a
-	// budget overrun is observed and asserted rather than masked by this deadline.
+	// eventIsolationSetupTimeout bounds registration, issuance and the enforcement probes.
+	// It is generously larger than SubscriberCredentialIssuanceBudget so that a budget
+	// overrun is observed and asserted rather than masked by this deadline.
 	eventIsolationSetupTimeout = 30 * time.Second
 
 	// eventIsolationOperationTimeout bounds one authorization probe. A broker answers an
@@ -209,8 +136,8 @@ const (
 	eventIsolationOperationTimeout = 15 * time.Second
 
 	// eventIsolationTeardownTimeout bounds revocation. Teardown runs on a fresh context
-	// rather than the test's, because the test context is usually already cancelled by
-	// the time cleanup runs and a cancelled context cannot revoke anything.
+	// rather than the test's, because the test context is usually already cancelled by the
+	// time cleanup runs and a cancelled context cannot revoke anything.
 	eventIsolationTeardownTimeout = 20 * time.Second
 
 	// eventIsolationDialTimeout bounds the reachability probe and every client dial.
@@ -220,27 +147,23 @@ const (
 	// assert authorization, not delivery, so they must not block for data.
 	eventIsolationFetchWait = 500 * time.Millisecond
 
-	// eventIsolationSettleTimeout bounds every wait for BROKER STATE TO CATCH UP, as opposed
-	// to a wait for an answer.
+	// eventIsolationSettleTimeout bounds every wait for BROKER STATE TO CATCH UP, as
+	// opposed to a wait for an answer.
 	//
-	// A KRaft broker holds SCRAM credentials and group coordination in its metadata log, and
-	// both become usable slightly after the administrative call that created them returns.
-	// Three things in this file were racing that gap and failing on a COLD broker while
-	// passing on a warm one — the worst possible shape, because CI always starts cold:
+	// A KRaft broker holds SCRAM credentials and group coordination in its metadata log,
+	// and both become usable slightly after the administrative call that created them
+	// returns. Three things in this file were racing that gap and failing on a COLD broker
+	// while passing on a warm one — the worst possible shape, because CI always starts
+	// cold:
 	//
-	//   - The FIRST authenticated request made with a just-minted credential answered
-	//     [58] SASL Authentication Failed.
-	//   - The first consumer-group request answered [16] Not Coordinator For Group, because
-	//     with auto.create.topics.enable=false the internal __consumer_offsets topic does
-	//     not exist until some client performs group activity, and provisioning creates only
-	//     the eight blnk.* topics.
+	//   - The FIRST authenticated request made with a just-minted credential answered [58]
+	//     SASL Authentication Failed.
+	//   - The first consumer-group request answered [16] Not Coordinator For Group,
+	//     because with auto.create.topics.enable=false the internal __consumer_offsets
+	//     topic does not exist until some client performs group activity, and provisioning
+	//     creates only the eight blnk.* topics.
 	//   - Teardown read the credential list immediately after revoking and reported a LEAK
 	//     that the same run's own log showed had been revoked.
-	//
-	// It is deliberately much larger than the propagation actually takes. Nothing waits the
-	// whole window unless something is wrong, and when something IS wrong the diagnostic is
-	// the same either way — so the cost of being generous is zero and the cost of being tight
-	// is a flake.
 	eventIsolationSettleTimeout = 30 * time.Second
 
 	// eventIsolationSettleInterval is how often a settle wait re-probes.
@@ -267,9 +190,7 @@ type eventIsolationEnvironment struct {
 // or explains what is missing.
 //
 // It returns a REASON rather than calling t.Skip itself so that the caller decides
-// whether an absent value is a skip or a failure. That distinction is the whole point of
-// the guard sequence in eventIsolationSetup: "no broker" and "a broker that does not
-// enforce ACLs" must never be reported the same way.
+// whether an absent value is a skip or a failure.
 func eventIsolationResolveEnvironment(t *testing.T) (eventIsolationEnvironment, string, bool) {
 	t.Helper()
 
@@ -283,15 +204,6 @@ func eventIsolationResolveEnvironment(t *testing.T) (eventIsolationEnvironment, 
 
 	// THE SUBSCRIBER-FACING LIST IS A SEPARATE REQUIREMENT, and it is deliberately NOT
 	// defaulted to the list above.
-	//
-	// A credential names the addresses the subscriber will connect to, and those are the
-	// broker's EXTERNAL listener — which in a real deployment is not the internal bootstrap
-	// list the relay uses. Issuance therefore refuses when it is unset rather than falling
-	// back, so that a deployment cannot hand out its internal addresses by omission. This
-	// fixture must not paper over that: defaulting it here would make the test pass while
-	// the production refusal it depends on went unexercised, and the day the refusal broke
-	// nothing would notice. It is set by .env.example and by both compose files for the
-	// local stack, so a machine that can run Blnk against Kafka already has it.
 	subscriberBrokers := eventIsolationSplitBrokers(os.Getenv(eventIsolationSubscriberBrokersEnv))
 	if len(subscriberBrokers) == 0 {
 		return eventIsolationEnvironment{}, fmt.Sprintf(
@@ -328,10 +240,10 @@ func eventIsolationResolveEnvironment(t *testing.T) (eventIsolationEnvironment, 
 			ServerName: strings.TrimSpace(os.Getenv(eventIsolationTLSServerNameEnv)),
 		},
 		// NewKafkaTransport refuses to dial in the clear unless this is set, which is the
-		// right default for production and exactly what the local single-broker KRaft
-		// stack needs waived: it listens on SASL_PLAINTEXT and nothing else. Defaulting
-		// it to true ONLY when TLS is off keeps the waiver scoped to the case that needs
-		// it, and an operator running against a TLS broker never sees it applied.
+		// right default for production and exactly what the local single-broker KRaft stack
+		// needs waived: it listens on SASL_PLAINTEXT and nothing else. Defaulting it to true
+		// ONLY when TLS is off keeps the waiver scoped to the case that needs it, and an
+		// operator running against a TLS broker never sees it applied.
 		InsecureLocalDev: eventIsolationBoolEnv(eventIsolationInsecureLocalDevEnv, !tlsEnabled),
 	}
 
@@ -345,8 +257,7 @@ func eventIsolationResolveEnvironment(t *testing.T) (eventIsolationEnvironment, 
 //
 // A trailing comma in KAFKA_BROKERS otherwise yields an empty element, which kafka-go
 // canonicalises to ":9092" and then dials on the local host — a failure that names no
-// broker. Dropping blanks here is what keeps "not configured" distinguishable from
-// "configured with something unusable".
+// broker.
 func eventIsolationSplitBrokers(raw string) []string {
 	brokers := make([]string, 0, 1)
 	for _, candidate := range strings.Split(raw, ",") {
@@ -398,18 +309,6 @@ func eventIsolationIntEnv(name string, fallback int) int {
 
 // eventIsolationPublishConfiguration publishes cnf to config.ConfigStore and restores
 // whatever was there when the test finishes.
-//
-// The topic-naming layer reads the prefix from the process-global configuration store on
-// every call, so the names this test asserts on are only the names the broker was
-// provisioned with if the store agrees. Publishing is therefore not a convenience — it is
-// what makes TopicForCategory return the right topic.
-//
-// The restore matters just as much. config.ConfigStore is a process-global atomic.Value
-// shared with every other test in the package, so leaving a Kafka-configured state behind
-// would change unrelated tests' behaviour depending on run order. It follows the same
-// save-and-restore shape event_outbox_test.go established, including publishing an empty
-// configuration when nothing was there before: atomic.Value cannot be reset to nil, and
-// an empty configuration is strictly closer to the original state than this one.
 func eventIsolationPublishConfiguration(t *testing.T, cnf *config.Configuration) {
 	t.Helper()
 
@@ -427,44 +326,33 @@ func eventIsolationPublishConfiguration(t *testing.T, cnf *config.Configuration)
 	config.ConfigStore.Store(cnf)
 }
 
-// eventIsolationKeyScopeGatewayBrokers is the address a declared key-authorising component
-// listens on, for the tests that need one declared.
+// eventIsolationKeyScopeGatewayBrokers is the address a declared key-authorising
+// component listens on, for the tests that need one declared.
 //
-// TWO PROPERTIES MATTER AND BOTH ARE DELIBERATE. It is UNROUTABLE, because no probe in this file
-// dials it — Blnk ships no component to run there, so the only thing a test can assert is which
-// address a credential NAMES. And it is DISTINCT from env.kafka.Brokers, because
-// config.KafkaConfig.KeyScopeGateway treats a gateway list equal to the broker list as NOT
-// enforcing: a declaration pointing at the brokers would send subscribers straight to the place
-// nothing evaluates keys, so it is read as no declaration at all.
+// TWO PROPERTIES MATTER. It is UNROUTABLE, because no probe here dials it — Blnk ships no
+// component to run there, so all a test can assert is which address a credential NAMES.
+// And it is DISTINCT from env.kafka.Brokers, because config.KafkaConfig.KeyScopeGateway
+// reads a gateway list equal to the broker list as NOT enforcing.
 var eventIsolationKeyScopeGatewayBrokers = []string{"keyscope-gateway.invalid:9095"}
 
-// eventIsolationDeclareKeyScopeGateway republishes the fixture's configuration with key-scope
-// enforcement DECLARED, and returns the gateway list it declared.
+// eventIsolationDeclareKeyScopeGateway republishes the fixture's configuration with
+// key-scope enforcement DECLARED, and returns the gateway list it declared.
 //
-// # Why a key-scoped test cannot skip this
-//
-// Issuance REFUSES a subscriber recording a partition_key_prefix unless the deployment has declared
-// a component that authorises record keys, because Blnk ships none and serves no records itself:
-// the only credentials it could otherwise mint are one carrying whole-topic Read beside a prefix
-// nothing applies, or one that can fetch nothing at all. So a test that needs a key-scoped
-// principal to EXIST at the broker declares one here first.
-//
-// What this does not do is make the prefix enforced. Nothing listens on the declared address, and
-// nothing needs to: the properties these tests own are Blnk's own — the narrowed broker-side grant
-// (Describe, no Read), the authorizer refusing the principal's own fetch, and the endpoint the
-// credential names. Per-record filtering belongs to whatever a deployment really runs there.
-//
-// The restore is eventIsolationPublishConfiguration's, so the process-global store is returned to
-// whatever the fixture published before this call.
+// Issuance REFUSES a subscriber recording a partition_key_prefix unless the deployment
+// has declared a component that authorises record keys, because Blnk ships none and
+// serves no records itself: the only credentials it could otherwise mint are one
+// carrying whole-topic Read beside a prefix nothing applies, or one that can fetch
+// nothing at all. So a test that needs a key-scoped principal to EXIST at the broker
+// declares one here first.
 //
 // Parameters:
 //   - t *testing.T: for the helper marker and the configuration restore.
-//   - fixture *eventIsolationFixture: supplies the environment's Kafka configuration, which is
-//     republished with only the two key-scope fields added.
+//   - fixture *eventIsolationFixture: supplies the environment's Kafka configuration,
+//     which is republished with only the two key-scope fields added.
 //
 // Returns:
-//   - []string: the declared gateway bootstrap list, which is what a key-scoped credential must
-//     report in place of the subscriber-facing brokers.
+//   - []string: the declared gateway bootstrap list, which is what a key-scoped
+//     credential must report in place of the subscriber-facing brokers.
 func eventIsolationDeclareKeyScopeGateway(t *testing.T, fixture *eventIsolationFixture) []string {
 	t.Helper()
 
@@ -473,29 +361,21 @@ func eventIsolationDeclareKeyScopeGateway(t *testing.T, fixture *eventIsolationF
 	return gateway
 }
 
-// eventIsolationDeclareKeyScopeGatewayWithDouble is the same declaration, returning the CONTROL
-// double as well so a test can assert what Blnk registered at it.
+// eventIsolationDeclareKeyScopeGatewayWithDouble is the same declaration, returning the
+// CONTROL double as well so a test can assert what Blnk registered at it.
 //
-// # Why the declaration now includes a control endpoint
-//
-// A mode and a distinct bootstrap list are assertions a deployment makes about itself, and any
-// address satisfies them. Issuance therefore BINDS the recorded prefix at the component's control
-// endpoint over an authenticated call and requires it to attest that exact binding before a secret
-// exists; a declaration with no usable endpoint is read as no declaration, and a key-scoped
-// subscriber is refused (SEC-01).
-//
-// So this helper starts the conformance double from event_keyscope_gateway_test.go and declares
-// its endpoint. The double is a CONTROL plane only, which is why the declared BROKER address stays
-// unroutable: no probe in this file dials it, because Blnk ships nothing to run there, and the
-// record-filtering half belongs to whatever a deployment really operates.
+// A mode and a distinct bootstrap list are assertions a deployment makes about itself,
+// and any address satisfies them.
 //
 // Parameters:
-//   - t *testing.T: for the helper marker, the double's lifetime and the configuration restore.
+//   - t *testing.T: for the helper marker, the double's lifetime and the configuration
+//     restore.
 //   - fixture *eventIsolationFixture: supplies the environment's Kafka configuration.
 //
 // Returns:
 //   - []string: the declared gateway bootstrap list.
-//   - *keyScopeGatewayDouble: the control component, for assertions about the binding it holds.
+//   - *keyScopeGatewayDouble: the control component, for assertions about the binding
+//     it holds.
 func eventIsolationDeclareKeyScopeGatewayWithDouble(
 	t *testing.T,
 	fixture *eventIsolationFixture,
@@ -528,9 +408,7 @@ func eventIsolationDeclareKeyScopeGatewayWithDouble(
 //
 // It is a plain dial rather than a Kafka round trip on purpose: this question is only
 // "is there something listening?", and answering it without SASL keeps an unreachable
-// broker distinguishable from a broker that rejects the administrative credentials. The
-// first is an environment gap and skips; the second is a real misconfiguration and fails
-// later, when an administrative call reports it.
+// broker distinguishable from a broker that rejects the administrative credentials.
 func eventIsolationRequireBroker(t *testing.T, address string) {
 	t.Helper()
 
@@ -548,20 +426,10 @@ func eventIsolationRequireBroker(t *testing.T, address string) {
 
 // eventIsolationRequireAuthorizer FAILS the test when the broker does not enforce ACLs.
 //
-// # Why this is a failure and not a skip
-//
-// A skip says "this machine cannot answer the question". That is true of a missing broker
-// and it is emphatically NOT true here: the broker answered, and the answer was that
-// nothing is being checked. Skipping would file the most dangerous possible finding — a
-// deployment whose subscriber boundaries do not exist — under "not run", where nobody
-// looks. Failing puts it in front of the person who can fix it, with the remedy in the
-// message.
-//
-// Both failure modes are fatal and for the same reason. SECURITY_DISABLED means there is
-// no boundary. A probe that cannot be answered means the boundary is unverifiable, and
-// from the point of view of the credential this test is about to mint, unverifiable and
-// absent are indistinguishable — so they are treated identically, exactly as
-// KafkaAdminClient.requireEnforcedAuthorizer treats them.
+// A skip would say "this machine cannot answer the question", and that is the wrong
+// answer: a broker that answers but authorises everything makes every isolation
+// assertion below pass vacuously. An unreachable broker and an unenforcing one are
+// therefore both fatal.
 func eventIsolationRequireAuthorizer(t *testing.T, ctx context.Context, admin *KafkaAdminClient) {
 	t.Helper()
 
@@ -591,16 +459,11 @@ func eventIsolationRequireAuthorizer(t *testing.T, ctx context.Context, admin *K
 	}
 }
 
-// eventIsolationRequireTopics skips the test when the topics it needs are not provisioned.
+// eventIsolationRequireTopics skips the test when the topics it needs are not
+// provisioned.
 //
 // It runs AFTER the authorizer check, and that order is deliberate: a provisioning gap
-// must never be able to mask a broker with no enforcement. If the topic check came first,
-// a stack whose topics were missing AND whose authorizer was absent would report the
-// harmless problem and stay silent about the dangerous one.
-//
-// Existence is established with the ADMINISTRATIVE client, which is also what makes the
-// non-disclosure assertions later in this file meaningful: when a subscriber is told a
-// topic does not exist, this call has already proven that it does.
+// must never be able to mask a broker with no enforcement.
 func eventIsolationRequireTopics(
 	t *testing.T,
 	ctx context.Context,
@@ -611,7 +474,7 @@ func eventIsolationRequireTopics(
 
 	// A zero instant asks for end offsets only: this probe cares whether the topics EXIST,
 	// not how much of their content is recent, and asking for a window would add a
-	// ListOffsets round trip whose answer nothing here reads (PERF-P05).
+	// ListOffsets round trip whose answer nothing here reads.
 	report, err := admin.TopicEndOffsets(ctx, time.Time{}, topics...)
 	if err != nil {
 		t.Skipf(
@@ -640,33 +503,23 @@ func eventIsolationRequireTopics(
 
 // eventIsolationStore is an in-memory eventSubscriberStore.
 //
-// The property under test lives entirely at the BROKER — does the authorizer refuse a principal the
-// operations its grant does not cover? — so Postgres contributes nothing, and the registry's own
-// persistence is covered by database/event_subscriber_test.go. It would also get in the way:
-// database.GetDBConnection memoises its connection in a sync.Once, so a real datasource here would
-// make this file depend on which test constructed one first, and a registry row outliving a failed
-// run is a second thing to clean up in a teardown that already reaches into a metadata log.
-//
-// Issuance still goes through the real EventSubscriberService.IssueSubscriberCredential, which mints
-// the SCRAM credential and binds the ACLs through KafkaAdminClient as production does; only the row
-// underneath is local. The store contract is mirrored faithfully because that path branches on it: a
-// missing subscriber must report apierror.ErrSubscriberNotFound, and a credential reference that
-// changed under an in-flight issuance must report apierror.ErrConflict rather than overwriting —
-// the same codes database/event_subscriber.go returns.
+// The property under test lives entirely at the BROKER — does the authorizer refuse a
+// principal the operations its grant does not cover?
 type eventIsolationStore struct {
 	mu   sync.Mutex
 	rows map[string]model.EventSubscriber
 
 	// fences mirrors the provisioning_token / provisioning_until pair the real table
 	// carries. It is a SEPARATE map rather than two fields on the row because the
-	// repository deliberately does not project those columns into
-	// model.EventSubscriber — that struct is serialised into API responses, and a live
-	// claim token in a response body would be an internal lock handed to a caller.
+	// repository deliberately does not project those columns into model.EventSubscriber —
+	// that struct is serialised into API responses, and a live claim token in a response
+	// body would be an internal lock handed to a caller.
 	fences map[string]eventIsolationFence
 
 	// obligations mirrors the five settlement columns, and is a separate map for the same
-	// reason fences is: they are operational bookkeeping the repository deliberately does not
-	// project into model.EventSubscriber, because that struct is serialised into API responses.
+	// reason fences is: they are operational bookkeeping the repository deliberately does
+	// not project into model.EventSubscriber, because that struct is serialised into API
+	// responses.
 	obligations map[string]eventIsolationObligation
 }
 
@@ -709,13 +562,6 @@ func eventIsolationSubscriberNotFound(subscriberID string) error {
 	)
 }
 
-// seedLegacyKeyScope WAS RETIRED HERE. It wrote a partition_key_prefix straight onto a stored row,
-// bypassing validation, so a test could model a subscriber that already carried a key scope.
-//
-// That was only necessary while recording a key scope was REFUSED: with no way to ask for one, a
-// row holding one could only be manufactured. Registration now issues the scope and discloses that
-// the broker does not enforce it, so a test that needs a key-scoped subscriber registers one — and
-// a fixture built the way production builds it is worth more than one built behind its back.
 func (s *eventIsolationStore) clone(row model.EventSubscriber) *model.EventSubscriber {
 	copied := row
 	copied.AuthorizedTopics = append([]string(nil), row.AuthorizedTopics...)
@@ -823,14 +669,11 @@ func (s *eventIsolationStore) ListEventSubscribers(
 	return page, nil
 }
 
-// UpdateEventSubscriber replaces the mutable columns of an existing row, under the caller's
-// provisioning claim and only while the row is not tombstoned for deregistration.
+// UpdateEventSubscriber replaces the mutable columns of an existing row, under the
+// caller's provisioning claim and only while the row is not tombstoned for
+// deregistration.
 //
-// Both predicates are reproduced rather than simplified. They are what stop a caller whose
-// lease expired from overwriting the authorization a new owner reconciled with the broker, and
-// what stop an update from WIDENING the topic set of a subscriber whose revocation is already in
-// flight — and a fake that omitted them would let a test asserting either property pass against
-// a store that does not enforce it.
+// Both predicates are reproduced rather than simplified.
 func (s *eventIsolationStore) UpdateEventSubscriber(
 	_ context.Context,
 	subscriber *model.EventSubscriber,
@@ -892,12 +735,6 @@ func (s *eventIsolationStore) TakeEventSubscriber(
 
 // RecordSubscriberCredentialIfUnchanged persists an issuance only while the row still
 // holds the reference observed before provisioning.
-//
-// The conditional is the point, and it is reproduced rather than simplified: it is what
-// makes a concurrent re-issue report a conflict instead of overwriting the record of the
-// secret that actually works. The reference is validated the way the repository validates
-// it, so a caller that passed a raw secret in this argument by mistake is refused here as
-// well — and, as there, the offending value is never echoed.
 func (s *eventIsolationStore) RecordSubscriberCredentialIfUnchanged(
 	_ context.Context,
 	subscriberID string,
@@ -1284,9 +1121,8 @@ func (s *eventIsolationStore) PurgeMigratedSubscriberWebhookURLs(
 // MarkSubscriberRevocationPending stamps the revocation tombstone and returns the row.
 //
 // The repository keeps the FIRST instant on a re-mark (COALESCE), because the value an
-// operator needs is how long the revocation has been outstanding rather than the age of the
-// last attempt. This mirror does the same, so a test that retries a deregistration sees the
-// same timestamp it saw the first time.
+// operator needs is how long the revocation has been outstanding rather than the age of
+// the last attempt.
 //
 // Parameters:
 //   - _ context.Context: unused; the store is local.
@@ -1295,8 +1131,10 @@ func (s *eventIsolationStore) PurgeMigratedSubscriberWebhookURLs(
 //   - fenceToken string: the provisioning claim the caller holds.
 //
 // Returns:
-//   - *model.EventSubscriber: the marked row, carrying the principal and topics to revoke.
-//   - error: ErrSubscriberNotFound when absent, ErrConflict when the claim is not the caller's.
+//   - *model.EventSubscriber: the marked row, carrying the principal and topics to
+//     revoke.
+//   - error: ErrSubscriberNotFound when absent, ErrConflict when the claim is not the
+//     caller's.
 func (s *eventIsolationStore) MarkSubscriberRevocationPending(
 	_ context.Context,
 	subscriberID string,
@@ -1329,12 +1167,8 @@ func (s *eventIsolationStore) MarkSubscriberRevocationPending(
 // ClaimSubscriberForProvisioning fences a subscriber for one issuance or revocation.
 //
 // The two refusal branches are kept distinct exactly as the repository keeps them: a
-// subscriber that was never registered reports ErrSubscriberNotFound, and one that exists
-// under a live claim reports ErrConflict. Collapsing them would send a caller looking for a
-// race that did not happen.
-//
-// An EXPIRED claim is not a conflict. That is what stops one crashed issuance from fencing a
-// subscriber permanently, and it is the property the fence's whole design rests on.
+// subscriber that was never registered reports ErrSubscriberNotFound, and one that
+// exists under a live claim reports ErrConflict.
 //
 // Parameters:
 //   - _ context.Context: unused; the store is local.
@@ -1397,10 +1231,10 @@ func (s *eventIsolationStore) ReleaseSubscriberProvisioningFence(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// THE SHARED PREDICATE, which is token AND LEASE. Each of these three sites tested the token
-	// alone, so an EXPIRED claim was accepted as held — and the production statements carry
-	// `provisioning_until > NOW()` in the write itself, so the fake was modelling a permission the
-	// database does not grant.
+	// THE SHARED PREDICATE, which is token AND LEASE. Each of these three sites tested the
+	// token alone, so an EXPIRED claim was accepted as held — and the production
+	// statements carry `provisioning_until > NOW()` in the write itself, so the fake was
+	// modelling a permission the database does not grant.
 	key := strings.TrimSpace(subscriberID)
 	if err := s.requireFenceLocked(subscriberID, token, "releasing the provisioning claim"); err != nil {
 		return err
@@ -1413,9 +1247,7 @@ func (s *eventIsolationStore) ReleaseSubscriberProvisioningFence(
 
 // RenewSubscriberProvisioningFence extends a claim the caller still holds.
 //
-// It is CONDITIONAL and it does NOT re-claim, exactly as the repository's is. A caller whose
-// lease was taken over must learn it no longer owns the subscriber rather than be handed it
-// back, because the new owner is mid-flight against the broker.
+// It is CONDITIONAL and it does NOT re-claim, exactly as the repository's is.
 //
 // Parameters:
 //   - _ context.Context: unused; the store is local.
@@ -1512,8 +1344,8 @@ func (s *eventIsolationStore) fencedWriteGuardLocked(
 // eventIsolationReferencesMatch compares a stored credential reference with the one an
 // issuance observed before it started.
 //
-// Two nils match — that is the first-issuance case — and a nil on one side only does not,
-// which is the race the conditional write exists to catch.
+// Two nils match — that is the first-issuance case — and a nil on one side only does
+// not, which is the race the conditional write exists to catch.
 func eventIsolationReferencesMatch(stored, expected *string) bool {
 	switch {
 	case stored == nil && expected == nil:
@@ -1539,18 +1371,16 @@ type eventIsolationFixture struct {
 	service *EventSubscriberService
 	store   *eventIsolationStore
 
-	// grantable is every category topic, in the order EventTopics
-	// composes them. The fixture asserts there are at least two so that one can be
-	// granted and another deliberately withheld.
+	// grantable is every category topic, in the order EventTopics composes them. The
+	// fixture asserts there are at least two so that one can be granted and another
+	// deliberately withheld.
 	grantable []string
 }
 
 // eventIsolationSetup performs the whole guard sequence and returns a prepared fixture.
 //
-// # The order of these checks is the safety property
-//
-//  1. SHORT MODE. `make test` runs `go test -short ./...` and CI depends on it passing with
-//     no broker in sight, so short mode skips before anything dials.
+//  1. SHORT MODE. `make test` runs `go test -short ./...` and CI depends on it passing
+//     with no broker in sight, so short mode skips before anything dials.
 //  2. CONFIGURATION. Absent broker or administrative credentials is an environment gap:
 //     skip, naming the variable.
 //  3. REACHABILITY. Nothing listening is an environment gap: skip, naming the address.
@@ -1643,23 +1473,19 @@ type eventIsolationPrincipal struct {
 	client *kafka.Client
 
 	// issuanceDuration is how long IssueSubscriberCredential took, so the 5-second budget
-	// of requirement R-7 is assertable.
+	// of the requirement is assertable.
 	issuanceDuration time.Duration
 }
 
-// eventIsolationProvision registers a subscriber with a NARROW grant and issues its credential
-// through the real production path.
+// eventIsolationProvision registers a subscriber with a NARROW grant and issues its
+// credential through the real production path.
 //
-// Calling KafkaAdminClient.ProvisionSubscriberPrincipal directly would test the ACL arithmetic and
-// skip everything a subscriber's boundary depends on: the grant validation that refuses a
-// dead-letter topic or a wildcard, the principal and consumer-group derivation, the enforcement
-// gate, the five-second budget, and the compensation that revokes a credential whose bindings
-// failed. So issuance goes through EventSubscriberService.IssueSubscriberCredential.
-//
-// The identifier is UUID-derived because a SCRAM credential and its bindings live in the broker's
-// metadata log, which outlives the test process: a fixed identifier would collide between
-// concurrent runs and could let a binding left behind by an earlier run satisfy a later run's
-// assertions — a test passing on someone else's grant.
+// Calling KafkaAdminClient.ProvisionSubscriberPrincipal directly would test the ACL
+// arithmetic and skip everything a subscriber's boundary depends on: the grant
+// validation that refuses a dead-letter topic or a wildcard, the principal and
+// consumer-group derivation, the enforcement gate, the five-second budget, and the
+// compensation that revokes a credential whose bindings failed. So issuance goes
+// through EventSubscriberService.IssueSubscriberCredential.
 func eventIsolationProvision(
 	t *testing.T,
 	ctx context.Context,
@@ -1699,11 +1525,11 @@ func eventIsolationProvision(
 	elapsed := time.Since(started)
 
 	if err != nil {
-		// The one failure mode that must be reported as the authorizer diagnostic rather
-		// than as an ordinary provisioning error: ProvisionSubscriberPrincipal refuses to
-		// write a credential against a broker whose ACL enforcement is not confirmed. It
-		// is the same finding eventIsolationRequireAuthorizer reports, arriving from the
-		// other side, and it is still a failure and still never a skip.
+		// The one failure mode that must be reported as the authorizer diagnostic rather than
+		// as an ordinary provisioning error: ProvisionSubscriberPrincipal refuses to write a
+		// credential against a broker whose ACL enforcement is not confirmed. It is the same
+		// finding eventIsolationRequireAuthorizer reports, arriving from the other side, and
+		// it is still a failure and still never a skip.
 		if errors.Is(err, ErrAuthorizerNotEnforcing) {
 			t.Fatalf(
 				"THE BROKER REFUSED TO ISSUE A SUBSCRIBER CREDENTIAL because its ACL enforcement is not "+
@@ -1719,10 +1545,10 @@ func eventIsolationProvision(
 
 	client := eventIsolationClient(t, fixture.env, credential)
 
-	// The credential exists in the broker's metadata log; it is not necessarily USABLE yet.
-	// Waiting for it here, once, is what keeps every assertion in every test from having to
-	// know that — and the wait is registered AFTER `elapsed` is taken, so the five-second
-	// issuance budget is still measured on issuance alone.
+	// The credential exists in the broker's metadata log; it is not necessarily USABLE
+	// yet. Waiting for it here, once, is what keeps every assertion in every test from
+	// having to know that — and the wait is registered AFTER `elapsed` is taken, so the
+	// five-second issuance budget is still measured on issuance alone.
 	eventIsolationAwaitAuthenticable(t, ctx, subscriberID, client)
 
 	return &eventIsolationPrincipal{
@@ -1733,31 +1559,11 @@ func eventIsolationProvision(
 	}
 }
 
-// eventIsolationAwaitAuthenticable blocks until a freshly minted credential can authenticate.
+// eventIsolationAwaitAuthenticable blocks until a freshly minted credential can
+// authenticate.
 //
-// # What was wrong
-//
-// AlterUserScramCredentials returns once the credential is in the KRaft metadata log, and the
-// broker's authenticator picks it up a moment later. The first authenticated request a test made
-// with a new credential therefore answered [58] SASL Authentication Failed on a COLD broker —
-// and the failure landed on the POSITIVE half of an assertion, the half that establishes the
-// credential works at all, so it read as "isolation is broken" when the credential was merely
-// new. It passed on a warm broker, which is the shape that makes CI red and a developer's
-// machine green.
-//
-// # Why only error 58 is retried, and why a timeout is a FAILURE and not a skip
-//
-// [58] is the one code that propagation explains. Anything else — an authorization refusal, a
-// transport error, a broker that is not there — returns immediately, so nothing about the
-// boundary under test is softened.
-//
-// And if the window elapses the credential genuinely does not work: the issuance path reported
-// success and produced something that cannot authenticate, which is a defect in exactly the
-// thing requirement R-7 promises. So this fails, loudly, naming the principal.
-//
-// The probe is Metadata with no topics, which every principal may issue: it is an
-// AUTHENTICATION probe, and using anything that could also be refused on AUTHORIZATION grounds
-// would conflate the two.
+// AlterUserScramCredentials returns once the credential is in the KRaft metadata log,
+// and the broker's authenticator picks it up a moment later.
 func eventIsolationAwaitAuthenticable(
 	t *testing.T,
 	ctx context.Context,
@@ -1778,10 +1584,10 @@ func eventIsolationAwaitAuthenticable(
 		if !eventIsolationIsCredentialPropagating(err) {
 			// Any other outcome, error or not, means authentication is settled: the broker
 			// either accepted the credential or refused the request for a reason that has
-			// nothing to do with it. The decision is named rather than inlined because it is
-			// the ONE error code propagation explains, and reading it as "is this still
-			// propagating?" is what keeps a future reader from widening it to every SASL
-			// failure — which would turn a genuinely unusable credential into a timeout.
+			// nothing to do with it. The decision is named rather than inlined because it is the
+			// ONE error code propagation explains, and reading it as "is this still
+			// propagating?" is what keeps a future reader from widening it to every SASL failure
+			// — which would turn a genuinely unusable credential into a timeout.
 			return
 		}
 
@@ -1808,11 +1614,8 @@ func eventIsolationAwaitAuthenticable(
 // eventIsolationSubscriberID mints a per-run subscriber identifier.
 //
 // The value has to satisfy model.CanonicalizeSubscriberIdentifier — lowercase ASCII
-// letters, digits, underscore and hyphen, first character alphanumeric — because the Kafka
-// principal and the consumer group are derived from it byte for byte. A UUID's canonical
-// form is already lowercase hex and hyphens, so it qualifies as-is; the label is lowercased
-// and stripped of anything else so a caller cannot accidentally introduce a character the
-// derivation refuses.
+// letters, digits, underscore and hyphen, first character alphanumeric — because the
+// Kafka principal and the consumer group are derived from it byte for byte.
 func eventIsolationSubscriberID(label string) string {
 	var safe strings.Builder
 	for _, character := range strings.ToLower(label) {
@@ -1827,20 +1630,11 @@ func eventIsolationSubscriberID(label string) string {
 	return fmt.Sprintf("iso-%s-%s", safe.String(), uuid.NewString())
 }
 
-// eventIsolationClient builds a Kafka client that authenticates as the given subscriber.
+// eventIsolationClient builds a Kafka client that authenticates as the given
+// subscriber.
 //
 // This is the only place in the repository that authenticates as a SUBSCRIBER, and it
-// exists FOR VERIFICATION ONLY. Production never does this: Blnk publishes as its own
-// producer principal and administers as its administrative principal, and subscribers
-// connect from their own systems with their own consumers. Nothing here is a consumer
-// library, and per the requirement's MUST NOT it must not become one.
-//
-// The transport is assembled directly rather than through NewKafkaTransport because that
-// helper resolves the PRODUCER or ADMINISTRATIVE credential pair from configuration by
-// role, and there is deliberately no role for "a subscriber" — a subscriber's secret is
-// never in Blnk's configuration. The TLS posture is kept identical to the administrative
-// client's so the test does not accidentally probe a different security posture from the
-// one the service uses.
+// exists FOR VERIFICATION ONLY.
 func eventIsolationClient(
 	t *testing.T,
 	env eventIsolationEnvironment,
@@ -1877,17 +1671,11 @@ func eventIsolationClient(
 	return client
 }
 
-// eventIsolationAdminClient builds a kafka-go client authenticated as the ADMINISTRATOR.
+// eventIsolationAdminClient builds a kafka-go client authenticated as the
+// ADMINISTRATOR.
 //
-// It exists for exactly one job the product's KafkaAdminClient has no reason to do: deleting the
-// consumer groups this fixture's assertions create. Blnk never deletes a subscriber's groups —
-// a group belongs to the consumer, not to the ledger — so adding the capability to
-// event_admin.go to serve a test would put an operation in production code that production has
-// no caller for. The raw client keeps it where it belongs.
-//
-// The transport mirrors eventIsolationClient's exactly, including the TLS posture, so an
-// administrative operation cannot succeed or fail for a transport reason a subscriber operation
-// would not have hit.
+// It exists for exactly one job the product's KafkaAdminClient has no reason to do:
+// deleting the consumer groups this fixture's assertions create.
 func eventIsolationAdminClient(t *testing.T, env eventIsolationEnvironment) *kafka.Client {
 	t.Helper()
 
@@ -1918,20 +1706,8 @@ func eventIsolationAdminClient(t *testing.T, env eventIsolationEnvironment) *kaf
 // eventIsolationTeardown revokes a provisioned principal at the broker and removes its
 // registry row.
 //
-// # Why this is not optional
-//
-// A SCRAM credential and its ACL bindings are broker state, not process state, so nothing
-// about the test process exiting removes them. Left behind they accumulate in the metadata
-// log run after run, and — far worse — a stale binding from an earlier run can satisfy a
-// later run's assertions, which means a leak does not merely litter: it can make this test
-// pass while proving nothing.
-//
-// It runs on a FRESH context. By the time cleanup runs the test's own context is usually
-// cancelled, and a cancelled context revokes nothing.
-//
-// Failures are logged rather than failing the test, with one exception: a principal whose
-// credential is still present after revocation is reported as an error, because that is the
-// leak this function exists to prevent and a silent log line would let it recur.
+// A SCRAM credential and its ACL bindings are broker state, not process state, so
+// nothing about the test process exiting removes them.
 func eventIsolationTeardown(
 	t *testing.T,
 	fixture *eventIsolationFixture,
@@ -1944,8 +1720,8 @@ func eventIsolationTeardown(
 
 	// DeregisterSubscriber revokes at the broker and then removes the row, which is the
 	// production path and therefore the one worth exercising. A subscriber that was never
-	// successfully registered is already absent and reports not-found, which is the desired
-	// end state rather than a problem.
+	// successfully registered is already absent and reports not-found, which is the
+	// desired end state rather than a problem.
 	if _, err := fixture.service.DeregisterSubscriber(ctx, subscriber.SubscriberID); err != nil &&
 		!isSubscriberNotFoundError(err) {
 		// The FIRST attempt failing is logged rather than failed, because there is a second
@@ -1957,11 +1733,11 @@ func eventIsolationTeardown(
 		// disposable; the broker credential is not, so it gets a second attempt.
 		if revokeErr := fixture.admin.RevokeSubscriber(ctx, subscriber); revokeErr != nil {
 			// BOTH attempts failed, so a SCRAM credential and its ACLs are left on a broker
-			// every other test in this package shares, with no registry row recording them.
-			// That is a leak this test caused, and it must not be able to report success:
-			// the next isolation run asserts that a principal outside its grant cannot read,
-			// and an abandoned principal with live ACLs is exactly what makes that assertion
-			// pass or fail for the wrong reason.
+			// every other test in this package shares, with no registry row recording them. That
+			// is a leak this test caused, and it must not be able to report success: the next
+			// isolation run asserts that a principal outside its grant cannot read, and an
+			// abandoned principal with live ACLs is exactly what makes that assertion pass or
+			// fail for the wrong reason.
 			t.Errorf("teardown: LEAKED the Kafka principal %q — both DeregisterSubscriber and "+
 				"the direct RevokeSubscriber fallback failed, so a credential and its ACLs "+
 				"remain on the shared broker with no registry row recording them: %v",
@@ -1975,20 +1751,15 @@ func eventIsolationTeardown(
 	eventIsolationDeleteSubscriberGroups(t, ctx, fixture, subscriber)
 
 	// POLLED, not read once. Revocation is applied to the KRaft metadata log and the
-	// credential list catches up a moment later, so reading it immediately reported a LEAK in
-	// the same run whose own log said "subscriber SCRAM credential revoked" — an accusation
-	// against the product for something that had not happened. An independent
-	// kafka-configs --describe afterwards showed nothing leaked.
-	//
-	// The polarity matters: this waits for the credential to be GONE and reports a leak only if
-	// it is still there when the window elapses. A credential that really did leak is therefore
-	// still reported, just one settle window later.
+	// credential list catches up a moment later, so reading it immediately reported a LEAK
+	// in the same run whose own log said "subscriber SCRAM credential revoked" — an
+	// accusation against the product for something that had not happened.
 	exists, err := eventIsolationAwaitCredentialRevoked(ctx, fixture, subscriber.KafkaPrincipal)
 	if err != nil {
-		// Being UNABLE TO VERIFY is not the same as being clean, and it must not be reported as
-		// clean. If the credential list cannot be read, this run cannot say whether it left a
-		// principal on the shared broker — and "we could not tell" is the state in which a leak
-		// silently survives into the next run's isolation assertions.
+		// Being UNABLE TO VERIFY is not the same as being clean, and it must not be reported
+		// as clean. If the credential list cannot be read, this run cannot say whether it
+		// left a principal on the shared broker — and "we could not tell" is the state in
+		// which a leak silently survives into the next run's isolation assertions.
 		t.Errorf("teardown: could not confirm principal %q was revoked, so this run cannot "+
 			"establish that it left no credential on the shared broker: %v",
 			subscriber.KafkaPrincipal, err)
@@ -2007,8 +1778,8 @@ func eventIsolationTeardown(
 	}
 }
 
-// eventIsolationAwaitCredentialRevoked polls the broker until the principal holds no SCRAM
-// credential, or the settle window elapses.
+// eventIsolationAwaitCredentialRevoked polls the broker until the principal holds no
+// SCRAM credential, or the settle window elapses.
 //
 // Returns:
 //   - bool: whether the credential still exists.
@@ -2034,28 +1805,11 @@ func eventIsolationAwaitCredentialRevoked(
 	}
 }
 
-// eventIsolationDeleteSubscriberGroups removes every consumer group inside a subscriber's own
-// namespace, and reports a leak if any survives.
+// eventIsolationDeleteSubscriberGroups removes every consumer group inside a
+// subscriber's own namespace, and reports a leak if any survives.
 //
-// # Why the fixture owns this
-//
-// The assertions in this file COMMIT OFFSETS to prove a subscriber may use its own group
-// namespace, and committing an offset to a simple consumer group CREATES that group at the
-// broker. Teardown revoked the principal, its ACLs and its registry row but never the groups, so
-// a broker accumulated a `<principal>.default` and a `<principal>.replay` per run — 42 after
-// eight runs, and every one of them a durable entry in the metadata log.
-//
-// It matters for the same reason the file already argues about principals: a namespace left
-// behind is state a later run can pass on. It is also simply the checkpoint's requirement that
-// cleanup removes topics, groups AND rows.
-//
-// # Why it deletes by NAMESPACE rather than by a recorded list
-//
-// The namespace is derived from the subscriber id and the group terminator, and the subscriber
-// id is unique per run, so the namespace contains exactly this run's groups and nothing else.
-// Listing and filtering by it therefore also collects a group a FUTURE assertion in this file
-// creates, which a hand-maintained list of two names would not — and a cleanup that silently
-// stops covering new state is worse than none.
+// It matters for the same reason a leftover principal does: a namespace left behind is
+// state a later run inherits.
 func eventIsolationDeleteSubscriberGroups(
 	t *testing.T,
 	ctx context.Context,
@@ -2089,9 +1843,7 @@ func eventIsolationDeleteSubscriberGroups(
 	}
 
 	// The request failing does NOT skip the confirmation below. The two are separate
-	// obligations: whether the delete succeeded, and whether the groups are gone. A broker that
-	// refused the request but had already removed the groups is clean, and a request that
-	// returned without error but left one is not.
+	// obligations: whether the delete succeeded, and whether the groups are gone.
 	response, err := client.DeleteGroups(ctx, &kafka.DeleteGroupsRequest{
 		Addr:     client.Addr,
 		GroupIDs: groups,
@@ -2157,12 +1909,8 @@ func eventIsolationGroupsUnder(
 	return matched, nil
 }
 
-// eventIsolationTLSConfig mirrors the transport security posture the service dials with.
-//
-// The verification client must probe the SAME listener under the SAME posture as the
-// administrative client, or a refusal could be a TLS artefact rather than an authorization
-// decision. The rule is the one config.KafkaConfig documents: plaintext only when TLS is
-// off AND local development has been acknowledged.
+// eventIsolationTLSConfig mirrors the transport security posture the service dials
+// with.
 func eventIsolationTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
 	if !cfg.TLS.Enabled {
 		if !cfg.InsecureLocalDev {
@@ -2200,14 +1948,9 @@ func eventIsolationTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-// eventIsolationTopicOutcome is the result of one topic-scoped probe: the error the request
-// itself returned, and the error the broker attached to the topic or partition inside a
-// successful response.
-//
-// Both halves are needed because Kafka answers an authorization decision at whichever level
-// the API carries it. ListOffsets returns HTTP-200-shaped success with a PER-PARTITION
-// error code; Fetch can fail at the request level; Produce carries a response-level error.
-// Collapsing them would silently drop the very code the assertion is about.
+// eventIsolationTopicOutcome is the result of one topic-scoped probe: the error the
+// request itself returned, and the error the broker attached to the topic or partition
+// inside a successful response.
 type eventIsolationTopicOutcome struct {
 	// requestErr is what the client call returned.
 	requestErr error
@@ -2219,9 +1962,9 @@ type eventIsolationTopicOutcome struct {
 
 // any returns whichever error is present, preferring the broker's own code.
 //
-// The broker's code is the more specific and more trustworthy of the two: kafka-go wraps a
-// request-level failure in its own prose, while a per-partition code is the authorizer's
-// verdict verbatim.
+// The broker's code is the more specific and more trustworthy of the two: kafka-go
+// wraps a request-level failure in its own prose, while a per-partition code is the
+// authorizer's verdict verbatim.
 func (o eventIsolationTopicOutcome) any() error {
 	if o.brokerErr != nil {
 		return o.brokerErr
@@ -2235,23 +1978,10 @@ func (o eventIsolationTopicOutcome) allowed() bool {
 	return o.requestErr == nil && o.brokerErr == nil
 }
 
-// eventIsolationListOffsets asks the broker for a topic's partition offsets as the given
-// principal.
+// eventIsolationListOffsets asks the broker for a topic's partition offsets as the
+// given principal.
 //
-// # Why ListOffsets is the read-denial primitive in this file
-//
-// It is the operation whose refusal is UNAMBIGUOUS. Reading offsets requires Describe on the
-// topic, and a principal without it gets TOPIC_AUTHORIZATION_FAILED attached to the
-// partition — the authorizer's verdict, stated in the response, with no room to
-// misinterpret.
-//
-// A Fetch would be the more obvious choice and is a weaker instrument: kafka-go resolves the
-// partition leader from metadata first, and Kafka deliberately answers metadata for an
-// unauthorized topic with UNKNOWN_TOPIC_OR_PARTITION so as not to disclose that the topic
-// exists. The read is refused either way, but the error that surfaces is "topic not found",
-// which is indistinguishable from a broker where the topic genuinely is not there. Both
-// probes are used below, and the fixture proves with the administrative client that every
-// topic exists first, which is what turns non-disclosure into evidence.
+// It is the operation whose refusal is UNAMBIGUOUS.
 func eventIsolationListOffsets(
 	ctx context.Context,
 	client *kafka.Client,
@@ -2313,11 +2043,11 @@ func eventIsolationFetch(
 	if response != nil {
 		outcome.brokerErr = response.Error
 
-		// The record set holds no assertion value here — only the authorization outcome
-		// does — but kafka-go's documentation asks the caller to close it, and leaving it
-		// open would hold the connection's buffer for the rest of the run. The reader is
-		// declared as a bare RecordReader, so closability is discovered rather than
-		// assumed; a refused request returns one that is not closeable at all.
+		// The record set holds no assertion value here — only the authorization outcome does
+		// — but kafka-go's documentation asks the caller to close it, and leaving it open
+		// would hold the connection's buffer for the rest of the run. The reader is declared
+		// as a bare RecordReader, so closability is discovered rather than assumed; a refused
+		// request returns one that is not closeable at all.
 		if closer, ok := response.Records.(io.Closer); ok && closer != nil {
 			if closeErr := closer.Close(); closeErr != nil && outcome.brokerErr == nil {
 				outcome.brokerErr = closeErr
@@ -2331,14 +2061,7 @@ func eventIsolationFetch(
 // eventIsolationProduce attempts to WRITE one record as the given principal.
 //
 // Subscribers are read-only: ProvisionSubscriberPrincipal grants Read and Describe and
-// nothing else, so no Write binding exists for any topic. The probe targets a topic INSIDE
-// the grant on purpose. On a granted topic the principal has Describe, so metadata resolves
-// and the broker gets as far as evaluating the write itself, which it refuses with
-// TOPIC_AUTHORIZATION_FAILED. Aimed at an ungranted topic the request would die earlier in
-// metadata resolution and prove less.
-//
-// The record is never delivered — that is the point — so producing here cannot pollute a
-// topic that sibling tests share.
+// nothing else, so no Write binding exists for any topic.
 func eventIsolationProduce(
 	ctx context.Context,
 	client *kafka.Client,
@@ -2376,10 +2099,6 @@ func eventIsolationProduce(
 
 // eventIsolationOffsetFetch reads a consumer group's committed offsets as the given
 // principal.
-//
-// Group authorization is a separate resource type from topic authorization, so it needs its
-// own probe: a subscriber's grant reserves its own group NAMESPACE with a prefixed pattern
-// and nothing beside it, and this is how "beside it" is tested.
 func eventIsolationOffsetFetch(
 	ctx context.Context,
 	client *kafka.Client,
@@ -2403,32 +2122,16 @@ func eventIsolationOffsetFetch(
 	})
 }
 
-// eventIsolationAwaitGroupCoordinator runs a consumer-group probe, retrying only while the
-// broker says it has no coordinator to answer with.
-//
-// # Why retrying here cannot weaken any assertion
+// eventIsolationAwaitGroupCoordinator runs a consumer-group probe, retrying only while
+// the broker says it has no coordinator to answer with.
 //
 // The three retried codes are statements about the broker's own state, never about this
 // principal's rights:
 //
 //   - [14] GroupLoadInProgress — the coordinator is loading its state.
-//   - [15] GroupCoordinatorNotAvailable — __consumer_offsets has no leader yet, or does not
-//     exist at all. On a freshly provisioned broker it does not: auto.create.topics.enable is
-//     false and kafka-provision.sh creates only the eight blnk.* topics, so the internal topic
-//     is materialised by the first client that needs group coordination.
+//   - [15] GroupCoordinatorNotAvailable — __consumer_offsets has no leader yet, or does
+//     not exist at all.
 //   - [16] NotCoordinatorForGroup — this broker is not the coordinator for this group.
-//
-// An authorization decision is [30] GroupAuthorizationFailed, which is NOT in that set and
-// therefore returns on the first attempt, unchanged and immediately. So a refusal is still a
-// refusal, an allow is still an allow, and the only thing that changes is that a cold broker
-// gets the moment it needs to elect a coordinator instead of failing the criterion.
-//
-// # Why not materialise the coordinator during setup instead
-//
-// A setup-time warm-up would have to perform group activity as some principal, and doing it as
-// the ADMINISTRATOR would create the internal topic on a broker where the test then asserts
-// what a SUBSCRIBER can see. Retrying at the probe keeps the fixture's footprint to exactly the
-// groups the assertions name.
 func eventIsolationAwaitGroupCoordinator(ctx context.Context, probe func(context.Context) error) error {
 	deadline := time.Now().Add(eventIsolationSettleTimeout)
 
@@ -2466,12 +2169,8 @@ func eventIsolationIsCoordinatorUnready(err error) bool {
 		errors.Is(err, kafka.NotCoordinatorForGroup)
 }
 
-// eventIsolationOffsetCommit commits an offset to a consumer group as the given principal.
-//
-// Committing is the write half of group access and is authorized separately from reading, so
-// a grant that leaked it would let one subscriber move another's consumer position — a
-// denial-of-service against a tenant that no topic-level check would catch. GenerationID is
-// -1 and MemberID empty, which is the simple-consumer form and needs no group membership.
+// eventIsolationOffsetCommit commits an offset to a consumer group as the given
+// principal.
 func eventIsolationOffsetCommit(
 	ctx context.Context,
 	client *kafka.Client,
@@ -2507,13 +2206,11 @@ func eventIsolationOffsetCommit(
 	})
 }
 
-// eventIsolationVisibleTopics lists every topic the broker is willing to disclose to the
-// given principal.
+// eventIsolationVisibleTopics lists every topic the broker is willing to disclose to
+// the given principal.
 //
-// Kafka filters a full metadata response by Describe authorization rather than refusing it,
-// so an unauthorized principal receives a SHORTER LIST instead of an error. That makes this
-// the right shape for the list-operation half of the criterion: the assertion is about what
-// is absent from the answer, not about an error code.
+// Kafka filters a full metadata response by Describe authorization rather than refusing
+// it, so an unauthorized principal receives a SHORTER LIST instead of an error.
 func eventIsolationVisibleTopics(ctx context.Context, client *kafka.Client) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, eventIsolationOperationTimeout)
 	defer cancel()
@@ -2542,12 +2239,6 @@ func eventIsolationVisibleTopics(ctx context.Context, client *kafka.Client) ([]s
 }
 
 // eventIsolationDescribeACLs attempts an ADMINISTRATIVE list as the given principal.
-//
-// Describing ACLs requires Describe on the CLUSTER, which a subscriber's grant does not
-// include — deliberately, because a principal that could enumerate the authorization state
-// could read off every other subscriber's topics and group namespaces by name even without
-// being able to consume them. It is the cluster-scoped list denial, and the broker states it
-// plainly as CLUSTER_AUTHORIZATION_FAILED.
 func eventIsolationDescribeACLs(ctx context.Context, client *kafka.Client) error {
 	ctx, cancel := context.WithTimeout(ctx, eventIsolationOperationTimeout)
 	defer cancel()
@@ -2572,16 +2263,10 @@ func eventIsolationDescribeACLs(ctx context.Context, client *kafka.Client) error
 }
 
 // eventIsolationAssertAuthorizationError requires that err is the broker refusing on
-// authorization grounds, and specifically not something that merely looks like a refusal.
+// authorization grounds, and specifically not something that merely looks like a
+// refusal.
 //
-// # Why the error KIND is asserted and not just its presence
-//
-// A non-nil error proves nothing on its own. A connection refused because the broker went
-// away, a SASL handshake that failed because the credential was revoked, a request that
-// timed out — every one of those is a non-nil error on an operation the principal was in
-// fact authorized to perform, and a test that accepted them would report isolation while the
-// broker enforced nothing. So the assertion is positive and narrow: the error must carry one
-// of the codes the Kafka protocol reserves for an authorization decision.
+// A non-nil error proves nothing on its own.
 func eventIsolationAssertAuthorizationError(
 	t *testing.T,
 	operation string,
@@ -2616,18 +2301,11 @@ func eventIsolationAssertAuthorizationError(
 	)
 }
 
-// eventIsolationAssertReadDenied requires the broker's DIRECT authorization verdict on a
-// read outside the grant.
+// eventIsolationAssertReadDenied requires the broker's DIRECT authorization verdict on
+// a read outside the grant.
 //
 // It is deliberately the strictest assertion in this file: nothing but
-// TOPIC_AUTHORIZATION_FAILED is accepted. That is exactly what the authorizer attaches to
-// the partition of a ListOffsets request from a principal without Describe on the topic, so
-// there is no reason to accept anything looser and every reason not to — a laxer expectation
-// is how a test starts passing on a timeout or a stale connection.
-//
-// Use it with eventIsolationListOffsets. The consumer-shaped probes go through
-// eventIsolationAssertTopicUndiscoverable instead, because their refusal legitimately
-// arrives in a different shape.
+// TOPIC_AUTHORIZATION_FAILED is accepted.
 func eventIsolationAssertReadDenied(t *testing.T, topic string, outcome eventIsolationTopicOutcome) {
 	t.Helper()
 
@@ -2639,27 +2317,10 @@ func eventIsolationAssertReadDenied(t *testing.T, topic string, outcome eventIso
 	)
 }
 
-// eventIsolationAssertTopicUndiscoverable requires that a consumer-shaped operation could not
-// even locate the topic.
+// eventIsolationAssertTopicUndiscoverable requires that a consumer-shaped operation
+// could not even locate the topic.
 //
-// # Why this refusal has a different shape, and why it is still the boundary
-//
-// Kafka does not tell a principal that a topic it may not describe exists. Metadata for such
-// a topic comes back as UNKNOWN_TOPIC_OR_PARTITION — deliberate NON-DISCLOSURE, so that a
-// probing client cannot enumerate the names of topics it has no access to. Since kafka-go
-// resolves a partition leader from metadata before it can fetch or produce, a Fetch or a
-// Produce fails at that resolution step and surfaces the client-side protocol.ErrNoTopic
-// rather than the authorizer's verdict.
-//
-// Accepting that WOULD be a real weakening if the topic might genuinely be absent, because
-// then "topic not found" would mean "there was nothing there to protect". That hole is closed
-// before any assertion runs: eventIsolationRequireTopics proves with the ADMINISTRATIVE
-// client that every topic named in this file exists, and skips the test when one does not.
-// Given that proof, a principal being told the topic does not exist is the strongest form the
-// boundary takes — the broker refused to admit its existence at all.
-//
-// The direct verdict is accepted too, because a broker or client version that surfaces it
-// instead is equally correct and equally a refusal.
+// Kafka does not tell a principal that a topic it may not describe exists.
 func eventIsolationAssertTopicUndiscoverable(t *testing.T, operation string, err error) {
 	t.Helper()
 
@@ -2675,10 +2336,7 @@ func eventIsolationAssertTopicUndiscoverable(t *testing.T, operation string, err
 
 // eventIsolationAssertGroupDenied requires that a consumer-group operation was refused.
 //
-// Only GROUP_AUTHORIZATION_FAILED is accepted. Unlike a topic, a consumer group needs no
-// non-disclosure treatment — groups are created by clients at will, so their names carry no
-// secret and Kafka states the refusal directly. Accepting anything looser here would allow a
-// coordinator-not-available or an unknown-group answer to stand in for a refusal.
+// Only GROUP_AUTHORIZATION_FAILED is accepted.
 func eventIsolationAssertGroupDenied(t *testing.T, operation string, err error) {
 	t.Helper()
 
@@ -2687,14 +2345,9 @@ func eventIsolationAssertGroupDenied(t *testing.T, operation string, err error) 
 
 // eventIsolationAssertAllowed requires that an operation INSIDE the grant succeeded.
 //
-// # Why the positive assertions are load-bearing
-//
-// Every refusal above would also be reported by a principal whose credential does not work
-// at all, or by a broker that refuses everything. A file containing only negative
-// assertions can therefore pass while testing nothing but a broken credential. These
-// assertions are what fix the test's meaning: the same credential that is refused
-// everything outside its grant is demonstrably accepted everywhere inside it, so the
-// refusals can only be the grant boundary.
+// Every refusal above would also be reported by a principal whose credential does not
+// work at all, or by a broker that refuses everything. A file containing only negative
+// assertions can therefore pass while testing nothing but a broken credential.
 func eventIsolationAssertAllowed(t *testing.T, operation string, err error) {
 	t.Helper()
 
@@ -2707,19 +2360,10 @@ func eventIsolationAssertAllowed(t *testing.T, operation string, err error) {
 
 // eventIsolationRequireEnforcement is the EMPIRICAL enforcement probe.
 //
-// # Why a second check, when AuthorizerActive already answered
-//
-// AuthorizerActive asks the broker to describe its own configuration. That is the right
-// first question and it is not the last one, because it establishes only that an authorizer
-// is loaded — not that this principal's bindings are the ones being applied. A broker with a
-// permissive super-user list, an accidental wildcard binding, an authorizer that failed to
-// load its metadata, or simply an ACL grant that turned out broader than intended would all
-// answer "active" and then allow the read anyway.
+// AuthorizerActive asks the broker to describe its own configuration.
 //
 // So enforcement is also proven by DOING it: this principal, on this topic outside its
-// grant, must actually be refused. If it is allowed, every assertion that follows would pass
-// vacuously, so the test stops here with the reason stated rather than continuing to a green
-// result that means nothing.
+// grant, must actually be refused.
 func eventIsolationRequireEnforcement(
 	t *testing.T,
 	ctx context.Context,
@@ -2749,20 +2393,13 @@ func eventIsolationRequireEnforcement(
 // eventIsolationGrantSplit divides the grantable category topics into the one topic a
 // principal is authorised for and the ones it is deliberately not.
 //
-// A grant of exactly one topic is what gives the test something to prove. A subscriber
-// authorised for everything has no boundary to test, and a subscriber authorised for nothing
-// would be refused everything for the trivial reason that it holds no bindings at all —
-// which is why the positive assertions matter as much as the negative ones.
+// A grant of exactly one topic is what gives the test something to prove.
 func eventIsolationGrantSplit(fixture *eventIsolationFixture) (string, []string) {
 	return fixture.grantable[0], append([]string(nil), fixture.grantable[1:]...)
 }
 
-// TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant is acceptance
-// criterion V-5.
-//
-// It provisions a real principal with a deliberately narrow grant — ONE category topic, no
-// dead-letter topics — and then requires the broker to refuse it, on authorization grounds,
-// every read, every list and every write outside that grant.
+// TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant is the
+// subscriber-isolation guarantee, asserted against a live broker.
 func TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -2786,8 +2423,8 @@ func TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant(t
 
 			// The same denial through the operation a real consumer performs. Its refusal
 			// arrives as non-disclosure rather than as the direct verdict; see
-			// eventIsolationAssertTopicUndiscoverable for why that is the stronger answer
-			// and not a weaker assertion.
+			// eventIsolationAssertTopicUndiscoverable for why that is the stronger answer and
+			// not a weaker assertion.
 			eventIsolationAssertTopicUndiscoverable(t,
 				fmt.Sprintf("fetching records from topic %q outside the subscriber's grant", topic),
 				eventIsolationFetch(ctx, principal.client, topic, 0).any())
@@ -2795,11 +2432,9 @@ func TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant(t
 	})
 
 	t.Run("reading a dead-letter topic outside the grant is refused", func(t *testing.T) {
-		// Both the dead-letter sibling of a WITHHELD category and the sibling of the
-		// GRANTED one. The second is the case worth being explicit about: a grant on
-		// blnk.transactions must not carry blnk.transactions.dlt with it. Dead-letter
-		// topics hold the events that failed to publish, so a leaked DLT grant exposes
-		// exactly the payloads an operator is still triaging.
+		// Both the dead-letter sibling of a WITHHELD category and the sibling of the GRANTED
+		// one. The second is the case worth being explicit about: a grant on
+		// blnk.transactions must not carry blnk.transactions.dlt with it.
 		deadLetterTopics := []string{DLTFor(granted)}
 		for _, topic := range withheld {
 			deadLetterTopics = append(deadLetterTopics, DLTFor(topic))
@@ -2870,10 +2505,10 @@ func TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant(t
 			// A plausible Blnk-issued group belonging to a different subscriber.
 			model.SubscriberPrincipalNamespace + "someone-else" +
 				model.SubscriberGroupTerminator + model.SubscriberDefaultGroupLeaf,
-			// A group that shares this subscriber's namespace as a strict PREFIX of its
-			// own name rather than sitting inside it. "blnk-sub-<id>" and
-			// "blnk-sub-<id>x" look alike and are different namespaces; a binding that
-			// matched the second would be reserving more than it should.
+			// A group that shares this subscriber's namespace as a strict PREFIX of its own name
+			// rather than sitting inside it. "blnk-sub-<id>" and "blnk-sub-<id>x" look alike and
+			// are different namespaces; a binding that matched the second would be reserving
+			// more than it should.
 			strings.TrimSuffix(namespace, model.SubscriberGroupTerminator) + "x.default",
 			// An arbitrary group outside the Blnk namespace entirely.
 			"blnk-isolation-unrelated-group",
@@ -2895,9 +2530,9 @@ func TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant(t
 
 	t.Run("writing is refused even on a granted topic", func(t *testing.T) {
 		// Subscribers are read-only by construction: the provisioning grant is Read and
-		// Describe on each authorised topic and Read on the group namespace. No Write
-		// binding is created for any topic, so a subscriber cannot forge a ledger event on
-		// the very topic it is entitled to consume.
+		// Describe on each authorised topic and Read on the group namespace. No Write binding
+		// is created for any topic, so a subscriber cannot forge a ledger event on the very
+		// topic it is entitled to consume.
 		eventIsolationAssertAuthorizationError(
 			t,
 			fmt.Sprintf("writing to the granted topic %q", granted),
@@ -2913,13 +2548,11 @@ func TestEventIsolation_SubscriberCredentialIsRefusedEverythingOutsideItsGrant(t
 	})
 }
 
-// TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant is the other half
-// of criterion V-5, and it is not decoration.
+// TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant is the
+// POSITIVE half of the isolation proof, and it is not decoration.
 //
-// A file of refusals alone would pass against a credential that does not work at all, or
-// against a broker refusing every request for an unrelated reason. This test pins the
-// meaning of those refusals: the same credential is demonstrably accepted for every
-// operation inside its grant, so what it is refused elsewhere can only be the boundary.
+// A file of refusals alone would pass against a credential that does not work at all,
+// or against a broker refusing every request for an unrelated reason.
 func TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -2927,8 +2560,8 @@ func TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant(t 
 	principal := eventIsolationProvision(t, ctx, fixture, "granted", []string{granted})
 
 	// Even the POSITIVE test gates on enforcement. Without it, "the credential can do
-	// everything inside its grant" is a green result on a broker where it can do everything
-	// everywhere — true, reassuring, and worthless. The gate keeps that reading impossible.
+	// everything inside its grant" is a green result on a broker where it can do
+	// everything everywhere — true, reassuring, and worthless.
 	eventIsolationRequireEnforcement(t, ctx, principal, withheld[0])
 
 	t.Run("the granted topic is readable", func(t *testing.T) {
@@ -2938,9 +2571,9 @@ func TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant(t 
 		require.NotEmpty(t, disclosed,
 			"the broker disclosed no partitions of the granted topic %q", granted)
 
-		// Read from the topic's actual first offset rather than zero: a topic whose head
-		// has been truncated by retention answers OFFSET_OUT_OF_RANGE at zero, which would
-		// be a spurious failure with nothing to do with authorization.
+		// Read from the topic's actual first offset rather than zero: a topic whose head has
+		// been truncated by retention answers OFFSET_OUT_OF_RANGE at zero, which would be a
+		// spurious failure with nothing to do with authorization.
 		eventIsolationAssertAllowed(t,
 			fmt.Sprintf("fetching records from the granted topic %q", granted),
 			eventIsolationFetch(ctx, principal.client, granted, disclosed[0].FirstOffset).any())
@@ -2967,11 +2600,10 @@ func TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant(t 
 	})
 
 	t.Run("any group inside its own namespace is usable", func(t *testing.T) {
-		// The group binding uses a PREFIXED pattern, which is the one intentional widening
-		// in the grant: a subscriber can stand up a replay group beside its live one
-		// without an administrative round trip. This asserts the widening actually works —
-		// and the companion test asserts it widens only within the subscriber's own
-		// namespace.
+		// The group binding uses a PREFIXED pattern, which is the one intentional widening in
+		// the grant: a subscriber can stand up a replay group beside its live one without an
+		// administrative round trip. This asserts the widening actually works — and the
+		// companion test asserts it widens only within the subscriber's own namespace.
 		namespace, err := SubscriberConsumerGroupNamespace(principal.subscriber.SubscriberID)
 		require.NoError(t, err, "deriving the subscriber's consumer group namespace")
 
@@ -2993,9 +2625,7 @@ func TestEventIsolation_SubscriberCredentialIsAllowedEverythingInsideItsGrant(t 
 // boundary holds BETWEEN subscribers, which is the tenancy property that matters
 // operationally.
 //
-// Two principals are provisioned independently, on disjoint grants. Each must be refused the
-// other's topic and the other's consumer group namespace — the latter being the assertion
-// that the prefixed group pattern RESERVES a namespace rather than sharing one.
+// Two principals are provisioned independently, on disjoint grants.
 func TestEventIsolation_SubscribersCannotReachEachOthersTopicsOrGroupNamespaces(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -3038,9 +2668,9 @@ func TestEventIsolation_SubscribersCannotReachEachOthersTopicsOrGroupNamespaces(
 		betaNamespace, err := SubscriberConsumerGroupNamespace(beta.subscriber.SubscriberID)
 		require.NoError(t, err, "deriving the second principal's group namespace")
 
-		// Both the other's default group and an arbitrary leaf inside the other's
-		// namespace. The leaf is the assertion that the prefixed pattern reserves the whole
-		// namespace for its owner rather than merely naming one group.
+		// Both the other's default group and an arbitrary leaf inside the other's namespace.
+		// The leaf is the assertion that the prefixed pattern reserves the whole namespace
+		// for its owner rather than merely naming one group.
 		eventIsolationAssertGroupDenied(t,
 			"the second principal reading the first principal's default consumer group",
 			eventIsolationOffsetFetch(ctx, beta.client, alpha.credential.ConsumerGroupID, second))
@@ -3064,13 +2694,9 @@ func TestEventIsolation_SubscribersCannotReachEachOthersTopicsOrGroupNamespaces(
 }
 
 // TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget covers the
-// issuance properties requirement R-7 states, against a real broker.
+// issuance properties the requirement states, against a real broker.
 //
-// The unit tests already drive these through a fake provisioner. What only a real broker can
-// establish is that four genuine administrative round trips — the enforcement probe, the
-// credential describe, the credential upsert and the ACL creation — complete inside the
-// five-second budget, and that the credential the broker actually minted is SCRAM-SHA-512
-// at the required iteration count.
+// The unit tests already drive these through a fake provisioner.
 func TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -3092,29 +2718,8 @@ func TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget(t 
 		assert.Equal(t, principal.subscriber.KafkaPrincipal, credential.Username)
 		assert.Equal(t, []string{granted}, credential.AuthorizedTopics)
 		assert.Equal(t, principal.subscriber.ConsumerGroupID, credential.ConsumerGroupID)
-		// THE SUBSCRIBER-FACING LIST, and asserting the other one was a defect in this test
-		// rather than in the service.
-		//
-		// A credential names the addresses the SUBSCRIBER will dial, which are the broker's
-		// external listener — KAFKA_SUBSCRIBER_BROKERS. KAFKA_BROKERS is what Blnk's own admin
-		// client and relay dial, and inside a deployment those are internal names that do not
-		// resolve for a subscriber; Kafka makes it worse, because a broker answers each client
-		// with the advertised address of the listener the connection arrived on, so even a
-		// reachable internal bootstrap hands back internal names for the partition leaders.
-		// subscriberFacingBrokers therefore reports the external list whenever one is
-		// configured, and falls back to the internal list with a warning when it is not — the
-		// fallback keeps the endpoint usable on the eight required variables alone, and the
-		// warning is what tells an operator with external subscribers to set the override.
-		//
-		// This assertion named fixture.env.kafka.Brokers, so it only held while the two lists
-		// happened to be equal, and it failed the moment they were configured differently — the
-		// exact split the separate variable exists for, and the one .env.example ships. The
-		// failure was in the acceptance suite that guards subscriber isolation, which is the
-		// worst place for a false alarm: it trains a reader to discount a red V-5 run.
-		//
-		// The fixture keeps the two values DIFFERENT on purpose (see
-		// eventIsolationResolveEnvironment), so this assertion now fails if the service ever
-		// reports the internal list — which is the property worth having covered.
+		// THE SUBSCRIBER-FACING LIST, and asserting the other one would be a defect in this
+		// test rather than in the service.
 		assert.Equal(t, fixture.env.kafka.SubscriberBrokers, credential.Brokers,
 			"the credential must hand back the SUBSCRIBER-FACING broker list (%s), not the "+
 				"addresses the admin client dialled (%s)",
@@ -3176,9 +2781,10 @@ func TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget(t 
 		require.False(t, strings.Contains(logged, secret),
 			"the credential's log fields disclosed the plaintext secret")
 
-		// The registry keeps a non-reversible reference and an issuance instant, and nothing that
-		// could be authenticated with. Once the issuance result above is discarded there is no
-		// route by which Blnk can produce the secret again; a lost password can only be replaced.
+		// The registry keeps a non-reversible reference and an issuance instant, and nothing
+		// that could be authenticated with. Once the issuance result above is discarded there
+		// is no route by which Blnk can produce the secret again; a lost password can only be
+		// replaced.
 		stored, err := fixture.service.GetSubscriber(ctx, principal.subscriber.SubscriberID)
 		require.NoError(t, err, "reading back the registry row")
 		require.NotNil(t, stored.CredentialReference,
@@ -3205,17 +2811,11 @@ func TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget(t 
 	})
 }
 
-// TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker proves that revocation ends
-// access, which is both the last state of the isolation boundary and the guarantee this
-// file's own teardown depends on.
+// TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker proves that revocation
+// ends access, which is both the last state of the isolation boundary and the guarantee
+// this file's own teardown depends on.
 //
-// # Why it belongs here
-//
-// A grant that cannot be withdrawn is not a boundary. And a teardown that did not really
-// revoke would leave live principals in the broker's metadata log where a stale binding from
-// an earlier run could satisfy a later run's assertions — a leak that does not merely litter
-// but can make this whole file pass for the wrong reason. This test asserts the mechanism
-// every other test's cleanup relies on.
+// A grant that cannot be withdrawn is not a boundary.
 func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -3264,11 +2864,7 @@ func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T)
 
 		// Two refusals are both correct here, and which one arrives depends on whether the
 		// client's pooled connection outlived the revocation. On a NEW connection the SASL
-		// handshake fails, because the credential is gone. On a connection that was already
-		// authenticated the handshake never repeats, so the request reaches the authorizer
-		// and is refused on the deleted bindings instead — which is itself worth having
-		// asserted, because it shows revocation ends access on established connections and
-		// not merely on future ones.
+		// handshake fails, because the credential is gone.
 		eventIsolationAssertAuthorizationError(t,
 			fmt.Sprintf("reading the granted topic %q with a revoked credential", granted),
 			outcome.any(),
@@ -3280,70 +2876,34 @@ func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T)
 	})
 }
 
-// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint covers the
-// REGISTRY AND ISSUANCE path for a key-scoped subscriber against a real broker: that the credential
-// exists, that it names the declared component rather than the brokers, that criterion V-5 still
-// holds for the principal, and that a prefix may be recorded on a subscriber that already holds a
+// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint covers
+// the REGISTRY AND ISSUANCE path for a key-scoped subscriber against a real broker:
+// that the credential exists, that it names the declared component rather than the
+// brokers, and that a prefix may be recorded on a subscriber that already holds a
 // credential.
 //
-// # What this test does NOT establish, and where that lives instead
-//
-// It says nothing about whether the principal can FETCH RECORDS. Every broker probe here is
-// eventIsolationListOffsets, which exercises metadata and offset visibility — the Describe
-// dimension — and a Describe that succeeds is not evidence about Read. The record-access boundary
-// is TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced's subject,
-// below, where eventIsolationFetch is required to be REFUSED with TopicAuthorizationFailed.
-//
-// That separation is the correction, and the header this replaces got it wrong twice over. It
-// opened by declaring the test REMOVED while the function was still defined and running
-// immediately beneath it, and it described the assertions as proving that "the prefix grants and
-// withholds NOTHING at the broker" and that "the principal reads its granted topic in full" —
-// which was the disclosure posture, is no longer true of the shipped grant, and was never what a
-// ListOffsets call could show even when it was.
-//
-// # The three positions this area has held
-//
-// The concern was always real: Kafka's authorizer has no message-key dimension, so a registry row
-// carrying a prefix must never be readable as "the broker confines this subscriber to those keys".
-// Two remedies failed before the current one.
-//
-// Refusing the credential unconditionally was the first. A subscriber refused a credential
-// CONSUMES NOTHING, so that was not a narrower boundary but the absence of one, and it left a
-// mandatory endpoint unable to serve a state the registry is designed to hold.
-//
-// Issuing unconditionally with the limitation DISCLOSED was the second, and it is the posture this
-// header used to describe. The credential was granted whole-topic Read and the response said the
-// prefix was the consumer's own business — every word true, and still unrestricted access to a
-// shared stream, because the party asked to filter was the party holding the credential.
-//
-// What ships is CONDITIONAL AND NARROWED. Registration and update accept a prefix freely; issuance
-// refuses it unless the deployment declares a component that authorises record keys
-// (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with a distinct KAFKA_KEY_SCOPE_GATEWAY_BROKERS and
-// an attestation endpoint); and the credential it then mints carries Describe and NO topic Read,
-// with the gateway named as both the endpoint to dial and the enforcement point.
-//
-// # What is asserted here, and why the broker is required for it
+// The credential was granted whole-topic Read and the response said the prefix was the
+// consumer's own business — every word true, and still unrestricted access to a shared
+// stream, because the party asked to filter was the party holding the credential.
 //
 // Two claims, and only a real authorizer can settle either:
 //
-//  1. The credential exists, discloses its scope, and names the DECLARED COMPONENT as its
-//     endpoint. A credential declaring key-scoped isolation beside an address that bypasses the
-//     thing enforcing it is the substitution that pairing exists to prevent.
-//  2. Acceptance criterion V-5 still holds for this principal. A key-scoped subscriber is refused
-//     every topic, dead-letter topic, listing and consumer group outside its grant exactly as a
-//     subscriber with no prefix is, because the two broker-enforced dimensions are untouched by
-//     any of this. This is the assertion that would break if a future change tried to "honour"
-//     the prefix by binding a PREFIXED topic pattern, which would widen the grant to every topic
-//     sharing that prefix while appearing to narrow it.
+//  1. The credential exists, discloses its scope, and names the DECLARED COMPONENT as
+//     its endpoint.
+//  2. Subscriber isolation still holds for this principal. A key-scoped subscriber is
+//     refused every topic, dead-letter topic, listing and consumer group outside its
+//     grant exactly as a subscriber with no prefix is, because the two broker-enforced
+//     dimensions are untouched by any of this.
 func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
 	granted, withheld := eventIsolationGrantSplit(fixture)
 	keyPrefix := "ldg_" + uuid.NewString()
 
-	// A DECLARED ENFORCEMENT POINT FIRST, because issuance refuses a key-scoped row without one
-	// and every assertion below is about a credential that exists. The refusal itself is
-	// TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared's subject.
+	// A DECLARED ENFORCEMENT POINT FIRST, because issuance refuses a key-scoped row
+	// without one and every assertion below is about a credential that exists. The refusal
+	// itself is TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared's
+	// subject.
 	gateway := eventIsolationDeclareKeyScopeGateway(t, fixture)
 
 	// Provisioned through the SHARED helper, with the key prefix supplied.
@@ -3388,21 +2948,12 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpo
 	})
 
 	t.Run("the granted topic stays DESCRIBABLE, which is all this proves", func(t *testing.T) {
-		// A DESCRIBE-ONLY ASSERTION, said so in the name because the claim it used to carry was
-		// wider than the probe could support: it read "the credential reads the granted topic in
-		// FULL … the broker never consults a key", from a ListOffsets call that resolves metadata
-		// and offsets and never fetches a record. Under the shipped grant that claim is also
-		// false — a key-scoped principal holds no topic Read at all — so the subtest was passing
-		// while asserting the opposite of the boundary.
-		//
-		// What Describe surviving DOES matter for: a consumer measures its own lag from its
-		// topics' offsets, so a key-scoped subscriber that lost Describe as well would be narrowed
-		// further than its prefix asks for.
-		//
-		// THE RECORD-ACCESS PROOF IS ELSEWHERE, deliberately:
-		// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced requires
-		// eventIsolationFetch on this same topic to be REFUSED with TopicAuthorizationFailed. Two
-		// assertions, two dimensions, neither standing in for the other.
+		// A DESCRIBE-ONLY ASSERTION, said so in the name because the probe cannot support a
+		// wider one: ListOffsets resolves metadata and offsets and never fetches a record, so
+		// it cannot show that "the credential reads the granted topic in FULL". Under the
+		// shipped grant such a claim is also false — a key-scoped principal holds no topic
+		// Read at all — so a subtest making it would pass while asserting the opposite of the
+		// boundary.
 		outcome, disclosed := eventIsolationListOffsets(ctx, principal.client, granted)
 		eventIsolationAssertAllowed(t,
 			fmt.Sprintf("describing the granted topic %q as a key-scoped principal", granted),
@@ -3461,14 +3012,11 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpo
 	})
 
 	t.Run("recording a key prefix on a provisioned subscriber is accepted", func(t *testing.T) {
-		// THE REVERSE ORDER, which used to be refused as the second half of the same policy.
-		// An operator who decides on a key scope after the credential exists must be able to
-		// record that decision; refusing left them with nowhere to put it and no route to the
-		// state except revoking a working credential, destroying a secret that cannot be
-		// recovered in response to a request that never mentioned revocation.
-		//
-		// What must NOT change is the boundary, and that is what this asserts against the
-		// broker: same credential, same allowed read, same refusals.
+		// THE REVERSE ORDER, which is accepted rather than refused. An operator who decides on
+		// a key scope after the credential exists must be able to record that decision;
+		// refusing leaves them with nowhere to put it and no route to the state except revoking
+		// a working credential, destroying a secret that cannot be recovered in response to a
+		// request that never mentioned revocation.
 		latePrefix := "ldg_late_" + uuid.NewString()
 		updated, updateErr := fixture.service.UpdateSubscriber(ctx, principal.subscriber.SubscriberID,
 			SubscriberUpdate{PartitionKeyPrefix: &latePrefix})
@@ -3498,23 +3046,9 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpo
 	})
 }
 
-// subscriberIDOf WAS RETIRED HERE. It was a nil-safe accessor for a principal's subscriber id, and
-// the fixture that mints a principal requires both the principal and its subscriber to be non-nil
-// before returning it — so every one of the fifteen sites that reads the field reads it directly,
-// and a nil-tolerant accessor beside them suggested a nil is reachable when it is not.
-// TestEventIsolation_NarrowingASubscribersGrantWithdrawsItAtTheBroker is AUTH-02 against a real
-// broker.
-//
-// # The defect
-//
-// Provisioning CREATED bindings and removed none, so a subscriber's broker-side grant was the
-// union of every authorization it had ever held. Narrowing authorized_topics updated the
-// registry and left the dropped topic's Read and Describe bindings live: the registry said the
-// access was gone, the subscriber kept consuming, and no request failed to say otherwise.
-//
-// This is the only place that property can be proven for what it is. The admin-tier tests assert
-// that the right ACL requests are sent; only a real authorizer can answer whether the withdrawn
-// topic has actually become unreachable to a credential that could read it a moment earlier.
+// The fixture that mints a principal guarantees both the principal and its subscriber are
+// non-nil, so every site reads the subscriber id directly rather than through a
+// nil-tolerant accessor that would suggest a nil is reachable.
 func TestEventIsolation_NarrowingASubscribersGrantWithdrawsItAtTheBroker(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -3585,14 +3119,11 @@ func TestEventIsolation_NarrowingASubscribersGrantWithdrawsItAtTheBroker(t *test
 	})
 }
 
-// TestEventIsolation_DeregistrationRevokesBeforeItForgetsThePrincipal is AUTH-01 against a real
-// broker.
+// TestEventIsolation_DeregistrationRevokesBeforeItForgetsThePrincipal is the revoke-before-delete rule
+// against a real broker.
 //
-// Deregistration used to delete the registry row and then revoke, so a failed revocation left a
-// principal that kept authenticating and kept reading — with the only record of WHICH principal
-// that was having just been deleted. Here the whole sequence runs against a real broker and the
-// end state is checked from the broker's side: the credential is gone, and nothing can be read
-// with it.
+// Here the whole sequence runs against a real broker and the end state is checked from
+// the broker's side: the credential is gone, and nothing can be read with it.
 func TestEventIsolation_DeregistrationRevokesBeforeItForgetsThePrincipal(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -3645,23 +3176,23 @@ func TestEventIsolation_DeregistrationRevokesBeforeItForgetsThePrincipal(t *test
 	})
 }
 
-// requireFenceLocked reproduces the repository's ownership predicate for a fenced write.
+// requireFenceLocked reproduces the repository's ownership predicate for a fenced
+// write.
 //
-// The real writes carry `AND provisioning_token = $n AND provisioning_until > NOW()` inside the
-// statement, so a caller whose lease lapsed is refused rather than racing. A fake that ignored
-// the token would let every fence test pass while the production predicate was absent, which is
-// the one thing these tests exist to rule out.
-//
-// The caller must already hold s.mu.
+// The real writes carry `AND provisioning_token = $n AND provisioning_until > NOW()`
+// inside the statement, so a caller whose lease lapsed is refused rather than racing. A
+// fake that ignored the token would let every fence test pass while the production
+// predicate was absent, which is the one thing these tests exist to rule out.
 //
 // Parameters:
 //   - subscriberID string: the row the write targets.
 //   - token string: the claim token the write carried.
-//   - operation string: named in the lost-fence error, matching the repository's wording.
+//   - operation string: named in the lost-fence error, matching the repository's
+//     wording.
 //
 // Returns:
-//   - error: ErrInvalidInput for a blank token, the lost-fence conflict when the claim is not
-//     the caller's, nil otherwise.
+//   - error: ErrInvalidInput for a blank token, the lost-fence conflict when the claim
+//     is not the caller's, nil otherwise.
 func (s *eventIsolationStore) requireFenceLocked(subscriberID, token, operation string) error {
 	trimmed := strings.TrimSpace(token)
 	if trimmed == "" {
@@ -3676,9 +3207,9 @@ func (s *eventIsolationStore) requireFenceLocked(subscriberID, token, operation 
 		// THE CLIENT MESSAGE database.fencedWriteMissError produces, with the marker in the
 		// DETAIL because subscriberFenceWasLost matches on it: a fake that reported a generic
 		// conflict would exercise the wrong branch of every compensation path, and one that
-		// reported a message the repository no longer returns would pass here and fail against
-		// the database. The release and renewal statements answer with the same sentence up to
-		// its final clause, so this one string serves all three sites.
+		// reported a message the repository no longer returns would pass here and fail
+		// against the database. The release and renewal statements answer with the same
+		// sentence up to its final clause, so this one string serves all three sites.
 		return apierror.NewAPIError(apierror.ErrConflict,
 			"The subscriber provisioning claim is no longer held by this caller, so the change was not applied",
 			fmt.Errorf("subscriber %q: the provisioning claim was no longer held while %s, so the "+
@@ -3741,24 +3272,17 @@ func (s *eventIsolationStore) MarkSubscriberRevocationFailed(
 	return nil
 }
 
-// eventIsolationIsCredentialPropagating reports whether err is the one failure a credential that
-// has just been written to the metadata log explains on its own.
+// eventIsolationIsCredentialPropagating reports whether err is the one failure a
+// credential that has just been written to the metadata log explains on its own.
 //
-// [58] SASL Authentication Failed is that failure and the only one. AlterUserScramCredentials
-// returns when the credential is in the log, and the broker's authenticator loads it a moment
-// later, so a handshake in that gap is refused with 58 by a broker that is working correctly.
+// [58] SASL Authentication Failed is that failure and the only one.
 //
 // Nothing else belongs here, and the exclusions are the point rather than an omission:
 //
-//   - A transport error, a dial failure or a timeout says the broker could not be reached. The
-//     fixture already proved it could be reached at setup, so this is an environment fault and
-//     must be reported, not waited out.
-//   - An authorization refusal says the credential authenticated and the request was denied. That
-//     is a settled credential and a different question, and the probe is chosen so it cannot
-//     happen.
-//
-// Widening this set is how a wait stops proving anything: whatever is retried here is, by
-// construction, an outcome the caller will never be told about.
+//   - A transport error, a dial failure or a timeout says the broker could not be
+//     reached.
+//   - An authorization refusal says the credential authenticated and the request was
+//     denied.
 func eventIsolationIsCredentialPropagating(err error) bool {
 	if err == nil {
 		return false
@@ -3767,86 +3291,61 @@ func eventIsolationIsCredentialPropagating(err error) bool {
 	return errors.Is(err, kafka.SASLAuthenticationFailed)
 }
 
-// WHERE THE KEY-SCOPE COVERAGE LIVES, in four places and none of it optional. This block used to
-// stand under the names of two tests that no longer exist —
-// TestEventIsolation_AKeyScopedSubscriberIsRefusedAndTheKeyIsNoBoundary and
-// TestEventIsolation_AKeyScopedSubscribersDisclosureMatchesWhatTheBrokerEnforces — and a doc
-// comment naming absent functions sends a reader looking for coverage they cannot find and
-// concluding it is missing.
+// WHERE THE KEY-SCOPE COVERAGE LIVES, in four places and none of it optional. Every
+// name below is a function in this file, so a reader can reach the coverage rather than
+// looking for it:
 //
-//   - TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced, directly
-//     below, is the RECORD-ACCESS proof: it requires the broker to REFUSE this principal's fetch
-//     with TopicAuthorizationFailed, and it covers replacing and clearing the prefix.
-//   - TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint, above,
-//     covers the registry and issuance path, the gateway endpoint substitution, criterion V-5 and
-//     the Describe dimension. It deliberately asserts nothing about record access.
-//   - TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared covers the shipped
-//     default: no component declared, no credential minted, nothing left at the broker.
-//   - TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists covers
-//     the attestation ordering, and the api/model validation tests plus
-//     TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package cover the response
-//     projection in both deployments.
+//   - TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced,
+//     directly below, is the RECORD-ACCESS proof: it requires the broker to REFUSE this
+//     principal's fetch with TopicAuthorizationFailed, and it covers replacing and
+//     clearing the prefix.
+//   - TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndNamesItsGatewayEndpoint,
+//     above, covers the registry and issuance path, the gateway endpoint substitution
+//     and the Describe dimension.
+//   - TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared covers
+//     the shipped default: no component declared, no credential minted, nothing left at
+//     the broker.
+//   - TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists
+//     covers the attestation ordering, and the api/model validation tests plus
+//     TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package cover the
+//     response projection in both deployments.
 
-// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced is C-02
-// against a REAL broker, and it is the finding's resolution stated as a property of the running
-// system.
+// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced is
+// The stated-scope contract against a REAL broker, stated as a property
+// of the running system.
 //
-// # The two answers this test has held, and why neither of the first two was right
+// It first asserted a REFUSAL: a subscriber recording a partition key prefix was
+// unprovisionable, and the test proved no credential existed at the broker for it.
 //
-// It first asserted a REFUSAL: a subscriber recording a partition key prefix was unprovisionable,
-// and the test proved no credential existed at the broker for it. That withheld the only
-// credential Kafka can express — its authorizer names Topic, Group, Cluster, TransactionalId and
-// DelegationToken, and not one of them is a message key — permanently, for a state the registry is
-// designed to hold. A mandatory endpoint became a dead end.
+// It then asserted the opposite and asserted it truthfully: the credential was issued
+// with Read on the whole topic, and this test PROVED the prefix was not a boundary by
+// fetching the partition from offset zero with a prefix no record carried.
 //
-// It then asserted the opposite and asserted it truthfully: the credential was issued with Read on
-// the whole topic, and this test PROVED the prefix was not a boundary by fetching the partition
-// from offset zero with a prefix no record carried. The response declared the narrowing to be the
-// subscriber's own obligation. A security review rejected that too, and correctly: a boundary that
-// depends on the subscriber choosing to apply it is not an access boundary, and any other Kafka
-// client reads every record on the shared topic — including records written for other ledgers.
+// The grant itself is narrower, and the broker is the thing that proves it. A
+// key-scoped subscriber is provisioned with Describe and NO Read on its authorised
+// topics, so:
 //
-// # What is asserted now
-//
-// The grant itself is narrower, and the broker is the thing that proves it. A key-scoped
-// subscriber is provisioned with Describe and NO Read on its authorised topics, so:
-//
-//  1. The credential IS issued, DOES authenticate, and carries the recorded prefix. The mandatory
-//     capability exists for every registry state the schema can hold.
-//  2. Describe still works on the granted topic and is still refused on every withheld one. A
-//     key-scoped subscriber is not a blind subscriber: it can still see its own topics' offsets,
-//     which is what a consumer needs for lag and health.
-//  3. A FETCH of the granted topic is REFUSED — TOPIC_AUTHORIZATION_FAILED from the authorizer
-//     itself. This is the assertion the previous revision had inverted, and it is the finding's
-//     resolution: no record on a shared topic can reach this principal directly, whatever client
-//     it uses and whether or not it cooperates.
-//  4. The transition is reversible and observable in both directions. Replacing one prefix with
-//     another moves nothing (there is no key dimension to move). CLEARING the prefix re-grants
-//     Read, and the same fetch that was refused above then succeeds.
-//
-// Point 3 is an authorization observation rather than a record-level one, deliberately: proving
-// it by producing records would need Write on a category topic that sibling runs share, and this
-// file's discipline is that no probe leaves records behind. The authorizer's verdict is the
-// stronger evidence anyway — it is the boundary, not a consequence of it.
-//
-// The records a key-scoped subscriber is entitled to reach it through the key-authorising component
-// the DEPLOYMENT declares in front of the brokers. Blnk ships none, so there is nothing here to
-// test on that side; what this test owns is the fact that the broker path is closed, which is the
-// half Blnk provisions.
+//  1. The credential IS issued, DOES authenticate, and carries the recorded prefix.
+//  2. Describe still works on the granted topic and is still refused on every withheld
+//     one.
+//  3. A FETCH of the granted topic is REFUSED — TOPIC_AUTHORIZATION_FAILED from the
+//     authorizer itself.
+//  4. The transition is reversible and observable in both directions.
 func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
 	granted, withheld := eventIsolationGrantSplit(fixture)
 	subscriberID := eventIsolationSubscriberID("keyscope")
 
-	// A DECLARED ENFORCEMENT POINT FIRST. Without one, issuance refuses this row outright and the
-	// broker-side properties below could not be observed at all — see
-	// TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared for that refusal.
+	// A DECLARED ENFORCEMENT POINT FIRST. Without one, issuance refuses this row outright
+	// and the broker-side properties below could not be observed at all — see
+	// TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared for that
+	// refusal.
 	eventIsolationDeclareKeyScopeGateway(t, fixture)
 
-	// A prefix no record on the shared topic can carry. It is arbitrary now that the broker
-	// refuses the fetch outright — but keeping it unrelated costs nothing and keeps the fixture
-	// honest about what a prefix is.
+	// A prefix no record on the shared topic can carry. It is arbitrary now that the
+	// broker refuses the fetch outright — but keeping it unrelated costs nothing and keeps
+	// the fixture honest about what a prefix is.
 	keyPrefix := "ldg_" + uuid.NewString()
 	subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
 		SubscriberID:       subscriberID,
@@ -3910,10 +3409,10 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 	}, withheld[0])
 
 	t.Run("topic isolation is unaffected by the key scope", func(t *testing.T) {
-		// The DESCRIBE dimension must hold exactly as it does for a subscriber with no prefix. A
-		// key-scoped subscriber that lost Describe as well could no longer read its own topics'
-		// offsets, which is what a consumer needs to measure its lag — so withholding it would
-		// narrow more than the prefix asks for.
+		// The DESCRIBE dimension must hold exactly as it does for a subscriber with no
+		// prefix. A key-scoped subscriber that lost Describe as well could no longer read its
+		// own topics' offsets, which is what a consumer needs to measure its lag — so
+		// withholding it would narrow more than the prefix asks for.
 		allowed, disclosed := eventIsolationListOffsets(ctx, principalClient, granted)
 		eventIsolationAssertAllowed(t,
 			fmt.Sprintf("describing the granted topic %q as a key-scoped subscriber", granted),
@@ -3933,11 +3432,11 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 	t.Run("the key boundary IS enforced: the broker refuses this principal's records", func(t *testing.T) {
 		// THE ASSERTION THAT MATTERS, and the one that was inverted before.
 		//
-		// The principal holds Describe on this topic, so metadata resolves and the request reaches
-		// the authorizer's decision on the read itself — which is refused, because a key-scoped
-		// subscriber is granted no Read binding at all. That refusal is the boundary: it does not
-		// depend on which client the subscriber uses, on the prefix it was told, or on it choosing
-		// to filter anything.
+		// The principal holds Describe on this topic, so metadata resolves and the request
+		// reaches the authorizer's decision on the read itself — which is refused, because a
+		// key-scoped subscriber is granted no Read binding at all. That refusal is the
+		// boundary: it does not depend on which client the subscriber uses, on the prefix it
+		// was told, or on it choosing to filter anything.
 		outcome := eventIsolationFetch(ctx, principalClient, granted, 0)
 
 		eventIsolationAssertAuthorizationError(
@@ -3958,11 +3457,6 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 	})
 
 	// REPLACING one prefix with another, which is the edit that moves nothing.
-	//
-	// Kafka has no key dimension, so the desired binding set is identical either side of it: the
-	// subscriber is key-scoped before and after, so its topics carry Describe and no Read both
-	// times. The assertion is therefore that the boundary is UNCHANGED — still describable, still
-	// unfetchable, still refused outside the grant, and the credential untouched.
 	t.Run("replacing the key prefix changes no boundary", func(t *testing.T) {
 		before, beforeErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
 		require.NoError(t, beforeErr)
@@ -4013,16 +3507,16 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 	})
 
 	t.Run("clearing the key prefix re-grants record access at the broker", func(t *testing.T) {
-		// THE WIDENING DIRECTION, and the reason this cycle is worth running end to end: it is the
-		// same claim as point 3 read backwards. If clearing did NOT restore the fetch, the
-		// narrowing would be indistinguishable from a broken grant — a subscriber that could
-		// never read anything would satisfy every refusal above while proving nothing.
+		// THE WIDENING DIRECTION, and the reason this cycle is worth running end to end: it
+		// is the same claim as point 3 read backwards. If clearing did NOT restore the fetch,
+		// the narrowing would be indistinguishable from a broken grant — a subscriber that
+		// could never read anything would satisfy every refusal above while proving nothing.
 		//
-		// WHILE THE KEY-SCOPED MODEL IS DECLARED, CLEARING IS REFUSED (SEC-01). It is the one path
-		// that turns a live key-scoped principal into a whole-topic reader with issuance never
-		// running again, so the deployment's own declaration is what stands in the way — and the
-		// refusal is asserted here rather than assumed, because the widening below would otherwise
-		// look like proof that clearing is always available.
+		// WHILE THE KEY-SCOPED MODEL IS DECLARED, CLEARING IS REFUSED. It is the one path
+		// that turns a live key-scoped principal into a whole-topic reader with issuance
+		// never running again, so the deployment's own declaration is what stands in the way
+		// — and the refusal is asserted here rather than assumed, because the widening below
+		// would otherwise look like proof that clearing is always available.
 		cleared := ""
 		refusedUpdate, refusedErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
 			PartitionKeyPrefix: &cleared,
@@ -4042,9 +3536,10 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 			"and the refusal applied nothing: a half-applied clearing would leave the registry "+
 				"describing whole-topic access it had just declined to grant")
 
-		// THE REMEDY THE REFUSAL NAMES, exercised: the deployment stops declaring the key-scoped
-		// model. That is a deployment-level decision rather than a per-subscriber opt-out, which
-		// is the whole point — the model holds for every subscriber or for none.
+		// THE REMEDY THE REFUSAL NAMES, exercised: the deployment stops declaring the
+		// key-scoped model. That is a deployment-level decision rather than a per-subscriber
+		// opt-out, which is the whole point — the model holds for every subscriber or for
+		// none.
 		eventIsolationPublishConfiguration(t, &config.Configuration{Kafka: fixture.env.kafka})
 		_, stillDeclared := fixture.env.kafka.KeyScopeGateway()
 		require.False(t, stillDeclared,
@@ -4095,20 +3590,11 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnfo
 	})
 }
 
-// TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared is V-5's fail-closed
-// half against a REAL broker: the shipped configuration, and the credential that is never minted.
+// TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared is the isolation guarantee's
+// fail-closed half against a REAL broker: the shipped configuration, and the credential
+// that is never minted.
 //
-// # Why this needs a live broker when the unit test already asserts the code path
-//
-// event_subscriber_test.go proves the refusal is returned. What only a broker can prove is that
-// the refusal left NOTHING BEHIND at the broker — no SCRAM credential for the principal, and so
-// nothing that authenticates. A refusal that generated a credential and then failed to revoke it
-// would satisfy every in-process assertion and still leave a live principal in the metadata log.
-//
-// It is the one key-scope test in this file that does NOT call
-// eventIsolationDeclareKeyScopeGateway, and it must stay that way: every other one declares a
-// component first, so without this test the shipped default would be the single configuration the
-// integration suite never exercises.
+// event_subscriber_test.go proves the refusal is returned.
 func TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
@@ -4191,31 +3677,23 @@ func TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared(t 
 			"this deployment never declared")
 }
 
-// TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists is SEC-01's
-// end-to-end half, against a REAL broker and a REAL control endpoint.
+// TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists is
+// The attestation rule's end-to-end half, against a REAL broker and a REAL control endpoint.
 //
-// # What only this combination can prove
+// event_keyscope_gateway_test.go proves the client speaks the contract.
+// event_subscriber_test.go proves the service refuses when the contract is not
+// satisfied. Neither can answer the question an operator actually has: when Blnk
+// declares a subscriber key-scoped, IS THERE A COMPONENT HOLDING THAT BINDING, and is
+// the broker-side state consistent with it?
 //
-// event_keyscope_gateway_test.go proves the client speaks the contract. event_subscriber_test.go
-// proves the service refuses when the contract is not satisfied. Neither can answer the question
-// an operator actually has: when Blnk declares a subscriber key-scoped, IS THERE A COMPONENT
-// HOLDING THAT BINDING, and is the broker-side state consistent with it? That needs a live
-// authorizer on one side and a live control endpoint on the other, which is this fixture plus the
-// conformance double.
-//
-// # The two directions, and why both are here
-//
-//  1. ATTESTED. The binding the component holds is the principal and the exact stored prefix, it
-//     was registered before any secret existed, and the credential that came back authenticates
-//     against the broker while naming the component rather than a broker address. A credential
-//     naming a bootstrap address would hand the subscriber a route around the thing enforcing its
-//     scope.
-//  2. UNATTESTED. A component that answers for a WIDER prefix than the row records — the
-//     truncating proxy, which is the dangerous misbehaviour because the subscriber is told it is
-//     isolated — must produce a refusal that leaves NOTHING at the broker. That is the assertion
-//     no in-process test can make: a refusal that minted a SCRAM credential and failed to unwind
-//     it would satisfy every unit assertion and leave a principal in the metadata log that
-//     authenticates.
+//  1. ATTESTED. The binding the component holds is the principal and the exact stored
+//     prefix, it was registered before any secret existed, and the credential that came
+//     back authenticates against the broker while naming the component rather than a
+//     broker address.
+//  2. UNATTESTED. A component that answers for a WIDER prefix than the row records —
+//     the truncating proxy, which is the dangerous misbehaviour because the subscriber
+//     is told it is isolated — must produce a refusal that leaves NOTHING at the
+//     broker.
 func TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentialExists(t *testing.T) {
 	t.Run("attested: the component holds the exact binding and the credential names it", func(t *testing.T) {
 		fixture, ctx := eventIsolationSetup(t)
@@ -4320,27 +3798,5 @@ func TestEventIsolation_AKeyScopeIsBoundAtTheDeclaredComponentBeforeAnyCredentia
 	})
 }
 
-// There is no test of a Blnk-hosted read path for a key-scoped subscriber, because there is no
-// such path.
-//
-// One existed. It read the shared topic with BLNK's own administrative credential, applied the
-// subscriber's prefix per record, and served the result from GET /subscribers/{id}/events. Three
-// properties of that design are why it is gone rather than fixed: it was a second data plane
-// holding a credential far wider than any subscriber's; it authenticated with a bespoke
-// X-Blnk-Subscriber-Secret header the platform's authorization middleware knows nothing about; and
-// revoking a subscriber's SCRAM credential at the broker closed the direct path while leaving the
-// served one open, so revocation was not revocation.
-//
-// A key-scoped subscriber's records are delivered by the key-authorising component the DEPLOYMENT
-// declares in front of the brokers (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway). Blnk does not
-// ship it, so there is nothing here to integration-test: what Blnk owns is the broker-side
-// narrowing and the refusal, and both are asserted above —
-// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced measures the
-// authorizer refusing the principal's own fetch, and
-// TestEventIsolation_AKeyScopedSubscriberIsRefusedWhereNoGatewayIsDeclared measures the refusal to
-// mint at all.
-//
-// The probe-publishing helper and the fixed-partition balancer that supported the removed test are
-// gone with it. Nothing else in this file publishes records: the discipline it keeps is that no
-// probe writes as a subscriber principal, because a subscriber holds no Write binding and a test
-// that produced through one would assert against a grant production must never make.
+// There is no test of a Blnk-hosted read path for a key-scoped subscriber, because
+// there is no such path.

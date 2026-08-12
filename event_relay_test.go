@@ -16,18 +16,12 @@
 
 // Tests for the event outbox relay.
 //
-// Every test here runs WITHOUT A BROKER AND WITHOUT A DATABASE, which is deliberate: the
-// relay's contract is expressed against four repository methods, one publisher method, one
-// dead-letter hand-off and one legacy enqueue, so substituting those seams exercises the
-// real decision logic — the retry schedule, the ordering guarantee, the exhaustion
-// hand-off, the dual-delivery branch — with nothing skipped and nothing mocked away that
-// matters. The end-to-end proofs against a live broker are the integration tests named in
-// the acceptance criteria (ordering, recovery, isolation, dual delivery).
-//
-// The fake store below is a small STATE MACHINE rather than a recorder, because the parts
-// most worth testing are sequences: five failed attempts must produce four scheduled
-// retries and exactly one dead-letter, and a re-claim after a crash must republish only
-// what was not marked. A recorder cannot express either.
+// Every test here runs WITHOUT A BROKER AND WITHOUT A DATABASE, which is deliberate:
+// the relay's contract is expressed against four repository methods, one publisher
+// method, one dead-letter hand-off and one legacy enqueue, so substituting those seams
+// exercises the real decision logic — the retry schedule, the ordering guarantee, the
+// exhaustion hand-off, the dual-delivery branch — with nothing skipped and nothing
+// mocked away that matters.
 package blnk
 
 import (
@@ -56,10 +50,10 @@ import (
 // rather than approximately now.
 var relayFixedNow = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
-// relayDeadLetterHandoffLease WAS RETIRED HERE. The fake now renews the hand-off lease from the
-// lease the RELAY supplied, normalised through deadLetterHandoffDeadline exactly as the
-// repository normalises it — so a test that sets WithLockDuration reasons about the duration it
-// set rather than about a constant this file chose.
+// The fake now renews the hand-off lease from the lease the RELAY supplied, normalised
+// through deadLetterHandoffDeadline exactly as the repository normalises it — so a test
+// that sets WithLockDuration reasons about the duration it set rather than about a
+// constant this file chose.
 
 // errRelayTransient stands in for a recoverable broker failure.
 var errRelayTransient = errors.New("relay test: broker unavailable")
@@ -92,19 +86,12 @@ type relayFailRecord struct {
 	reason     string
 	retryAfter time.Duration
 
-	// terminal is the caller's permanent-failure verdict, recorded so a test can assert the
-	// relay FORWARDED the publisher's classification rather than leaving the retry-versus-
-	// exhaustion decision to the attempt count alone.
+	// terminal is the caller's permanent-failure verdict, recorded so a test can assert
+	// the relay FORWARDED the publisher's classification rather than leaving the
+	// retry-versus- exhaustion decision to the attempt count alone.
 	terminal bool
 
 	// deadLetterLease is the hand-off lease the caller supplied for the exhaustion arm.
-	//
-	// It is recorded because a ZERO lease is the whole of the race this parameter exists to
-	// close: NOW() + '0s' has already passed by the next poll, so the row the relay still
-	// holds a token for becomes re-claimable by a sibling relay while its dead-letter write is
-	// in flight, and the event is published to the DLT twice. A test that only checked the
-	// transition happened could not tell a relay that passed its lock duration from one that
-	// passed nothing, so the value is captured and asserted rather than assumed.
 	deadLetterLease time.Duration
 
 	// record is the broker coordinate the transition was given, empty on a transition that
@@ -112,15 +99,10 @@ type relayFailRecord struct {
 	record model.BrokerRecord
 }
 
-// relayFakeStore models blnk.event_outbox closely enough to drive multi-attempt sequences:
-// it claims FIFO with a fresh token, returns a failed row to the claimable set with the
-// caller's backoff applied, and exhausts a row's budget the way MarkEventFailed's in-SQL
-// CASE does.
-//
-// It deliberately does NOT reproduce the repository's one-row-per-partition-key claim rule.
-// That rule is one of the two independent reasons ordering holds; leaving it out is what
-// lets these tests exercise the OTHER one — the relay's own grouping — by handing a batch
-// two rows that share a key.
+// relayFakeStore models blnk.event_outbox closely enough to drive multi-attempt
+// sequences: it claims FIFO with a fresh token, returns a failed row to the claimable
+// set with the caller's backoff applied, and exhausts a row's budget the way
+// MarkEventFailed's in-SQL CASE does.
 type relayFakeStore struct {
 	mu sync.Mutex
 
@@ -152,25 +134,17 @@ type relayFakeStore struct {
 	failedRows  []model.EventOutbox
 	failedTaken bool
 
-	// webhookOwedRows is the LEGACY leg's recovery set: rows whose Kafka leg has reached an
-	// end state — dispatched, failed or dead_lettered — with webhook_dispatched still FALSE.
-	// It is seeded and handed out exactly once, mirroring failedRows, because the pass under
-	// test polls every tick and an unbounded set would loop.
+	// webhookOwedRows is the LEGACY leg's recovery set: rows whose Kafka leg has reached
+	// an end state — dispatched, failed or dead_lettered — with webhook_dispatched still
+	// FALSE. It is seeded and handed out exactly once, mirroring failedRows, because the
+	// pass under test polls every tick and an unbounded set would loop.
 	webhookOwedRows  []model.EventOutbox
 	webhookOwedTaken bool
 
-	// The REPAIR CAPACITY instrumentation (PERF-M06). Both repair claims now take a
-	// CONFIGURED batch size and are CHAINED within one tick, and neither property is visible
-	// from the rows a pass produced — a chain of three batches and one batch of three rows
-	// leave the same result behind.
-	//
-	// failedClaimSizes and webhookClaimSizes record the batchSize of every claim in order, so
-	// the chain length is the slice length and the configured bound is its values.
-	//
-	// failedWaves and webhookWaves serve SUCCESSIVE batches when set, which is what lets a
-	// test present a backlog larger than one batch. They take precedence over the one-shot
-	// fields above, which are left exactly as they were so every existing test is unaffected:
-	// a wave list is how a test opts into the multi-batch behaviour.
+	// The REPAIR CAPACITY instrumentation. Both repair claims now take a CONFIGURED batch
+	// size and are CHAINED within one tick, and neither property is visible from the rows
+	// a pass produced — a chain of three batches and one batch of three rows leave the
+	// same result behind.
 	failedClaimSizes  []int
 	webhookClaimSizes []int
 	failedWaves       [][]model.EventOutbox
@@ -283,15 +257,10 @@ func (s *relayFakeStore) ClaimPendingEventOutbox(
 	return claimed, nil
 }
 
-// MarkEventDispatched moves a claimed row to the success terminal state, refusing a token
-// that is not the current one.
+// MarkEventDispatched moves a claimed row to the success terminal state, refusing a
+// token that is not the current one.
 //
-// Like every method here it HONOURS THE CONTEXT, and that is not incidental. A fake that
-// ignored cancellation could not tell a bookkeeping transition running on the relay's detached
-// context from one running on a cancelled caller context — so the very bug
-// detachedBookkeepingContext exists to prevent would be invisible to every test that used this
-// fake. The check comes before the call is recorded, because a statement a cancelled context
-// never sends leaves nothing behind in the database either.
+// Like every method here it HONOURS THE CONTEXT, and that is not incidental.
 func (s *relayFakeStore) MarkEventDispatched(
 	ctx context.Context,
 	id int64,
@@ -324,16 +293,11 @@ func (s *relayFakeStore) MarkEventDispatched(
 	return nil
 }
 
-// MarkEventFailed records the attempt and reproduces the repository's two arms: back to the
-// claimable set with the caller's backoff applied, or failed with the token AND its lease
-// retained.
+// MarkEventFailed records the attempt and reproduces the repository's two arms: back to
+// the claimable set with the caller's backoff applied, or failed with the token AND its
+// lease retained.
 //
-// The lease is what makes the retained token mean anything on the exhaustion arm. The real
-// statement extends locked_until in the same UPDATE that keeps the token, so the row stays
-// invisible to the dead-letter repair claim while the relay that owns it writes to the DLT.
-// This double therefore records the lease it was handed and applies it to the row, so a test
-// can prove the relay supplied its lock duration and that the resulting row is NOT
-// immediately re-claimable.
+// The lease is what makes the retained token mean anything on the exhaustion arm.
 func (s *relayFakeStore) MarkEventFailed(
 	ctx context.Context,
 	id int64,
@@ -366,22 +330,19 @@ func (s *relayFakeStore) MarkEventFailed(
 	row.Attempts++
 	row.LastError = errMsg
 
-	// The caller's verdict is ORed into the arithmetic exactly as the real UPDATE's CASE does,
-	// so a permanent failure exhausts the row on whichever attempt it happened. A double that
-	// only counted attempts would report a retry where production reports exhaustion, and the
-	// relay's dead-letter hand-off would go untested for the whole permanent-failure class.
+	// The caller's verdict is ORed into the arithmetic exactly as the real UPDATE's CASE
+	// does, so a permanent failure exhausts the row on whichever attempt it happened. A
+	// double that only counted attempts would report a retry where production reports
+	// exhaustion, and the relay's dead-letter hand-off would go untested for the whole
+	// permanent-failure class.
 	if terminal || row.Attempts >= row.MaxAttempts {
 		row.Status = model.EventOutboxStatusFailed
 		// THE LEASE IS RENEWED, not cleared, exactly as the real statement does it. The token
 		// is retained so only this worker may write the dead-letter message, and the lease is
-		// what makes that retention mean something: the repair claim takes a failed row with no
-		// dlt_topic and no LIVE lease and stamps a fresh token over it, so a cleared lease here
-		// would let a second instance take the row mid-hand-off and publish the same
-		// dead-letter message. A fake that cleared it could not fail on that regression.
-		// THE CALLER'S OWN LEASE, normalised the way the repository normalises it. A fixed
-		// constant here would ignore WithLockDuration entirely, so a test that set a lock
-		// duration and then reasoned about the hand-off window would be reasoning about
-		// thirty seconds whatever it asked for.
+		// what makes that retention mean something: the repair claim takes a failed row with
+		// no dlt_topic and no LIVE lease and stamps a fresh token over it, so a cleared lease
+		// here would let a second instance take the row mid-hand-off and publish the same
+		// dead-letter message.
 		row.LockedUntil = s.deadLetterHandoffDeadline(deadLetterLease)
 		s.inflight[id] = row
 		s.terminal[id] = model.EventOutboxStatusFailed
@@ -409,14 +370,9 @@ func (s *relayFakeStore) MarkEventFailed(
 	return model.EventFailureOutcome{Status: row.Status, Attempts: row.Attempts}, nil
 }
 
-// MarkEventPermanentlyFailed reproduces the permanent-failure transition: the attempt is
-// counted, the row becomes failed on THIS attempt whatever budget remained, and the claim
-// token is retained for the dead-letter hand-off.
-//
-// The budget is deliberately NOT consulted, exactly as the real statement does not consult it.
-// A fake that fell back to the max_attempts test would make the terminal gate indistinguishable
-// from the exhaustion arm and the regression this covers — five attempts spent on an
-// unauthorised principal — would pass unnoticed.
+// MarkEventPermanentlyFailed reproduces the permanent-failure transition: the attempt
+// is counted, the row becomes failed on THIS attempt whatever budget remained, and the
+// claim token is retained for the dead-letter hand-off.
 func (s *relayFakeStore) MarkEventPermanentlyFailed(
 	ctx context.Context,
 	id int64,
@@ -487,14 +443,10 @@ func (s *relayFakeStore) MarkWebhookDispatched(ctx context.Context, id int64, cl
 	return nil
 }
 
-// MarkEventWebhookPending reproduces the repository's two arms for a Kafka leg that is done
-// while the legacy leg is still owed: back to the CLAIMABLE set as webhook_pending with the
-// caller's backoff applied, or dispatched with the legacy leg abandoned once the webhook
-// budget is spent.
-//
-// It stamps KafkaDispatchedAt exactly as the COALESCE in the real statement does, because
-// that column is what makes a re-claim publish nothing — a fake that omitted it would let a
-// duplicate-publish regression pass.
+// MarkEventWebhookPending reproduces the repository's two arms for a Kafka leg that is
+// done while the legacy leg is still owed: back to the CLAIMABLE set as webhook_pending
+// with the caller's backoff applied, or dispatched with the legacy leg abandoned once
+// the webhook budget is spent.
 func (s *relayFakeStore) MarkEventWebhookPending(
 	ctx context.Context,
 	id int64,
@@ -651,9 +603,9 @@ func (s *relayFakeStore) ClaimFailedEventOutboxForDeadLetter(
 
 		// THE LEASE PREDICATE, mirrored from the real statement: a failed row that still
 		// holds a LIVE lease belongs to the worker performing its dead-letter hand-off and
-		// must not be taken. Omitting this is the F-28 defect expressed in a fake — the
-		// repair pass would appear able to take a row mid-hand-off, and a test written
-		// against it would prove the opposite of the production invariant.
+		// must not be taken. Omitting this is the defect expressed in a fake — the repair
+		// pass would appear able to take a row mid-hand-off, and a test written against it
+		// would prove the opposite of the production invariant.
 		if row.LockedUntil != nil && row.LockedUntil.After(s.now()) {
 			continue
 		}
@@ -667,12 +619,13 @@ func (s *relayFakeStore) ClaimFailedEventOutboxForDeadLetter(
 	return claimed, nil
 }
 
-// leaseRepairWave leases one seeded wave of repair rows under a fresh token, truncated to the
-// batch size the caller asked for.
+// leaseRepairWave leases one seeded wave of repair rows under a fresh token, truncated
+// to the batch size the caller asked for.
 //
-// Shared by both repair claims because both repository statements do the same three things — cap
-// at the batch size, stamp one fresh token per claim, take a lease — and two copies of that in a
-// fake are two chances for one of them to stop matching the statement it stands in for.
+// Shared by both repair claims because both repository statements do the same three
+// things — cap at the batch size, stamp one fresh token per claim, take a lease — and
+// two copies of that in a fake are two chances for one of them to stop matching the
+// statement it stands in for.
 //
 // The caller holds s.mu.
 //
@@ -721,12 +674,8 @@ func (s *relayFakeStore) snapshotRepairClaimSizes() (deadLetter, webhook []int) 
 	return append([]int(nil), s.failedClaimSizes...), append([]int(nil), s.webhookClaimSizes...)
 }
 
-// inflightRow returns the store's current copy of a claimed row, so a test can assert on the
-// lease and the token a transition left behind.
-//
-// It reads the row the STORE holds rather than the copy the relay passed on, which is the
-// distinction that matters for F-28: the relay's in-memory row is not what a second instance's
-// claim predicate evaluates.
+// inflightRow returns the store's current copy of a claimed row, so a test can assert
+// on the lease and the token a transition left behind.
 func (s *relayFakeStore) inflightRow(id int64) (model.EventOutbox, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -736,13 +685,8 @@ func (s *relayFakeStore) inflightRow(id int64) (model.EventOutbox, bool) {
 	return row, held
 }
 
-// ClaimPendingWebhookDeliveries hands out the seeded rows whose LEGACY leg is still owed,
-// once, stamping a FRESH token and leaving the status EXACTLY as it is.
-//
-// The untouched status is the property under test rather than a shortcut: the real claim admits
-// dispatched, failed and dead_lettered alike, and a fake that normalised them to processing
-// would hide the whole class of defect this recovery pass exists to prevent — a terminal event
-// handed back to the publisher, or a dead-letter reported as a dispatch.
+// ClaimPendingWebhookDeliveries hands out the seeded rows whose LEGACY leg is still
+// owed, once, stamping a FRESH token and leaving the status EXACTLY as it is.
 func (s *relayFakeStore) ClaimPendingWebhookDeliveries(
 	ctx context.Context,
 	batchSize int,
@@ -796,12 +740,13 @@ func (s *relayFakeStore) ClaimPendingWebhookDeliveries(
 	return claimed, nil
 }
 
-// MarkEventLegacyWebhookAttempted records one failed legacy enqueue against a row whose Kafka
-// leg has finished, and reproduces the two properties the real statement is built around: the
-// STATUS IS NOT TOUCHED, and abandoned is decided from the incremented count.
+// MarkEventLegacyWebhookAttempted records one failed legacy enqueue against a row whose
+// Kafka leg has finished, and reproduces the two properties the real statement is built
+// around: the STATUS IS NOT TOUCHED, and abandoned is decided from the incremented
+// count.
 //
-// last_error is likewise left alone, because on a failed or dead-lettered row it holds the
-// Kafka failure reason the dead-letter metadata reports.
+// last_error is likewise left alone, because on a failed or dead-lettered row it holds
+// the Kafka failure reason the dead-letter metadata reports.
 func (s *relayFakeStore) MarkEventLegacyWebhookAttempted(
 	ctx context.Context,
 	id int64,
@@ -874,12 +819,9 @@ func (s *relayFakeStore) expireLeases() {
 	}
 }
 
-// retireInflight drops every claimed row's token, which is what a FINISHED batch looks like
-// from the database's point of view: every terminal transition clears claim_token, so nothing
-// is left under it for a lease renewal to extend.
-//
-// It exists so a test can produce a zero renewal count without waiting for real publishes to
-// complete, which is the condition the heartbeat retires itself on.
+// retireInflight drops every claimed row's token, which is what a FINISHED batch looks
+// like from the database's point of view: every terminal transition clears claim_token,
+// so nothing is left under it for a lease renewal to extend.
 func (s *relayFakeStore) retireInflight() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -900,21 +842,11 @@ func (s *relayFakeStore) setClaimErr(err error) {
 	s.claimErr = err
 }
 
-// claimableIDs returns the ids of every row in the claimable set that is DUE at the given
-// instant — the same predicate the repository's claim applies, so a test can ask "could anything
-// pick this row up again?" without driving a whole batch.
-// rowByID returns the row as the store now holds it, wherever it currently lives —
-// claimable, leased, or terminal.
-//
-// It exists so a test can assert the ROW STATE a transition produced rather than only which
-// method was called. That distinction is not academic: MarkEventFailed's two arms are one
-// method with one parameter, so "MarkEventFailed was called once" is true of both a scheduled
-// retry and an exhausted budget, and a test asserting only the call cannot tell an event that
-// will be delivered from one that has been abandoned.
-//
-// The lookup fails the test rather than returning a zero value, because a zero row would make
-// every subsequent assertion pass or fail for the wrong reason — Status "" is not the pending
-// state, and an assertion against it reads as a real verdict.
+// claimableIDs returns the ids of every row in the claimable set that is DUE at the
+// given instant — the same predicate the repository's claim applies, so a test can ask
+// "could anything pick this row up again?" without driving a whole batch. rowByID
+// returns the row as the store now holds it, wherever it currently lives — claimable,
+// leased, or terminal.
 func (s *relayFakeStore) rowByID(t *testing.T, id int64) model.EventOutbox {
 	t.Helper()
 
@@ -936,16 +868,9 @@ func (s *relayFakeStore) rowByID(t *testing.T, id int64) model.EventOutbox {
 	return model.EventOutbox{}
 }
 
-// deadLetterHandoffDeadline resolves the instant a terminal transition holds the row under
-// while its dead-letter write is owed, mirroring the repository's
+// deadLetterHandoffDeadline resolves the instant a terminal transition holds the row
+// under while its dead-letter write is owed, mirroring the repository's
 // normalizeDeadLetterHandoffLease.
-//
-// The normalisation is reproduced rather than skipped because the two behaviours it separates
-// are exactly what the tests need to tell apart: a caller that plumbed its lock duration
-// through, and a caller that passed nothing. Without it a zero lease would produce a deadline
-// in the past and this double would report the row as immediately re-claimable — which is the
-// production race, not the production behaviour, so a test asserting exclusivity would fail
-// for a reason the repository does not have.
 //
 // The caller must hold s.mu.
 func (s *relayFakeStore) deadLetterHandoffDeadline(lease time.Duration) *time.Time {
@@ -974,14 +899,11 @@ func (s *relayFakeStore) claimableIDs(at time.Time) []int64 {
 	return ids
 }
 
-// unpublishedBacklog counts the rows that are still un-published work: claimable rows plus rows
-// held under a lease.
+// unpublishedBacklog counts the rows that are still un-published work: claimable rows
+// plus rows held under a lease.
 //
-// It is deliberately the SAME arithmetic as EventMetricsCollector.collectOutboxBacklog, which
-// reports pending + processing to metrics.OutboxPendingBacklog. Processing rows are included
-// there because a row claimed under a lease but not yet acknowledged is still undelivered, so a
-// stalled relay holding every claimable row must not render as a drained backlog — which is the
-// exact condition the gauge exists to make visible.
+// It is deliberately the SAME arithmetic as EventMetricsCollector.collectOutboxBacklog,
+// which reports pending + processing to metrics.OutboxPendingBacklog.
 func (s *relayFakeStore) unpublishedBacklog() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1100,30 +1022,27 @@ type relayFakePublisher struct {
 	// permanentFailFor fails the listed events PERMANENTLY, reproducing what the real
 	// publisher reports for a message no retry can deliver — an envelope over the size
 	// ceiling, bytes that are not valid JSON, a destination outside Blnk's namespace.
-	//
-	// The two maps are separate rather than one map with a flag because the distinction is the
-	// subject of a test: the relay must forward the permanent verdict to the durable
-	// transition and must NOT forward it for a transient failure.
 	permanentFailFor map[string]error
 	// beforePublish runs inside the publish, which is how a test observes concurrency.
 	beforePublish func(req PublishRequest)
 
-	// coordinates hands back a broker coordinate per event, modelling what the real publisher
-	// reads off Writer.Completion. Absent means the publish reports no coordinate, which is a
-	// legitimate outcome the relay has to record honestly as unconfirmed.
+	// coordinates hands back a broker coordinate per event, modelling what the real
+	// publisher reads off Writer.Completion. Absent means the publish reports no
+	// coordinate, which is a legitimate outcome the relay has to record honestly as
+	// unconfirmed.
 	coordinates map[string]model.BrokerRecord
 
 	// permanent makes every failure this publisher reports a PERMANENT one, which is the
-	// classification the real publisher applies to an unauthorised principal, a destination
-	// outside the topic catalogue, bytes that will never parse and a message over the size
-	// limit. It is how a test drives the relay's terminal gate, which reads
+	// classification the real publisher applies to an unauthorised principal, a
+	// destination outside the topic catalogue, bytes that will never parse and a message
+	// over the size limit. It is how a test drives the relay's terminal gate, which reads
 	// PublishResult.PermanentFailure and must NOT spend the retry budget on any of those.
 	permanent bool
 
-	// unclassified makes the publisher return a bare error with an EMPTY result, which is what
-	// an implementation that does no classification produces. The relay must read that as
-	// retryable: the publisher is an interface seam, so "no verdict" cannot be allowed to mean
-	// "give up on this event".
+	// unclassified makes the publisher return a bare error with an EMPTY result, which is
+	// what an implementation that does no classification produces. The relay must read
+	// that as retryable: the publisher is an interface seam, so "no verdict" cannot be
+	// allowed to mean "give up on this event".
 	unclassified bool
 }
 
@@ -1140,11 +1059,6 @@ func (p *relayFakePublisher) failingPermanently() *relayFakePublisher {
 }
 
 // failPermanentlyFor makes one event fail with a failure no retry can fix.
-//
-// The result it produces mirrors kafkaPublisher.fail's permanent arm exactly — Transient and
-// Retryable both false, status dead-lettered — and the error is a real *PublishError classified
-// non-transient, so IsTransientPublishError reads the same verdict off it. A double that only
-// set the boolean would let the relay pass by reading the wrong signal.
 func (p *relayFakePublisher) failPermanentlyFor(eventID string, cause error) *relayFakePublisher {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1204,15 +1118,8 @@ func (p *relayFakePublisher) PublishToTopic(_ context.Context, req PublishReques
 		Record:       p.coordinates[req.Event.EventID],
 	}
 
-	// PERMANENT first, because it is the stricter answer: an event listed in both maps is one
-	// the test means to be unpublishable.
-	//
-	// IT REPORTS WHAT THE REAL PUBLISHER REPORTS: outcome retrying, Terminal true. It used to
-	// report model.PublishStatusDeadLettered, which the real publisher never produces from an
-	// original publish — dead_lettered means an acknowledged write to a `<topic>.dlt` sibling,
-	// and this publish performed none. A double that overstates the outcome is worse than one
-	// that understates it: it made the relay's permanent-failure path testable only against a
-	// verdict production does not emit.
+	// PERMANENT first, because it is the stricter answer: an event listed in both maps is
+	// one the test means to be unpublishable.
 	if cause, permanent := p.permanentFailFor[req.Event.EventID]; permanent {
 		result.Status = model.PublishStatusRetrying
 		result.Terminal = true
@@ -1220,10 +1127,10 @@ func (p *relayFakePublisher) PublishToTopic(_ context.Context, req PublishReques
 		result.Retryable = false
 		// CLASSIFIED IS THE FIELD THE RELAY'S GATE READS, through PermanentFailure, and it is
 		// affirmative by design so that a publisher which classifies nothing can never end an
-		// event's life on its first attempt. A double that sets Terminal and leaves this false
-		// therefore looks permanent in the log and in the metric while the relay treats it as
-		// unclassified and retries it — which is exactly the shape that let the permanent path
-		// go unexercised. The whole-publisher arm below sets it for the same reason.
+		// event's life on its first attempt. A double that sets Terminal and leaves this
+		// false therefore looks permanent in the log and in the metric while the relay treats
+		// it as unclassified and retries it — which is exactly the shape that let the
+		// permanent path go unexercised.
 		result.Classified = true
 		result.Err = &PublishError{
 			Topic:     result.Topic,
@@ -1251,12 +1158,6 @@ func (p *relayFakePublisher) PublishToTopic(_ context.Context, req PublishReques
 		// different path for each: a transient verdict goes to the budgeted retry whose
 		// exhaustion the database decides, a permanent one goes straight to the dead-letter
 		// hand-off.
-		//
-		// BOTH REPORT model.PublishStatusRetrying, exactly as kafkaPublisher.fail does:
-		// requirement R-3 fixes the outcome vocabulary at three values, so the permanence is
-		// carried on Classified and Transient rather than on the status. Setting Classified
-		// here is what makes this double behave like the real publisher — an implementation
-		// that leaves it false is the `unclassified` case above, and it must be retried.
 		result.Status = model.PublishStatusRetrying
 		result.Classified = true
 		if p.permanent {
@@ -1397,14 +1298,8 @@ type relayHarness struct {
 	deadLetters *relayFakeDeadLetterer
 	legacy      *relayFakeLegacy
 
-	// wiredWindow is the dual-delivery predicate NewEventRelayProcessor ACTUALLY INSTALLED,
-	// captured before the harness replaced it with a stub.
-	//
-	// A test that needs the production decision must restore this rather than naming
-	// WebhookDualDeliveryActive again. Naming it again re-derives the right answer even when
-	// the constructor wired the wrong thing — a constructor that hardwired "the window is
-	// open" would satisfy such a test and then dual-write forever in production, which is
-	// exactly the mutant worth catching.
+	// wiredWindow is the dual-delivery predicate NewEventRelayProcessor ACTUALLY
+	// INSTALLED, captured before the harness replaced it with a stub.
 	wiredWindow func(now time.Time) bool
 }
 
@@ -1454,13 +1349,8 @@ func relayConfiguration() *config.Configuration {
 	}
 }
 
-// relayRow builds a claimable outbox row whose payload is a real legacy webhook body, so the
-// dual-delivery assertions compare the bytes production would carry.
-//
-// event_raw is populated too, because the column is NOT NULL and PrepareEventOutbox fills it at
-// capture: a row without it is a row the database cannot hold, and every transport reads that
-// column rather than rebuilding the envelope, so a fixture that left it empty would exercise
-// the compatibility fallback instead of the live path.
+// relayRow builds a claimable outbox row whose payload is a real legacy webhook body,
+// so the dual-delivery assertions compare the bytes production would carry.
 func relayRow(id int64, eventID, eventType, partitionKey string, occurredAt time.Time) model.EventOutbox {
 	payload, err := json.Marshal(NewWebhook{
 		Event:   eventType,
@@ -1498,33 +1388,23 @@ func relayTransactionRow(id int64, eventID string) model.EventOutbox {
 	return relayRow(id, eventID, "transaction.applied", "ldg_relay_1", relayFixedNow.Add(time.Duration(id)*time.Second))
 }
 
-// relayParseOwnSource parses event_relay.go so a test can assert the ABSENCE of something.
+// relayParseOwnSource parses event_relay.go so a test can assert the ABSENCE of
+// something.
 //
-// An absence is the one property a behavioural test cannot reach: a second sunset comparison,
-// or a date parse, is invisible from the outside for exactly as long as it happens to agree
-// with event_sunset.go — which is the whole interval before somebody changes one of them, and
-// the entire reason single ownership is worth asserting.
+// An absence is the one property a behavioural test cannot reach: a second sunset
+// comparison, or a date parse, is invisible from the outside for exactly as long as it
+// happens to agree with event_sunset.go — which is the whole interval before somebody
+// changes one of them, and the entire reason single ownership is worth asserting.
 //
-// IT IS THE AST, NOT THE TEXT, and that is the whole difference. These rules used to be
-// strings.Contains over the file's contents, which failed in both directions: a comment
-// explaining "the relay must never call time.Sleep" violated the rule that forbids it, so the
-// documentation and the check could not coexist; and a substring pins one spelling, so an
-// equivalent written any other way passed. Parsing without comments removes the first, and
-// matching identifiers as identifiers removes the second. See event_ast_test.go.
+// IT IS THE AST, NOT THE TEXT, and that is the whole difference.
 func relayParseOwnSource(t *testing.T) *ast.File {
 	t.Helper()
 
 	return parseRepositoryGoFile(t, "event_relay.go")
 }
 
-// relayPinLogLevel sets the standard logger's level for one test and restores whatever was
-// in place afterwards.
-//
-// It is mandatory rather than convenient for the two tests that use it. logAttempt's success
-// arm is guarded by logrus.IsLevelEnabled(logrus.DebugLevel), so a test that asserted the
-// success line without raising the level would assert nothing, and a test that asserted the
-// silence without pinning the level to info would pass or fail depending on which other test
-// ran first.
+// relayPinLogLevel sets the standard logger's level for one test and restores whatever
+// was in place afterwards.
 func relayPinLogLevel(t *testing.T, level logrus.Level) {
 	t.Helper()
 
@@ -1547,23 +1427,13 @@ func relayEntriesWithMessage(hook *logtest.Hook, needle string) []*logrus.Entry 
 }
 
 // ---------------------------------------------------------------------------
-// The retry schedule (requirement R-4)
+// The retry schedule
 // ---------------------------------------------------------------------------
 
 // TestRelayRetryPolicy_DefaultScheduleIsExactlyOneTwoFourEightSixteenSeconds pins the
 // mandated schedule value by value.
 //
-// "Roughly increasing" is not the requirement and would not survive the mutation gate: a
-// multiplier of 3, a base of 500ms or an off-by-one on the attempt index all produce a
-// monotonically growing schedule and all violate R-4.
-//
-// THIS TEST IS HALF THE PROOF AND MUST NOT BE READ AS THE WHOLE OF IT. It calls backoffFor
-// directly, so it says what the policy computes and nothing about what the relay does with the
-// result — a helper that returned the mandated schedule while the live path indexed it wrongly,
-// or ignored it, would pass here unchanged. The live counterpart is
-// TestProcessRow_SchedulesTheConfiguredBackoffOnEveryFailure, which drives a real processor
-// through a full five-attempt lifecycle and reads the delay the relay actually handed the
-// repository on each attempt, the fifth included. Change one of these two and check the other.
+// THIS TEST IS HALF THE PROOF AND MUST NOT BE READ AS THE WHOLE OF IT.
 func TestRelayRetryPolicy_DefaultScheduleIsExactlyOneTwoFourEightSixteenSeconds(t *testing.T) {
 	policy := newRelayRetryPolicy(relayConfiguration().Relay)
 
@@ -1586,8 +1456,6 @@ func TestRelayRetryPolicy_DefaultScheduleIsExactlyOneTwoFourEightSixteenSeconds(
 			"the delay after attempt %d must be exactly %s", attempt, want)
 
 		// EVERY delay in the budget is strictly below the cap, not merely the last one.
-		// Asserting only the final attempt would leave a mutant that capped an earlier
-		// delay — a base of 40s, say — indistinguishable from the mandated schedule.
 		assert.Less(t, policy.backoffFor(attempt), policy.maxBackoff,
 			"the 30s cap is deliberately never reached within five attempts; do not 'fix' "+
 				"the multiplier or the cap to make it engage on attempt %d", attempt)
@@ -1597,7 +1465,7 @@ func TestRelayRetryPolicy_DefaultScheduleIsExactlyOneTwoFourEightSixteenSeconds(
 		}
 
 		// The multiplier itself, pinned as a relationship rather than inferred from the
-		// literals above. R-4 fixes it at 2, and a mutant that changed it to 3 while the
+		// literals above. The multiplier is fixed at 2, and a mutant that changed it to 3 while the
 		// literals were "corrected" to match would still fail here.
 		assert.Equal(t, expected[index-1]*eventRelayBackoffMultiplier, want,
 			"attempt %d's delay must be exactly the previous one doubled", attempt)
@@ -1701,21 +1569,18 @@ func TestNewEventRelayProcessor_UsesTheHouseDefaults(t *testing.T) {
 	assert.Equal(t, 30*time.Second, processor.retry.maxBackoff)
 }
 
-// TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly asserts the relay
-// reads the ONE decision point rather than comparing instants itself. Two comparisons could
-// disagree, and the pair that would disagree is "stop dual-writing" and "answer 410 Gone".
-//
-// The decision consulted is the WINDOW predicate, which gates on both ends. A relay reading
-// the sunset alone would keep dual-delivering outside the 30-day span the window declares,
-// which is the discrepancy the start date exists to make impossible.
+// TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly asserts the
+// relay reads the ONE decision point rather than comparing instants itself. Two
+// comparisons could disagree, and the pair that would disagree is "stop dual-writing"
+// and "answer 410 Gone".
 func TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly(t *testing.T) {
 	// The clock is a fixed instant rather than the wall clock, so the fixture cannot start
 	// meaning something else as time passes.
 	now := relayFixedNow
 
-	// A window that has CLOSED, so the expected answer is FALSE. Both sides of the boundary
-	// are exercised below, which is what stops a constructor that hardwired either constant
-	// from satisfying this test.
+	// A window that has CLOSED, so the expected answer is FALSE. Both sides of the
+	// boundary are exercised below, which is what stops a constructor that hardwired
+	// either constant from satisfying this test.
 	storeDeprecationWindow(t, now.AddDate(0, 0, -60), now.AddDate(0, 0, -30))
 
 	processor := NewEventRelayProcessor(&Blnk{config: relayConfiguration()})
@@ -1745,8 +1610,8 @@ func TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly(t *
 	assert.Equal(t, WebhookWindowPending, processor.windowState(now))
 
 	// The structural half: the relay holds no second copy of the decision. Behaviour above
-	// proves the relay's answer AGREES with event_sunset.go's today; this proves there is only
-	// one thing that could answer, so it cannot stop agreeing tomorrow.
+	// proves the relay's answer AGREES with event_sunset.go's today; this proves there is
+	// only one thing that could answer, so it cannot stop agreeing tomorrow.
 	source := relayParseOwnSource(t)
 	assert.Zero(t, identifierUses(source, "WebhookDeprecationSunsetDate"),
 		"the relay must never read the configured sunset date; event_sunset.go owns it, and a "+
@@ -1757,23 +1622,17 @@ func TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly(t *
 		"and it must never parse a date; a second parse is a second chance to disagree about "+
 			"what the configured instant means")
 
-	// The comparison primitives too, so the rule is about the OPERATION rather than about one
-	// spelling of one helper. A relay that compared instants itself would satisfy every
-	// assertion above and still own a second copy of the boundary.
+	// The comparison primitives too, so the rule is about the OPERATION rather than about
+	// one spelling of one helper. A relay that compared instants itself would satisfy
+	// every assertion above and still own a second copy of the boundary.
 	calls := selectorCallNames(source)
 	assert.Zero(t, calls["Before"],
 		"the relay must not compare instants itself; that comparison is the sunset decision")
 	assert.Zero(t, calls["After"], "the same, in the other direction")
 }
 
-// TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens is the other half of gating on
-// both ends of the window, and the reason the hard gate is safe.
-//
-// A relay running before its configured start would publish to Kafka while enqueuing NO
-// legacy webhooks, so subscribers who have not migrated would simply stop receiving events —
-// the same silent-loss shape as a webhook-only deployment writing rows nobody drains.
-// Refusing to start is what turns that into an operator-visible startup failure, and it is
-// why the per-row predicate may fail closed without stranding anybody.
+// TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens is the other half of
+// gating on both ends of the window, and the reason the hard gate is safe.
 func TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens(t *testing.T) {
 	now := relayFixedNow
 	storeDeprecationWindow(t, now.AddDate(0, 0, 30), now.AddDate(0, 0, 60))
@@ -1794,9 +1653,7 @@ func TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens(t *testing.T) {
 	assert.NotContains(t, err.Error(), "WEBHOOK_DEPRECATION_START_DATE",
 		"and it must not name a retired key")
 
-	// AND THE OBSTACLE REACHES THE CALLER (CR-2). Start used to log this and return nothing,
-	// so cmd/server.go could not see it and served anyway — with brokers configured and no
-	// relay, every producer captured a row that NEITHER transport would deliver.
+	// AND THE OBSTACLE REACHES THE CALLER.
 	startErr := harness.processor.Start(context.Background())
 	require.Error(t, startErr, "Start must return the obstacle, not only log it")
 	assert.Equal(t, err.Error(), startErr.Error(),
@@ -1818,22 +1675,23 @@ func TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens(t *testing.T) {
 		"after the sunset the relay must still run; Kafka is then the only transport")
 }
 
-// TestEventRelayProcessor_RefusesToStartWithAnUnusableWindow is the C-1 finding's relay leg.
+// TestEventRelayProcessor_RefusesToStartWithAnUnusableWindow is the relay leg of the
+// fail-closed rule.
 //
-// # The state, and why refusing is the only coherent answer
+// A relay only reaches the window check with a REAL publisher — the no-op is refused
+// above it — so Kafka is configured. For such a process WebhookWindowUnavailable means
+// configuration describes no usable dual-delivery window at all, and the sunset
+// predicate fails closed on that: WebhookSunsetPassed answers true, so the per-row
+// legacy leg is skipped and NO webhooks are enqueued, while nothing in configuration
+// said a retirement had happened. Subscribers who have not migrated stop receiving
+// events with nothing failing to say so — the same silent loss as the not-yet-open
+// case, arrived at from the other end of the window.
 //
-// A relay only reaches the window check with a REAL publisher — the no-op is refused above it
-// — so Kafka is configured. For such a process WebhookWindowUnavailable means configuration
-// describes no usable dual-delivery window at all, and the sunset predicate fails closed on
-// that: WebhookSunsetPassed answers true, so the per-row legacy leg is skipped and NO webhooks
-// are enqueued, while nothing in configuration said a retirement had happened. Subscribers who
-// have not migrated stop receiving events with nothing failing to say so — the same silent loss
-// as the not-yet-open case, arrived at from the other end of the window.
-//
-// config.resolveWebhookDeprecationWindow now refuses to LOAD brokers without a usable window,
-// so this arm is a second line of defence. It is reachable only by publishing configuration
-// some other way, which is exactly what the fetchConfiguration seam does here — the global
-// store cannot hold this shape, because validateAndAddDefaults rejects it.
+// config.resolveWebhookDeprecationWindow now refuses to LOAD brokers without a usable
+// window, so this arm is a second line of defence. It is reachable only by publishing
+// configuration some other way, which is exactly what the fetchConfiguration seam does
+// here — the global store cannot hold this shape, because validateAndAddDefaults
+// rejects it.
 func TestEventRelayProcessor_RefusesToStartWithAnUnusableWindow(t *testing.T) {
 	restoreFetchConfiguration(t)
 	sunsetParseWarnings.reset()
@@ -1925,10 +1783,6 @@ func TestNewEventRelayProcessor_IsNilSafe(t *testing.T) {
 }
 
 // TestEventRelayProcessor_RefusesToStartWithoutAUsableTransport is the data-loss guard.
-//
-// The no-op publisher case is the important one: it reports every publish as dispatched, so a
-// relay holding it would mark an entire outbox dispatched having sent nothing — every event
-// silently retired, with no error, no dead letter and nothing to replay from.
 func TestEventRelayProcessor_RefusesToStartWithoutAUsableTransport(t *testing.T) {
 	cases := map[string]struct {
 		mutate func(p *EventRelayProcessor)
@@ -2051,8 +1905,9 @@ func TestEventRelayProcessor_StartIsIdempotent(t *testing.T) {
 	defer cancel()
 
 	// EVERY Start MUST ANSWER nil, including the two that do nothing. Idempotency is the
-	// contract — cmd/server.go refuses to serve when Start reports an obstacle — so a repeated
-	// call that reported one would make a harmless double start look like a real refusal.
+	// contract — cmd/server.go refuses to serve when Start reports an obstacle — so a
+	// repeated call that reported one would make a harmless double start look like a real
+	// refusal.
 	require.NoError(t, harness.processor.Start(ctx))
 	require.NoError(t, harness.processor.Start(ctx), "a second Start is a no-op, not an obstacle")
 	require.NoError(t, harness.processor.Start(ctx), "and so is a third")
@@ -2187,14 +2042,8 @@ func TestEventRelayProcessor_StopWaitsForInFlightWork(t *testing.T) {
 		"the in-flight row must have been published before Stop returned")
 }
 
-// TestEventRelayProcessor_IsRunningTracksTheLifecycle walks the flag through every state a
-// caller can observe it in.
-//
-// It is asserted as one sequence rather than left implied by the tests above because
-// cmd/server.go starts the relay unconditionally and this flag is how anything else finds out
-// whether it came up. A flag that were merely "true after Start" — set before the refusal
-// check, say, or never cleared on Stop — would make a relay that is publishing nothing
-// indistinguishable from one that is working.
+// TestEventRelayProcessor_IsRunningTracksTheLifecycle walks the flag through every
+// state a caller can observe it in.
 func TestEventRelayProcessor_IsRunningTracksTheLifecycle(t *testing.T) {
 	harness := newRelayHarness(t)
 	harness.processor.WithPollInterval(5 * time.Millisecond)
@@ -2207,9 +2056,10 @@ func TestEventRelayProcessor_IsRunningTracksTheLifecycle(t *testing.T) {
 	require.NoError(t, harness.processor.Start(ctx), "a usable relay must start")
 	assert.True(t, harness.processor.IsRunning(), "after Start: running")
 
-	// A SECOND Start RETURNS NIL, and that is a contract rather than an accident: the caller
-	// asked for a draining relay and there is one. cmd/server.go refuses to serve on a
-	// non-nil return, so an error here would turn a harmless double call into a failed boot.
+	// A SECOND Start RETURNS NIL, and that is a contract rather than an accident: the
+	// caller asked for a draining relay and there is one. cmd/server.go refuses to serve
+	// on a non-nil return, so an error here would turn a harmless double call into a
+	// failed boot.
 	assert.NoError(t, harness.processor.Start(ctx),
 		"an idempotent second Start must not report the running relay as a refusal")
 	assert.True(t, harness.processor.IsRunning(),
@@ -2242,15 +2092,8 @@ func TestEventRelayProcessor_IsRunningTracksTheLifecycle(t *testing.T) {
 		"a relay that refused to start must never report as running")
 }
 
-// TestEventRelayProcessor_AClaimFailureDoesNotStopTheLoop asserts the run loop SURVIVES a
-// failing database and recovers on its own.
-//
-// The distinction this draws is the whole point: processBatch returning zero on a claim error
-// is already covered, but returning zero and ENDING THE LOOP would look identical from inside
-// one batch. A relay that quit on the first transient claim error would stop draining the
-// outbox permanently after any database blip, while still holding a running flag until someone
-// noticed — and recovery would need a process restart rather than the database simply coming
-// back.
+// TestEventRelayProcessor_AClaimFailureDoesNotStopTheLoop asserts the run loop SURVIVES
+// a failing database and recovers on its own.
 func TestEventRelayProcessor_AClaimFailureDoesNotStopTheLoop(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -2378,16 +2221,11 @@ func TestProcessBatch_BuildsThePublishRequestFromTheStoredRow(t *testing.T) {
 			"means the relay assembled the envelope itself and the fallback is silently in use")
 }
 
-// TestProcessBatch_PublishesTheStoredEnvelopeAndNeverARebuild is the relay's half of the
-// byte-fidelity guarantee, and it is asserted here because the relay is the PRIMARY publisher:
-// a stored envelope honoured on replay but rebuilt on first delivery would mean subscribers
-// received one byte sequence and the replay of that same event another.
-//
-// The row carries an envelope this build's serialiser could not have produced — a member no
-// version of model.LedgerEvent declares, plus a member order and whitespace layout the
-// canonical composer never emits — so an implementation that rebuilt from the row's columns
-// fails here and only here. Every other assertion in this file would keep passing, because a
-// rebuild agrees with itself.
+// TestProcessBatch_PublishesTheStoredEnvelopeAndNeverARebuild is the relay's half of
+// the byte-fidelity guarantee, and it is asserted here because the relay is the PRIMARY
+// publisher: a stored envelope honoured on replay but rebuilt on first delivery would
+// mean subscribers received one byte sequence and the replay of that same event
+// another.
 func TestProcessBatch_PublishesTheStoredEnvelopeAndNeverARebuild(t *testing.T) {
 	row := relayTransactionRow(11, "evt-stored-envelope")
 
@@ -2584,19 +2422,11 @@ func TestProcessTick_BoundsTheNumberOfBatchesOneTickChains(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Ordering (acceptance criterion V-6)
+// Ordering
 // ---------------------------------------------------------------------------
 
-// TestProcessBatch_PublishesInTheClaimOrderRatherThanReorderingIt is the relay's half of the
-// FIFO guarantee.
-//
-// The repository claims oldest occurrence first — ORDER BY occurred_at ascending, re-sorted
-// because `UPDATE … RETURNING` does not preserve the inner ORDER BY — and the relay's job is to
-// PRESERVE that order rather than impose one of its own. So the batch below arrives in
-// occurred_at order while its row ids and its event ids both run the OTHER way: a relay that
-// sorted by id, reversed the batch, or walked a map instead of the slice would produce a
-// different order and fail here, even though every one of those mutants leaves a "correct
-// looking" batch behind.
+// TestProcessBatch_PublishesInTheClaimOrderRatherThanReorderingIt is the relay's half
+// of the FIFO guarantee.
 func TestProcessBatch_PublishesInTheClaimOrderRatherThanReorderingIt(t *testing.T) {
 	// Descending ids, descending event ids, ASCENDING occurrence — the three orders are
 	// deliberately in conflict so only one of them can be the one observed.
@@ -2631,9 +2461,8 @@ func TestProcessBatch_PublishesInTheClaimOrderRatherThanReorderingIt(t *testing.
 	})
 
 	t.Run("within one aggregate under the default concurrency", func(t *testing.T) {
-		// This is the case acceptance criterion V-6 is actually about: every row shares a
-		// partition key, so they all land in one group and must be published in order even
-		// though the relay is free to run eight groups at once.
+		// Every row below shares one partition key, so they all land in one group and must be
+		// published in order even though the relay is free to run eight groups at once.
 		rows := make([]model.EventOutbox, 0, len(claimOrder))
 		for index, row := range claimOrder {
 			rows = append(rows, relayRow(
@@ -2654,15 +2483,13 @@ func TestProcessBatch_PublishesInTheClaimOrderRatherThanReorderingIt(t *testing.
 	})
 }
 
-// TestProcessBatch_BoundsConcurrencyAndKeepsOneAggregateOnOneWorker asserts the two properties
-// that make concurrent publishing safe rather than merely fast.
+// TestProcessBatch_BoundsConcurrencyAndKeepsOneAggregateOnOneWorker asserts the two
+// properties that make concurrent publishing safe rather than merely fast.
 //
-// Concurrency and ordering sound incompatible, and the reason they are not is specific: Kafka
-// orders within a PARTITION, the partition comes from the message key, and the key is the row's
-// partition key — so ordering survives concurrency exactly as long as no two rows sharing a key
-// are ever in flight at the same time. That is a property of how work is PARTITIONED, and the
-// wrong arrangement — rows round-robined across workers — would pass a throughput test and
-// break ordering silently.
+// Concurrency and ordering sound incompatible, and the reason they are not is specific:
+// Kafka orders within a PARTITION, the partition comes from the message key, and the
+// key is the row's partition key — so ordering survives concurrency exactly as long as
+// no two rows sharing a key are ever in flight at the same time.
 func TestProcessBatch_BoundsConcurrencyAndKeepsOneAggregateOnOneWorker(t *testing.T) {
 	t.Run("no more publishes are in flight than there are permits", func(t *testing.T) {
 		const (
@@ -2710,8 +2537,8 @@ func TestProcessBatch_BoundsConcurrencyAndKeepsOneAggregateOnOneWorker(t *testin
 
 		go func() {
 			// The timeout is the failure path: if fewer than `permits` publishes are ever
-			// concurrent, releasing anyway lets the peak assertion below report it rather
-			// than deadlocking the suite.
+			// concurrent, releasing anyway lets the peak assertion below report it rather than
+			// deadlocking the suite.
 			select {
 			case <-reached:
 			case <-time.After(5 * time.Second):
@@ -2805,13 +2632,9 @@ func TestProcessBatch_BoundsConcurrencyAndKeepsOneAggregateOnOneWorker(t *testin
 	})
 }
 
-// TestProcessBatch_PreservesPerAggregateOrderUnderConcurrency is the ordering guarantee in
-// the one arrangement that could break it: several aggregates interleaved in one batch,
-// published concurrently.
-//
-// It asserts the property that actually matters — per-aggregate order — rather than global
-// order, because global order is not what partitioned Kafka provides and pinning it would
-// forbid the concurrency the throughput requirement needs.
+// TestProcessBatch_PreservesPerAggregateOrderUnderConcurrency is the ordering guarantee
+// in the one arrangement that could break it: several aggregates interleaved in one
+// batch, published concurrently.
 func TestProcessBatch_PreservesPerAggregateOrderUnderConcurrency(t *testing.T) {
 	const perAggregate = 6
 
@@ -2888,19 +2711,11 @@ func TestGroupEventRowsByPartitionKey_KeepsClaimOrderAndSeparatesKeys(t *testing
 		"groups are ordered by first appearance, keeping the batch's FIFO shape")
 }
 
-// TestGroupEventRowsByPartitionKey_GroupsByTheKeyThePublishUses closes the gap between the
-// grouping and the routing.
+// TestGroupEventRowsByPartitionKey_GroupsByTheKeyThePublishUses closes the gap between
+// the grouping and the routing.
 //
-// The grouping exists to serialise the rows destined for ONE Kafka partition, and a partition is
-// selected by the key the publish sends — which is the ledger when the row carries one
-// (requirement R-6) and the stored partition_key otherwise. Grouping on the stored column alone
-// therefore splits two rows headed for the same partition into two groups and publishes them
-// concurrently, losing the ordering guarantee on precisely the rows where the two values disagree:
-// a row written before the ledger was threaded through, or one whose key was derived from the
-// payload first.
-//
-// Concurrency makes the resulting misordering non-deterministic, so it would surface as an
-// intermittent ordering complaint with nothing in the data to explain it.
+// Concurrency makes the resulting misordering non-deterministic, so it would surface as
+// an intermittent ordering complaint with nothing in the data to explain it.
 func TestGroupEventRowsByPartitionKey_GroupsByTheKeyThePublishUses(t *testing.T) {
 	// Two rows on ONE ledger whose stored keys differ — the divergent case. Under the old
 	// grouping these were two groups; they are one partition.
@@ -2964,31 +2779,14 @@ func relayGroupEventIDs(group []model.EventOutbox) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Per-attempt logging and the retry schedule in force (requirement R-4)
+// Per-attempt logging and the retry schedule in force
 // ---------------------------------------------------------------------------
 
-// TestProcessRow_LogsOneDurableRecordPerFailedAttemptAndNeverRestatesTheAttempt is the relay's
-// half of the per-attempt logging contract, and it pins BOTH halves of OBS-15.
+// TestProcessRow_LogsOneDurableRecordPerFailedAttemptAndNeverRestatesTheAttempt is the
+// relay's half of the per-attempt logging contract, and it pins both halves of it.
 //
-// # What changed, and why this test is shaped this way
-//
-// The relay used to log every failed attempt at warning, immediately after the publisher had
-// already logged the same attempt at error. One attempt produced two lines at two levels with
-// two field vocabularies, which doubled the volume of an incident on the highest-volume path
-// in the pipeline and — worse — made "how many attempts failed" answer twice the truth for
-// anyone counting lines. So the relay's restatement was removed and the publisher's
-// unconditional record is now the single canonical per-attempt line. Requirement R-4's field
-// set is asserted against that line in event_publisher_test.go, against the REAL publisher and
-// a fake broker; the fake publisher this harness substitutes cannot emit it, which is exactly
-// why the assertion lives there and not here.
-//
-// What the relay must still say is the part the publisher cannot know, and every line below is
-// a DURABLE STATE CHANGE rather than a second description of the attempt: four
-// retry-scheduling lines carrying the delay stamped on the row, then one exhaustion line
-// carrying the delay the schedule produced for the attempt that spent the budget.
-//
-// The five delays asserted here are the frozen schedule requirement R-4 mandates — 1s, 2s, 4s,
-// 8s, 16s — read from the log rather than from the policy helper.
+// The five delays asserted here are the frozen schedule the requirement mandates — 1s,
+// 2s, 4s, 8s, 16s — read from the log rather than from the policy helper.
 func TestProcessRow_LogsOneDurableRecordPerFailedAttemptAndNeverRestatesTheAttempt(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -3043,8 +2841,7 @@ func TestProcessRow_LogsOneDurableRecordPerFailedAttemptAndNeverRestatesTheAttem
 	}
 
 	// The fifth delay. It IS produced by the live path and IS recorded on the row; what it
-	// never does is separate two publishes, because the budget is spent. Both facts are on
-	// one line so neither can be inferred wrongly from the absence of the other.
+	// never does is separate two publishes, because the budget is spent.
 	exhausted := relayEntriesWithMessage(hook, "last attempt this row's budget allowed")
 	require.Len(t, exhausted, 1, "exactly one attempt spends the budget")
 	assert.Equal(t, 5, exhausted[0].Data["attempt"])
@@ -3054,16 +2851,8 @@ func TestProcessRow_LogsOneDurableRecordPerFailedAttemptAndNeverRestatesTheAttem
 		"and the line must say plainly that nothing waits it, so 'produced' is never read as 'waited'")
 }
 
-// TestProcessRow_LogsASuccessfulAttemptAtDebugCarryingTheSameFields covers logAttempt's other
-// arm, and the level split between the two.
-//
-// Requirement R-4 asks for PER-ATTEMPT logging, which is why the successful arm exists at all:
-// an operator reconstructing what happened to one event needs the attempt that worked as well
-// as the ones that did not. But a line per published event is a line five hundred times a
-// second whose content is "it worked", so it is emitted at debug and the fields are built only
-// when debug is enabled. Both halves of that compromise are asserted here, because testing
-// only the first would let a mutant that logged successes unconditionally through — and that
-// mutant floods production logs at exactly the throughput the feature was built for.
+// TestProcessRow_LogsASuccessfulAttemptAtDebugCarryingTheSameFields covers logAttempt's
+// other arm, and the level split between the two.
 func TestProcessRow_LogsASuccessfulAttemptAtDebugCarryingTheSameFields(t *testing.T) {
 	t.Run("at debug level the attempt is logged with the same field set", func(t *testing.T) {
 		relayPinLogLevel(t, logrus.DebugLevel)
@@ -3133,8 +2922,8 @@ func TestProcessRow_LogsASuccessfulAttemptAtDebugCarryingTheSameFields(t *testin
 		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 
 		// The RETRY SCHEDULING is what the relay owns, and no level filter may hide it: it
-		// carries the delay stamped on the row and the instant the row is next due, neither of
-		// which the publisher knows.
+		// carries the delay stamped on the row and the instant the row is next due, neither
+		// of which the publisher knows.
 		scheduled := relayEntriesWithMessage(hook, "scheduled for another attempt")
 		require.Len(t, scheduled, 1,
 			"the durable retry decision must survive a level filter — it is the only record of "+
@@ -3152,30 +2941,10 @@ func TestProcessRow_LogsASuccessfulAttemptAtDebugCarryingTheSameFields(t *testin
 	})
 }
 
-// TestProcessRow_SchedulesTheConfiguredBackoffOnEveryFailure is THE LIVE PROOF of requirement
-// R-4's schedule: it drives a real EventRelayProcessor through a full five-attempt lifecycle
-// and reads the delay the relay actually handed the repository on each one.
-//
-// # Why this test and not the policy table
-//
-// TestRelayRetryPolicy_DefaultScheduleIsExactlyOneTwoFourEightSixteenSeconds pins the same five
-// values by calling backoffFor directly. That is a necessary check and an insufficient one: a
-// helper can return the right number while nothing calls it, or calls it with the wrong
-// index. This test cannot be satisfied that way. Every value below is one the relay passed to
-// MarkEventFailed, which is the value stamped on next_attempt_at and therefore the delay the
-// row genuinely waits before the claim predicate offers it again.
-//
-// # All FIVE values are produced, and the fifth is the one that gets misread
-//
-// Five attempts have four gaps between them, so 1s, 2s, 4s and 8s are the delays a retried
-// event experiences. The fifth attempt still computes and records 16s — the schedule's final
-// value — and then spends the budget instead of publishing a sixth time. Asserting only the
-// first four would leave the file agreeing with the reading that the live path never produces
-// the mandated sequence's last value, which is exactly the misreading the assertion on
-// failures[4] rules out.
-//
-// The delay is DURABLE rather than slept: see TestProcessRow_DoesNotRetryInProcess, which is
-// why five attempts here mean five separate claims with the fake's clock advanced between them.
+// TestProcessRow_SchedulesTheConfiguredBackoffOnEveryFailure is THE LIVE PROOF of
+// the configured retry schedule: it drives a real EventRelayProcessor through a full
+// five-attempt lifecycle and reads the delay the relay actually handed the repository
+// on each one.
 func TestProcessRow_SchedulesTheConfiguredBackoffOnEveryFailure(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-backoff"))
 	harness.publisher.err = errRelayTransient
@@ -3216,11 +2985,8 @@ func TestProcessRow_SchedulesTheConfiguredBackoffOnEveryFailure(t *testing.T) {
 	}
 }
 
-// The three suites that used to assert blnk.events.published.total's contract here and
-// in two other places are now one table-driven suite,
-// TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent, which carries every property
-// they asserted between them. Its own doc records why the EventsDispatchedTotal suite
-// is deliberately not folded in with them.
+// Its own doc records why the EventsDispatchedTotal suite is deliberately not folded in
+// with them.
 
 // TestProcessRow_DoesNotRetryInProcess asserts one publish attempt per claim. Sleeping the
 // schedule here would outlive the 30-second lease and let a second instance republish the row
@@ -3296,7 +3062,7 @@ func TestProcessRow_LogsWhenAPublishedRowCannotBeMarked(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Exhaustion and the dead-letter hand-off (requirement R-5)
+// Exhaustion and the dead-letter hand-off
 // ---------------------------------------------------------------------------
 
 // TestProcessRow_DeadLettersOnExhaustionWithEverythingTheMetadataNeeds drives the whole
@@ -3427,9 +3193,8 @@ func TestProcessRow_UsesTheRowBudgetRatherThanTheConfiguredOne(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The dual-delivery window (requirement R-12, acceptance criterion V-8)
-//
-// DELETED AT THE WEBHOOK SUNSET, together with the branch these tests cover.
+// The dual-delivery window. DELETED AT THE WEBHOOK SUNSET, together with the branch these
+// tests cover.
 // ---------------------------------------------------------------------------
 
 // TestDualDelivery_EnqueuesTheStoredBytesAndRecordsTheMarker asserts the mechanism that makes
@@ -3481,19 +3246,11 @@ func TestDualDelivery_StopsAfterTheSunset(t *testing.T) {
 	assert.Len(t, harness.store.snapshotDispatched(), 1)
 }
 
-// TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset drives the branch from REAL
-// CONFIGURATION rather than from a stub predicate.
+// TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset drives the branch
+// from REAL CONFIGURATION rather than from a stub predicate.
 //
-// Every other test in this section pins the window predicate so that the boundary is exact.
-// That is the right way to test the branch, and it leaves one thing unproven: that the wired
-// predicate is the one that reads the configured window. A relay whose field defaulted to
-// "the window is open" would satisfy every stubbed test in this file and then keep
-// dual-writing forever in production. So this test uses the predicate the CONSTRUCTOR
-// installs — event_sunset.go's WebhookDualDeliveryActive — and moves the configured window
-// around it.
-//
-// config.ConfigStore is global, so the helper snapshots and restores it through t.Cleanup;
-// without that, the window set here would leak into every later test in the package.
+// Every other test in this section pins the window predicate so that the boundary is
+// exact.
 func TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset(t *testing.T) {
 	cases := map[string]struct {
 		startOffset  int
@@ -3528,9 +3285,9 @@ func TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset(t *testin
 
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
-			// Saved and restored with t.Cleanup by the helper the sunset tests already use.
-			// The offsets are relative to relayFixedNow, which is where the harness pins the
-			// clock, so each window sits unambiguously on its side of the boundary.
+			// Saved and restored with t.Cleanup by the helper the sunset tests already use. The
+			// offsets are relative to relayFixedNow, which is where the harness pins the clock,
+			// so each window sits unambiguously on its side of the boundary.
 			storeDeprecationWindow(t,
 				relayFixedNow.AddDate(0, 0, testCase.startOffset),
 				relayFixedNow.AddDate(0, 0, testCase.sunsetOffset),
@@ -3557,21 +3314,10 @@ func TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset(t *testin
 	}
 }
 
-// TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook proves the no-double-enqueue
-// guarantee through a REAL re-claim cycle rather than a pre-set flag.
+// TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook proves the
+// no-double-enqueue guarantee through a REAL re-claim cycle rather than a pre-set flag.
 //
-// The cycle matters because the flag is only useful if it SURVIVES the round trip: claim,
-// enqueue, mark the webhook leg, crash before the Kafka leg is marked, lease expiry, re-claim.
-// Asserting on a row whose WebhookDispatched was set by hand proves the branch reads the field;
-// this proves the field is still set when the row comes back, which is the property production
-// depends on.
-//
-// Note which duplicate is and is not acceptable here. The LEGACY leg must not repeat: asynq
-// would deliver a second HTTP POST to a subscriber that already received one. The KAFKA leg
-// does repeat, and that is the documented at-least-once redelivery — the publish succeeded and
-// the row could not be marked, so the next claim republishes, and the subscriber suppresses it
-// on event_id. This test asserts exactly that asymmetry rather than pretending both are
-// exactly-once.
+// Note which duplicate is and is not acceptable here.
 func TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-restart-once"))
 
@@ -3611,22 +3357,9 @@ func TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook(t *testing.T)
 		"a crash in the bookkeeping must not consume a publish retry attempt")
 }
 
-// TestDualDelivery_EvaluatesTheBoundaryImmediatelyBeforeEachEnqueue asserts the decision is
-// taken PER ROW, immediately before the enqueue — not once at the top of the batch.
-//
-// # Why the cheaper thing is the wrong thing
-//
-// One decision per batch is obviously less work, and it was what this test used to require.
-// It is also wrong at the only moment that matters. A batch of a hundred rows claimed one
-// second before the sunset takes longer than a second to publish, so a decision taken at the
-// top of it enqueues legacy webhooks AFTER the boundary has passed — the single behaviour the
-// sunset is defined to prevent, on the single day anybody is watching for it.
-//
-// The cost is a comparison of two instants per row against a value already in memory, which
-// at five hundred events a second is nothing next to a broker round trip.
-//
-// The second half of the test is the one that would fail under a batch-level decision: the
-// boundary MOVES mid-batch, and only the rows dispatched before it may have a legacy leg.
+// TestDualDelivery_EvaluatesTheBoundaryImmediatelyBeforeEachEnqueue asserts the
+// decision is taken PER ROW, immediately before the enqueue — not once at the top of
+// the batch.
 func TestDualDelivery_EvaluatesTheBoundaryImmediatelyBeforeEachEnqueue(t *testing.T) {
 	t.Run("one decision per row", func(t *testing.T) {
 		rows := make([]model.EventOutbox, 0, 4)
@@ -3763,23 +3496,18 @@ func TestDualDelivery_LegacyFailuresNeverAffectTheKafkaPath(t *testing.T) {
 	})
 }
 
-// TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka is the positive proof
-// that the two legs are tracked independently, and it is the test the previous behaviour could
-// not have passed.
+// TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka is the positive
+// proof that the two legs are tracked independently, and it is the test the previous
+// behaviour could not have passed.
 //
-// # The full cycle, because each half alone proves nothing
-//
-// The first pass publishes to Kafka and fails to enqueue. The second pass — a REAL re-claim of
-// the same row, not a pre-set flag — must enqueue the webhook and nothing else. Both halves
-// matter:
+// The first pass publishes to Kafka and fails to enqueue. The second pass — a REAL
+// re-claim of the same row, not a pre-set flag — must enqueue the webhook and nothing
+// else.
 //
 //   - if the row were not claimable, the webhook would be lost, which is the defect;
-//   - if the re-claim republished to Kafka, retrying a deprecated-transport failure would put a
-//     duplicate on the topic — paid for by every subscriber's idempotency filter, for the
-//     benefit of a transport being retired.
-//
-// The Kafka publish count is therefore the assertion that matters most here, and it is one
-// across both passes.
+//   - if the re-claim republished to Kafka, retrying a deprecated-transport failure
+//     would put a duplicate on the topic — paid for by every subscriber's idempotency
+//     filter, for the benefit of a transport being retired.
 func TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-legacy-recovered"))
 	harness.legacy.err = errors.New("relay test: redis unavailable")
@@ -3792,7 +3520,7 @@ func TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka(t *testi
 	require.Empty(t, harness.store.snapshotDispatched(), "and the row must not be terminal")
 
 	// The row must be back in the claimable set once its webhook backoff has elapsed. This is
-	// the property the old code did not have: dispatched rows are never claimed again.
+	// the property that matters: dispatched rows are never claimed again.
 	afterBackoff := relayFixedNow.Add(72 * time.Hour)
 	require.Contains(t, harness.store.claimableIDs(afterBackoff), int64(1),
 		"a row whose legacy leg is owed must return to the claimable set")
@@ -3831,14 +3559,9 @@ func TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka(t *testi
 		"and a legacy failure must never dead-letter an event that reached its topic")
 }
 
-// TestDualDelivery_AnUnreachableQueueAbandonsTheLegacyLegLoudly covers the terminal arm of the
-// webhook budget, which exists so a permanently unreachable queue cannot keep a row claimable
-// forever.
-//
-// The row does eventually become dispatched — the Kafka delivery is real and final — but only
-// after the legacy leg has spent its own budget, and the abandonment is logged at ERROR
-// naming the event. That log line is the only notice anybody gets that a webhook promised for
-// the migration window will never arrive, so its level and its content are the assertion.
+// TestDualDelivery_AnUnreachableQueueAbandonsTheLegacyLegLoudly covers the terminal arm
+// of the webhook budget, which exists so a permanently unreachable queue cannot keep a
+// row claimable forever.
 func TestDualDelivery_AnUnreachableQueueAbandonsTheLegacyLegLoudly(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -3903,37 +3626,26 @@ func TestDualDelivery_WithoutALegacyTransportIsANoOp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Crash recovery (acceptance criterion V-7)
+// Crash recovery
 //
-// THE GUARANTEE, STATED HONESTLY — nothing below asserts exactly-once end-to-end delivery,
-// because that is not what this pipeline provides and a test claiming it would be wrong.
+// THE GUARANTEE, STATED HONESTLY — nothing below asserts exactly-once end-to-end
+// delivery, because that is not what this pipeline provides and a test claiming it
+// would be wrong.
 //
 // What IS guaranteed:
 //
-//   - NO LOSS. The event and the ledger mutation commit in one database transaction, and a
-//     claim takes a LEASE rather than removing the row, so a relay that dies mid-batch strands
-//     nothing: the rows re-enter the claimable set when the lease expires.
-//   - DUPLICATE SUPPRESSION IS POSSIBLE. blnk.event_outbox.event_id is uniquely indexed and
-//     travels on the message, so a subscriber can recognise a redelivery.
-//
-// What is NOT guaranteed: single delivery. The relay publishes and then marks the row
-// dispatched, and those are two operations against two systems with no transaction spanning
-// them. A crash in between leaves a row that was published but not marked, and the next claim
-// publishes it AGAIN. That window is deliberately open — marking first would lose events
-// instead of duplicating them, and a duplicate is recoverable at the subscriber while a loss is
-// recoverable nowhere. event_id idempotency is therefore a DOCUMENTED SUBSCRIBER OBLIGATION
-// (docs/event-streaming.md), not an implicit promise, and the tests below assert exactly that
-// shape: every event delivered at least once, and the redelivery bounded to the one attempt the
-// crash window is wide.
+//   - NO LOSS. The event and the ledger mutation commit in one database transaction,
+//     and a claim takes a LEASE rather than removing the row, so a relay that dies
+//     mid-batch strands nothing: the rows re-enter the claimable set when the lease
+//     expires.
+//   - DUPLICATE SUPPRESSION IS POSSIBLE. blnk.event_outbox.event_id is uniquely indexed
+//     and travels on the message, so a subscriber can recognise a redelivery.
 // ---------------------------------------------------------------------------
 
-// TestEventRelay_LockExpiryReturnsAClaimedRowToTheClaimableSet asserts the mechanism the whole
-// recovery story rests on: a claim is a LEASE, not a delete.
+// TestEventRelay_LockExpiryReturnsAClaimedRowToTheClaimableSet asserts the mechanism
+// the whole recovery story rests on: a claim is a LEASE, not a delete.
 //
-// Both directions matter. While the lease is live the row belongs to the instance holding it, so
-// nothing else may take it — without that, two relays would publish the same event concurrently
-// and the per-aggregate ordering guarantee would be gone. Once the lease expires the row must
-// come back, because a relay that died holding it is exactly the case this recovers.
+// Both directions matter.
 func TestEventRelay_LockExpiryReturnsAClaimedRowToTheClaimableSet(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-leased"))
 
@@ -3971,16 +3683,10 @@ func TestEventRelay_LockExpiryReturnsAClaimedRowToTheClaimableSet(t *testing.T) 
 		"published twice: the at-least-once duplicate, suppressed at the subscriber on event_id")
 }
 
-// TestEventRelay_NoTransitionLeavesARowPermanentlyUnclaimable enumerates every way the relay can
-// leave a row and asserts that none of them is a dead end.
+// TestEventRelay_NoTransitionLeavesARowPermanentlyUnclaimable enumerates every way the
+// relay can leave a row and asserts that none of them is a dead end.
 //
-// This is the invariant that makes "no loss" true in practice rather than in principle. Every
-// individual failure path is tested elsewhere; what is asserted here is the property they must
-// share — after the relay is finished with a row it is either TERMINAL (and the event is durable
-// somewhere: the category topic, or its `<topic>.dlt` sibling, or visibly failed in the
-// dead-letter inventory for an operator) or CLAIMABLE AGAIN. A single transition that produced
-// neither would silently retire an event with nothing to alert on, and no individual path test
-// would notice.
+// This is the invariant that makes "no loss" true in practice rather than in principle.
 func TestEventRelay_NoTransitionLeavesARowPermanentlyUnclaimable(t *testing.T) {
 	// Far enough ahead that any scheduled retry delay has certainly come due, so a row that is
 	// merely waiting is not mistaken for a row that is stuck.
@@ -4037,9 +3743,7 @@ func TestEventRelay_NoTransitionLeavesARowPermanentlyUnclaimable(t *testing.T) {
 		},
 		// NOT terminal, and that is the corrected expectation rather than a relaxed one. A
 		// legacy enqueue failure leaves a webhook OWED, and this test's subject is precisely
-		// that no transition strands a row: the row must come back so the webhook is
-		// retried. It does come back — as webhook_pending, which is inside the claimable set
-		// — and its Kafka leg is recorded, so the re-claim publishes nothing.
+		// that no transition strands a row: the row must come back so the webhook is retried.
 		"the legacy leg fails": {
 			injectFault: func(h *relayHarness) {
 				h.legacy.err = errors.New("relay test: redis unavailable")
@@ -4083,22 +3787,11 @@ func TestEventRelay_NoTransitionLeavesARowPermanentlyUnclaimable(t *testing.T) {
 	}
 }
 
-// TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports asserts the relay's contract with
-// blnk.outbox.pending, which is NOT to record it.
+// TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports asserts the relay's contract
+// with blnk.outbox.pending, which is NOT to record it.
 //
-// The gauge has exactly one owner: EventMetricsCollector, which re-reads the authoritative
-// per-status counts on every tick and publishes pending + processing — including an explicit
-// zero, because zero is the measurement that clears the alert. Recording it from here as well
-// would produce two writers of one gauge whose values disagree between ticks, and a gauge
-// written from the code path that causes the condition measures the wrong thing.
-//
-// So what this asserts is the relay's actual responsibility: MOVING the number the collector
-// reports. Draining takes it to zero; a relay that cannot publish leaves it standing, which is
-// precisely what has to remain true for the backlog alert to be able to fire at all.
-//
-// The arithmetic used here (`unpublishedBacklog`) is the collector's own — pending PLUS
-// processing. Counting pending alone would report a drained backlog at exactly the moment a
-// stalled relay held every claimable row under a lease.
+// So what this asserts is the relay's actual responsibility: MOVING the number the
+// collector reports.
 func TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports(t *testing.T) {
 	const rowCount = 4
 
@@ -4155,37 +3848,17 @@ func TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports(t *testing.T) {
 
 		// THE ALLOWLIST, and it replaces a flat ban on importing internal/metrics.
 		//
-		// The ban was the right rule while every instrument in the pipeline was owned by the
-		// publisher or the collector. It stopped being right when the per-event delivery count
-		// arrived (PERF-P21): that count can only be taken at the DURABLE TRANSITION, which
-		// happens here and nowhere else, so the relay is its only possible owner and a rule
-		// that forbade the import forbade the fix.
-		//
 		// What has to stay asserted is the boundary the ban was standing in for, so it is
-		// stated directly instead: ONE WRITER PER INSTRUMENT. The allowlist is therefore not a
-		// budget but a list of facts only the relay can observe, and each entry has to survive
-		// that test in writing:
+		// stated directly instead: ONE WRITER PER INSTRUMENT. The allowlist is therefore not
+		// a budget but a list of facts only the relay can observe, and each entry has to
+		// survive that test in writing:
 		//
 		//   - EventsDispatchedTotal is taken at the durable transition, which happens here.
 		//   - EventRepairsCompletedTotal counts rows a repair pass drove to their destination
-		//     (PERF-M06). Nothing outside this file performs a repair, so nothing else can
-		//     count one; the collector reading the table would see the row GONE from the
-		//     backlog and could not tell a repair from a purge.
-		//   - EventRepairSaturated is whether this tick's repair BUDGET ended the chain. It is
-		//     a property of the relay's own control flow, invisible in the table: a database
-		//     reader sees a falling backlog either way, which is precisely the distinction the
-		//     gauge exists to draw.
-		//
-		// The REPAIR BACKLOG gauge is deliberately NOT here, and its absence is the rule still
-		// doing its job: it is a count of rows, so the collector owns it and publishes it from
-		// the per-status aggregate it already reads for blnk.outbox.pending. A relay writing it
-		// would be the second writer this boundary exists to prevent.
-		//
-		// Enumerating the selections rather than banning names one at a time is what keeps this
-		// correct when the package gains an instrument — a new gauge recorded from here fails
-		// this assertion without anybody having to remember to add it. It is an equality against
-		// a non-empty set, which also makes it self-guarding: a helper that saw nothing would
-		// fail rather than pass.
+		//     Nothing outside this file performs a repair, so nothing else can count one; the
+		//     collector reading the table would see the row GONE from the backlog and could
+		//     not tell a repair from a purge.
+		//   - EventRepairSaturated is whether this tick's repair BUDGET ended the chain.
 		selections := qualifiedSelections(source, "metrics")
 		assert.Equal(t,
 			[]string{"EventRepairSaturated", "EventRepairsCompletedTotal", "EventsDispatchedTotal"},
@@ -4223,22 +3896,14 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // ---------------------------------------------------------------------------
-// The per-event delivery count (PERF-P21)
+// The per-event delivery count
 // ---------------------------------------------------------------------------
 
-// captureDispatchedCounter swaps blnk.events.dispatched.total for a recorder and restores
-// the original when the test ends.
+// captureDispatchedCounter swaps blnk.events.dispatched.total for a recorder and
+// restores the original when the test ends.
 //
-// The instrument is a package-level variable in internal/metrics, so the swap is the whole
-// mechanism: installing a global meter provider instead would blind every other test in the
-// binary, because otel delegates its global meter to the first provider set, once and
-// permanently. publisherRecordedCounter is reused rather than reimplemented — it is in this
-// package, it already satisfies otelmetric.Int64Counter, and its Enabled reports true so the
-// code under test takes the same path it takes in a process with an exporter configured.
-//
-// It lives here, beside the two increments, and is shared with event_dlt_test.go, which asserts
-// the REPLAY path leaves this counter alone. One recorder for one instrument is deliberate: two
-// would let the two files disagree about what a recorded increment looks like.
+// It lives here, beside the two increments, and is shared with event_dlt_test.go, which
+// asserts the REPLAY path leaves this counter alone.
 func captureDispatchedCounter(t *testing.T) *publisherRecordedCounter {
 	t.Helper()
 
@@ -4250,31 +3915,12 @@ func captureDispatchedCounter(t *testing.T) *publisherRecordedCounter {
 	return recorder
 }
 
-// TestEventRelay_CountsEachEventOnceWhenItReachesDispatched is the guard on PERF-P21.
-//
-// # The defect
+// TestEventRelay_CountsEachEventOnceWhenItReachesDispatched is the dispatch-counting guard.
 //
 // blnk.events.published.total is incremented on the BROKER ACKNOWLEDGEMENT, inside the
-// publisher, before the outbox row has been moved. That is a correct measure of write
-// throughput and an incorrect measure of delivery, because the relay is at-least-once by
-// design: a crash between the acknowledgement and the transition leaves the row claimable, the
-// next pass writes the same event again, and the counter counts it again. Acceptance criteria
-// V-1 (500 events per second) and V-3 (dead-letter rate under 0.1% of events) were both stated
-// against that counter, so both silently read redeliveries as extra events — inflating measured
-// throughput and DEFLATING the dead-letter rate, in the same direction, at exactly the moment a
-// broker is unhealthy enough for the rate to matter.
+// publisher, before the outbox row has been moved.
 //
-// # The fix these assertions pin
-//
-// blnk.events.dispatched.total is incremented at the DURABLE TRANSITION instead. The transition
-// is conditional on the claim token and clears it, so it succeeds for one worker once in an
-// event's whole life — which makes "increment after it returns" a once-per-event guarantee
-// rather than a hope. Two arms of the relay reach dispatched and both must count; nothing else
-// may.
-//
-// The two counters are therefore both right, about different questions, and their ratio is the
-// redelivery factor. That is why the write counter is not simply moved: it is asserted here to
-// be UNTOUCHED by the relay, in the ownership test above.
+// blnk.events.dispatched.total is incremented at the DURABLE TRANSITION instead.
 func TestEventRelay_CountsEachEventOnceWhenItReachesDispatched(t *testing.T) {
 	t.Run("one increment per event, attributed by topic and event type", func(t *testing.T) {
 		counter := captureDispatchedCounter(t)
@@ -4299,8 +3945,8 @@ func TestEventRelay_CountsEachEventOnceWhenItReachesDispatched(t *testing.T) {
 			assert.EqualValues(t, 1, record.value, "an event is one event, never a batch")
 			// THE SAME ATTRIBUTE SET AS THE WRITE COUNTER, asserted as a whole set because the
 			// ratio between the two is only computable if their label sets match: an extra
-			// attribute here would split this series against an unsplit denominator and make
-			// the redelivery factor unjoinable. The write counter's own set is pinned in
+			// attribute here would split this series against an unsplit denominator and make the
+			// redelivery factor unjoinable. The write counter's own set is pinned in
 			// TestEventPublisher_RecordsThePublishInstruments.
 			assert.Equal(t, map[string]string{
 				"topic":      "blnk.transactions",
@@ -4368,11 +4014,9 @@ func TestEventRelay_CountsEachEventOnceWhenItReachesDispatched(t *testing.T) {
 	})
 
 	t.Run("the abandoned legacy leg is counted, because that row IS dispatched", func(t *testing.T) {
-		// The second arm. MarkEventWebhookPending moves the row straight to dispatched when the
-		// webhook budget is spent, so the event's delivery is durably recorded there rather
-		// than through MarkEventDispatched. Omitting this arm would under-report deliveries by
-		// exactly the number of events whose legacy leg was abandoned — and, because the
-		// dead-letter rate divides by this counter, would make that rate look higher than it is.
+		// The second arm. MarkEventWebhookPending moves the row straight to dispatched when
+		// the webhook budget is spent, so the event's delivery is durably recorded there
+		// rather than through MarkEventDispatched.
 		counter := captureDispatchedCounter(t)
 
 		row := relayTransactionRow(1, "evt-count-abandoned")
@@ -4397,8 +4041,8 @@ func TestEventRelay_CountsEachEventOnceWhenItReachesDispatched(t *testing.T) {
 
 	t.Run("a row still owed its webhook is counted on the pass that dispatches it", func(t *testing.T) {
 		// The retry arm of the same transition, which does NOT reach dispatched. The row is
-		// claimed a second time for its webhook alone, and it is that second pass — not the one
-		// that published to Kafka — which moves it to dispatched and counts it.
+		// claimed a second time for its webhook alone, and it is that second pass — not the
+		// one that published to Kafka — which moves it to dispatched and counts it.
 		counter := captureDispatchedCounter(t)
 
 		harness := newRelayHarness(t, relayTransactionRow(1, "evt-count-owed"))
@@ -4439,7 +4083,7 @@ func TestEventRelay_CountsEachEventOnceWhenItReachesDispatched(t *testing.T) {
 	})
 
 	t.Run("an exhausted event is counted as dead-lettered and never as dispatched", func(t *testing.T) {
-		// The two terminal counters must partition the events, not overlap: V-3 reads
+		// The two terminal counters must partition the events, not overlap: the dead-letter rate reads
 		// dead-lettered over dispatched, so an event appearing in both would understate the
 		// rate while a broker was rejecting everything.
 		counter := captureDispatchedCounter(t)
@@ -4555,9 +4199,9 @@ func TestCrashRecovery_LeavesUnprocessedRowsClaimableWhenTheContextIsCancelled(t
 	assert.Less(t, firstRun, 6, "cancellation must stop dispatching the rest of the batch")
 	assert.GreaterOrEqual(t, firstRun, 2, "the rows already in flight must complete")
 
-	// The bookkeeping the relay already owed must have been completed on its detached context,
-	// even though the caller's context was cancelled: otherwise the rows it published would be
-	// republished for no reason.
+	// The bookkeeping the relay already owed must have been completed on its detached
+	// context, even though the caller's context was cancelled: otherwise the rows it
+	// published would be republished for no reason.
 	assert.Len(t, harness.store.snapshotDispatched(), firstRun,
 		"work already done on the wire must be recorded despite the cancellation")
 
@@ -4625,24 +4269,11 @@ type relayCtxKey struct{}
 // Lease safety while a batch is in flight
 // ---------------------------------------------------------------------------
 
-// TestEventRelay_RenewsTheLeaseWhileTheBatchIsInFlight is the fix for the arithmetic that
-// made the shipped defaults unsafe.
+// TestEventRelay_RenewsTheLeaseWhileTheBatchIsInFlight is the fix for the arithmetic
+// that made the shipped defaults unsafe.
 //
-// # The arithmetic
-//
-// Batch 100, concurrency 8, and a writer whose produce timeout is 10 seconds: the batch runs
-// in 13 waves and a wave can occupy the whole timeout, so the worst case is well over two
-// minutes against a 30-second lease. The rows in the later waves had their lease expire
-// BEFORE their publish was attempted, while this relay still held them — so another instance
-// claimed and published them, this one published them again, and every transition this one
-// attempted failed as a lost claim. Nothing logged a defect.
-//
-// # What is asserted
-//
-// The heartbeat renews under THIS BATCH'S CLAIM TOKEN and with the configured lease, and it
-// stops when the batch does. The claim token matters more than the count: renewing under the
-// wrong token would extend somebody else's lease and leave this batch's rows to expire, and
-// no throughput or ordering assertion anywhere would notice.
+// The heartbeat renews under THIS BATCH'S CLAIM TOKEN and with the configured lease,
+// and it stops when the batch does.
 func TestEventRelay_RenewsTheLeaseWhileTheBatchIsInFlight(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-renewed"))
 	// A short lease so the renewal interval (lease/3, floored at 250ms) elapses inside the
@@ -4693,12 +4324,11 @@ func TestEventRelay_RenewsTheLeaseWhileTheBatchIsInFlight(t *testing.T) {
 			"a lease on rows it no longer owns and delay their recovery after a crash")
 }
 
-// TestEventRelay_LeaseRenewalRetiresWhenNothingIsLeftInFlight asserts the heartbeat stops
-// itself when the database reports nothing under the token.
+// TestEventRelay_LeaseRenewalRetiresWhenNothingIsLeftInFlight asserts the heartbeat
+// stops itself when the database reports nothing under the token.
 //
-// Every terminal transition clears claim_token, so a zero count means every row is finished.
-// Continuing to renew on that answer would be a pointless round trip per lease-third for the
-// life of the process — and, worse, it would keep asserting a hold this relay no longer has.
+// Every terminal transition clears claim_token, so a zero count means every row is
+// finished.
 func TestEventRelay_LeaseRenewalRetiresWhenNothingIsLeftInFlight(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-renewal-retires"))
 	harness.processor.WithLockDuration(750 * time.Millisecond)
@@ -4737,11 +4367,7 @@ func TestEventRelay_LeaseRenewalRetiresWhenNothingIsLeftInFlight(t *testing.T) {
 // TestEventRelay_ALeaseRenewalFailureDoesNotAbortTheBatch asserts a failed renewal is
 // reported and stepped past.
 //
-// The batch has publishes in flight. Abandoning them because a bookkeeping round trip failed
-// would strand events that were about to be delivered; carrying on risks the rows being
-// reclaimed and republished, which is the same at-least-once duplicate every other path here
-// accepts and which the subscriber suppresses on event_id. The trade is deliberate, so the
-// warning is the assertion.
+// The batch has publishes in flight.
 func TestEventRelay_ALeaseRenewalFailureDoesNotAbortTheBatch(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -4779,36 +4405,25 @@ func TestEventRelay_ALeaseRenewalFailureDoesNotAbortTheBatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The dead-letter hand-off lease — F-28
+// The dead-letter hand-off lease
 // ---------------------------------------------------------------------------
 
 // TestEventRelay_ATerminalFailureKeepsTheRowLeasedThroughItsDeadLetterHandOff is the
 // cross-instance race, modelled at the level the relay's store contract can express it.
 //
-// # The race
-//
 // Both terminal transitions RETAIN the claim token, and the reason is exclusivity: the
-// dead-letter write and the MarkEventDeadLettered that records it are still owed, and only the
-// worker that took the decision may perform them. That is what stops two copies of one event
-// reaching a `<topic>.dlt` sibling.
+// dead-letter write and the MarkEventDeadLettered that records it are still owed, and
+// only the worker that took the decision may perform them.
 //
-// Retaining the token is not sufficient on its own, and that was the defect. The repair claim
-// admits a failed row with no dlt_topic and NO LIVE LEASE, and it stamps a FRESH token over
-// whatever was there. So a transition that retained the token while releasing the lease handed
-// the row straight back: a second relay instance could take it in the same instant, overwrite
-// the token the owning worker was about to present, and publish the dead-letter message
-// concurrently with it — two copies on the topic, and the owning worker's transition then
-// failing with a claim it never actually lost.
+// The repair claim admits a failed row with no dlt_topic and NO LIVE LEASE, and it
+// stamps a FRESH token over whatever was there.
 //
-// # What is asserted, and where the other half of the proof lives
+// The row the STORE holds after the terminal transition — not the copy the relay
+// carries in memory, which is not what another instance's predicate evaluates — must
+// carry the retained token AND a lease that is still live.
 //
-// The row the STORE holds after the terminal transition — not the copy the relay carries in
-// memory, which is not what another instance's predicate evaluates — must carry the retained
-// token AND a lease that is still live. The repair claim's predicate is then what excludes it,
-// and this fake mirrors that predicate, so the exclusion is asserted here directly as well.
-//
-// The behavioural proof against real PostgreSQL, including the fencing of the superseded token
-// and the recovery once the lease lapses, is
+// The behavioural proof against real PostgreSQL, including the fencing of the
+// superseded token and the recovery once the lease lapses, is
 // TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB.
 func TestEventRelay_ATerminalFailureKeepsTheRowLeasedThroughItsDeadLetterHandOff(t *testing.T) {
 	for _, testCase := range []struct {
@@ -4891,25 +4506,11 @@ func TestEventRelay_ATerminalFailureKeepsTheRowLeasedThroughItsDeadLetterHandOff
 // Dead-letter preservation recovery
 // ---------------------------------------------------------------------------
 
-// TestEventRelay_RetriesADeadLetterWriteThatFailed is the fix for the only state in this
-// machine from which nothing moved forward.
+// TestEventRelay_RetriesADeadLetterWriteThatFailed is the fix for the only state in
+// this machine from which nothing moved forward.
 //
-// # The limbo
-//
-// When a row exhausts its retry budget it becomes 'failed', and the worker that spent the
-// last attempt writes the event to its `<topic>.dlt` sibling. If that write fails — no
-// transport, a broker outage, a topic that does not exist — the row stays 'failed' with no
-// dlt_topic, and that state was a dead end in three directions at once: the ordinary claim
-// excludes 'failed', replay accepts only 'dead_lettered', and the worker holding the token had
-// moved on. The row was the ONLY copy of the event, and nothing would ever act on it again.
-//
-// # What is asserted
-//
-// The repair pass claims such a row and hands it back to the dead-letter writer, carrying the
-// failure that actually ended its retry budget — the row's last_error, not "recovered" — so
-// the metadata an operator reads says what went wrong. The fresh claim token matters: the
-// original belonged to a worker that may no longer exist, and MarkEventDeadLettered is
-// conditional on the token the caller holds.
+// When a row exhausts its retry budget it becomes 'failed', and the worker that spent
+// the last attempt writes the event to its `<topic>.dlt` sibling.
 func TestEventRelay_RetriesADeadLetterWriteThatFailed(t *testing.T) {
 	unpreserved := relayTransactionRow(1, "evt-unpreserved")
 	unpreserved.Status = model.EventOutboxStatusFailed
@@ -4944,13 +4545,6 @@ func TestEventRelay_RetriesADeadLetterWriteThatFailed(t *testing.T) {
 
 // TestEventRelay_ADeadLetterRepairThatFailsAgainStaysRecoverable asserts the repair is
 // idempotent under continued failure.
-//
-// A broker that is still down must leave the row exactly as it found it — failed, unpreserved,
-// and re-claimable once its lease expires — rather than consuming anything or moving it into a
-// state the next pass cannot reach. Nothing here is bounded by an attempt count on purpose:
-// the dead-letter topic IS the last resort, so abandoning the write would delete the only copy
-// of the event. What bounds it is the lease, and what escalates it is the dead-letter age
-// alert.
 func TestEventRelay_ADeadLetterRepairThatFailsAgainStaysRecoverable(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -4981,12 +4575,9 @@ func TestEventRelay_ADeadLetterRepairThatFailsAgainStaysRecoverable(t *testing.T
 		"a preservation retry must not record a publish attempt: the publish budget is already spent")
 }
 
-// TestEventRelay_TheRepairPassIsQuietAndCheapWhenThereIsNothingToRepair asserts the ordinary
-// case, which is the one that runs five hundred times a second's worth of ticks.
-//
-// The pass runs on every tick by design — the rows it looks for are the only copies of events
-// that reached no topic, so delaying the search delays the repair — and that is only
-// affordable if an empty result costs one query and no log line.
+// TestEventRelay_TheRepairPassIsQuietAndCheapWhenThereIsNothingToRepair asserts the
+// ordinary case, which is the one that runs five hundred times a second's worth of
+// ticks.
 func TestEventRelay_TheRepairPassIsQuietAndCheapWhenThereIsNothingToRepair(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -5005,12 +4596,10 @@ func TestEventRelay_TheRepairPassIsQuietAndCheapWhenThereIsNothingToRepair(t *te
 	assert.Len(t, harness.store.snapshotDispatched(), 1)
 }
 
-// TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues asserts a failure to even
-// LOOK for repair work does not cost the tick its publishing.
+// TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues asserts a failure to
+// even LOOK for repair work does not cost the tick its publishing.
 //
-// The two paths share a database and a tick. A repair query that fails — a statement timeout,
-// a connection blip — must not stop the relay publishing the rows that are due, because those
-// are the events currently being delivered.
+// The two paths share a database and a tick.
 func TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -5034,23 +4623,16 @@ func TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues(t *testing.
 // The publisher's permanent-failure verdict reaches the durable state
 // ---------------------------------------------------------------------------
 
-// TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately is the relay half of the
-// verdict hand-off.
+// TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately is the relay half of
+// the verdict hand-off.
 //
-// The publisher already knows which failures no retry can fix: an envelope over the size
-// ceiling, bytes that are not valid JSON, a destination outside the topic namespace Blnk owns.
-// It reports those as NOT transient and with PublishResult.Terminal set. That verdict used to be
-// dropped here, so the row went back to pending with its whole budget intact and spent the full
-// 1s + 2s + 4s + 8s + 16s schedule rediscovering it — 31 seconds before the event reached the
-// dead-letter topic where an operator could see it, four attempts of relay throughput spent on
-// a message that can never be published, and a permanently stuck event reported as a busy one
-// in the status counter throughout.
+// The publisher already knows which failures no retry can fix: an envelope over the
+// size ceiling, bytes that are not valid JSON, a destination outside the topic
+// namespace Blnk owns.
 //
-// The assertions are on both halves of the hand-off: the verdict took the PERMANENT transition
-// rather than the budgeted one, and the row went straight to the dead-letter writer on attempt
-// one. Which transition ran is asserted explicitly and in both directions, because the two
-// produce the same terminal row and are otherwise indistinguishable from the outside — and
-// because only the permanent one leaves the exhaustion decision out of the budget arithmetic.
+// The assertions are on both halves of the hand-off: the verdict took the PERMANENT
+// transition rather than the budgeted one, and the row went straight to the dead-letter
+// writer on attempt one.
 func TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -5089,9 +4671,10 @@ func TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately(t *testing
 	assert.Len(t, harness.publisher.snapshotRequests(), 1,
 		"the remaining budget must NOT be spent: no retry can make an unpublishable message publishable")
 
-	// The message the PERMANENT transition emits, not the budgeted arm's. They are different
-	// lines because they are different decisions, and matching the wrong one is how this test
-	// went on passing while the verdict was being routed through the budgeted statement.
+	// The message the PERMANENT transition emits, not the budgeted arm's. They are
+	// different lines because they are different decisions, and matching the wrong one is
+	// how this test went on passing while the verdict was being routed through the
+	// budgeted statement.
 	entries := relayEntriesWithMessage(hook, "publish failed permanently")
 	require.NotEmpty(t, entries,
 		"the reason for an early exhaustion must be stated, or 'attempt 1 of 5, exhausted' reads as a defect")
@@ -5100,12 +4683,11 @@ func TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately(t *testing
 		"and the line must say the budget was deliberately left unspent rather than exhausted")
 }
 
-// TestEventRelay_ATransientPublishFailureKeepsItsWholeBudget is the other side of the same
-// decision, and it is what stops the fix above from becoming a regression.
+// TestEventRelay_ATransientPublishFailureKeepsItsWholeBudget is the other side of the
+// same decision, and it is what stops the fix above from becoming a regression.
 //
-// A broker being briefly unreachable is the ordinary case, and it MUST still be bounded by
-// max_attempts rather than exhausted on sight. Forwarding "terminal" for every failure would
-// dead-letter every event during a two-second broker blip.
+// A broker being briefly unreachable is the ordinary case, and it MUST still be bounded
+// by max_attempts rather than exhausted on sight.
 func TestEventRelay_ATransientPublishFailureKeepsItsWholeBudget(t *testing.T) {
 	row := relayTransactionRow(1, "evt-transient")
 
@@ -5135,31 +4717,14 @@ func TestEventRelay_ATransientPublishFailureKeepsItsWholeBudget(t *testing.T) {
 // TestEventRelay_BothLegsFailingOnTheExhaustingAttemptDoesNotDiscardTheWebhook is the
 // acceptance test for the dual-delivery guarantee's worst case.
 //
-// # The loss
+// The relay enqueues the legacy webhook FIRST and publishes to Kafka SECOND. A failed
+// enqueue is deliberately swallowed, because a webhook receiver being down must not
+// consume a Kafka retry attempt or dead-letter an event on the new transport.
 //
-// The relay enqueues the legacy webhook FIRST and publishes to Kafka SECOND. A failed enqueue is
-// deliberately swallowed, because a webhook receiver being down must not consume a Kafka retry
-// attempt or dead-letter an event on the new transport. Three settlements follow a publish, and
-// only two of them used to carry the outstanding webhook forward:
-//
-//   - publish SUCCEEDED → MarkEventWebhookPending, status webhook_pending, inside the claim
-//     predicate. Covered.
-//   - publish FAILED with budget left → back to pending, whole row retried. Covered.
+//   - publish SUCCEEDED → MarkEventWebhookPending, status webhook_pending, inside the
+//     claim predicate.
+//   - publish FAILED with budget left → back to pending, whole row retried.
 //   - publish FAILED on the attempt that spent the budget → failed, then dead_lettered.
-//     TERMINAL, token cleared, outside every claim predicate, webhook_dispatched still FALSE.
-//     THE WEBHOOK WAS DISCARDED.
-//
-// The third case is the one that matters most, not least: the broker being unreachable is why
-// the Kafka leg failed, so the webhook may be the only transport still working — and the
-// subscribers it serves are precisely the ones that have not migrated, which is who the 30-day
-// window exists for.
-//
-// # What is asserted
-//
-// That the obligation is DURABLE and INDEPENDENTLY RECLAIMABLE: the row reaches its Kafka
-// terminal state, the recovery claim reaches it there, the webhook is enqueued with the STORED
-// bytes, the marker is recorded — and the Kafka leg's terminal state is not disturbed by any of
-// it.
 func TestEventRelay_BothLegsFailingOnTheExhaustingAttemptDoesNotDiscardTheWebhook(t *testing.T) {
 	// A row on its LAST attempt, so the coming publish failure exhausts it.
 	row := relayTransactionRow(1, "evt-both-legs-failed")
@@ -5216,13 +4781,8 @@ func TestEventRelay_BothLegsFailingOnTheExhaustingAttemptDoesNotDiscardTheWebhoo
 		"a successful enqueue records no failure transition")
 }
 
-// TestEventRelay_ARecoveredWebhookThatFailsAgainSpendsOnlyItsOwnBudget asserts the recovery
-// path is bounded, and bounded by the LEGACY leg's own counter.
-//
-// A receiver that is permanently gone must not keep a row in this candidate set for ever, and
-// must not spend a Kafka attempt doing it — a webhook budget that drew on the Kafka one would
-// let the deprecated transport dead-letter events on the new one, which is the inversion the
-// whole two-column split exists to prevent.
+// TestEventRelay_ARecoveredWebhookThatFailsAgainSpendsOnlyItsOwnBudget asserts the
+// recovery path is bounded, and bounded by the LEGACY leg's own counter.
 func TestEventRelay_ARecoveredWebhookThatFailsAgainSpendsOnlyItsOwnBudget(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -5262,12 +4822,11 @@ func TestEventRelay_ARecoveredWebhookThatFailsAgainSpendsOnlyItsOwnBudget(t *tes
 	assert.Equal(t, logrus.WarnLevel, entries[0].Level)
 }
 
-// TestEventRelay_TheWebhookRecoveryPassIsSilentAfterTheSunset asserts the pass observes the same
-// boundary the inline enqueue does.
+// TestEventRelay_TheWebhookRecoveryPassIsSilentAfterTheSunset asserts the pass observes
+// the same boundary the inline enqueue does.
 //
-// From the sunset onwards there is no leg to finish: the promise has ended and Kafka is the only
-// transport. A recovery pass that kept enqueuing would deliver webhooks after the date on which
-// the API starts answering 410 Gone, which is the one behaviour the sunset is defined to prevent.
+// From the sunset onwards there is no leg to finish: the promise has ended and Kafka is
+// the only transport.
 func TestEventRelay_TheWebhookRecoveryPassIsSilentAfterTheSunset(t *testing.T) {
 	owed := relayTransactionRow(1, "evt-after-sunset")
 	owed.Status = model.EventOutboxStatusDeadLettered
@@ -5285,11 +4844,10 @@ func TestEventRelay_TheWebhookRecoveryPassIsSilentAfterTheSunset(t *testing.T) {
 			"discarding them, and it keeps the boundary in ONE predicate")
 }
 
-// TestEventRelay_AWebhookRecoveryClaimFailureIsReportedAndTheTickContinues asserts the pass
-// cannot cost the tick its publishing.
+// TestEventRelay_AWebhookRecoveryClaimFailureIsReportedAndTheTickContinues asserts the
+// pass cannot cost the tick its publishing.
 //
-// The passes share a database and a tick. A recovery query that fails must not stop the relay
-// delivering the events that are due now.
+// The passes share a database and a tick.
 func TestEventRelay_AWebhookRecoveryClaimFailureIsReportedAndTheTickContinues(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -5309,16 +4867,14 @@ func TestEventRelay_AWebhookRecoveryClaimFailureIsReportedAndTheTickContinues(t 
 }
 
 // ---------------------------------------------------------------------------
-// Broker coordinate persistence — OBS-02
+// Broker coordinate persistence
 // ---------------------------------------------------------------------------
 
-// TestEventRelay_PersistsTheBrokerCoordinateOfTheRecordItProduced is the relay half of OBS-02.
+// TestEventRelay_PersistsTheBrokerCoordinateOfTheRecordItProduced is the relay half of
+// the broker-coordinate contract.
 //
-// The publisher captures the coordinate (event_publisher_test.go) and the repository stores it
-// (database/event_outbox_test.go). This is the join between them, and it is the join that would
-// silently fail: a relay that dropped the coordinate on the floor would still publish, still mark
-// the row, and still pass every other test in this file — while every row became an unconfirmed
-// publication and the zero-loss reconciliation reported itself permanently inconclusive.
+// The publisher captures the coordinate (event_publisher_test.go) and the repository
+// stores it (database/event_outbox_test.go).
 func TestEventRelay_PersistsTheBrokerCoordinateOfTheRecordItProduced(t *testing.T) {
 	row := relayTransactionRow(1, "evt-coordinate")
 	harness := newRelayHarness(t, row)
@@ -5338,11 +4894,8 @@ func TestEventRelay_PersistsTheBrokerCoordinateOfTheRecordItProduced(t *testing.
 
 // TestEventRelay_RecordsAnUnconfirmedPublishHonestly covers the absence.
 //
-// A broker that acknowledges a write while the client reports no coordinate has still published
-// the event — so the publish must NOT fail. What must happen instead is that the row records
-// nothing rather than a fabricated location, and the audit then counts it as an unconfirmed
-// publication. Manufacturing "partition 0, offset 0" would be worse than recording nothing: it
-// is a real location, so an operator would follow it and find somebody else's event.
+// A broker that acknowledges a write while the client reports no coordinate has still
+// published the event — so the publish must NOT fail.
 func TestEventRelay_RecordsAnUnconfirmedPublishHonestly(t *testing.T) {
 	row := relayTransactionRow(1, "evt-coordinate")
 	harness := newRelayHarness(t, row)
@@ -5361,13 +4914,11 @@ func TestEventRelay_RecordsAnUnconfirmedPublishHonestly(t *testing.T) {
 		"an unreported coordinate is NOT a publish failure: the broker acknowledged the write")
 }
 
-// TestEventRelay_CarriesTheCoordinateThroughAnOutstandingWebhookLeg covers the dual-delivery
-// path, where the row does not reach a terminal state.
+// TestEventRelay_CarriesTheCoordinateThroughAnOutstandingWebhookLeg covers the
+// dual-delivery path, where the row does not reach a terminal state.
 //
-// A webhook_pending row has been published to Kafka — its record is on the topic and the
-// zero-loss audit counts it — so it must name that record too. Dropping the coordinate on this
-// path would make every dual-delivered row an unconfirmed publication, which is exactly the
-// window in which the reconciliation matters most.
+// A webhook_pending row has been published to Kafka — its record is on the topic and
+// the zero-loss audit counts it — so it must name that record too.
 func TestEventRelay_CarriesTheCoordinateThroughAnOutstandingWebhookLeg(t *testing.T) {
 	row := relayTransactionRow(1, "evt-coordinate")
 	harness := newRelayHarness(t, row)
@@ -5390,10 +4941,9 @@ func TestEventRelay_CarriesTheCoordinateThroughAnOutstandingWebhookLeg(t *testin
 
 // TestEventRelay_AWebhookOnlyPassCarriesNoCoordinate pins the case COALESCE exists for.
 //
-// A row whose Kafka leg is already recorded is re-claimed ONLY for its outstanding webhook:
-// nothing is published, so there is no new record to name — and the row already carries the
-// coordinate its earlier successful publish produced. Passing a coordinate here would be a lie,
-// and passing the zero value is what lets the statement's COALESCE preserve the stored one.
+// A row whose Kafka leg is already recorded is re-claimed ONLY for its outstanding
+// webhook: nothing is published, so there is no new record to name — and the row
+// already carries the coordinate its earlier successful publish produced.
 func TestEventRelay_AWebhookOnlyPassCarriesNoCoordinate(t *testing.T) {
 	row := relayTransactionRow(1, "evt-coordinate")
 	acknowledged := relayFixedNow.Add(-time.Minute)
@@ -5426,21 +4976,12 @@ func TestEventRelay_AWebhookOnlyPassCarriesNoCoordinate(t *testing.T) {
 			"then preserves the one the row already carries")
 }
 
-// TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget is the relay half of the
-// defect where a publish verdict was computed, logged and then ignored.
+// TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget is the relay half
+// of the rule that a publish verdict is acted on rather than computed, logged and then
+// ignored.
 //
-// The publisher classifies each failure, and for a permanent one — an unauthorised principal, a
-// destination outside the topic catalogue, bytes that will never parse, a message over the size
-// limit — it reports failed with retryable=false. The relay recorded an ordinary attempt anyway,
-// so every such event made FIVE broker round trips separated by 1s, 2s, 4s and 8s of backoff
-// before reaching the dead-letter topic it was always going to reach. The log was worse than the
-// waste: each attempt line carried "retryable=false" and was immediately followed by "publish
-// failed and the event is scheduled for another attempt", so the two lines contradicted each
-// other about the decision that had just been taken.
-//
-// The assertions are therefore about WHICH transition ran, how many times, and what the log
-// said. The dead-letter hand-off is asserted to happen on the first attempt, because "eventually
-// dead-lettered" was already true before the fix and is not what was wrong.
+// The assertions are therefore about WHICH transition ran, how many times, and what the
+// log said.
 func TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget(t *testing.T) {
 	t.Run("a permanent failure is terminal on the first attempt", func(t *testing.T) {
 		hook := logtest.NewGlobal()
@@ -5466,9 +5007,9 @@ func TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget(t *testin
 		require.Len(t, harness.deadLetters.rows, 1,
 			"the row must reach the dead-letter writer on this attempt, not after the schedule")
 
-		// The claim token has to survive onto the row handed off, or the dead-letter write and
-		// the transition that records it are not exclusive to this worker and two workers can
-		// put two copies of one event on the topic.
+		// The claim token has to survive onto the row handed off, or the dead-letter write
+		// and the transition that records it are not exclusive to this worker and two workers
+		// can put two copies of one event on the topic.
 		assert.NotEmpty(t, harness.deadLetters.rows[0].ClaimToken,
 			"the terminal transition must retain the claim token for the hand-off")
 		assert.Equal(t, 1, harness.deadLetters.rows[0].Attempts,
@@ -5524,16 +5065,6 @@ func TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget(t *testin
 		// The publisher is an interface seam. A result with no status and no classification
 		// must fall through to the budgeted path: reading "no verdict" as "give up" would
 		// dead-letter every event a bare-error publisher failed on, on its first attempt.
-		//
-		// # Why this asserts the ROW and the DLT rather than only which method was called
-		//
-		// It used to assert only that MarkEventFailed was reached and MarkEventPermanentlyFailed
-		// was not, and that pair of assertions passed while the defect was live: the relay called
-		// the budgeted method and handed it terminal=true, so the SQL transition exhausted the row
-		// on attempt one, the dead-letter hand-off ran, and the event's delivery ended — all
-		// through the "budgeted" method. Which method was called says nothing on its own. What
-		// says something is the terminal flag it was given, the status the row ends in, whether it
-		// is claimable again, and whether anything was written to a dead-letter topic.
 		hook := logtest.NewGlobal()
 
 		row := relayTransactionRow(4, "evt-unclassified")
@@ -5594,46 +5125,21 @@ func TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget(t *testin
 }
 
 // ---------------------------------------------------------------------------
-// Q-01: the unique published-events count belongs to the DURABLE transition
+// The unique published-events count belongs to the DURABLE transition
 // ---------------------------------------------------------------------------
 
-// The three suites that used to assert blnk.events.published.total's contract here and
-// in two other places are now one table-driven suite,
-// TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent, which carries every property
-// they asserted between them. Its own doc records why the EventsDispatchedTotal suite
-// is deliberately not folded in with them.
+// Its own doc records why the EventsDispatchedTotal suite is deliberately not folded in
+// with them.
 
-// defaultRelayDeadLetterHandoffLease mirrors the database package's defaultEventClaimLease,
-// which is the lease a terminal transition falls back to when its caller supplies a
-// non-positive one.
-//
-// It is restated here because the repository constant is unexported, and the fake store must
-// normalise identically or it would model a race the repository does not have. If the
-// repository default ever moves, this constant goes stale in a way the compiler cannot catch —
-// so the tests that matter assert the RELAY'S OWN lock duration was supplied rather than
-// asserting this fallback, and the fallback exists only so a zero lease behaves like
-// production instead of producing an already-expired deadline.
+// defaultRelayDeadLetterHandoffLease mirrors the database package's
+// defaultEventClaimLease, which is the lease a terminal transition falls back to when
+// its caller supplies a non-positive one.
 const defaultRelayDeadLetterHandoffLease = 30 * time.Second
 
-// TestProcessRow_LogsEveryFailedAttemptWithTheFiveRequiredFields is requirement R-4's log
-// contract: a line for EVERY attempt including the first, not only for the final failure, and
-// each carrying the attempt, the maximum attempts, the error, the event id and the topic.
-//
-// # Which line carries the contract
-//
-// The relay used to emit a dedicated per-attempt failure line AND then a second line stating
-// the retry decision it had just recorded, so one failed publish produced two warnings — five
-// hundred events a second turning into a thousand lines a second, both saying the same thing,
-// and an operator counting lines to size a problem counting it twice. The dedicated line was
-// therefore withdrawn and the FIELD SET moved onto the decision line, which is the one that
-// can also say what happens next.
-//
-// So the contract is now asserted over every arm of the failure path — "scheduled for another
-// attempt" for an attempt with budget left, and the budget-spent and permanent-failure
-// wordings for the attempt that ends the row's life. All of them are matched on the substring
-// they share, which is why the needle is the shared phrase and not one whole message: a future
-// arm added to the failure path is then covered by this assertion automatically, rather than
-// silently escaping it.
+// TestProcessRow_LogsEveryFailedAttemptWithTheFiveRequiredFields is the requirement log
+// contract: a line for EVERY attempt including the first, not only for the final
+// failure, and each carrying the attempt, the maximum attempts, the error, the event id
+// and the topic.
 func TestProcessRow_LogsEveryFailedAttemptWithTheFiveRequiredFields(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -5670,28 +5176,20 @@ func TestProcessRow_LogsEveryFailedAttemptWithTheFiveRequiredFields(t *testing.T
 	}
 }
 
-// TestProcessRow_SuppliesItsLockDurationAsTheDeadLetterHandOffLease asserts the plumbing that
-// makes the retained claim token on a terminal transition mean anything.
+// TestProcessRow_SuppliesItsLockDurationAsTheDeadLetterHandOffLease asserts the
+// plumbing that makes the retained claim token on a terminal transition mean anything.
 //
-// # What the parameter is for
+// Both terminal transitions retain the row's claim token so that only the worker that
+// spent the last attempt may write to the dead-letter topic, and both hold the row's
+// LEASE for the same span so that the dead-letter repair claim — whose predicate admits
+// a failed row with no dead-letter record and a lease that is NULL or past — cannot
+// adopt the row while that write is in flight.
 //
-// Both terminal transitions retain the row's claim token so that only the worker that spent the
-// last attempt may write to the dead-letter topic, and both hold the row's LEASE for the same
-// span so that the dead-letter repair claim — whose predicate admits a failed row with no
-// dead-letter record and a lease that is NULL or past — cannot adopt the row while that write is
-// in flight. The lease is the enforcement; the token only decides which worker wins.
+// A caller that forgot to plumb its lock duration through would pass the zero value,
+// and `NOW() + '0s'` is an instant that has already passed.
 //
-// # Why the value is asserted and not just its presence
-//
-// A caller that forgot to plumb its lock duration through would pass the zero value, and
-// `NOW() + '0s'` is an instant that has already passed. The repository normalises that to its
-// own default rather than honouring it, so the race would NOT reappear — but the relay would be
-// silently governed by a duration its operator never configured, and the two halves of one
-// ownership window would be set by different things. Asserting the value keeps the window
-// governed by the one number the operator set: WithLockDuration.
-//
-// Both transitions are covered because they are separate statements with separate call sites,
-// and only one of them is on the retry path a generic failure test would reach.
+// Both transitions are covered because they are separate statements with separate call
+// sites, and only one of them is on the retry path a generic failure test would reach.
 func TestProcessRow_SuppliesItsLockDurationAsTheDeadLetterHandOffLease(t *testing.T) {
 	const lease = 17 * time.Second
 
@@ -5729,11 +5227,6 @@ func TestProcessRow_SuppliesItsLockDurationAsTheDeadLetterHandOffLease(t *testin
 
 // relayPublishedCountCase is one single-pass arrangement and the number of times
 // blnk.events.published.total must move for it.
-//
-// The three fields are the whole state machine this counter hangs off: what the
-// broker did, what the row's durable transition did, and therefore whether ONE
-// delivery became durable. Expressing them as data rather than as prose in four
-// near-identical subtests is what makes a missing arm visible.
 type relayPublishedCountCase struct {
 	// row overrides the default transaction row when an arm needs a pre-set field.
 	row func() model.EventOutbox
@@ -5751,43 +5244,11 @@ type relayPublishedCountCase struct {
 // TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent is the guard on what
 // blnk.events.published.total means, and it is the ONLY guard on it.
 //
-// # The contract
-//
-// The instrument's own declaration (internal/metrics/metrics.go:81-114) defines a
-// published event as one whose KAFKA LEG is durably recorded: the broker acknowledged
-// the write AND the outbox row was moved to say so. Those two facts are separated by a
-// database round trip that can fail, and delivery is at-least-once — the row keeps its
-// lease, the lease expires, another pass publishes the same event. Incremented on the
-// acknowledgement alone, the counter therefore moved twice for one event, over-reporting
-// deliveries exactly when the pipeline was in trouble; and because acceptance criterion
-// V-3 states the dead-letter rate as dead-lettered over the terminal total, the rate
-// under-reported for the same reason and in the same direction.
-//
-// "Kafka leg" rather than "whole delivery" is deliberate and is the distinction from
-// EventsDispatchedTotal: a row still owed its legacy webhook HAS been delivered to
-// Kafka, and its coordinate is persisted by MarkEventWebhookPending. Waiting for
-// dispatched would make this counter — and every throughput and dead-letter figure
-// derived from it — track the health of the LEGACY transport for as long as the
-// dual-delivery window lasts.
-//
-// # Why this is one test and not four
-//
-// Three separate suites used to assert this same contract against this same instrument
-// through this same harness — TestProcessRow_CountsADeliveredEventOnceAtItsDurable-
-// Transition, TestEventRelay_CountsOneSettledPublicationPerOriginalEvent and
-// TestEventRelay_CountsOneDurableDeliveryPerEvent — with substantially the same arms
-// under three different names. Fifteen subtests covered seven distinct properties. The
-// cost was not the duplication itself but the drift it invites: three places to update
-// when the transition set changes, and no way to see from any one of them whether an
-// end state is covered at all. They are one table here, and every property they
-// asserted between them is below.
-//
-// TestEventRelay_CountsEachEventOnceWhenItReachesDispatched is deliberately NOT folded
-// in. It guards a DIFFERENT instrument, EventsDispatchedTotal, whose transition set is
-// not this one's — the abandoned-legacy-leg arm reaches dispatched without
-// MarkEventDispatched, and the webhook-pending arm counts here and not there. Merging
-// two contracts into one table is the maintainability defect this consolidation exists
-// to remove, not an extension of it.
+// Those two facts are separated by a database round trip that can fail, and delivery is
+// at-least-once — the row keeps its lease, the lease expires, another pass publishes
+// the same event. Incremented on the acknowledgement alone, the counter therefore moved
+// twice for one event, over-reporting deliveries exactly when the pipeline was in
+// trouble.
 func TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent(t *testing.T) {
 	dualDeliveryOff := func(harness *relayHarness) {
 		harness.processor.dualDeliveryActive = func(time.Time) bool { return false }
@@ -5927,9 +5388,9 @@ func TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent(t *testing.T) {
 		})
 	}
 
-	// THE ATTRIBUTE SET, asserted once rather than in every counting arm: it is a
-	// property of the increment and not of the end state that produced it. The pair must
-	// match EventsDeadLetteredTotal's and EventsDispatchedTotal's exactly, or the
+	// THE ATTRIBUTE SET, asserted once rather than in every counting arm: it is a property
+	// of the increment and not of the end state that produced it. The pair must match
+	// EventsDeadLetteredTotal's and EventsDispatchedTotal's exactly, or the
 	// dead-letter-rate query divides series that do not correspond.
 	t.Run("the increment is attributed by topic and event type and by nothing else", func(t *testing.T) {
 		instruments := publisherCaptureInstruments(t)
@@ -5958,8 +5419,8 @@ func TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent(t *testing.T) {
 		harness.legacy.err = errors.New("relay test: redis unavailable")
 
 		// PASS ONE. Kafka succeeds, the legacy enqueue does not, so the Kafka leg is recorded
-		// by MarkEventWebhookPending — the broker coordinate is persisted with it — and the row
-		// stays claimable for the webhook alone.
+		// by MarkEventWebhookPending — the broker coordinate is persisted with it — and the
+		// row stays claimable for the webhook alone.
 		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 		require.Len(t, harness.store.snapshotWebhookPendings(), 1,
 			"the outstanding legacy leg must be recorded")
@@ -5991,15 +5452,10 @@ func TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Repair capacity (PERF-M06)
+// Repair capacity
 // ---------------------------------------------------------------------------
 
 // relayRepairWave builds count rows in one repair wave, each with its OWN message key.
-//
-// Distinct keys are the point: repairRowsConcurrently groups by the effective key and writes one
-// group sequentially, so a wave sharing a key would be written one row at a time however wide the
-// configured concurrency was — and a test built on it would report the bound as working while
-// proving nothing about it.
 //
 // Parameters:
 //   - base int64: the first surrogate key, so two waves cannot collide.
@@ -6007,7 +5463,8 @@ func TestEventRelay_CountsOneDurableKafkaDeliveryPerEvent(t *testing.T) {
 //   - status string: the status the rows carry.
 //
 // Returns:
-//   - []model.EventOutbox: the wave, with attempts spent so it belongs to the repair path.
+//   - []model.EventOutbox: the wave, with attempts spent so it belongs to the repair
+//     path.
 func relayRepairWave(base int64, count int, status string) []model.EventOutbox {
 	wave := make([]model.EventOutbox, 0, count)
 
@@ -6030,19 +5487,10 @@ func relayRepairWave(base int64, count int, status string) []model.EventOutbox {
 	return wave
 }
 
-// TestEventRelay_RepairClaimsTakeTheConfiguredBatchSize pins the first half of PERF-M06: the
-// repair batch is a SETTING rather than a literal.
+// TestEventRelay_RepairClaimsTakeTheConfiguredBatchSize pins the first half of
+// The repair batch is a SETTING rather than a literal.
 //
-// # Why the literal could not stay
-//
-// Both repair passes claimed a fixed 20 rows, once per tick. The number looked adequate because
-// these sets are empty in normal operation, so an idle pass costs one indexed query whatever the
-// batch size is — but they fill during an outage, all at once. Fifteen minutes at the 500 events
-// per second acceptance rate is about 450,000 rows, and 20 rows a second clears that in roughly
-// six and a quarter hours on one replica, with the dead-letter age alert firing throughout.
-//
-// The batch size is invisible from the rows a pass produced, so it is asserted at the seam: the
-// value the claim was CALLED with.
+// Both repair passes claimed a fixed 20 rows, once per tick.
 func TestEventRelay_RepairClaimsTakeTheConfiguredBatchSize(t *testing.T) {
 	t.Run("the shipped default reaches both claims", func(t *testing.T) {
 		harness := newRelayHarness(t)
@@ -6081,16 +5529,11 @@ func TestEventRelay_RepairClaimsTakeTheConfiguredBatchSize(t *testing.T) {
 	})
 }
 
-// TestEventRelay_RepairChainsBatchesUntilTheBacklogDrains is the second half of PERF-M06: one
-// tick repairs as much as its budget allows rather than one batch.
+// TestEventRelay_RepairChainsBatchesUntilTheBacklogDrains is the second half of
+// One tick repairs as much as its budget allows rather than one batch.
 //
-// A full batch means there may be more, so the pass runs again; a SHORT batch means the set is
-// drained and the chain ends. That is the same signal the publish loop uses, and it is what turns
-// the drain rate from "one batch per poll interval" into "the configured rows per tick".
-//
-// Both legs are asserted, because they are two call sites of one mechanism and a change that
-// chained only one of them would leave the migration window's webhooks draining at the old rate
-// with nothing to show it.
+// A full batch means there may be more, so the pass runs again; a SHORT batch means the
+// set is drained and the chain ends.
 func TestEventRelay_RepairChainsBatchesUntilTheBacklogDrains(t *testing.T) {
 	const batch = 3
 
@@ -6133,13 +5576,11 @@ func TestEventRelay_RepairChainsBatchesUntilTheBacklogDrains(t *testing.T) {
 	})
 }
 
-// TestEventRelay_RepairStopsAtItsPerTickBudget is the other side of chaining, and the reason the
-// bound exists at all.
+// TestEventRelay_RepairStopsAtItsPerTickBudget is the other side of chaining, and the
+// reason the bound exists at all.
 //
-// An unbounded chain would let one tick attempt an entire historical backlog, holding the publish
-// loop — which the same tick owes — behind it for as long as that took. The backlog exists
-// precisely while the pipeline is recovering, which is when new events must keep flowing. So the
-// budget stops the chain, and the next tick resumes: nothing is lost, only deferred.
+// An unbounded chain would let one tick attempt an entire historical backlog, holding
+// the publish loop — which the same tick owes — behind it for as long as that took.
 func TestEventRelay_RepairStopsAtItsPerTickBudget(t *testing.T) {
 	const batch = 2
 
@@ -6169,16 +5610,11 @@ func TestEventRelay_RepairStopsAtItsPerTickBudget(t *testing.T) {
 			"dropping it")
 }
 
-// TestEventRelay_RepairPreservesPerKeyOrderWhileWritingConcurrently is the safety property the
-// concurrency setting rests on.
+// TestEventRelay_RepairPreservesPerKeyOrderWhileWritingConcurrently is the safety
+// property the concurrency setting rests on.
 //
-// A repair write is still a write to a Kafka topic, so two rows of one aggregate written at the
-// same time can be appended in either order. The pass therefore groups by the same effective key
-// the publisher hashes and writes each group with ONE worker — so a wave sharing a key is written
-// in claim order however wide the configured concurrency is.
-//
-// Asserted through the dead-letter writer's recorded order, which is the order the messages were
-// composed in.
+// A repair write is still a write to a Kafka topic, so two rows of one aggregate
+// written at the same time can be appended in either order.
 func TestEventRelay_RepairPreservesPerKeyOrderWhileWritingConcurrently(t *testing.T) {
 	harness := newRelayHarness(t)
 	harness.processor.WithRepairCapacity(10, 1, 8)

@@ -180,25 +180,11 @@ func TestRespondErrorFallbackSanitizes(t *testing.T) {
 	assert.Equal(t, sanitizedInternalMessage, detail.Message)
 }
 
-// TestRespondErrorWithDefault_SanitizesAServerFaultAndKeepsAClientFault is the MI-3 guard.
+// TestRespondErrorWithDefault_SanitizesAServerFaultAndKeepsAClientFault is the guard.
 //
-// # What it used to assert, and why that was wrong
+// The comment described the intended rule and the assertion pinned its opposite.
 //
-// This test previously asserted that a 500 default echoed the raw error, under a comment reading
-// "4xx/explicit-default paths keep the original message" — while the code it passed,
-// ErrReconStartFailed, maps to 500. The comment described the intended rule and the assertion
-// pinned its opposite.
-//
-// The message on this path is not one anybody wrote for a client. Reaching the default-code
-// branch means classification found nothing — no typed APIError, no sentinel, no recognised
-// pattern — so the text is whatever a driver, repository or broker produced, and those are the
-// errors carrying a DSN, a host:port, SQL text or a filesystem path. The final fallback in
-// respondError has always sanitized; the only difference on this branch is that a caller named a
-// code, which is a choice about the CODE and never a decision to disclose internals.
-//
-// The rule is therefore keyed on the effective STATUS, and both directions are asserted below,
-// because a blanket sanitize would be its own regression: a 4xx refusal's message is the useful
-// part of the response.
+// The message on this path is not one anybody wrote for a client.
 func TestRespondErrorWithDefault_SanitizesAServerFaultAndKeepsAClientFault(t *testing.T) {
 	t.Run("a 5xx default withholds the internal text", func(t *testing.T) {
 		c, w := newTestContext()

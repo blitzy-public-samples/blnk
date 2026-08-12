@@ -14,53 +14,26 @@
 
 -- +migrate Up
 
--- The event outbox: the durable hand-off between a ledger mutation and the
--- Kafka event announcing it.
+-- The event outbox: the durable hand-off between a ledger mutation and the Kafka event
+-- announcing it.
 --
--- For almost every event, a row is inserted INSIDE THE SAME DATABASE TRANSACTION
--- as the mutation that produced it, immediately before the commit. The mutation
--- and its event therefore commit or roll back together and can never disagree:
--- there is no window in which a balance moved but the event was lost, and none in
--- which an event describes work that was rolled back. A separate relay polls this
--- table, publishes claimed rows to Kafka, and marks them dispatched.
+-- For almost every event, a row is inserted INSIDE THE SAME DATABASE TRANSACTION as the
+-- mutation that produced it, immediately before the commit. The mutation and its event
+-- therefore commit or roll back together and can never disagree: there is no window in
+-- which a balance moved but the event was lost, and none in which an event describes
+-- work that was rolled back.
 --
--- THREE EVENT CLASSES ARE CAPTURED AFTER THEIR MUTATION COMMITS, and this table
--- cannot tell you which rows those were, so it is stated here: balance.monitor,
--- bulk_transaction.<status>, and the transaction.* events of a COALESCED write.
--- Each has a structural reason — no transaction remains open to enrol them in —
--- and each is retried on a transient failure, but a process death between the
--- commit and the insert loses the event and NO ROW IS EVER WRITTEN for it. Those
--- three are at-most-once on the write side. docs/event-streaming.md publishes the
--- set and PublishEventDurably enumerates it in code.
+-- THREE EVENT CLASSES ARE CAPTURED AFTER THEIR MUTATION COMMITS, and this table cannot
+-- tell you which rows those were, so it is stated here: balance.monitor,
+-- bulk_transaction.<status>, and the transaction.* events of a COALESCED write. Each
+-- has a structural reason — no transaction remains open to enrol them in — and each is
+-- retried on a transient failure, but a process death between the commit and the insert
+-- loses the event and NO ROW IS EVER WRITTEN for it.
 --
--- What that buys for every other event is exactly-once ON THE WRITE SIDE ONLY,
--- and the distinction matters enough to state here rather than leave to
--- documentation. Each such event is recorded exactly once — that is what the
--- unique index on event_id enforces — but Kafka delivery downstream remains
--- AT-LEAST-ONCE for all of them. A relay that crashes between an acknowledged
--- publish and marking the row dispatched will reclaim the row once its lease
--- expires and publish it again. Suppressing that duplicate is a subscriber
--- obligation, keyed on event_id. Nothing in this table promises end-to-end
--- exactly-once delivery, and it should not be read as if it did.
---
--- This is a SECOND, INDEPENDENT outbox alongside blnk.lineage_outbox, not a
--- replacement for it and never merged with it: separate tables, separate relays,
--- and the lineage relay's behaviour is unchanged. The column vocabulary, the
--- status literals and the index set here are deliberately modelled on that table
--- so an operator who knows one can read the other.
---
--- Every timestamp below is TIMESTAMP WITH TIME ZONE. That departs from
--- blnk.lineage_outbox's naive TIMESTAMP and follows blnk.api_keys instead; the
--- deviation is deliberate and both reasons are load-bearing rather than
--- stylistic. First, occurred_at is an RFC3339 instant that crosses the process
--- boundary onto the Kafka wire, where it is read by consumers running in other
--- timezones. Second, first_attempted_at, last_attempted_at and dispatched_at
--- feed the dead-letter age arithmetic behind the
--- blnk.dlt.oldest_message_age_seconds gauge and its 15-minute alert. A naive
--- timestamp makes both silently wrong on any deployment whose server timezone is
--- not UTC — wrong by a whole-hour offset, with no error to notice. Nothing
--- downstream is affected by the choice: NOW() + $2::interval arithmetic and
--- scanning into a Go time.Time behave identically with either type.
+-- What that buys for every other event is exactly-once ON THE WRITE SIDE ONLY, and the
+-- distinction matters enough to state here rather than leave to documentation. Each
+-- such event is recorded exactly once — that is what the unique index on event_id
+-- enforces — but Kafka delivery downstream remains AT-LEAST-ONCE for all of them.
 CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- Surrogate key, and not decoration. The in-transaction insert ends
     -- RETURNING id, mirroring InsertLineageOutboxInTx, and the claim query
@@ -82,16 +55,9 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- carried verbatim as a JSON string on the wire, never compared as a uuid.
     event_id            TEXT                      NOT NULL,
 
-    -- The event name, e.g. 'transaction.applied' or 'balance.monitor'. It
-    -- duplicates the event name already inside payload, hoisted to the top level
-    -- so the relay and any SQL-side triage can route and filter without parsing
-    -- the payload.
-    --
-    -- Deliberately NO CHECK constraint enumerating the known event types. Bulk
-    -- transaction events are composed at runtime as 'bulk_transaction.' plus the
-    -- batch status, so the value set is open-ended: any enumeration would be
-    -- wrong the moment a status is added, and would fail the write rather than
-    -- the routing.
+    -- The event name, e.g. 'transaction.applied' or 'balance.monitor'. It duplicates
+    -- the event name already inside payload, hoisted to the top level so the relay and
+    -- any SQL-side triage can route and filter without parsing the payload.
     event_type          TEXT                      NOT NULL,
 
     -- The aggregate the event belongs to — the transaction, balance, identity or
@@ -101,63 +67,23 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
 
     -- The Kafka message key, and the column the relay serialises on.
     --
-    -- Keying with a stable hash balancer pins every event sharing a key to a
-    -- single partition, which is what delivers the per-aggregate ordering
-    -- guarantee. NOT NULL AND NON-BLANK, enforced by the CHECK below: an empty
-    -- key would let Kafka scatter the event round-robin and destroy that ordering
-    -- with nothing in the data to show it, so "no key" is not a representable
-    -- state. The construction path guarantees a value through a documented
-    -- fallback chain ending in a sentinel.
-    --
-    -- IN PRACTICE THIS HOLDS THE LEDGER ID for every ledger-scoped event, because
-    -- the capture path lets the producer state the ledger and every ledger-scoped
-    -- producer does: transaction, balance, balance-monitor and ledger events all
-    -- store a ledger ID here and in ledger_id, and the two agree. Only an event
-    -- with no ledger at all falls through to something else — an identity ID for
-    -- identity.created, a batch ID for bulk_transaction.<status>, the event type
-    -- for system.error, and a source/destination/transaction ID for a rejected
-    -- transaction whose balances were never loaded.
-    --
-    -- IT IS STILL NOT DEFINED AS THE LEDGER ID, which is why it remains its own
-    -- column. The two used to be one: it was called ledger_id and held, depending
-    -- on the event, a ledger ID, a source or destination balance ID, an identity
-    -- ID, a monitor ID, a batch ID or the event type — so the name was wrong for
-    -- several of its values. Splitting them means each column means one thing:
-    -- this one is "where does this message go" and is never NULL; ledger_id is
-    -- "which ledger is this about" and is NULL when the answer is none.
+    -- IT IS STILL NOT DEFINED AS THE LEDGER ID, which is why it remains its own column.
+    -- Splitting them means each column means one thing: this one is "where does this
+    -- message go" and is never NULL; ledger_id is "which ledger is this about" and is
+    -- NULL when the answer is none.
     partition_key       TEXT                      NOT NULL,
 
-    -- The AUTHORITATIVE ledger this event belongs to, or NULL when the event
-    -- genuinely has no ledger. It takes no part in partitioning or in ordering.
+    -- The AUTHORITATIVE ledger this event belongs to, or NULL when the event genuinely
+    -- has no ledger. It takes no part in partitioning or in ordering.
     --
-    -- Populated either from a payload that carries a ledger identifier — a ledger,
-    -- or a balance, which belongs to exactly one ledger — or from a ledger the
-    -- PRODUCER states explicitly at capture time. The second route is what
-    -- populates it for transactions and balance monitors, whose payload records
-    -- carry no ledger field of their own: transaction execution reads it from the
-    -- loaded source balance (falling back to the destination), and the monitor
-    -- check reads it from the balance whose update satisfied the condition.
-    --
-    -- NULL for identities (an identity is not scoped to a ledger), for bulk
-    -- transaction batches (a runtime grouping spanning whatever ledgers its
-    -- members touched, not a ledger object), for system.error (no aggregate of any
-    -- kind), and for a REJECTED transaction — which usually never loaded its
-    -- balances, that often being why it was rejected, so no ledger is known and
-    -- inventing one would be worse than recording none.
-    --
-    -- NULLABLE, deliberately, and this is the point of the split: NULL states
-    -- "this event has no ledger" as a fact. The previous NOT NULL column with ''
-    -- as its no-ledger value could not distinguish that from "nobody looked".
+    -- NULLABLE, deliberately, and this is the point of the split: NULL states "this
+    -- event has no ledger" as a fact. The previous NOT NULL column with '' as its
+    -- no-ledger value could not distinguish that from "nobody looked".
     ledger_id           TEXT                      NULL,
 
-    -- The fully-resolved destination topic, recorded at insert time so the relay
-    -- never re-derives it and so a stored row stays replayable to its ORIGINAL
-    -- destination even if the topic-naming configuration changes later.
-    --
-    -- Deliberately NO CHECK constraint enumerating topic names. The topic prefix
-    -- is configurable (KAFKA_TOPIC_PREFIX, default 'blnk'), so a hardcoded
-    -- 'blnk.transactions'-style constraint would reject every write on any
-    -- deployment using a non-default prefix.
+    -- The fully-resolved destination topic, recorded at insert time so the relay never
+    -- re-derives it and so a stored row stays replayable to its ORIGINAL destination
+    -- even if the topic-naming configuration changes later.
     topic               TEXT                      NOT NULL,
 
     -- The envelope version, starting at 1 to match the SchemaVersionV1 constant.
@@ -167,181 +93,79 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- The event body, held TWICE and deliberately so. Read both comments before
     -- touching either column: which one a reader picks decides whether the
     -- payload-preservation guarantee holds.
-    --
-    -- Both columns hold the marshaled legacy webhook object — the two-key
-    -- {"event": ..., "data": ...} form of NewWebhook, BOTH keys included — which
-    -- is byte-for-byte what the HTTP webhook body is today. Carrying the whole
-    -- object means an existing subscriber's body parser keeps working unchanged
-    -- and only the transport differs.
-    --
-    -- payload is the QUERYABLE projection. JSONB is a parsed representation, and
-    -- that is precisely what makes it useful here: containment (@>), member
-    -- extraction (->, ->>) and a future expression index all work against it, so
-    -- an operator triaging a stuck event can ask questions of the body in SQL
-    -- rather than exporting it first.
-    --
-    -- What JSONB CANNOT do is return the bytes it was given. Measured on
-    -- PostgreSQL 16 rather than assumed: object keys are reordered (shortest
-    -- first, then bytewise), whitespace is renormalised rather than merely
-    -- stripped, a duplicate key collapses to its last occurrence, and exponent
-    -- notation is expanded — though numeric scale survives, so 100.50 stays
-    -- 100.50. A ::text cast does not recover the input either; it renders the
-    -- parsed form. So JSONB alone cannot carry a byte contract, which is why the
-    -- next column exists.
     payload             JSONB                     NOT NULL,
 
     -- THE PAYLOAD-PRESERVATION GUARANTEE LIVES IN THIS COLUMN.
     --
-    -- payload_raw holds the EXACT bytes json.Marshal produced for the NewWebhook
-    -- value at the producer call site — the same bytes SendWebhook would have put
-    -- on the wire as the HTTP body, with the producer's member order, spelling and
-    -- number literals intact. BYTEA, not TEXT and not JSON, for two reasons: bytea
-    -- stores an opaque byte string, so nothing about it can validate, reject,
-    -- transcode or re-render the payload; and this INSERT runs inside the caller's
-    -- ledger transaction, where a column that could reject its input would let a
-    -- notification defect abort a financially valid mutation.
+    -- payload_raw holds the EXACT bytes json.Marshal produced for the NewWebhook value
+    -- at the producer call site — the same bytes SendWebhook would have put on the wire
+    -- as the HTTP body, with the producer's member order, spelling and number literals
+    -- intact. BYTEA, not TEXT and not JSON, for two reasons: bytea stores an opaque
+    -- byte string, so nothing about it can validate, reject, transcode or re-render the
+    -- payload; and this INSERT runs inside the caller's ledger transaction, where a
+    -- column that could reject its input would let a notification defect abort a
+    -- financially valid mutation.
     --
-    -- EVERY READER OF THE LEGACY WEBHOOK BODY TAKES IT FROM HERE, never from
-    -- payload: the legacy webhook leg during the dual-delivery window reads these
-    -- bytes, and so does the payload member spliced into the canonical envelope in
-    -- event_raw below. That is what makes the dual-delivery guarantee structural
-    -- rather than a matter of careful coding — during the window the Kafka message
-    -- and the legacy webhook body carry the same payload because both come from
-    -- this one column. Acceptance criterion V-8 compares exactly these bytes.
+    -- EVERY READER OF THE LEGACY WEBHOOK BODY TAKES IT FROM HERE, never from payload:
+    -- the legacy webhook leg during the dual-delivery window reads these bytes, and so
+    -- does the payload member spliced into the canonical envelope in event_raw below.
+    -- That is what makes the dual-delivery guarantee structural rather than a matter of
+    -- careful coding — during the window the Kafka message and the legacy webhook body
+    -- carry the same payload because both come from this one column.
     --
-    -- The two columns cannot drift apart, and that is a property of the write path
-    -- rather than a convention: eventOutboxInsertArgs binds both from ONE
-    -- in-memory slice, and no statement anywhere UPDATEs either of them. Any
-    -- future write must set both from the same slice. Nothing may transform these
-    -- bytes: no generated column, no trigger, no default.
-    --
-    -- Reading it by eye: SELECT convert_from(payload_raw, 'UTF8') renders the
-    -- stored body as text without touching what is stored.
+    -- Reading it by eye: SELECT convert_from(payload_raw, 'UTF8') renders the stored
+    -- body as text without touching what is stored.
     payload_raw         BYTEA                     NOT NULL,
 
     -- THE CANONICAL EVENT VALUE, and the column the replay guarantee lives in.
     --
-    -- event_raw holds the COMPLETE LedgerEvent envelope as it goes onto the Kafka
-    -- topic: the six members event_id, event_type, aggregate_id, occurred_at,
-    -- payload and schema_version, in that order, with payload_raw's bytes spliced
-    -- in verbatim. It is produced exactly once, at capture, by
-    -- model.LedgerEvent.CanonicalBytes, and it is what the publish, the
-    -- dead-letter write and a dead-letter replay all put on the wire.
-    --
-    -- # Why the whole envelope is stored rather than rebuilt from the columns
-    --
-    -- Requirement R-5 promises a dead-lettered event replays byte-for-byte apart
-    -- from its failure metadata, and V-9 asserts it. Rebuilding the envelope from
-    -- the columns at publish time satisfies that only while the serialiser never
-    -- changes: add a member, reorder one, or upgrade the encoder, and every row
-    -- already captured replays as DIFFERENT bytes — silently, because the two
-    -- values remain semantically equal, which is the kind of difference a
-    -- reviewer's eye passes over and a byte comparison does not. Storing the value
-    -- the broker was actually given makes the promise a property of the DATA rather
-    -- than of the code's stability across versions.
-    --
-    -- BYTEA for the same reasons payload_raw is: an opaque byte string cannot
-    -- validate, reject, transcode or re-render what it was given, and this INSERT
-    -- runs inside the caller's ledger transaction, where a column that could reject
-    -- its input would let a notification defect abort a financially valid mutation.
-    --
-    -- NOT NULL, and the repository guarantees it rather than merely requiring it:
-    -- prepareEventOutboxEntry derives the value from the row's own envelope fields
-    -- when a caller left it empty, so no write path can produce a row without one.
-    -- A dead-letter message is this value with a failure_metadata member spliced
-    -- on, which is why nothing here ever needs to re-marshal a struct.
-    --
-    -- Reading it by eye: SELECT convert_from(event_raw, 'UTF8').
+    -- BYTEA for the same reasons payload_raw is: an opaque byte string cannot validate,
+    -- reject, transcode or re-render what it was given, and this INSERT runs inside the
+    -- caller's ledger transaction, where a column that could reject its input would let
+    -- a notification defect abort a financially valid mutation.
     event_raw           BYTEA                     NOT NULL,
 
     -- ===================================================================
-    -- WHAT THE THREE COPIES ABOVE COST, MEASURED (PERF-C03)
-    --
-    -- The three columns above hold the event body three times over, and each of
-    -- the three has a reason stated at it. What none of those reasons could say
-    -- is the price, so the price is stated here — measured rather than
-    -- estimated, because this is the number the retention period and the
-    -- PostgreSQL volume must both be sized from, and an estimate is how those
-    -- two came to be set 858x apart.
-    --
-    -- # The measurement
-    --
-    -- Taken on PostgreSQL 16 against 500,000 rows in a table created with
-    -- `CREATE TABLE ... (LIKE blnk.event_outbox INCLUDING ALL)`, so every column,
-    -- constraint and all seventeen indexes below are included, and shaped like a
-    -- real `transaction.applied` event read out of a running deployment:
-    --
-    --     payload_raw                 741 bytes
-    --     event_raw                   963 bytes
-    --     payload (JSONB)             808 bytes
-    --     ------------------------------------
-    --     whole tuple               1,888 bytes   (no TOAST: under the 2 KiB threshold)
-    --     heap incl. page overhead  2,048 bytes/row
-    --     all seventeen indexes       323 bytes/row
-    --     ====================================
-    --     TOTAL                     2,372 bytes/row
-    --
-    -- The three body columns are 2,512 of the 1,888-byte tuple before
-    -- compression, so roughly 88% of every row IS the triplicated body. That is
-    -- the trade this design makes: a byte-exact payload guarantee, a byte-exact
-    -- replay guarantee and a queryable projection, bought with three copies.
-    --
-    -- # What that means at the validated throughput
-    --
-    -- Acceptance criterion V-1 validates this pipeline at 500 events per second,
-    -- so the arithmetic that matters is:
-    --
-    --     rows/day     = 500 x 86,400            =  43,200,000
-    --     bytes/day    = 43,200,000 x 2,372       = 102.5 GB  =  95.4 GiB/day
-    --     steady state = 95.4 GiB x retention_days x 1.5
-    --
-    -- The 1.5 is bloat and autovacuum headroom, and it is not padding: every row
-    -- is UPDATEd at least twice on its way to a terminal state (claim, then
-    -- dispatch), `status` is indexed so neither update can be HOT, and each one
-    -- therefore leaves a dead tuple and rewrites index entries.
-    --
-    -- WAL is on top of that and is bounded separately by max_wal_size.
-    --
-    -- # The two settings that must be sized from this, and their coupling
-    --
-    --   * RELAY_EVENT_RETENTION_DAYS in infrastructure/k8s-manifests/blnk-config.yaml
-    --     is the multiplier. It is additionally capped by the broker's own
-    --     log.retention.hours in kafka-statefulset.yaml: the daily
-    --     outbox-versus-offset reconciliation can only compare a window BOTH
-    --     sides still hold.
-    --   * the pg-data volumeClaimTemplate in postgres-statefulset.yaml must hold
-    --     the steady state above, plus the ledger's own tables, plus WAL.
-    --
-    -- Neither number is meaningful without the other. A generous retention
-    -- against a small volume does not keep more history — it exhausts the volume
-    -- the LEDGER lives on, which is an availability failure of the whole system
-    -- rather than of this table.
-    --
-    -- # Why this table is not partitioned
-    --
-    -- Range partitioning on occurred_at would turn the purge into a DROP
-    -- PARTITION and would bound vacuum to one partition at a time, which is the
-    -- textbook answer for a table with this write and delete profile. It is
-    -- deliberately NOT done here, for one reason that outweighs the benefit: the
-    -- relay's claim serialises on an anti-join over in-flight rows sharing a
-    -- message key, and the unique index on event_id is what makes capture
-    -- idempotent — and PostgreSQL cannot enforce a unique index across
-    -- partitions unless the partition key is part of it. Adding occurred_at to
-    -- that uniqueness would let the same event_id be captured twice in two
-    -- partitions, which is the one property the outbox exists to provide.
-    --
-    -- Revisit it if the retained window has to grow beyond a few days: the
-    -- alternative is a partitioned ARCHIVE table that terminal rows are moved
-    -- into, where uniqueness is no longer load-bearing because nothing claims
-    -- from it.
+    -- WHAT THE THREE COPIES ABOVE COST
     -- ===================================================================
+    --
+    -- The three columns above hold the event body three times over, each for the
+    -- reason stated at it. The price of holding it three times is stated here,
+    -- because it is the number the retention period and the PostgreSQL volume must
+    -- both be sized from.
+    --
+    -- Every figure below is ONE basis: bytes AS STORED, after TOAST compression, as
+    -- reported by pg_column_size, plus on-disk relation sizes from pg_relation_size /
+    -- pg_indexes_size / pg_total_relation_size. Logical (uncompressed) lengths are
+    -- called out where they are quoted, and are never mixed with stored sizes.
+    --
+    --     CREATE TABLE blnk.event_outbox_sizing
+    --         (LIKE blnk.event_outbox INCLUDING ALL);
+    --     -- insert or copy a representative sample, then:
+    --     ANALYZE blnk.event_outbox_sizing;
+    --     SELECT round(avg(pg_column_size(payload)))      AS payload_jsonb,
+    --            round(avg(pg_column_size(payload_raw)))  AS payload_raw,
+    --            round(avg(pg_column_size(event_raw)))    AS event_raw,
+    --            round(avg(pg_column_size(t)))            AS whole_tuple,
+    --            round(avg(octet_length(event_raw)))      AS event_raw_logical
+    --       FROM blnk.event_outbox_sizing t;
+    --     SELECT round(pg_relation_size('blnk.event_outbox_sizing')::numeric
+    --                  / count(*))                        AS heap_bytes_row,
+    --            round((pg_total_relation_size('blnk.event_outbox_sizing')
+    --                   - pg_relation_size('blnk.event_outbox_sizing')
+    --                   - pg_indexes_size('blnk.event_outbox_sizing'))::numeric
+    --                  / count(*))                        AS toast_bytes_row,
+    --            round(pg_indexes_size('blnk.event_outbox_sizing')::numeric
+    --                  / count(*))                        AS index_bytes_row,
+    --            round(pg_total_relation_size('blnk.event_outbox_sizing')::numeric
+    --                  / count(*))                        AS total_bytes_row
+    --       FROM blnk.event_outbox_sizing;
 
     -- When the domain action happened; RFC3339 on the wire.
     --
-    -- THIS, never created_at, is the ordering column throughout this table. The
-    -- relay claims rows in ascending occurred_at order so that FIFO holds within
-    -- a partition key, and every index below that carries an ordering column
-    -- carries this one. See the created_at comment for the distinction.
+    -- THIS, never created_at, is the ordering column throughout this table. The relay
+    -- claims rows in ascending occurred_at order so that FIFO holds within a partition
+    -- key, and every index below that carries an ordering column carries this one.
     occurred_at         TIMESTAMP WITH TIME ZONE  NOT NULL DEFAULT NOW(),
 
     -- ===================================================================
@@ -350,8 +174,8 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- bookkeeping the retry schedule and the dead-letter record are built from.
     -- ===================================================================
 
-    -- The row's durable state. The canonical vocabulary, fixed here because this
-    -- DDL is what the repository layer's queries are written against:
+    -- The row's durable state. The canonical vocabulary, fixed here because this DDL is
+    -- what the repository layer's queries are written against:
     --
     --   pending ──claimed──▶ processing ──broker ack──▶ dispatched
     --      │                     │        │            (dispatched_at set)
@@ -359,31 +183,6 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     --      │                     │                                        │
     --      │                     │            (re-claimed; Kafka NOT republished)
     --      └──budget exhausted───┴──▶ failed ──written to <topic>.dlt──▶ dead_lettered
-    --
-    -- 'dispatched' and 'dead_lettered' are the terminal states, and only a
-    -- dead_lettered row is eligible for replay. 'pending', 'processing' and
-    -- 'failed' reuse the lineage outbox's literals verbatim, which is what lets
-    -- its partial-index convention carry over here unchanged. The success
-    -- terminal is named 'dispatched' rather than lineage's 'completed' so it
-    -- matches the dispatched_at column and this pipeline's language;
-    -- 'dead_lettered' has no lineage equivalent at all. The Go-side declaration
-    -- site for every literal is model.EventOutboxStatus*.
-    --
-    -- 'webhook_pending' is the DUAL-DELIVERY state and, like the two columns in
-    -- group 3, it disappears at the sunset. It means: the Kafka leg is published
-    -- and recorded in kafka_dispatched_at, and the legacy HTTP leg is still owed.
-    -- Without it the two legs shared one terminal state, so a row whose Kafka
-    -- publish succeeded was marked dispatched even when its webhook enqueue had
-    -- failed — and because the claim predicate excludes dispatched rows, that
-    -- webhook was never retried and never delivered. The state is claimable and,
-    -- because kafka_dispatched_at is set, a re-claim delivers ONLY the webhook leg.
-    --
-    -- The CHECK below enumerates the vocabulary. It is the one place a typo'd
-    -- literal is caught, and it matters more here than on blnk.lineage_outbox
-    -- because this state machine has more states and every query selects on
-    -- specific ones: a row in an unrecognised state is an event nothing will ever
-    -- look at again. Adding a state means editing the constraint, which is the
-    -- intended friction.
     status              TEXT                      NOT NULL DEFAULT 'pending',
 
     -- Publish attempts made so far, and the budget for them. The default of 5
@@ -394,32 +193,11 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     attempts            INT                       NOT NULL DEFAULT 0,
     max_attempts        INT                       NOT NULL DEFAULT 5,
 
-    -- The instant this row is next DUE for a publish attempt, and the reason the
-    -- configured exponential backoff is real rather than nominal.
-    --
-    -- Without it, a failed row simply had its lease cleared and became claimable
-    -- again on the very next poll. At the relay's 1-second poll interval the
-    -- configured schedule of 1s, 2s, 4s, 8s, 16s collapsed to five attempts inside
-    -- about five seconds — the whole retry budget spent on a broker that had barely
-    -- begun to fail, and every attempt hammering it while it was already struggling.
-    -- The alternative, sleeping in the relay process, is worse: the schedule sums to
-    -- 31 seconds, which OUTLIVES the 30-second claim lease, so a second instance
-    -- reclaims the row mid-sleep and publishes it twice.
-    --
-    -- Persisting the decision removes both options. The claim predicate is
-    -- next_attempt_at <= NOW(), so a row that is not yet due is simply not claimed,
-    -- by any instance, and nothing has to sleep.
-    --
-    -- THE SCHEDULE ITSELF IS NOT HERE. RELAY_RETRY_BASE_BACKOFF_MS, the doubling and
-    -- the RELAY_RETRY_MAX_BACKOFF_MS cap are configuration; computing them in SQL
-    -- would freeze them into a migration and put them beyond the reach of the
-    -- configuration meant to govern them. This column records only the instant the
-    -- caller decided on.
-    --
-    -- NOT NULL DEFAULT NOW() so a freshly inserted row is due immediately: a first
-    -- publish is not a retry and must not wait. Distinct from locked_until, and the
-    -- two are not interchangeable — locked_until answers "is somebody publishing
-    -- this row right now", next_attempt_at answers "may anybody publish it yet".
+    -- The instant this row is next DUE for a publish attempt, which is what makes the
+    -- configured exponential backoff real rather than nominal: the delay survives a
+    -- relay restart and is honoured by every instance, because it is persisted here
+    -- rather than held in memory or slept through in-process. The claim predicate is
+    -- next_attempt_at <= NOW(), so a row that is not yet due is simply not claimed.
     next_attempt_at     TIMESTAMP WITH TIME ZONE  NOT NULL DEFAULT NOW(),
 
     -- The most recent publish failure reason, kept for operator triage and
@@ -439,35 +217,16 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     dispatched_at       TIMESTAMP WITH TIME ZONE  NULL,
 
     -- The lease held by the relay instance that claimed this row (30 seconds).
-    -- Concurrent relay instances skip locked rows, and an EXPIRED lease makes a
-    -- row claimable again, which is what lets a crashed relay's in-flight work be
-    -- picked up rather than stranded.
-    --
-    -- Nullability is required, not incidental: the claim predicate is
-    -- (locked_until IS NULL OR locked_until < NOW()), so a freshly inserted row
-    -- must have NULL here to be claimable. A NOT NULL default would either make
-    -- every new row unclaimable or force a sentinel timestamp.
+    -- Concurrent relay instances skip locked rows, and an EXPIRED lease makes a row
+    -- claimable again, which is what lets a crashed relay's in-flight work be picked up
+    -- rather than stranded.
     locked_until        TIMESTAMP WITH TIME ZONE  NULL,
 
-    -- The token identifying the CLAIM the row is currently under, and what makes
-    -- every state transition safe against a worker whose lease expired.
+    -- The token identifying the CLAIM the row is currently under, and what makes every
+    -- state transition safe against a worker whose lease expired.
     --
-    -- A fresh token is minted on each claim. Every transition — dispatched,
-    -- failed, dead-lettered, webhook-dispatched — then names the token it believes
-    -- it holds, and its UPDATE matches on that token as well as on the row id and
-    -- the expected status. A relay that stalled past its lease, and whose row has
-    -- since been claimed and moved on by another instance, therefore matches no
-    -- row and is told its claim was lost.
-    --
-    -- Without it, every transition matched on id alone. Three concrete failures
-    -- followed, all silent: a stalled worker overwrote the newer state of a row
-    -- another instance had already dispatched; two workers each recorded a failed
-    -- attempt against the same claim, double-incrementing attempts and spending
-    -- the retry budget at twice the intended rate; and a terminal row could be
-    -- moved back out of its terminal state by a call that arrived late.
-    --
-    -- NULL on a freshly inserted row and set back to NULL at a terminal state, so
-    -- a non-NULL value means "some worker holds this row right now".
+    -- NULL on a freshly inserted row and set back to NULL at a terminal state, so a
+    -- non-NULL value means "some worker holds this row right now".
     claim_token         TEXT                      NULL,
 
     -- ===================================================================
@@ -476,57 +235,30 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
 
     -- Records that the legacy HTTP webhook leg was dispatched for this row.
     --
-    -- During the 30-day dual-delivery window the relay publishes to Kafka AND
-    -- enqueues the legacy webhook task from the SAME claimed row. This flag makes
-    -- that second leg individually idempotent, so a row republished to Kafka
-    -- after a relay restart does not also re-enqueue a duplicate webhook.
-    -- Mirrors lineage_outbox.inflight's NOT NULL DEFAULT FALSE form.
-    --
-    -- This column becomes vestigial after the webhook sunset date: the legacy leg
-    -- is deleted and the flag is simply never set again. It can be dropped by a
-    -- later migration once no dual-delivery row remains of interest.
+    -- During the 30-day dual-delivery window the relay publishes to Kafka AND enqueues
+    -- the legacy webhook task from the SAME claimed row. This flag makes that second
+    -- leg individually idempotent, so a row republished to Kafka after a relay restart
+    -- does not also re-enqueue a duplicate webhook.
     webhook_dispatched  BOOLEAN                   NOT NULL DEFAULT FALSE,
 
     -- When the BROKER acknowledged the Kafka publish, recorded independently of
     -- dispatched_at — and the column that makes the two legs' fates independent.
     --
-    -- dispatched_at means "this row is finished". kafka_dispatched_at means "the
-    -- Kafka leg of this row is finished", which during the dual-delivery window is
-    -- a strictly weaker statement, because the legacy leg may still be owed. They
-    -- were once the same column, and the consequence was severe: a row whose Kafka
-    -- publish succeeded and whose webhook enqueue failed was marked dispatched
-    -- anyway, leaving the webhook leg undeliverable forever with only a warning to
-    -- show for it.
-    --
-    -- Its second job is to make a re-claim safe. A claimed row carrying a non-NULL
-    -- value here has ALREADY been published, so the relay skips the publish and
-    -- delivers only the outstanding webhook — which is what stops the retry of a
-    -- deprecated-transport failure from putting a duplicate on the Kafka topic.
-    --
-    -- Set on the ordinary success path too, not only in the webhook_pending case,
-    -- so the column answers "was this event published to Kafka, and when" for
-    -- every row rather than only for the ones that took the unusual path.
-    --
-    -- Vestigial after the sunset, exactly like webhook_dispatched.
+    -- Set on the ordinary success path too, not only in the webhook_pending case, so
+    -- the column answers "was this event published to Kafka, and when" for every row
+    -- rather than only for the ones that took the unusual path.
     kafka_dispatched_at TIMESTAMP WITH TIME ZONE  NULL,
 
-    -- Legacy webhook ENQUEUE attempts made so far, counted separately from
-    -- attempts.
+    -- Legacy webhook ENQUEUE attempts made so far, counted separately from attempts.
     --
     -- Separate because the two legs must not spend each other's budget. A webhook
-    -- receiver being down, or the queue being unreachable, must never consume a
-    -- Kafka retry attempt — that would let the deprecated transport dead-letter
-    -- events on the new one, which is precisely backwards. Bounded by the row's
-    -- own max_attempts so that a permanently unreachable queue cannot keep a row
-    -- claimable indefinitely: once the budget is spent the Kafka delivery is
-    -- recorded as final, the legacy leg is abandoned, and the reason is written to
-    -- last_error where an operator can find it.
-    --
-    -- Vestigial after the sunset, exactly like webhook_dispatched.
+    -- receiver being down, or the queue being unreachable, must never consume a Kafka
+    -- retry attempt — that would let the deprecated transport dead-letter events on the
+    -- new one, which is precisely backwards.
     webhook_attempts    INT                       NOT NULL DEFAULT 0,
 
     -- ===================================================================
-    -- Group 3b: the broker coordinate (OBS-02)
+    -- Group 3b: the broker coordinate
     -- WHERE this row's record actually landed. All three are nullable and are
     -- written and cleared TOGETHER, which the all-or-nothing check below enforces.
     -- ===================================================================
@@ -542,18 +274,9 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- partition_key, so it is stable across redeliveries of the same event.
     kafka_partition     INT                       NULL,
 
-    -- The record's offset within that partition.
-    --
-    -- WHY THE COORDINATE IS STORED AT ALL. The zero-loss criterion (V-2) reconciles
-    -- this table against the broker. Done by COUNTING — records written against rows
-    -- claiming a publication — it cannot detect loss that duplicate surplus happens
-    -- to offset: ten lost events plus ten redeliveries produce exactly the totals of
-    -- a healthy pipeline, and the reconciliation reports no loss while ten events are
-    -- genuinely missing. Storing the coordinate replaces that subtraction with a
-    -- MAPPING: every row that claims a publication names the record it produced, the
-    -- unique index below refuses two rows the same record, and a row claiming a
-    -- publication with no coordinate is visible as unconfirmed rather than absorbed
-    -- into the surplus.
+    -- The record's offset within that partition. The coordinate is stored because the
+    -- zero-loss reconciliation compares this table against the broker, and a stored
+    -- topic/partition/offset triple makes a row's record locatable without a scan.
     kafka_offset        BIGINT                    NULL,
 
     -- ===================================================================
@@ -566,37 +289,22 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- spent — the '<topic>.dlt' sibling of topic.
     dlt_topic           TEXT                      NULL,
 
-    -- The marshaled failure metadata attached to the dead-lettered event,
-    -- carrying exactly five fields: the original topic, the error reason, the
-    -- attempt count, and the first- and last-attempted instants. Stored as raw
-    -- JSON so the dead-letter API hands back the bytes as they were written, and
-    -- attached to the dead-letter message as a sibling top-level key so the
-    -- original envelope is left untouched and stays replayable.
+    -- The marshaled failure metadata attached to the dead-lettered event, carrying
+    -- exactly five fields: the original topic, the error reason, the attempt count, and
+    -- the first- and last-attempted instants. Stored as raw JSON so the dead-letter API
+    -- hands back the bytes as they were written, and attached to the dead-letter
+    -- message as a sibling top-level key so the original envelope is left untouched and
+    -- stays replayable.
     failure_metadata    JSONB                     NULL,
 
     -- The physical row-insert time, part of the lineage vocabulary and kept for
     -- operational forensics.
-    --
-    -- NOT the same thing as occurred_at, and conflating the two is the mistake
-    -- this comment exists to prevent. occurred_at is the DOMAIN event time: it
-    -- goes on the wire, and it drives FIFO ordering and every index. created_at
-    -- is when the row physically landed in this table. They can legitimately
-    -- differ — a backfilled or replayed mutation carries an earlier occurred_at
-    -- than its created_at — and using created_at for ordering would publish such
-    -- events out of domain order.
     created_at          TIMESTAMP WITH TIME ZONE  NOT NULL DEFAULT NOW(),
 
     -- ===================================================================
     -- Group 5: the invariants the database itself enforces
-    --
-    -- These are here rather than in Go because application-level validation
-    -- protects only the code paths that remember to call it, while a constraint
-    -- protects the table. A row that violates one of these is not a row with a bad
-    -- value in it; it is a row that breaks a delivery guarantee, and the cheapest
-    -- place to make it unrepresentable is the schema.
-    --
-    -- Each is written to be satisfied by every row the current code inserts, so
-    -- the migration applies to an existing table without a data fix.
+    -- Each is written to be satisfied by every row the current code inserts, so the
+    -- migration applies to an existing table without a data fix.
     -- ===================================================================
 
     -- A blank partition key would let Kafka scatter the event round-robin, so
@@ -673,23 +381,6 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- transition, so an unrecognised literal is not a cosmetic problem: a row in a
     -- state nothing selects for is a permanently invisible event. The list is the
     -- model.EventOutboxStatus* vocabulary, in state-machine order.
-    --
-    -- "THE BUDGET IS SPENT" AND "THE EVENT IS PRESERVED SOMEWHERE DURABLE" are two
-    -- different facts, and the state machine keeps them apart WITHOUT a status of
-    -- their own: the exhaustion arm writes failed and leaves dlt_topic NULL, and
-    -- that PAIR is the "dead-letter write owed" state. If failed implied preserved,
-    -- a row whose dead-letter write then failed — a broker outage, a cancelled
-    -- context, a process killed between the two — would be terminal with the event
-    -- existing NOWHERE but this row, and no relay poll and no replay path could
-    -- pick it up again.
-    --
-    -- The pair is re-claimable instead: ClaimFailedEventOutboxForDeadLetter selects
-    -- exactly (status = failed AND dlt_topic IS NULL) once the holder's lease has
-    -- expired, and only MarkEventDeadLettered — which runs after the `<topic>.dlt`
-    -- write is acknowledged — may declare the row terminal. An earlier shape of
-    -- this feature named that state 'dlt_pending'; it is absent from this list, was
-    -- never written by any statement, and its vocabulary has been removed rather
-    -- than left to read as live.
     CONSTRAINT event_outbox_status_known
         CHECK (status IN ('pending', 'processing', 'webhook_pending', 'dispatched', 'failed',
                           'dead_lettered', 'replaying'))
@@ -697,16 +388,9 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
 
 -- The write-side exactly-once guard, load-bearing in two distinct ways.
 --
--- First, it makes "one event is recorded once" an invariant the schema enforces
--- rather than a property the code intends: a retried or duplicated insert is
--- rejected by the database, inside the caller's transaction.
---
--- Second, event_id doubles as the subscriber idempotency key. The relay can
--- crash between an acknowledged publish and marking the row dispatched, after
--- which the row is reclaimed and republished; this index is what guarantees the
--- key a consumer deduplicates on is unique in the first place, and is therefore
--- what makes that duplicate suppressible at the consumer's idempotency
--- boundary.
+-- First, it makes "one event is recorded once" an invariant the schema enforces rather
+-- than a property the code intends: a retried or duplicated insert is rejected by the
+-- database, inside the caller's transaction.
 CREATE UNIQUE INDEX IF NOT EXISTS event_outbox_event_id_uidx
     ON blnk.event_outbox (event_id);
 
@@ -719,28 +403,14 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_pending
     ON blnk.event_outbox (status, occurred_at)
     WHERE status = 'pending';
 
--- The dead-letter inventory behind GET /events/dead-letter, and the operator's
--- view of stalled events.
---
--- It covers BOTH failure literals so it stays usable whichever one the repository
--- layer filters on: the planner can prove that status = 'dead_lettered' implies
--- this predicate, and likewise for 'failed'. Restricting it to a single literal
--- would silently drop the other query off the index.
---
--- IT HAS A SECOND CONSUMER, and narrowing it would take that one off the index
--- too. ClaimFailedEventOutboxForDeadLetter sweeps for rows left `failed` with the
--- retry budget spent and dlt_topic still NULL — events whose dead-letter write
--- never completed, which no other claim in the repository can reach — and it
--- drives this index by (status, occurred_at), taking the remaining columns as a
--- filter. That sweep runs on every relay tick, so an index scan here rather than
--- a sequential one is what keeps it free on an outbox that has accumulated
--- terminal rows.
+-- The dead-letter inventory behind GET /events/dead-letter, and the operator's view of
+-- stalled events.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
     ON blnk.event_outbox (status, occurred_at)
     WHERE status IN ('failed', 'dead_lettered');
 
--- The index the FIFO claim query drives, and the reason relay polling stays
--- viable at 500 events per second. The query, run once per poll interval:
+-- The index the FIFO claim query drives, and the reason relay polling stays viable at
+-- 500 events per second. The query, run once per poll interval:
 --
 --   WITH claimed AS (
 --       UPDATE blnk.event_outbox
@@ -758,31 +428,6 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
 --       RETURNING <all columns>
 --   )
 --   SELECT * FROM claimed ORDER BY occurred_at ASC
---
--- The partial predicate is the same IN-list the query filters on, which is what
--- confines the scan to the claimable working set and keeps dispatched and
--- dead-lettered rows — eventually the overwhelming majority of the table — out
--- of the index entirely. The three predicate columns lead and the ordering
--- column trails, matching the shape proven on blnk.lineage_outbox.
---
--- One honest note on the plan, measured rather than assumed: because the leading
--- key is matched against a two-element IN-list, a btree cannot emit rows already
--- sorted by the trailing occurred_at, so the plan legitimately contains a Sort
--- above the index scan. blnk.lineage_outbox has the same index and query shape
--- and the same plan. It costs nothing that matters, because the partial
--- predicate confines that sort's input to the claimable working set rather than
--- the whole table: EXPLAIN ANALYZE over 20,000 rows claims a batch of 100 in
--- roughly 3 ms via this index, with no sequential scan.
---
--- next_attempt_at joins the predicate columns because the due check runs on every
--- candidate on every poll. A row inside its backoff window is the common case
--- during an outage — the entire backlog is not yet due — so leaving that column
--- off the index would make the poll read and discard the whole retrying set on
--- every lap, which is exactly the load the backoff exists to shed.
--- 'webhook_pending' is in the predicate because it is part of the CLAIMABLE set: a
--- row whose Kafka leg is done but whose legacy leg is still owed has to be picked up
--- again, and a claim predicate the index did not cover would degrade the poll into a
--- sequential scan during exactly the incident that produced those rows.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_claim
     ON blnk.event_outbox (status, locked_until, attempts, next_attempt_at, occurred_at)
     WHERE status IN ('pending', 'processing', 'webhook_pending');
@@ -795,109 +440,33 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_claim
 CREATE INDEX IF NOT EXISTS idx_event_outbox_aggregate
     ON blnk.event_outbox (aggregate_id, occurred_at);
 
--- The index that makes PER-KEY ORDERING enforceable rather than merely intended,
--- and the most consequential index in this migration.
---
--- SUPERSEDED by idx_event_outbox_effective_key_inflight in sql/1781252000.sql, which
--- drops this one. Read that migration before this comment: the claim serialises on the
--- EFFECTIVE key — ledger_id where a row has one, partition_key where it does not, which
--- is the key the publisher hashes — and keying this index on the column alone left
--- same-ledger rows with divergent stored keys unserialised while Kafka placed them on one
--- partition. What follows is preserved because the reasoning about the NOT EXISTS
--- predicate, the blocking set and the webhook_pending asymmetry is unchanged; only the
--- key the predicate compares moved.
---
--- The claim query used to be FOR UPDATE SKIP LOCKED over a globally ordered
--- window, which is safe against two relays claiming the SAME row and unsafe
--- against something subtler: SKIP LOCKED means relay B skips the earlier row that
--- relay A holds and claims a LATER row — possibly one with the same partition
--- key. Kafka preserves append order, not occurred_at, so relay B's message can be
--- appended first and a subscriber sees transaction.applied before
--- transaction.queued for the same aggregate. No error, no log line, and the
--- ordering guarantee the whole partitioning scheme exists to provide is gone.
---
--- The fix is a NOT EXISTS predicate in the claim: a row is claimable only when no
--- EARLIER row with the same partition_key is still pending or processing. That
--- predicate runs once per candidate row, so it needs an index keyed on
--- partition_key with the ordering columns trailing, restricted to exactly the
--- states that block — otherwise the check degrades into a scan of the table's
--- entire history per candidate and the relay's throughput collapses as the table
--- grows.
---
--- The partial predicate is the set of BLOCKING states, and it is deliberately
--- narrower than the claimable set: only pending and processing rows hold a key
--- back. A row that has exhausted its budget (failed) or been preserved on its
--- dead-letter topic (dead_lettered) does NOT block its key forever — the trade is
--- explicit. Strict ordering would demand it block, but a single permanently
--- undeliverable event would then stall every subsequent event for that aggregate
--- indefinitely, which is a worse failure than a gap. Retries DO preserve order,
--- because a retrying row returns to pending.
---
--- 'webhook_pending' is deliberately NOT here, and the asymmetry with the claim index
--- above is the point. Ordering is a property of the KAFKA topic, and a webhook_pending
--- row has already been published to it — its position in the partition is fixed and
--- nothing it does subsequently can change it. Blocking its key would let a failing
--- LEGACY enqueue stall Kafka delivery for the whole aggregate, which is the deprecated
--- transport interfering with the new one. So such a row is claimable without being
--- blocking: the outstanding webhook is retried while later events keep flowing.
+-- The index that makes PER-KEY ORDERING enforceable rather than merely intended, and
+-- the most consequential index in this migration.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_partition_key_inflight
     ON blnk.event_outbox (partition_key, occurred_at, id)
     WHERE status IN ('pending', 'processing');
 
 -- The retention index, and the retention contract it serves.
 --
--- WHAT IS STORED HERE IS SENSITIVE. payload is the webhook body verbatim, so a
--- transaction event carries amounts and balance identifiers and an identity event
--- carries names, email addresses, phone numbers, postal addresses and dates of
--- birth. last_error and failure_metadata carry broker and driver text. None of it
--- has any operational value once the event has been delivered, and keeping it
--- indefinitely turns a delivery buffer into an unbounded secondary copy of the
--- ledger's most sensitive data — with none of the access controls the primary
--- tables have around them.
---
--- The retention primitive is Datasource.PurgeTerminalEventsBefore, which deletes
--- rows in a TERMINAL state whose occurrence is older than a cutoff. This index is
--- what lets it delete a bounded slice cheaply instead of scanning the table.
---
--- Terminal only, and that is the safety property: a pending, processing,
--- replaying or failed row is still owed a delivery attempt, and nothing here can
--- delete one however old it is. Choosing the cutoff, and honouring any legal or
--- audit hold that requires a longer one, is an operator decision — this schema
--- provides the mechanism and takes no view on the period.
+-- The retention primitive is Datasource.PurgeTerminalEventsBefore, which deletes rows
+-- in a TERMINAL state whose occurrence is older than a cutoff. This index is what lets
+-- it delete a bounded slice cheaply instead of scanning the table.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_terminal_retention
     ON blnk.event_outbox (occurred_at)
     WHERE status IN ('dispatched', 'dead_lettered');
 
--- The broker coordinate is UNIQUE, and that is a correctness guarantee rather
--- than a performance one (OBS-02).
---
--- One record is produced by one acknowledged write of one row, so two rows can
--- never legitimately name the same coordinate. Making the database refuse it turns
--- the audit's "confirmed rows equals distinct records" check into a statement about
--- an enforced invariant rather than a hopeful comparison: a duplicate would
--- otherwise let two rows share one record's corroboration, which is the same
--- double-counting the reconciliation exists to eliminate.
---
--- PARTIAL, so the overwhelming majority of rows — everything not yet published, and
--- everything published before this column existed — cost nothing and collide with
--- nothing. Postgres treats NULLs as distinct in a unique index anyway; the
--- predicate makes the index small as well as correct.
+-- The broker coordinate is UNIQUE, and that is a correctness guarantee rather than a
+-- performance one.
 CREATE UNIQUE INDEX IF NOT EXISTS event_outbox_broker_record_uidx
     ON blnk.event_outbox (kafka_topic, kafka_partition, kafka_offset)
     WHERE kafka_offset IS NOT NULL;
 
--- The outbox side of the daily zero-loss reconciliation, which counts rows claiming
--- a Kafka record and how many of those name one.
+-- The outbox side of the daily zero-loss reconciliation, which counts rows claiming a
+-- Kafka record and how many of those name one.
 --
--- The predicate is deliberately WIDER than the terminal statuses. A webhook_pending
--- row HAS been published to Kafka — its Kafka leg completed and kafka_dispatched_at
--- is stamped; what is outstanding is the deprecated HTTP leg. Counting only
--- dispatched and dead_lettered rows would leave those records unaccounted for on the
--- broker side, inflating the apparent surplus and loosening the reconciliation during
--- exactly the window it matters most.
---
--- kafka_offset is carried as an INCLUDE column so the confirmed/unconfirmed split is
--- answerable from the index alone.
+-- The predicate is deliberately WIDER than the terminal statuses. A webhook_pending row
+-- HAS been published to Kafka — its Kafka leg completed and kafka_dispatched_at is
+-- stamped; what is outstanding is the deprecated HTTP leg.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_published_audit
     ON blnk.event_outbox (kafka_dispatched_at)
     INCLUDE (kafka_topic, kafka_partition, kafka_offset)
@@ -905,12 +474,11 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_published_audit
 
 -- +migrate Down
 
--- Indexes first, then the table. Dropping the table would take its indexes with
--- it, but naming them explicitly keeps the rollback correct if a future
--- migration ever detaches one of these objects from the other, and it documents
--- exactly what this migration created. Index names are schema-qualified in the
--- drop even though they are unqualified in the create; that asymmetry is the
--- house convention.
+-- Indexes first, then the table. Dropping the table would take its indexes with it, but
+-- naming them explicitly keeps the rollback correct if a future migration ever detaches
+-- one of these objects from the other, and it documents exactly what this migration
+-- created. Index names are schema-qualified in the drop even though they are
+-- unqualified in the create; that asymmetry is the house convention.
 DROP INDEX IF EXISTS blnk.idx_event_outbox_published_audit;
 DROP INDEX IF EXISTS blnk.event_outbox_broker_record_uidx;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_terminal_retention;

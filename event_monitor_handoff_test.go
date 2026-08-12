@@ -14,20 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// event_monitor_handoff_test.go covers the evaluation half of the balance-monitor handoff:
-// the processor that turns a durable intent into a transactionally captured alert.
+// event_monitor_handoff_test.go covers the evaluation half of the balance-monitor
+// handoff: the processor that turns a durable intent into a transactionally captured
+// alert.
 //
-// The assertions are grouped around the two properties the mechanism exists for, because a
-// test that only checked "an alert was produced" would pass against the post-commit capture
-// this replaces and would prove nothing:
+// The assertions are grouped around the two properties the mechanism exists for,
+// because a test that only checked "an alert was produced" would pass against the
+// post-commit capture this replaces and would prove nothing:
 //
 //   - THE CAPTURE IS ATOMIC WITH THE COMPLETION. The alerts and the handoff's terminal
-//     transition must reach the repository as ONE call, never as an insert followed by a
-//     mark. Two calls are two transactions, and a crash between them is precisely the window
-//     the handoff removes.
-//   - A REPEATED EVALUATION IS IDEMPOTENT. A lapsed claim lease, a retry or a restart must
-//     derive the SAME event ids, so the duplicate collides with the unique index instead of
-//     delivering the alert twice.
+//     transition must reach the repository as ONE call, never as an insert followed by
+//     a mark.
+//   - A REPEATED EVALUATION IS IDEMPOTENT. A lapsed claim lease, a retry or a restart
+//     must derive the SAME event ids, so the duplicate collides with the unique index
+//     instead of delivering the alert twice.
 package blnk
 
 import (
@@ -70,10 +70,8 @@ func handoffProcessorHarness(t *testing.T) (*BalanceMonitorHandoffProcessor, *mo
 // monitoredHandoff returns a claimed handoff carrying BOTH snapshots: the balance that
 // satisfies crossedMonitor's condition, and crossedMonitor itself.
 //
-// Both are built from the same fixtures the post-commit tests use, so the two describe one
-// balance and one monitor rather than plausible-looking copies of them. Carrying the monitor
-// snapshot is what makes these tests exercise the shipped path — a row written by the
-// producer always carries one, and only a row predating sql/1781252100.sql does not.
+// Both are built from the same fixtures the post-commit tests use, so the two describe
+// one balance and one monitor rather than plausible-looking copies of them.
 func monitoredHandoff(t *testing.T, handoffID string) model.BalanceMonitorHandoff {
 	t.Helper()
 
@@ -104,11 +102,8 @@ func monitoredHandoffWithMonitors(
 	return handoff
 }
 
-// legacyMonitoredHandoff returns a claimed handoff written BEFORE sql/1781252100.sql: the
-// balance snapshot is present and the monitor snapshot is absent.
-//
-// It is produced by stripping the column rather than by hand-building a row, so it stays a
-// faithful copy of what the previous release wrote as the rest of the row's shape evolves.
+// legacyMonitoredHandoff returns a claimed handoff written BEFORE sql/1781252100.sql:
+// the balance snapshot is present and the monitor snapshot is absent.
 func legacyMonitoredHandoff(t *testing.T, handoffID string) model.BalanceMonitorHandoff {
 	t.Helper()
 
@@ -142,9 +137,10 @@ func TestPrepareBalanceMonitorHandoffs_SnapshotsBothDecisionInputsAsWritten(t *t
 	assert.Equal(t, 0, snapshot.Balance.Cmp(big.NewInt(700)),
 		"the snapshotted value is what the condition is judged against")
 
-	// AND THE OTHER HALF OF THE DECISION. A row carrying only the balance leaves the monitor
-	// definitions to be re-read after the commit, from a table operators edit — which is what
-	// let a deleted monitor suppress an alert for a movement that had already crossed it.
+	// AND THE OTHER HALF OF THE DECISION. A row carrying only the balance leaves the
+	// monitor definitions to be re-read after the commit, from a table operators edit —
+	// which is what let a deleted monitor suppress an alert for a movement that had
+	// already crossed it.
 	monitors, snapshotted, err := handoffs[0].Monitors()
 	require.NoError(t, err)
 	require.True(t, snapshotted,
@@ -160,12 +156,10 @@ func TestPrepareBalanceMonitorHandoffs_SnapshotsBothDecisionInputsAsWritten(t *t
 		"and the precise value survives the JSON round trip, or the payload bytes change")
 }
 
-// TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe keeps a bookkeeping row from
-// failing a ledger movement.
+// TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe keeps a bookkeeping row
+// from failing a ledger movement.
 //
-// The atomic writers call this for every balance they update. A nil entry or a blank id is a
-// caller's slip, and refusing the whole batch for one would refuse money movement because an
-// alerting side effect could not be described.
+// The atomic writers call this for every balance they update.
 func TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe(t *testing.T) {
 	balance := monitoredBalance()
 	handoffs, err := model.PrepareBalanceMonitorHandoffs(
@@ -183,16 +177,11 @@ func TestPrepareBalanceMonitorHandoffs_SkipsWhatItCannotDescribe(t *testing.T) {
 	assert.Equal(t, "bln_monitored", handoffs[0].BalanceID)
 }
 
-// TestPrepareBalanceMonitorHandoffs_WritesNothingForAnUnmonitoredBalance pins the guard that
-// replaced a SQL EXISTS clause, and it is the one that keeps this affordable on the money path.
+// TestPrepareBalanceMonitorHandoffs_WritesNothingForAnUnmonitoredBalance pins the guard
+// that replaced a SQL EXISTS clause, and it is the one that keeps this affordable on
+// the money path.
 //
-// The overwhelming majority of balances carry no monitor. A row per balance per transaction
-// would be pure write amplification at the throughput target, every one destined to evaluate to
-// "nothing fired" and be deleted — so a balance absent from the monitor map produces no row.
-//
-// It is also what gives an EMPTY MonitorSnapshot on a stored row a single meaning. Because a row
-// is never written for an empty monitor set, an empty snapshot can only mean "written before the
-// column existed", which is what makes the evaluator's legacy fallback safe to key on.
+// The overwhelming majority of balances carry no monitor.
 func TestPrepareBalanceMonitorHandoffs_WritesNothingForAnUnmonitoredBalance(t *testing.T) {
 	balance := monitoredBalance()
 
@@ -213,12 +202,8 @@ func TestPrepareBalanceMonitorHandoffs_WritesNothingForAnUnmonitoredBalance(t *t
 	}
 }
 
-// TestPrepareBalanceMonitorHandoffs_MintsAFreshIDPerMovement is the guard on the id that makes
-// repeated firings distinguishable.
-//
-// One balance legitimately produces many handoffs — one per movement — so a derived handoff id
-// would collapse every movement after the first into a duplicate the unique index rejects, and
-// the alerts for exactly the balances that move most would silently stop.
+// TestPrepareBalanceMonitorHandoffs_MintsAFreshIDPerMovement is the guard on the id
+// that makes repeated firings distinguishable.
 func TestPrepareBalanceMonitorHandoffs_MintsAFreshIDPerMovement(t *testing.T) {
 	monitors := map[string][]model.BalanceMonitor{"bln_monitored": {crossedMonitor()}}
 
@@ -231,12 +216,11 @@ func TestPrepareBalanceMonitorHandoffs_MintsAFreshIDPerMovement(t *testing.T) {
 		"two movements of one balance must be two handoffs, or the second alert is suppressed")
 }
 
-// TestBalanceMonitorEventIdentity_IsStablePerHandoffAndMonitor is the property the whole
-// idempotence argument rests on.
+// TestBalanceMonitorEventIdentity_IsStablePerHandoffAndMonitor is the property the
+// whole idempotence argument rests on.
 //
-// Stable across re-evaluations of ONE handoff, so a lapsed lease or a retry collides with the
-// unique index instead of duplicating the alert. Distinct across handoffs, so a monitor that
-// fires on every movement keeps producing new alerts.
+// Stable across re-evaluations of ONE handoff, so a lapsed lease or a retry collides
+// with the unique index instead of duplicating the alert.
 func TestBalanceMonitorEventIdentity_IsStablePerHandoffAndMonitor(t *testing.T) {
 	first := model.BalanceMonitorEventIdentity("bmh_1", "mon_crossed")
 
@@ -251,23 +235,19 @@ func TestBalanceMonitorEventIdentity_IsStablePerHandoffAndMonitor(t *testing.T) 
 	assert.Empty(t, model.BalanceMonitorEventIdentity("", "mon_crossed"))
 }
 
-// TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion is the R-2 assertion
-// for balance.monitor.
+// TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion is the
+// assertion for balance.monitor.
 //
-// The alerts and the handoff's terminal transition must arrive as ONE repository call. A
-// version that inserted the events and then marked the handoff would pass any assertion about
-// the alert existing while leaving exactly the window the handoff was built to close: a crash
-// between the two either loses the alert or re-evaluates a handoff whose alerts are already
-// stored.
+// The alerts and the handoff's terminal transition must arrive as ONE repository call.
 func TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 	handoff := monitoredHandoff(t, "bmh_atomic")
 
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
 		Return([]model.BalanceMonitorHandoff{handoff}, nil).Once()
-	// NO GetBalanceMonitors STUB, deliberately: the row carries its monitor snapshot, so the
-	// evaluation reads no table at all. An unstubbed call would panic inside the mock, which is
-	// how this test would report a regression to the live read — and the explicit
+	// NO GetBalanceMonitors STUB, deliberately: the row carries its monitor snapshot, so
+	// the evaluation reads no table at all. An unstubbed call would panic inside the mock,
+	// which is how this test would report a regression to the live read — and the explicit
 	// AssertNotCalled below says so rather than leaving it to a panic.
 
 	var captured []*model.EventOutbox
@@ -294,30 +274,24 @@ func TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion(t *te
 	datasource.AssertNotCalled(t, "MarkBalanceMonitorHandoffFailed",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 
-	// AND THE MONITOR DEFINITIONS CAME FROM THE ROW, not from the table. This is the R-2 half
-	// the snapshot added: a live read here would make the alert depend on the definitions as
-	// they stand when the row is drained rather than as they stood when the balance's
+	// AND THE MONITOR DEFINITIONS CAME FROM THE ROW, not from the table. This is the half
+	// the snapshot added: a live read here would make the alert depend on the definitions
+	// as they stand when the row is drained rather than as they stood when the balance's
 	// transaction committed.
 	datasource.AssertNotCalled(t, "GetBalanceMonitors", mock.Anything)
 }
 
-// TestBalanceMonitorHandoff_VerdictIsUnchangedByALaterEditToTheMonitors is the MAJ-05
+// TestBalanceMonitorHandoff_VerdictIsUnchangedByALaterEditToTheMonitors is the handoff-verdict
 // property stated directly: the decision is a function of the ROW, and nothing else.
 //
-// # The three divergences a live read allowed
+// So which events existed depended on when the row happened to be drained:
 //
-// blnk.balance_monitors is operator-editable through PUT and DELETE /balance-monitors, and the
-// evaluator used to read it when it drained a handoff — after the balance's transaction had
-// already committed. So which events existed depended on when the row happened to be drained:
-//
-//  1. DELETED between commit and drain: no alert, for a movement that had crossed the threshold.
-//  2. CREATED in that window: an alert, for a movement the monitor was never registered to watch.
-//  3. EDITED in that window: an alert for a condition that was not the condition in force.
-//
-// Each is asserted here by making the live table say something DIFFERENT from the snapshot and
-// requiring the verdict to follow the snapshot. The stubs are `.Maybe()` rather than absent, so a
-// regression to the live read produces a wrong VERDICT — a specific, readable failure — instead
-// of an unstubbed-call panic that says only that something was called.
+//  1. DELETED between commit and drain: no alert, for a movement that had crossed the
+//     threshold.
+//  2. CREATED in that window: an alert, for a movement the monitor was never registered
+//     to watch.
+//  3. EDITED in that window: an alert for a condition that was not the condition in
+//     force.
 func TestBalanceMonitorHandoff_VerdictIsUnchangedByALaterEditToTheMonitors(t *testing.T) {
 	t.Run("a monitor deleted after the commit still fires", func(t *testing.T) {
 		processor, datasource := handoffProcessorHarness(t)
@@ -404,17 +378,10 @@ func TestBalanceMonitorHandoff_VerdictIsUnchangedByALaterEditToTheMonitors(t *te
 	})
 }
 
-// TestBalanceMonitorHandoff_FallsBackToALiveReadForALegacyRow keeps the upgrade path drainable.
+// TestBalanceMonitorHandoff_FallsBackToALiveReadForALegacyRow keeps the upgrade path
+// drainable.
 //
-// A row written before sql/1781252100.sql carries no monitor snapshot. Refusing it would strand
-// the backlog an upgrade inherits at exactly the moment that backlog is largest, so such a row is
-// still evaluated — by reading the monitors live, which is the older guarantee, applied to a
-// finite and shrinking population.
-//
-// The fallback is keyed on the snapshot being ABSENT, never on it being empty-after-decode: a row
-// is only ever written for a balance that HAS a monitor, so an absent snapshot has exactly one
-// meaning. That is what stops an upgraded deployment from silently re-reading live monitors
-// forever if the write side ever regressed to omitting the column.
+// A row written before sql/1781252100.sql carries no monitor snapshot.
 func TestBalanceMonitorHandoff_FallsBackToALiveReadForALegacyRow(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
@@ -439,13 +406,11 @@ func TestBalanceMonitorHandoff_FallsBackToALiveReadForALegacyRow(t *testing.T) {
 	datasource.AssertExpectations(t)
 }
 
-// TestBalanceMonitorHandoff_FailsAnUndecodableMonitorSnapshotPermanently mirrors the balance
-// snapshot's treatment, and for the same reason.
+// TestBalanceMonitorHandoff_FailsAnUndecodableMonitorSnapshotPermanently mirrors the
+// balance snapshot's treatment, and for the same reason.
 //
-// Stored bytes do not change, so a snapshot that does not decode will not decode on the sixth
-// attempt either. It must NOT be mistaken for a legacy row: falling back to a live read for
-// undecodable bytes would evaluate the wrong definitions while reporting success, which is worse
-// than failing the row.
+// Stored bytes do not change, so a snapshot that does not decode will not decode on the
+// sixth attempt either.
 func TestBalanceMonitorHandoff_FailsAnUndecodableMonitorSnapshotPermanently(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
@@ -471,11 +436,11 @@ func TestBalanceMonitorHandoff_FailsAnUndecodableMonitorSnapshotPermanently(t *t
 	datasource.AssertNotCalled(t, "GetBalanceMonitors", mock.Anything)
 }
 
-// TestBalanceMonitorHandoff_DerivesAStableEventIDAcrossEvaluations proves the duplicate a
-// lapsed lease can cause is absorbed by the unique index rather than delivered.
+// TestBalanceMonitorHandoff_DerivesAStableEventIDAcrossEvaluations proves the duplicate
+// a lapsed lease can cause is absorbed by the unique index rather than delivered.
 //
-// This is what lets the completion skip a fence: two evaluations of one handoff offer the same
-// event id, so the second insert resolves to the stored row.
+// This is what lets the completion skip a fence: two evaluations of one handoff offer
+// the same event id, so the second insert resolves to the stored row.
 func TestBalanceMonitorHandoff_DerivesAStableEventIDAcrossEvaluations(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 	handoff := monitoredHandoff(t, "bmh_stable")
@@ -509,13 +474,8 @@ func TestBalanceMonitorHandoff_DerivesAStableEventIDAcrossEvaluations(t *testing
 		"the id must come from the (handoff, monitor) identity, which is what makes it both stable and per-firing")
 }
 
-// TestBalanceMonitorHandoff_CompletesWithNoEventsWhenNoConditionIsMet keeps the common case
-// from being mistaken for the failure case.
-//
-// "Evaluated, nothing fired" and "never evaluated" are indistinguishable from the event outbox
-// alone, and the difference is the only question worth asking when an expected alert did not
-// arrive. Skipping the completion would also leave the row claimable and re-evaluate it until
-// its budget ran out.
+// TestBalanceMonitorHandoff_CompletesWithNoEventsWhenNoConditionIsMet keeps the common
+// case from being mistaken for the failure case.
 func TestBalanceMonitorHandoff_CompletesWithNoEventsWhenNoConditionIsMet(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
@@ -541,12 +501,11 @@ func TestBalanceMonitorHandoff_CompletesWithNoEventsWhenNoConditionIsMet(t *test
 		"the handoff must still be completed, or it is re-evaluated until its budget is spent")
 }
 
-// TestBalanceMonitorHandoff_FailsAnUndecodableSnapshotPermanently keeps the retry budget for
-// failures a retry can actually resolve.
+// TestBalanceMonitorHandoff_FailsAnUndecodableSnapshotPermanently keeps the retry
+// budget for failures a retry can actually resolve.
 //
-// Stored bytes do not change, so a snapshot that does not decode will not decode on the sixth
-// attempt either. Spending the budget on it costs five more claims and five more poll intervals
-// to reach the conclusion the first attempt already had.
+// Stored bytes do not change, so a snapshot that does not decode will not decode on the
+// sixth attempt either.
 func TestBalanceMonitorHandoff_FailsAnUndecodableSnapshotPermanently(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
@@ -572,10 +531,11 @@ func TestBalanceMonitorHandoff_FailsAnUndecodableSnapshotPermanently(t *testing.
 func TestBalanceMonitorHandoff_RetriesATransientEvaluationFailure(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
-	// THE TRANSIENT FAULT IS THE LEGACY FALLBACK READ, and it is the only read left on this
-	// path: a row carrying a monitor snapshot needs no database at all to be evaluated. A row
-	// written before sql/1781252100.sql does, so it is the one that can still fail this way —
-	// and the assertion below is that such a failure keeps the budget.
+	// THE TRANSIENT FAULT IS THE LEGACY FALLBACK READ, and it is the only read left on
+	// this path: a row carrying a monitor snapshot needs no database at all to be
+	// evaluated. A row written before sql/1781252100.sql does, so it is the one that can
+	// still fail this way — and the assertion below is that such a failure keeps the
+	// budget.
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
 		Return([]model.BalanceMonitorHandoff{legacyMonitoredHandoff(t, "bmh_transient")}, nil).Once()
 	datasource.On("GetBalanceMonitors", "bln_monitored").
@@ -591,11 +551,10 @@ func TestBalanceMonitorHandoff_RetriesATransientEvaluationFailure(t *testing.T) 
 		"a transient database fault must keep the budget, or one blip discards the alert")
 }
 
-// TestBalanceMonitorHandoff_RecordsTheFailureWhenTheCaptureCannotCommit asserts the handoff
-// stays claimable when the atomic write itself fails.
+// TestBalanceMonitorHandoff_RecordsTheFailureWhenTheCaptureCannotCommit asserts the
+// handoff stays claimable when the atomic write itself fails.
 //
-// Nothing was written, so the alert is not lost — it is owed. Marking the row is what makes the
-// next poll retry it rather than leaving it leased until expiry.
+// Nothing was written, so the alert is not lost — it is owed.
 func TestBalanceMonitorHandoff_RecordsTheFailureWhenTheCaptureCannotCommit(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
@@ -611,11 +570,11 @@ func TestBalanceMonitorHandoff_RecordsTheFailureWhenTheCaptureCannotCommit(t *te
 	datasource.AssertExpectations(t)
 }
 
-// TestBalanceMonitorHandoff_EvaluatesEveryHandoffInABatch keeps one bad row from stranding the
-// rest.
+// TestBalanceMonitorHandoff_EvaluatesEveryHandoffInABatch keeps one bad row from
+// stranding the rest.
 //
-// Each handoff is a different balance whose alerts have no reason to wait on an unrelated
-// failure, and each failure is recorded against its own row.
+// Each handoff is a different balance whose alerts have no reason to wait on an
+// unrelated failure, and each failure is recorded against its own row.
 func TestBalanceMonitorHandoff_EvaluatesEveryHandoffInABatch(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 
@@ -634,12 +593,11 @@ func TestBalanceMonitorHandoff_EvaluatesEveryHandoffInABatch(t *testing.T) {
 	datasource.AssertExpectations(t)
 }
 
-// TestBalanceMonitorHandoffProcessor_LifecycleIsIdempotent pins the two guards that keep the
-// lifecycle honest.
+// TestBalanceMonitorHandoffProcessor_LifecycleIsIdempotent pins the two guards that
+// keep the lifecycle honest.
 //
-// Two loops on one processor would double every claim and halve the effective lease, and Stop
-// would close a channel one of them no longer reads. A second Stop must not close a closed
-// channel.
+// Two loops on one processor would double every claim and halve the effective lease,
+// and Stop would close a channel one of them no longer reads.
 func TestBalanceMonitorHandoffProcessor_LifecycleIsIdempotent(t *testing.T) {
 	processor, datasource := handoffProcessorHarness(t)
 	datasource.On("ClaimPendingBalanceMonitorHandoffs", mock.Anything, mock.Anything, mock.Anything).
@@ -661,11 +619,11 @@ func TestBalanceMonitorHandoffProcessor_LifecycleIsIdempotent(t *testing.T) {
 	assert.NotPanics(t, processor.Stop, "a second Stop must not close an already-closed channel")
 }
 
-// TestBalanceMonitorHandoffProcessor_RejectsUnusableConfiguration keeps a miswired configurator
-// from producing a processor that cannot work.
+// TestBalanceMonitorHandoffProcessor_RejectsUnusableConfiguration keeps a miswired
+// configurator from producing a processor that cannot work.
 //
-// A zero poll interval panics time.NewTicker, and a batch size of zero claims nothing for ever.
-// Both are ignored in favour of the default rather than accepted.
+// A zero poll interval panics time.NewTicker, and a batch size of zero claims nothing
+// for ever.
 func TestBalanceMonitorHandoffProcessor_RejectsUnusableConfiguration(t *testing.T) {
 	processor, _ := handoffProcessorHarness(t)
 
@@ -676,13 +634,11 @@ func TestBalanceMonitorHandoffProcessor_RejectsUnusableConfiguration(t *testing.
 	assert.Equal(t, defaultMonitorHandoffLockDuration, processor.lockDuration)
 }
 
-// TestBalanceMonitorHandoffEnabled_TracksTheOneSharedPredicate is the guard on the decision the
-// writer and the post-commit path must agree about.
+// TestBalanceMonitorHandoffEnabled_TracksTheOneSharedPredicate is the guard on the
+// decision the writer and the post-commit path must agree about.
 //
-// If they disagreed, one of two silent faults follows: every alert delivered twice, or a
-// movement whose monitors nobody evaluates. Both sides read
-// config.Configuration.EventPublishingConfigured, and this asserts the service-side reader
-// tracks it.
+// If they disagreed, one of two silent faults follows: every alert delivered twice, or
+// a movement whose monitors nobody evaluates.
 func TestBalanceMonitorHandoffEnabled_TracksTheOneSharedPredicate(t *testing.T) {
 	withBrokers := newOutboxBlnk(t, outboxPublishingConfiguration(), new(mocks.MockDataSource))
 	assert.True(t, withBrokers.balanceMonitorHandoffEnabled(),

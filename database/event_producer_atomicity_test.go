@@ -14,26 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// event_producer_atomicity_test.go exercises the writer-side capture that brings the last two
-// event families under requirement R-2, AGAINST A REAL POSTGRESQL.
+// event_producer_atomicity_test.go exercises the writer-side capture that brings the
+// last two event families under the requirement, AGAINST A REAL POSTGRESQL.
 //
-// Three claims are made here, and they are about transaction boundaries rather than about SQL:
+// Three claims are made here, and they are about transaction boundaries rather than
+// about SQL:
 //
-//   - A `balance.monitor` crossing is decided AND its canonical blnk.event_outbox row inserted
-//     inside the transaction that moved the balance, whenever a BalanceMonitorAlertCapture is
-//     registered — which is what recordBalanceMonitorEvaluation does and what R-2 asks for.
-//   - With no capture registered, the same transaction commits a balance_monitor_handoff instead:
-//     both decision inputs, frozen, for BalanceMonitorHandoffProcessor to convert. That is the
-//     fallback and the drain path for rows written before the in-transaction capture existed.
+//   - A `balance.monitor` crossing is decided AND its canonical blnk.event_outbox row
+//     inserted inside the transaction that moved the balance, whenever a
+//     BalanceMonitorAlertCapture is registered — which is what
+//     recordBalanceMonitorEvaluation does and what same-transaction capture asks for.
+//   - With no capture registered, the same transaction commits a
+//     balance_monitor_handoff instead: both decision inputs, frozen, for
+//     BalanceMonitorHandoffProcessor to convert.
 //   - A bulk batch's outcome and its summary event commit together.
-//
-// A mock cannot answer any of them. Whether a row is visible after a COMMIT, and invisible after a
-// ROLLBACK, is the whole assertion, and only a real transaction demonstrates it. The monitor read
-// the capture depends on resolves an index on blnk.balance_monitors that a mock does not have, and
-// the schema's own CHECK constraints are part of the contract too.
-//
-// Every test skips when no database is reachable, matching the convention the other real-database
-// tests in this package use.
 package database
 
 import (
@@ -59,8 +53,8 @@ import (
 // monitoredTestBalance creates a balance, and optionally a monitor on it, returning the
 // balance id.
 //
-// The monitor is what the handoff insert's EXISTS guard looks for, so a test that wants a
-// handoff written must ask for one and a test that wants none must not.
+// The monitor is what the handoff insert's EXISTS guard looks for, so a test that wants
+// a handoff written must ask for one and a test that wants none must not.
 func monitoredTestBalance(t *testing.T, ds Datasource, withMonitor bool) (string, string) {
 	t.Helper()
 
@@ -85,30 +79,19 @@ func monitoredTestBalance(t *testing.T, ds Datasource, withMonitor bool) (string
 	return created.BalanceID, ledger.LedgerID
 }
 
-// retireHandoffFixtures deletes every row this test caused, in both tables, once it ends.
+// retireHandoffFixtures deletes every row this test caused, in both tables, once it
+// ends.
 //
-// # Why a leaked row here is not inert
+// The database is SHARED with sibling clones and with the root package's own tiers,
+// which run in another process. A handoff or event row left behind is therefore not
+// merely clutter:
 //
-// The database is SHARED with sibling clones and with the root package's own tiers, which run
-// in another process. A handoff or event row left behind is therefore not merely clutter:
-//
-//   - A leaked event_outbox row is left PENDING, so the first relay to look — a live tier in
-//     another process — claims it, publishes it for real and stamps it with the broker
-//     coordinate it landed on. That coordinate then sits under the unique index on
-//     (kafka_topic, kafka_partition, kafka_offset) for ever, and it is read by the
-//     reconciliation audit, whose per-partition extremes are asserted for EXACT equality.
-//     One leaked row from this file is enough to fail
-//     TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB in a way that reads as
-//     a defect in the audit rather than as pollution from here.
-//   - A leaked handoff row is claim-visible, and the claim is global and oldest-first, so it
-//     is served AHEAD of the fixtures of any later test that reasons about batch composition.
-//
-// # Why it matches on four columns
-//
-// The two families this file exercises are keyed differently and neither is keyed on the
-// balance: a monitor alert carries the LEDGER as its aggregate and partition key, and the
-// handoff carries the balance. Matching all four covers both without assuming which of them a
-// given test produced.
+//   - A leaked event_outbox row is left PENDING, so the first relay to look — a live
+//     tier in another process — claims it, publishes it for real and stamps it with the
+//     broker coordinate it landed on.
+//   - A leaked handoff row is claim-visible, and the claim is global and oldest-first,
+//     so it is served AHEAD of the fixtures of any later test that reasons about batch
+//     composition.
 func retireHandoffFixtures(t *testing.T, ds Datasource, balanceID, ledgerID string) {
 	t.Helper()
 
@@ -127,12 +110,8 @@ func retireHandoffFixtures(t *testing.T, ds Datasource, balanceID, ledgerID stri
 	})
 }
 
-// coordinatedTestBatchID mints a batch id and registers the cleanup for everything a batch
-// leaves behind: the coordinator row and the outcome event captured with it.
-//
-// The event's aggregate id and partition key are both the batch id — the batch is the
-// aggregate a bulk outcome belongs to — so one predicate covers the event, and the coordinator
-// row is keyed on the same value.
+// coordinatedTestBatchID mints a batch id and registers the cleanup for everything a
+// batch leaves behind: the coordinator row and the outcome event captured with it.
 func coordinatedTestBatchID(t *testing.T, ds Datasource) string {
 	t.Helper()
 
@@ -154,24 +133,9 @@ func coordinatedTestBatchID(t *testing.T, ds Datasource) string {
 }
 
 // TestBalancesAwaitingMonitorEvaluation_SuppressesTheHandoffForABalanceEvaluatedWithTheMutation
-// is the guard on the duplicate two independently-built R-2 mechanisms create together.
+// is the guard on the duplicate two independently-built capture mechanisms create together.
 //
-// # The defect
-//
-// `balance.monitor` is brought inside the mutation's transaction by two routes. The caller-side
-// pass evaluates a moved balance's monitors before the write and hands the alerts to the writer;
-// the writer-side handoff records the intent to evaluate, which the handoff processor drains.
-// With both live and neither aware of the other, a crossing on the single-transaction path is
-// captured TWICE — once by the pass, once by the processor — under two different event ids. A
-// `balance.monitor` id is a fresh UUID by design, so no subscriber-side idempotency can collapse
-// the pair, and the duplicate is indistinguishable from two genuine crossings.
-//
-// # Why these two functions need no database
-//
-// They are pure: one reads balance ids out of event payloads, the other subtracts a set. The
-// statement they gate is exercised against real PostgreSQL above; the DECISION is exercised
-// here, deterministically, because a planner cannot be asked whether it would have been right
-// to write the row at all. This is the one test in this file that does not skip.
+// `balance.monitor` is brought inside the mutation's transaction by two routes.
 func TestBalancesAwaitingMonitorEvaluation_SuppressesTheHandoffForABalanceEvaluatedWithTheMutation(t *testing.T) {
 	monitorRow := func(balanceID string) *model.EventOutbox {
 		return &model.EventOutbox{
@@ -200,8 +164,8 @@ func TestBalancesAwaitingMonitorEvaluation_SuppressesTheHandoffForABalanceEvalua
 
 	t.Run("a balance with no captured alert is still handed off", func(t *testing.T) {
 		// The read-failure case, and the reason coverage is taken from the rows rather than
-		// assumed from the path: a monitor read that failed before the write captures nothing,
-		// so the handoff is the only thing that will ever evaluate that balance.
+		// assumed from the path: a monitor read that failed before the write captures
+		// nothing, so the handoff is the only thing that will ever evaluate that balance.
 		awaiting := balancesAwaitingMonitorEvaluation(both, balancesAlreadyEvaluatedInTx(
 			[]*model.EventOutbox{monitorRow("bln_source")}))
 
@@ -263,18 +227,9 @@ func countHandoffsForBalance(t *testing.T, ds Datasource, balanceID string) int 
 	return count
 }
 
-// storeEventPublishingConfigured installs a configuration that reports event publishing as
-// configured, for the duration of one test, and restores whatever was installed before it.
-//
-// recordBalanceMonitorEvaluation's first gate is config.Configuration.EventPublishingConfigured,
-// which answers false with no brokers — and false there means the whole gate returns without
-// writing anything, so a test that skipped this would assert on a no-op and pass for the wrong
-// reason. The existing handoff tests do not need it because they call the insert directly, beneath
-// the gate.
-//
-// The previous configuration is restored rather than cleared: the store is process-wide, and a
-// zero-value Configuration is not "no configuration" — it answers every lookup with a default the
-// test never chose.
+// storeEventPublishingConfigured installs a configuration that reports event publishing
+// as configured, for the duration of one test, and restores whatever was installed
+// before it.
 func storeEventPublishingConfigured(t *testing.T) {
 	t.Helper()
 
@@ -299,17 +254,13 @@ func storeEventPublishingConfigured(t *testing.T) {
 	config.ConfigStore.Store(&replacement)
 }
 
-// stubMonitorAlertCapture installs a BalanceMonitorAlertCapture for the duration of one test and
-// restores whatever was registered before it.
-//
-// The registry is process-wide, so a test that installed one and walked away would silently change
-// the path every later test in this package takes — which is the whole difference between "the
-// writer captures the canonical row" and "the writer commits a handoff". Restoring the previous
-// value rather than clearing it is what lets these tests run in any order.
+// stubMonitorAlertCapture installs a BalanceMonitorAlertCapture for the duration of one
+// test and restores whatever was registered before it.
 //
 // Parameters:
 //   - t *testing.T: the test, for cleanup registration.
-//   - capture BalanceMonitorAlertCapture: the capture to install; nil reaches the handoff fallback.
+//   - capture BalanceMonitorAlertCapture: the capture to install; nil reaches the
+//     handoff fallback.
 func stubMonitorAlertCapture(t *testing.T, capture BalanceMonitorAlertCapture) {
 	t.Helper()
 
@@ -318,13 +269,8 @@ func stubMonitorAlertCapture(t *testing.T, capture BalanceMonitorAlertCapture) {
 	t.Cleanup(func() { RegisterBalanceMonitorAlertCapture(previous) })
 }
 
-// monitorAlertRowFor builds the row a real capture would build for one crossing, without importing
-// the root package.
-//
-// It is deliberately minimal: this file is asserting WHERE the row is written and WHETHER it is
-// written, not how the envelope is constructed, which blnk.prepareBalanceMonitorAlertRow owns and
-// the root package's own tests pin. Every column the schema requires NOT NULL is populated so the
-// insert exercises the real statement rather than failing a constraint for a fixture reason.
+// monitorAlertRowFor builds the row a real capture would build for one crossing,
+// without importing the root package.
 func monitorAlertRowFor(balance *model.Balance, monitor model.BalanceMonitor) *model.EventOutbox {
 	payload, _ := json.Marshal(map[string]interface{}{
 		"event": model.EventTypeBalanceMonitor,
@@ -360,22 +306,9 @@ func countMonitorAlertsForLedger(t *testing.T, ds Datasource, ledgerID string) i
 	return count
 }
 
-// TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction is the
-// R-2 assertion for `balance.monitor`, and it is the whole point of the in-transaction capture.
-//
-// # The gap it closes
-//
-// The writer used to commit a balance_monitor_handoff row — an INTENT — and leave the canonical
-// blnk.event_outbox row to a second transaction run later by BalanceMonitorHandoffProcessor. That
-// intent is durable and it fixes the verdict at commit time, but it is not the row R-2 names: until
-// the conversion succeeded, the event announcing the crossing did not exist. This asserts the row
-// itself is committed by the transaction that moved the balance, and that no handoff is written
-// alongside it — because writing both would publish one crossing twice under two different event
-// ids, which no subscriber could collapse.
-//
-// It runs against real PostgreSQL because the claim being made is about a transaction boundary:
-// the row is read back only AFTER the commit, from a fresh connection, so a row visible here
-// cannot have been written by anything but that transaction.
+// TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction
+// is the same-transaction assertion for `balance.monitor`, and it is the whole point of the
+// in-transaction capture.
 func TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction(t *testing.T) {
 	ds := openRealTestDB(t)
 	storeEventPublishingConfigured(t)
@@ -405,13 +338,10 @@ func TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutation
 			"crossing a second time under a different event id")
 }
 
-// TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet asserts the writer does not
-// pay for a monitor that did not fire.
+// TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet asserts the
+// writer does not pay for a monitor that did not fire.
 //
-// This is strictly less write amplification than the handoff it replaces. The handoff wrote one
-// jsonb row per MONITORED balance whether or not anything fired, to be drained, evaluated to
-// "nothing fired" and deleted. Evaluating in the transaction means a balance carrying monitors it
-// does not cross costs one indexed read and no write at all.
+// This is strictly less write amplification than the handoff it replaces.
 func TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet(t *testing.T) {
 	ds := openRealTestDB(t)
 	storeEventPublishingConfigured(t)
@@ -438,13 +368,8 @@ func TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet(t *tes
 	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID))
 }
 
-// TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered asserts the
-// fallback that keeps a Datasource built without the root service correct.
-//
-// Such a process cannot BUILD an event row — the envelope, the partition-key resolution and the
-// topic binding live in the root package — so if it wrote nothing here, a committed movement would
-// have its alerts decided later against whatever blnk.balance_monitors says then. The handoff is
-// what stops that: both decision inputs, frozen inside the mutation's transaction.
+// TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered
+// asserts the fallback that keeps a Datasource built without the root service correct.
 func TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered(t *testing.T) {
 	ds := openRealTestDB(t)
 	storeEventPublishingConfigured(t)
@@ -464,11 +389,9 @@ func TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegist
 		"and it cannot have built a canonical row, because building one is what it lacks")
 }
 
-// TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated asserts the
-// second gate: the pre-write pass and the writer must not both capture one crossing.
-//
-// The coverage is read from the event rows the transaction is already inserting, so a balance whose
-// alert the caller prepared is skipped entirely — neither re-evaluated nor handed off.
+// TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated
+// asserts the second gate: the pre-write pass and the writer must not both capture one
+// crossing.
 func TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated(t *testing.T) {
 	ds := openRealTestDB(t)
 	storeEventPublishingConfigured(t)
@@ -504,13 +427,8 @@ func TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEval
 		"the caller's own row is inserted by the writer's event loop, not by this gate")
 }
 
-// TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails asserts that a
-// capture failure fails the WRITE.
-//
-// A payload that will not serialise or a partition key that cannot be resolved is a producer
-// defect, not a transient condition, and R-2's whole point is that a mutation whose event cannot be
-// captured must not commit. Committing the movement and logging the failure is the pre-R-2
-// behaviour: it trades a visible failure for an invisible one.
+// TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails asserts
+// that a capture failure fails the WRITE.
 func TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails(t *testing.T) {
 	ds := openRealTestDB(t)
 	storeEventPublishingConfigured(t)
@@ -541,11 +459,8 @@ func TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails(
 		"a failed capture must not silently fall back to the handoff: the mutation is refused instead")
 }
 
-// TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction guards the one mistake that
-// would look like it worked.
-//
-// Inserting the alert on the connection rather than in the writer's transaction would pass every
-// happy-path assertion while reopening the exact loss window this capture exists to close.
+// TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction guards the one
+// mistake that would look like it worked.
 func TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction(t *testing.T) {
 	_, _, err := captureBalanceMonitorAlertsInTx(context.Background(), Datasource{}, nil,
 		[]*model.Balance{{BalanceID: "bln_x"}},
@@ -571,18 +486,10 @@ func recordEvaluationInOwnTx(t *testing.T, ds Datasource, balances []*model.Bala
 	require.NoError(t, tx.Commit())
 }
 
-// TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance is the assertion that
-// makes this affordable on the money path.
+// TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance is the assertion
+// that makes this affordable on the money path.
 //
-// The overwhelming majority of balances carry no monitor. A row per balance per transaction
-// would be pure write amplification at the system's throughput target, every row destined to be
-// evaluated to "nothing fired". The guard is what avoids that.
-//
-// It USED to be a correlated EXISTS in the insert's own WHERE clause. It is now a consequence of
-// the monitor read this statement performs for the snapshot: a balance the read returns nothing
-// for produces no handoff. That is strictly cheaper — one indexed statement for the batch rather
-// than one probe per balance — and it is what gives an absent monitor_snapshot on a stored row a
-// single meaning, since a row is never written for an empty monitor set.
+// The overwhelming majority of balances carry no monitor.
 func TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance(t *testing.T) {
 	ds := openRealTestDB(t)
 
@@ -600,13 +507,10 @@ func TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance(t *test
 		"an unmonitored balance must write nothing at all, or the money path pays for every transaction")
 }
 
-// TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger asserts the row carries
-// everything the evaluation needs, so the evaluator can run in another process and judge the
-// state the transaction actually wrote — against the definitions that were in force when it did.
-//
-// BOTH snapshots are the assertion, and the monitor one is the R-2 half that was missing. Without
-// it the evaluator re-read blnk.balance_monitors after the commit, from a table operators edit, so
-// which events existed depended on when the row was drained.
+// TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger asserts the row
+// carries everything the evaluation needs, so the evaluator can run in another process
+// and judge the state the transaction actually wrote — against the definitions that
+// were in force when it did.
 func TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger(t *testing.T) {
 	ds := openRealTestDB(t)
 
@@ -659,17 +563,10 @@ func TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger(t *tes
 	assert.Equal(t, 0, monitors[0].Condition.PreciseValue.Cmp(big.NewInt(100)))
 }
 
-// TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead is what keeps the event payload
-// bytes unchanged by the snapshot.
+// TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead is what keeps the
+// event payload bytes unchanged by the snapshot.
 //
-// The `balance.monitor` payload is the marshalled monitor object, and AAP §0.7.1 V-8 requires the
-// Kafka payload and the legacy webhook body to be byte-identical during the dual-delivery window.
-// The snapshot therefore has to decode a row to the SAME values Datasource.GetBalanceMonitors
-// decodes it to — otherwise the bytes differ for a reason no requirement asked for.
-//
-// The one deliberate divergence is NULL tolerance: precision and precise_value are nullable
-// columns, GetBalanceMonitors scans them into bare numeric types and errors on a NULL, and this
-// read must not, because it runs inside a money transaction. Both halves are asserted.
+// The `balance.monitor` payload is the marshalled monitor object.
 func TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead(t *testing.T) {
 	ds := openRealTestDB(t)
 
@@ -763,11 +660,11 @@ func TestInsertBalanceMonitorHandoffsInTx_RollsBackWithItsTransaction(t *testing
 		"a rolled-back movement must leave no evaluation intent behind")
 }
 
-// TestInsertBalanceMonitorHandoffsInTx_RefusesToWriteOutsideATransaction protects the guarantee
-// from a caller that would silently break it.
+// TestInsertBalanceMonitorHandoffsInTx_RefusesToWriteOutsideATransaction protects the
+// guarantee from a caller that would silently break it.
 //
-// A handoff written on its own connection would look exactly like a working one and would
-// reintroduce the crash window the mechanism exists to close.
+// A handoff written on its own connection would look exactly like a working one and
+// would reintroduce the crash window the mechanism exists to close.
 func TestInsertBalanceMonitorHandoffsInTx_RefusesToWriteOutsideATransaction(t *testing.T) {
 	err := insertBalanceMonitorHandoffsInTx(context.Background(), nil,
 		[]*model.Balance{{BalanceID: "bln_anything"}})
@@ -783,10 +680,9 @@ func TestBalanceMonitorHandoffClaim_LeasesFIFOAndSkipsHeldRows(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
 
-	// DRAINED FIRST, and this is not tidying. The claim is global and strictly oldest-first, so
-	// pending rows left by earlier tests in this package would be claimed ahead of this test's
-	// and a batch-size assertion would see none of its own rows. Leasing them out of the way
-	// for an hour makes the batch below deterministic without deleting anything.
+	// DRAINED FIRST, and this is not tidying. The claim is global and strictly
+	// oldest-first, so pending rows left by earlier tests in this package would be claimed
+	// ahead of this test's and a batch-size assertion would see none of its own rows.
 	drainPendingHandoffs(t, ds)
 
 	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
@@ -813,21 +709,18 @@ func TestBalanceMonitorHandoffClaim_LeasesFIFOAndSkipsHeldRows(t *testing.T) {
 	assert.NotEqual(t, claimed[0].HandoffID, remaining[0].HandoffID)
 }
 
-// TestClaimPendingBalanceMonitorHandoffQuery_KeepsTheShapeItsCorrectnessDependsOn asserts the
-// two clauses whose absence is invisible until the conditions that need them occur.
+// TestClaimPendingBalanceMonitorHandoffQuery_KeepsTheShapeItsCorrectnessDependsOn
+// asserts the two clauses whose absence is invisible until the conditions that need
+// them occur.
 //
-// Both were defects in the first version of this statement, and neither showed up as a wrong
-// answer in a way a normal test would catch:
+//   - Without MATERIALIZED, the candidate selection is a semi-join subplan the planner
+//     may re-evaluate, and because this UPDATE writes `attempts` — the very column that
+//     subplan filters on — each re-evaluation applies the LIMIT again.
+//   - Without FOR UPDATE SKIP LOCKED, two processors block on each other instead of
+//     taking disjoint batches, which converts horizontal scaling into serialisation.
 //
-//   - Without MATERIALIZED, the candidate selection is a semi-join subplan the planner may
-//     re-evaluate, and because this UPDATE writes `attempts` — the very column that subplan
-//     filters on — each re-evaluation applies the LIMIT again. Measured on PostgreSQL 16, the
-//     inline form claimed three rows for a batch size of two. It is PLAN-DEPENDENT, so it
-//     appears on a small table and hides on a large one.
-//   - Without FOR UPDATE SKIP LOCKED, two processors block on each other instead of taking
-//     disjoint batches, which converts horizontal scaling into serialisation.
-//
-// A behavioural test cannot reliably reach either state, so the shape is asserted directly.
+// A behavioural test cannot reliably reach either state, so the shape is asserted
+// directly.
 func TestClaimPendingBalanceMonitorHandoffQuery_KeepsTheShapeItsCorrectnessDependsOn(t *testing.T) {
 	assert.Contains(t, claimPendingBalanceMonitorHandoffQuery, "AS MATERIALIZED",
 		"the candidate selection must be materialised, or the batch size is a hint rather than a bound")
@@ -841,9 +734,8 @@ func TestClaimPendingBalanceMonitorHandoffQuery_KeepsTheShapeItsCorrectnessDepen
 
 // drainPendingHandoffs leases every currently claimable handoff far into the future.
 //
-// The claim query is global and oldest-first, so a test that wants to reason about ITS rows has
-// to move everything older out of the way. A long lease does that without deleting rows another
-// assertion may depend on.
+// The claim query is global and oldest-first, so a test that wants to reason about ITS
+// rows has to move everything older out of the way.
 func drainPendingHandoffs(t *testing.T, ds Datasource) {
 	t.Helper()
 
@@ -858,9 +750,8 @@ func drainPendingHandoffs(t *testing.T, ds Datasource) {
 
 // handoffsForBalance filters a claim batch down to one balance's rows.
 //
-// The database is shared with other tests and with sibling clones, so a claim legitimately
-// returns rows this test knows nothing about. Filtering is what makes the assertions about
-// THIS test's rows rather than about whatever else is pending.
+// The database is shared with other tests and with sibling clones, so a claim
+// legitimately returns rows this test knows nothing about.
 func handoffsForBalance(handoffs []model.BalanceMonitorHandoff, balanceID string) []model.BalanceMonitorHandoff {
 	filtered := make([]model.BalanceMonitorHandoff, 0, len(handoffs))
 	for _, handoff := range handoffs {
@@ -873,7 +764,7 @@ func handoffsForBalance(handoffs []model.BalanceMonitorHandoff, balanceID string
 }
 
 // TestCompleteBalanceMonitorHandoffWithEvents_WritesTheAlertAndTheCompletionTogether is the
-// R-2 assertion at the repository boundary.
+// Same-transaction assertion at the repository boundary.
 func TestCompleteBalanceMonitorHandoffWithEvents_WritesTheAlertAndTheCompletionTogether(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -902,12 +793,10 @@ func TestCompleteBalanceMonitorHandoffWithEvents_WritesTheAlertAndTheCompletionT
 		"the alert must be durable in the same transaction that completed the handoff")
 }
 
-// TestCompleteBalanceMonitorHandoffWithEvents_IsIdempotentForARepeatedEvaluation is what lets
-// the completion skip a fence.
+// TestCompleteBalanceMonitorHandoffWithEvents_IsIdempotentForARepeatedEvaluation is
+// what lets the completion skip a fence.
 //
-// A lapsed lease can let two processors evaluate one handoff. Because the alert's id is derived
-// from (handoff, monitor), the second completion offers the same row: the unique index resolves
-// it to the stored one and the second call succeeds without writing a second alert.
+// A lapsed lease can let two processors evaluate one handoff.
 func TestCompleteBalanceMonitorHandoffWithEvents_IsIdempotentForARepeatedEvaluation(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -1041,12 +930,11 @@ func monitorAlertRow(handoffID, ledgerID string) *model.EventOutbox {
 	}
 }
 
-// TestFinalizeBulkTransactionBatchWithEvent_CommitsTheOutcomeWithItsEvent is the R-2 assertion
-// for bulk_transaction.<status>.
+// TestFinalizeBulkTransactionBatchWithEvent_CommitsTheOutcomeWithItsEvent is the
+// assertion for bulk_transaction.<status>.
 //
 // The batch has no batch-spanning transaction, so the summary is made atomic with the
-// coordinator's terminal transition instead. Both facts must be durable after one call, and the
-// coordinator must record which event carried the outcome.
+// coordinator's terminal transition instead.
 func TestFinalizeBulkTransactionBatchWithEvent_CommitsTheOutcomeWithItsEvent(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -1076,11 +964,8 @@ func TestFinalizeBulkTransactionBatchWithEvent_CommitsTheOutcomeWithItsEvent(t *
 	assert.Equal(t, "bulk_transaction.applied", storedType)
 }
 
-// TestFinalizeBulkTransactionBatchWithEvent_IsIdempotentForTheSameOutcome is what makes the
-// retry safe.
-//
-// An attempt whose commit succeeded but whose acknowledgement was lost must be recognised, not
-// followed by a second differently-identified event for one batch outcome.
+// TestFinalizeBulkTransactionBatchWithEvent_IsIdempotentForTheSameOutcome is what makes
+// the retry safe.
 func TestFinalizeBulkTransactionBatchWithEvent_IsIdempotentForTheSameOutcome(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -1125,16 +1010,9 @@ func TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingOutcome(t *tes
 		"a second, different outcome must be refused rather than overwriting the first")
 }
 
-// TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch is the replacement for
-// the last standalone capture on a producer that has state to be atomic with.
-//
-// A batch whose start-of-batch coordinator write failed used to be reported as ErrNotFound
-// here, and the producer then captured its outcome with a single insert standing outside any
-// transaction — so bulk_transaction.<status> was at-most-once for the whole life of a
-// deployment that had suffered one database blip at the wrong moment. The finalise now ADOPTS
-// such a batch: it writes the terminal coordinator row inside the same transaction as the
-// outcome event, so the two commit together and requirement R-2 holds for this producer
-// unconditionally.
+// TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch is the
+// replacement for the last standalone capture on a producer that has state to be atomic
+// with.
 func TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -1179,10 +1057,6 @@ func TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch(t *tes
 
 // TestFinalizeBulkTransactionBatchWithEvent_AdoptionIsIdempotent covers the retry of an
 // adoption whose acknowledgement was lost.
-//
-// The event id is derived from the batch, so a second attempt must recognise the outcome it
-// already recorded and stop rather than write a second, differently-identified event for one
-// batch outcome.
 func TestFinalizeBulkTransactionBatchWithEvent_AdoptionIsIdempotent(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -1232,12 +1106,8 @@ func TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingAdoptedOutcome
 		"the caller is told the state disagrees rather than silently having its answer discarded")
 }
 
-// TestFinalizeBulkTransactionBatchWithEvent_RefusesANonTerminalOutcome keeps the coordinator's
-// one invariant enforceable.
-//
-// A finalise to 'processing' would move the row nowhere while stamping finalized_at, which the
-// schema's CHECK forbids — and the stuck-batch query would then miss a batch that never
-// finished.
+// TestFinalizeBulkTransactionBatchWithEvent_RefusesANonTerminalOutcome keeps the
+// coordinator's one invariant enforceable.
 func TestFinalizeBulkTransactionBatchWithEvent_RefusesANonTerminalOutcome(t *testing.T) {
 	ds := openRealTestDB(t)
 
@@ -1274,12 +1144,11 @@ func TestInsertBulkTransactionBatch_IsIdempotentOnTheBatchID(t *testing.T) {
 		"a repeated start must not fail the batch")
 }
 
-// TestCountUnfinalizedBulkTransactionBatches_CountsTheResidueBeyondTheGrace is the visibility
-// assertion for the one window the coordinator cannot close.
+// TestCountUnfinalizedBulkTransactionBatches_CountsTheResidueBeyondTheGrace is the
+// visibility assertion for the one window the coordinator cannot close.
 //
-// A batch that began and never reported an outcome is not silent loss — it is a countable state.
-// The grace period is what separates a batch still legitimately running, which a large batch
-// may be for minutes, from one that was abandoned.
+// A batch that began and never reported an outcome is not silent loss — it is a
+// countable state.
 func TestCountUnfinalizedBulkTransactionBatches_CountsTheResidueBeyondTheGrace(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -1301,11 +1170,6 @@ func TestCountUnfinalizedBulkTransactionBatches_CountsTheResidueBeyondTheGrace(t
 }
 
 // bulkBatchState reads a coordinator row directly.
-//
-// The columns are read here rather than through a repository getter, because no production code
-// reads a coordinator row by id — the finalise conditions its UPDATE instead, and an operator
-// queries the table — and adding an exported accessor with no caller would be adding API for a
-// test's convenience.
 func bulkBatchState(t *testing.T, ds Datasource, batchID string) model.BulkTransactionBatch {
 	t.Helper()
 

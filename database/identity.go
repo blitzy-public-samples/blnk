@@ -46,7 +46,7 @@ import (
 //   - If identity.IdentityID is empty, a fresh id is generated (existing
 //     behaviour).
 //
-// # Atomic event capture (requirement R-2)
+// # Atomic event capture
 //
 // When a caller supplies an EventPreparer, the identity INSERT and the identity.created
 // event row are written inside ONE transaction: the preparer is handed the finished identity

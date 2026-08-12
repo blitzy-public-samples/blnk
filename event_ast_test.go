@@ -29,48 +29,22 @@ import (
 // Structural assertions over the event pipeline's own source, for the small set of
 // properties that are genuinely about STRUCTURE rather than about behaviour.
 //
-// # Why these exist, and what they replaced
+// A handful of properties in this package are absences: "the relay does not sleep a
+// retry delay in process", "the relay does not own a second copy of the sunset
+// decision", "this test file forms no opinion of its own about the boundary it tests".
 //
-// A handful of properties in this package are absences: "the relay does not sleep a retry
-// delay in process", "the relay does not own a second copy of the sunset decision", "this
-// test file forms no opinion of its own about the boundary it tests". An absence cannot be
-// observed by running the code — a second sunset comparison is invisible to a behavioural
-// test for exactly as long as it happens to agree with the first, which is the whole
-// interval before somebody changes one of them.
+// FALSE POSITIVES.
 //
-// They used to be asserted with strings.Contains over the file's text, and that instrument
-// is wrong in both directions:
+// FALSE NEGATIVES.
 //
-//	FALSE POSITIVES. The text includes comments and string literals. A comment explaining
-//	"the relay must never call time.Sleep" fails an assertion that the file must not contain
-//	"time.Sleep" — so the documentation and the test that documents the same rule cannot
-//	coexist. One scan was reduced to assembling its needles from concatenated fragments
-//	precisely so it would not match itself, which is the point at which a check has stopped
-//	being a check.
+// An AST match has neither failure mode for these properties.
 //
-//	FALSE NEGATIVES. A substring pins one spelling. `.Record(` misses `Record (`, misses a
-//	method value passed as a function, and misses an equivalent instrument written through an
-//	alias. A byte-distance check like "the guard must be within 120 characters of the call"
-//	fails when a comment is added between them and passes when the guard encloses something
-//	else entirely.
-//
-// An AST match has neither failure mode for these properties. Comments are not parsed unless
-// asked for, so prose about a rule cannot violate it. Identifiers are matched as
-// identifiers, so formatting, wrapping and whitespace are irrelevant. And containment is
-// asserted as containment — a call inside an if-statement's body — instead of as arithmetic
-// over byte offsets.
-//
-// # What these helpers are NOT for
-//
-// Anything observable at runtime belongs in a behavioural test, and every AST assertion in
-// this package is paired with one. The structure is the part behaviour cannot reach; it is
-// never the whole of what is checked.
+// Anything observable at runtime belongs in a behavioural test, and every AST assertion
+// in this package is paired with one.
 
 // parseRepositoryGoFile parses a repository-root Go file into an AST.
 //
-// COMMENTS ARE DELIBERATELY NOT PARSED. Every assertion built on this asks about code, and
-// including comments would reintroduce the exact false positive that made the text scans
-// untenable: a comment naming the forbidden construct would count as the construct.
+// COMMENTS ARE DELIBERATELY NOT PARSED.
 //
 // Parameters:
 //   - t *testing.T: the test; the parse failing is a hard failure.
@@ -88,15 +62,11 @@ func parseRepositoryGoFile(t *testing.T, name string) *ast.File {
 	return parsed
 }
 
-// selectorCallNames returns the set of method and package-function names CALLED anywhere in
-// the file, as they appear after the dot.
+// selectorCallNames returns the set of method and package-function names CALLED
+// anywhere in the file, as they appear after the dot.
 //
-// It answers "does this file call anything named Sleep / Record / Before?" without caring
-// what it is called on, which is the right granularity for the absence rules here: the rule
-// is about the operation, and naming the receiver as well would let a rename evade it.
-//
-// A NAME IN A COMMENT OR A STRING IS NOT A CALL and is absent from this set, which is the
-// whole reason for parsing rather than scanning.
+// A NAME IN A COMMENT OR A STRING IS NOT A CALL and is absent from this set, which is
+// the whole reason for parsing rather than scanning.
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
@@ -122,12 +92,8 @@ func selectorCallNames(file *ast.File) map[string]int {
 	return names
 }
 
-// qualifiedCallCount counts calls written as pkg.Name(...) — a package-qualified call, or a
-// method call on a variable of that name.
-//
-// Distinguishing the qualifier matters where the bare name is common: "Sleep" alone is
-// unambiguous, but a rule about time.Parse should not be satisfied or violated by an
-// unrelated Parse method.
+// qualifiedCallCount counts calls written as pkg.Name(...) — a package-qualified call,
+// or a method call on a variable of that name.
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
@@ -160,18 +126,11 @@ func qualifiedCallCount(file *ast.File, qualifier, name string) int {
 	return count
 }
 
-// qualifiedSelections returns every name the file selects off one package qualifier, whether
-// or not the selection is itself a call.
+// qualifiedSelections returns every name the file selects off one package qualifier,
+// whether or not the selection is itself a call.
 //
-// It answers a question the two helpers above cannot: "which members of this package does
-// this file touch at all?". selectorCallNames sees `metrics.EventsDispatchedTotal.Add(...)`
-// as a call named Add, because that is what it is, and qualifiedCallCount would need the
-// forbidden name spelled out one at a time. Enumerating the selections instead lets a rule be
-// stated as an ALLOWLIST — this file may reference exactly these members and no others —
-// which is the only phrasing that stays correct when a new instrument is added to the package.
-//
-// A name in a comment or a string is not a selection and is absent from the map, for the same
-// reason it is absent from selectorCallNames.
+// A name in a comment or a string is not a selection and is absent from the map, for
+// the same reason it is absent from selectorCallNames.
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
@@ -198,11 +157,10 @@ func qualifiedSelections(file *ast.File, qualifier string) map[string]int {
 	return names
 }
 
-// identifierUses returns how many times the file REFERS to an identifier of the given name,
-// in any position — a selector's field name, a bare identifier, a key.
+// identifierUses returns how many times the file REFERS to an identifier of the given
+// name, in any position — a selector's field name, a bare identifier, a key.
 //
-// This is the AST answer to "does this file read that configuration field at all?". It sees a
-// reference wherever one exists and, again, does not see the name in prose.
+// This is the AST answer to "does this file read that configuration field at all?".
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
@@ -224,12 +182,10 @@ func identifierUses(file *ast.File, name string) int {
 	return count
 }
 
-// assignmentTargets returns the names assigned to anywhere in the file, whether by = or :=,
-// and whether the target is a bare identifier or a selected field.
+// assignmentTargets returns the names assigned to anywhere in the file, whether by = or
+// :=, and whether the target is a bare identifier or a selected field.
 //
-// It is how "nothing here replaces that field" is stated. A struct field assigned in a
-// composite literal is included too, because `Foo{bar: stub}` and `x.bar = stub` are the same
-// substitution as far as the rule is concerned.
+// It is how "nothing here replaces that field" is stated.
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
@@ -271,19 +227,16 @@ func assignmentTargets(file *ast.File) map[string]int {
 // callsGuardedBy returns the calls that appear INSIDE the body of an if-statement whose
 // condition calls guardQualifier.guardName, reported by the called name.
 //
-// Containment is read from the tree, so it is containment: a guard that encloses the call is
-// found, and a guard that merely sits near it in the file is not. That replaces a byte-offset
-// comparison whose verdict changed whenever a comment was added between the two.
-//
-// Nested ifs are covered because the search descends the whole body.
+// Containment is read from the tree, so it is containment: a guard that encloses the
+// call is found, and a guard that merely sits near it in the file is not.
 //
 // Parameters:
 //   - file *ast.File: the parsed file.
-//   - guardQualifier string: the package or receiver in the guard condition, e.g. "logrus".
+//   - guardQualifier string: the package or receiver in the guard condition, e.g.
 //   - guardName string: the function called in the condition, e.g. "IsLevelEnabled".
 //
 // Returns:
-//   - map[string]int: count of guarded calls keyed by the selected name. Empty, never nil.
+//   - map[string]int: count of guarded calls keyed by the selected name.
 func callsGuardedBy(file *ast.File, guardQualifier, guardName string) map[string]int {
 	guarded := make(map[string]int)
 
@@ -322,9 +275,6 @@ func callsGuardedBy(file *ast.File, guardQualifier, guardName string) map[string
 
 // wrapStatementsAsDecl puts a block into a throwaway function declaration so it can be
 // walked by the same helpers that walk a file.
-//
-// Reusing one walker for a file and for a block is what keeps "is this call present?" and "is
-// this call present inside that guard?" from being two implementations that can disagree.
 func wrapStatementsAsDecl(body *ast.BlockStmt) ast.Decl {
 	return &ast.FuncDecl{
 		Name: ast.NewIdent("guardedBlock"),

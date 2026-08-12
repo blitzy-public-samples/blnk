@@ -9,11 +9,11 @@ data:
       scrape_interval: 15s
 
       # runbook_base_url is read from an alerting rule's annotations as
-      # $externalLabels.runbook_base_url and is the documentation base every
-      # rule's runbook_url resolves against. Unset yields the public copy of
-      # docs/kafka-operations.md; set yields this cluster's own copy. Either way
-      # the fragment naming the rule that fired is preserved, so the link opens
-      # that rule's procedure rather than the top of the document.
+      # $externalLabels.runbook_base_url and is the documentation base every rule's
+      # runbook_url resolves against. Unset yields the public copy of
+      # docs/kafka-operations.md; set yields this cluster's own copy. Either way the
+      # fragment naming the rule that fired is preserved, so the link opens that rule's
+      # procedure rather than the top of the document.
       #
       # UNCOMMENT AND POINT IT AT YOUR OWN RUNBOOK if you publish one. Left fully
       # commented rather than declared empty for the reason the root copy states:
@@ -26,44 +26,27 @@ data:
     # Kubernetes has no bind mounts, so the rule file travels as the
     # blnk-kafka-alerts.yml key below and prometheus-deployment.yaml must project
     # that key into this same directory:
-    #   - name: prometheus-config
-    #     mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
-    #     subPath: blnk-kafka-alerts.yml
-    # Keep the key name, the subPath, the mountPath and this path in step. An
-    # unmounted rule file is a SILENT failure — the alerts are absent from
-    # /api/v1/rules rather than the pod failing to start — so verify there after
-    # changing any of the four. The glob matches the root file character for
-    # character and resolves for either a per-key subPath mount or a whole-
-    # directory projection.
+    #   - name: prometheus-config mountPath:
+    #     /etc/prometheus/alerts/blnk-kafka-alerts.yml subPath: blnk-kafka-alerts.yml
+    #     Keep the key name, the subPath, the mountPath and this path in step.
     rule_files:
       - '/etc/prometheus/alerts/*.yml'
-    # Both jobs authenticate. This is not optional hardening — it is what makes
-    # the alerts above capable of firing at all.
+    # Both jobs authenticate. This is not optional hardening — it is what makes the
+    # alerts above capable of firing at all.
     #
-    # Blnk's /metrics endpoint is guarded by MetricsAuthHandler: when
-    # server.secure is true it REQUIRES `Authorization: Bearer <token>` and
-    # answers everything else with an apierror, and when secure is true with no
-    # metrics_bearer_token configured it refuses every request outright. So an
-    # unauthenticated scrape against a production deployment collects nothing,
-    # every series the rules match on is absent, and all 13 Kafka alerts sit
-    # permanently in a state where they cannot fire. That failure is SILENT in
-    # the worst way: Prometheus reports the target as down, the rules report no
-    # error, and the absence of an alert is indistinguishable from health.
+    # Blnk's /metrics endpoint is guarded by MetricsAuthHandler: when server.secure is
+    # true it REQUIRES `Authorization: Bearer <token>` and answers everything else with
+    # an apierror, and when secure is true with no metrics_bearer_token configured it
+    # refuses every request outright. So an unauthenticated scrape against a production
+    # deployment collects nothing, every series the rules match on is absent, and all 13
+    # Kafka alerts sit permanently in a state where they cannot fire.
     #
-    # credentials_file, never inline `credentials`. Inline would put the token
-    # in a ConfigMap, which is stored unencrypted, readable by anything with
-    # get-configmap in the namespace, and printed in full by `kubectl describe`
-    # — a credential in the one Kubernetes object specifically not intended to
-    # hold one. The file form keeps the token in a Secret and leaves only its
-    # path here. It also reloads: Prometheus re-reads the file on each scrape,
-    # so rotating the Secret takes effect without restarting the pod.
-    #
-    # The path is a MOUNT CONTRACT with prometheus-deployment.yaml, which
-    # projects Secret blnk-metrics-token into this directory. The two must agree
-    # exactly, and the failure mode if they do not is loud rather than silent:
-    # Prometheus validates that the file exists at config load and refuses to
-    # start without it, which is the correct direction — a monitoring stack that
-    # cannot authenticate should fail visibly rather than scrape nothing.
+    # The path is a MOUNT CONTRACT with prometheus-deployment.yaml, which projects
+    # Secret blnk-metrics-token into this directory. The two must agree exactly, and the
+    # failure mode if they do not is loud rather than silent: Prometheus validates that
+    # the file exists at config load and refuses to start without it, which is the
+    # correct direction — a monitoring stack that cannot authenticate should fail
+    # visibly rather than scrape nothing.
     #
     # Create the Secret before applying these manifests. Passed BY FILE, because
     # --from-literal would put the token in kubectl's argv, where
@@ -79,43 +62,21 @@ data:
     # The value must equal server.metrics_bearer_token in blnk.json (or the
     # BLNK_METRICS_BEARER_TOKEN environment variable) for both the server and
     # the worker, since one token guards both endpoints.
-    # POD DISCOVERY, NOT THE SERVICE (PERF-P19). This is the second sanctioned
+    # POD DISCOVERY, NOT THE SERVICE. This is the second sanctioned
     # divergence from the repository-root prometheus.yml, alongside the scrape
     # authentication above, and it exists because a Service target is WRONG here
     # in a way a static target at the root is not.
     #
-    # server-hpa.yaml scales the server between 2 and 10 replicas and
-    # worker-hpa.yaml scales the worker likewise. Scraping `server:5001` asks
-    # the Service, which load-balances: each scrape reaches ONE arbitrary
-    # backend, so Prometheus collects one replica in ten under a single
-    # `instance` label and attributes whichever pod answered to that one
-    # series. Two consequences, and
-    # both are silent:
+    # server-hpa.yaml scales the server between 2 and 10 replicas and worker-hpa.yaml
+    # scales the worker likewise. Scraping `server:5001` asks the Service, which
+    # load-balances: each scrape reaches ONE arbitrary backend, so Prometheus collects
+    # one replica in ten under a single `instance` label and attributes whichever pod
+    # answered to that one series.
     #
     #   * COUNTERS APPEAR TO RESET. blnk_events_dispatched_total is per process.
-    #     Consecutive scrapes landing on different pods produce a series that
-    #     jumps up and down, so rate() over it is meaningless and the load
-    #     test's own reset detection reads ordinary balancing as a restart.
-    #   * NINE REPLICAS ARE INVISIBLE. A dead-letter backlog, a stalled
-    #     relay or a lag-measurement failure on a pod never scraped breaches no
-    #     threshold, because the series describing it does not exist.
-    #
-    # The root copy keeps static targets and is CORRECT to: Compose runs one
-    # container per service and has no Kubernetes API to discover anything
-    # from. The divergence is between two right answers for two topologies,
-    # not a drift.
-    #
-    # role: pod rather than role: endpoints, deliberately. Both enumerate
-    # individual pods, but endpoints discovers through the Service's readiness
-    # — so a pod removed from the Service, which is exactly what a NotReady
-    # replica is, stops being scraped at the moment its metrics are most
-    # wanted. Pod discovery keeps scraping it, and a scrape that then fails is
-    # visible as a down target rather than as an absent one.
-    #
-    # REQUIRES prometheus-rbac.yaml AND serviceAccountName on the Prometheus
-    # Deployment. Without permission to list pods, discovery finds nothing,
-    # reports no error, and starts cleanly — verify at /targets after any change
-    # here, never at /-/ready.
+    #   * NINE REPLICAS ARE INVISIBLE. A dead-letter backlog, a stalled relay or a
+    #     lag-measurement failure on a pod never scraped breaches no threshold, because
+    #     the series describing it does not exist.
     scrape_configs:
       - job_name: 'blnk-server'
         authorization:
@@ -144,14 +105,12 @@ data:
           - source_labels: [__meta_kubernetes_pod_ip]
             target_label: __address__
             replacement: '$1:5001'
-          # instance BECOMES THE POD NAME, which is the whole point of
-          # the change:
-          # it is what makes each replica its own series so counters accumulate
-          # per process, and it is what the alert annotations interpolate as
-          # {{ $labels.instance }} to name the pod an operator has to look at.
-          # Aggregate across replicas with sum()/max() by job, deliberately, so
-          # the aggregation is stated in each query rather than imposed by the
-          # scrape.
+          # instance BECOMES THE POD NAME, which is the whole point of the change: it is
+          # what makes each replica its own series so counters accumulate per process,
+          # and it is what the alert annotations interpolate as {{ $labels.instance }}
+          # to name the pod an operator has to look at. Aggregate across replicas with
+          # sum()/max() by job, deliberately, so the aggregation is stated in each query
+          # rather than imposed by the scrape.
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: instance
       - job_name: 'blnk-worker'
@@ -171,67 +130,32 @@ data:
             replacement: '$1:5004'
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: instance
-  # KUBERNETES-ONLY INFRASTRUCTURE ALERTS, in a key of their own. PERF-P24.
+  # KUBERNETES-ONLY INFRASTRUCTURE ALERTS, in a key of their own.
   #
-  # SEPARATE FROM blnk-kafka-alerts.yml ON PURPOSE, and the separation is
-  # structural rather than tidiness. That key is a verbatim mirror of the
-  # repository-root alerts/blnk-kafka-alerts.yml and an automated parity test
-  # compares the two; every rule in it reads a `blnk_*` series this codebase
-  # publishes, so it loads identically under Compose and under Kubernetes. The
-  # rule below reads `kubelet_volume_stats_*`, which is published by the
-  # kubelet and exists in NEITHER of those places under Compose. Putting it in
-  # the mirrored key would either break that parity or force a rule into the
-  # root file that can never evaluate there.
-  #
-  # The rule_files glob above scans a whole directory, so this key needs only
-  # its own subPath mount in prometheus-deployment.yaml to be loaded. An
-  # unmounted rule file is a SILENT failure — absent from /api/v1/rules with
-  # no error — so verify there.
-  #
-  # THIS RULE HAS A PREREQUISITE THIS FOLDER DOES NOT PROVIDE.
-  # kubelet_volume_stats_* comes from the kubelet's own /metrics/resource
-  # endpoint, which requires a scrape job against the kubelet — cluster-scoped
-  # discovery and a bearer token from a ServiceAccount with nodes/metrics
-  # access, which prometheus-rbac.yaml deliberately does not grant because pod
-  # discovery does not need it. Most clusters already run
-  # kube-prometheus-stack or an equivalent that scrapes the kubelet; where
-  # that is true this rule evaluates as soon as the file is mounted, and where
-  # it is not the rule loads and never fires. That is stated rather than
-  # hidden because a rule that cannot fire is indistinguishable from a system
-  # that is healthy.
+  # SEPARATE FROM blnk-kafka-alerts.yml ON PURPOSE, and the separation is structural
+  # rather than tidiness. That key is a verbatim mirror of the repository-root
+  # alerts/blnk-kafka-alerts.yml and an automated parity test compares the two; every
+  # rule in it reads a `blnk_*` series this codebase publishes, so it loads identically
+  # under Compose and under Kubernetes. The rule below reads `kubelet_volume_stats_*`,
+  # which is published by the kubelet and exists in NEITHER of those places under
+  # Compose.
   blnk-infra-alerts.yml: |
     groups:
       - name: blnk-infra-alerts
         interval: 30s
         rules:
-          # THE BROKER'S DISK, which the retention policy in
-          # kafka-statefulset.yaml bounds but cannot guarantee.
-          # log.retention.bytes is 2 GiB per partition against 48 partitions
-          # per broker on a 200Gi volume — 96 GiB, 48% — so the steady state
-          # has ample headroom. What this rule catches is every way the
+          # THE BROKER'S DISK, which the retention policy in kafka-statefulset.yaml
+          # bounds but cannot guarantee. log.retention.bytes is 2 GiB per partition
+          # against 48 partitions per broker on a 200Gi volume — 96 GiB, 48% — so the
+          # steady state has ample headroom. What this rule catches is every way the
           # arithmetic stops holding: a topic added without recomputing the
-          # per-partition budget, partitions grown past KAFKA_MIN_PARTITIONS,
-          # a per-topic retention override, or a consumer-group offset topic
-          # behaving unexpectedly.
+          # per-partition budget, partitions grown past KAFKA_MIN_PARTITIONS, a
+          # per-topic retention override, or a consumer-group offset topic behaving
+          # unexpectedly.
           #
-          # THE NUMBERS ARE DERIVED AND THE DERIVATION IS ASSERTED. The
-          # catalogue is four categories plus their four .dlt siblings, so
-          # 8 topics x 6 = 48 partitions, and the volumeClaimTemplate is
-          # 200Gi. A monitoring narrative describing a different cluster from
-          # the one it watches is how an operator reading this rule concludes
-          # the THRESHOLD is wrong rather than that the disk is filling — which
-          # is what happened when the catalogue and this prose last disagreed.
-          # TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor derives
-          # these numbers from model.AllEventCategories() and the manifests and
-          # asserts this prose states them, so the two cannot drift apart again.
-          #
-          # WHY IT MATTERS MORE THAN A USUAL DISK ALERT: a Kafka broker that
-          # fills its log directory does not shed old data to continue. It
-          # marks the directory OFFLINE and drops the partitions on it. With
-          # min.insync.replicas=2 across three brokers, that happening on two
-          # brokers stops every acks=all produce in the cluster — so the relay
-          # can neither publish nor dead-letter, and events accumulate in the
-          # outbox instead.
+          # THE NUMBERS ARE DERIVED AND THE DERIVATION IS ASSERTED. The catalogue is
+          # four categories plus their four .dlt siblings, so 8 topics x 6 = 48
+          # partitions, and the volumeClaimTemplate is 200Gi.
           - alert: KafkaBrokerVolumeFilling
             # 80% used, expressed as available/capacity so it is independent
             # of the volume's size and survives the expansion the manifest
@@ -244,11 +168,10 @@ data:
               kubelet_volume_stats_capacity_bytes{namespace="blnk",
               persistentvolumeclaim=~"kafka-data-kafka-.*"} < 0.20
             # 15 minutes. A broker's disk usage rises steadily rather than
-            # instantaneously, so there is no burst to ride out — but
-            # expanding a StatefulSet's volume is not a rolling change (see
-            # the note on the claim template), so an operator needs the
-            # warning early enough to plan it rather than perform it during an
-            # incident.
+            # instantaneously, so there is no burst to ride out — but expanding a
+            # StatefulSet's volume is not a rolling change (see the note on the claim
+            # template), so an operator needs the warning early enough to plan it rather
+            # than perform it during an incident.
             for: 15m
             labels:
               severity: warning
@@ -257,21 +180,17 @@ data:
               summary: "A Kafka broker's log volume is over 80% full"
               description: "PersistentVolumeClaim {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} available. A broker that fills its log directory takes the directory OFFLINE and drops the partitions on it rather than deleting old data to continue — and with min.insync.replicas=2 that happening twice stops every acks=all produce in the cluster. Check whether the retention arithmetic still holds: log.retention.bytes is PER PARTITION, so a topic or partitions added since it was set raise the total without changing the value. Expanding the volume requires expanding each kafka-data-kafka-<n> PVC and recreating the StatefulSet with --cascade=orphan, so plan it rather than wait."
               runbook_url: docs/kafka-operations.md
-  # The Kubernetes mirror of alerts/blnk-kafka-alerts.yml, which is the source of
-  # truth. A ConfigMap cannot reference a file on disk, so the rules are
-  # duplicated here by design; the two copies MUST stay identical in group,
-  # interval, expressions, thresholds, dwell times, labels and annotations,
-  # because a divergence means one environment alerts and the other does not. The
-  # rationale for each threshold and dwell lives in the source file rather than
-  # being duplicated here too. Every series is already exposed on the /metrics
-  # endpoints the scrape jobs above collect, so no extra target is needed; copy
-  # the names rather than retyping them, since one wrong character yields a rule
-  # that evaluates against a series nothing records and can never fire.
+  # The Kubernetes mirror of alerts/blnk-kafka-alerts.yml, which is the source of truth.
+  # A ConfigMap cannot reference a file on disk, so the rules are duplicated here by
+  # design; the two copies MUST stay identical in group, interval, expressions,
+  # thresholds, dwell times, labels and annotations, because a divergence means one
+  # environment alerts and the other does not. The rationale for each threshold and
+  # dwell lives in the source file rather than being duplicated here too.
   #
-  # EventMetricsCollectionAbsent is the rule that catches exactly that mistake, and
-  # it is the reason the job names above are load-bearing: it is scoped to
-  # job="blnk-server" because the collector runs in the server role only, so
-  # renaming that scrape job silences it permanently.
+  # EventMetricsCollectionAbsent is the rule that catches exactly that mistake, and it
+  # is the reason the job names above are load-bearing: it is scoped to
+  # job="blnk-server" because the collector runs in the server role only, so renaming
+  # that scrape job silences it permanently.
   blnk-kafka-alerts.yml: |
     groups:
       # One group: every rule covers the same domain and shares one cadence, and a
@@ -287,29 +206,25 @@ data:
           # Retry-exhausted events nobody has cleared. In a financial ledger that
           # means mutations are not reaching subscribers, so this pages.
           - alert: DeadLetterMessageStuck
-            # 900 is the 15 minute threshold the requirement states, as a literal so
-            # it is greppable. blnk_dlt_oldest_message_age_seconds is the age of the
-            # OLDEST unresolved retry-exhausted event, so one comparison covers the
-            # whole inventory. That inventory is every outbox row in the
-            # dead_lettered or failed state, so an event whose dead-letter write
-            # itself failed is included, reported under the .dlt topic it was
-            # destined for. Left bare on purpose: no label matcher, so the rule keeps
-            # whatever attributes the gauge carries.
+            # 900 is the 15 minute threshold, written as a literal so it
+            # is greppable. blnk_dlt_oldest_message_age_seconds is the age of the OLDEST
+            # unresolved retry-exhausted event, so one comparison covers the whole
+            # inventory. That inventory is every outbox row in the dead_lettered or
+            # failed state, so an event whose dead-letter write itself failed is
+            # included, reported under the .dlt topic it was destined for. Left bare on
+            # purpose: no label matcher, so the rule keeps whatever attributes the gauge
+            # carries.
             #
-            # THE TWO STATES NEED DIFFERENT ACTIONS, which is why the description
-            # below is written in two branches rather than one. Only a dead_lettered
-            # entry is replayable; a failed entry's dead-letter write has not
-            # completed, so replay refuses it with EVENT_NOT_DEAD_LETTERED and the
-            # actual fix is upstream. A single "replay it" instruction sent an
-            # operator to an endpoint that would reject them, on the more urgent of
-            # the two states. Splitting the SIGNAL was considered and rejected: the
-            # age is one per-topic maximum, two gauges would double the series for
-            # one question, and an operator has to read the entry's status to triage
-            # it either way.
+            # THE TWO STATES NEED DIFFERENT ACTIONS, which is why the description below
+            # is written in two branches rather than one. Only a dead_lettered entry is
+            # replayable; a failed entry's dead-letter write has not completed, so
+            # replay refuses it with EVENT_NOT_DEAD_LETTERED and the actual fix is
+            # upstream. A single "replay it" instruction sent an operator to an endpoint
+            # that would reject them, on the more urgent of the two states.
             expr: blnk_dlt_oldest_message_age_seconds > 900
             # Deliberately zero, not omitted: the threshold already carries the 15
             # minutes, and a dwell here would double-count it and push the first
-            # notification past the boundary the requirement fixes.
+            # notification past the 15 minute boundary.
             for: 0m
             labels:
               severity: critical
@@ -322,12 +237,11 @@ data:
           # A subscriber falling behind. The events are durably in Kafka and the
           # consumer catches up on its own, so this is degradation, not loss.
           - alert: SubscriberConsumerLagHigh
-            # blnk_kafka_consumer_lag is computed in-process by differencing
-            # committed offsets against log end offsets and is already summed across
-            # a topic's partitions, so it is compared bare — no sum(), no
-            # clamp_min() — which also keeps the subscriber, group and topic
-            # attributes on the notification.
-            # The series carries only COMPLETE measurements, which is what makes the
+            # blnk_kafka_consumer_lag is computed in-process by differencing committed
+            # offsets against log end offsets and is already summed across a topic's
+            # partitions, so it is compared bare — no sum(), no clamp_min() — which also
+            # keeps the subscriber, group and topic attributes on the notification. The
+            # series carries only COMPLETE measurements, which is what makes the
             # comparison trustworthy: a topic with unreadable partitions is withheld
             # from this gauge rather than reported at its partial sum, so this rule can
             # never be resolved by a measurement failure. The gap that withholding
@@ -341,48 +255,26 @@ data:
               severity: warning
               component: event-streaming
             annotations:
-              # The subscriber and group values are PSEUDONYMS — a stable truncated SHA-256 of
-              # the registry identifier — and never customer-chosen names, deliberately: an
-              # annotation is rendered into notifications and incident tickets, so a
-              # name-derived label would export a customer's identity into places it cannot be
-              # recalled from. Even Blnk's own opaque 'sub_<uuid>' identifier is withheld,
-              # because a label carries no access control and the registry is the right place
-              # for the correlation capability to live. Resolve one with the registry's own
-              # resolver — GET /subscribers?subscriber_id_hash=<token>, which searches every
-              # page — or search the service logs for the matching subscriber_id_hash field.
-              # Do NOT fetch one page and hash the rows locally: that reports "no match" for
-              # subscribers it never read.
-              #
-              # Three collapse tokens can appear in place of a pseudonym, each meaning
-              # something different, and none of them is hashed because none is anyone's name:
-              # 'unattributed' — the reading came from a query that named no subscriber;
-              # 'unregistered' — a value was named but is not one Blnk issued, which is itself
-              # worth investigating; 'other' — the topic is not one Blnk owns. See
-              # consumerLagSample in event_admin.go and the resolvers in
-              # event_metrics_support.go.
+              # The subscriber and group values are PSEUDONYMS — a stable truncated
+              # SHA-256 of the registry identifier — and never customer-chosen names,
+              # deliberately: an annotation is rendered into notifications and incident
+              # tickets, so a name-derived label would export a customer's identity into
+              # places it cannot be recalled from. Even Blnk's own opaque 'sub_<uuid>'
+              # identifier is withheld, because a label carries no access control and
+              # the registry is the right place for the correlation capability to live.
+              # Resolve one with the registry's own resolver — GET
+              # /subscribers?subscriber_id_hash=<token>, which searches every page — or
+              # search the service logs for the matching subscriber_id_hash field.
               summary: "Subscriber consumer group lag is above 10,000 messages"
               description: "Subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) is {{ $value | humanize }} messages behind the end of topic {{ $labels.topic }}. Confirm the consumer is running and keeping up before Kafka's retention window is reached. The subscriber and group labels are PSEUDONYMS, not names: each is a truncated SHA-256 of the identifier, so a metric label never carries a subscriber name into a dashboard or a notification. They are stable, so the same subscriber always produces the same label. Resolve one by listing the registry through GET /subscribers and hashing each subscriber_id the same way, or search the service logs for the matching subscriber_id_hash field."
               runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberconsumerlaghigh"
 
-          # AUTH-01 — a subscriber credential Blnk could not revoke.
-          #
-          # Provisioning writes a subscriber's SCRAM credential BEFORE its ACL
-          # bindings, because a binding for a principal that does not exist is inert
-          # while a credential without bindings AUTHENTICATES. A binding failure is
-          # therefore compensated by revoking the credential — and when that
-          # compensation also fails, a live means of authenticating to the event bus
-          # exists at the broker for a principal the registry records no issuance for.
+          # A subscriber credential Blnk could not revoke.
           #
           # THE AGE, NOT THE COUNT, is what this fires on. A marker cleared within a
           # minute by a retry is routine: the automatic settlement paths — re-issuing,
           # which replaces the orphan credential by construction, and deprovisioning,
-          # which revokes it — are working. One outstanding for an hour means neither
-          # has been exercised and a human has to revoke it. Alerting on the count
-          # alone would page on every transient broker error.
-          #
-          # The age is measured from when the obligation was FIRST recorded and is
-          # never reset by a later failed attempt, so it is the age of the EXPOSURE
-          # rather than of the last try.
+          # which revokes it — are working.
           - alert: SubscriberRevocationOutstanding
             expr: blnk_subscribers_oldest_revocation_age_seconds > 3600
             # Zero dwell. The gauge is already an age, so the expression itself
@@ -424,11 +316,11 @@ data:
           - alert: SubscriberRevocationRefused
             # Fifteen minutes rather than an hour, and on the AGE of the refusal. The
             # marker is cleared at the start of every new attempt, so a value that
-            # persists means no attempt has even been made since the refusal — and unlike
-            # the two rules above, waiting does not help here, because the cause is at the
-            # broker. Fifteen minutes matches the dead-letter rule's window: long enough
-            # that a transient broker outage settles itself, short enough that a lost
-            # administrative grant is surfaced the same shift.
+            # persists means no attempt has even been made since the refusal — and
+            # unlike the two rules above, waiting does not help here, because the cause
+            # is at the broker. Fifteen minutes matches the dead-letter rule's window:
+            # long enough that a transient broker outage settles itself, short enough
+            # that a lost administrative grant is surfaced the same shift.
             expr: blnk_subscribers_oldest_revocation_failure_age_seconds > 900
             for: 0m
             labels:
@@ -439,8 +331,8 @@ data:
               # the exposure. Every row counted here also carries the revocation
               # tombstone, so SubscriberRevocationOutstanding already pages on the same
               # subscriber once the debt reaches an hour. This rule's job is to arrive
-              # EARLIER with the extra fact that page will not carry: the broker said no,
-              # so fix the broker side before retrying.
+              # EARLIER with the extra fact that page will not carry: the broker said
+              # no, so fix the broker side before retrying.
               summary: "The broker refused a subscriber credential revocation"
               description: "Blnk's most recent attempt to revoke a subscriber's SASL/SCRAM credential was refused by the broker {{ $value | humanizeDuration }} ago (instance {{ $labels.instance }}), and no attempt has been made since. RETRYING ALONE WILL NOT HELP: a CLUSTER_AUTHORIZATION_FAILED means the administrative principal is not in super.users or has lost its grants, and a transport error means the broker is unreachable. Fix that first, then retry with DELETE /subscribers/<id>. Find the rows with GET /subscribers and read revocation_failed_at, which the registry projects. These rows also carry revocation_pending_at, so SubscriberRevocationOutstanding will page on them once the debt passes an hour."
               runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberrevocationrefused"
@@ -461,10 +353,7 @@ data:
             # ordinary cluster events — a leader election, a broker restart, a partition
             # reassignment — and those resolve without intervention well inside five
             # minutes. Paging on them would make this the noisiest rule in the file and
-            # so the first one silenced, which is the opposite of the intent. Five
-            # minutes is ten consecutive evaluations at the interval above, and it stays
-            # comfortably inside the fifteen-minute window the dead-letter rule uses, so
-            # a genuine metadata fault is still surfaced promptly.
+            # so the first one silenced, which is the opposite of the intent.
             for: 5m
             labels:
               severity: warning
@@ -475,46 +364,17 @@ data:
               # relay is unaware of this — so nothing is being lost. What is lost is the
               # ability to see a lagging consumer, which is a warning that needs an
               # operator today rather than a page tonight.
-              #
-              # The subscriber and group values are opaque registry-issued identifiers
-              # for the same reason they are on SubscriberConsumerLagHigh: an annotation
-              # is rendered into notifications and incident tickets, so a name-derived
-              # label would export a customer's identity into places it cannot be
-              # recalled from.
               summary: "Consumer lag cannot be fully measured for a subscriber topic"
               description: "{{ $value }} partition(s) of topic {{ $labels.topic }} could not be read when subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) was last measured, so its lag is a lower bound and is WITHHELD from blnk_kafka_consumer_lag — SubscriberConsumerLagHigh cannot fire for this topic while this alert holds. Check broker and partition health first; the partial total is in the event-metrics log line. The subscriber and group values are opaque registry identifiers: resolve them through the subscriber registry."
               runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#consumerlagmeasurementdegraded"
 
-          # Lag that is measured too rarely to alert on. This is a COVERAGE rule,
-          # and it exists because the lag signal cannot report its own blind spots
-          # (PERF-P22).
-          #
-          # Measuring every registered subscriber on every tick would spend a
-          # broker round trip per subscriber per tick, so Blnk measures a bounded
-          # slice each tick and rotates through the registry, retaining each
-          # reading for ten minutes so a subscriber's series stays exported
-          # between the ticks that refresh it. SubscriberConsumerLagHigh is
-          # reliable only while the rotation returns to a subscriber inside that
-          # retention.
-          #
-          # When it does not, the failure is INVISIBLE IN THE LAG SERIES: the
-          # reading expires, the series stops being exported, and an absent series
-          # breaches no threshold. So a registry that has outgrown the measurement
-          # budget reports no lag problem for precisely the subscribers it can no
-          # longer see.
+          # Lag that is measured too rarely to alert on. This is a COVERAGE rule, and it
+          # exists because the lag signal cannot report its own blind spots
           - alert: SubscriberLagCoverageStale
-            # max_over_time is the whole point of the expression. The gauge is
-            # reset to zero every time a rotation completes, so its instantaneous
-            # value is whatever point of a rotation the last scrape landed on —
-            # the MAXIMUM over a window is the rotation latency, which is the
-            # quantity to compare.
-            #
-            # 600 is the ten-minute reading retention, as a literal so it is
-            # greppable and so this rule and that constant are visibly the same
-            # number. A rotation slower than the retention expires readings before
-            # returning to them. The window is 30m: three retention periods, long
-            # enough that a single slow rotation does not fire and a persistently
-            # slow one does.
+            # max_over_time is the whole point of the expression. The gauge is reset to
+            # zero every time a rotation completes, so its instantaneous value is
+            # whatever point of a rotation the last scrape landed on — the MAXIMUM over
+            # a window is the rotation latency, which is the quantity to compare.
             expr: >-
               max_over_time(blnk_kafka_consumer_lag_pass_age_seconds[30m]) > 600
             # No dwell needed. max_over_time already integrates over thirty
@@ -530,9 +390,7 @@ data:
               description: "The consumer-lag rotation on {{ $labels.instance }} has taken up to {{ $value | humanizeDuration }} to get back round the subscriber registry, against a ten-minute reading retention. A subscriber the rotation does not return to inside that retention has its reading EXPIRE, so its blnk_kafka_consumer_lag series stops being exported — and an absent series breaches no threshold, so SubscriberConsumerLagHigh reports nothing wrong for exactly the subscribers it can no longer see. Read blnk_kafka_consumer_lag_covered_subscribers against blnk_subscribers_registered to see how much of the registry is currently exported, then raise EVENT_METRICS_SUBSCRIBER_BUDGET so one tick measures more of it, and narrow over-broad subscriber grants, because the cost is one round trip per authorised topic per subscriber per tick. Do NOT reach for the collection interval: it is fixed at 15 seconds and is not operator-configurable, and lengthening it would make every reading staler, which is the condition this alert reports. A rotation that is slow because measurements are FAILING shows up on blnk_kafka_subscribers_unmeasured{reason=\"measure_failed\"} instead, and needs the broker rather than the budget."
               runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberlagcoveragestale"
 
-          # Subscribers the sweep did not measure at all. ConsumerLagMeasurementDegraded
-          # above covers a partition inside a measurement; this covers a whole subscriber
-          # that never got one, which nothing could previously see.
+          # Subscribers the sweep did not measure at all.
           - alert: SubscriberLagCoverageIncomplete
             # The lag inventory is WHOLE-SET: what a sweep publishes is exactly what is
             # exported, so a subscriber the sweep never reached has no series at all
@@ -543,14 +401,6 @@ data:
             # blnk_kafka_subscribers_unmeasured.
             expr: blnk_kafka_consumer_lag_inventory_complete == 0
             # THIRTY MINUTES, and the long dwell is the point rather than caution.
-            #
-            # Incompleteness is EXPECTED transiently on a registry larger than the
-            # per-tick measurement budget: the sweep resumes from a rotating cursor, so
-            # coverage completes over several ticks and any single tick legitimately
-            # reports 0. A short dwell here would fire permanently on a correctly
-            # configured large deployment and be the first rule silenced. Thirty minutes
-            # is long enough that only a registry the rotation cannot get through, or a
-            # persistent failure, still holds — both of which need the operator.
             for: 30m
             labels:
               severity: warning
@@ -562,13 +412,6 @@ data:
 
           # The settlement pass itself has stopped.
           #
-          # Distinct from the rule above, and more urgent in one specific way: that one
-          # fires when an obligation is OLD, which requires an obligation to exist. This
-          # one fires when work is outstanding and NOTHING is being discharged, which is
-          # the signature of a pass that is not running at all — a server role started
-          # without a broker configured while subscribers were provisioned against one,
-          # a processor that failed its wiring check, or a loop that has died.
-          #
           # It fires an hour earlier than the age rule by design, so the "the mechanism
           # is broken" signal precedes the "this specific obligation is stale" signal
           # rather than arriving with it.
@@ -578,27 +421,6 @@ data:
             # ago is expected to be outstanding — and a zero settlement rate alone is
             # the healthy steady state, because most deployments never fail a subscriber
             # operation at all.
-            #
-            # WRITTEN WITH `unless` RATHER THAN `and ... == 0`, AND THAT IS THE
-            # WHOLE RULE. The settled counter has NO SERIES until the pass
-            # discharges its first obligation — OpenTelemetry exports the
-            # attribute sets that have been written, not every instrument
-            # declared — so `and rate(...) == 0` matched against an empty vector
-            # and produced an empty result. The rule could therefore never fire
-            # on the one deployment that needs it: a pass that has never settled
-            # anything, which is exactly what "not progressing" means. `unless`
-            # inverts the failure: the left side survives when the right has
-            # nothing to match, so a real backlog alerts before the counter's
-            # first sample.
-            #
-            # The vector matching is unchanged. `unless` is a set operator like
-            # `and` and matches on the full label set, so instance and job still
-            # pair the backlog with its own process's settle rate, and because
-            # `unless` returns the LEFT side, $value and $labels in the
-            # annotation below mean what they meant before. Suppression is now
-            # expressed as "a positive settle rate exists" instead of "the rate
-            # equals zero", which is the same condition whenever the series
-            # exists at all.
             expr: blnk_subscribers_settlement_outstanding > 0
               unless rate(blnk_subscribers_obligations_settled_total[30m]) > 0
             # Ten consecutive evaluations at the interval above. Long enough that a pass
@@ -636,8 +458,8 @@ data:
             # collector, deliberately: a gauge only the collector could update would
             # freeze at its last age and read as permanently fresh precisely when the
             # collector had stopped. 120 seconds is eight collection intervals and four
-            # times the per-tick deadline, so an ordinary slow tick cannot reach it while
-            # a loop that has genuinely stopped passes it within two minutes.
+            # times the per-tick deadline, so an ordinary slow tick cannot reach it
+            # while a loop that has genuinely stopped passes it within two minutes.
             expr: blnk_event_metrics_last_collection_age_seconds > 120
             # Four consecutive evaluations. The gauge is already an age, so the dwell only
             # guards against a single scrape landing inside one unusually long tick.
@@ -680,12 +502,6 @@ data:
             # the other's series as stale — so this gauge is legitimately absent from
             # every blnk-worker target and an unscoped absent() would fire for ever on a
             # correctly deployed stack.
-            #
-            # This is the rule that makes the whole file trustworthy. Without it a
-            # deployment where /metrics is unarmed, or where the server never started its
-            # collector, exports no event series at all — and every other rule here
-            # evaluates against nothing, which cannot fire and is indistinguishable from
-            # a healthy system.
             expr: absent(blnk_event_metrics_last_collection_age_seconds{job="blnk-server"})
             # Ten minutes, so a rolling deployment or a restart does not page. The
             # collector runs its first collection immediately on Start, so a server that

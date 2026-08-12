@@ -46,42 +46,18 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// event_producer_atomicity_test.go asserts, at the PRODUCER call sites, that every event a
-// ledger mutation owes is threaded into the mutation's own atomic writer — requirement R-2.
-//
-// # Why the repository tests are not enough
-//
-// database/entity_event_outbox_test.go proves the writers are atomic. That is a different
-// claim from "the producers use them". A producer that reverted to the plain CreateLedger,
-// or that called the atomic writer with no event builder, would leave every repository test
-// green and every functional test green while the guarantee was completely gone: the row
-// exists, the event exists, and the only difference is the window in which a crash loses
-// one of them.
-//
-// So each test here drives the real service method against a mock datasource, requires the
-// ATOMIC writer to be the one called, and inspects the row the builder produced through
-// MockDataSource.CapturedEventOutboxes — which records exactly what the writer would have
-// inserted inside the transaction.
+// event_producer_atomicity_test.go asserts, at the PRODUCER call sites, that every
+// event a ledger mutation owes is threaded into the mutation's own atomic writer — the
+// requirement.
 
 // The bounds for the post-commit assertions.
-//
-// postTransactionActions does its work in a goroutine, so both directions have to be
-// asserted against a WINDOW rather than an instant: the positive case waits for a capture to
-// appear, and the negative case waits the same window and requires none to have appeared.
-// Asserting the negative immediately would pass against an implementation that captures a
-// duplicate a millisecond later, which is exactly the defect it exists to catch.
 const (
 	waitForPostActions = 2 * time.Second
 	pollPostActions    = 10 * time.Millisecond
 )
 
-// producerAtomicityMock returns a Blnk whose configuration has event publishing switched on
-// and whose datasource is a bare testify mock.
-//
-// Publishing MUST be configured for these assertions to mean anything: PrepareEventOutbox
-// returns a nil row when it is not, so an unconfigured instance would produce no captures
-// and every assertion below would be vacuously satisfiable by a producer that captured
-// nothing at all.
+// producerAtomicityMock returns a Blnk whose configuration has event publishing
+// switched on and whose datasource is a bare testify mock.
 func producerAtomicityMock(t *testing.T) (*Blnk, *mocks.MockDataSource) {
 	t.Helper()
 
@@ -94,11 +70,6 @@ func producerAtomicityMock(t *testing.T) (*Blnk, *mocks.MockDataSource) {
 
 // producerAtomicityConfiguration is outboxPublishingConfiguration plus the Redis DSN
 // NewQueue parses.
-//
-// TypeSense.Dns is deliberately left EMPTY: queueIndexBatch and queueIndexData both return
-// immediately when it is, so the post-action goroutines here perform no indexing and reach
-// no network. Redis.Dns is set only because NewQueue parses it at construction — it opens no
-// connection — and a blank value would take the Fatal branch and abort the whole test binary.
 func producerAtomicityConfiguration() *config.Configuration {
 	cnf := outboxPublishingConfiguration()
 	cnf.Redis.Dns = "localhost:6379"
@@ -109,9 +80,8 @@ func producerAtomicityConfiguration() *config.Configuration {
 // producerAtomicityQueue gives the instance a real *Queue with a nil asynq client.
 //
 // It is REQUIRED, not decorative: postTransactionActions calls l.queue.queueIndexBatch
-// unconditionally, so a nil queue panics inside a goroutine and takes the test binary down
-// rather than failing one test. The nil client is never used because the empty TypeSense DNS
-// short-circuits every enqueue before it is touched.
+// unconditionally, so a nil queue panics inside a goroutine and takes the test binary
+// down rather than failing one test.
 func producerAtomicityQueue(t *testing.T, instance *Blnk) *Queue {
 	t.Helper()
 
@@ -132,13 +102,8 @@ func capturedEventPayload(t *testing.T, row *model.EventOutbox) (string, map[str
 	return body.Event, body.Data
 }
 
-// TestCreateLedger_CapturesTheEventInTheCreationTransaction is the R-2 assertion for
+// TestCreateLedger_CapturesTheEventInTheCreationTransaction is the assertion for
 // ledger.created.
-//
-// The atomic writer is required to be the one called — a plain CreateLedger expectation
-// would go unmatched and testify would fail the call — and the captured row is inspected to
-// confirm the builder ran against the SETTLED ledger, so the payload carries the generated
-// id the legacy webhook body carried.
 func TestCreateLedger_CapturesTheEventInTheCreationTransaction(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 
@@ -152,10 +117,8 @@ func TestCreateLedger_CapturesTheEventInTheCreationTransaction(t *testing.T) {
 	datasource.AssertCalled(t, "CreateLedger", mock.Anything)
 
 	// THE ATOMICITY CLAIM IS CARRIED BY THE CAPTURE, not by the method name. There is one
-	// writer — CreateLedger takes the preparer as a variadic tail — so "the atomic path was
-	// used" is not observable from the call. It is observable from CapturedEventOutboxes,
-	// which the mock populates ONLY by running a non-nil preparer inside the writer: a
-	// producer that stopped supplying one would leave this empty.
+	// writer — CreateLedger takes the preparer as a variadic tail — so "the atomic path
+	// was used" is not observable from the call.
 	captured := datasource.CapturedEventOutboxes()
 	require.Len(t, captured, 1,
 		"exactly one event row must be threaded into the ledger creation transaction")
@@ -187,28 +150,13 @@ func TestCreateLedger_FailsWhenTheCreationTransactionFails(t *testing.T) {
 }
 
 // TestUpdateLedger_DoesNotRecaptureTheCreationEventID covers the rename, and it asserts
-// that the rename captures NOTHING — which is a deliberate outcome, not a missing feature.
+// that the rename captures NOTHING — which is a deliberate outcome, not a missing
+// feature.
 //
-// # What the rename used to do
-//
-// UpdateLedger calls postLedgerActions, and postLedgerActions used to publish
-// ledger.created. So a rename re-announced the ledger's creation, with the new name, over
-// the legacy transport. That is pre-existing behaviour and it is preserved WHERE THE LEGACY
-// TRANSPORT IS THE TRANSPORT — see TestPostEntityActions_WebhookOnlyDeploymentStillDelivers.
-//
-// # Why it cannot be captured into the outbox
-//
-// event_id is DERIVED for ledger.created, from the ledger id and the event type
-// (model.DeriveEventID), so the row a rename would build carries the SAME event id as the
-// row its creation already committed. Capturing it would hit the unique index on event_id.
-// Inside the rename's own transaction that is fatal: the conflict aborts the transaction and
-// THE RENAME ITSELF FAILS with a 409 for every ledger whose creation event is still in the
-// table. Outside it, the conflict is reported and every rename logs an error about a rename
-// that succeeded.
-//
-// Suppressing the re-emission is what the determinism is FOR: a subscriber's idempotency key
-// is event_id, so a conforming subscriber would discard the duplicate anyway. The stream is
-// therefore identical to what a correct consumer would observe, and the rename keeps working.
+// Suppressing the re-emission is what the determinism is FOR: a subscriber's
+// idempotency key is event_id, so a conforming subscriber would discard the duplicate
+// anyway. The stream is therefore identical to what a correct consumer would observe,
+// and the rename keeps working.
 func TestUpdateLedger_DoesNotRecaptureTheCreationEventID(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 
@@ -232,8 +180,8 @@ func TestUpdateLedger_DoesNotRecaptureTheCreationEventID(t *testing.T) {
 // TestUpdateLedger_DerivesTheSameEventIDAsTheCreation is the arithmetic behind the test
 // above, stated directly rather than left as a claim in a comment.
 //
-// If these two ever diverged, the reasoning for not capturing the rename would silently stop
-// holding — and nothing else in the suite would notice.
+// If these two ever diverged, the reasoning for not capturing the rename would silently
+// stop holding — and nothing else in the suite would notice.
 func TestUpdateLedger_DerivesTheSameEventIDAsTheCreation(t *testing.T) {
 	created := model.DeriveEventID("ldg_atomic", "ledger.created", model.SchemaVersionV1)
 	renamed := model.DeriveEventID("ldg_atomic", "ledger.created", model.SchemaVersionV1)
@@ -243,7 +191,7 @@ func TestUpdateLedger_DerivesTheSameEventIDAsTheCreation(t *testing.T) {
 			"cannot produce a distinguishable event id")
 }
 
-// TestCreateIdentity_CapturesTheEventInTheCreationTransaction is the R-2 assertion for
+// TestCreateIdentity_CapturesTheEventInTheCreationTransaction is the assertion for
 // identity.created.
 func TestCreateIdentity_CapturesTheEventInTheCreationTransaction(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
@@ -270,7 +218,7 @@ func TestCreateIdentity_CapturesTheEventInTheCreationTransaction(t *testing.T) {
 		"the builder must run against the settled identity")
 }
 
-// TestCreateBalance_CapturesTheEventInTheCreationTransaction is the R-2 assertion for
+// TestCreateBalance_CapturesTheEventInTheCreationTransaction is the assertion for
 // balance.created, and it also pins the ledger key.
 func TestCreateBalance_CapturesTheEventInTheCreationTransaction(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
@@ -299,16 +247,9 @@ func TestCreateBalance_CapturesTheEventInTheCreationTransaction(t *testing.T) {
 		"the builder must run against the settled balance")
 }
 
-// TestCreateBalance_CapturesTheEventEvenWhenTheRequestIsAlreadyCancelled is the assertion
-// that keeps a cancelled HTTP request from turning into a lost balance OR a lost event.
-//
-// CreateBalance is reached from the API with c.Request.Context(), which net/http cancels the
-// moment the handler returns. The event now commits INSIDE the creation transaction, so a
-// producer that threaded the request context into the write would abort that transaction on a
-// cancelled request — losing the balance as well as its event, where previously a
-// cancellation lost only a notification. The capture must therefore be reachable with an
-// already-cancelled context, which is what this asserts end to end rather than by inspecting
-// which context object was passed.
+// TestCreateBalance_CapturesTheEventEvenWhenTheRequestIsAlreadyCancelled is the
+// assertion that keeps a cancelled HTTP request from turning into a lost balance OR a
+// lost event.
 func TestCreateBalance_CapturesTheEventEvenWhenTheRequestIsAlreadyCancelled(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 
@@ -331,14 +272,10 @@ func TestCreateBalance_CapturesTheEventEvenWhenTheRequestIsAlreadyCancelled(t *t
 	assert.Equal(t, "balance.created", captured[0].EventType)
 }
 
-// TestRejectTransaction_CapturesTheEventInTheRejectionTransaction is the R-2 assertion for
-// transaction.rejected, and the guard on the duplicate that used to accompany it.
+// TestRejectTransaction_CapturesTheEventInTheRejectionTransaction is the assertion for
+// transaction.rejected, and the guard against a duplicate accompanying it.
 //
-// A rejection moves no balances, so it uses RecordTransaction. Before this
-// change it used the plain RecordTransaction and the event was captured separately —
-// non-atomically — and the worker's rejection handler published a SECOND
-// transaction.rejected of its own, so every worker-path rejection was announced twice under
-// two different event ids that no subscriber could collapse.
+// A rejection moves no balances, so it uses RecordTransaction.
 func TestRejectTransaction_CapturesTheEventInTheRejectionTransaction(t *testing.T) {
 	// The SPY datasource, not the bare mock: it embeds the mock — so RecordTransaction can
 	// still be expected — and additionally records standalone outbox inserts, which is the
@@ -363,9 +300,9 @@ func TestRejectTransaction_CapturesTheEventInTheRejectionTransaction(t *testing.
 
 	datasource.AssertCalled(t, "RecordTransaction", mock.Anything, mock.Anything)
 
-	// The post-commit branch runs in a goroutine, so the SECOND capture this test exists to
-	// rule out can only be ruled out after waiting for it. Asserting immediately would pass
-	// against an implementation that publishes a duplicate a millisecond later.
+	// The post-commit branch runs in a goroutine, so the SECOND capture this test exists
+	// to rule out can only be ruled out after waiting for it. Asserting immediately would
+	// pass against an implementation that publishes a duplicate a millisecond later.
 	time.Sleep(waitForPostActions / 4)
 
 	captured := datasource.CapturedEventOutboxes()
@@ -394,9 +331,7 @@ func TestRejectTransaction_CapturesTheEventInTheRejectionTransaction(t *testing.
 // TestRejectTransaction_FailsWhenTheEventCannotBePrepared asserts the rejection is not
 // persisted when its event cannot even be built.
 //
-// A payload that will not marshal is a producer defect. Persisting the rejection anyway
-// would leave a rejected transaction nobody is ever told about, which is precisely the loss
-// the outbox exists to make impossible.
+// A payload that will not marshal is a producer defect.
 func TestRejectTransaction_FailsWhenTheEventCannotBePrepared(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 
@@ -416,10 +351,8 @@ func TestRejectTransaction_FailsWhenTheEventCannotBePrepared(t *testing.T) {
 // TestTransactionLedgerID_PrefersTheSourceLedger pins the key derivation production now
 // uses, which is the same one the ordering integration test exercises.
 //
-// Before this change the production producer supplied no ledger at all, so a transaction
-// event was keyed on its source balance while the ordering test injected a ledger key — the
-// two were proving different things. Source first, destination as the fallback, and empty
-// when neither is available so that a blank key never splits an aggregate across partitions.
+// Source first, destination as the fallback, and empty when neither is available so
+// that a blank key never splits an aggregate across partitions.
 func TestTransactionLedgerID_PrefersTheSourceLedger(t *testing.T) {
 	source := &model.Balance{BalanceID: "bln_source", LedgerID: "ldg_source"}
 	destination := &model.Balance{BalanceID: "bln_destination", LedgerID: "ldg_destination"}
@@ -434,7 +367,7 @@ func TestTransactionLedgerID_PrefersTheSourceLedger(t *testing.T) {
 }
 
 // TestPrepareTransactionEventOutbox_KeysOnTheLedger asserts the production producer supplies
-// the ledger, which is what makes requirement R-6's per-ledger ordering true in production
+// the ledger, which is what makes the requirement per-ledger ordering true in production
 // rather than only in a test fixture.
 func TestPrepareTransactionEventOutbox_KeysOnTheLedger(t *testing.T) {
 	instance, _ := producerAtomicityMock(t)
@@ -456,10 +389,6 @@ func TestPrepareTransactionEventOutbox_KeysOnTheLedger(t *testing.T) {
 
 // TestPrepareTransactionEventOutbox_ReturnsNilWhenPublishingIsUnconfigured keeps the
 // no-op-when-unconfigured contract inherited from SendWebhook.
-//
-// This is what allows every existing deployment, and the whole existing test suite, to run
-// with neither Kafka brokers nor a webhook URL: no row is prepared, the atomic writer
-// receives nothing, and the mutation commits exactly as it did before.
 func TestPrepareTransactionEventOutbox_ReturnsNilWhenPublishingIsUnconfigured(t *testing.T) {
 	datasource := new(mocks.MockDataSource)
 	instance := newOutboxBlnk(t, &config.Configuration{Redis: config.RedisConfig{Dns: "localhost:6379"}}, datasource)
@@ -479,12 +408,7 @@ func TestPrepareTransactionEventOutbox_ReturnsNilWhenPublishingIsUnconfigured(t 
 // scriptBulkFinalize makes the atomic finalise return the supplied results in order,
 // repeating the last one once they run out, and returns the rows it was offered.
 //
-// The offered event row matters as much as the count. Every attempt must be handed the SAME
-// prepared row, because the event id is what makes a retry idempotent: an attempt whose
-// commit succeeded but whose acknowledgement was lost is recognised on the next attempt only
-// if it carries the same id. A finalise that re-prepared per attempt would record a second,
-// differently-identified event for one batch outcome, and nothing downstream could collapse
-// the pair.
+// The offered event row matters as much as the count.
 func scriptBulkFinalize(datasource *mocks.MockDataSource, results ...error) *captureSpy {
 	spy := &captureSpy{rows: make([]*model.EventOutbox, 0, len(results))}
 	record := func(args mock.Arguments) {
@@ -511,19 +435,11 @@ func scriptBulkFinalize(datasource *mocks.MockDataSource, results ...error) *cap
 	return spy
 }
 
-// TestSendBulkTransactionWebhook_CommitsTheOutcomeWithItsEvent is the R-2 assertion for
+// TestSendBulkTransactionWebhook_CommitsTheOutcomeWithItsEvent is the assertion for
 // bulk_transaction.<status>.
 //
-// A bulk request executes one transaction at a time with compensating rollback, so by the
-// time the batch's outcome is known every mutation it describes has already committed under
-// its own transaction: there is no ledger row this summary could be atomic with. What it IS
-// atomic with is the batch coordinator's terminal transition — one database transaction
-// writes both — so the outcome can never be recorded without its event and the event can
-// never describe a batch the coordinator still calls in progress.
-//
-// The test drives the real producer entry point and requires the ATOMIC repository call. A
-// site that reverted to the standalone insert would leave the retry assertions below green
-// while the outcome could once again be recorded with its event missing.
+// The test drives the real producer entry point and requires the ATOMIC repository
+// call.
 func TestSendBulkTransactionWebhook_CommitsTheOutcomeWithItsEvent(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	spy := scriptBulkFinalize(datasource, nil)
@@ -543,11 +459,11 @@ func TestSendBulkTransactionWebhook_CommitsTheOutcomeWithItsEvent(t *testing.T) 
 		"the payload is the map the legacy transport carried, unchanged")
 }
 
-// TestSendBulkTransactionWebhook_RetriesTheBatchOutcomeCapture asserts a transient failure of
-// the atomic finalise is retried with the SAME prepared event.
+// TestSendBulkTransactionWebhook_RetriesTheBatchOutcomeCapture asserts a transient
+// failure of the atomic finalise is retried with the SAME prepared event.
 //
-// Retrying the whole transaction is what makes the pair recoverable, and re-offering one row
-// is what makes the retry idempotent rather than duplicating.
+// Retrying the whole transaction is what makes the pair recoverable, and re-offering
+// one row is what makes the retry idempotent rather than duplicating.
 func TestSendBulkTransactionWebhook_RetriesTheBatchOutcomeCapture(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	spy := scriptBulkFinalize(datasource, errors.New("connection reset"), nil)
@@ -563,15 +479,9 @@ func TestSendBulkTransactionWebhook_RetriesTheBatchOutcomeCapture(t *testing.T) 
 		"both attempts must offer the same event id, or a lost acknowledgement records the outcome twice")
 }
 
-// TestSendBulkTransactionWebhook_ReportsAnExhaustedBudget asserts the failure is RETURNED
-// rather than only logged, so a caller can act on a batch outcome that is not in the outbox,
-// AND that it is escalated as system.error.
-//
-// The escalation is the half that does not depend on a caller: one of this function's two
-// callers discarded its error, so before it existed a spent budget lost the batch summary with
-// nothing an alert could fire on. It is the same signal a lost balance.monitor alert raises,
-// which is what makes the two post-commit producers of PostCommitEventCaptureContract
-// observable through one mechanism.
+// TestSendBulkTransactionWebhook_ReportsAnExhaustedBudget asserts the failure is
+// RETURNED rather than only logged, so a caller can act on a batch outcome that is not
+// in the outbox, AND that it is escalated as system.error.
 func TestSendBulkTransactionWebhook_ReportsAnExhaustedBudget(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	escalations := captureSystemErrorEscalations(t)
@@ -592,13 +502,8 @@ func TestSendBulkTransactionWebhook_ReportsAnExhaustedBudget(t *testing.T) {
 			"distinguishable from a reused id or an abandoned retry")
 }
 
-// TestSendBulkTransactionWebhook_StopsRetryingOnCancellation asserts the retry loop honours
-// the caller going away, while still reporting AND escalating the failure.
-//
-// A cancelled caller is a different reason for the summary to be lost, not a lesser one: the
-// insert itself runs under a detached context, so reaching this exit means the write failed and
-// the retry was abandoned. Escalating only the exhausted budget would have left this a silent
-// way to lose a batch outcome.
+// TestSendBulkTransactionWebhook_StopsRetryingOnCancellation asserts the retry loop
+// honours the caller going away, while still reporting AND escalating the failure.
 func TestSendBulkTransactionWebhook_StopsRetryingOnCancellation(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	escalations := captureSystemErrorEscalations(t)
@@ -620,20 +525,17 @@ func TestSendBulkTransactionWebhook_StopsRetryingOnCancellation(t *testing.T) {
 		"the escalation names the exit taken, so an abandoned retry is not reported as a spent budget")
 }
 
-// TestSendBulkTransactionWebhook_EscalatesAReusedEventID covers the third way the summary is
-// lost: the unique index refused the insert as a duplicate that is not an identical event.
-//
-// The repository reports an identical event already recorded as SUCCESS, so a conflict reaching
-// this function is a genuine id collision that no retry can resolve — and the outcome is just
-// as absent from the outbox as it is after a spent budget.
+// TestSendBulkTransactionWebhook_EscalatesAReusedEventID covers the third way the
+// summary is lost: the unique index refused the insert as a duplicate that is not an
+// identical event.
 func TestSendBulkTransactionWebhook_EscalatesAReusedEventID(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	escalations := captureSystemErrorEscalations(t)
 
-	// SCRIPTED ON THE COORDINATOR, because that is the path the summary takes. The outcome and
-	// its event are written together by FinalizeBulkTransactionBatchWithEvent, so a reused event
-	// id is refused there rather than on the standalone insert — which is only reached when the
-	// coordinator row is absent altogether.
+	// SCRIPTED ON THE COORDINATOR, because that is the path the summary takes. The outcome
+	// and its event are written together by FinalizeBulkTransactionBatchWithEvent, so a
+	// reused event id is refused there rather than on the standalone insert — which is
+	// only reached when the coordinator row is absent altogether.
 	spy := scriptBulkFinalize(datasource,
 		apierror.NewAPIError(apierror.ErrConflict, "Event outbox entry already exists", nil))
 
@@ -648,12 +550,11 @@ func TestSendBulkTransactionWebhook_EscalatesAReusedEventID(t *testing.T) {
 	assert.Contains(t, raised.message, "the event id was reused, so no retry can resolve it")
 }
 
-// TestSendBulkTransactionWebhook_DoesNotRetryAConflictingOutcome pins the one failure that no
-// further attempt can resolve.
+// TestSendBulkTransactionWebhook_DoesNotRetryAConflictingOutcome pins the one failure
+// that no further attempt can resolve.
 //
 // A conflict means either the event id has been reused or the batch already reports a
-// DIFFERENT outcome. Spending the remaining attempts and their backoff on either only delays
-// the error the caller needs.
+// DIFFERENT outcome.
 func TestSendBulkTransactionWebhook_DoesNotRetryAConflictingOutcome(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	spy := scriptBulkFinalize(datasource, apierror.NewAPIError(
@@ -665,13 +566,11 @@ func TestSendBulkTransactionWebhook_DoesNotRetryAConflictingOutcome(t *testing.T
 	assert.Equal(t, 1, spy.count(), "a conflicting outcome must not be retried")
 }
 
-// TestSendBulkTransactionWebhook_FallsBackWhenTheBatchWasNeverCoordinated asserts the one
-// degradation this design allows, and that it degrades rather than failing.
+// TestSendBulkTransactionWebhook_FallsBackWhenTheBatchWasNeverCoordinated asserts the
+// one degradation this design allows, and that it degrades rather than failing.
 //
 // A coordinator row that could not be written at batch start makes the atomic finalise
-// impossible for that batch. Losing the outcome entirely would be worse than capturing it on
-// the weaker standalone path, so the producer falls back — and only for this failure, which is
-// why the sentinel is distinguished from every other error the finalise can return.
+// impossible for that batch.
 func TestSendBulkTransactionWebhook_FallsBackWhenTheBatchWasNeverCoordinated(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	scriptBulkFinalize(datasource, apierror.NewAPIError(
@@ -715,10 +614,8 @@ func TestRecordBulkBatchStart_WritesTheCoordinatorBeforeTheBatchRuns(t *testing.
 // TestRecordBulkBatchStart_DoesNotFailTheBatchWhenTheCoordinatorCannotBeWritten keeps a
 // bookkeeping write from refusing a ledger request.
 //
-// The insert hits the same database the member transactions are about to use, so a fault here
-// means the batch is going to fail on its own terms anyway. Refusing it here would turn a
-// recoverable blip into a rejected request, and the outcome is still captured on the fallback
-// path.
+// The insert hits the same database the member transactions are about to use, so a
+// fault here means the batch is going to fail on its own terms anyway.
 func TestRecordBulkBatchStart_DoesNotFailTheBatchWhenTheCoordinatorCannotBeWritten(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	datasource.On("InsertBulkTransactionBatch", mock.Anything, mock.Anything).
@@ -732,39 +629,11 @@ func TestRecordBulkBatchStart_DoesNotFailTheBatchWhenTheCoordinatorCannotBeWritt
 }
 
 // ---------------------------------------------------------------------------
-// balance.monitor — the FALLBACK capture path
-//
-// The primary path is atomic. prepareBalanceMonitorEventOutboxes evaluates the same
-// conditions against the same post-update balances before the write, and
-// persistSingleTransactionExecutionWork hands the resulting rows to the writer that commits
-// the movement, so on the single-transaction path an alert and the threshold crossing that
-// produced it commit together. That is R-2 applied to balance.monitor, and it is covered by
-// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement in
-// event_outbox_test.go.
-//
-// checkBalanceMonitors remains for the paths that cannot enrol their rows — today the
-// coalesced batch path, whose writer is called from the transaction_coalescing.go that AAP
-// §0.6.2 excludes from modification. There the mutation is already durable when the alert
-// exists, so the insert is the alert's only chance: what the tests below pin is that the one
-// insert it gets survives a transient fault instead of losing the alert on the first try, and
-// that a monitor already captured atomically is SKIPPED rather than published twice.
-//
-// Monitor condition evaluation itself is untouched on both paths — the same
-// getBalanceMonitorsCached and the same model.BalanceMonitor.CheckCondition — which is what
-// keeps §0.6.2 honoured while the moment of capture moves.
+// balance.monitor — the FALLBACK capture path, which checkBalanceMonitors keeps for the
+// paths that cannot enrol their rows
 // ---------------------------------------------------------------------------
 
 // monitorCaptureBlnk returns an instance wired for the balance.monitor producer site.
-//
-// It adds a CACHE to the atomicity mock, because that is what production does:
-// getBalanceMonitorsCached reads l.cache before it reaches the datasource, and exercising the
-// cached branch is what makes these assertions describe the production path rather than a
-// degraded one. The cache is backed by an in-process Redis so the assertions do not depend on
-// any external service.
-//
-// A nil cache no longer panics — the lookup skips the cache and queries the datasource, which
-// is the correct degradation now that the persistence path reaches the same function — but a
-// test that relied on that would be asserting the fallback rather than the real path.
 func monitorCaptureBlnk(t *testing.T) (*Blnk, *mocks.MockDataSource) {
 	t.Helper()
 
@@ -779,21 +648,10 @@ func monitorCaptureBlnk(t *testing.T) (*Blnk, *mocks.MockDataSource) {
 }
 
 // monitorFallbackBlnk builds the ONE deployment shape in which checkBalanceMonitors
-// publishes anything at all: a webhook URL, a real asynq client against an in-process Redis,
-// and NO Kafka broker.
+// publishes anything at all: a webhook URL, a real asynq client against an in-process
+// Redis, and NO Kafka broker.
 //
-// # Why the shape has to be this exact one
-//
-// Two guards decide what this function does, and they read the same fact from opposite
-// sides. With a broker configured, balanceMonitorHandoffEnabled is true and the function
-// returns immediately, because the mutation's own transaction owns the evaluation and publishing
-// from both would deliver every alert twice. With no broker configured there is no outbox row to
-// capture — PrepareEventOutbox returns nil, deliberately, since no relay would ever drain it
-// — and the alert goes straight down the legacy webhook transport instead.
-//
-// So the fallback's behaviour is OBSERVABLE ONLY as a legacy enqueue. A test that scripted an
-// outbox insert here would be asserting against a path that cannot run in either shape, and
-// would pass or fail for reasons unrelated to the per-monitor skip it means to pin.
+// So the fallback's behaviour is OBSERVABLE ONLY as a legacy enqueue.
 //
 // Parameters:
 //   - t *testing.T: the test, for the Redis, cache and asynq client lifecycles.
@@ -850,8 +708,8 @@ func monitorEvent() NewWebhook {
 // captureSpy records what the standalone insert was offered.
 //
 // It is mutex-guarded because checkBalanceMonitors publishes from a goroutine, so the
-// recording and the assertion happen on different goroutines and an unguarded counter would
-// be a data race that -race fails.
+// recording and the assertion happen on different goroutines and an unguarded counter
+// would be a data race that -race fails.
 type captureSpy struct {
 	guard    sync.Mutex
 	attempts int
@@ -888,12 +746,9 @@ func (s *captureSpy) captured() []*model.EventOutbox {
 	return rows
 }
 
-// scriptStandaloneInsert makes the standalone insert return the supplied results in order,
-// repeating the last one once they run out, and returns the spy that observed it.
-//
-// The rows matter as much as the count: a retry that re-prepared the event would offer a
-// DIFFERENT row each time, which is the failure mode
-// TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate exists to catch.
+// scriptStandaloneInsert makes the standalone insert return the supplied results in
+// order, repeating the last one once they run out, and returns the spy that observed
+// it.
 func scriptStandaloneInsert(datasource *mocks.MockDataSource, results ...error) *captureSpy {
 	spy := &captureSpy{rows: make([]*model.EventOutbox, 0, len(results))}
 
@@ -910,12 +765,7 @@ func scriptStandaloneInsert(datasource *mocks.MockDataSource, results ...error) 
 	return spy
 }
 
-// TestPublishEventDurably_RetriesATransientCaptureFailure is the F-1 regression guard.
-//
-// Before this, one failed insert destroyed the alert outright: the balance had moved, the
-// threshold had been crossed, and the notification simply ceased to exist — with nothing to
-// retry it, because the only record that it should have existed was the row that never got
-// written.
+// TestPublishEventDurably_RetriesATransientCaptureFailure is the transient-capture retry guard.
 func TestPublishEventDurably_RetriesATransientCaptureFailure(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 	spy := scriptStandaloneInsert(datasource, errors.New("connection reset"), nil)
@@ -926,15 +776,11 @@ func TestPublishEventDurably_RetriesATransientCaptureFailure(t *testing.T) {
 	assert.Equal(t, 2, spy.count(), "the first attempt failed and the second succeeded")
 }
 
-// TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate is why the retry sits
-// beneath PrepareEventOutbox rather than above it.
+// TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate is why the retry
+// sits beneath PrepareEventOutbox rather than above it.
 //
-// A balance.monitor event id is a fresh UUID by design, because a derived id would collapse a
-// monitor that fires repeatedly into one event. Retrying by re-entering PublishEvent would
-// therefore mint a NEW id per attempt, and an attempt whose insert committed but whose
-// acknowledgement was lost would be followed by a second, differently-identified row: one
-// business event delivered twice, with nothing at a subscriber able to collapse the pair,
-// because duplicate suppression keys on event_id.
+// A balance.monitor event id is a fresh UUID by design, because a derived id would
+// collapse a monitor that fires repeatedly into one event.
 func TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 	spy := scriptStandaloneInsert(datasource, errors.New("connection reset"), nil)
@@ -953,11 +799,11 @@ func TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate(t *tes
 	assert.Equal(t, first.Payload, second.Payload, "and the same bytes with it")
 }
 
-// TestPublishEventDurably_DoesNotRetryAGenuineConflict asserts the budget is not spent on a
-// failure no further attempt can resolve.
+// TestPublishEventDurably_DoesNotRetryAGenuineConflict asserts the budget is not spent
+// on a failure no further attempt can resolve.
 //
-// An identical event already recorded is reported as SUCCESS by the repository, so a conflict
-// reaching the producer is a genuine id collision. Retrying it only delays the error.
+// An identical event already recorded is reported as SUCCESS by the repository, so a
+// conflict reaching the producer is a genuine id collision.
 func TestPublishEventDurably_DoesNotRetryAGenuineConflict(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 	spy := scriptStandaloneInsert(datasource,
@@ -1014,12 +860,8 @@ func TestPublishEventDurably_StopsRetryingOnCancellation(t *testing.T) {
 		"a cancelled caller is a reason to stop retrying, not a reason to keep sleeping")
 }
 
-// TestPublishEvent_MakesASingleCaptureAttempt pins the OTHER half of the change: the budget
-// belongs to the durable entry point alone.
-//
-// Every producer whose event is enrolled in its mutation's transaction keeps one attempt on
-// purpose, because for them a failed insert must fail the mutation rather than be retried
-// past it. A budget applied to PublishEvent generally would have changed all of them.
+// TestPublishEvent_MakesASingleCaptureAttempt pins the OTHER half of the change: the
+// budget belongs to the durable entry point alone.
 func TestPublishEvent_MakesASingleCaptureAttempt(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 	spy := scriptStandaloneInsert(datasource, errors.New("outbox unavailable"))
@@ -1030,18 +872,10 @@ func TestPublishEvent_MakesASingleCaptureAttempt(t *testing.T) {
 	assert.Equal(t, 1, spy.count(), "PublishEvent's behaviour is unchanged")
 }
 
-// TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured is the R-2
+// TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured is the same-transaction
 // assertion for balance.monitor, expressed as the absence it depends on.
 //
-// The post-commit capture is exactly what made this the one at-most-once event: the balance
-// was already committed, so a process dying before the insert destroyed the alert and left
-// nothing to replay. The alert is now captured by BalanceMonitorHandoffProcessor from a
-// handoff row written INSIDE the balance's own transaction, and its events and the handoff's
-// completion commit together.
-//
-// So this path must publish NOTHING. If it published as well, every alert would be delivered
-// twice under two different event ids, and duplicate suppression at a subscriber keys on
-// event_id — nothing downstream could collapse the pair.
+// So this path must publish NOTHING.
 func TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 	spy := scriptStandaloneInsert(datasource, nil)
@@ -1055,15 +889,9 @@ func TestCheckBalanceMonitors_DefersToTheDurableHandoffWhenKafkaIsConfigured(t *
 }
 
 // legacyOnlyMonitorInstance builds the WEBHOOK-ONLY deployment shape for the monitor
-// producer: a webhook URL, a real asynq client against an in-process Redis, no Kafka broker,
-// and the cache getBalanceMonitorsCached reads before it reaches the datasource.
-//
-// The two deployment shapes take genuinely different paths and both have to be covered. With
-// brokers, the writer owns monitor capture — it evaluates inside the mutation's transaction and
-// inserts the canonical row there — and this producer must publish nothing. Without them there is
-// no outbox to capture into at all: database.recordBalanceMonitorEvaluation reads the SAME
-// predicate and writes nothing, so this post-commit evaluation is the ONLY capture, and it must
-// keep delivering exactly as it did before the event pipeline existed (AAP §0.5.4).
+// producer: a webhook URL, a real asynq client against an in-process Redis, no Kafka
+// broker, and the cache getBalanceMonitorsCached reads before it reaches the
+// datasource.
 //
 // Parameters:
 //   - t *testing.T: the test, for the Redis, client and cache lifecycles.
@@ -1088,14 +916,8 @@ func legacyOnlyMonitorInstance(t *testing.T) (*Blnk, *mocks.MockDataSource, stri
 	return instance, datasource, redisServer.Addr()
 }
 
-// TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka pins the path that
-// survives for a broker-less deployment.
-//
-// With no broker there is no outbox to capture into and no handoff processor to evaluate, so
-// this post-commit evaluation is the alert's only route and it goes straight down the legacy
-// webhook transport. The alert must arrive with the same bytes it always had — the monitor
-// object inside the two-key envelope — so a subscriber on this shape cannot tell that the
-// event pipeline exists at all.
+// TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka pins the path
+// that survives for a broker-less deployment.
 func TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka(t *testing.T) {
 	instance, datasource, redisAddress := legacyOnlyMonitorInstance(t)
 	datasource.On("GetBalanceMonitors", "bln_monitored").
@@ -1107,15 +929,8 @@ func TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka(t *test
 	datasource.AssertNotCalled(t, "InsertEventOutbox", mock.Anything, mock.Anything)
 }
 
-// TestCheckBalanceMonitors_EscalatesALostAlert is the monitor half of the escalation parity
-// the bulk tests above assert.
-//
-// Both producers named in PostCommitEventCaptureContract publish an event that no mutation
-// owns, so for both of them a capture that never succeeds is an event that exists nowhere: no
-// outbox row to claim, nothing to dead-letter, nothing to replay. The two must therefore raise
-// the SAME signal, and this is the test that says so from the monitor side — the bulk side is
-// TestSendBulkTransactionWebhook_ReportsAnExhaustedBudget. Without both, "escalation parity" is
-// a claim in a comment rather than a property of the code.
+// TestCheckBalanceMonitors_EscalatesALostAlert is the monitor half of the escalation
+// parity the bulk tests above assert.
 func TestCheckBalanceMonitors_EscalatesALostAlert(t *testing.T) {
 	instance, datasource, queueAddress := unreachableQueueMonitorInstance(t)
 	escalations := captureSystemErrorEscalations(t)
@@ -1134,36 +949,24 @@ func TestCheckBalanceMonitors_EscalatesALostAlert(t *testing.T) {
 	datasource.AssertNotCalled(t, "InsertEventOutbox", mock.Anything, mock.Anything)
 }
 
-// unreachableQueueMonitorInstance builds the one shape in which a balance.monitor alert can still
-// be lost outright, which is what makes the escalation above assertable at all.
+// unreachableQueueMonitorInstance builds the one shape in which a balance.monitor alert
+// can still be lost outright, which is what makes the escalation above assertable at
+// all.
 //
-// # Why the loss has to be staged on the TRANSPORT rather than on the outbox
-//
-// The obvious staging — a Kafka-configured instance whose InsertEventOutbox fails — cannot
-// happen. With a broker configured the alert is captured inside the balance's own transaction and
-// checkBalanceMonitors returns before it reaches any capture at all; with no broker,
-// PrepareEventOutbox deliberately returns nil, so there is no row to fail on. Either way the
-// outbox is not where this alert can go missing.
-//
-// Where it CAN go missing is the broker-less deployment's legacy enqueue: no outbox row is
-// written by design, so the asynq enqueue is the alert's only delivery, and a queue that cannot
-// be reached loses the threshold notification outright while the balance movement stands. That is
-// the residual at-most-once window docs/event-streaming.md names for balance.monitor, and this is
-// the fault that opens it.
-//
-// The address is produced by starting an in-process Redis and closing it immediately: that yields
-// a loopback address nothing is listening on, so the enqueue fails with a connection refusal in
-// microseconds rather than after a dial timeout, and the address itself is what the assertion
-// matches on — deterministic regardless of how the platform words the refusal. miniredis.Close is
-// idempotent, so the cleanup RunT registered is a no-op.
+// The address is produced by starting an in-process Redis and closing it immediately:
+// that yields a loopback address nothing is listening on, so the enqueue fails with a
+// connection refusal in microseconds rather than after a dial timeout, and the address
+// itself is what the assertion matches on — deterministic regardless of how the
+// platform words the refusal. miniredis.Close is idempotent, so the cleanup RunT
+// registered is a no-op.
 //
 // Parameters:
 //   - t *testing.T: the test, for the Redis, client and cache lifecycles.
 //
 // Returns:
 //   - *Blnk: an instance with a webhook URL, no brokers and an unreachable queue.
-//   - *mocks.MockDataSource: the datasource, for the monitor lookup and for asserting that
-//     nothing was captured.
+//   - *mocks.MockDataSource: the datasource, for the monitor lookup and for asserting
+//     that nothing was captured.
 //   - string: the unreachable queue address, which the escalation must name.
 func unreachableQueueMonitorInstance(t *testing.T) (*Blnk, *mocks.MockDataSource, string) {
 	t.Helper()
@@ -1184,13 +987,10 @@ func unreachableQueueMonitorInstance(t *testing.T) (*Blnk, *mocks.MockDataSource
 	return instance, datasource, queueAddress
 }
 
-// TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet keeps the substitution inside
-// the CheckCondition guard.
+// TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet keeps the substitution
+// inside the CheckCondition guard.
 //
-// Monitor condition evaluation is frozen domain logic (AAP §0.6.2). A publish that escaped the
-// guard would announce a threshold crossing that never happened, to every subscriber. It is
-// driven on the broker-less shape because that is the only shape where this function still
-// evaluates anything at all.
+// Monitor condition evaluation is frozen domain logic.
 func TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet(t *testing.T) {
 	instance, datasource, redisAddress := legacyOnlyMonitorInstance(t)
 
@@ -1208,14 +1008,8 @@ func TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet(t *testing.T)
 		"a condition that was not met must publish nothing at all")
 }
 
-// TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite drives the PRIMARY,
-// atomic monitor producer directly.
-//
-// It proves the row the writer receives is built from the same monitors, the same condition and
-// the same ledger the post-commit fallback used — so moving the capture into the mutation's
-// transaction did not change WHAT is captured, only when. The fallback's own remaining behaviour
-// is covered by TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka and
-// TestCheckBalanceMonitors_EscalatesALostAlert.
+// TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite drives the
+// PRIMARY, atomic monitor producer directly.
 func TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 
@@ -1253,22 +1047,8 @@ func TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite(t *test
 			"later movement that DOES meet its condition")
 }
 
-// TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses is what keeps the three routes
-// to a `balance.monitor` row interchangeable to a subscriber.
-//
-// # Why this matters more than it looks
-//
-// Three routes can decide a crossing: the pre-write pass on the single-transaction path, the
-// writer's own in-transaction evaluation for every other path (through the registered
-// database.BalanceMonitorAlertCapture), and the handoff drain for a row written before that
-// capture existed. If any of them built its own envelope, the STORED BYTES for one crossing would
-// depend on which route happened to see it — and a subscriber cannot tell the routes apart, so the
-// difference would look like Blnk emitting two different shapes for one event type. It would also
-// break the dual-delivery payload-equivalence guarantee for this producer, since the legacy HTTP
-// leg is spliced from those same bytes.
-//
-// So the assertion is field-by-field equality of the two rows, with the event id excluded — that
-// one is a fresh UUID by design for this event type, which is asserted separately below.
+// TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses is what keeps the
+// three routes to a `balance.monitor` row interchangeable to a subscriber.
 func TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 
@@ -1305,30 +1085,11 @@ func TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses(t *testing.
 			"rejects, and the alerts would silently stop")
 }
 
-// TestNewBlnk_RegistersBothInTransactionEventCaptures is the wiring assertion for the two captures
-// the atomic writers cannot work without.
+// TestNewBlnk_RegistersBothInTransactionEventCaptures is the wiring assertion for the
+// two captures the atomic writers cannot work without.
 //
-// # Why the registration is the whole feature, and why nothing else fails without it
-//
-// database.recordBalanceMonitorEvaluation inserts the canonical `balance.monitor` row inside the
-// mutation's transaction ONLY when a BalanceMonitorAlertCapture is registered; with none it falls
-// back to committing a balance_monitor_handoff for a second transaction to convert. A constructor
-// that omitted the call would therefore leave requirement R-2 unmet for that producer on every
-// path, and NOTHING would fail: the handoff is durable, the alert still arrives, and every test of
-// the handoff still passes. The same is true of the transaction capture the coalesced batch writer
-// derives its rows from — without it a coalesced batch commits balance updates and publishes
-// nothing.
-//
-// # Why this asserts on the constructor's source rather than on the registry
-//
-// The registry is unexported package state in `database`, and exporting an accessor purely so this
-// test could read it would widen a production API to serve a test. The registration is a
-// STRUCTURAL fact about NewBlnk — the call is either in the constructor or it is not — so the
-// constructor's own source is the honest thing to assert on, and it is the same technique
-// cmd/server_test.go uses for the relay's startup wiring. What the registered function then
-// PRODUCES is covered behaviourally by
-// TestPrepareBalanceMonitorAlertRow_IsTheOneBuilderEveryRouteUses above, and the path it unlocks
-// by the real-database tests in database/event_producer_atomicity_test.go.
+// The registry is unexported package state in `database`, and exporting an accessor
+// purely so this test could read it would widen a production API to serve a test.
 func TestNewBlnk_RegistersBothInTransactionEventCaptures(t *testing.T) {
 	source, err := os.ReadFile("blnk.go")
 	require.NoError(t, err)
@@ -1357,21 +1118,7 @@ func TestNewBlnk_RegistersBothInTransactionEventCaptures(t *testing.T) {
 // TestPrepareBalanceMonitorEventOutboxes_DegradesToTheFallbackWhenTheLookupFails is the
 // failure direction of the atomic path.
 //
-// # Why the movement still commits
-//
-// The lookup failure is reported and STEPPED PAST rather than returned, and that is a scope
-// boundary rather than a preference: this change substitutes a transport and may not turn an
-// outage of the monitor table into an outage of the ledger. Returning it here would abandon the
-// write, so a transaction Blnk has always applied would be refused because a table used only for
-// threshold alerting could not be read.
-//
-// # What has to be true instead, and it is the whole assertion
-//
-// The balance must NOT be reported as evaluated. That is what routes it back to the post-commit
-// check, which is the behaviour that existed before this path and carries its own documented
-// loss window. A capture claiming a balance it never read would suppress the fallback as well,
-// so the crossing would be examined by neither route — strictly worse than the window this path
-// narrows.
+// The balance must NOT be reported as evaluated.
 func TestPrepareBalanceMonitorEventOutboxes_DegradesToTheFallbackWhenTheLookupFails(t *testing.T) {
 	instance, datasource := monitorCaptureBlnk(t)
 
@@ -1394,12 +1141,12 @@ func TestPrepareBalanceMonitorEventOutboxes_DegradesToTheFallbackWhenTheLookupFa
 // TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement is the guard on
 // the duplicate the atomic monitor capture creates the possibility of.
 //
-// Once an alert is inserted inside the mutation's transaction, the post-commit path would
-// publish a SECOND copy of it — and a balance.monitor event id is a fresh UUID by design, so no
-// subscriber-side idempotency could collapse the pair. The captured set is the only thing
-// preventing that, and it must be applied per MONITOR: one balance can carry many monitors and a
-// movement can satisfy some and not others, so skipping the whole balance would lose the alerts
-// that were not captured.
+// Once an alert is inserted inside the mutation's transaction, the post-commit path
+// would publish a SECOND copy of it — and a balance.monitor event id is a fresh UUID by
+// design, so no subscriber-side idempotency could collapse the pair. The captured set
+// is the only thing preventing that, and it must be applied per MONITOR: one balance
+// can carry many monitors and a movement can satisfy some and not others, so skipping
+// the whole balance would lose the alerts that were not captured.
 func TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement(t *testing.T) {
 	t.Run("a captured monitor publishes nothing", func(t *testing.T) {
 		instance, datasource := monitorCaptureBlnk(t)
@@ -1438,8 +1185,8 @@ func TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement(t *tes
 	})
 
 	t.Run("a nil captured set behaves exactly as before", func(t *testing.T) {
-		// The coalesced batch path supplies nothing, so the zero capture must mean "nothing was
-		// captured" rather than "everything was" — the conservative direction, in which a
+		// The coalesced batch path supplies nothing, so the zero capture must mean "nothing
+		// was captured" rather than "everything was" — the conservative direction, in which a
 		// duplicate an operator can see beats a threshold crossing nobody is told about.
 		instance, datasource, redisAddress := monitorFallbackBlnk(t)
 		datasource.On("GetBalanceMonitors", "bln_monitored").
@@ -1456,10 +1203,7 @@ func TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement(t *tes
 // TestPostTransactionActions_DoesNotRecaptureAnAlreadyCapturedEvent is the guard on the
 // duplicate the conditional capture exists to prevent.
 //
-// The single-transaction path inserts the event with the mutation. Capturing it again after
-// the commit would publish every transaction event twice, under two different event ids —
-// and duplicate suppression at a subscriber keys on event_id, so nothing downstream could
-// collapse them.
+// The single-transaction path inserts the event with the mutation.
 func TestPostTransactionActions_DoesNotRecaptureAnAlreadyCapturedEvent(t *testing.T) {
 	datasource := newOutboxSpyDatasource()
 	instance := newOutboxBlnk(t, producerAtomicityConfiguration(), datasource)
@@ -1479,12 +1223,10 @@ func TestPostTransactionActions_DoesNotRecaptureAnAlreadyCapturedEvent(t *testin
 		"an event captured in the mutation transaction must never be captured a second time")
 }
 
-// TestPostTransactionActions_CapturesTheEventForTheCoalescedBatchPath is the other half.
+// TestPostTransactionActions_CapturesTheEventForTheCoalescedBatchPath is the other
+// half.
 //
-// The coalesced batch path assembles its writer arguments in transaction_coalescing.go,
-// which belongs to the frozen transaction-processing pipeline (AAP §0.6.2), so its event
-// rows have no route into the batch writer and this remains their only capture — exactly as
-// it was for every event before this change. Removing it would lose those events entirely.
+// Removing it would lose those events entirely.
 func TestPostTransactionActions_CapturesTheEventForTheCoalescedBatchPath(t *testing.T) {
 	datasource := newOutboxSpyDatasource()
 	instance := newOutboxBlnk(t, producerAtomicityConfiguration(), datasource)
@@ -1510,14 +1252,11 @@ func TestPostTransactionActions_CapturesTheEventForTheCoalescedBatchPath(t *test
 			"partitions depending on which execution path ran them")
 }
 
-// legacyOnlyEntityInstance builds the WEBHOOK-ONLY deployment shape: a webhook URL, a real
-// asynq client against an in-process Redis, and NO Kafka broker.
+// legacyOnlyEntityInstance builds the WEBHOOK-ONLY deployment shape: a webhook URL, a
+// real asynq client against an in-process Redis, and NO Kafka broker.
 //
-// This is the shape every deployment is in before it opts into Kafka, and it is the one the
-// entity producers stopped serving: with no broker there is no preparer, so nothing is
-// captured, and the post-commit publish that used to serve it had been removed. The queue is
-// supplied because postLedgerActions and its siblings index unconditionally and a nil queue
-// panics inside their goroutine.
+// The queue is supplied because postLedgerActions and its siblings index
+// unconditionally and a nil queue panics inside their goroutine.
 //
 // Parameters:
 //   - t *testing.T: the test, for the Redis and client lifecycles.
@@ -1537,13 +1276,10 @@ func legacyOnlyEntityInstance(t *testing.T) (*Blnk, *outboxSpyDatasource, string
 	return instance, datasource, redisServer.Addr()
 }
 
-// requireLegacyDelivery waits for exactly one legacy task and asserts it carries the event's
-// bytes verbatim.
+// requireLegacyDelivery waits for exactly one legacy task and asserts it carries the
+// event's bytes verbatim.
 //
-// The producers publish from a goroutine, so the delivery is asserted against a WINDOW. The
-// body is compared byte for byte rather than field by field because byte equality with the
-// marshaled NewWebhook envelope IS the payload guarantee (AAP R-8, AMBIGUITY-3): a subscriber
-// on this deployment must not be able to tell that anything changed.
+// The producers publish from a goroutine, so the delivery is asserted against a WINDOW.
 func requireLegacyDelivery(t *testing.T, redisAddress string, event NewWebhook) {
 	t.Helper()
 
@@ -1553,9 +1289,9 @@ func requireLegacyDelivery(t *testing.T, redisAddress string, event NewWebhook) 
 		"a webhook-only deployment must still receive %s; before the fallback was restored it "+
 			"was delivered by NEITHER transport", event.Event)
 
-	// READ ONCE THE WINDOW HAS CLOSED, and through the error-returning reader rather than the
-	// counter: the assertions below are about the task's CONTENT, so a read failure has to be a
-	// test failure rather than a zero that reads as "no task".
+	// READ ONCE THE WINDOW HAS CLOSED, and through the error-returning reader rather than
+	// the counter: the assertions below are about the task's CONTENT, so a read failure
+	// has to be a test failure rather than a zero that reads as "no task".
 	tasks, listErr := pendingLegacyTasks(redisAddress)
 	require.NoError(t, listErr, "listing the pending legacy webhook tasks")
 	require.Len(t, tasks, 1, "exactly one legacy task must be pending for %s", event.Event)
@@ -1566,21 +1302,11 @@ func requireLegacyDelivery(t *testing.T, redisAddress string, event NewWebhook) 
 		"the enqueued body must be the legacy two-key envelope, byte for byte")
 }
 
-// TestPostEntityActions_WebhookOnlyDeploymentStillDelivers is the regression guard on the
-// legacy continuity of the three entity creation events.
+// TestPostEntityActions_WebhookOnlyDeploymentStillDelivers is the regression guard on
+// the legacy continuity of the three entity creation events.
 //
-// # The defect it pins
-//
-// Capture for ledger.created, identity.created and balance.created moved INTO the repository,
-// behind an EventPreparer, to close the R-2 window. The preparer is nil when
-// eventCaptureEnabled is false, which is correct — a row no relay can drain is worse than no
-// row — and the post-commit publish was removed as a duplicate, which is correct WHEN A
-// PREPARER EXISTS. On a webhook-only deployment neither is true: no preparer, no publish, and
-// three event types silently delivered by nothing at all. No error, no failed delivery, no
-// log line.
-//
-// Every other producer in the package kept its publish call and so kept working, which is why
-// this reached the merged tree looking like a tidied-up duplicate rather than a lost event.
+// Capture for ledger.created, identity.created and balance.created moved INTO the
+// repository, behind an EventPreparer, to close the window.
 func TestPostEntityActions_WebhookOnlyDeploymentStillDelivers(t *testing.T) {
 	t.Run("ledger.created", func(t *testing.T) {
 		instance, datasource, redisAddress := legacyOnlyEntityInstance(t)
@@ -1643,14 +1369,11 @@ func TestPostEntityActions_WebhookOnlyDeploymentStillDelivers(t *testing.T) {
 	})
 }
 
-// TestPostEntityActions_DoNotPublishWhenTheRepositoryCaptured is the other half, and it is
-// what keeps the fix from becoming the duplicate it replaced.
+// TestPostEntityActions_DoNotPublishWhenTheRepositoryCaptured is the other half, and it
+// is what keeps the fix from becoming the duplicate it replaced.
 //
-// With a broker configured the preparer runs inside the creation transaction, so a publish
-// here would be a second capture of the same event. It would not even be a silent one: the
-// derived event id makes the second insert a unique violation, so every ledger, identity and
-// balance creation would log a conflict and emit a system.error about a creation that
-// succeeded.
+// With a broker configured the preparer runs inside the creation transaction, so a
+// publish here would be a second capture of the same event.
 func TestPostEntityActions_DoNotPublishWhenTheRepositoryCaptured(t *testing.T) {
 	newInstance := func(t *testing.T) (*Blnk, *outboxSpyDatasource, string) {
 		t.Helper()
@@ -1700,15 +1423,14 @@ func TestPostEntityActions_DoNotPublishWhenTheRepositoryCaptured(t *testing.T) {
 	})
 }
 
-// TestPostBalanceActions_DeclinesTheIdempotentIndicatorConflict keeps a restored publish from
-// restoring a defect that was removed with it.
+// TestPostBalanceActions_DeclinesTheIdempotentIndicatorConflict keeps a restored
+// publish from restoring a defect that was removed with it.
 //
 // CreateBalance reports a unique_indicator_currency violation as SUCCESS with an empty
 // balance — its long-standing idempotent-create contract — and it still calls
-// postBalanceActions. The post-commit publish used to announce balance.created for it: an
-// event whose payload had no balance id, no ledger and no currency, describing a creation
-// that did not happen. The repository declines to capture on that path; the fallback declines
-// on the same grounds.
+// postBalanceActions. A post-commit publish would announce balance.created for it: an
+// event whose payload has no balance id, no ledger and no currency, describing a creation
+// that did not happen.
 func TestPostBalanceActions_DeclinesTheIdempotentIndicatorConflict(t *testing.T) {
 	instance, datasource, redisAddress := legacyOnlyEntityInstance(t)
 
@@ -1722,11 +1444,11 @@ func TestPostBalanceActions_DeclinesTheIdempotentIndicatorConflict(t *testing.T)
 	datasource.assertWroteNothing(t, "and nothing to capture either")
 }
 
-// TestPublishEntityEventWhenUncaptured_IsANoOpWithNoTransportAtAll pins the third state.
+// TestPublishEntityEventWhenUncaptured_IsANoOpWithNoTransportAtAll pins the third
+// state.
 //
-// No broker and no webhook URL is a LEGITIMATE STEADY STATE, not a misconfiguration: it is
-// what every existing test and every deployment with no notification sink runs in. The
-// fallback must be invisible there.
+// No broker and no webhook URL is a LEGITIMATE STEADY STATE, not a misconfiguration: it
+// is what every existing test and every deployment with no notification sink runs in.
 func TestPublishEntityEventWhenUncaptured_IsANoOpWithNoTransportAtAll(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 	cnf := outboxLegacyWebhookConfiguration(redisServer.Addr())
@@ -1757,7 +1479,7 @@ var (
 // prepareTransactionEventForTest builds a transaction's event row exactly as
 // buildTransactionExecutionWork does before handing it to the atomic writer: the status-derived
 // event name, the transaction as the payload, and the ledger resolved from the balances so the
-// row is keyed on the aggregate requirement R-6 partitions by.
+// row is keyed on the aggregate the requirement partitions by.
 func prepareTransactionEventForTest(
 	l *Blnk,
 	ctx context.Context,
@@ -1773,27 +1495,8 @@ func prepareTransactionEventForTest(
 // ---------------------------------------------------------------------------
 // The complete set of post-commit captures, and the guard that keeps it honest
 //
-// Requirement R-2 puts an event in the same database transaction as the mutation it
-// describes, and almost every producer does. THREE do not, because their mutation is
-// already committed when the event comes into existence, and those three are at-most-once:
-// a process death between the commit and the insert loses the event with no row anywhere to
-// replay from.
-//
-// # Why this needed a test rather than a comment
-//
-// Each of the three sites used to describe ITSELF as the only one. balance.go called its
-// window "the single documented exception to requirement R-2"; transaction_bulk.go opened a
-// section with "This is the ONE event that cannot be enrolled in its mutation's
-// transaction"; docs/event-streaming.md published a section headed "The one exception:
-// balance.monitor is at-most-once" and told subscribers that "every other event type carries
-// the full transactional guarantee". All three statements were false, and each was false
-// because of the other two \u2014 so an operator reading any one of them was told this pipeline
-// had one loss window when it has three, and the third one (a coalesced batch's transaction
-// events) was not mentioned anywhere a subscriber would look.
-//
-// A prose fix alone would decay the same way. These tests pin the set from both ends: the
-// call sites must still spend a retry budget, the published documentation must still name
-// every member, and NO source may reclaim sole-exception status.
+// The set is stated as a table the assertions read, so a new capture site that is not
+// added to it fails the guard rather than going unnoticed.
 // ---------------------------------------------------------------------------
 
 // postCommitCaptureSite is one member of the at-most-once set.
@@ -1812,26 +1515,20 @@ type postCommitCaptureSite struct {
 	why string
 }
 
-// postCommitCaptureSites is the authoritative enumeration of the standalone capture SITES — the
-// three places in the production source that spend a bounded retry budget because the mutation
-// they describe has already committed.
+// postCommitCaptureSites is the authoritative enumeration of the standalone capture
+// SITES — the three places in the production source that spend a bounded retry budget
+// because the mutation they describe has already committed.
 //
-// IT IS NOT THE SAME SET as the at-most-once EVENT TYPES, and the difference is the reason two
-// separate reviews each arrived at a confident but different "three". Both sets have three
-// members; they disagree on the third in both directions:
+// IT IS NOT THE SAME SET as the at-most-once EVENT TYPES, and the difference is the
+// reason two separate reviews each arrived at a confident but different "three". Both
+// sets have three members; they disagree on the third in both directions:
 //
-//   - `system.error` is an at-most-once event type but NOT a site here. It captures through
-//     PublishEvent in a single attempt, because it describes no mutation and therefore has no
-//     ledger state behind it that a retry would protect.
-//   - The coalesced batch's `transaction.*` events are a site here but NOT an at-most-once event
-//     type. The batch writer derives the same rows and inserts them inside its own transaction,
-//     so this site's copy is normally recognised as the identical stored row and reported as
-//     success.
+//   - `system.error` is an at-most-once event type but NOT a site here.
+//   - The coalesced batch's `transaction.*` events are a site here but NOT an
+//     at-most-once event type.
 //
 // PublishEventDurably's doc comment states both sets side by side, and
-// PostCommitEventCaptureContract declares the event-type set once. Adding a fourth site means
-// adding a row here; adding a fourth at-most-once event type means extending that constant AND
-// the published section in docs/event-streaming.md — which is what the guards below enforce.
+// PostCommitEventCaptureContract declares the event-type set once.
 var postCommitCaptureSites = []postCommitCaptureSite{
 	{
 		eventClass:      "balance.monitor",
@@ -1853,11 +1550,10 @@ var postCommitCaptureSites = []postCommitCaptureSite{
 	},
 }
 
-// soleExceptionClaims are the phrasings that assert a single exception to R-2.
+// soleExceptionClaims are the phrasings that assert a single exception to same-transaction
+// capture.
 //
-// Every one of these was present in the tree and every one was false. They are matched as
-// literals because the defect IS the literal claim: this is an assertion about what the
-// repository tells a reader, and only prose can carry it.
+// Every one of these was present in the tree and every one was false.
 var soleExceptionClaims = []string{
 	"single documented exception",
 	"the single explicit exception",
@@ -1868,11 +1564,10 @@ var soleExceptionClaims = []string{
 }
 
 // durabilityClaimSources are the files that describe the durability contract: the three
-// capture sites, the shared capture helpers, the model, the published documentation and the
-// migration that creates the table.
+// capture sites, the shared capture helpers, the model, the published documentation and
+// the migration that creates the table.
 //
-// This test file is deliberately ABSENT from the list. It holds every forbidden phrase above
-// as data, so scanning itself would make the guard fail on its own evidence.
+// This test file is deliberately ABSENT from the list.
 var durabilityClaimSources = []string{
 	"balance.go",
 	"transaction_bulk.go",
@@ -1887,10 +1582,8 @@ var durabilityClaimSources = []string{
 
 // TestPostCommitCaptureSites_StillSpendARetryBudget pins the code half of the contract.
 //
-// A capture whose mutation has already committed gets exactly one chance at the row, so a
-// single attempt turns a momentary connection reset into permanent loss. All three sites
-// therefore spend the same bounded budget. Reverting any of them to a one-shot PublishEvent
-// deletes the snippet named here.
+// A capture whose mutation has already committed gets exactly one chance at the row, so
+// a single attempt turns a momentary connection reset into permanent loss.
 func TestPostCommitCaptureSites_StillSpendARetryBudget(t *testing.T) {
 	for _, site := range postCommitCaptureSites {
 		t.Run(site.eventClass, func(t *testing.T) {
@@ -1910,14 +1603,9 @@ func TestPostCommitCaptureSites_StillSpendARetryBudget(t *testing.T) {
 
 // TestPostCommitCaptureSites_AreDocumentedAsASetOfThree pins the documentation half.
 //
-// The heading it requires is the one docs/event-streaming.md actually carries and the one
-// guarantee 1 links to by anchor — "event types", the noun the rest of that document and the
-// `event_type` envelope field already use. A second noun for the same concept is how an
-// in-document anchor comes to point at a heading that no longer exists.
-//
-// docs/event-streaming.md is what a subscriber reads to decide whether it needs to reconcile
-// against the API, so a member missing from that section is a member nobody knows to defend
-// against.
+// The heading it requires is the one docs/event-streaming.md actually carries and the
+// one guarantee 1 links to by anchor — "event types", the noun the rest of that
+// document and the `event_type` envelope field already use.
 func TestPostCommitCaptureSites_AreDocumentedAsASetOfThree(t *testing.T) {
 	published, err := os.ReadFile("docs/event-streaming.md")
 	require.NoError(t, err, "reading the published event documentation")
@@ -1940,11 +1628,8 @@ func TestPostCommitCaptureSites_AreDocumentedAsASetOfThree(t *testing.T) {
 			"assumes otherwise will look for it in the dead-letter inventory, where it can never appear")
 }
 
-// TestDurabilityContract_NoSourceClaimsToBeTheOnlyException is the regression guard proper.
-//
-// It is the assertion that makes the original defect unrepresentable rather than merely
-// corrected: three sites each claiming exclusivity cannot coexist, and the only way to catch
-// that is to forbid the claim outright. Every needle below was in the tree.
+// TestDurabilityContract_NoSourceClaimsToBeTheOnlyException is the regression guard
+// proper.
 func TestDurabilityContract_NoSourceClaimsToBeTheOnlyException(t *testing.T) {
 	for _, file := range durabilityClaimSources {
 		t.Run(file, func(t *testing.T) {
@@ -1953,9 +1638,9 @@ func TestDurabilityContract_NoSourceClaimsToBeTheOnlyException(t *testing.T) {
 			text := string(source)
 
 			for _, claim := range soleExceptionClaims {
-				// assert.Falsef rather than assert.NotContains, deliberately: the latter
-				// prints the ENTIRE haystack on failure, which for a 1,500-line source file
-				// buries the one sentence the reader has to change under the whole file.
+				// assert.Falsef rather than assert.NotContains, deliberately: the latter prints the
+				// ENTIRE haystack on failure, which for a 1,500-line source file buries the one
+				// sentence the reader has to change under the whole file.
 				assert.Falsef(t, strings.Contains(text, claim),
 					"%s claims a SINGLE exception to requirement R-2 with %q, and there are "+
 						"THREE: balance.monitor, bulk_transaction.* and a coalesced batch's "+
@@ -1970,14 +1655,10 @@ func TestDurabilityContract_NoSourceClaimsToBeTheOnlyException(t *testing.T) {
 	}
 }
 
-// TestPostTransactionActions_RetriesTheCoalescedCaptureOnATransientFault is the behavioural
-// half of the third member.
+// TestPostTransactionActions_RetriesTheCoalescedCaptureOnATransientFault is the
+// behavioural half of the third member.
 //
-// This capture used to make ONE attempt. Everything that reaches it has already committed —
-// a coalesced batch is durable before the hook runs — so a single failed insert destroyed
-// the event outright while the balances stood, which is the same defect PublishEventDurably
-// was introduced to fix for balance.monitor. The retry re-sends the SAME prepared row, so it
-// cannot deliver the event twice.
+// This capture used to make ONE attempt.
 func TestPostTransactionActions_RetriesTheCoalescedCaptureOnATransientFault(t *testing.T) {
 	instance, datasource := producerAtomicityMock(t)
 	spy := scriptStandaloneInsert(datasource, errors.New("connection reset"), nil)
@@ -2009,11 +1690,8 @@ func TestPostTransactionActions_RetriesTheCoalescedCaptureOnATransientFault(t *t
 // TestDurabilityContract_SystemErrorIsNotCountedAsAnException records a distinction the
 // enumeration depends on.
 //
-// system.error is captured outside a transaction like the three above, so it is easy to add
-// to the set by mistake. It does not belong there: it describes no ledger mutation, so there
-// is nothing it could have been atomic with and nothing about a mutation is lost with it.
-// Counting it would make "three" wrong in the other direction and would tell a subscriber to
-// reconcile a stream that has no ledger state behind it.
+// system.error is captured outside a transaction like the three above, so it is easy to
+// add to the set by mistake.
 func TestDurabilityContract_SystemErrorIsNotCountedAsAnException(t *testing.T) {
 	for _, site := range postCommitCaptureSites {
 		require.NotEqual(t, "system.error", site.eventClass,
@@ -2035,9 +1713,9 @@ func TestDurabilityContract_SystemErrorIsNotCountedAsAnException(t *testing.T) {
 
 // capturedMonitorAlert builds a balanceMonitorCapture recording exactly one alert.
 //
-// It exists so a test can state "this monitor's alert is already in the mutation's transaction"
-// without reaching into the capture's map keys, which are composed by monitorCaptureKey and are
-// not the test's business.
+// It exists so a test can state "this monitor's alert is already in the mutation's
+// transaction" without reaching into the capture's map keys, which are composed by
+// monitorCaptureKey and are not the test's business.
 //
 // Parameters:
 //   - balanceID, monitorID string: the alert already captured atomically.
@@ -2058,24 +1736,8 @@ type escalatedSystemError struct {
 	message string
 }
 
-// escalationCapture records the system.error escalations notification.NotifyError dispatches
-// while one test runs.
-//
-// # Why capturing the sender is REQUIRED here rather than tidy
-//
-// NotifyError dispatches asynchronously — it returns as soon as it has spawned its goroutine —
-// through a sender registered in a PROCESS-GLOBAL variable that NewBlnk installs. Nothing in
-// this file calls NewBlnk, so without an override the sender registered when one of these
-// escalations actually runs is the closure some earlier test's NewBlnk left behind, pointing at
-// THAT test's mock datasource. The escalation then calls InsertEventOutbox on a mock with no
-// expectation for it, and testify's response to an unexpected call on a goroutine it does not
-// own is to panic and take the whole test binary down — from a test that had already passed,
-// naming a batch from a test that had already finished.
-//
-// Registering a capture removes both halves of that: the escalation lands somewhere that
-// records it instead of somewhere that panics, and the test can WAIT for it, so no goroutine
-// from this test is still in flight when the next one starts. It also turns the escalation from
-// an invisible side effect into an asserted one, which is what the fix it belongs to claims.
+// escalationCapture records the system.error escalations notification.NotifyError
+// dispatches while one test runs.
 type escalationCapture struct {
 	guard   sync.Mutex
 	raised  []escalatedSystemError
@@ -2090,10 +1752,7 @@ const escalationCaptureDepth = 8
 
 // captureSystemErrorEscalations installs the capture for the duration of one test.
 //
-// The cleanup deliberately restores a BENIGN sender rather than the production closure. A
-// goroutine this test spawned can only be in flight if the test did not wait for it, and the
-// production closure would route that stray escalation into the next test's mock — the exact
-// failure described above. A sender that records nothing and returns nil cannot.
+// The cleanup deliberately restores a BENIGN sender rather than the production closure.
 func captureSystemErrorEscalations(t *testing.T) *escalationCapture {
 	t.Helper()
 
@@ -2153,67 +1812,27 @@ func (c *escalationCapture) await(t *testing.T) escalatedSystemError {
 	return c.raised[len(c.raised)-1]
 }
 
-// TestCheckBalanceMonitors_CapturesTheMonitorEventDurably HAS BEEN REMOVED, and this records
-// where each half of it went, because the property it asserted is still guarded — just not from
-// that site, which can no longer reach the behaviour.
-//
-// # Why it could not stay
-//
-// It drove checkBalanceMonitors on a Kafka-configured instance and asserted that a failed
-// InsertEventOutbox was retried. Both of those are now unreachable together. checkBalanceMonitors
-// returns immediately when balanceMonitorHandoffEnabled is true, because the alert is captured
-// inside the balance's own transaction — evaluated before the write, or from a durable handoff row
-// — and publishing from here as well would deliver every threshold crossing twice under two
-// different event ids, which nothing at a subscriber could collapse. And that predicate is
-// EventPublishingConfigured, the same fact PrepareEventOutbox reads, so on the one shape where
-// this function does still publish there is no outbox row to insert and therefore none to retry.
-// A configuration in which the assertion held would have had to be one production cannot produce.
-//
-// # Where its three assertions live now
+// The durability of a balance.monitor capture is guarded from two places rather than from
+// the monitor-check site, which can no longer reach the behaviour:
 //
 //   - "the site spends a retry budget rather than making one attempt" —
-//     TestPostCommitCaptureSites_StillSpendARetryBudget, subtest balance.monitor, which reads
-//     balance.go and fails if the budgeted call is replaced by a one-shot PublishEvent. That is
-//     the same regression the deleted test was written to catch, caught by source rather than by
-//     a mock that can no longer be reached.
+//     TestPostCommitCaptureSites_StillSpendARetryBudget, subtest balance.monitor, which
+//     reads balance.go and fails if the budgeted call is replaced by a one-shot
+//     PublishEvent.
 //   - "a transient capture failure is retried with the same event id" —
 //     TestPublishEventDurably_RetriesATransientCaptureFailure and
 //     TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate.
-//   - "the captured alert carries the monitor payload and the monitored balance's ledger" —
-//     TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite for the pre-commit
-//     route and TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion for the
+//   - "the captured alert carries the monitor payload and the monitored balance's
+//     ledger" — TestPrepareBalanceMonitorEventOutboxes_BuildsTheAlertBeforeTheWrite for
+//     the pre-commit route and
+//     TestBalanceMonitorHandoff_CapturesTheAlertAtomicallyWithTheCompletion for the
 //     handoff route, which are the two routes that now produce the row.
-//
-// What remains observable at the site itself is the broker-less fallback, and it is covered:
-// TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka for the delivery,
-// TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement for the per-monitor skip,
-// and TestCheckBalanceMonitors_EscalatesALostAlert for the loss.
 
-// TestPolledConditions_CannotFailTheTestFromTestifysGoroutine is the guard on a defect class
-// that cost this package a whole run and blamed a test that had passed.
+// TestPolledConditions_CannotFailTheTestFromTestifysGoroutine is the guard on a defect
+// class that cost this package a whole run and blamed a test that had passed.
 //
-// # What went wrong
-//
-// assert.Never and require.Eventually evaluate their condition REPEATEDLY and on a goroutine of
-// testify's own, and they stop waiting for it once the window closes. A straggler evaluation can
-// therefore still be running after the test function has returned and after t.Cleanup has torn
-// down the miniredis server it reads. If that condition can fail the test — because it calls
-// require or assert, directly or through a helper that takes *testing.T — the report arrives
-// after completion, and Go's testing package turns it into "panic: Fail in goroutine after
-// <test> has completed", which fails the ENTIRE PACKAGE and names the wrong test. Under -race the
-// wider scheduling window made it the usual outcome rather than a rare one.
-//
-// # What this asserts
-//
-// No polled condition in this package's tests may touch the test at all: its job is to answer
-// true or false. A read that cannot be performed is "not yet satisfied" — which is the correct
-// answer for Never, and for Eventually leaves the loud failure to the timeout, on the test
-// goroutine where it is legal. Helpers for the two forms sit beside each other in
-// event_outbox_test.go: outboxPendingLegacyTasks for the test goroutine, countPendingLegacyTasks
-// for a condition.
-//
-// The WithT variants are exempt: they are handed an *assert.CollectT precisely so that a
-// condition CAN assert, and testify owns the reporting.
+// assert.Never and require.Eventually evaluate their condition REPEATEDLY and on a
+// goroutine of testify's own, and they stop waiting for it once the window closes.
 func TestPolledConditions_CannotFailTheTestFromTestifysGoroutine(t *testing.T) {
 	t.Parallel()
 

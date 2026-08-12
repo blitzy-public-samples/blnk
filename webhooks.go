@@ -43,74 +43,20 @@ import (
 	"github.com/hibiken/asynq"
 )
 
-// This file is the LEGACY HTTP webhook transport. It is retained deliberately, and
-// only for the duration of the 30-day dual-delivery window that accompanies the move
-// to Kafka event streaming. Nothing in it is new work; everything in it is frozen.
-//
-// What changed when Kafka publishing landed is not the code here — it is who calls
-// it. Before: eight domain post-actions called SendWebhook directly (the ledger,
-// identity, balance, balance-monitor, transaction-execution, bulk-transaction and
-// transaction-rejection sites, plus the notification.RegisterWebhookSender closure in
-// blnk.go that carries system.error). After: none of them do. They record an event
-// into blnk.event_outbox — inside the mutation's own transaction when the caller has
-// one to share, and otherwise as its own committed insert from the post-action
-// goroutine, which is what those call sites do today — and the event relay in
-// event_relay.go claims that row, publishes it to Kafka, and, for as long as the
-// window is open, enqueues the legacy webhook task from THAT SAME CLAIMED ROW through
-// EnqueueLegacyWebhookDelivery. The relay's dual-delivery branch is therefore the one
-// and only caller of that function.
-//
-// READING ONE ROW IS NECESSARY BUT NOT SUFFICIENT. Both transports reading one row is
-// what makes them carry the same EVENT; carrying the same BYTES additionally requires
-// that neither re-serialises the payload on its way out, and the byte-level equivalence
-// assertion is what the guarantee is actually measured by. An earlier version of this
-// contract claimed equivalence while the legacy path decoded the stored bytes into
-// NewWebhook.Payload interface{} and marshalled them again — which sorts every object's
-// keys and re-renders every number through float64. The two bodies stayed semantically
-// equal, so nothing looked wrong; they were simply not the same bytes.
-//
-// The path is therefore byte-oriented end to end: EnqueueLegacyWebhookDelivery carries
-// the stored bytes into the queue, ProcessWebhook validates without transforming, and
-// processHTTPRaw signs and POSTs exactly what it was handed. Nothing between the outbox
-// row and the socket re-serialises anything, which is what makes the equivalence
-// structural rather than a property somebody has to remember to preserve.
-//
-// Deleting this file before the window closes would remove the second transport that
-// the guarantee is measured against.
-//
-// This file holds NO sunset logic, and that is intentional. The deprecation window is
-// one resolution with two consumers, each keying on the boundary it owns: the relay's
-// dual-delivery branch asks WebhookDualDeliveryActive, which is true only inside
-// [start, sunset), and the HTTP 410 Gone guard asks WebhookSunsetPassed, because a
-// route's availability is a function of the sunset alone. Both live in
-// event_sunset.go, the only place in this codebase that compares a clock against the
-// configured window. A date comparison added here would be a third, independently
-// drifting copy of that decision. The functions below simply deliver whatever they are
-// handed, whenever they are called; deciding whether they should be called at all
-// belongs to the caller.
-//
-// Retiring this file is a separate, later step with a strict order of operations,
-// spelled out in the SUNSET block at the foot of this file. Read it before deleting
-// anything. Its first step is already done — the two symbols that had to outlive this
-// file, NewWebhook and getEventFromStatus, now live in event_outbox.go and
-// event_topics.go — so what remains is a deletion plus the one prohibition that matters:
-// the shared asynq queue must survive it untouched.
+// This file is the LEGACY HTTP webhook transport. It is retained deliberately, and only
+// for the duration of the 30-day dual-delivery window that accompanies the move to
+// Kafka event streaming. Nothing in it is new work; everything in it is frozen.
 
 // legacyWebhookPrivateDestinationWarning makes the operator's private-destination
 // assertion appear in the log exactly once per process.
-//
-// Once, rather than per delivery: at any real delivery rate a per-dial warning becomes
-// noise that gets filtered, and a filtered warning is not a warning. Once per process is
-// enough for the assertion to be discoverable in the log of any deployment that made it,
-// which is the whole purpose.
 var legacyWebhookPrivateDestinationWarning sync.Once
 
 // errLegacyWebhookRedirect is the sentinel every refused redirect wraps.
 //
 // A sentinel rather than a formatted string so a test can assert the REASON a delivery
-// failed with errors.Is instead of matching prose, and so a future caller can distinguish
-// "the endpoint tried to redirect us" from a transport failure it should retry
-// differently.
+// failed with errors.Is instead of matching prose, and so a future caller can
+// distinguish "the endpoint tried to redirect us" from a transport failure it should
+// retry differently.
 var errLegacyWebhookRedirect = errors.New("legacy webhook delivery refused to follow a redirect")
 
 // errLegacyWebhookDestination is the sentinel every refused destination wraps.
@@ -118,11 +64,6 @@ var errLegacyWebhookDestination = errors.New("legacy webhook destination is not 
 
 // legacyWebhookAllowsPrivateDestination reports whether the operator has asserted that
 // the webhook destination is on a network they own.
-//
-// Configuration is read on every call rather than captured when the client was built.
-// That is deliberate: the client is constructed once for the process lifetime, so a
-// captured value would freeze whatever configuration happened to be loaded at
-// construction and ignore every later reload.
 //
 // It FAILS CLOSED. Unfetchable configuration answers false, so an unconfigured process
 // refuses internal destinations rather than permitting them by accident.
@@ -142,7 +83,8 @@ func legacyWebhookAllowsPrivateDestination() bool {
 // transport. It never permits a redirect.
 //
 // Parameters:
-//   - req *http.Request: the request the client is about to make to the redirect target.
+//   - req *http.Request: the request the client is about to make to the redirect
+//     target.
 //   - via []*http.Request: the requests already made, so the hop count can be reported.
 //
 // Returns:
@@ -150,8 +92,8 @@ func legacyWebhookAllowsPrivateDestination() bool {
 func refuseLegacyWebhookRedirect(req *http.Request, via []*http.Request) error {
 	target := "unknown"
 	if req != nil && req.URL != nil {
-		// Scheme and host only. The path can carry a subscriber's own identifiers, and
-		// the whole value is third-party text, so it is bounded and stripped of control
+		// Scheme and host only. The path can carry a subscriber's own identifiers, and the
+		// whole value is third-party text, so it is bounded and stripped of control
 		// characters before it reaches a log line.
 		target = sanitizeLogValue(req.URL.Scheme+"://"+req.URL.Host, maxLoggedErrorLength)
 	}
@@ -166,19 +108,15 @@ func refuseLegacyWebhookRedirect(req *http.Request, via []*http.Request) error {
 	return fmt.Errorf("%w: %s after %d hop(s)", errLegacyWebhookRedirect, target, len(via))
 }
 
-// guardLegacyWebhookDial is the net.Dialer Control hook for the legacy transport. It runs
-// after DNS resolution and before connect, and refuses an address Blnk must not reach.
-//
-// # Why here and not before the request
+// guardLegacyWebhookDial is the net.Dialer Control hook for the legacy transport. It
+// runs after DNS resolution and before connect, and refuses an address Blnk must not
+// reach.
 //
 // This is the only point at which the address actually being connected to is known. A
-// check on the URL text judges a name; this judges the answer. That closes DNS rebinding,
-// and it closes it without a time-of-check-to-time-of-use window, because the address
-// handed to this hook is the address the socket then uses — there is no second lookup to
-// disagree with.
+// check on the URL text judges a name; this judges the answer.
 //
 // Parameters:
-//   - network string: the dial network, e.g. "tcp4". A non-TCP network is refused.
+//   - network string: the dial network, e.g. "tcp4".
 //   - address string: "host:port", where host is always a resolved literal.
 //   - _ syscall.RawConn: the raw connection, unused. No socket option is set here.
 //
@@ -225,20 +163,12 @@ func guardLegacyWebhookDial(network, address string, _ syscall.RawConn) error {
 		errLegacyWebhookDestination, reason)
 }
 
-// validateLegacyWebhookDestination applies the URL-text half of the destination policy to
-// the configured endpoint.
+// validateLegacyWebhookDestination applies the URL-text half of the destination policy
+// to the configured endpoint.
 //
 // It is the cheap, early half. It rejects the schemes and the obviously-internal hosts
 // before a request is built, so the common misconfiguration produces one clear error
-// instead of a dial failure an operator has to interpret. The authoritative half is
-// guardLegacyWebhookDial, which judges what the name actually resolves to — this function
-// deliberately claims nothing about that.
-//
-// Names are treated as operator-ownable when the assertion is set, IP literals are not.
-// The asymmetry is the point: a name cannot be identified as the metadata endpoint by
-// inspection (metadata.google.internal is just a .internal name), so nothing is gained by
-// tiering names here — the dial hook judges the address it resolves to, and that hook
-// refuses link-local no matter what the assertion says.
+// instead of a dial failure an operator has to interpret.
 //
 // Parameters:
 //   - rawURL string: the configured destination. Never empty; callers check first.
@@ -293,9 +223,9 @@ func validateLegacyWebhookDestination(rawURL string) error {
 
 // processHTTP sends a webhook notification via HTTP POST request.
 //
-// The wire contract it implements is unchanged by the move to Kafka and is asserted
-// end to end by webhooks_process_test.go, which reconstructs the signature from what
-// the receiver was handed:
+// The wire contract it implements is unchanged by the move to Kafka and is asserted end
+// to end by webhooks_process_test.go, which reconstructs the signature from what the
+// receiver was handed:
 //
 //   - The body is the marshaled NewWebhook envelope, sent with
 //     Content-Type: application/json.
@@ -307,13 +237,6 @@ func validateLegacyWebhookDestination(rawURL string) error {
 //   - Configured Notification.Webhook.Headers are applied, EXCEPT the ones the transport
 //     computes for itself — see applyConfiguredWebhookHeaders, which explains why a
 //     configured X-Blnk-Signature is an integrity problem rather than an override.
-//
-// Retry is delegated, not owned. A non-2xx response returns an error so that asynq
-// retries the delivery; swallowing it would permanently drop the webhook on a
-// receiver-side failure. Exactly one HTTP attempt happens per call. The Kafka relay
-// deliberately does NOT reuse this arrangement — a Kafka publish has no HTTP status
-// to key on, so event_relay.go owns its own bounded exponential backoff. That
-// difference lives entirely in the relay and changes nothing here.
 //
 // Parameters:
 // - ctx context.Context: bounds the request. Cancelling it abandons the delivery.
@@ -333,55 +256,17 @@ func processHTTP(ctx context.Context, data NewWebhook, client *http.Client) erro
 	return processHTTPRaw(ctx, "", payloadBytes, client)
 }
 
-// processHTTPRaw sends an already-serialised webhook body, signing and posting the exact
-// bytes it was handed.
+// processHTTPRaw sends an already-serialised webhook body, signing and posting the
+// exact bytes it was handed.
 //
-// # Why this is the primitive and processHTTP is the wrapper
-//
-// This is the only function that touches the socket, and it takes BYTES. That is what makes
-// byte fidelity structural rather than a property somebody has to remember to preserve:
-// there is no path to the network that re-serialises anything, so the body a subscriber
-// receives is necessarily the body the caller supplied. For the dual-delivery window that
-// body is blnk.event_outbox.payload_raw, the byte-exact stored copy, identical to the bytes
-// published to Kafka.
-//
-// processHTTP remains as a thin wrapper for the struct-shaped callers — the existing tests
-// and any caller that genuinely holds a NewWebhook — and marshals once before delegating
-// here. The important consequence is the direction of the dependency: serialisation happens
-// ABOVE this function or not at all, never inside it.
-//
-// The signature covers the bytes as sent. Signing the supplied body rather than a
-// re-serialisation of it is not a detail: a receiver recomputes HMAC over the body it
-// received, so a body that changed between signing and sending would fail verification at
-// every subscriber.
-//
-// Every other element of the wire contract is unchanged from processHTTP's documentation
-// above — content type, the timestamp inside the signed material, the unsigned warning when
-// no secret is configured, configured headers filtered by applyConfiguredWebhookHeaders, and
-// a non-2xx returned so asynq retries.
-//
-// # THE REQUEST IS BOUND TO THE CALLER'S CONTEXT
-//
-// It is built with http.NewRequestWithContext, not http.NewRequest. asynq cancels a handler's
-// context when a worker begins shutting down, and with an unbound request that cancellation
-// reached nothing: the only bound on a delivery was the shared client's thirty-second
-// timeout, so a worker draining for deployment had to wait out every delivery already on the
-// wire, and a receiver holding connections open could stretch that to thirty seconds per
-// in-flight task. A cancelled delivery costs one redelivery — the task fails, asynq retries
-// it, and the outbox row behind it is untouched — which is a far cheaper thing to pay than a
-// deployment that cannot drain.
-//
-// # THIS FUNCTION LOGS NOTHING ABOUT A FAILED DELIVERY
-//
-// It returns the failure, status code included, and its callers record it once. It used to
-// warn about a non-2xx here as well, which produced two records for one failure — a status
-// with no event, task or queue beside it, and then the caller's record saying the same thing
-// in different words. At the pipeline's 500-events-per-second target that duplicate is not a
-// second opinion, it is half the log. See legacyWebhookFailureRecord for what replaced it.
+// It returns the failure, status code included, and its callers record it once. At the
+// pipeline's 500-events-per-second target that duplicate is not a second opinion, it is
+// half the log.
 //
 // Parameters:
 //   - ctx context.Context: bounds the request. Cancelling it abandons the delivery.
-//   - payloadBytes []byte: the body to send, verbatim. Never inspected, never rewritten.
+//   - payloadBytes []byte: the body to send, verbatim. Never inspected, never
+//     rewritten.
 //   - client *http.Client: the pooled client to send with.
 //
 // Returns:
@@ -415,14 +300,9 @@ func processHTTPRaw(ctx context.Context, eventID string, payloadBytes []byte, cl
 
 	req.Header.Set("Content-Type", "application/json")
 
-	// THE IDENTITY, when the caller has one. Set before the signature so the ordering reads
-	// as "describe the delivery, then sign the body", and set before the configured headers
-	// so applyConfiguredWebhookHeaders can refuse an override of it.
-	//
-	// Empty means the caller genuinely has no identity to offer — SendWebhook takes a struct
-	// and carries none — and the header is OMITTED rather than sent blank. An empty value is
-	// worse than an absent one: a receiver keying on it would treat every such delivery as the
-	// same event and discard all but the first.
+	// THE IDENTITY, when the caller has one. Set before the signature so the ordering
+	// reads as "describe the delivery, then sign the body", and set before the configured
+	// headers so applyConfiguredWebhookHeaders can refuse an override of it.
 	if trimmedEventID := strings.TrimSpace(eventID); trimmedEventID != "" {
 		req.Header.Set(LegacyWebhookEventIDHeader, trimmedEventID)
 	}
@@ -447,50 +327,27 @@ func processHTTPRaw(ctx context.Context, eventID string, payloadBytes []byte, cl
 	}
 
 	// DRAIN BEFORE CLOSE, or the pooled connection is thrown away on every delivery.
-	//
-	// Go returns a connection to the transport's idle pool only when the response body has
-	// been read to EOF and then closed. A Close on an unread body closes the CONNECTION
-	// instead — so with no drain here, initializeHTTPClient's MaxIdleConns of 100 and
-	// MaxIdleConnsPerHost of 10 pool nothing at all, and every webhook delivery pays for a
-	// fresh TCP handshake (and a fresh TLS handshake, on an https receiver) even though the
-	// client is shared. Measured on the receiver: five sequential deliveries opened five
-	// connections without this drain and one with it.
-	//
-	// The response body is otherwise of no interest — the status decides success, and
-	// nothing here parses what a subscriber sends back — which is exactly why the read was
-	// easy to omit and impossible to notice: delivery works perfectly either way.
-	//
-	// BOUNDED, because the receiver is not ours. An unbounded io.Copy would let a broken or
-	// hostile endpoint stream unlimited data into a webhook worker for as long as the
-	// client timeout allows, turning a delivery into a memory-and-bandwidth sink. A body
-	// larger than the cap simply does not get its connection reused, which is the correct
-	// trade: reuse is an optimisation and the bound is a safety property.
-	//
-	// The read error is deliberately ignored. A drain that fails leaves the connection
-	// unreusable and nothing else — the delivery has already happened, and the status below
-	// is what determines whether asynq retries it. Reporting a drain failure as a delivery
-	// failure would cause a retry of a webhook the subscriber already received.
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxWebhookResponseDrainBytes))
 		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Returning the error lets asynq retry the delivery; swallowing it would
-		// permanently drop the webhook on receiver-side failures. The status is carried IN
-		// the error rather than logged here, so the caller's single record can name it
-		// alongside the event, task and queue it belongs to.
+		// Returning the error lets asynq retry the delivery; swallowing it would permanently
+		// drop the webhook on receiver-side failures. The status is carried IN the error
+		// rather than logged here, so the caller's single record can name it alongside the
+		// event, task and queue it belongs to.
 		return fmt.Errorf("webhook delivery failed with status %d", resp.StatusCode)
 	}
 
 	return nil
 }
 
-// transportOwnedWebhookHeaders are the headers processHTTPRaw computes for itself, in the
-// canonical form net/http stores them under.
+// transportOwnedWebhookHeaders are the headers processHTTPRaw computes for itself, in
+// the canonical form net/http stores them under.
 //
-// They are listed rather than derived because each one carries a guarantee the delivery makes
-// about ITSELF, which no amount of configuration can be allowed to restate:
+// They are listed rather than derived because each one carries a guarantee the delivery
+// makes about ITSELF, which no amount of configuration can be allowed to restate:
 //
 //   - X-Blnk-Signature and X-Blnk-Timestamp are the HMAC over timestamp + "." + body and the
 //     timestamp it is computed against. They are the only evidence a subscriber has that the
@@ -499,83 +356,38 @@ func processHTTPRaw(ctx context.Context, eventID string, payloadBytes []byte, cl
 //     receiver told otherwise mis-parses a payload that is perfectly well formed.
 //   - Content-Length is set by net/http from the body it is actually sending; a configured
 //     value would either truncate the request or make it hang waiting for bytes.
-//
-// The map is keyed by http.CanonicalMIMEHeaderKey's output because Header.Set canonicalises
-// what it is given: a configured "x-blnk-timestamp" and "X-Blnk-Timestamp" land on the same
-// entry, so comparing raw configured keys would let the lower-cased spelling through.
 var transportOwnedWebhookHeaders = map[string]struct{}{
 	textproto.CanonicalMIMEHeaderKey("Content-Type"):     {},
 	textproto.CanonicalMIMEHeaderKey("Content-Length"):   {},
 	textproto.CanonicalMIMEHeaderKey("X-Blnk-Signature"): {},
 	textproto.CanonicalMIMEHeaderKey("X-Blnk-Timestamp"): {},
 	// The event identity, for the same reason as the signature: it is a statement the
-	// transport makes about THIS delivery, and a receiver deduplicating on it must be able to
-	// trust it. A configured constant here would collapse every event onto one identity and a
-	// receiver would discard all but the first as duplicates — silently, and permanently.
+	// transport makes about THIS delivery, and a receiver deduplicating on it must be able
+	// to trust it. A configured constant here would collapse every event onto one identity
+	// and a receiver would discard all but the first as duplicates — silently, and
+	// permanently.
 	textproto.CanonicalMIMEHeaderKey(LegacyWebhookEventIDHeader): {},
 }
 
-// LegacyWebhookEventIDHeader carries the outbox event id to the receiver of a legacy HTTP
-// delivery.
+// LegacyWebhookEventIDHeader carries the outbox event id to the receiver of a legacy
+// HTTP delivery.
 //
-// # Why the receiver needs it
-//
-// Legacy delivery is AT-LEAST-ONCE with a bounded suppression window — see
-// LegacyWebhookRetention for the bound and why it exists. A receiver that wants
-// exactly-once processing therefore has to deduplicate, and until this header existed it had
-// nothing to deduplicate ON: the body is the frozen legacy envelope, `{"event":…,"data":…}`,
-// which carries no delivery identity, and two deliveries of one event are byte-identical, so
-// hashing the body cannot distinguish a duplicate from a legitimately repeated event.
-//
-// It is the SAME `event_id` that is the Kafka subscriber's idempotency key, deliberately: a
-// subscriber migrating from the webhook to the topic keeps the key it already deduplicates on
-// rather than acquiring a second one, and a subscriber reading both during the dual-delivery
-// window can recognise the two transports' copies of one event as one event.
-//
-// # Why a header rather than a body field
-//
-// The body is FROZEN. Its bytes are asserted equal to the bytes published to Kafka, and the
-// payload-preservation guarantee is that a subscriber's existing parser works unchanged. Adding
-// a member would break both, and it would break them in the migration's final week, for the
-// benefit of a field the receiver can have for free in a header.
-//
-// The signature is unaffected: the HMAC is computed over `timestamp + "." + body`, so headers
-// are outside it. That also means this header is NOT signed and a receiver must not treat it as
-// evidence of origin — it is a correlation and deduplication key, and the signature over the
-// body remains the only proof the delivery came from this deployment.
+// The body is FROZEN. Its bytes are asserted equal to the bytes published to Kafka, and
+// the payload-preservation guarantee is that a subscriber's existing parser works
+// unchanged.
 const LegacyWebhookEventIDHeader = "X-Blnk-Event-Id"
 
-// applyConfiguredWebhookHeaders copies the operator's configured headers onto an outgoing
-// request, refusing the ones the transport owns.
-//
-// # The defect this closes, which is an integrity defect rather than a tidiness one
-//
-// Configured headers used to be applied last, so a header named X-Blnk-Signature simply
-// REPLACED the computed HMAC with whatever constant was configured. Every subscriber that
-// actually verifies the signature would then reject every delivery — noisy, and therefore
-// survivable. The dangerous half is the subscriber that only checks the header is PRESENT: it
-// accepts the constant for ever, including for a body it should have refused, and the
-// deployment believes it is signing its webhooks the whole time. Neither side logs anything.
-//
-// # Why the refusal is narrow
+// applyConfiguredWebhookHeaders copies the operator's configured headers onto an
+// outgoing request, refusing the ones the transport owns.
 //
 // Only the four headers the transport computes are refused. A configured Authorization,
 // X-Tenant or User-Agent is exactly what this setting is for — the receiver's own
-// requirements — and filtering by prefix or by an allowlist would break that. The rule is
-// "the transport's own statements about this request are not configurable", nothing wider.
-//
-// # Why the refusal is a warning rather than an error
-//
-// The delivery still happens, correctly signed. Refusing the whole delivery would turn a
-// configuration mistake into an outage for every subscriber on a transport that is already
-// deprecated, and the mistake is visible in the log either way. The warning is rate-limited
-// on the same reasoning as the unsigned-delivery one: the condition is static configuration
-// re-read on every delivery, so warning per delivery produces hundreds of identical lines a
-// second and buries everything else.
+// requirements — and filtering by prefix or by an allowlist would break that.
 //
 // Parameters:
-//   - header http.Header: the outgoing request's headers, already carrying the computed ones.
-//   - configured map[string]string: the operator's configured headers. A nil map is a no-op.
+//   - header http.Header: the outgoing request's headers, already carrying the computed
+//     ones.
+//   - configured map[string]string: the operator's configured headers.
 func applyConfiguredWebhookHeaders(header http.Header, configured map[string]string) {
 	refused := make([]string, 0, len(configured))
 
@@ -613,10 +425,6 @@ var configuredWebhookHeaderWarning = &rateLimitedWarning{
 // unsignedWebhookWarningInterval, naming which ones and how many deliveries the silence
 // covered.
 //
-// The names are safe to log: they are header FIELD NAMES from the deployment's own
-// configuration and are matched against a fixed set before they get here, so the value —
-// which may be a credential — is never named.
-//
 // Parameters:
 //   - refused []string: the canonical names that were not applied, already sorted.
 func warnConfiguredWebhookHeadersRefused(refused []string) {
@@ -640,68 +448,28 @@ func warnConfiguredWebhookHeadersRefused(refused []string) {
 	)
 }
 
-// maxWebhookResponseDrainBytes bounds how much of a webhook receiver's response body is read
-// before the connection is returned to the idle pool.
-//
-// 64 KiB is far more than any acknowledgement a receiver has cause to send — Blnk reads none
-// of it, and the status line is what decides success — while being small enough that a
-// receiver which streams a response cannot use a delivery as a memory sink. Above the cap the
-// connection is not reused; nothing else changes.
+// maxWebhookResponseDrainBytes bounds how much of a webhook receiver's response body is
+// read before the connection is returned to the idle pool.
 const maxWebhookResponseDrainBytes = 64 << 10
 
-// unsignedWebhookWarningInterval is the shortest gap between two warnings about the same
-// unconfigured signing key.
-//
-// Ten minutes is chosen against the failure it prevents rather than as a round number. The
-// condition is STATIC — server.secret_key is either configured or it is not — so its
-// information content is one bit, and the pipeline's acceptance target is 500 events per
-// second. Warning per delivery therefore produced up to 500 identical lines a second, which
-// is not a louder warning but a quieter one: it buries every other line in the log, and an
-// operator who has seen the first thousand stops reading. Ten minutes keeps the condition
-// continuously visible to anyone reading a window of log, at a cost of six lines an hour.
-// legacyWebhookTaskIDNamespace prefixes an event id to form the task identity.
-//
-// It is declared once and shared by legacyWebhookTaskID and legacyWebhookEventID because
-// those two are inverses. Spelling it twice would let the decoder drift from the encoder,
-// and the symptom would be silent: task ids would still be namespaced correctly, and the
-// failure record would simply stop reporting event_id.
+// unsignedWebhookWarningInterval is the shortest gap between two warnings about the
+// same unconfigured signing key.
 const legacyWebhookTaskIDNamespace = "legacy-webhook:"
 
 const unsignedWebhookWarningInterval = 10 * time.Minute
 
-// rateLimitedWarning admits at most one occurrence of a repeating condition per interval
-// and counts the ones it withholds.
-//
-// # Why a latch would be wrong
-//
-// The obvious implementation is sync.Once: warn the first time and never again. It is
-// wrong here because the condition is not permanent — configuration is re-read on every
-// delivery (see ProcessWebhook), so a secret key can be removed from a running
-// deployment. A latch would have spent its single warning during a correctly configured
-// period and then stayed silent through the exposure it exists to report. An interval
-// re-warns for as long as the condition lasts and stops when it stops.
-//
-// # Why the count is unsigned and never resets to a lie
-//
-// suppressed counts occurrences since the last EMITTED warning, and admit hands that count
-// to the caller and clears it in the same critical section. Two callers can therefore never
-// both report the same suppressed occurrences, and none is dropped: whichever wins the lock
-// reports them.
-//
-// The zero value is usable and warns on its first occurrence: emitted is false until the
-// first admission, which is what distinguishes "never warned" from "warned at the zero
-// time" — an interval comparison against a zero time.Time would technically also admit,
-// but only by accident of the epoch being far in the past.
+// rateLimitedWarning admits at most one occurrence of a repeating condition per
+// interval and counts the ones it withholds.
 type rateLimitedWarning struct {
 	mu sync.Mutex
 
-	// interval is the minimum gap between emitted warnings. A non-positive interval
-	// emits every occurrence, which is the pre-rate-limit behaviour and is useful in a
-	// test that wants to observe every one.
+	// interval is the minimum gap between emitted warnings. A non-positive interval emits
+	// every occurrence, which is the pre-rate-limit behaviour and is useful in a test that
+	// wants to observe every one.
 	interval time.Duration
 
-	// now is the clock, injectable so a test can advance time without sleeping. Never
-	// nil in the package-level instances; admit falls back to time.Now if it is, so a
+	// now is the clock, injectable so a test can advance time without sleeping. Never nil
+	// in the package-level instances; admit falls back to time.Now if it is, so a
 	// zero-value struct is still usable.
 	now func() time.Time
 
@@ -710,13 +478,13 @@ type rateLimitedWarning struct {
 	suppressed  uint64
 }
 
-// admit records one occurrence of the condition and decides whether it should be logged.
+// admit records one occurrence of the condition and decides whether it should be
+// logged.
 //
 // Returns:
 //   - bool: true when the caller should log this occurrence.
-//   - uint64: when logging, how many occurrences were withheld since the previous logged
-//     one, not counting this one. Zero when nothing was withheld. Meaningless when the
-//     first return value is false.
+//   - uint64: when logging, how many occurrences were withheld since the previous
+//     logged one, not counting this one.
 func (w *rateLimitedWarning) admit() (bool, uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -744,9 +512,9 @@ func (w *rateLimitedWarning) admit() (bool, uint64) {
 // unsignedWebhookWarning rate-limits the unsigned-delivery warning for the process.
 //
 // It is package-level state because the condition is package-level: it describes the
-// deployment's configuration, not any one delivery, so every delivery site must share one
-// budget or the limit means nothing. It is created here rather than lazily so there is no
-// initialisation race between concurrent workers.
+// deployment's configuration, not any one delivery, so every delivery site must share
+// one budget or the limit means nothing. It is created here rather than lazily so there
+// is no initialisation race between concurrent workers.
 var unsignedWebhookWarning = &rateLimitedWarning{
 	interval: unsignedWebhookWarningInterval,
 	now:      time.Now,
@@ -755,11 +523,6 @@ var unsignedWebhookWarning = &rateLimitedWarning{
 // warnWebhookSentUnsigned reports an unsigned delivery at most once per
 // unsignedWebhookWarningInterval, saying how many deliveries the suppressed interval
 // covered.
-//
-// The count is the part that makes rate limiting honest. A bare "warned once every ten
-// minutes" hides the scale of the exposure — one unsigned test delivery and forty thousand
-// unsigned production deliveries produce the same line — so the number of occurrences the
-// silence covered is reported with the warning that ends it.
 func warnWebhookSentUnsigned() {
 	emit, suppressed := unsignedWebhookWarning.admit()
 	if !emit {
@@ -774,50 +537,23 @@ func warnWebhookSentUnsigned() {
 	entry.Warn("webhook sent unsigned: server.secret_key is not configured")
 }
 
-// legacyWebhookFailureRecord assembles the one structured record a failed legacy delivery
-// produces, naming what failed as precisely as the available identity allows.
+// legacyWebhookFailureRecord assembles the one structured record a failed legacy
+// delivery produces, naming what failed as precisely as the available identity allows.
 //
-// # What it names, and why each field earns its place
-//
-//   - task_id and queue come from the asynq handler context and are what an operator needs
-//     to find, inspect or archive the task with asynqmon or the Inspector.
-//   - event_id is decoded from the task id when the relay's namespace is present. It is the
-//     join to blnk.event_outbox and to the Kafka message published from the same row, which
-//     is what makes a webhook failure diagnosable against the event rather than in
-//     isolation. Absent for a task that did not come from the relay — SendWebhook sets no
-//     task identity at all — and absent rather than guessed.
-//   - retry_count and max_retry say whether asynq will try again or is about to archive the
-//     task. Without them a failure line cannot be told from a final one.
-//   - event_type is the envelope's event name, which is what attributes the failure to a
-//     subscriber-visible event family. Empty on the malformed-payload path, where by
-//     definition nothing could be decoded.
-//   - payload_bytes is the body size. It is the only fact available about a body that would
-//     not parse, and it distinguishes an empty task from a truncated one.
-//
-// The context getters return ok=false for a context asynq did not create, and every such
-// field is then OMITTED. A record that says retry_count=0 for a context that never carried
-// one is worse than a record that says nothing: it reads as a first attempt.
-//
-// # Bounding
-//
-// event_type and task_type reach this function from stored data and from configuration, and
-// the error text from a dependency; all three are passed through sanitizeLogValue, which
-// strips the characters that let a value forge a log line and caps the length. The caps
-// differ by kind deliberately: an identifier that is long is malformed, an error that is
-// long may still be useful for its first few hundred characters.
+// The context getters return ok=false for a context asynq did not create, and every
+// such field is then OMITTED. A record that says retry_count=0 for a context that never
+// carried one is worse than a record that says nothing: it reads as a first attempt.
 //
 // Parameters:
 //   - ctx context.Context: the asynq handler context, read for identity only.
 //   - task *asynq.Task: the task being processed. Read for its type and payload length.
 //   - envelope NewWebhook: the decoded envelope, or the zero value when it could not be
 //     decoded.
-//   - cause error: the failure. Never nil at any call site; a nil cause simply contributes
-//     no error field.
+//   - cause error: the failure. Never nil at any call site; a nil cause simply
+//     contributes no error field.
 //
 // Returns:
-//   - *logrus.Entry: the assembled record, ready for the caller to give a message. Returned
-//     rather than logged so the caller owns the message and the level stays visible at the
-//     call site.
+//   - *logrus.Entry: the assembled record, ready for the caller to give a message.
 func legacyWebhookFailureRecord(ctx context.Context, task *asynq.Task, envelope NewWebhook, cause error) *logrus.Entry {
 	fields := logrus.Fields{
 		"transport": "legacy_webhook",
@@ -862,12 +598,6 @@ func legacyWebhookFailureRecord(ctx context.Context, task *asynq.Task, envelope 
 // legacyWebhookEventID recovers the outbox event id from a task id that
 // legacyWebhookTaskID produced.
 //
-// It is the exact inverse of that function and must stay so: the two are the only reason a
-// webhook failure can be joined to the outbox row and the Kafka message that share its
-// event. A task id from any other producer on the shared queue lacks the namespace and
-// yields the empty string, which is how the caller knows to omit the field rather than
-// report a foreign id as an event.
-//
 // Parameters:
 //   - taskID string: the asynq task id, as the handler context reported it.
 //
@@ -882,16 +612,8 @@ func legacyWebhookEventID(taskID string) string {
 	return strings.TrimSpace(eventID)
 }
 
-// legacyWebhookEventIDFromContext recovers the outbox event id for the delivery being handled.
-//
-// The id is not in the task payload — the body is the frozen legacy envelope and carries no
-// delivery identity — so it travels as the asynq task ID, which EnqueueLegacyWebhookDelivery
-// sets to the namespaced event id. This is the read side of that arrangement.
-//
-// Nil-safe and namespace-checked for the same reasons the failure-log helper is: asynq's
-// context accessors dereference the context without a nil check, and the webhook queue is
-// shared with transaction hooks and TypeSense indexing, so a task ID lacking the namespace
-// belongs to another producer and must yield nothing rather than be reported as an event id.
+// legacyWebhookEventIDFromContext recovers the outbox event id for the delivery being
+// handled.
 //
 // Parameters:
 //   - ctx context.Context: the handler context asynq supplied. May be nil.
@@ -913,106 +635,25 @@ func legacyWebhookEventIDFromContext(ctx context.Context) string {
 
 // LegacyWebhookRetention is how long a completed legacy-delivery task is kept in Redis.
 //
-// It exists solely to give the event-ID task identity a window in which it can actually
-// suppress a duplicate. asynq deletes a task the moment it completes unless a retention is
-// set, and a deleted task's ID is immediately reusable — so without this, a re-enqueue of
-// the same event after the first delivery finished would be accepted, which is precisely
-// the duplicate the identity is there to stop.
-//
-// # LEGACY DELIVERY IS AT-LEAST-ONCE, AND THIS CONSTANT IS THE BOUND ON THE SUPPRESSION
-//
-// Stating it plainly because the mechanism above reads like exactly-once and is not. Enqueuing
-// the task and recording that the webhook leg was dispatched are two operations against two
-// systems with no transaction spanning them, so a crash in between leaves `webhook_dispatched`
-// FALSE for a delivery that already happened. The next claim of that row re-enqueues it, and
-// whether the receiver sees a second HTTP request turns entirely on whether the completed
-// task's ID is still in Redis:
-//
-//   - WITHIN twenty-four hours of the first delivery completing, the re-enqueue is refused with
-//     ErrTaskIDConflict and the receiver sees one request. This covers a relay crash and
-//     restart, an operator-initiated replay of a claimed batch, and a Redis failover — the
-//     realistic causes, which is why the window is set where it is.
-//   - BEYOND twenty-four hours, the retention has lapsed and the ID is free again, so the
-//     re-enqueue is ACCEPTED and the receiver sees the delivery a SECOND time. A relay outage
-//     longer than a day that straddles an unmarked row produces exactly this, and so does the
-//     owed-leg recovery pass reaching a row whose marking failed more than a day earlier.
-//
-// # Why the window is not simply extended to cover the whole migration
-//
-// Because the cost is unbounded where the alternative is free. Retention keeps the completed
-// task, not a token: covering the full thirty-day dual-delivery window would hold every legacy
-// delivery of those thirty days in Redis, which at the pipeline's target rate is on the order of
-// a billion tasks. That trades a duplicate a receiver can discard in one line for a memory
-// profile that can take the queue — and with it transaction processing and search indexing,
-// which share this Redis — down.
-//
-// The receiver is given the means instead: every delivery carries its event id in
-// LegacyWebhookEventIDHeader, which is the SAME key the Kafka subscriber deduplicates on. A
-// receiver can then hold an idempotency horizon as long as it likes, chosen against its own
-// storage rather than against Blnk's queue, and that is strictly better than any window Blnk
-// could pick on its behalf. docs/webhook-to-kafka-migration.md states the obligation for
-// subscribers; this comment states the mechanism for maintainers.
+// Because the cost is unbounded where the alternative is free. Retention keeps the
+// completed task, not a token: covering the full thirty-day dual-delivery window would
+// hold every legacy delivery of those thirty days in Redis, which at the pipeline's
+// target rate is on the order of a billion tasks.
 const LegacyWebhookRetention = 24 * time.Hour
 
 // EnqueueLegacyWebhookDelivery enqueues the legacy HTTP delivery of ONE outbox event,
 // carrying the stored bytes verbatim and using the event ID as the task's identity.
 //
-// # Why a byte-oriented entry point exists at all
-//
-// SendWebhook takes a NewWebhook STRUCT, and that is the problem it exists to solve. The
-// relay holds the authoritative bytes of the legacy body: the bytes stored in
-// blnk.event_outbox.payload_raw (BYTEA), which is the column that preserves them exactly,
-// and the same bytes published to Kafka. The payload JSONB column beside it is a queryable
-// projection of the same object — parsed and re-rendered, so key order and number
-// formatting are not preserved — and is never the source of a body. Handing the bytes to
-// SendWebhook would mean decoding them into
-// NewWebhook.Payload interface{} and marshalling again, and a round trip through
-// interface{} does not preserve bytes:
-//
-//   - Every JSON object becomes a map[string]interface{}, and Go marshals map keys in
-//     SORTED order. A payload whose struct fields were serialised in declaration order
-//     comes back alphabetised.
-//   - Every JSON number becomes a float64. A large integer identifier re-renders in
-//     scientific notation, and a decimal amount can gain or lose its trailing digits.
-//
-// The dual-delivery guarantee is that both transports carry the SAME payload for the same
-// event, and it is asserted byte-for-byte. Re-marshalling breaks it while looking like it
-// preserves it, because the two bodies remain semantically equal — which is exactly the
-// kind of difference a reviewer's eye passes over and a byte comparison does not.
-//
-// So this path never decodes. It validates that the bytes are a well-formed legacy envelope,
-// and then carries them unchanged all the way to the socket.
-//
-// # Why the event ID is the task ID
-//
-// Enqueuing the task and recording that the webhook leg was dispatched are two separate
-// operations against two separate systems, and no transaction spans them. A crash between
-// them leaves the row not-yet-marked, so the next claim of that row enqueues the delivery
-// again — a duplicate webhook for one event.
-//
-// asynq's TaskID makes that harmless FOR A BOUNDED PERIOD: a second enqueue under an ID
-// already present is refused with ErrTaskIDConflict rather than accepted. That conflict is
-// therefore SUCCESS for this operation's purposes — the task the caller wants enqueued is
-// already enqueued — and it is reported as such rather than as an error, because treating it
-// as a failure would stall the row it belongs to behind a condition that is already satisfied.
-//
-// "Bounded" is the honest word and not a hedge. The ID is only present while the task is,
-// which after completion means for LegacyWebhookRetention — twenty-four hours. Past that the
-// suppression is gone and a re-enqueue of the same event is accepted, so the receiver sees a
-// second HTTP delivery. Read that constant's documentation before reasoning about duplicates;
-// this transport is at-least-once, and every delivery carries LegacyWebhookEventIDHeader so a
-// receiver can close the gap on its own terms.
+// So this path never decodes. It validates that the bytes are a well-formed legacy
+// envelope, and then carries them unchanged all the way to the socket.
 //
 // Parameters:
-//   - eventID string: the outbox row's event_id, which is the task's identity. Required:
-//     without it there is no dedup key, and an empty asynq task ID is silently ignored
-//     rather than rejected, so the caller would get at-least-once with no indication.
+//   - eventID string: the outbox row's event_id, which is the task's identity.
 //   - body []byte: the stored legacy webhook body, carried verbatim.
 //
 // Returns:
 //   - error: nil when the task is enqueued, and nil when an identical task was already
-//     enqueued. Non-nil for a missing event ID, a body that is not a legacy envelope, or an
-//     enqueue failure.
+//     enqueued.
 func (b *Blnk) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 	conf := b.Config()
 
@@ -1029,9 +670,7 @@ func (b *Blnk) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 		)
 	}
 
-	// Validation, NOT transformation. The bytes are checked to be a legacy envelope and are
-	// then forwarded untouched — the decoded value is deliberately discarded, because using
-	// it is the defect this function exists to avoid.
+	// Validation, NOT transformation.
 	var envelope NewWebhook
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return fmt.Errorf("legacy webhook body for event %s is not a valid webhook envelope: %w", eventID, err)
@@ -1048,8 +687,8 @@ func (b *Blnk) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 	if _, err := b.asynqClient.Enqueue(task); err != nil {
 		if errors.Is(err, asynq.ErrTaskIDConflict) {
 			// Already enqueued, in flight, or completed within the retention window. The
-			// post-condition the caller needs — this event's webhook leg is queued exactly
-			// once — holds, so this is success.
+			// post-condition the caller needs — this event's webhook leg is queued exactly once
+			// — holds, so this is success.
 			logrus.WithFields(logrus.Fields{
 				"event_id": eventID,
 				"task_id":  legacyWebhookTaskID(eventID),
@@ -1067,13 +706,8 @@ func (b *Blnk) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 	return nil
 }
 
-// legacyWebhookTaskID namespaces the event ID so it cannot collide with another producer's
-// task identity on the shared webhook queue.
-//
-// The queue is shared with transaction hooks and TypeSense indexing (see the sunset block at
-// the foot of this file), and asynq task IDs are unique per QUEUE rather than per task type.
-// A bare event ID would be one accidental identifier collision away from silently dropping
-// somebody else's task as a duplicate.
+// legacyWebhookTaskID namespaces the event ID so it cannot collide with another
+// producer's task identity on the shared webhook queue.
 //
 // Parameters:
 //   - eventID string: the outbox event id, already trimmed.
@@ -1084,31 +718,8 @@ func legacyWebhookTaskID(eventID string) string {
 	return "legacy-webhook:" + eventID
 }
 
-// SendWebhook enqueues a webhook notification task using the Blnk instance's asynq client.
-//
-// # Prefer EnqueueLegacyWebhookDelivery for dual delivery
-//
-// This method takes a STRUCT and marshals it, so it cannot preserve bytes it was not given.
-// The relay's dual-delivery branch must therefore call EnqueueLegacyWebhookDelivery with the
-// stored payload instead: a struct round trip re-orders object keys and re-renders numbers,
-// which breaks the byte-for-byte payload-equivalence guarantee while leaving the two bodies
-// semantically equal and the difference invisible to review.
-//
-// It is retained because it is the entry point every existing webhook test exercises, and
-// because a caller that legitimately HAS a struct rather than bytes — nothing in the event
-// pipeline does — needs one. It also carries no task identity, so it offers no duplicate
-// suppression.
-//
-// NO-OP WHEN UNCONFIGURED — load-bearing, not defensive noise. With no webhook URL
-// configured this returns nil without enqueuing, which is why Blnk runs perfectly
-// well with no notification sink at all and why the whole existing test suite is
-// unaffected by webhook configuration it never sets. The Kafka publisher reproduces
-// exactly this contract for an empty KAFKA_BROKERS, for exactly the same reason.
-//
-// The asynq task type and the queue name are deliberately the same string,
-// conf.Queue.WebhookQueue: the handler in cmd/workers.go dispatches on the task type,
-// and asynq.Queue routes to the queue. They must stay identical or the enqueued task
-// lands on a queue whose mux has no handler for its type and expires unhandled.
+// SendWebhook enqueues a webhook notification task using the Blnk instance's asynq
+// client.
 //
 // Parameters:
 // - newWebhook NewWebhook: The webhook notification data to enqueue.
@@ -1137,13 +748,6 @@ func (b *Blnk) SendWebhook(newWebhook NewWebhook) error {
 }
 
 // ProcessWebhook processes a webhook notification task from the queue.
-//
-// This is the asynq handler registered against conf.Queue.WebhookQueue in
-// initializeWebhookTaskHandlers (cmd/workers.go). It re-reads configuration rather
-// than trusting the enqueue-time value, so a URL that has been unconfigured since the
-// task was queued results in the task being dropped cleanly instead of delivered to a
-// stale endpoint. It shares the pooled b.httpClient with every other outbound call so
-// that connections are reused across deliveries.
 //
 // An unmarshalable task payload is a permanent failure that returning an error cannot
 // cure, but the error is returned regardless: asynq's retry and archival machinery is
@@ -1178,23 +782,15 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 
 	// Unmarshal to VALIDATE, then deliver the ORIGINAL BYTES.
 	//
-	// The decoded value is deliberately discarded. Delivering it would mean marshalling
-	// NewWebhook.Payload interface{} again, and that round trip re-orders every object's
-	// keys (Go sorts map keys) and re-renders every number through float64 — so the body
-	// that reaches the subscriber would differ, byte for byte, from the body recorded in
-	// blnk.event_outbox and published to Kafka. The two would stay semantically equal,
-	// which is what makes the difference easy to miss and fatal to a byte-level
-	// equivalence assertion.
-	//
 	// The unmarshal is kept because a malformed task payload must still be recognised: it
 	// is a permanent failure that no retry can cure, and returning the error is how
 	// asynq's archival machinery makes it visible to an operator instead of it vanishing.
 	var payload NewWebhook
 	if err := json.Unmarshal(task.Payload(), &payload); err != nil {
-		// The ZERO envelope is passed deliberately: nothing was decoded, so there is no
-		// event name to report, and legacyWebhookFailureRecord omits the field rather than
-		// naming one. A fabricated event_type here would send an investigation to an event
-		// that had nothing to do with the failure.
+		// The ZERO envelope is passed deliberately: nothing was decoded, so there is no event
+		// name to report, and legacyWebhookFailureRecord omits the field rather than naming
+		// one. A fabricated event_type here would send an investigation to an event that had
+		// nothing to do with the failure.
 		legacyWebhookFailureRecord(ctx, task, NewWebhook{}, err).
 			Error("not a webhook envelope")
 
@@ -1203,7 +799,8 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 
 	// The identity travels as the TASK ID rather than in the body, so it is recovered from
 	// there — the same inverse pair that lets a failure log name the event. A task from
-	// another producer on the shared queue yields the empty string and the header is omitted.
+	// another producer on the shared queue yields the empty string and the header is
+	// omitted.
 	if err := processHTTPRaw(ctx, legacyWebhookEventIDFromContext(ctx), task.Payload(), b.httpClient); err != nil {
 		// ONE record per failed delivery, and this is it. The envelope is available here, so
 		// this is the only place that can name the event alongside the task, queue, retry
@@ -1222,11 +819,11 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 //
 // This block is the executable contract for retiring the legacy HTTP transport. It is
 // written as an ordered procedure because the order matters: step 1 before step 2
-// preserves a contract that step 2 would otherwise destroy, and step 4 is a
-// prohibition that step 3 makes tempting.
+// preserves a contract that step 2 would otherwise destroy, and step 4 is a prohibition
+// that step 3 makes tempting.
 //
-// THE OBLIGATION IS PUBLISHED AND ENFORCED, not merely recorded here. This procedure has
-// two counterparts, and all three describe one release:
+// THE OBLIGATION IS PUBLISHED AND ENFORCED, not merely recorded here. This procedure
+// has two counterparts, and all three describe one release:
 //
 //   - docs/webhook-to-kafka-migration.md carries the same release as an operator-facing
 //     DELETION CHECKLIST — the artifacts, where each lives, and the preserve half — because
@@ -1237,118 +834,30 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 //     the release cannot be performed without editing the checklist, and the checklist cannot
 //     rot while the transport is still compiled in.
 //
-// WHY THIS IS DEFERRED RATHER THAN OVERDUE. Requirement R-12 runs in two halves in sequence:
-// both transports deliver from the same outbox rows for the fixed window, and only after the
-// window closes is the delivery source removed. The project's plan schedules these deletions
-// as the feature's TERMINAL step for that reason. Performing them earlier would remove the
-// second transport the payload-equivalence check compares against, so this file existing is a
-// requirement of the window rather than an omission from it.
-//
-// PRECONDITION. Do none of this until WebhookSunsetPassed (event_sunset.go) answers
-// true for the deployed window — that is, until the full 30-day dual-delivery window
-// has elapsed and WebhookDualDeliveryActive has answered false ever since. Until then this file must remain compiled
-// in and reachable: the dual-delivery payload-equivalence check needs a live second
-// transport to compare against, and the 410 Gone behaviour is a runtime decision made
-// by that predicate, not a consequence of deleting source.
-//
-// STEP 1 — RELOCATE FIRST, DELETE SECOND. ALREADY DONE. Two symbols that used to be
-// declared here are not implementation, they are contract, and they have been moved out
-// of this file ahead of its deletion:
-//
-//   - NewWebhook now lives in event_outbox.go. Its marshaled form IS the payload carried
-//     inside every LedgerEvent, so it survives the transport that named it. Twelve
-//     surviving non-test files depend on it.
-//   - getEventFromStatus now lives in event_topics.go, beside the topic resolution it
-//     feeds. It IS the transaction event-string vocabulary that decides which topic a
-//     transaction event is published to. Three surviving non-test files call it.
-//
-// Both were file moves inside package blnk: no import changed, no call site was edited,
-// and every caller kept compiling untouched. Doing it early rather than as the first act
-// of the deletion release is deliberate — it means whoever performs that release does not
-// have to rescue two symbols from a 1,300-line file under time pressure, and STEP 2 is now
-// a pure deletion. NOTHING ELSE in this file outlives it; verify that with a build after
-// STEP 2 rather than by reading, and if a symbol declared here turns out to be needed,
-// move it out FIRST and update this list.
-//
-// STEP 2 — DELETE. Remove processHTTP, processHTTPRaw, SendWebhook,
-// EnqueueLegacyWebhookDelivery, legacyWebhookTaskID, LegacyWebhookRetention and
-// ProcessWebhook, then this file, then webhooks_test.go, webhooks_process_test.go,
-// webhooks_destination_test.go and webhooks_logging_test.go. Those four test files cover
-// the HTTP transport specifically and have no subject once it is gone; the payload and
-// vocabulary behaviours they also touch are covered where those two symbols now live.
-// event_dual_delivery_test.go goes with STEP 5, because its subject is the dual-delivery
-// branch rather than this file.
-//
-// Delete the relay's call to EnqueueLegacyWebhookDelivery in the same change, or the
-// build breaks at that call site. That is deliberate: the dual-delivery branch and this
-// file must go together, and a compile error is a better reminder than a comment.
-//
-// STEP 3 — UNREGISTER EXACTLY ONE HANDLER. In initializeWebhookTaskHandlers
-// (cmd/workers.go) remove the single line that maps the webhook queue to this file's
-// handler — mux.HandleFunc(cfg.Queue.WebhookQueue, b.blnk.ProcessWebhook) — and
-// nothing else on that mux.
-//
-// STEP 4 — DO NOT REMOVE THE QUEUE. This is the trap, and it is the most consequential
-// prohibition in the whole feature. conf.Queue.WebhookQueue, initializeWebhookQueues,
-// initializeWebhookWorkerServer and the webhook asynq server itself must all SURVIVE,
-// because the queue is shared infrastructure that predates and outlives this
-// transport:
-//
-//   - initializeWebhookQueues returns two queues, the webhook queue AND the index
-//     queue, so deleting it stops search indexing as well.
-//   - The mux carries four handlers, of which only ProcessWebhook belongs to this
-//     feature; the others are new:hook_execution, the index queue handler and
-//     new:index:batch.
-//   - internal/hooks/manager.go enqueues PRE_TRANSACTION / POST_TRANSACTION hook work
-//     onto conf.Queue.WebhookQueue BY NAME. The /hooks feature is a different feature
-//     — synchronous request-time callouts, not asynchronous event notification — and
-//     it stays fully functional.
-//
-// Removing the queue or its worker server would therefore silently disable transaction
-// hooks and search indexing, with no compile error to catch it. Remove the mapping
-// only.
-//
-// STEP 5 — DROP DUAL DELIVERY. Remove the dual-delivery branch in event_relay.go so
-// the relay publishes to Kafka only, and remove the delivery use of the
-// Notification.Webhook configuration block. That branch is more than the enqueue: it
-// carries the legacy leg's own state — MarkEventWebhookPending, the webhook_pending
-// status, kafka_dispatched_at and webhook_attempts — all of which exist only to keep a
-// failed enqueue recoverable during the window, and all of which go with it. Kafka is
-// then the sole transport, and the deprecated webhook management routes answer 410 Gone
-// through api/middleware/sunset.go under the WebhookSunsetPassed decision.
-//
-// STEP 6 — REMOVE NO DEPENDENCY. Nothing leaves go.mod at sunset. Deleting
-// ProcessWebhook removes a handler registration, not a module: hibiken/asynq,
-// hibiken/asynqmon and redis/go-redis all remain required by the transaction queue,
-// the hooks subsystem and the index queue. Pruning them would break features that
-// merely shared infrastructure with this one.
+// STEP 6 — REMOVE NO DEPENDENCY. Nothing leaves go.mod at sunset.
 //
 // ===== END SUNSET =====
 
 // retiredLegacyWebhookLogFields describes a task dropped because the sunset has passed.
 //
-// The retry count is the field worth having. A task at retry 0 was merely sitting in the
-// queue when the sunset arrived; a task at retry 4 has been failing against the subscriber
-// for the whole of its backoff schedule and would have gone on trying across the boundary.
-// The two are different operational stories and the log should not flatten them.
-//
-// asynq exposes these through the handler context, and each is best-effort: a caller that
-// invokes the handler directly — every test of it does — has no asynq context, so the
-// lookups fail and the fields are simply omitted rather than reported as zero. A dropped
-// task must still be logged when its identity is unknown, so nothing here can fail the drop.
+// The retry count is the field worth having. A task at retry 0 was merely sitting in
+// the queue when the sunset arrived; a task at retry 4 has been failing against the
+// subscriber for the whole of its backoff schedule and would have gone on trying across
+// the boundary.
 //
 // Parameters:
 //   - ctx context.Context: the handler context, or any context at all.
 //
 // Returns:
-//   - logrus.Fields: the reason, plus whichever of task ID, queue and retry count are known.
+//   - logrus.Fields: the reason, plus whichever of task ID, queue and retry count are
+//     known.
 func retiredLegacyWebhookLogFields(ctx context.Context) logrus.Fields {
 	fields := logrus.Fields{"reason": legacyWebhookRetiredAtSunsetReason}
 
 	// asynq's context accessors dereference the context without a nil check, so a nil one
 	// panics. asynq itself never passes nil, but this function's only job is to describe a
-	// drop, and a log helper must never be the reason a worker goroutine dies — the drop has
-	// to be reportable even when its identity is not.
+	// drop, and a log helper must never be the reason a worker goroutine dies — the drop
+	// has to be reportable even when its identity is not.
 	if ctx == nil {
 		return fields
 	}

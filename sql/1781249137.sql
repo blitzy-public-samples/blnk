@@ -17,24 +17,15 @@
 -- The W3C trace context of the request that CAPTURED an event, carried on the row.
 --
 -- Why the row and not a side table: an outbox row is the only artefact that survives
--- between the request that produced the event and the relay that publishes it. The two are
--- decoupled by design — the request commits and returns, the relay claims the row up to a
--- poll interval later, possibly in a different process — so a trace that is not written
--- down here cannot be recovered afterwards from anything. Every request and database span
--- therefore ENDED AT THE OUTBOX INSERT: publishing, retrying, dead-lettering and replaying
--- one event all produced spans in unrelated traces, and "show me everything that happened
--- to this event" was answerable only by grepping logs for its id.
+-- between the request that produced the event and the relay that publishes it. The two
+-- are decoupled by design — the request commits and returns, the relay claims the row
+-- up to a poll interval later, possibly in a different process — so a trace that is not
+-- written down here cannot be recovered afterwards from anything.
 --
--- Both columns are NULLABLE and stay null for every event captured with no active trace —
--- a CLI-driven mutation, a worker-initiated rejection, or any deployment running without
--- observability enabled. Null is the correct reading of "there was no trace to record", and
--- the publish path treats it as such rather than as a defect.
---
--- ADDITIVE ONLY: no existing column, constraint or index is touched, so this applies
--- cleanly to a database already carrying 1781248800.sql and every row already in it simply
--- reads as untraced. The ADD COLUMN clauses are IF NOT EXISTS and the constraints are guarded
--- by a catalogue lookup below, so applying this file twice is a no-op rather than a failure —
--- which also makes it safe against a deployment that had the columns added out of band.
+-- Both columns are NULLABLE and stay null for every event captured with no active trace
+-- — a CLI-driven mutation, a worker-initiated rejection, or any deployment running
+-- without observability enabled. Null is the correct reading of "there was no trace to
+-- record", and the publish path treats it as such rather than as a defect.
 ALTER TABLE blnk.event_outbox
     ADD COLUMN IF NOT EXISTS traceparent TEXT NULL,
     ADD COLUMN IF NOT EXISTS tracestate  TEXT NULL;
@@ -48,27 +39,19 @@ ALTER TABLE blnk.event_outbox
 
 -- The two columns are BOUNDED, and the bound is the point rather than defensiveness.
 --
--- These values arrive from an inbound HTTP header, so they are caller-influenced data on a
--- table that carries one row per ledger mutation at 500 events per second. Without a ceiling
--- a caller could append arbitrary bytes to every event row in the ledger, and the cost would
--- appear as table and index bloat on the relay's hottest table rather than as a rejected
--- request.
+-- These values arrive from an inbound HTTP header, so they are caller-influenced data
+-- on a table that carries one row per ledger mutation at 500 events per second. Without
+-- a ceiling a caller could append arbitrary bytes to every event row in the ledger, and
+-- the cost would appear as table and index bloat on the relay's hottest table rather
+-- than as a rejected request.
 --
--- W3C Trace Context fixes both sizes. A traceparent is exactly 55 characters in version 00
--- and the specification requires implementations to accept longer future versions, so 255
--- leaves generous room while still refusing an unbounded value. A tracestate is capped by
--- the specification at 512 characters, which is used verbatim.
---
--- Written as CHECK constraints rather than VARCHAR(n) following the convention of every
--- other bounded text column on this table: the constraint is named, so a violation names
--- itself in the error, and the column type stays TEXT.
---
--- Guarded by a catalogue lookup because PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS, and
--- the columns above ARE idempotent — so a re-run would otherwise fail here having succeeded
--- there, which is the worst of both. sql/1781248920.sql guards its constraint the same way,
--- and for the same reason. The StatementBegin/StatementEnd markers are required rather than
--- decorative: sql-migrate splits on semicolons and knows nothing about dollar quoting, so
--- without them the block is cut at its first internal semicolon.
+-- Guarded by a catalogue lookup because PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS,
+-- and the columns above ARE idempotent — so a re-run would otherwise fail here having
+-- succeeded there, which is the worst of both. sql/1781248920.sql guards its constraint
+-- the same way, and for the same reason. The StatementBegin/StatementEnd markers are
+-- required rather than decorative: sql-migrate splits on semicolons and knows nothing
+-- about dollar quoting, so without them the block is cut at its first internal
+-- semicolon.
 -- +migrate StatementBegin
 DO $$
 BEGIN

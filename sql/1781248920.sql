@@ -14,55 +14,22 @@
 
 -- +migrate Up
 
--- Ensure event_subscribers_key_scope_chk is absent.
+-- Ensure event_subscribers_key_scope_chk is absent, idempotently.
 --
--- # This migration used to CREATE that constraint, and creating it was the defect
+-- The constraint this drops forbade "partition_key_prefix IS NOT NULL AND
+-- credential_reference IS NOT NULL". That combination MUST be representable: a
+-- partition key prefix is a ROUTING HINT rather than an access boundary — Kafka's ACL
+-- resource types are Topic, Group, Cluster, TransactionalId and DelegationToken, none of
+-- them a message key — so forbidding it withholds no narrower credential and instead
+-- leaves a subscriber that legitimately records a prefix permanently unable to obtain
+-- credentials at all. Every credential response and subscriber read states the boundary
+-- the broker really keeps in enforced_access, and sql/1781248900.sql documents the
+-- column in those terms.
 --
--- As first written, this file cleared every partition_key_prefix on a row that also held a
--- credential and then added a CHECK forbidding the combination
--- "partition_key_prefix IS NOT NULL AND credential_reference IS NOT NULL". Two service
--- guards refused the same combination from either direction, so the state was
--- unrepresentable in the database and unreachable through the API.
---
--- The reasoning went as far as it went: partition_key_prefix looks like an authorization,
--- Kafka's authorizer has no message-key dimension, and so a row carrying a prefix appears
--- to describe a narrower boundary than any credential Blnk can mint. Rather than issue a
--- wider credential silently, the state was forbidden.
---
--- What that actually did was withdraw a REQUIRED capability.
--- `POST /subscribers/{id}/kafka-credentials` is mandatory, and blnk.event_subscribers is
--- explicitly designed to hold a partition key prefix — so between them, a subscriber could
--- be registered into a state from which it could never obtain credentials at all,
--- permanently, with the endpoint answering 409 forever. A refusal is fail-closed only when
--- a narrower grant exists to insist upon. Kafka has five ACL resource types — Topic, Group,
--- Cluster, TransactionalId and DelegationToken — and none is a message key, and a topic per
--- key space is ruled out, so no narrower credential was being withheld. None exists.
---
--- The prefix is therefore a ROUTING HINT and not an access boundary, and the API states
--- that where a client cannot miss it: every credential response and every subscriber read
--- carries enforced_access with the two dimensions the broker really keeps,
--- partition_key_prefix_enforced = false, the echoed prefix, and
--- client_side_key_filtering_required = true. sql/1781248900.sql documents the column in
--- those terms.
---
--- # Why the file is retained rather than deleted, and why it is now a DROP
---
--- Deleting it is not available. sql-migrate plans against the ledger in
--- blnk.gorp_migrations, and an id recorded there with no corresponding source file aborts
--- the whole run with "unknown migration in database" — so removing this file would leave
--- every database that already applied it unable to migrate at all, which is far worse than
--- the constraint it created.
---
--- So the file stays and its content is corrected. The destructive UPDATE is gone: it
--- existed only to make the constraint's validating scan pass, and clearing a prefix an
--- operator deliberately recorded is data loss with nothing to show for it. What remains is
--- the inverse of what this migration used to do, which also makes it idempotent and safe on
--- a database that never created the constraint.
---
--- A database that applied the ORIGINAL version of this file still carries the constraint
--- and will never run this file again, because its id is already in the ledger.
--- sql/1781248930.sql is what converges those databases; the two together cover both
--- populations.
+-- The file is a DROP rather than a deletion because sql-migrate plans against the ledger
+-- in blnk.gorp_migrations: an id recorded there with no source file aborts the whole run
+-- with "unknown migration in database", so any database that applied the original could
+-- never migrate again.
 ALTER TABLE blnk.event_subscribers
     DROP CONSTRAINT IF EXISTS event_subscribers_key_scope_chk;
 
@@ -70,17 +37,9 @@ ALTER TABLE blnk.event_subscribers
 
 -- Deliberately a NO-OP.
 --
--- The state this migration's up direction finds is "the constraint is absent" — on a fresh
--- database because nothing creates it, and on a database that applied the original version
--- because the up direction has just removed it. Re-adding it on the way down would not
--- restore a previous state; it would reinstate the defect described above on any database
--- that rolled back.
---
--- It could not run cleanly either. Rows recording both a prefix and a credential are
--- legitimate once this migration is applied, so ADD CONSTRAINT would fail its validating
--- scan on exactly the databases that exercised the restored capability — and clearing those
--- prefixes to make it pass is the data loss removed above.
---
--- The statement below keeps the section explicit, so a reader can tell an intentional
--- no-op from a forgotten one.
+-- The state this migration's up direction finds is "the constraint is absent" — on a
+-- fresh database because nothing creates it, and on a database that applied the
+-- original version because the up direction has just removed it. Re-adding it on the
+-- way down would not restore a previous state; it would reinstate the defect described
+-- above on any database that rolled back.
 SELECT 1;

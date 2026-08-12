@@ -14,22 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// subscribers_api_test.go covers the request-side contract of the subscriber
-// registry surface, and specifically the four decisions this layer owns outright
-// because no layer beneath it can make them:
+// subscribers_api_test.go covers the request-side contract of the subscriber registry
+// surface, and specifically the four decisions this layer owns outright because no
+// layer beneath it can make them:
 //
-//	The five-second CEILING on credential issuance, which is a property of the
-//	request rather than of the service call inside it.
-//	Path-parameter VALIDATION, which decides whether a malformed identifier is a
-//	client mistake or a missing resource.
-//	The closed QUERY-PARAMETER SET on the listing, which decides whether a
-//	misspelled filter narrows nothing in silence.
-//	The include_count ENVELOPE, which is the shape every other listing in the API
-//	already answers in.
+// The five-second CEILING on credential issuance, which is a property of the request
+// rather than of the service call inside it.
 //
-// The service's own behaviour — provisioning, ACL reconciliation, the registry
-// writes — is asserted in the root package against doubles and against a real
-// broker, and is deliberately not restated here.
+// The service's own behaviour — provisioning, ACL reconciliation, the registry writes —
+// is asserted in the root package against doubles and against a real broker, and is
+// deliberately not restated here.
 package api
 
 import (
@@ -76,17 +70,6 @@ func subscribersRequest(t *testing.T, method, target string) *httptest.ResponseR
 }
 
 // assertSubscribersErrorCode asserts the status AND the error code.
-//
-// Both are needed for the reason given on assertEventsErrorCode: several distinct
-// refusals share a status, and a status-only assertion cannot tell "this gate
-// refused me" from "the route prefix is missing from the authorization
-// middleware" — a real failure mode for a new prefix, and one that would make
-// every test here pass for the wrong reason.
-//
-// The diagnostics are SANITISED because this helper is used on the credential route as well as on
-// the read routes: an assertion expecting a refusal renders its message when the request
-// SUCCEEDED, and a successful credential response carries a plaintext SASL password. Decoding
-// still runs against the untouched body, so nothing about what is asserted changes.
 func assertSubscribersErrorCode(t *testing.T, recorder *httptest.ResponseRecorder, status int, code string) {
 	t.Helper()
 
@@ -101,13 +84,10 @@ func assertSubscribersErrorCode(t *testing.T, recorder *httptest.ResponseRecorde
 	assert.Equal(t, code, body.ErrorDetail.Code, safeResponseBody(recorder))
 }
 
-// TestSubscriberRoutes_RequireTheMasterKey pins the gate on every route in the
-// surface.
+// TestSubscriberRoutes_RequireTheMasterKey pins the gate on every route in the surface.
 //
-// The credential route mints a SASL secret and the read routes disclose the
-// broker-side access model of every subscriber, so a single unguarded route is
-// the whole surface. It is asserted per route rather than once, because the gate
-// is a call at the top of each handler and a new handler can be added without it.
+// The credential route mints a SASL secret and the read routes disclose the broker-side
+// access model of every subscriber, so a single unguarded route is the whole surface.
 func TestSubscriberRoutes_RequireTheMasterKey(t *testing.T) {
 	router, _ := setupAuthedRouter(t, false, nil)
 
@@ -125,24 +105,12 @@ func TestSubscriberRoutes_RequireTheMasterKey(t *testing.T) {
 	}
 }
 
-// TestSubscriberRoute_ValidatesTheIdentifierBeforeLookingItUp is C-07 at this
-// surface.
+// TestSubscriberRoute_ValidatesTheIdentifierBeforeLookingItUp is the identifier-first refusal at this surface.
 //
-// # The defect
-//
-// The route parameter was trimmed and passed straight to the lookup. A value no
-// subscriber id can ever equal — "sub_ABC!", "*", "a" — therefore matched no row
-// and came back as 404 SUBSCRIBER_NOT_FOUND, which reads as "that subscriber was
-// deleted" when it means "that is not an identifier". The two demand opposite
-// responses from a caller: re-register, or fix the request.
+// The route parameter was trimmed and passed straight to the lookup.
 //
 // It also spent a database round trip on a value refusable in memory, and on the
 // credential route a slice of the five-second budget.
-//
-// The validator is model.CanonicalizeSubscriberIdentifier — the same function the
-// registry, the schema check and the Kafka principal derivation use — so a value
-// this layer accepts is provably one a row could have held. The cases below are
-// its rules, each of which would previously have produced a 404.
 func TestSubscriberRoute_ValidatesTheIdentifierBeforeLookingItUp(t *testing.T) {
 	for name, identifier := range map[string]string{
 		"a wildcard, which names every Kafka resource": "%2A",
@@ -170,27 +138,16 @@ func TestSubscriberRoute_ValidatesTheIdentifierBeforeLookingItUp(t *testing.T) {
 	}
 }
 
-// TestSubscriberRoute_StillAnswersMissingForABlankIdentifier keeps the two
-// refusals distinct.
-//
-// A blank-but-present segment is a MISSING parameter, not a malformed one, and it
-// must stay that way: collapsing the two would tell a caller that omitted the id
-// that its id is invalid.
+// TestSubscriberRoute_StillAnswersMissingForABlankIdentifier keeps the two refusals
+// distinct.
 func TestSubscriberRoute_StillAnswersMissingForABlankIdentifier(t *testing.T) {
 	recorder := subscribersRequest(t, http.MethodGet, "/subscribers/%20%20")
 
 	assertSubscribersErrorCode(t, recorder, http.StatusBadRequest, "GEN_MISSING_PARAMETER")
 }
 
-// TestSubscriberRoute_AcceptsAGeneratedIdentifier is the negative control, and it
-// is what stops the validation above being too strict.
-//
-// The identifier under test comes from model.GenerateSubscriberID — the function
-// that mints every id in the system — so if canonicalization refused this shape,
-// every real subscriber would be unreachable through its own routes. The assertion
-// is only that the request got PAST validation: with no such row it reaches the
-// lookup and answers 404, which is the correct answer and is precisely the answer
-// a malformed id must NOT produce.
+// TestSubscriberRoute_AcceptsAGeneratedIdentifier is the negative control, and it is
+// what stops the validation above being too strict.
 func TestSubscriberRoute_AcceptsAGeneratedIdentifier(t *testing.T) {
 	recorder := subscribersRequest(t, http.MethodGet, "/subscribers/"+coremodel.GenerateSubscriberID())
 
@@ -201,44 +158,13 @@ func TestSubscriberRoute_AcceptsAGeneratedIdentifier(t *testing.T) {
 // issuance goroutine to exit after it has been released.
 //
 // The wait itself is the point — see parkedIssuance — and this is only its ceiling.
-// It is generous because the released goroutine has nothing left to do but return,
-// so anything approaching this value means it never observed the release at all.
 const subscribersSlowWorkDrainBudget = 5 * time.Second
 
 // parkedIssuance builds an issuance fake that BLOCKS until this subtest releases it,
 // and guarantees the released goroutine is gone before the subtest ends.
 //
-// # Why the fakes here must park rather than sleep
-//
 // issueWithinBudget abandons work that overruns its budget: it returns while the
-// goroutine is still running. A fake that stood in for that overrun by sleeping for a
-// fixed duration — a bare `<-time.After(time.Minute)` was what these tests used —
-// leaves a goroutine parked for the remaining lifetime of the TEST BINARY, holding
-// everything it captured. A leaked goroutine is not a harmless one: `go test -race`
-// accounts for every live goroutine, a panic dump lists it against whichever test
-// happens to be running when the dump is taken, and one leaked per subtest is how a
-// package comes to exhaust its own scheduler.
-//
-// # Why it parks on this channel and NOT on the context it is handed
-//
-// issueWithinBudget passes the work the SAME context it selects on. Work that
-// returned as soon as that context was done would make both of those select arms
-// ready at once, and `completed` would then come out true or false depending on the
-// scheduler — turning the property under test into a coin flip. The release channel
-// is an input this subtest controls, so the abandonment is deterministic.
-//
-// # What the cleanup adds
-//
-// Releasing and then WAITING makes the abandonment observable rather than merely
-// tolerated: the work is proven to have been left running at the moment
-// issueWithinBudget returned, and proven to be gone before the subtest ends. The wait
-// is bounded because an unbounded one would hang the whole binary — taking every
-// unrelated package with it and reporting nothing, since a killed binary loses its
-// buffered output.
-//
-// The returned started channel closes when the work is entered. Asserting on it is
-// what separates "the work was abandoned" from "the work was never invoked", which
-// are different behaviours with the same observable result at the call site.
+// goroutine is still running.
 func parkedIssuance(t *testing.T) (
 	issue func(context.Context, string) (blnk.SubscriberCredential, error),
 	started <-chan struct{},
@@ -282,29 +208,11 @@ func parkedIssuance(t *testing.T) (
 	return issue, begun, hasFinished
 }
 
-// TestIssueWithinBudget_AnswersOnTimeWhenTheIssuanceOverrunsIt is C-23, and it is
-// the only place the ceiling can be asserted as a property of the request.
+// TestIssueWithinBudget_AnswersOnTimeWhenTheIssuanceOverrunsIt is the budget answer, and it is the
+// only place the ceiling can be asserted as a property of the request.
 //
-// # The defect
-//
-// AAP R-7 requires issuance to complete within five seconds, and the handler
-// bounds the service context to exactly that — which is not the same thing. The
-// service's compensating writes and its fence release each run on a FRESH bounded
-// context, deliberately, because an expired issuance deadline is one of the
-// commonest reasons a cleanup is needed and a cleanup on an already-cancelled
-// context does nothing. Those fresh budgets are the same five seconds, so a
-// synchronous chain of issuance, compensation and release can take fifteen seconds
-// of wall clock while every step in it is individually bounded.
-//
-// # What is asserted
-//
-// That the CALL returns when the budget elapses rather than when the work does.
-// The fake issuance below never returns, so a helper that waited would hang this
-// test — which is the point: the assertion is a real deadline, not a mocked clock.
-//
-// The budget is shortened to keep the test fast. The ceiling under test is a
-// relationship between the context and the return, not the specific duration, and
-// the production value is pinned separately below.
+// The contract requires issuance to complete within five seconds, and the handler
+// bounds the service context to exactly that — which is not the same thing.
 func TestIssueWithinBudget_AnswersOnTimeWhenTheIssuanceOverrunsIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -332,13 +240,11 @@ func TestIssueWithinBudget_AnswersOnTimeWhenTheIssuanceOverrunsIt(t *testing.T) 
 			"the fifteen-second wall clock this closes")
 }
 
-// TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime is the other half:
-// the ceiling must not become a truncation.
+// TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime is the other half: the
+// ceiling must not become a truncation.
 //
-// A helper that abandoned unconditionally, or that raced its own goroutine, would
-// make the endpoint useless while passing the test above. Both the success and the
-// failure paths are asserted, because they return through different arms and a
-// mutant that dropped the error would hand back a zero credential as a success.
+// A helper that abandoned unconditionally, or that raced its own goroutine, would make
+// the endpoint useless while passing the test above.
 func TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime(t *testing.T) {
 	t.Run("a completed issuance is returned", func(t *testing.T) {
 		issued := time.Now().UTC()
@@ -376,9 +282,9 @@ func TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime(t *testing.T) 
 	})
 
 	t.Run("a caller that has already gone away is not waited for", func(t *testing.T) {
-		// A cancelled request context lands in the same arm as an elapsed budget, which
-		// is correct: there is nobody to answer, so the work is abandoned to its own
-		// cleanup rather than held open.
+		// A cancelled request context lands in the same arm as an elapsed budget, which is
+		// correct: there is nobody to answer, so the work is abandoned to its own cleanup
+		// rather than held open.
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -390,9 +296,9 @@ func TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime(t *testing.T) 
 		assert.False(t, completed,
 			"a caller that has already gone away must not be waited for")
 
-		// The premise: the work really did start. Without this the subtest would pass
-		// against an implementation that never invoked the work at all, which is a
-		// different behaviour with the same observable result at the call site.
+		// The premise: the work really did start. Without this the subtest would pass against
+		// an implementation that never invoked the work at all, which is a different
+		// behaviour with the same observable result at the call site.
 		select {
 		case <-started:
 		case <-time.After(time.Second):
@@ -406,31 +312,18 @@ func TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime(t *testing.T) 
 	})
 }
 
-// TestSubscriberCredentialIssuanceBudget_IsTheFiveSecondsTheRequirementNames pins
-// the production value.
-//
-// The tests above shorten the budget so they run fast, which means none of them
-// would notice the constant being changed. AAP R-7 names five seconds, the handler
-// and the service both read this one constant so they cannot drift apart, and this
-// is what fails if it moves.
+// TestSubscriberCredentialIssuanceBudget_IsTheFiveSecondsTheRequirementNames pins the
+// production value.
 func TestSubscriberCredentialIssuanceBudget_IsTheFiveSecondsTheRequirementNames(t *testing.T) {
 	assert.Equal(t, 5*time.Second, blnk.SubscriberCredentialIssuanceBudget,
 		"the credential endpoint's ceiling is a stated requirement, not a tuning parameter")
 }
 
-// TestListSubscribers_RefusesAnUnsupportedQueryParameter is C-13's closed set.
-//
-// # The defect
+// TestListSubscribers_RefusesAnUnsupportedQueryParameter is the closed parameter set.
 //
 // The parameter set was open, so "?limitt=5", "?status=active" and
-// "?topic=blnk.balances" were all accepted in silence and answered with the whole
-// first page. An operator running a migration report cannot distinguish that from a
-// correct answer, and would read "every subscriber" as "every subscriber matching my
-// filter" — the more dangerous reading of the two, because it looks complete.
-//
-// The message names every offending parameter at once and lists the accepted set, so
-// a caller fixes one request rather than discovering its parameters one round trip at
-// a time.
+// "?topic=blnk.balances" were all accepted in silence and answered with the whole first
+// page.
 func TestListSubscribers_RefusesAnUnsupportedQueryParameter(t *testing.T) {
 	for name, target := range map[string]string{
 		"a misspelled page bound":                         "/subscribers?limitt=5",
@@ -449,18 +342,8 @@ func TestListSubscribers_RefusesAnUnsupportedQueryParameter(t *testing.T) {
 // TestListSubscribers_AcceptsTheSupportedParameters is the negative control on the
 // closed set.
 //
-// A guard that refused a legitimate parameter would break paging while passing the
-// test above, and sort_by and sort_order in particular must be accepted-and-inert:
-// the repository fixes the ordering because paging stability depends on it, and a
-// caller reusing a generic list-endpoint client sends them regardless.
-//
 // `offset` IS NOT ONE OF THEM, and its absence is asserted below rather than left
-// implicit. Paging moved to a keyset cursor (PERF-P08) because the registry is
-// written while it is read: an offset can show a row twice or skip it entirely when a
-// subscriber is registered between two pages, and its cost grows with its depth.
-// Accepting it silently would be the worse failure — a caller would page with it and
-// receive a stable-looking sequence that quietly repeats or loses rows — so the closed
-// set refuses it and NAMES what it does accept.
+// implicit.
 func TestListSubscribers_AcceptsTheSupportedParameters(t *testing.T) {
 	for _, target := range []string{
 		"/subscribers",
@@ -491,26 +374,12 @@ func TestListSubscribers_AcceptsTheSupportedParameters(t *testing.T) {
 	})
 }
 
-// TestListSubscribers_HonoursIncludeCountWithTheEstablishedEnvelope is C-06.
-//
-// # The defect
+// TestListSubscribers_HonoursIncludeCountWithTheEstablishedEnvelope is the established list envelope.
 //
 // include_count was REFUSED with a validation error, because no layer could count the
-// registry. Every other counted listing in this API answers {"data":[...],
-// "total_count":N}, so a generic client asking for a total against this one endpoint
-// received a 400 instead.
+// registry.
 //
-// The count is a real query rather than the length of the page. That distinction is
-// the reason the refusal existed and is worth keeping in mind here: a client reading
-// a full page of 20 as "20 exist" stops early, and one comparing a page length
-// against itself never stops.
-//
-// Both shapes are asserted, and the option adds a FIELD rather than changing the
-// shape. The body was once a bare JSON array, and include_count wrapped it; the
-// envelope became unconditional when paging moved to a keyset cursor (PERF-P08),
-// because the position to resume from has to be returned somewhere and there is
-// nowhere else in a bare array to put it. So `data` is always present, `next_cursor`
-// and `has_more` are always meaningful, and include_count adds `total_count`.
+// The count is a real query rather than the length of the page.
 func TestListSubscribers_HonoursIncludeCountWithTheEstablishedEnvelope(t *testing.T) {
 	t.Run("without include_count the envelope carries no total", func(t *testing.T) {
 		recorder := subscribersRequest(t, http.MethodGet, "/subscribers?limit=1")
@@ -553,21 +422,22 @@ func TestListSubscribers_HonoursIncludeCountWithTheEstablishedEnvelope(t *testin
 	})
 }
 
-// TestManagementBodies_RefuseAFieldTheShapeDoesNotDeclare is the M-9 guard.
+// TestManagementBodies_RefuseAFieldTheShapeDoesNotDeclare is the guard.
 //
-// gin's ShouldBindJSON discards unknown keys, so a misspelling was accepted and dropped. The
-// consequence differs per route, and on two of them it is worse than a no-op:
+// gin's ShouldBindJSON discards unknown keys, so a misspelling was accepted and
+// dropped. The consequence differs per route, and on two of them it is worse than a
+// no-op:
 //
-//   - POST /subscribers with "authorised_topics" — the British spelling, or any typo — registered a
-//     subscriber authorised for NOTHING and answered 201. The operator holds a subscriber that can
-//     obtain a credential and read no topic, and learns it from the consumer rather than the API.
-//   - PUT /subscribers/{id} with every field misspelled decoded to a wholly EMPTY update, which is
-//     a legitimate instruction meaning "rewrite the row with its own values" — so the answer was
-//     200 with the unchanged row, and a caller diffing the response against what they sent could
-//     not tell an ignored field from a value the server kept.
+//   - POST /subscribers with "authorised_topics" — the British spelling, or any typo —
+//     registered a subscriber authorised for NOTHING and answered 201.
+//   - PUT /subscribers/{id} with every field misspelled decoded to a wholly EMPTY
+//     update, which is a legitimate instruction meaning "rewrite the row with its own
+//     values" — so the answer was 200 with the unchanged row, and a caller diffing the
+//     response against what they sent could not tell an ignored field from a value the
+//     server kept.
 //
-// A rejected filter and a rejected body field are the same class of problem, and this API already
-// refuses an unknown QUERY parameter. The body was the remaining half.
+// A rejected filter and a rejected body field are the same class of problem, and this
+// API already refuses an unknown QUERY parameter. The body was the remaining half.
 func TestManagementBodies_RefuseAFieldTheShapeDoesNotDeclare(t *testing.T) {
 	router := subscribersRouter(t, true)
 
@@ -634,12 +504,8 @@ func TestManagementBodies_RefuseAFieldTheShapeDoesNotDeclare(t *testing.T) {
 	}
 }
 
-// TestManagementBodies_StillAcceptWhatTheyDeclare is the other half of M-9: strictness must not
-// have narrowed the accepted vocabulary.
-//
-// A guard that refused a legitimate body would be a worse regression than the gap it closes, and
-// the binding tags have to keep running — decoding through encoding/json directly bypasses gin's
-// validator, and these shapes depend on it for binding:"required" and for the topic-list bounds.
+// TestManagementBodies_StillAcceptWhatTheyDeclare is the other half of the strictness rule:
+// must not have narrowed the accepted vocabulary.
 func TestManagementBodies_StillAcceptWhatTheyDeclare(t *testing.T) {
 	router := subscribersRouter(t, true)
 
@@ -667,9 +533,9 @@ func TestManagementBodies_StillAcceptWhatTheyDeclare(t *testing.T) {
 	})
 
 	t.Run("a topic list beyond the binding bound is still refused", func(t *testing.T) {
-		// binding:"max=16,dive,max=249" is what stops a caller submitting a thousand topic names
-		// or one longer than Kafka accepts, and it only runs because the validator is invoked
-		// explicitly.
+		// binding:"max=16,dive,max=249" is what stops a caller submitting a thousand topic
+		// names or one longer than Kafka accepts, and it only runs because the validator is
+		// invoked explicitly.
 		topics := make([]string, 0, 17)
 		for i := range 17 {
 			topics = append(topics, fmt.Sprintf("blnk.t%d", i))
@@ -701,21 +567,12 @@ func TestManagementBodies_StillAcceptWhatTheyDeclare(t *testing.T) {
 	})
 }
 
-// TestListSubscribers_AnswersOneShapeForEveryReading is the M-7 guard.
+// TestListSubscribers_AnswersOneShapeForEveryReading is the guard.
 //
-// GET /subscribers has three readings — the ordinary keyset page, the `subscriber_id_hash`
-// resolution and the `revocation_pending=true` scan — and two of them used to answer with a bare
-// JSON array while the third answered with the page envelope. That is a breaking difference, not a
-// cosmetic one: a client written against the page reading fails on the resolver with a type error
-// rather than a message.
+// That is a breaking difference, not a cosmetic one: a client written against the page
+// reading fails on the resolver with a type error rather than a message.
 //
-// And it fails where it costs most. The two bare-array readings are the ones an operator reaches
-// from a runbook DURING AN INCIDENT — the first step of the outstanding-revocation procedure, and
-// the resolution of a pseudonym off a consumer-lag alert — so the shape that broke was the one
-// exercised while something was already wrong.
-//
-// Each reading is asserted to decode into the SAME envelope struct, which is the property a client
-// depends on and the one a bare array cannot satisfy.
+// And it fails where it costs most.
 func TestListSubscribers_AnswersOneShapeForEveryReading(t *testing.T) {
 	type envelope struct {
 		Data       []json.RawMessage `json:"data"`
@@ -748,9 +605,9 @@ func TestListSubscribers_AnswersOneShapeForEveryReading(t *testing.T) {
 	})
 
 	t.Run("the pseudonym resolution of an unknown token", func(t *testing.T) {
-		// A token no subscriber can hash to. An empty result is a SUCCESSFUL answer here — the
-		// registry was searched to its end — so it must be an empty data array, not a 404 and not
-		// a bare [].
+		// A token no subscriber can hash to. An empty result is a SUCCESSFUL answer here —
+		// the registry was searched to its end — so it must be an empty data array, not a 404
+		// and not a bare [].
 		body := decode(t, "/subscribers?subscriber_id_hash="+strings.Repeat("f", 16))
 
 		assert.Empty(t, body.Data)
@@ -773,26 +630,22 @@ func TestListSubscribers_AnswersOneShapeForEveryReading(t *testing.T) {
 	})
 
 	t.Run("revocation_pending=false is the ordinary page", func(t *testing.T) {
-		// Carried rather than refused so a client building the query from a boolean variable does
-		// not have to special-case one of its values — and it must therefore behave exactly as the
-		// parameter's absence does.
+		// Carried rather than refused so a client building the query from a boolean variable
+		// does not have to special-case one of its values — and it must therefore behave
+		// exactly as the parameter's absence does.
 		body := decode(t, "/subscribers?revocation_pending=false&limit=1")
 		assert.Nil(t, body.TotalCount, "nobody asked for a total on the ordinary page")
 	})
 }
 
-// TestListSubscribers_RefusesPagingOptionsOnACompleteReading is the other half of M-7.
+// TestListSubscribers_RefusesPagingOptionsOnACompleteReading is the other half of the complete-reading rule.
 //
-// The pseudonym resolution and the revocation scan are not walks: the resolver returns at most one
-// row, and the scan deliberately covers the WHOLE registry because a partial list of live
-// unaccounted-for credentials reads exactly like a complete one — acting on it would leave the rest
-// authenticating while the incident looked closed, which is why the service refuses rather than
-// truncating when the registry exceeds its bound.
-//
-// So `?revocation_pending=true&limit=10` asks for something that does not exist. It was silently
-// ignored, and the caller received every matching row believing they had asked for ten. On this
-// endpoint that is the dangerous direction: an operator who thinks they hold a bounded page of a
-// longer list stops looking.
+// The pseudonym resolution and the revocation scan are not walks: the resolver returns
+// at most one row, and the scan deliberately covers the WHOLE registry because a
+// partial list of live unaccounted-for credentials reads exactly like a complete one —
+// acting on it would leave the rest authenticating while the incident looked closed,
+// which is why the service refuses rather than truncating when the registry exceeds its
+// bound.
 func TestListSubscribers_RefusesPagingOptionsOnACompleteReading(t *testing.T) {
 	readings := map[string]string{
 		"the pseudonym resolution": "subscriber_id_hash=" + strings.Repeat("a", 16),
@@ -828,16 +681,11 @@ func TestListSubscribers_RefusesPagingOptionsOnACompleteReading(t *testing.T) {
 	}
 }
 
-// TestListSubscribers_ParsesIncludeCountStrictly is the other half of C-13.
+// TestListSubscribers_ParsesIncludeCountStrictly is the other half of the closed parameter set.
 //
-// ParseQueryOptions reads include_count as `value == "true"`, so "TRUE", "True" and
-// "1" all meant false and the caller received a bare array with nothing to indicate
-// its spelling had been ignored. A misspelling that silently changes the response
-// SHAPE is worse than one that is refused, so the accepted vocabulary is
-// strconv.ParseBool's and everything else is a validation error.
-//
-// api/filter_helper.go is not modified: tightening ParseQueryOptions would change
-// every listing in the API, including endpoints no finding covers.
+// ParseQueryOptions reads include_count as `value == "true"`, so "TRUE", "True" and "1"
+// all meant false and the caller received a bare array with nothing to indicate its
+// spelling had been ignored.
 func TestListSubscribers_ParsesIncludeCountStrictly(t *testing.T) {
 	t.Run("the counted spellings all produce a total", func(t *testing.T) {
 		for _, value := range []string{"true", "TRUE", "True", "t", "1"} {
@@ -856,9 +704,9 @@ func TestListSubscribers_ParsesIncludeCountStrictly(t *testing.T) {
 	})
 
 	t.Run("the uncounted spellings all omit the total", func(t *testing.T) {
-		// The empty and whitespace-only values are here rather than among the refusals:
-		// not asking for a count is the ordinary request, and "?include_count=" is what
-		// an HTTP client serialising an unset option produces.
+		// The empty and whitespace-only values are here rather than among the refusals: not
+		// asking for a count is the ordinary request, and "?include_count=" is what an HTTP
+		// client serialising an unset option produces.
 		for _, value := range []string{"false", "FALSE", "False", "f", "0", "", "%20"} {
 			recorder := subscribersRequest(t, http.MethodGet,
 				"/subscribers?limit=1&include_count="+value)
@@ -886,22 +734,10 @@ func TestListSubscribers_ParsesIncludeCountStrictly(t *testing.T) {
 	})
 }
 
-// TestCreateSubscriber_AnswersAValidationErrorForAMissingName is C-24.
+// TestCreateSubscriber_AnswersAValidationErrorForAMissingName is the missing-name validation error.
 //
-// # The defect
-//
-// name carried binding:"required", so the BINDER refused a body that omitted it and
-// the handler answered GEN_MALFORMED_REQUEST — "this body could not be read". The
-// endpoint's contract, and every other rule its DTO applies, answers
-// GEN_VALIDATION_ERROR — "this body was read and one field is wrong". A caller
-// distinguishing a transport problem from a field problem was told the wrong one.
-//
-// It also split one rule across two mechanisms: an OMITTED name was refused by the
-// binder and a WHITESPACE-ONLY one by the DTO, so the same broken rule produced two
-// codes depending on how the client spelled it. Both now take the DTO path.
-//
-// A genuinely unbindable body must still answer GEN_MALFORMED_REQUEST, or the fix
-// would have removed the distinction rather than corrected it — hence the last case.
+// name carried binding:"required", so the BINDER refused a body that omitted it and the
+// handler answered GEN_MALFORMED_REQUEST — "this body could not be read".
 func TestCreateSubscriber_AnswersAValidationErrorForAMissingName(t *testing.T) {
 	post := func(t *testing.T, body string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -946,31 +782,17 @@ func TestCreateSubscriber_AnswersAValidationErrorForAMissingName(t *testing.T) {
 	})
 }
 
-// TestSubscriberCRUD_CarriesNoLegacyWebhookState is C-01 at the HTTP boundary.
-//
-// # The defect
+// TestSubscriberCRUD_CarriesNoLegacyWebhookState is the no-legacy-state rule at the HTTP boundary.
 //
 // The four `/subscribers/:id/webhook-subscription` routes are each fronted by
-// middleware.WebhookSunsetGuard and answer 410 Gone after the retirement instant.
-// The GENERAL subscriber routes are not deprecated and are not guarded — and they
-// accepted `webhook_url` on create and update, and echoed it on every read.
-//
-// So the sunset was bypassable by choosing a different route: a caller could keep
-// writing and reading legacy webhook state indefinitely after the surface that owns
-// it had been retired. A sunset with a way around it is not a sunset.
-//
-// # What is asserted, and why it is the shape rather than a status
-//
-// A request carrying an unknown JSON key is not refused — encoding/json ignores it —
-// so the guarantee cannot be "sending webhook_url is a 400". It is that the field has
-// no EFFECT and is never DISCLOSED: the create body has nowhere to put it, and no
-// read projection reports it. Both halves are checked, because either alone leaves
-// the bypass open in one direction.
+// middleware.WebhookSunsetGuard and answer 410 Gone after the retirement instant. The
+// GENERAL subscriber routes are not deprecated and are not guarded — and they accepted
+// `webhook_url` on create and update, and echoed it on every read.
 func TestSubscriberCRUD_CarriesNoLegacyWebhookState(t *testing.T) {
 	t.Run("the registration body has no webhook_url to accept", func(t *testing.T) {
-		// The struct's JSON shape is the contract a client codes against. Asserted here
-		// as well as in the DTO's own contract test because this is the layer where the
-		// bypass was reachable.
+		// The struct's JSON shape is the contract a client codes against. Asserted here as
+		// well as in the DTO's own contract test because this is the layer where the bypass
+		// was reachable.
 		body, err := json.Marshal(model.CreateSubscriber{Name: "ledger-ops"})
 		require.NoError(t, err)
 		assert.NotContains(t, string(body), "webhook_url",
@@ -1008,8 +830,8 @@ func TestSubscriberCRUD_CarriesNoLegacyWebhookState(t *testing.T) {
 			"and not the value under any other key either")
 
 		// migrated_at IS reported, deliberately: it is migration progress about this
-		// deployment rather than legacy state, and a progress report needs it on both
-		// sides of the sunset.
+		// deployment rather than legacy state, and a progress report needs it on both sides
+		// of the sunset.
 		assert.Contains(t, string(body), "migrated_at")
 	})
 
@@ -1040,24 +862,8 @@ func subscribersRouter(t *testing.T, isMaster bool) *gin.Engine {
 	return eventsRouter(t, isMaster)
 }
 
-// subscribersRouterUnderDeclaredKeyScope is subscribersRouter over a deployment that DECLARES a
-// key-authorising component, with the same real datasource.
-//
-// It exists because the registry projection is now truthful about deployment state, so the two
-// halves of the key-scope contract cannot be asserted against one router: the same registration
-// must report the scope requested-and-blocked where nothing is declared, and enforced-and-
-// provisionable where something is. eventsRouter installs no Kafka block at all, which is the
-// first of those deployments; this is the second.
-//
-// The declaration is complete rather than partial — mode, a distinct gateway address list, and an
-// attestation endpoint — because config.KafkaConfig.KeyScopeGateway reports enforcement active only
-// when all three hold, and a partial declaration is deliberately read as no declaration.
-// SubscriberBrokers is set too, so credential_issuance_blocked is not answered by the unadvertised-
-// brokers precondition instead of the one under test.
-//
-// The previous configuration is saved and restored: config.ConfigStore is a process-global
-// atomic.Value, so a gateway installed here would otherwise be read by every later test in the
-// package — including the ones asserting the shipped default.
+// subscribersRouterUnderDeclaredKeyScope is subscribersRouter over a deployment that
+// DECLARES a key-authorising component, with the same real datasource.
 func subscribersRouterUnderDeclaredKeyScope(t *testing.T) *gin.Engine {
 	t.Helper()
 
@@ -1118,11 +924,11 @@ func subscriberRequest(
 		request.Header.Set("Content-Type", "application/json")
 	}
 
-	// IN-PROCESS TLS, because the credential endpoint refuses to put a one-time secret on a
-	// channel it cannot establish as confidential, and this is the channel a production
-	// deployment has. A loopback peer was presented here once; it establishes only that the LAST
-	// hop stayed on the host, so relying on it made this harness model a posture that a
-	// same-host reverse proxy silently invalidates.
+	// IN-PROCESS TLS, because the credential endpoint refuses to put a one-time secret on
+	// a channel it cannot establish as confidential, and this is the channel a production
+	// deployment has. A loopback peer was presented here once; it establishes only that
+	// the LAST hop stayed on the host, so relying on it made this harness model a posture
+	// that a same-host reverse proxy silently invalidates.
 	request.TLS = &tls.ConnectionState{}
 
 	w := httptest.NewRecorder()
@@ -1133,19 +939,20 @@ func subscriberRequest(
 
 // uniqueSubscriberID returns a canonical identifier no other test run uses.
 //
-// The registry is a shared real table and the identifier is unique-indexed, so a fixed value
-// would make this file fail on its second run rather than on a defect. model's own generator
-// is used so the value is canonical by construction — the principal and the consumer group
-// are derived from it, and a non-canonical id is refused at registration.
+// The registry is a shared real table and the identifier is unique-indexed, so a fixed
+// value would make this file fail on its second run rather than on a defect. model's
+// own generator is used so the value is canonical by construction — the principal and
+// the consumer group are derived from it, and a non-canonical id is refused at
+// registration.
 func uniqueSubscriberID() string {
 	return coremodel.GenerateSubscriberID()
 }
 
 // deleteSubscriber removes a subscriber through the API, for cleanup.
 //
-// Cleanup failures are REPORTED rather than ignored: a leaked row is a real registry row that
-// the next run's list assertions have to tolerate, and a silent leak is how a suite becomes
-// order-dependent. A 404 is accepted because the test may already have deleted it.
+// Cleanup failures are REPORTED rather than ignored: a leaked row is a real registry
+// row that the next run's list assertions have to tolerate, and a silent leak is how a
+// suite becomes order-dependent.
 func deleteSubscriber(t *testing.T, router *gin.Engine, subscriberID string) {
 	t.Helper()
 
@@ -1159,8 +966,8 @@ func deleteSubscriber(t *testing.T, router *gin.Engine, subscriberID string) {
 // grantableTopic returns one topic a subscriber may legitimately be granted.
 //
 // It is read from the model rather than written as a literal, so a change to the topic
-// catalogue cannot leave this file granting a topic that is no longer grantable — which would
-// fail as a validation error and read as a routing problem.
+// catalogue cannot leave this file granting a topic that is no longer grantable — which
+// would fail as a validation error and read as a routing problem.
 func grantableTopic(t *testing.T) string {
 	t.Helper()
 
@@ -1170,14 +977,11 @@ func grantableTopic(t *testing.T) string {
 	return topics[0]
 }
 
-// TestSubscribersAPI_RoutesAreReachableAndMasterKeyGated is the authorization matrix for the
-// endpoints' own master-key gate: every one of the six routes must refuse a non-master caller
-// and admit the master key.
+// TestSubscribersAPI_RoutesAreReachableAndMasterKeyGated is the authorization matrix
+// for the endpoints' own master-key gate: every one of the six routes must refuse a
+// non-master caller and admit the master key.
 //
-// THE RESOURCE MAP IS NOT PROVEN HERE. Secure mode is off, so the auth middleware returns early
-// without consulting pathToResource, and an unmapped "subscribers" prefix would pass everything
-// below. TestEventsAPI_PathPrefixesResolveToAuthorizationResources covers both surfaces' prefixes
-// in secure mode with a non-master key, which is the only combination that reaches the map.
+// THE RESOURCE MAP IS NOT PROVEN HERE.
 func TestSubscribersAPI_RoutesAreReachableAndMasterKeyGated(t *testing.T) {
 	for name, target := range map[string]struct {
 		method string
@@ -1211,9 +1015,9 @@ func TestSubscribersAPI_RoutesAreReachableAndMasterKeyGated(t *testing.T) {
 
 // TestSubscribersAPI_CRUDThroughTheRealRouter walks the whole lifecycle over HTTP.
 //
-// Each step reads the state back through the API rather than through the service, because what
-// was unverified is the HTTP layer: the binding, the derived identity in the response, the
-// status codes, and the JSON field names a client is written against.
+// Each step reads the state back through the API rather than through the service,
+// because what was unverified is the HTTP layer: the binding, the derived identity in
+// the response, the status codes, and the JSON field names a client is written against.
 func TestSubscribersAPI_CRUDThroughTheRealRouter(t *testing.T) {
 	router := subscribersRouter(t, true)
 	subscriberID := uniqueSubscriberID()
@@ -1310,22 +1114,9 @@ func TestSubscribersAPI_CRUDThroughTheRealRouter(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_RecordsAndReturnsTheKeyScope is the F-05 contract at the HTTP boundary, and
-// after MAJ-1 it is TWO contracts because the same row means two different things in two
-// deployments.
-//
-// A subscriber registered with a key scope must be accepted either way — recording an intent is
-// always legitimate — and every response about it must carry the scope beside a TRUTHFUL statement
-// of what keeps it. That second half is what this test previously got wrong, and it got it wrong in
-// the direction that matters: it asserted `partition_key_prefix_enforced: true` and
-// `partition_key_prefix_enforced_by: "broker_gateway"` on a harness that declared NO gateway, and
-// the very next test in this file asserts that credential issuance refuses exactly that row for
-// exactly that missing component. Two consecutive tests pinned two contradictory contracts, and the
-// registry was telling operators and clients that a verified isolation boundary existed when none
-// did.
-//
-// So the assertions are split by deployment, and `partition_key_scope_state` is the field that
-// names which one a reader is looking at.
+// TestSubscribersAPI_RecordsAndReturnsTheKeyScope is the contract at the HTTP boundary,
+// It is TWO contracts because the same row means two different things
+// in two deployments.
 func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 	// THE SHIPPED DEFAULT: brokers configured, no key-authorising component declared. The
 	// registration must be accepted and every enforcement claim must be withheld.
@@ -1386,8 +1177,8 @@ func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 
 		// AND THE PREDICTION MATCHES THE REFUSAL. The very next call would be refused with
 		// SUBSCRIBER_KEY_SCOPE_UNENFORCED — see
-		// TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway — so the row
-		// has to say so, with the remedy, rather than reporting itself provisionable.
+		// TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway — so the
+		// row has to say so, with the remedy, rather than reporting itself provisionable.
 		require.Equal(t, true, created["credential_issuance_blocked"],
 			"the registry must predict the refusal instead of contradicting it. body: %s",
 			w.Body.String())
@@ -1396,12 +1187,11 @@ func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 		assert.Contains(t, reason, "KAFKA_KEY_SCOPE_ENFORCEMENT",
 			"and it must name the variable that unblocks it")
 
-		// AND ON EVERY LATER READ, not only on the registration that produced it. The credential is
-		// delivered once, so an operator auditing tenancy months later reads the row rather than the
-		// registration response — and a projection that told the truth at create time and reverted
-		// to the claim on GET would be the same defect with a longer fuse. Asserted here because all
-		// six subscriber projections funnel through one place; if GET agrees, so do list, update,
-		// the pseudonym lookup and the revocation listing.
+		// AND ON EVERY LATER READ, not only on the registration that produced it. The
+		// credential is delivered once, so an operator auditing tenancy months later reads
+		// the row rather than the registration response — and a projection that told the
+		// truth at create time and reverted to the claim on GET would be the same defect with
+		// a longer fuse.
 		read := subscriberRequest(t, router, http.MethodGet, "/subscribers/"+subscriberID, "")
 		require.Equal(t, http.StatusOK, read.Code, "body: %s", read.Body.String())
 
@@ -1475,41 +1265,10 @@ func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 	})
 }
 
-// TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the F-1 contract
-// at the HTTP boundary as this build actually ships it: on the DEFAULT configuration a key-scoped
-// row is refused a credential, with the typed conflict and both remedies.
-//
-// # Why the refusal is the contract
-//
-// Kafka's authorizer has no message-key dimension, so a credential carrying topic Read for a
-// key-scoped row would read every record on every granted topic — other ledgers' and other
-// subscribers' included. Three answers were tried and only the third holds.
-//
-// Disclosing the limitation in a 200 body is not a boundary: the party asked to apply the filter is
-// the party holding the credential, and any other Kafka client ignores the request entirely.
-// Serving the records from Blnk instead — a read path under /subscribers, reading with Blnk's own
-// wide credential and filtering per record — was worse in three specific ways: it was a second data
-// plane, it authenticated with a bespoke header the platform's authorization middleware knows
-// nothing about, and revoking the subscriber's SCRAM credential at the broker left it open.
-//
-// What ships is a NARROWED GRANT plus a REFUSAL. A key-scoped principal is provisioned with
-// Describe and no topic Read, and the records must be delivered by whatever key-authorising
-// component the DEPLOYMENT declares in KAFKA_KEY_SCOPE_ENFORCEMENT. Blnk ships none — so with none
-// declared there is no credential worth minting, and the endpoint says so.
-//
-// # What this asserts, and why at this layer
-//
-// The service layer owns the semantics and event_subscriber_test.go covers them. What belongs HERE
-// is the boundary contract: the status, the typed code a client branches on, the remedies in the
-// message, and that a refusal leaves nothing written and discloses nothing.
-//
-// The ORDER is part of it. The refusal happens after the row is read — so the fence claim and the
-// registry read are required expectations below — and before any secret exists or the broker is
-// touched, which is what makes it free of residue.
-//
-// The registry read of the same state — the prefix reported together with the component that would
-// enforce it — is TestSubscribersAPI_RecordsAndReturnsTheKeyScope. The declared-gateway case is
-// TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway, immediately below.
+// TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway is the
+// contract at the HTTP boundary as this build actually ships it: on the DEFAULT
+// configuration a key-scoped row is refused a credential, with the typed conflict and
+// both remedies.
 func TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
@@ -1529,10 +1288,11 @@ func TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(
 
 	const claimToken = "claim-token-for-the-key-scoped-issuance"
 
-	// REQUIRED, both of them: the refusal is a judgement about the ROW, so the request must reach
-	// the provisioning fence and then the registry before it can be made. An implementation that
-	// refused every request carrying no gateway declaration — without reading the row — would
-	// also refuse prefix-less subscribers, and AssertExpectations below is what separates the two.
+	// REQUIRED, both of them: the refusal is a judgement about the ROW, so the request
+	// must reach the provisioning fence and then the registry before it can be made. An
+	// implementation that refused every request carrying no gateway declaration — without
+	// reading the row — would also refuse prefix-less subscribers, and AssertExpectations
+	// below is what separates the two.
 	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
 		Return(claimToken, nil).Once()
 	datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(stored, nil).Once()
@@ -1580,17 +1340,11 @@ func TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway(
 	datasource.AssertExpectations(t)
 }
 
-// TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway is the other side
-// of the same decision, and it is what keeps the refusal above from being read as "key scopes are
-// unusable".
+// TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway is the
+// other side of the same decision, and it is what keeps the refusal above from being
+// read as "key scopes are unusable".
 //
-// With KAFKA_KEY_SCOPE_ENFORCEMENT declaring a component at a distinct endpoint, the identical
-// request is NOT refused: it proceeds past the key-scope guard to the broker. This harness holds no
-// admin SASL credential, so the broker step fails with a 503 — which is the assertion. A 503 here
-// means the row was accepted and provisioning was attempted; a 409 would mean the guard refused.
-//
-// The pair is what makes either test conclusive. A build that always refused would satisfy the test
-// above and fail this one; a build that never refused would satisfy this one and fail that.
+// The pair is what makes either test conclusive.
 func TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGateway(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
@@ -1632,10 +1386,10 @@ func TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGate
 		"SUBSCRIBER_KEY_SCOPE_UNENFORCED says nothing applies the prefix; this deployment declared "+
 			"something that does")
 
-	// AND PROVISIONING WAS ATTEMPTED AT THE BROKER, which is what proves the row was accepted
-	// rather than skipped. It fails because the harness holds no admin SASL credential, and a 503
-	// is the honest answer: nothing was created, and a retry against a reachable, authenticated
-	// cluster is what would succeed.
+	// AND PROVISIONING WAS ATTEMPTED AT THE BROKER, which is what proves the row was
+	// accepted rather than skipped. It fails because the harness holds no admin SASL
+	// credential, and a 503 is the honest answer: nothing was created, and a retry against
+	// a reachable, authenticated cluster is what would succeed.
 	require.Equal(t, http.StatusServiceUnavailable, recorder.Code,
 		"the row was accepted, so the next step is the broker, and this harness cannot "+
 			"authenticate to one. body: %s", body)
@@ -1651,11 +1405,11 @@ func TestIssueKafkaCredentials_ProceedsForAKeyScopedSubscriberUnderADeclaredGate
 	datasource.AssertExpectations(t)
 }
 
-// TestSubscribersAPI_RefusesAnUngrantableTopic covers the grant validation at the boundary.
+// TestSubscribersAPI_RefusesAnUngrantableTopic covers the grant validation at the
+// boundary.
 //
 // Dead-letter topics and the internal system category are Blnk's own; granting one to a
-// subscriber would hand it Blnk's failure stream. The refusal must be a 400-class validation
-// error rather than a 500, because it is entirely a property of the request.
+// subscriber would hand it Blnk's failure stream.
 func TestSubscribersAPI_RefusesAnUngrantableTopic(t *testing.T) {
 	router := subscribersRouter(t, true)
 
@@ -1686,11 +1440,11 @@ func TestSubscribersAPI_RefusesAnUngrantableTopic(t *testing.T) {
 	}
 }
 
-// TestSubscribersAPI_RefusesAMalformedRegistration covers the binder and the DTO validation.
+// TestSubscribersAPI_RefusesAMalformedRegistration covers the binder and the DTO
+// validation.
 //
-// Name is the one field the service cannot invent, and the topic-count and length caps live in
-// the BINDING TAGS so they bound allocation before any handler code runs. Each of these must be
-// a 400 rather than a 500 or a silent success.
+// Name is the one field the service cannot invent, and the topic-count and length caps
+// live in the BINDING TAGS so they bound allocation before any handler code runs.
 func TestSubscribersAPI_RefusesAMalformedRegistration(t *testing.T) {
 	router := subscribersRouter(t, true)
 
@@ -1720,9 +1474,7 @@ func TestSubscribersAPI_RefusesAMalformedRegistration(t *testing.T) {
 
 // TestSubscribersAPI_ReadAndUpdateRefuseAnUnknownSubscriber pins the not-found path.
 //
-// An identifier that matches nothing must be a clean 404. It is worth asserting at the router
-// because the alternative — a 500 from a nil dereference in a projection — is the shape this
-// class of bug usually takes.
+// An identifier that matches nothing must be a clean 404.
 func TestSubscribersAPI_ReadAndUpdateRefuseAnUnknownSubscriber(t *testing.T) {
 	router := subscribersRouter(t, true)
 	missing := uniqueSubscriberID()
@@ -1742,15 +1494,11 @@ func TestSubscribersAPI_ReadAndUpdateRefuseAnUnknownSubscriber(t *testing.T) {
 	}
 }
 
-// TestSubscribersAPI_CredentialIssuanceRefusesWithoutABroker covers the credential endpoint's
-// HTTP contract in the configuration the ordinary suite runs in.
+// TestSubscribersAPI_CredentialIssuanceRefusesWithoutABroker covers the credential
+// endpoint's HTTP contract in the configuration the ordinary suite runs in.
 //
 // No broker is configured here, so the endpoint must refuse with the typed
-// EVENT_KAFKA_UNAVAILABLE — a 503, retryable, and emphatically not a 500. That distinction is
-// the whole reason the code exists: an operator seeing 500 looks for a defect in Blnk, while
-// 503 names the dependency. The broker-backed success path is owned by
-// event_isolation_integration_test.go, which skips without a broker; asserting it here would
-// make this file skip in the ordinary suite.
+// EVENT_KAFKA_UNAVAILABLE — a 503, retryable, and emphatically not a 500.
 func TestSubscribersAPI_CredentialIssuanceRefusesWithoutABroker(t *testing.T) {
 	router := subscribersRouter(t, true)
 	subscriberID := uniqueSubscriberID()
@@ -1777,7 +1525,8 @@ func TestSubscribersAPI_CredentialIssuanceRefusesWithoutABroker(t *testing.T) {
 
 	// THE FIVE-SECOND BUDGET, asserted as HTTP behaviour: the request ENDS within it. The
 	// requirement is that provisioning completes inside five seconds, and the endpoint's
-	// contract is that an expiry is answered rather than waited out — so no request may hang.
+	// contract is that an expiry is answered rather than waited out — so no request may
+	// hang.
 	assert.Less(t, elapsed, blnk.SubscriberCredentialIssuanceBudget+2*time.Second,
 		"the endpoint must answer within its own budget rather than holding the request open")
 
@@ -1834,12 +1583,11 @@ func TestSubscribersAPI_ListPagingIsBounded(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_NeverReturnsTheCredentialReference is the secret-handling assertion at the
-// HTTP boundary, and it is the one that would matter most if it failed.
+// TestSubscribersAPI_NeverReturnsTheCredentialReference is the secret-handling
+// assertion at the HTTP boundary, and it is the one that would matter most if it
+// failed.
 //
-// The registry stores a non-reversible reference. It is not a secret, but it is not a caller's
-// business either, and the response contract reduces it to a short fingerprint in exactly one
-// place so no handler can return the raw value by writing the obvious assignment.
+// The registry stores a non-reversible reference.
 func TestSubscribersAPI_NeverReturnsTheCredentialReference(t *testing.T) {
 	router := subscribersRouter(t, true)
 	subscriberID := uniqueSubscriberID()
@@ -1867,9 +1615,9 @@ func TestSubscribersAPI_NeverReturnsTheCredentialReference(t *testing.T) {
 
 // webhookSubscriptionPath returns the deprecated route for one subscriber.
 //
-// It is built from the exported route pattern rather than written as a literal so this file
-// cannot drift from api/api.go's registration: the pattern is the single source of truth the
-// router, the sunset interceptor and these tests all read.
+// It is built from the exported route pattern rather than written as a literal so this
+// file cannot drift from api/api.go's registration: the pattern is the single source of
+// truth the router, the sunset interceptor and these tests all read.
 func webhookSubscriptionPath(subscriberID string) string {
 	return strings.Replace(
 		middleware.DeprecatedWebhookSubscriptionRoute, ":subscriber_id", subscriberID, 1,
@@ -1895,19 +1643,11 @@ func registerSubscriberForWebhookTests(t *testing.T, router *gin.Engine) string 
 	return subscriberID
 }
 
-// TestSubscribersAPI_WebhookSubscriptionLifecycleThroughTheRealRouter walks the deprecated
-// surface end to end while the dual-delivery window is open.
+// TestSubscribersAPI_WebhookSubscriptionLifecycleThroughTheRealRouter walks the
+// deprecated surface end to end while the dual-delivery window is open.
 //
-// The router is built with NO retirement instant, so the sunset interceptor passes the request
-// through and the handlers actually run. That is the only configuration in which these four
-// handler bodies are reachable at all, which is why the coverage they carry cannot come from
-// the sunset file.
-//
-// The delete step is the one worth reading closely. The handler clears the URL and then stamps
-// the migration instant as two separate writes, in that order, so that a failure between them
-// leaves a subscriber reported as awaiting migration rather than as migrated. The read after
-// the delete asserts BOTH halves landed, because a 204 alone would be satisfied by a clear that
-// never stamped.
+// The router is built with NO retirement instant, so the sunset interceptor passes the
+// request through and the handlers actually run.
 func TestSubscribersAPI_WebhookSubscriptionLifecycleThroughTheRealRouter(t *testing.T) {
 	router := subscribersRouter(t, true)
 	subscriberID := registerSubscriberForWebhookTests(t, router)
@@ -2002,12 +1742,11 @@ func TestSubscribersAPI_WebhookSubscriptionLifecycleThroughTheRealRouter(t *test
 	})
 }
 
-// TestSubscribersAPI_WebhookSubscriptionRefusesAnUnsafeDestination is the SSRF policy at the
-// HTTP boundary, applied at the same standard on create and on replace.
+// TestSubscribersAPI_WebhookSubscriptionRefusesAnUnsafeDestination is the SSRF policy
+// at the HTTP boundary, applied at the same standard on create and on replace.
 //
-// This route's whole purpose is to accept a URL, which makes it the most likely way an internal
-// address reaches a column that is a future request sink. A policy enforced on create but not on
-// replace is a policy with an edit-shaped hole, so every case is asserted against both verbs.
+// This route's whole purpose is to accept a URL, which makes it the most likely way an
+// internal address reaches a column that is a future request sink.
 func TestSubscribersAPI_WebhookSubscriptionRefusesAnUnsafeDestination(t *testing.T) {
 	router := subscribersRouter(t, true)
 	path := webhookSubscriptionPath(registerSubscriberForWebhookTests(t, router))
@@ -2046,11 +1785,8 @@ func TestSubscribersAPI_WebhookSubscriptionRefusesAnUnsafeDestination(t *testing
 	})
 }
 
-// TestSubscribersAPI_WebhookSubscriptionRefusesAnUnknownSubscriber pins the not-found path on
-// all four verbs.
-//
-// The identifier is canonical, so the refusal can only come from the registry rather than from
-// identifier validation — which is what makes this a not-found assertion and not a format one.
+// TestSubscribersAPI_WebhookSubscriptionRefusesAnUnknownSubscriber pins the not-found
+// path on all four verbs.
 func TestSubscribersAPI_WebhookSubscriptionRefusesAnUnknownSubscriber(t *testing.T) {
 	router := subscribersRouter(t, true)
 	path := webhookSubscriptionPath(uniqueSubscriberID())
@@ -2071,13 +1807,10 @@ func TestSubscribersAPI_WebhookSubscriptionRefusesAnUnknownSubscriber(t *testing
 	}
 }
 
-// TestSubscribersAPI_WebhookSubscriptionIsMasterKeyGated covers the privileged-endpoint gate on
-// the deprecated surface.
+// TestSubscribersAPI_WebhookSubscriptionIsMasterKeyGated covers the privileged-endpoint
+// gate on the deprecated surface.
 //
-// The gate must hold on all four verbs while the window is open. It is asserted separately from
-// the sunset file's authorization matrix because that file proves 410 comes FIRST once the
-// instant has passed; this one proves that before the instant the gate is still the thing that
-// stops a non-master caller, rather than the surface being open because it is deprecated.
+// The gate must hold on all four verbs while the window is open.
 func TestSubscribersAPI_WebhookSubscriptionIsMasterKeyGated(t *testing.T) {
 	router := subscribersRouter(t, false)
 	path := webhookSubscriptionPath(uniqueSubscriberID())
@@ -2098,13 +1831,11 @@ func TestSubscribersAPI_WebhookSubscriptionIsMasterKeyGated(t *testing.T) {
 	}
 }
 
-// TestSubscribersAPI_WebhookSubscriptionNeverReturnsTheSigningSecret keeps the deprecated read
-// shape from becoming a secret-bearing response.
+// TestSubscribersAPI_WebhookSubscriptionNeverReturnsTheSigningSecret keeps the
+// deprecated read shape from becoming a secret-bearing response.
 //
 // The legacy transport's signing secret and configured headers are deployment-wide
-// configuration, not per-subscriber data. Returning them here would turn migration tracking
-// into credential distribution on the one surface that is being retired and therefore attracts
-// the least scrutiny.
+// configuration, not per-subscriber data.
 func TestSubscribersAPI_WebhookSubscriptionNeverReturnsTheSigningSecret(t *testing.T) {
 	router := subscribersRouter(t, true)
 	path := webhookSubscriptionPath(registerSubscriberForWebhookTests(t, router))
@@ -2134,45 +1865,25 @@ func TestSubscribersAPI_WebhookSubscriptionNeverReturnsTheSigningSecret(t *testi
 // The mock-backed half of this file
 //
 // Everything above this line runs against a REAL datasource and, for the credential
-// route, against no broker at all. That combination proves a great deal — the bindings,
-// the derived identity, the status codes, the deprecated surface's lifecycle — but there
-// are four properties it cannot reach, and each of them is the kind that fails silently.
+// route, against no broker at all.
 //
-//	THE AUTHORIZATION RESOURCE MAP. A master-key request never consults it: the auth
-//	middleware matches the master key and returns before getResourceFromPath is called, so
-//	a master-key-only reachability test passes even with "subscribers" missing from
-//	middleware.pathToResource — the state in which every request to the surface from a
-//	NON-MASTER principal is aborted with ErrAuthUnknownResource, which in a secure
-//	deployment is every integration. Proving the map needs secure mode AND a valid
-//	non-master key, which needs a datasource that can answer GetAPIKey without a
-//	database row.
+// THE AUTHORIZATION RESOURCE MAP.
 //
-//	THAT THE GATE SHORT-CIRCUITS. "Refused with AUTH_MASTER_KEY_REQUIRED" and "refused
-//	before any registry work" are different claims. The second one is only observable by
-//	watching the store, and a real datasource cannot be watched.
+// THAT THE GATE SHORT-CIRCUITS.
 //
-//	THE FIVE-SECOND CEILING AS AN HTTP OUTCOME. It takes a dependency that stalls PAST the
-//	budget, which no real dependency does on demand.
+// THE FIVE-SECOND CEILING AS AN HTTP OUTCOME.
 //
-//	THE PLAINTEXT SASL PASSWORD. A SubscriberCredential's password field is unexported and
-//	has no exported constructor, deliberately, so this package cannot fabricate one: the
-//	only way a plaintext reaches a response is a real issuance against a real broker. The
-//	test that does it is skipped, with a reason, when no broker is configured.
+// THE PLAINTEXT SASL PASSWORD.
 //
 // Rules status, stated because UR4 requires it: review_rules reports NO USER RULES for
-// this project. The baseline held to instead is the one AAP §0.8 anchors to conventions
-// this repository already keeps — tests beside their source in package api, testify
-// assertions, configuration injected only through config.MockConfig, assertions on
-// error_detail.code rather than on a status that several codes share, the secret-handling
-// posture proved rather than asserted in prose, and the Apache-2.0 header this file
-// already carries.
+// this project.
 // =======================================================================================
 
 // subscribersAPITestMasterKey is the master secret the mock-backed router runs with.
 //
 // It is a test fixture and deliberately self-describing: it matches no provider's
-// credential format, so a secret scanner reading this file finds a string that says what
-// it is rather than something it has to guess about.
+// credential format, so a secret scanner reading this file finds a string that says
+// what it is rather than something it has to guess about.
 const subscribersAPITestMasterKey = "subscribers-api-test-master-key-not-a-real-credential"
 
 // subscribersHarness describes the deployment a mock-backed router is built for.
@@ -2181,60 +1892,38 @@ const subscribersAPITestMasterKey = "subscribers-api-test-master-key-not-a-real-
 // deployments, and a single boolean could not express them:
 //
 //   - secure selects the authentication middleware. TRUE is required to prove anything
-//     about the resource map or about scopes; FALSE is what allows the master-key flag to
-//     be injected directly, which is the only way to observe a request that reaches a
-//     handler while making NO datasource call at all.
-//   - masterKey is the injected principal, honoured only when secure is false. In secure
-//     mode the key travels on the request instead, so that the whole chain is exercised.
-//   - brokers configures Kafka. Empty is the graceful-degradation deployment the ordinary
-//     suite runs in; non-empty is what lets a request reach the registry through the
-//     credential route, which is where the ceiling lives.
+//     about the resource map or about scopes; FALSE is what allows the master-key flag
+//     to be injected directly, which is the only way to observe a request that reaches
+//     a handler while making NO datasource call at all.
+//   - masterKey is the injected principal, honoured only when secure is false.
+//   - brokers configures Kafka. Empty is the graceful-degradation deployment the
+//     ordinary suite runs in; non-empty is what lets a request reach the registry
+//     through the credential route, which is where the ceiling lives.
 type subscribersHarness struct {
 	secure    bool
 	masterKey bool
 	brokers   []string
 
-	// keyScopeGateway declares a key-authorising component in front of the brokers, at these
-	// addresses. Empty is the SHIPPED DEFAULT, under which issuance refuses a subscriber
-	// recording a partition_key_prefix — so a test that needs a key-scoped issuance to proceed
-	// sets this, and a test asserting the refusal must not.
-	//
-	// The addresses must be DISTINCT from brokers: config.KafkaConfig.KeyScopeGateway reads a
-	// gateway list equal to the broker list as no declaration at all, on the grounds that a
-	// component which IS the brokers cannot be evaluating keys.
-	//
-	// SETTING THIS ALSO STARTS AN ATTESTING STUB and declares its control endpoint, because a
-	// mode and an address are no longer a complete declaration: issuance binds the recorded
-	// prefix at the component and requires it to attest that binding back (SEC-01). A harness
-	// that declared addresses alone would refuse every key-scoped issuance with
-	// SUBSCRIBER_KEY_SCOPE_UNATTESTED — a refusal, just not the one under test.
+	// keyScopeGateway declares a key-authorising component in front of the brokers, at
+	// these addresses. Empty is the SHIPPED DEFAULT, under which issuance refuses a
+	// subscriber recording a partition_key_prefix — so a test that needs a key-scoped
+	// issuance to proceed sets this, and a test asserting the refusal must not.
 	keyScopeGateway []string
 
-	// allowLoopbackIssuance declares the deployment a LOCAL-DEVELOPMENT host, which is the only
-	// state in which a loopback peer establishes a confidential channel for credential issuance.
-	//
-	// Default false, matching production: a loopback peer proves only that the last hop stayed
-	// on the host, and a same-host reverse proxy makes a public plaintext hop look loopback from
-	// inside the process. Tests here therefore present IN-PROCESS TLS instead, which is the
-	// channel a production deployment actually has; this field exists for the two tests whose
-	// subject IS the local-development exception.
+	// allowLoopbackIssuance declares the deployment a LOCAL-DEVELOPMENT host, which is the
+	// only state in which a loopback peer establishes a confidential channel for
+	// credential issuance.
 	allowLoopbackIssuance bool
 
 	// trustForwardedProto declares the proxy in front of Blnk that terminated TLS and sets
-	// X-Forwarded-Proto, which is the production Kubernetes shape: TLS ends at the ingress and
-	// the hop to the pod is plaintext, so the process never sees a handshake. Without the
-	// declaration the header is a claim any caller can make and is not believed.
+	// X-Forwarded-Proto, which is the production Kubernetes shape: TLS ends at the ingress
+	// and the hop to the pod is plaintext, so the process never sees a handshake. Without
+	// the declaration the header is a claim any caller can make and is not believed.
 	trustForwardedProto bool
 
 	// trustedProxies names the peers that declaration applies to
-	// (BLNK_SERVER_TRUSTED_PROXIES), and it is the SECOND HALF of the forwarded-HTTPS channel
-	// rather than a refinement of it (SEC-03).
-	//
-	// The declaration alone is a statement about the intended path, and a request arriving by
-	// any other route — a pod IP, a port-forward, a second Service — is not on it while still
-	// being able to send the same header. So trustForwardedProto with this left empty is a
-	// deployment in which the forwarded channel establishes NOTHING, and that combination is
-	// exercised deliberately below rather than avoided.
+	// (BLNK_SERVER_TRUSTED_PROXIES), and it is the SECOND HALF of the forwarded-HTTPS
+	// channel rather than a refinement of it.
 	trustedProxies string
 }
 
@@ -2243,20 +1932,6 @@ type subscribersHarness struct {
 // The mock is returned because it IS the assertion surface for half the properties in
 // this section: which repository methods a request reached, with which arguments, and —
 // most often — that it reached none.
-//
-// blnk.NewBlnk accepts the mock because it takes a database.IDataSource and touches none
-// of its methods during construction. Composing &blnk.Blnk{datasource: …} directly is
-// impossible from package api because the field is unexported; the root package's own
-// tests do that only because they are in package blnk.
-//
-// The DataSource and Redis DSNs are set even though no test here reaches PostgreSQL:
-// config.MockConfig runs validateAndAddDefaults, which requires both. WebhookDeprecation
-// SunsetDate is set only in the Kafka case, and to a FUTURE instant — configuration
-// validation refuses brokers without a sunset date, because a Kafka deployment with no
-// usable dual-delivery window is treated as already past the retirement. A future instant
-// keeps the sunset guard transparent, which is the state the deprecated routes are
-// exercised in here; the retirement itself belongs to api/webhook_sunset_test.go and is
-// not touched from this file.
 //
 // Parameters:
 //   - t *testing.T: the test, for fatal reporting and cleanup.
@@ -2315,11 +1990,12 @@ func setupSubscribersRouter(
 			Add(20 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	}
 
-	// RESTORED WHEN THE TEST ENDS. config.ConfigStore is a process-global atomic.Value, so a
-	// broker list, a master key or a sunset date installed here is read by every later test in
-	// the package that calls config.Fetch — including the ones asserting the unconfigured or
-	// insecure posture, which then fail somewhere that never mentioned Kafka. Saving and
-	// restoring is the established idiom; see the same block in newEventsAPIOverMockDatasource.
+	// RESTORED WHEN THE TEST ENDS. config.ConfigStore is a process-global atomic.Value, so
+	// a broker list, a master key or a sunset date installed here is read by every later
+	// test in the package that calls config.Fetch — including the ones asserting the
+	// unconfigured or insecure posture, which then fail somewhere that never mentioned
+	// Kafka. Saving and restoring is the established idiom; see the same block in
+	// newEventsAPIOverMockDatasource.
 	previousConfiguration := config.ConfigStore.Load()
 	t.Cleanup(func() {
 		if previousConfiguration != nil {
@@ -2344,18 +2020,10 @@ func setupSubscribersRouter(
 
 	datasource := new(mocks.MockDataSource)
 
-	// THE MOCK IS HANDED OVER UNWRAPPED, and the wrapper it replaced is gone rather than
-	// retired. This harness used to interpose a synchronised datasource plus a barrier
-	// middleware so a non-master request could be ordered ahead of the background last-used
-	// update the authentication middleware starts for it — scaffolding that existed only
-	// because the middleware read c.Request from INSIDE that goroutine, racing otelgin's
-	// deferred restore.
-	//
-	// That race was fixed at its cause: the middleware now captures the request context and the
-	// key id on the request goroutine and runs the update on a detached bounded context
-	// (context.WithoutCancel), so nothing here has to schedule around it. A test that needs to
-	// OBSERVE the update joins it through expectEventsAPIKeyLookup / requireEventsLastUsedTouch
-	// in events_api_test.go — same package, one implementation of that join.
+	// THE MOCK IS HANDED OVER UNWRAPPED, because the authentication middleware does not
+	// read c.Request from inside the background last-used update it starts. Interposing a
+	// synchronised datasource plus a barrier middleware, to order a non-master request ahead
+	// of that update, would be scaffolding for a race this code does not have.
 	service, err := blnk.NewBlnk(datasource)
 	require.NoError(t, err, "the service container must be constructible over the mock store")
 
@@ -2366,10 +2034,6 @@ func setupSubscribersRouter(
 		// Injected into the API's OWN engine before the routes are registered, exactly as
 		// setupHookRouter and eventsRouter do. Wrapping the finished router in a second
 		// engine does not work: the nested context is not the one the handlers read.
-		//
-		// This is only reachable with secure mode off. With it on, the authentication
-		// middleware answers 401 before any injected value is consulted, which is why the
-		// secure harness sends the key on the request instead.
 		instance.router.Use(func(c *gin.Context) {
 			c.Set("isMasterKey", harness.masterKey)
 			c.Next()
@@ -2380,11 +2044,6 @@ func setupSubscribersRouter(
 }
 
 // subscribersTestAPIKey builds a VALID non-master API key carrying the given scopes.
-//
-// Valid is the operative word, and it is two conditions rather than one:
-// model.APIKey.IsValid() is !IsRevoked && now.Before(ExpiresAt), and an invalid key is
-// refused with AUTH_EXPIRED_API_KEY before the resource map is ever consulted — which
-// would make the authorization test below pass while proving nothing.
 //
 // Parameters:
 //   - scopes ...string: the scopes to grant, in resource:action form.
@@ -2405,19 +2064,10 @@ func subscribersTestAPIKey(scopes ...string) *coremodel.APIKey {
 
 // subscribersCall is one request against the surface.
 //
-// # The transport this presents by default, and why it is TLS rather than loopback
-//
-// The credential route refuses to put a one-time password on a channel the deployment has not
-// established as confidential, so every call has to present one of the three. This harness
-// presents IN-PROCESS TLS — the channel a production deployment actually has — because the
-// alternative it used to present, a loopback peer, is not evidence of confidentiality on its
-// own: a reverse proxy on the same host forwards a public plaintext request over 127.0.0.1, so
-// the peer reads as loopback while the client's hop was readable. Defaulting to it made every
-// test in this file assert against a posture no production deployment should have.
-//
-// peer is left to httptest's 192.0.2.1 unless a test sets it, and plaintext drops the TLS state,
-// so the two tests whose subject IS the transport gate can compose any of the four shapes:
-// TLS, declared proxy, declared local-development host with a loopback peer, and none of those.
+// The credential route refuses to put a one-time password on a channel the deployment
+// has not established as confidential, so every call has to present one of the three.
+// Defaulting to it made every test in this file assert against a posture no production
+// deployment should have.
 type subscribersCall struct {
 	method string
 	path   string
@@ -2457,10 +2107,11 @@ func subscribersServe(
 		request.Header.Set("X-Forwarded-Proto", call.forwardedProto)
 	}
 
-	// IN-PROCESS TLS, unless the call is deliberately plaintext. A non-nil Request.TLS is what a
-	// server that completed the handshake itself records, and it is the one confidential channel
-	// that needs no declaration by the deployment — which makes it the honest default for a
-	// harness whose subject is the handlers rather than the transport gate.
+	// IN-PROCESS TLS, unless the call is deliberately plaintext. A non-nil Request.TLS is
+	// what a server that completed the handshake itself records, and it is the one
+	// confidential channel that needs no declaration by the deployment — which makes it
+	// the honest default for a harness whose subject is the handlers rather than the
+	// transport gate.
 	if !call.plaintext {
 		request.TLS = &tls.ConnectionState{}
 	}
@@ -2471,21 +2122,11 @@ func subscribersServe(
 	return recorder
 }
 
-// subscribersEveryRoute is the whole MASTER-KEY-GATED surface: the six registry routes and
-// the four deprecated webhook-subscription ones.
+// subscribersEveryRoute is the whole MASTER-KEY-GATED surface: the six registry routes
+// and the four deprecated webhook-subscription ones.
 //
 // It is a function rather than a package-level slice so that each caller gets its own
-// copy and cannot mutate a shared table. The bodies are the smallest ones each route
-// binds, because these tables drive tests about AUTHORIZATION: a request must fail on the
-// gate rather than on its body, or the assertion moves to a different property.
-//
-// EVERY ROUTE UNDER /subscribers IS HERE, and that is now a complete statement rather than a
-// qualified one: there is no data-plane route to leave out. A record-serving route existed and was
-// removed — it was authenticated by the subscriber's own SASL secret rather than by an operator's
-// master key, which is precisely why it could not appear in a table asserting
-// ErrAuthMasterKeyRequired for every entry. Its absence is asserted directly by
-// TestSubscribersAPI_HasNoRecordServingRoute, and the absence of the header it read by
-// TestSubscribersAPI_DoesNotReadASubscriberSecretHeader.
+// copy and cannot mutate a shared table.
 func subscribersEveryRoute(subscriberID string) []subscribersCall {
 	webhookPath := webhookSubscriptionPath(subscriberID)
 
@@ -2512,15 +2153,13 @@ func subscribersEveryRoute(subscriberID string) []subscribersCall {
 // subscribersFixtureRow is a stored registry row, with the two columns a response must
 // never disclose deliberately populated.
 //
-// CredentialReference and WebhookURL are set on every fixture. A read shape that dropped
-// them would pass a test built from a row that never carried them, which is the shape of
-// test that lets a leak through: the assertion has to be able to fail.
+// CredentialReference and WebhookURL are set on every fixture.
 func subscribersFixtureRow(subscriberID string) *coremodel.EventSubscriber {
 	principal, err := coremodel.CanonicalKafkaPrincipal(subscriberID)
 	if err != nil {
-		// A fixture built from a non-canonical identifier would exercise the validator
-		// rather than the handler, so this is a defect in the test rather than a case to
-		// handle at run time. Panicking names it at the point it was introduced.
+		// A fixture built from a non-canonical identifier would exercise the validator rather
+		// than the handler, so this is a defect in the test rather than a case to handle at
+		// run time. Panicking names it at the point it was introduced.
 		panic("subscribers api test: fixture identifier is not canonical: " + err.Error())
 	}
 
@@ -2549,47 +2188,27 @@ func subscribersFixtureRow(subscriberID string) *coremodel.EventSubscriber {
 }
 
 // TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate is the
-// AUTHORIZED-CALLER half of the two-file registration proof, and it is the half that was
-// missing.
+// AUTHORIZED-CALLER half of the two-file registration proof, and it is the half that
+// was missing.
 //
-// # Why the unrelated-scope test is not enough on its own
+// TestSubscribersAPI_AuthorizationResourceIsRegistered above drives every route with a
+// key scoped to ANOTHER feature. That refusal proves the prefix resolves and names the
+// scope it resolves to, and it stops there — by construction, because the request is
+// refused by the MIDDLEWARE. Everything past that point is untested by it:
 //
-// TestSubscribersAPI_AuthorizationResourceIsRegistered above drives every route with a key
-// scoped to ANOTHER feature. That refusal proves the prefix resolves and names the scope it
-// resolves to, and it stops there — by construction, because the request is refused by the
-// MIDDLEWARE. Everything past that point is untested by it:
-//
-//   - Whether a caller granted exactly `subscribers:<action>` is ADMITTED. A permission check
-//     that refused the correct scope — an action table off by one entry, a scope comparison that
-//     never matches — would leave every route unusable by every non-master principal, and the
-//     unrelated-scope test would still pass, because it EXPECTS a refusal.
-//   - Whether the ENDPOINT'S OWN master-key gate then refuses. AUTH_MASTER_KEY_REQUIRED is the
-//     only code that proves a request traversed the entire chain and was stopped last by the
-//     handler. A route that forgot its gate would answer 200, or reach the registry, and again
-//     the unrelated-scope test would notice nothing: its request never got that far.
-//   - Whether the gate refuses BEFORE doing work. A gate that fires after the service call has
-//     started is not a gate, and on the credential route it would mint a credential for a caller
-//     it was about to refuse.
-//
-// # Why this could not be written before
-//
-// A correctly scoped key is exactly the path that spawns the authentication middleware's
-// fire-and-forget last-used update, and that goroutine races otelgin's deferred restore of
-// c.Request — a PRE-EXISTING production race, reproducible on /ledgers and every resource older
-// than this feature. The harness now joins each request with its own background work through
-// expectEventsAPIKeyLookup and requireEventsLastUsedTouch, which is a happens-before edge
-// rather than a delay, so the path is testable without the race being reported against this file
-// and without pretending it does not exist.
-//
-// Every assertion names a CODE, never a status: AUTH_UNKNOWN_RESOURCE,
-// AUTH_INSUFFICIENT_PERMISSIONS and AUTH_MASTER_KEY_REQUIRED all resolve to 403, so a
-// status-only assertion passes in all three of the failure modes above.
+//   - Whether a caller granted exactly `subscribers:<action>` is ADMITTED.
+//   - Whether the ENDPOINT'S OWN master-key gate then refuses. AUTH_MASTER_KEY_REQUIRED
+//     is the only code that proves a request traversed the entire chain and was stopped
+//     last by the handler.
+//   - Whether the gate refuses BEFORE doing work. A gate that fires after the service
+//     call has started is not a gate, and on the credential route it would mint a
+//     credential for a caller it was about to refuse.
 func TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate(t *testing.T) {
 	subscriberID := uniqueSubscriberID()
 
-	// The action each method maps to in middleware.methodToAction. The scope granted below is
-	// built from it, so a key is granted EXACTLY what the route requires and nothing more: a
-	// wildcard would pass even if the method mapped to the wrong action.
+	// The action each method maps to in middleware.methodToAction. The scope granted below
+	// is built from it, so a key is granted EXACTLY what the route requires and nothing
+	// more: a wildcard would pass even if the method mapped to the wrong action.
 	actionForMethod := map[string]middleware.Action{
 		http.MethodGet:    middleware.ActionRead,
 		http.MethodPost:   middleware.ActionWrite,
@@ -2612,10 +2231,7 @@ func TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate
 
 			// The two calls the authentication middleware makes for a non-master credential,
 			// programmed together with the join that orders the second one against the call-log
-			// read further down. The barrier that used to provide that ordering was removed with
-			// the c.Request race it existed for — see the note on setupSubscribersRouter — so the
-			// join is what keeps this test's read off testify's internals while a goroutine is
-			// still appending to them.
+			// read further down.
 			touched := expectSubscribersAPIKeyLookup(datasource, key)
 
 			target.key = key.Key
@@ -2641,15 +2257,15 @@ func TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate
 
 			// THE ASSERTION THIS TEST EXISTS FOR. Only a request that passed authentication AND
 			// the permission check reaches the handler, and only the handler's own gate answers
-			// this code. A route that forgot the gate would answer 200 or 4xx-with-another-code
-			// here.
+			// this code.
 			assertErrorCode(t, recorder,
 				http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
 
 			// THE CREDENTIAL WAS ADMITTED, which the audit write is the observable proof of: the
 			// middleware performs it only for a principal it authenticated and permitted, so its
-			// arrival says the refusal below came from the HANDLER rather than from authentication.
-			// It is also the join that makes the call-log read that follows safe.
+			// arrival says the refusal below came from the HANDLER rather than from
+			// authentication. It is also the join that makes the call-log read that follows
+			// safe.
 			requireSubscribersLastUsedTouch(t, touched)
 
 			// AND IT REFUSED BEFORE DOING ANY WORK. A fully authorised non-master caller must
@@ -2666,22 +2282,10 @@ func TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate
 	}
 }
 
-// subscribersAssertSecretAbsent requires that a corpus does not contain the one-time password,
-// without handing testify either the secret or the text containing it.
+// subscribersAssertSecretAbsent requires that a corpus does not contain the one-time
+// password, without handing testify either the secret or the text containing it.
 //
-// # Why this is not assert.NotContains
-//
-// testify renders BOTH operands when an assertion fails, so
-// assert.NotContains(t, body, password) prints the plaintext SCRAM password into the build log
-// on exactly the run where the leak is real. CI logs are retained, searchable, and readable by
-// more people and for far longer than the HTTP response ever was — so the assertion written to
-// prove the secret is never disclosed would become the widest disclosure of it, and a credential
-// cannot be un-leaked afterwards. The corpus is no safer to print: by hypothesis it contains the
-// secret.
-//
-// So the comparison happens in Go and only a BOOLEAN reaches testify. The failure message says
-// WHICH corpus and at what offset, which is what a reader needs to find the leak in the code, and
-// carries neither the secret nor the text around it.
+// So the comparison happens in Go and only a BOOLEAN reaches testify.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -2691,9 +2295,9 @@ func TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate
 func subscribersAssertSecretAbsent(t *testing.T, corpus, secret, what string) {
 	t.Helper()
 
-	// An empty secret would make every Index call return 0 and every assertion below fail for a
-	// reason that has nothing to do with disclosure, so the fixture's own precondition is
-	// checked rather than assumed.
+	// An empty secret would make every Index call return 0 and every assertion below fail
+	// for a reason that has nothing to do with disclosure, so the fixture's own
+	// precondition is checked rather than assumed.
 	require.NotEmpty(t, secret,
 		"the secret under test is empty, so %s cannot be checked for it", what)
 
@@ -2712,36 +2316,20 @@ func subscribersAssertSecretAbsent(t *testing.T, corpus, secret, what string) {
 // It matches eventsBackgroundTouchTimeout deliberately — one grace period for one mechanism.
 const subscribersBackgroundTouchTimeout = 5 * time.Second
 
-// expectSubscribersAPIKeyLookup programs the two datasource calls the authentication middleware
-// makes for a non-master credential, and returns a channel that reports when the second has been
-// RECORDED.
+// expectSubscribersAPIKeyLookup programs the two datasource calls the authentication
+// middleware makes for a non-master credential, and returns a channel that reports when
+// the second has been RECORDED.
 //
-// # Why the channel exists
-//
-// The middleware answers the request and updates last_used_at on a goroutine that outlives the
-// response, and that goroutine appends to testify's call log. Any assertion that reads the log —
-// subscribersRepositoryCallsExcludingAuth below — is therefore reading a slice another goroutine
-// may still be writing, which `go test -race` reports as a data race and which is one, not an
-// artefact of the detector.
-//
-// A gin middleware used to serialise this by waiting after c.Next(). It was removed with the
-// production race it was scheduling around (see the note on setupSubscribersRouter), and removing
-// it left this file's readers with nothing ordering them. The channel is what replaces it: the
-// signal is sent from testify's own Run hook, which fires AFTER the call has been appended, so a
-// receive on it establishes a happens-before edge covering the append. No scheduling is
-// influenced and nothing is guessed at.
-//
-// UpdateLastUsed is expected STRICTLY, exactly once and on the key that was admitted, for the
-// same reason it is in api/events_api_test.go: `.Maybe()` hides both the update being dropped
-// altogether and the update being made for a different key id.
+// The channel is what serialises the assertion, rather than a gin middleware waiting
+// after c.Next().
 //
 // Parameters:
 //   - datasource *mocks.MockDataSource: the datasource to program.
 //   - key *coremodel.APIKey: the principal the lookup resolves to.
 //
 // Returns:
-//   - <-chan struct{}: signalled once the background last-used update has been recorded.
-//     Buffered, so the production goroutine never blocks on a test channel.
+//   - <-chan struct{}: signalled once the background last-used update has been
+//     recorded.
 func expectSubscribersAPIKeyLookup(
 	datasource *mocks.MockDataSource, key *coremodel.APIKey,
 ) <-chan struct{} {
@@ -2761,8 +2349,9 @@ func expectSubscribersAPIKeyLookup(
 	return touched
 }
 
-// requireSubscribersLastUsedTouch joins an authenticated request with the background last-used
-// update the middleware starts for it, and FAILS if that update never happens.
+// requireSubscribersLastUsedTouch joins an authenticated request with the background
+// last-used update the middleware starts for it, and FAILS if that update never
+// happens.
 //
 // Parameters:
 //   - t *testing.T: the test, FAILED when the update does not arrive.
@@ -2783,22 +2372,15 @@ func requireSubscribersLastUsedTouch(t *testing.T, touched <-chan struct{}) {
 	}
 }
 
-// subscribersRepositoryCallsExcludingAuth names every datasource method a request reached apart
-// from the two the authentication middleware itself makes.
-//
-// GetAPIKey and UpdateLastUsed are authentication's own work and are present on every
-// non-master request by definition, so counting them would make "reached nothing" impossible to
-// express. Everything else is the handler's, and on a refused request there must be none of it.
-//
-// THE CALLER MUST HAVE JOINED THE BACKGROUND UPDATE FIRST — requireSubscribersLastUsedTouch —
-// because the log this reads is appended to from that goroutine. Reading it while the goroutine
-// is live is a data race on testify's internals, and the join, not a delay, is what orders them.
+// subscribersRepositoryCallsExcludingAuth names every datasource method a request
+// reached apart from the two the authentication middleware itself makes.
 //
 // Parameters:
 //   - datasource *mocks.MockDataSource: the store behind the router.
 //
 // Returns:
-//   - []string: the method names reached, in call order, excluding authentication's own.
+//   - []string: the method names reached, in call order, excluding authentication's
+//     own.
 func subscribersRepositoryCallsExcludingAuth(datasource *mocks.MockDataSource) []string {
 	reached := make([]string, 0, len(datasource.Calls))
 	for _, recorded := range datasource.Calls {
@@ -2813,55 +2395,14 @@ func subscribersRepositoryCallsExcludingAuth(datasource *mocks.MockDataSource) [
 }
 
 // TestSubscribersAPI_AuthorizationResourceIsRegistered is the decisive test for the
-// "subscribers" authorization resource, and it is the only one in this package that can be.
-//
-// # The failure mode it closes
-//
-// Registering a new route prefix takes edits in TWO files. api/middleware/scope.go declares
-// ResourceSubscribers, and api/middleware/auth.go maps the first path segment to it in
-// pathToResource. Make only the first edit and getResourceFromPath returns the empty
-// resource, at which point the middleware ABORTS every request to the prefix with
-// ErrAuthUnknownResource — every request, that is, from an authenticated NON-MASTER caller.
-// The master key is deliberately excepted by the middleware itself, which matches it and
-// returns on at api/middleware/auth.go:232-238 before any resource is resolved. The surface is
-// therefore unreachable by every integration principal while remaining reachable by the one
-// credential an operator is likeliest to try, and nothing in the ordinary suite notices.
-//
-// # Why a master-key test cannot see it
+// "subscribers" authorization resource, and it is the only one in this package that can
+// be.
 //
 // The middleware matches the master key and returns BEFORE the resource is resolved. A
-// master-key request therefore reaches the handler whether the prefix is mapped or not, so a
-// reachability test built on the master key passes VACUOUSLY with pathToResource unedited.
-// Reaching the map at all takes secure mode and a valid NON-MASTER key, which is what the
-// mock store makes possible without seeding a database row.
-//
-// # Why the refusal asserted is INSUFFICIENT_PERMISSIONS
-//
-// The key below is scoped to another feature entirely. A request whose prefix resolves is
-// therefore evaluated against "subscribers:<action>" and refused on permissions — and the
-// refusal NAMES that scope, which is a stronger statement than mere resolution: a prefix
-// wired to some other feature's resource would also resolve, would also pass a wildcard key,
-// and would authorise this surface under that feature's scope with nothing failing. The
-// scope named in the message is what pins the mapping's TARGET.
-//
-// This path is also chosen for what it does NOT touch. A CORRECTLY scoped non-master key
-// passes HasPermission, and the middleware then spawns a background goroutine that reads
-// c.Request after the handler may already have returned (api/middleware/auth.go:285-286) —
-// which races with otelgin's deferred restore of the same field, because gin recycles its
-// contexts through a pool. That race is PRE-EXISTING production behaviour, reproducible on
-// /ledgers and every other resource that predates this feature, and it has nothing to do with
-// this prefix. Refused-on-permissions reaches the map without ever creating that goroutine,
-// so this test proves the mapping's TARGET while depending on none of it.
-//
-// The correctly-scoped path IS driven, separately, by
-// TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate, which joins each
-// request to its own background update through eventsSynchronizedDatasource and
-// requireEventsLastUsedTouch — a happens-before edge rather than a delay. The two tests answer
-// different questions: this one asks whether the prefix resolves to the right resource, that one
-// asks whether a key granted exactly that resource is admitted and then stopped by the handler.
-//
-// Every assertion names a CODE and never a status, because ErrAuthUnknownResource,
-// ErrAuthInsufficientPermissions and ErrAuthMasterKeyRequired all resolve to 403.
+// master-key request therefore reaches the handler whether the prefix is mapped or not,
+// so a reachability test built on the master key passes VACUOUSLY with pathToResource
+// unedited. Reaching the map at all takes secure mode and a valid NON-MASTER key, which
+// is what the mock store makes possible without seeding a database row.
 func TestSubscribersAPI_AuthorizationResourceIsRegistered(t *testing.T) {
 	subscriberID := uniqueSubscriberID()
 
@@ -2902,9 +2443,9 @@ func TestSubscribersAPI_AuthorizationResourceIsRegistered(t *testing.T) {
 				}
 				require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
 
-				// THE PROOF that pathToResource carries "subscribers". Asserted explicitly
-				// and separately, because this is the failure the whole test exists for and
-				// the two codes share a status.
+				// THE PROOF that pathToResource carries "subscribers". Asserted explicitly and
+				// separately, because this is the failure the whole test exists for and the two
+				// codes share a status.
 				require.NotEqual(t, apierror.ErrAuthUnknownResource, body.ErrorDetail.Code,
 					"%s %s RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware aborts "+
 						"every request to it from every non-master principal. Add \"subscribers\" to "+
@@ -2936,10 +2477,6 @@ func TestSubscribersAPI_AuthorizationResourceIsRegistered(t *testing.T) {
 		// comparison. Without this leg every master-key assertion in this file would rest on
 		// an injected flag, and a regression in key extraction or comparison would be
 		// invisible here.
-		//
-		// One route is enough, and this one is chosen because it reaches the store with a
-		// single call: the property is the CHAIN, and reachability of the other nine is
-		// covered by TestSubscribersAPI_RoutesAreReachableAndMasterKeyGated.
 		router, datasource := setupSubscribersRouter(t, subscribersHarness{secure: true})
 
 		datasource.On("ListEventSubscribers", mock.Anything, mock.Anything).
@@ -3006,14 +2543,13 @@ func TestSubscribersAPI_AuthorizationResourceIsRegistered(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_GateHelperAnswersTheRefusalItself unit-tests the gate in isolation,
-// as api/hooks_test.go does for its counterpart.
+// TestSubscribersAPI_GateHelperAnswersTheRefusalItself unit-tests the gate in
+// isolation, as api/hooks_test.go does for its counterpart.
 //
-// ensureSubscriberManagementAuthorized both DECIDES and RESPONDS, and the two halves fail
-// independently: a helper that returned false without writing anything would produce an
-// empty 200, and one that wrote the refusal but returned true would carry on into the
-// handler after answering. Driving it through a bare test context is the only way to
-// observe both halves at once.
+// ensureSubscriberManagementAuthorized both DECIDES and RESPONDS, and the two halves
+// fail independently: a helper that returned false without writing anything would
+// produce an empty 200, and one that wrote the refusal but returned true would carry on
+// into the handler after answering.
 func TestSubscribersAPI_GateHelperAnswersTheRefusalItself(t *testing.T) {
 	t.Run("the master key is admitted and nothing is written", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
@@ -3053,18 +2589,11 @@ func TestSubscribersAPI_GateHelperAnswersTheRefusalItself(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_MasterKeyGateShortCircuitsBeforeTheRegistry proves the gate refuses
-// BEFORE any work, on all ten endpoints.
+// TestSubscribersAPI_MasterKeyGateShortCircuitsBeforeTheRegistry proves the gate
+// refuses BEFORE any work, on all ten endpoints.
 //
-// "Refused" and "refused before doing anything" are different claims, and only the second
-// one is a gate. A handler that read the row, reconciled a grant or minted a credential and
-// only then noticed the caller has already done the work: the response says no while the
-// side effects say yes, and on the credential route the side effect is a live SCRAM
-// credential at the broker.
-//
-// The store is the witness. Secure mode is OFF here deliberately — that is what makes the
-// expected number of datasource calls exactly ZERO, since in secure mode the middleware
-// itself would legitimately call GetAPIKey and the assertion would have to allow for it.
+// "Refused" and "refused before doing anything" are different claims, and only the
+// second one is a gate.
 func TestSubscribersAPI_MasterKeyGateShortCircuitsBeforeTheRegistry(t *testing.T) {
 	subscriberID := uniqueSubscriberID()
 
@@ -3076,9 +2605,9 @@ func TestSubscribersAPI_MasterKeyGateShortCircuitsBeforeTheRegistry(t *testing.T
 
 			assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
 
-			// THE DECISIVE ASSERTION. Not "these particular methods were not called" but
-			// "the store was not touched at all", which no future handler can slip past by
-			// reaching for a method this list does not name.
+			// THE DECISIVE ASSERTION. Not "these particular methods were not called" but "the
+			// store was not touched at all", which no future handler can slip past by reaching
+			// for a method this list does not name.
 			assert.Empty(t, datasource.Calls,
 				"the gate must refuse before ANY registry work; %s %s reached the store",
 				call.method, call.path)
@@ -3108,14 +2637,10 @@ func TestSubscribersAPI_MasterKeyGateShortCircuitsBeforeTheRegistry(t *testing.T
 	}
 }
 
-// TestCreateSubscriber_AnswersTheRegisteredSubscriber pins the registration response and
-// the row the handler asks the registry to store.
+// TestCreateSubscriber_AnswersTheRegisteredSubscriber pins the registration response
+// and the row the handler asks the registry to store.
 //
-// Both halves matter. The response is what a client is written against, and the ARGUMENT is
-// where the derived identity appears: the Kafka principal and the consumer group are
-// computed from the identifier and have no field in the request DTO, precisely so a caller
-// cannot name the values every ACL binding is granted to. Reading them off the captured
-// argument is what proves they were derived rather than defaulted to empty.
+// Both halves matter.
 func TestCreateSubscriber_AnswersTheRegisteredSubscriber(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
 
@@ -3146,8 +2671,7 @@ func TestCreateSubscriber_AnswersTheRegisteredSubscriber(t *testing.T) {
 
 	// authorized_topics ROUND-TRIPS AS A JSON ARRAY. It is a TEXT[] column read through
 	// lib/pq, so the two places it could stop being an array are the driver's array
-	// handling and this projection. A single-element grant serialising as a bare string
-	// would break every client that iterates it, and would look correct in a body dump.
+	// handling and this projection.
 	topics, ok := body["authorized_topics"].([]interface{})
 	require.True(t, ok, "authorized_topics must be a JSON array: %s", recorder.Body.String())
 	require.Len(t, topics, 1)
@@ -3177,12 +2701,13 @@ func TestCreateSubscriber_AnswersTheRegisteredSubscriber(t *testing.T) {
 	datasource.AssertExpectations(t)
 }
 
-// TestCreateSubscriber_RefusesAnUnbindableBodyBeforeTheRegistry covers the binding failures.
+// TestCreateSubscriber_RefusesAnUnbindableBodyBeforeTheRegistry covers the binding
+// failures.
 //
-// Each case is refused with a TYPED code rather than a panic recovered by the middleware,
-// and — the part worth asserting — none of them reaches the store. A body that cannot be
-// bound cannot describe a subscriber, so a write attempted from it would be a write of
-// whatever the zero value happened to be.
+// Each case is refused with a TYPED code rather than a panic recovered by the
+// middleware, and — the part worth asserting — none of them reaches the store. A body
+// that cannot be bound cannot describe a subscriber, so a write attempted from it would
+// be a write of whatever the zero value happened to be.
 func TestCreateSubscriber_RefusesAnUnbindableBodyBeforeTheRegistry(t *testing.T) {
 	for name, expected := range map[string]struct {
 		body string
@@ -3225,12 +2750,6 @@ func TestCreateSubscriber_RefusesAnUnbindableBodyBeforeTheRegistry(t *testing.T)
 
 // TestListSubscribers_NormalisesEveryPageBoundTheSameWay proves the normalisation by
 // reading the query the repository actually received.
-//
-// Asserting on the response cannot distinguish "the bound was normalised" from "the store
-// happened to return few rows", which is why the captured argument is the assertion. The
-// rule matches ParseFiltersFromBody in api/filter_helper.go exactly, INCLUDING its habit of
-// resetting an oversized limit to the default rather than clamping it to the ceiling, so
-// that every listing in this package answers a page request the same way.
 func TestListSubscribers_NormalisesEveryPageBoundTheSameWay(t *testing.T) {
 	for name, expected := range map[string]struct {
 		query string
@@ -3313,9 +2832,7 @@ func TestListSubscribers_NormalisesEveryPageBoundTheSameWay(t *testing.T) {
 // TestListSubscribers_AnswersAnEmptyRegistryWithAnEmptyPage keeps an empty listing a
 // success.
 //
-// An empty collection is not a missing one. A 404 here would make a paging client treat
-// "no subscribers yet" as "this endpoint does not exist", and a null data field would make
-// a client that iterates it fail on a legitimate answer.
+// An empty collection is not a missing one.
 func TestListSubscribers_AnswersAnEmptyRegistryWithAnEmptyPage(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
 
@@ -3348,10 +2865,9 @@ func TestListSubscribers_AnswersAnEmptyRegistryWithAnEmptyPage(t *testing.T) {
 
 // TestGetSubscriber_AnswersTheStoredSubscriberWithoutItsSecrets is the read contract.
 //
-// The fixture row deliberately carries BOTH columns a response must never disclose — the
-// credential reference and the legacy webhook URL — so the assertions below can fail. A row
-// that never held them would make this test pass against a projection that copies every
-// field it is given.
+// The fixture row deliberately carries BOTH columns a response must never disclose —
+// the credential reference and the legacy webhook URL — so the assertions below can
+// fail.
 func TestGetSubscriber_AnswersTheStoredSubscriberWithoutItsSecrets(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
 
@@ -3392,18 +2908,10 @@ func TestGetSubscriber_AnswersTheStoredSubscriberWithoutItsSecrets(t *testing.T)
 	datasource.AssertExpectations(t)
 }
 
-// TestSubscribersAPI_UntypedNotFoundBecomesTheSubscriberCode is the catch-all guard, and it
-// is the one assertion in this file that pins a decision made in api/errors.go.
+// TestSubscribersAPI_UntypedNotFoundBecomesTheSubscriberCode is the catch-all guard,
+// and it is the one assertion in this file that pins a decision made in api/errors.go.
 //
-// classifyMessage ends with a broad {"not found"} entry that resolves to GEN_NOT_FOUND. A
-// repository or service path that returns an untyped error whose text happens to contain
-// those words would therefore be answered GEN_NOT_FOUND, and a client branching on the code
-// could not tell a missing SUBSCRIBER from a missing anything else — while the status,
-// which is 404 either way, would look perfectly correct.
-//
-// respondSubscriberRegistryError applies withUpgrade(GEN_NOT_FOUND, SUBSCRIBER_NOT_FOUND)
-// for exactly this reason, and this is what fails if the upgrade is dropped. It is driven on
-// every route that can reach a lookup, because the upgrade is applied per call site.
+// classifyMessage ends with a broad {"not found"} entry that resolves to GEN_NOT_FOUND.
 func TestSubscribersAPI_UntypedNotFoundBecomesTheSubscriberCode(t *testing.T) {
 	subscriberID := uniqueSubscriberID()
 
@@ -3487,10 +2995,7 @@ func TestSubscribersAPI_UntypedNotFoundBecomesTheSubscriberCode(t *testing.T) {
 
 // TestUpdateSubscriber_AnswersTheUpdatedSubscriber walks the mutable subset over HTTP.
 //
-// The sequence is asserted, not just the status. The update takes the provisioning claim
-// BEFORE it reads the row and persists under that claim's token, which is what stops a
-// concurrent credential issuance and an update interleaving into a row that describes
-// neither. A handler that wrote without the token would still answer 200.
+// The sequence is asserted, not just the status.
 func TestUpdateSubscriber_AnswersTheUpdatedSubscriber(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
 
@@ -3541,8 +3046,8 @@ func TestUpdateSubscriber_AnswersTheUpdatedSubscriber(t *testing.T) {
 // findSubscribersCallArgument returns the *EventSubscriber a recorded call was given.
 //
 // Reaching into Mock.Calls rather than using a capture closure keeps the expectation
-// declarations readable, and it works for a call that may not have happened — which is what
-// lets the caller assert its absence rather than dereference a nil.
+// declarations readable, and it works for a call that may not have happened — which is
+// what lets the caller assert its absence rather than dereference a nil.
 func findSubscribersCallArgument(
 	datasource *mocks.MockDataSource, method string,
 ) (*coremodel.EventSubscriber, bool) {
@@ -3563,19 +3068,14 @@ func findSubscribersCallArgument(
 
 // TestDeleteSubscriber_AnswersNoContentWithAnEmptyBody pins the deregistration response
 // exactly.
-//
-// 204 with an empty body is the shape RevokeAPIKey already answers in, and the exactness is
-// the point: a 200 carrying the deleted row would tell a client that a resource it must
-// treat as gone still has a representation, and a body on a 204 is a protocol violation
-// some proxies drop and others forward.
 func TestDeleteSubscriber_AnswersNoContentWithAnEmptyBody(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
 
 	subscriberID := uniqueSubscriberID()
 	stored := subscribersFixtureRow(subscriberID)
 	// A subscriber that HOLDS a credential cannot be deregistered without a reachable
-	// broker — see the sub-test below, which is the fail-closed half of this contract. This
-	// one is about the success shape, so the row records no issuance.
+	// broker — see the sub-test below, which is the fail-closed half of this contract.
+	// This one is about the success shape, so the row records no issuance.
 	stored.CredentialReference = nil
 	stored.CredentialIssuedAt = nil
 
@@ -3653,14 +3153,11 @@ func TestDeleteSubscriber_AnswersNoContentWithAnEmptyBody(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_BlankIdentifierIsAMissingParameterOnEveryRoute keeps the two parameter
-// refusals distinct across the whole surface.
+// TestSubscribersAPI_BlankIdentifierIsAMissingParameterOnEveryRoute keeps the two
+// parameter refusals distinct across the whole surface.
 //
 // A blank-but-present segment is a MISSING parameter; a present-but-unusable one is a
-// VALIDATION error. Collapsing them would tell a caller that omitted the identifier that its
-// identifier is invalid, and the two demand opposite fixes. Every per-subscriber route reads
-// the parameter through the same helper, so this is asserted on all of them: a regression in
-// one is a regression in all, and only a table shows that.
+// VALIDATION error.
 func TestSubscribersAPI_BlankIdentifierIsAMissingParameterOnEveryRoute(t *testing.T) {
 	// A single encoded space: present in the path, blank once trimmed.
 	const blank = "%20"
@@ -3695,42 +3192,10 @@ func TestSubscribersAPI_BlankIdentifierIsAMissingParameterOnEveryRoute(t *testin
 	}
 }
 
-// TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls is requirement R-7 as
-// an HTTP outcome rather than as a documented intention.
+// TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls is the
+// requirement as an HTTP outcome rather than as a documented intention.
 //
-// # What is under test
-//
-// R-7 requires credential provisioning to complete within five seconds. The handler bounds
-// the service's context to exactly that, and that bound alone is NOT the guarantee: the
-// service's compensating writes and its fence release deliberately run on FRESH bounded
-// contexts detached from the caller's, because an expired issuance deadline is one of the
-// commonest reasons a cleanup is needed and a cleanup on an already-cancelled context does
-// nothing. Those fresh budgets are the same five seconds, so a synchronous chain of
-// issuance, compensation and release is individually bounded and collectively fifteen
-// seconds long.
-//
-// issueWithinBudget separates the REQUEST from the WORK, and this test is the only place
-// that separation is observable end to end: the store below blocks until the test releases
-// it, so a handler that waited for the work would hold the request open indefinitely.
-//
-// # The assertions, and why each bound is there
-//
-//	Not less than the budget — an earlier answer would mean the ceiling is not what
-//	produced it, and the test would be passing for another reason.
-//	Not much more than the budget — this is the fifteen-second wall clock the ceiling closes.
-//	Not never — the request must not hang, which is the failure a timeout-less handler has.
-//
-// # The code it answers with
-//
-// SUBSCRIBER_PROVISIONING_FAILED (503), which is the published contract for the condition and
-// is asserted as such deliberately. Every deadline expiry in the issuance path reports this one
-// code, so a client's retry policy does not depend on which layer noticed the expiry first, and
-// its 503 is the retryable answer a spent budget wants. The taxonomy carries no separate
-// timeout code — adding a status a retry policy branches on is a public contract change — so
-// the fact that the ceiling fired is carried in the message, which this test also pins.
-//
-// The block is bounded and released with defer, so this test cannot hang the suite even if
-// every assertion in it fails.
+// Credential provisioning must complete within five seconds.
 func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *testing.T) {
 	// Brokers must be configured or issuance refuses before the store is reached at all —
 	// the address is never dialled, because the stall happens first.
@@ -3750,16 +3215,9 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 	releaseStall := func() { releaseOnce.Do(func() { close(release) }) }
 	defer releaseStall()
 
-	// The provisioning claim is the FIRST store call issuance makes, which is what keeps the
-	// stall to exactly one method: the service returns before registering its compensation
-	// when the claim fails, so nothing else is reached on the way out.
-	//
-	// The error it eventually returns is the one the REAL repository returns for a claim it could
-	// not take — an internal-server-class APIError, exactly as database.ClaimSubscriberForProvisioning
-	// builds — rather than a bare error. It changes nothing about the response asserted below,
-	// which comes from the ceiling and not from this error, and it makes the abandoned attempt
-	// take the path a real one takes: the service reclassifies a spent budget at the registry as a
-	// timeout and says so, which is what requireAbandonedIssuanceSettled waits for at the end.
+	// The provisioning claim is the FIRST store call issuance makes, which is what keeps
+	// the stall to exactly one method: the service returns before registering its
+	// compensation when the claim fails, so nothing else is reached on the way out.
 	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
 		WaitUntil(release).
 		Return("", apierror.NewAPIError(apierror.ErrInternalServer,
@@ -3786,9 +3244,9 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 			"fifteen-second wall clock of issuance, then compensation, then the fence release")
 
 	// NO SECRET ON THE ABANDONED PATH. The handler receives a zero-valued credential when
-	// the ceiling fires, so there is nothing to serialise — and the message says a credential
-	// may nevertheless exist at the broker, because that is the one thing the caller cannot
-	// otherwise know and the thing that decides what it should do next.
+	// the ceiling fires, so there is nothing to serialise — and the message says a
+	// credential may nevertheless exist at the broker, because that is the one thing the
+	// caller cannot otherwise know and the thing that decides what it should do next.
 	assert.NotContains(t, recorder.Body.String(), `"password"`,
 		"an abandoned issuance returns no credential field at all")
 	assert.Contains(t, recorder.Body.String(), "Re-issue to obtain one",
@@ -3796,10 +3254,8 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 			"re-issuing replaces whatever the abandoned attempt left behind")
 
 	// THE LOG LINE PSEUDONYMISES THE SUBSCRIBER. A subscriber id is a tenant-chosen name
-	// that reaches logs, alert annotations and incident tickets, and every other layer emits
-	// the keyed digest under a _hash key. Emitting the raw name on the one line an operator
-	// goes looking for after a timeout would make the pseudonyms everywhere else resolvable
-	// by anyone reading the same stream.
+	// that reaches logs, alert annotations and incident tickets, and every other layer
+	// emits the keyed digest under a _hash key.
 	timeoutLogged := false
 	for _, entry := range logs.AllEntries() {
 		if !strings.Contains(entry.Message, "exceeded the issuance budget") {
@@ -3820,43 +3276,26 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 
 	// JOIN THE ABANDONED ATTEMPT BEFORE THIS TEST ENDS.
 	//
-	// Everything above is about the REQUEST, and the request is over. What is still running is
-	// the issuance goroutine, parked in the stalled store call. Releasing it and walking away —
-	// which is what a bare `defer close(release)` amounted to — lets it wake up inside whatever
-	// test runs next: it writes a Warn line through the GLOBAL logrus logger, and the global test
-	// hook installed here is never uninstalled, so that line lands in this hook after Reset has
-	// cleared it and in every hook a later test installs. A later test that scans the global log
-	// then sees an entry no request of its own produced, and fails somewhere else entirely.
-	//
-	// So the stall is released HERE, explicitly, and the attempt is waited for.
+	// Everything above is about the REQUEST, and the request is over.
 	releaseStall()
 	requireAbandonedIssuanceSettled(t, logs)
 }
 
 // subscribersAbandonedIssuanceMarker is the last thing an abandoned issuance does.
 //
-// The service classifies a budget spent on the provisioning claim as a timeout and says so at
-// Warn before returning; nothing it does afterwards touches anything a test owns. That makes this
-// line the completion signal, and asserting on it is worth doing in its own right: it is the only
-// record that an attempt which had already been answered for went on to release its claim, and it
-// is what an operator correlates with the request's own line.
+// The service classifies a budget spent on the provisioning claim as a timeout and says
+// so at Warn before returning; nothing it does afterwards touches anything a test owns.
 const subscribersAbandonedIssuanceMarker = "ran out of time at the registry"
 
 // subscribersAbandonedIssuanceTimeout bounds the wait for that line.
 //
-// It is generous because it is never reached in a correct run — the attempt is already released
-// and has one classification left to perform — and because reaching it means the attempt did not
-// finish, which is a real leak rather than a slow machine.
+// It is generous because it is never reached in a correct run — the attempt is already
+// released and has one classification left to perform — and because reaching it means
+// the attempt did not finish, which is a real leak rather than a slow machine.
 const subscribersAbandonedIssuanceTimeout = 10 * time.Second
 
-// requireAbandonedIssuanceSettled waits for an abandoned credential issuance to finish, and FAILS
-// if it never does.
-//
-// The wait is a poll of the global log hook rather than a channel, because the goroutine being
-// waited for is started inside the handler by issueWithinBudget and is deliberately unobservable
-// from outside: the handler hands the service call a context and a callback and keeps no handle,
-// which is exactly what lets the request answer at its ceiling. The hook is mutex-protected, so
-// polling it while the attempt is still writing to it is safe.
+// requireAbandonedIssuanceSettled waits for an abandoned credential issuance to finish,
+// and FAILS if it never does.
 //
 // Parameters:
 //   - t *testing.T: the test, FAILED when the abandoned attempt does not settle.
@@ -3889,15 +3328,8 @@ func requireAbandonedIssuanceSettled(t *testing.T, logs *logtest.Hook) {
 // TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured pins the
 // graceful-degradation contract on the one route that cannot degrade.
 //
-// Every other part of Blnk runs unchanged without Kafka — the publisher resolves to a no-op,
-// exactly as SendWebhook no-ops without a configured URL. Credential issuance is the
-// exception, because there is no useful credential for a broker that does not exist, and the
-// refusal has to be the RIGHT refusal: 503 EVENT_KAFKA_UNAVAILABLE names the dependency and
-// says a retry may succeed, while a 500 sends an operator looking for a defect in Blnk.
-//
-// It must also refuse before touching the registry. A provisioning claim taken for an
-// issuance that cannot proceed would block a concurrent update for the lease's duration
-// against a subscriber nothing was ever going to be issued for.
+// Every other part of Blnk runs unchanged without Kafka — the publisher resolves to a
+// no-op, exactly as SendWebhook no-ops without a configured URL.
 func TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
 
@@ -3922,18 +3354,11 @@ func TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured(
 	assert.NotContains(t, recorder.Body.String(), `"password"`)
 }
 
-// TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnything covers the
-// gate that exists only on this route.
+// TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnything
+// covers the gate that exists only on this route.
 //
-// This is the one endpoint in Blnk whose response body carries a secret, so an authorised
-// request over a channel nobody has established as confidential is an authorised credential
-// leak. The refusal must come BEFORE the broker is touched: a password refused after issuance
-// would already exist at the broker, unusable by the caller that never received it and still
-// requiring revocation.
-//
-// The request below is PLAINTEXT with a remote peer: no in-process TLS, no declared proxy, and
-// no loopback. It is the negative control for the whole harness, which presents in-process TLS
-// so that every other test asserts against the handler rather than against this gate.
+// The request below is PLAINTEXT with a remote peer: no in-process TLS, no declared
+// proxy, and no loopback.
 func TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnything(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
@@ -3972,21 +3397,11 @@ func TestIssueKafkaCredentials_RefusesAnUnconfidentialTransportBeforeMintingAnyt
 			"request gets the identical body")
 }
 
-// TestIssueKafkaCredentials_RefusesALoopbackPeerOnAnUndeclaredHost is the production half of the
-// transport gate, and the one that closes a real disclosure.
+// TestIssueKafkaCredentials_RefusesALoopbackPeerOnAnUndeclaredHost is the production
+// half of the transport gate, and the one that closes a real disclosure.
 //
-// # Why a loopback peer proves less than it appears to
-//
-// Request.RemoteAddr is the far end of the accepted socket, so a loopback value establishes that
-// the LAST hop stayed on this host. It establishes nothing about the hop before it. The shape
-// that matters is ordinary: a reverse proxy on the same host — nginx, Caddy, an Envoy sidecar —
-// accepts a request from the internet, possibly over plain http, and forwards it to Blnk over
-// 127.0.0.1. From inside the process that request is indistinguishable from an operator running
-// curl in the container, and answering it puts a one-time SASL password on the public hop.
-//
-// Blnk cannot tell those apart, so it does not try: the loopback channel is a DECLARATION the
-// deployment makes, exactly like the trusted-proxy one, and the default is to refuse. This test
-// is the default.
+// Request.RemoteAddr is the far end of the accepted socket, so a loopback value
+// establishes that the LAST hop stayed on this host.
 func TestIssueKafkaCredentials_RefusesALoopbackPeerOnAnUndeclaredHost(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
@@ -4020,18 +3435,11 @@ func TestIssueKafkaCredentials_RefusesALoopbackPeerOnAnUndeclaredHost(t *testing
 			"that cannot be answered safely leaves no provisioning fence behind")
 }
 
-// TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHost is the exception,
-// tested separately from the production posture on purpose.
+// TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHost is the
+// exception, tested separately from the production posture on purpose.
 //
-// The local stack is a plaintext listener reached over loopback and nothing else, so without this
-// declaration `make run` plus curl could never issue a credential. What the test pins is that the
-// exception is reached ONLY through the declaration: the same request refused above is admitted
-// here, and the only difference is BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE.
-//
-// The assertion is that the transport gate PASSED, not that a credential was issued. Issuance
-// then fails against the unreachable broker in this harness, which is a different code — and
-// asserting the transport code's ABSENCE is what distinguishes "the gate admitted it" from "the
-// gate refused it" without needing a live broker.
+// The local stack is a plaintext listener reached over loopback and nothing else, so
+// without this declaration `make run` plus curl could never issue a credential.
 func TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHost(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey:             true,
@@ -4061,27 +3469,11 @@ func TestIssueKafkaCredentials_AllowsALoopbackPeerOnADeclaredLocalDevelopmentHos
 	datasource.AssertCalled(t, "ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything)
 }
 
-// TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS is the third channel, and the one a
-// production Kubernetes deployment actually uses.
+// TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS is the third channel,
+// and the one a production Kubernetes deployment actually uses.
 //
-// TLS terminates at the ingress and the hop to the pod is plaintext, so the process never sees a
-// handshake. X-Forwarded-Proto is a request header any client can set, so it is believed only
-// where BLNK_SERVER_TRUST_FORWARDED_PROTO declares that a proxy sets it and overwrites what the
-// client sent — AND only on a request that arrived from a proxy BLNK_SERVER_TRUSTED_PROXIES names.
-//
-// # Why the peer is a condition rather than a refinement (SEC-03)
-//
-// The declaration is a statement about the intended path: "requests reach this process through our
-// ingress, which owns this header". It is true of that path and says nothing about a request that
-// arrived by another one — a pod IP inside the cluster, a `kubectl port-forward`, a second Service,
-// an ingress rule that passes the client's header straight through. Each of those can set
-// `X-Forwarded-Proto: https` itself, and the response to this endpoint is a one-time SASL password,
-// so being believed is the entire exploit. Requiring the socket peer to be a named proxy is what
-// makes the declaration true of the request in hand rather than of the topology diagram.
-//
-// Every combination is exercised below because each one fails differently, and three of them used
-// to be admitted: the header alone, the declaration with no allowlist, the declaration with a
-// universal range, and a peer outside the allowlist.
+// TLS terminates at the ingress and the hop to the pod is plaintext, so the process
+// never sees a handshake.
 func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) {
 	subscriberID := uniqueSubscriberID()
 
@@ -4113,9 +3505,9 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 	})
 
 	t.Run("the declaration with no named proxy establishes nothing either", func(t *testing.T) {
-		// THE SEC-03 CASE. This combination was admitted, and it is the one a deployment reaches
-		// by setting the flag and nothing else — so the refusal has to hold here or the peer
-		// condition is decorative.
+		// THE GRANT-SCOPE CASE. This combination is the one a deployment
+		// reaches by setting the flag and nothing else — so the refusal has to hold here or
+		// the peer condition is decorative.
 		router, datasource := setupSubscribersRouter(t, subscribersHarness{
 			masterKey:           true,
 			brokers:             []string{"127.0.0.1:9092"},
@@ -4143,8 +3535,8 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 	t.Run("a universal range is not an allowlist", func(t *testing.T) {
 		// 0.0.0.0/0 matches every peer, so honouring it would restore the forgeable behaviour
 		// while reading as though a decision had been made. In secure mode configuration
-		// validation refuses this outright; here — secure off, as the whole harness runs — the
-		// channel simply establishes nothing.
+		// validation refuses this outright; here — secure off, as the whole harness runs —
+		// the channel simply establishes nothing.
 		router, datasource := setupSubscribersRouter(t, subscribersHarness{
 			masterKey:           true,
 			brokers:             []string{"127.0.0.1:9092"},
@@ -4265,12 +3657,8 @@ func TestIssueKafkaCredentials_AllowsADeclaredProxyReportingHTTPS(t *testing.T) 
 	})
 }
 
-// TestIssueKafkaCredentials_RefusesAnUnknownSubscriber keeps the missing-row answer on the
-// route that mints secrets.
-//
-// 404 rather than 503: an identifier that matches nothing is a client mistake, and answering
-// it as a dependency failure would have a caller retry for ever against a subscriber that
-// was never registered.
+// TestIssueKafkaCredentials_RefusesAnUnknownSubscriber keeps the missing-row answer on
+// the route that mints secrets.
 func TestIssueKafkaCredentials_RefusesAnUnknownSubscriber(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{
 		masterKey: true,
@@ -4292,22 +3680,12 @@ func TestIssueKafkaCredentials_RefusesAnUnknownSubscriber(t *testing.T) {
 	datasource.AssertExpectations(t)
 }
 
-// subscribersKafkaEnvironment resolves the broker environment for the end-to-end issuance
-// test, or explains what is missing.
+// subscribersKafkaEnvironment resolves the broker environment for the end-to-end
+// issuance test, or explains what is missing.
 //
-// It returns a REASON rather than skipping itself, so the caller decides. The variable names
-// are the un-prefixed ones the deployment contract mandates, which is what .env, both
-// compose files and event_isolation_integration_test.go all use.
+// It returns a REASON rather than skipping itself, so the caller decides.
 //
-// KAFKA_SUBSCRIBER_BROKERS is required and deliberately NOT defaulted to KAFKA_BROKERS. A
-// credential names the addresses the SUBSCRIBER will dial, which in a real deployment is the
-// broker's external listener rather than the internal bootstrap list Blnk itself uses.
-// Issuance refuses when it is unset rather than falling back, so that a deployment cannot
-// hand out its internal addresses by omission — and defaulting it here would make this test
-// pass while that refusal went unexercised.
-//
-// Nothing is written to the environment: configuration reaches the service only through
-// config.MockConfig, and these values are READ so the test can tell whether a broker exists.
+// KAFKA_SUBSCRIBER_BROKERS is required and deliberately NOT defaulted to KAFKA_BROKERS.
 func subscribersKafkaEnvironment(t *testing.T) (config.KafkaConfig, string, bool) {
 	t.Helper()
 
@@ -4377,8 +3755,8 @@ func subscribersKafkaEnvironment(t *testing.T) (config.KafkaConfig, string, bool
 		},
 		// The transport refuses to dial in the clear without this acknowledgement, which is
 		// the right default for production and exactly what the local single-broker KRaft
-		// stack needs waived. Scoped to the TLS-off case so an operator running against a
-		// TLS broker never sees it applied.
+		// stack needs waived. Scoped to the TLS-off case so an operator running against a TLS
+		// broker never sees it applied.
 		InsecureLocalDev: !tlsEnabled,
 	}, "", true
 }
@@ -4387,36 +3765,22 @@ func subscribersKafkaEnvironment(t *testing.T) (config.KafkaConfig, string, bool
 // highest-value test in this file, and the only one in this package that can prove the
 // secret-handling posture rather than describe it.
 //
-// # Why it needs a real broker
-//
 // blnk.SubscriberCredential holds its password in an unexported field with no exported
-// constructor, deliberately, so no test outside the root package can fabricate one. A
-// plaintext therefore reaches a response only through a real issuance, which means a real
-// SCRAM credential and real ACL bindings at a real broker. It skips with a reason when none
-// is configured; the ordinary suite runs in that state, and every other assertion about this
-// route above is reachable without one.
+// constructor, deliberately, so no test outside the root package can fabricate one.
 //
-// # The four properties it establishes
+// THE RESPONSE CONTRACT: the broker endpoint, the authorised topic list, the consumer
+// group and the SASL credentials — username, password, mechanism — are all present and
+// non-empty.
 //
-//	THE RESPONSE CONTRACT (R-7): the broker endpoint, the authorised topic list, the consumer
-//	group and the SASL credentials — username, password, mechanism — are all present and
-//	non-empty. A subscriber that receives any one of them empty cannot connect.
+// THE BUDGET, from the other side: a real issuance completes far inside five seconds.
 //
-//	THE BUDGET, from the other side: a real issuance completes far inside five seconds. The
-//	ceiling test above proves the request ends when the budget elapses; this proves the
-//	budget is not itself the thing making requests slow.
+// THE SECRET IS RETURNED ONCE.
 //
-//	THE SECRET IS RETURNED ONCE. Asserted against the RAW BYTES of every subsequent read,
-//	not against a decoded struct, so that a stray field under any key would fail. The row is
-//	read back through the datasource as well, which is what proves nothing capable of holding
-//	the plaintext was written.
+// THE SECRET IS NEVER LOGGED. Every logrus entry emitted during the issuance is
+// captured and searched, message and fields alike.
 //
-//	THE SECRET IS NEVER LOGGED. Every logrus entry emitted during the issuance is captured
-//	and searched, message and fields alike.
-//
-// The store is a mock so that the arguments the credential record was written with can be
-// inspected directly. Cleanup deregisters through the API, which revokes the principal and
-// its bindings at the broker rather than leaving them behind.
+// The store is a mock so that the arguments the credential record was written with can
+// be inspected directly.
 func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnce(t *testing.T) {
 	kafkaConfig, reason, ok := subscribersKafkaEnvironment(t)
 	if !ok {
@@ -4506,11 +3870,11 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 	})
 	elapsed := time.Since(started)
 
-	// SANITISED, and this is the assertion that made it necessary: the message renders only when
-	// the status is NOT 200, which is precisely the regression — a handler answering 500 while
-	// still marshalling the credential — that would write a real SASL password into CI output.
-	// The assertions below that forbid a secret in the body cannot help, because a failed
-	// require aborts before they run.
+	// SANITISED, and this is the assertion that made it necessary: the message renders
+	// only when the status is NOT 200, which is precisely the regression — a handler
+	// answering 500 while still marshalling the credential — that would write a real SASL
+	// password into CI output. The assertions below that forbid a secret in the body
+	// cannot help, because a failed require aborts before they run.
 	require.Equal(t, http.StatusOK, recorder.Code,
 		"a successful issuance answers 200. %s", safeResponseBody(recorder))
 
@@ -4544,7 +3908,7 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 
 	// 2. THE BUDGET, from the fast side.
 	require.Less(t, elapsed, blnk.SubscriberCredentialIssuanceBudget,
-		"issuance must complete well inside its five-second budget (requirement R-7); it took %s",
+		"issuance must complete well inside its five-second budget; it took %s",
 		elapsed)
 
 	// 3. THE SECRET IS RETURNED ONCE, asserted on raw bytes so no key can hide it.
@@ -4583,9 +3947,7 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 		}
 	}
 
-	// 5. ONLY A NON-REVERSIBLE REFERENCE AND AN ISSUANCE TIMESTAMP ARE PERSISTED. Read off
-	// the arguments the credential record was actually written with, which is the closest a
-	// test can stand to the column itself.
+	// 5. ONLY A NON-REVERSIBLE REFERENCE AND AN ISSUANCE TIMESTAMP ARE PERSISTED.
 	recorded := false
 	for _, call := range datasource.Calls {
 		if call.Method != "RecordSubscriberCredentialIfUnchanged" {
@@ -4619,8 +3981,8 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 			"reports describes nothing")
 
 	// 6. THE ERROR PATH DISCLOSES NOTHING EITHER. A second issuance whose record cannot be
-	// written fails AFTER the password was generated, which is the one failure path a
-	// plaintext could ride out on.
+	//    written fails AFTER the password was generated, which is the one failure path a
+	//    plaintext could ride out on.
 	t.Run("a failure after generation returns no secret", func(t *testing.T) {
 		failing := new(mocks.MockDataSource)
 
@@ -4688,18 +4050,11 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 	})
 }
 
-// TestSubscribersAPI_NoPersistedShapeCanCarryAPlaintextSecret is the schema-level half of the
-// posture, and it runs whether or not a broker is configured.
+// TestSubscribersAPI_NoPersistedShapeCanCarryAPlaintextSecret is the schema-level half
+// of the posture, and it runs whether or not a broker is configured.
 //
-// The end-to-end test above proves that no plaintext WAS persisted on the path it exercised.
-// This proves something stronger and cheaper: the stored shape has nowhere to put one. That
-// is what makes "absent from every subsequent read" a structural guarantee rather than a
-// property of the projection that happens to be written today — a new read shape assembled
-// from a registry row cannot leak a secret that the row cannot hold.
-//
-// KafkaCredentialsResponse is the deliberate exception and is asserted as such: it is the one
-// shape in the system that carries a plaintext, it is a RESPONSE rather than a stored row,
-// and it exists for exactly one write of exactly one field.
+// The end-to-end test above proves that no plaintext WAS persisted on the path it
+// exercised.
 func TestSubscribersAPI_NoPersistedShapeCanCarryAPlaintextSecret(t *testing.T) {
 	secretish := []string{"password", "secret", "plaintext", "credential_value"}
 
@@ -4767,31 +4122,13 @@ func TestSubscribersAPI_NoPersistedShapeCanCarryAPlaintextSecret(t *testing.T) {
 	})
 }
 
-// TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret is the other half of that
-// posture: the response shape may carry a plaintext exactly once, and nothing this suite WRITES
-// may.
+// TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret is the other half of
+// that posture: the response shape may carry a plaintext exactly once, and nothing this
+// suite WRITES may.
 //
-// # What was wrong
-//
-// Assertions about the credential endpoint passed the whole response body into their failure
-// message. A failure message renders only when the assertion fails, which is the case where the
-// body is not what the test assumed — and for the two mirror-image shapes on this endpoint that is
-// precisely when the body holds a real password. `require.Equal(t, 200, code, "…body: %s")` renders
-// when the status is NOT 200, so a handler that answered 500 while still marshalling the credential
-// disclosed it; `require.NotEqual(t, 200, code, "…body: %s")` renders when the status IS 200, so the
-// body is a successful credential response and disclosure is certain. Both had an assertion on the
-// next line forbidding a secret in the body, and neither ever reached it: a failed require aborts.
-//
-// CI output is durable and broadly readable, so a secret written there is disclosed however
-// carefully the endpoint behaves afterwards — which is the one-time-issuance posture undone by its
-// own test suite.
-//
-// # Why the helper is asserted rather than the call sites
-//
-// Every diagnostic on this endpoint now renders through safeResponseBody, so the property worth
-// pinning is the helper's: given a real credential response, the password does not appear in what
-// it returns, and the fields that make a diagnostic worth having do. Asserting that once is
-// stronger than grepping the call sites, because a new assertion added later inherits it.
+// CI output is durable and broadly readable, so a secret written there is disclosed
+// however carefully the endpoint behaves afterwards — which is the one-time-issuance
+// posture undone by its own test suite.
 func TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret(t *testing.T) {
 	const plaintext = "a-real-looking-sasl-password-8f3b1c"
 
@@ -4894,10 +4231,8 @@ func TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret(t *testing.T)
 
 	// AND THE CALL SITES ACTUALLY USE IT. A sanitiser nothing calls is decorative, and the
 	// idiom it replaces — `"...body: %s", recorder.Body.String()` — is the one every other
-	// assertion in this suite is written with, so it will be reached for again by anyone adding
-	// a case here. The region asserted on is the end-to-end issuance test, which is the only
-	// test in the file that holds a REAL password, plus the surface's shared error helper,
-	// which is used on the credential route as well as on the read routes.
+	// assertion in this suite is written with, so it will be reached for again by anyone
+	// adding a case here.
 	t.Run("no diagnostic in the issuance test renders a raw body", func(t *testing.T) {
 		source, err := os.ReadFile("subscribers_api_test.go")
 		require.NoError(t, err, "this test reads its own file")
@@ -4912,8 +4247,7 @@ func TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret(t *testing.T)
 		// A raw body used as an assertion SUBJECT is fine and necessary — several assertions
 		// here check that a later read carries no password, which requires the untouched
 		// bytes. What must not appear is a raw body as a MESSAGE ARGUMENT, because that is
-		// what gets written out on failure. The region is whitespace-collapsed first so a
-		// wrapped call is matched the same as a single-line one.
+		// what gets written out on failure.
 		collapsed := strings.Join(strings.Fields(region), " ")
 		diagnostic := regexp.MustCompile(`%s"[^)]*\.Body\.String\(\)`)
 
@@ -4938,15 +4272,8 @@ func TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret(t *testing.T)
 // TestSubscribersAPI_TypedCodesResolveToIntendedStatuses pins the status catalogue this
 // surface answers from.
 //
-// statusByCode in internal/apierror/codes.go is the single source of truth for every code's
-// default status, and StatusForCode defaults an UNKNOWN code to 500. A code declared but
-// never mapped therefore turns every refusal that carries it into a server error: a missing
-// subscriber would read as a Blnk defect, and a retryable dependency failure would read as
-// one too. Nothing else in the suite fails when that happens, because the code in the body
-// still looks correct.
-//
-// The last case is why every other assertion in this file is written against
-// error_detail.code rather than against a status.
+// statusByCode in internal/apierror/codes.go is the single source of truth for every
+// code's default status, and StatusForCode defaults an UNKNOWN code to 500.
 func TestSubscribersAPI_TypedCodesResolveToIntendedStatuses(t *testing.T) {
 	for code, status := range map[apierror.ErrorCode]int{
 		apierror.ErrSubscriberNotFound:           http.StatusNotFound,
@@ -4987,58 +4314,26 @@ func TestSubscribersAPI_TypedCodesResolveToIntendedStatuses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// THERE IS NO DATA-PLANE ROUTE UNDER /subscribers, and this section is what enforces that
+// THERE IS NO DATA-PLANE ROUTE UNDER /subscribers, and this section is what enforces
+// that
 //
-// # What was here, and why it is gone rather than fixed
-//
-// GET /subscribers/:subscriber_id/events served a key-scoped subscriber its own records: Blnk read
-// the shared category topic with its OWN administrative credential, applied the subscriber's
-// partition-key prefix per record, and returned a page. Three properties of that design are why it
-// was removed outright rather than hardened.
-//
-//  1. It was a SECOND DATA PLANE holding a credential far wider than any subscriber's. Every record
-//     on the topic passed through the filter, so a defect in the filter — or a diagnostic field
-//     added to the page in good faith — disclosed other ledgers' records.
-//  2. It authenticated with a BESPOKE HEADER, X-Blnk-Subscriber-Secret, which the platform's
-//     authorization middleware knows nothing about. Two authentication systems on one router is how
-//     one of them comes to be forgotten.
-//  3. REVOCATION DID NOT REVOKE. Removing a subscriber's SCRAM credential at the broker closed the
-//     direct path and left the served one open, because the served one authenticated against a
-//     registry column rather than against the broker.
-//
-// AAP requirement R-7 authorises exactly one subscriber endpoint — POST
-// /subscribers/{id}/kafka-credentials — and §0.5.2 enumerates the four new routes this feature adds.
-// A record-serving route is not among them.
-//
-// # What replaces it
-//
-// A key-scoped subscriber's records are delivered by the key-authorising component the DEPLOYMENT
-// declares in front of the brokers (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway, addressed by
-// KAFKA_KEY_SCOPE_GATEWAY_BROKERS). Blnk does not ship it. Where none is declared, issuance refuses
-// the row — see TestIssueKafkaCredentials_RefusesAKeyScopedSubscriberWithNoDeclaredGateway — so no
-// credential ever exists that claims an enforcement point nothing is running.
+//  1. It was a SECOND DATA PLANE holding a credential far wider than any subscriber's.
+//  2. It authenticated with a BESPOKE HEADER, X-Blnk-Subscriber-Secret, which the
+//     platform's authorization middleware knows nothing about.
+//  3. REVOCATION DID NOT REVOKE. Removing a subscriber's SCRAM credential at the broker
+//     closed the direct path and left the served one open, because the served one
+//     authenticated against a registry column rather than against the broker.
 // ---------------------------------------------------------------------------------------
 
-// TestSubscribersAPI_HasNoRecordServingRoute is the guard that keeps the removal removed.
+// TestSubscribersAPI_HasNoRecordServingRoute is the guard that keeps the removal
+// removed.
 //
-// # Why an absence needs a test
+// A deleted route leaves no compile error behind.
 //
-// A deleted route leaves no compile error behind. Re-adding one is a single line in api.go, and the
-// reasoning against it lives in prose that a future change need not read. So the absence is asserted
-// the only way an absence can be: by making the requests such a route would answer and requiring
-// the ROUTER to refuse them before any handler exists to serve them.
-//
-// # Why it asserts 404 specifically, and what would break it
-//
-// gin answers an unregistered path with 404 from the router itself, ahead of the whole middleware
-// chain. That is the fingerprint of "no such route", and it is distinguishable from every answer a
-// registered route could give: 403 would mean the path resolved and authorization judged it, 401
-// that something authenticated it, 405 that the path exists under another method, 500 that a handler
-// ran. Any of those means a record-serving route is back.
-//
-// The master key is presented on purpose. A 404 while holding the most privileged credential the
-// deployment has is the strongest available statement that nothing is registered there — a refusal
-// that depended on the caller's scope would leave the route reachable by someone.
+// The master key is presented on purpose. A 404 while holding the most privileged
+// credential the deployment has is the strongest available statement that nothing is
+// registered there — a refusal that depended on the caller's scope would leave the
+// route reachable by someone.
 func TestSubscribersAPI_HasNoRecordServingRoute(t *testing.T) {
 	router, _ := setupSubscribersRouter(t, subscribersHarness{secure: true, masterKey: true})
 
@@ -5085,25 +4380,17 @@ func TestSubscribersAPI_HasNoRecordServingRoute(t *testing.T) {
 	}
 }
 
-// TestSubscribersAPI_DoesNotReadASubscriberSecretHeader pins the second half of the removal: not
-// merely that the route is gone, but that no surviving route accepts the header it used.
-//
-// X-Blnk-Subscriber-Secret was a live SASL password presented on every poll, authenticated against
-// a registry column by code that sat outside the authorization middleware. If any subscriber route
-// still honoured it, the removal would have moved the second authentication system rather than
-// deleted it — so the credential endpoint is exercised with the header and WITHOUT a master key, and
-// must refuse on the master key exactly as it does when no header is present at all.
+// TestSubscribersAPI_DoesNotReadASubscriberSecretHeader pins the second half of the
+// removal: not merely that the route is gone, but that no surviving route accepts the
+// header it used.
 func TestSubscribersAPI_DoesNotReadASubscriberSecretHeader(t *testing.T) {
 	router, datasource := setupSubscribersRouter(t, subscribersHarness{secure: true})
 
 	subscriberID := uniqueSubscriberID()
 
-	// A key scoped to the subscriber resource, so the request is authenticated and authorised as
-	// far as the master-key gate. Whatever refuses it below refuses it there and not earlier.
-	//
-	// Programmed through the shared helper because authentication ALSO starts a background
-	// last-used update for every non-master credential it admits; the helper is what makes that
-	// call expected and joinable rather than an unexpected-call panic on another goroutine.
+	// A key scoped to the subscriber resource, so the request is authenticated and
+	// authorised as far as the master-key gate. Whatever refuses it below refuses it there
+	// and not earlier.
 	key := subscribersTestAPIKey(
 		middleware.BuildScope(middleware.ResourceSubscribers, middleware.ActionAll))
 	touched := expectSubscribersAPIKeyLookup(datasource, key)
@@ -5144,29 +4431,18 @@ func TestSubscribersAPI_DoesNotReadASubscriberSecretHeader(t *testing.T) {
 		mock.Anything, mock.Anything, mock.Anything)
 }
 
-// startKeyScopeGatewayStub starts a stub for the key-authorising component a deployment declares
-// in front of its brokers, and returns its control endpoint and bearer token.
+// startKeyScopeGatewayStub starts a stub for the key-authorising component a deployment
+// declares in front of its brokers, and returns its control endpoint and bearer token.
 //
-// # Why the HTTP layer needs one at all
-//
-// Issuance for a key-scoped subscriber now BINDS the recorded prefix at that component and
-// requires it to attest the binding back before a secret exists (SEC-01). A declaration Blnk
-// cannot verify is treated as no declaration, so without a reachable endpoint every key-scoped
-// request through this router answers SUBSCRIBER_KEY_SCOPE_UNATTESTED — and the tests whose
-// subject is the request contract, the five-second ceiling or the broker step would all be
-// asserting that one refusal instead.
-//
-// It is deliberately MINIMAL. The conformance cases — a component that trims the prefix, answers
-// for the wrong principal, enforces nothing, or rejects Blnk's token — belong to the client and
-// the service, and are covered in the root package's event_keyscope_gateway_test.go against a
-// double that implements the contract in full. What this stub has to be is CORRECT, so that a
-// request under test is not refused by its stand-in.
+// Issuance for a key-scoped subscriber now BINDS the recorded prefix at that component
+// and requires it to attest the binding back before a secret exists.
 //
 // Parameters:
 //   - t *testing.T: for the helper marker and to close the server when the test ends.
 //
 // Returns:
-//   - string: the control endpoint to declare in KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL.
+//   - string: the control endpoint to declare in
+//     KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL.
 //   - string: the bearer token to declare alongside it.
 func startKeyScopeGatewayStub(t *testing.T) (endpoint string, token string) {
 	t.Helper()

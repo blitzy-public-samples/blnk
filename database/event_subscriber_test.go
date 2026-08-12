@@ -36,46 +36,29 @@ import (
 )
 
 // event_subscriber_test.go covers the SCHEMA half of one property of the subscriber
-// registry: a subscriber's Kafka identity is DERIVED from its business identifier and may
-// not be supplied independently of it.
-//
-// Why that matters beyond tidiness. blnk.event_subscribers.kafka_principal is the SASL
-// principal every ACL binding is attached to, and consumer_group_id is exported as a METRIC
-// LABEL VALUE on blnk.kafka.consumer_lag and interpolated into that alert's annotations. So
-// the two columns are simultaneously an authorization boundary and a value that leaves the
-// process — scraped into a monitoring system, held for the retention period, rendered on
-// dashboards and pasted into incident tickets. A caller able to supply a principal of its
-// own choosing would be choosing which broker identity Blnk binds ACLs to: a request for a
-// NAME would silently be a request for a BOUNDARY.
+// registry: a subscriber's Kafka identity is DERIVED from its business identifier and
+// may not be supplied independently of it.
 //
 // The contract is enforced at three layers:
 //
-//  1. THE REPOSITORY derives the principal and the group and refuses a supplied value that
-//     differs. Covered by TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne
-//     in event_outbox_test.go, beside the rest of the repository's validation.
-//  2. THE SCHEMA restates the derivation as CHECK constraints, so a writer that never comes
-//     through the repository is refused too. That is what this file covers.
-//  3. THE MEASUREMENT collapses a non-conforming value instead of exporting it, covered in
-//     the root package where the label resolvers live.
-//
-// Layer 2 is not redundant with layer 1, and it is the layer most easily assumed rather than
-// proven. A migration, a manual INSERT during an incident, or a future service that skips
-// the repository is precisely the case an application-layer check cannot cover — the same
-// reasoning sql/1781248900.sql gives for enforcing its no-secret-column rule in the schema
-// rather than in code.
+//  1. THE REPOSITORY derives the principal and the group and refuses a supplied value
+//     that differs. Covered by
+//     TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne in
+//     event_outbox_test.go, beside the rest of the repository's validation.
+//  2. THE SCHEMA restates the derivation as CHECK constraints, so a writer that never
+//     comes through the repository is refused too.
+//  3. THE MEASUREMENT collapses a non-conforming value instead of exporting it, covered
+//     in the root package where the label resolvers live.
 
 // TestSubscriberIdentityGenerators_ProduceCanonicalValues pins the property every other
 // assertion in this file and in the root package's fixtures depends on.
 //
-// The generators exist so that a subscriber identifier is OPAQUE: a human-readable one ends
-// up naming the customer, and the identifier is copied verbatim into a Kafka principal, a
-// consumer group id and a metric label. That is only useful if what they emit is also
-// storable — an opaque identifier the schema rejects would simply push every caller back to
-// inventing a literal, which is the failure the generators exist to prevent.
-//
-// It is repeated rather than sampled once because the identifier carries a UUID, and a rule
-// that happened to reject a value with, say, a leading digit would pass a single-sample test
-// most of the time.
+// The generators exist so that a subscriber identifier is OPAQUE: a human-readable one
+// ends up naming the customer, and the identifier is copied verbatim into a Kafka
+// principal, a consumer group id and a metric label. That is only useful if what they
+// emit is also storable — an opaque identifier the schema rejects would simply push
+// every caller back to inventing a literal, which is the failure the generators exist
+// to prevent.
 func TestSubscriberIdentityGenerators_ProduceCanonicalValues(t *testing.T) {
 	for i := 0; i < 64; i++ {
 		subscriberID := model.GenerateSubscriberID()
@@ -98,13 +81,8 @@ func TestSubscriberIdentityGenerators_ProduceCanonicalValues(t *testing.T) {
 
 // TestEventSubscriberSchema_RefusesAnUnderivedIdentity is layer 2.
 //
-// It runs against a real database because a CHECK constraint cannot be proven any other way:
-// sqlmock would assert what the test told it to assert. The insert deliberately BYPASSES
-// CreateEventSubscriber and issues raw SQL, because going through the repository would be
-// stopped by layer 1 and would prove nothing about the schema.
-//
-// It skips rather than fails when no database is reachable, matching openRealTestDB's
-// existing contract in this package.
+// It runs against a real database because a CHECK constraint cannot be proven any other
+// way: sqlmock would assert what the test told it to assert.
 func TestEventSubscriberSchema_RefusesAnUnderivedIdentity(t *testing.T) {
 	datasource := openRealTestDB(t)
 	ctx := context.Background()
@@ -209,39 +187,15 @@ func TestEventSubscriberSchema_RefusesAnUnderivedIdentity(t *testing.T) {
 	})
 
 	t.Run("a key scope alongside a credential is accepted by the database", func(t *testing.T) {
-		// THERE IS NO PRECONDITION TO ASSERT HERE, and there used to be one that asserted the
-		// opposite of what this subtest now proves: it required
-		// event_subscribers_key_scope_chk to be PRESENT before exercising the refusal it
-		// enforced. The refusal is withdrawn — sql/1781248930.sql drops the constraint, this
-		// subtest's body asserts the combination is writable in both orders, and its closing
-		// assertion requires the constraint to be absent BY NAME. A precondition demanding the
-		// presence of the very object the closing assertion forbids can only ever fail, and it
-		// failed with the words "PRECONDITION MISSING ... the schema has drifted", which sent a
+		// The refusal is withdrawn — sql/1781248930.sql drops the constraint, this subtest's
+		// body asserts the combination is writable in both orders, and its closing assertion
+		// requires the constraint to be absent BY NAME. A precondition demanding the presence
+		// of the very object the closing assertion forbids can only ever fail, and it failed
+		// with the words "PRECONDITION MISSING ... the schema has drifted", which sent a
 		// reader to re-run migrations that had in fact applied correctly.
-		//
-		// The absence is checked at the END rather than as a precondition, and deliberately: this
-		// is a test about what the database ACCEPTS, so the writes are the evidence and the
-		// name-level check is the guard against a future migration reintroducing it.
 
-		// SEC-05's THIRD barrier, and the only one that also covers a psql session, a data
+		// The THIRD barrier, and the only one that also covers a psql session, a data
 		// migration and a restored backup.
-		//
-		// event_subscribers_key_scope_chk once forbade this combination outright, on the
-		// reasoning that a prefix records a boundary Kafka cannot enforce and so a row holding
-		// both states a tenancy boundary that does not exist. What that actually did was make a
-		// REQUIRED capability unreachable: a subscriber registered with a prefix could never be
-		// issued credentials, from either direction, permanently.
-		//
-		// The combination is legitimate, because a prefix is a routing hint rather than an access
-		// boundary — Kafka has no message-key ACL resource, so there is no narrower credential
-		// being withheld — and the API states the boundary instead of prohibiting the state.
-		// sql/1781248930.sql drops the constraint, including on databases that already created
-		// it, and this asserts that the drop reached THIS database rather than only the file.
-		//
-		// It matters that the assertion lives here. The service layer can be tested against a
-		// double, but a lingering CHECK would surface only as a raw write failure at runtime —
-		// no code maps it to a typed error any more — and only a real database can answer
-		// whether it is gone.
 		subscriberID := model.GenerateSubscriberID()
 		principal, group := derived(t, subscriberID)
 
@@ -321,8 +275,8 @@ func TestEventSubscriberSchema_RefusesAnUnderivedIdentity(t *testing.T) {
 	t.Run("a group leaf inside the subscriber's own namespace is accepted at rest", func(t *testing.T) {
 		// A subscriber running several consumer instances legitimately commits under its own
 		// leaves, and the provisioned ACL grants the namespace with a PREFIXED pattern
-		// precisely so it may. A constraint that pinned the default leaf would make the
-		// grant unusable.
+		// precisely so it may. A constraint that pinned the default leaf would make the grant
+		// unusable.
 		subscriberID := model.GenerateSubscriberID()
 		principal, _ := derived(t, subscriberID)
 
@@ -339,20 +293,17 @@ func TestEventSubscriberSchema_RefusesAnUnderivedIdentity(t *testing.T) {
 	})
 }
 
-// TestCountSubscriberRevocationsPending_ReadsTheBacklogAsAnAggregate covers the read that gave
-// two declared-but-never-recorded gauges a value, and with them an alert rule that could not
-// fire.
+// TestCountSubscriberRevocationsPending_ReadsTheBacklogAsAnAggregate covers the read
+// that gave two declared-but-never-recorded gauges a value, and with them an alert rule
+// that could not fire.
 //
-// A registry row carrying revocation_pending_at is a principal that may still authenticate at
-// the broker while nothing in Blnk records an issuance for it. Deregistration revokes first and
-// deletes only once the revocation is confirmed, so the marker is a durable to-do item — and
-// until this read existed, nothing observed it: blnk_subscribers_revocation_pending and
-// blnk_subscribers_oldest_revocation_age_seconds were exported by nothing and
-// SubscriberRevocationOutstanding sat permanently inactive with a healthy-looking rule.
+// A registry row carrying revocation_pending_at is a principal that may still
+// authenticate at the broker while nothing in Blnk records an issuance for it.
 //
-// The three assertions are the three properties the gauges depend on: it is an AGGREGATE (two
-// scalars, no row scan), it filters to unsettled markers only, and a NULL minimum — the healthy
-// case — comes back as the zero instant rather than a scan error.
+// The three assertions are the three properties the gauges depend on: it is an
+// AGGREGATE (two scalars, no row scan), it filters to unsettled markers only, and a
+// NULL minimum — the healthy case — comes back as the zero instant rather than a scan
+// error.
 func TestCountSubscriberRevocationsPending_ReadsTheBacklogAsAnAggregate(t *testing.T) {
 	t.Run("an outstanding backlog reports its count and its oldest instant", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -394,8 +345,8 @@ func TestCountSubscriberRevocationsPending_ReadsTheBacklogAsAnAggregate(t *testi
 		ds := Datasource{Conn: db}
 
 		// COUNT returns 0 and MIN returns NULL. The NULL must be scanned through a nullable
-		// time, or the healthy steady state — by far the commonest one — fails the read and the
-		// caller publishes nothing for a system with nothing wrong.
+		// time, or the healthy steady state — by far the commonest one — fails the read and
+		// the caller publishes nothing for a system with nothing wrong.
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*), MIN(revocation_pending_at)")).
 			WillReturnRows(sqlmock.NewRows([]string{"count", "min"}).AddRow(int64(0), nil))
 
@@ -430,11 +381,6 @@ func TestCountSubscriberRevocationsPending_ReadsTheBacklogAsAnAggregate(t *testi
 
 // fenceMissRows builds the two-column answer describeFencedWriteMiss reads.
 //
-// The two facts are read in ONE statement rather than through GetEventSubscriberByID because
-// provisioning_token is deliberately not a field of the read model — exposing a
-// concurrency-control secret on every API response is the disclosure that omission prevents —
-// so it cannot be inspected from a row struct.
-//
 // Parameters:
 //   - holdsClaim bool: whether the stored claim is the one the caller presented.
 //   - revocationPending bool: whether the row carries the revocation tombstone.
@@ -451,13 +397,9 @@ func fenceMissRows(holdsClaim, revocationPending bool) *sqlmock.Rows {
 //
 // The statement used to match on subscriber_id alone:
 //
-//   - WITHOUT THE CLAIM, an operation whose lease had expired still landed its write, on top of
-//     the authorization the new owner had just reconciled with the broker. The registry then
-//     described one boundary while Kafka enforced another, and the call reported success.
-//   - WITHOUT THE TOMBSTONE CHECK, an update was accepted on a row being deregistered. A
-//     non-nil AuthorizedTopics REPLACES the whole set, so it could WIDEN the authorization —
-//     and the service's grant step then created bindings for a principal whose revocation was
-//     already in flight. Access regained while being removed, recorded as an ordinary edit.
+//   - WITHOUT THE CLAIM, an operation whose lease had expired still landed its write,
+//     on top of the authorization the new owner had just reconciled with the broker.
+//   - WITHOUT THE TOMBSTONE CHECK, an update was accepted on a row being deregistered.
 func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 	t.Run("the claim and the tombstone are both predicates of the write", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -516,8 +458,8 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		// NO ROWS is what a failed predicate looks like now that the statement RETURNS the row:
-		// the same condition the affected-row count used to report, reached through the scan.
+		// NO ROWS is what a failed predicate looks like when the statement RETURNS the row:
+		// the failure surfaces through the scan rather than through an affected-row count.
 		mock.ExpectQuery("UPDATE blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnRows(fenceMissRows(false, false))
@@ -563,13 +505,12 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 	})
 }
 
-// TestMarkSubscriberRevocationPending_IsFencedButAcceptsAnExistingTombstone pins the ONE
-// deliberate asymmetry in the fenced-write family.
+// TestMarkSubscriberRevocationPending_IsFencedButAcceptsAnExistingTombstone pins the
+// ONE deliberate asymmetry in the fenced-write family.
 //
-// Every other mutation refuses a tombstoned row. This one must not: an already-tombstoned row
-// IS a deregistration that failed part way through, and the correct response to retrying it is
-// to FINISH it. That is also why the stamp keeps the first instant — the value an operator needs
-// is how long the revocation has been outstanding, not the age of the last attempt.
+// Every other mutation refuses a tombstoned row. This one must not: an
+// already-tombstoned row IS a deregistration that failed part way through, and the
+// correct response to retrying it is to FINISH it.
 func TestMarkSubscriberRevocationPending_IsFencedButAcceptsAnExistingTombstone(t *testing.T) {
 	t.Run("carries the claim but not the tombstone predicate", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -629,13 +570,10 @@ func TestMarkSubscriberRevocationPending_IsFencedButAcceptsAnExistingTombstone(t
 	})
 }
 
-// TestRenewSubscriberProvisioningFence_ExtendsOnlyTheCallersOwnClaim covers the write that
-// makes a short lease compatible with a long operation.
+// TestRenewSubscriberProvisioningFence_ExtendsOnlyTheCallersOwnClaim covers the write
+// that makes a short lease compatible with a long operation.
 //
-// The lease has to be SHORT, because it is also the recovery time after a crash. But the work
-// under it is a variable-length sequence of Kafka administrative round trips, so no single
-// fixed lease is both short enough to recover quickly and long enough for the worst case. Before
-// renewal existed the operation simply continued past its expired claim.
+// The lease has to be SHORT, because it is also the recovery time after a crash.
 func TestRenewSubscriberProvisioningFence_ExtendsOnlyTheCallersOwnClaim(t *testing.T) {
 	t.Run("extends from NOW under the caller's token", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -703,20 +641,10 @@ func TestRenewSubscriberProvisioningFence_ExtendsOnlyTheCallersOwnClaim(t *testi
 
 // requireSubscriberConstraint fails the test unless a named constraint is present.
 //
-// IT IS THE PRECONDITION ASSERTION for the schema-enforced refusals below, and it exists because
-// a constraint-backed test has two distinct ways to fail that produce the same words: the
-// constraint is missing from a drifted schema, or it is present and has stopped refusing. Both
-// report "an error was expected but got nil", and they send a reader to opposite places.
+// It asserts that a named constraint is present on blnk.event_subscribers, and says
+// what to do about it when it is not.
 //
-// It asserts that a named constraint is present on blnk.event_subscribers, and says what to do
-// about it when it is not. Its earlier caller went away because the constraint THAT one named was
-// dropped by design, not because the pattern stopped being right.
-//
-// It exists to separate a MISSING PRECONDITION from a BROKEN BEHAVIOUR. A constraint-backed test
-// whose constraint has gone reports "an error was expected but got nil" — the same words the
-// genuine regression produces — so the two become indistinguishable at exactly the moment the
-// distinction matters. Naming the missing object and the command that restores it turns ten
-// minutes of confusion into one line.
+// It exists to separate a MISSING PRECONDITION from a BROKEN BEHAVIOUR.
 //
 // Parameters:
 //   - ctx context.Context: cancels the lookup.
@@ -751,14 +679,8 @@ func requireSubscriberConstraint(
 			"into it.", constraint)
 }
 
-// TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement is the repository half of
-// the cutover atomicity guard.
-//
-// The endpoint used to issue two statements with no transaction spanning them, and a failure
-// between them left the row absent from BOTH halves of the migration report: webhook_url gone, so
-// nothing still to migrate from; migrated_at NULL, so not counted as migrated. The property that
-// removes the window is not "the write succeeds" but that there is only ONE statement, so this
-// test reads the SQL the database would really have received rather than trusting the call.
+// TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement is the
+// repository half of the cutover atomicity guard.
 func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *testing.T) {
 	t.Run("one statement sets both columns and returns the row", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -799,12 +721,12 @@ func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *te
 			"the row is returned so a caller can confirm both facts without re-reading")
 
 		// COALESCE, AND NOT A BARE ASSIGNMENT. This statement is idempotent by design — the
-		// endpoint can legitimately be called again on a row already migrated, and webhook_url is
-		// already NULL by then so nothing else distinguishes the repeat — but an unconditional
-		// `migrated_at = $1` rewrote the instant on every call. The column records WHEN a
-		// subscriber left HTTP delivery, which is what migration-progress reporting reads and what
-		// an operator uses to judge whether the sunset window has been served, so a repeat made a
-		// long-migrated subscriber look like it moved today.
+		// endpoint can legitimately be called again on a row already migrated, and
+		// webhook_url is already NULL by then so nothing else distinguishes the repeat — but
+		// an unconditional `migrated_at = $1` rewrote the instant on every call. The column
+		// records WHEN a subscriber left HTTP delivery, which is what migration-progress
+		// reporting reads and what an operator uses to judge whether the sunset window has
+		// been served, so a repeat made a long-migrated subscriber look like it moved today.
 		assert.Contains(t, statement, "migrated_at = COALESCE(migrated_at, $1)",
 			"the FIRST transition must be preserved: a repeated call must not move the migration "+
 				"instant forward")
@@ -813,15 +735,9 @@ func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *te
 	})
 
 	t.Run("carries no fence and no tombstone predicate, deliberately", func(t *testing.T) {
-		// The provisioning claim guards the writes whose state the BROKER also holds — the access
-		// model and the credential record. Neither column here has a broker counterpart, so there
-		// is no second system for a stale caller to make disagree.
-		//
-		// And the tombstone predicate is absent because this write ERASES third-party data Blnk
-		// has a retention obligation for. Blocking that because the subscriber happens to be
-		// mid-deregistration would put the obligation behind somebody else's stuck operation, and
-		// PurgeMigratedSubscriberWebhookURLs — the bulk form of the same erasure — carries no such
-		// predicate either. The two forms must not disagree about when the data may go.
+		// The provisioning claim guards the writes whose state the BROKER also holds — the
+		// access model and the credential record. Neither column here has a broker
+		// counterpart, so there is no second system for a stale caller to make disagree.
 		db, mock, captured := newCapturingSQLMock(t)
 		source := Datasource{Conn: db}
 
@@ -842,9 +758,9 @@ func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *te
 		require.NoError(t, err)
 		require.Len(t, *captured, 1)
 
-		// The PREDICATE only. Both column names also appear in the RETURNING projection, which
-		// every reader of the row legitimately needs, so asserting on the whole statement would
-		// assert the opposite of what it looks like.
+		// The PREDICATE only. Both column names also appear in the RETURNING projection,
+		// which every reader of the row legitimately needs, so asserting on the whole
+		// statement would assert the opposite of what it looks like.
 		predicate := whereClauseOf(t, (*captured)[0])
 
 		assert.NotContains(t, predicate, "provisioning_token",
@@ -908,7 +824,7 @@ func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *te
 	})
 
 	t.Run("does not leak driver detail on failure", func(t *testing.T) {
-		// DATA-01: a raw *pq.Error attached to APIError.Details serialises the database's schema,
+		// a raw *pq.Error attached to APIError.Details serialises the database's schema,
 		// table, column and constraint names straight into the response body.
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
@@ -927,18 +843,8 @@ func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *te
 }
 
 // ---------------------------------------------------------------------------------------
-// SETTLEMENT OBLIGATIONS — the durable record of broker-side work a request could not finish
-//
-// A subscriber's state lives in two systems that cannot be written atomically. Every
-// intermediate state of an authorization change or a credential issuance is reachable, and each
-// used to be recorded as nothing more than a log line — some ending in "revoke it by hand
-// immediately". The five columns these statements maintain are what replace that.
-//
-// The properties pinned below are the ones the mechanism's correctness rests on: the marker
-// keeps its FIRST instant so its age is the age of the divergence, every write is conditional on
-// the caller's claim, the scan's predicate matches the partial index EXACTLY, and a successful
-// issuance or clear DISCHARGES a pending cleanup in the same statement — which is what stops
-// settlement destroying a credential that has just been issued.
+// SETTLEMENT OBLIGATIONS — the durable record of broker-side work a request could not
+// finish
 // ---------------------------------------------------------------------------------------
 
 // TestRecordSubscriberGrantReconcilePending_KeepsTheFirstInstantUnderTheCallersClaim covers the
@@ -1026,12 +932,11 @@ func TestRecordSubscriberGrantReconcilePending_KeepsTheFirstInstantUnderTheCalle
 	})
 }
 
-// TestClearSubscriberGrantReconcilePending_ResetsTheCountersOnlyWhenNothingRemains covers the
-// discharge.
+// TestClearSubscriberGrantReconcilePending_ResetsTheCountersOnlyWhenNothingRemains
+// covers the discharge.
 //
-// The conditional reset is the subtle half: the settlement counters belong to whatever is STILL
-// outstanding, so a row that also owes a credential cleanup keeps its history. Resetting
-// unconditionally would restart the pacing of an obligation that is still failing.
+// The conditional reset is the subtle half: the settlement counters belong to whatever
+// is STILL outstanding, so a row that also owes a credential cleanup keeps its history.
 func TestClearSubscriberGrantReconcilePending_ResetsTheCountersOnlyWhenNothingRemains(t *testing.T) {
 	t.Run("nulls the marker and conditionally resets the counters", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -1093,13 +998,11 @@ func TestRecordSubscriberCredentialCleanupPending_KeepsTheFirstInstantUnderTheCa
 	})
 }
 
-// TestRecordSubscriberCredentialIfUnchanged_DischargesAPendingCleanup is the SELF-SATISFYING
-// case, and the one that would be dangerous to get wrong.
+// TestRecordSubscriberCredentialIfUnchanged_DischargesAPendingCleanup is the
+// SELF-SATISFYING case, and the one that would be dangerous to get wrong.
 //
-// Provisioning UPSERTS the principal's SCRAM credential, so an issuance that reaches this write
-// has replaced whatever orphan a pending cleanup was about. Left outstanding, the next settlement
-// pass would revoke the credential just issued and handed to a subscriber. Two statements would
-// leave a window in which exactly that could happen, so it is cleared in the SAME statement.
+// Provisioning UPSERTS the principal's SCRAM credential, so an issuance that reaches
+// this write has replaced whatever orphan a pending cleanup was about.
 func TestRecordSubscriberCredentialIfUnchanged_DischargesAPendingCleanup(t *testing.T) {
 	reference, err := model.DeriveCredentialReference("User:blnk-sub-acme_prod", "s3cret-value")
 	require.NoError(t, err)
@@ -1139,12 +1042,11 @@ func TestRecordSubscriberCredentialIfUnchanged_DischargesAPendingCleanup(t *test
 	})
 }
 
-// TestClearSubscriberCredential_DischargesAPendingCleanup is the other statement that satisfies
-// the obligation, and the one settlement itself calls.
+// TestClearSubscriberCredential_DischargesAPendingCleanup is the other statement that
+// satisfies the obligation, and the one settlement itself calls.
 //
-// The row's credential columns and the cleanup marker describe ONE fact — whether Blnk records a
-// credential it has not settled — so they must move together. Clearing them separately would let
-// the registry report "no credential" while still owing a cleanup, or the reverse.
+// The row's credential columns and the cleanup marker describe ONE fact — whether Blnk
+// records a credential it has not settled — so they must move together.
 func TestClearSubscriberCredential_DischargesAPendingCleanup(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	source := Datasource{Conn: db}
@@ -1163,13 +1065,10 @@ func TestClearSubscriberCredential_DischargesAPendingCleanup(t *testing.T) {
 	assert.Contains(t, issued, "WHEN grant_reconcile_pending_at IS NULL THEN 0")
 }
 
-// TestListSubscriberSettlementObligations_MatchesThePartialIndexAndIsUnfenced covers the scan.
+// TestListSubscriberSettlementObligations_MatchesThePartialIndexAndIsUnfenced covers
+// the scan.
 //
-// Two properties, both load-bearing. The predicate must repeat the partial index's EXACTLY, or
-// the planner cannot prove the query's condition implies the index's and every poll becomes a
-// sequential scan of the registry. And the NULL arms must be spelled out, because
-// `last_attempt < $1` is NULL rather than true for a row that has never been attempted — which
-// would make the never-tried obligations, the newest and most urgent, permanently invisible.
+// Two properties, both load-bearing.
 func TestListSubscriberSettlementObligations_MatchesThePartialIndexAndIsUnfenced(t *testing.T) {
 	t.Run("returns the outstanding obligations oldest attempt first", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -1258,13 +1157,10 @@ func TestListSubscriberSettlementObligations_MatchesThePartialIndexAndIsUnfenced
 	})
 }
 
-// TestGetSubscriberSettlementObligation_ReReadsTheFlagsForOneSubscriber covers the read that
-// makes settlement safe.
+// TestGetSubscriberSettlementObligation_ReReadsTheFlagsForOneSubscriber covers the read
+// that makes settlement safe.
 //
-// A pass finds an obligation, then takes the claim, and time passes in between. A successful
-// re-issuance in that window discharges the cleanup obligation — so acting on the scanned flag
-// would revoke a credential that had just been issued. This is the read taken once the claim is
-// held, which is the first moment the flags cannot change underneath the remedy.
+// A pass finds an obligation, then takes the claim, and time passes in between.
 func TestGetSubscriberSettlementObligation_ReReadsTheFlagsForOneSubscriber(t *testing.T) {
 	t.Run("projects the five columns narrowly", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -1325,9 +1221,7 @@ func TestGetSubscriberSettlementObligation_ReReadsTheFlagsForOneSubscriber(t *te
 
 // TestMarkSubscriberSettlementAttempt_PacesWithoutDischarging covers the pacing write.
 //
-// Two properties. It does NOT discharge either obligation, so a pass that logged its attempt and
-// then crashed cannot be mistaken for one that succeeded. And a row that no longer exists is not
-// an error, because a subscriber deregistered between the scan and the attempt owes nothing.
+// Two properties.
 func TestMarkSubscriberSettlementAttempt_PacesWithoutDischarging(t *testing.T) {
 	t.Run("increments the attempt and stores the bounded failure", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -1377,13 +1271,8 @@ func TestMarkSubscriberSettlementAttempt_PacesWithoutDischarging(t *testing.T) {
 	})
 }
 
-// TestCountSubscriberSettlementObligations_ReadsTheBacklogAsAnAggregate covers the read the four
-// settlement gauges depend on.
-//
-// Three properties: it is an AGGREGATE, so observing the backlog costs the same whatever its
-// size; Outstanding is counted with an OR rather than summed, because one subscriber can owe
-// both; and a NULL minimum — the healthy case — comes back as the zero instant rather than a
-// scan error.
+// TestCountSubscriberSettlementObligations_ReadsTheBacklogAsAnAggregate covers the read
+// the four settlement gauges depend on.
 func TestCountSubscriberSettlementObligations_ReadsTheBacklogAsAnAggregate(t *testing.T) {
 	t.Run("reports the split and the oldest instant", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -1450,11 +1339,11 @@ func TestCountSubscriberSettlementObligations_ReadsTheBacklogAsAnAggregate(t *te
 	})
 }
 
-// TestNullableTime_TurnsTheZeroInstantIntoSQLNull pins the helper the scan's pacing bound relies
-// on.
+// TestNullableTime_TurnsTheZeroInstantIntoSQLNull pins the helper the scan's pacing
+// bound relies on.
 //
-// Passing Go's zero time through as a literal would compare against year 1 rather than meaning
-// "no bound" — a predicate that looks like it is pacing and is not.
+// Passing Go's zero time through as a literal would compare against year 1 rather than
+// meaning "no bound" — a predicate that looks like it is pacing and is not.
 func TestNullableTime_TurnsTheZeroInstantIntoSQLNull(t *testing.T) {
 	assert.Nil(t, nullableTime(time.Time{}))
 
@@ -1466,45 +1355,12 @@ func TestNullableTime_TurnsTheZeroInstantIntoSQLNull(t *testing.T) {
 // The webhook-migration invariant, enforced at the write rather than by the schema
 // ---------------------------------------------------------------------------------------
 
-// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository pins the statement
-// that makes an invariant real instead of merely documented.
+// TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository pins the
+// statement that makes an invariant real instead of merely documented.
 //
-// # The defect this replaces
+// The pair therefore has to stay representable.
 //
-// Four comments and the operations runbook asserted that a CHECK constraint named
-// event_subscribers_webhook_migration_chk forbade a row from being migrated while it still
-// carried a live endpoint. No such constraint exists in any migration, and none is wanted:
-// PurgeMigratedSubscriberWebhookURLs — the RETAIN-01 retention control documented on the
-// table itself — selects exactly `webhook_url IS NOT NULL AND migrated_at IS NOT NULL`, so a
-// constraint forbidding that pair would leave it unable to match anything, and would fail
-// `migrate up` on any database already holding such a row.
-//
-// The pair therefore has to stay representable. What must not happen is this repository
-// CREATING one, and the only method that could was this one: it stamped migrated_at with
-// `WHERE subscriber_id = $1` alone. The refusal its own documentation promised did not
-// happen, and the registry double in the root package mirrored a constraint that was not
-// there — so the assertion that the call is refused passed against a fake STRICTER than
-// PostgreSQL, which is the one way a green test becomes a false one.
-//
-// # What is asserted
-//
-// The predicate, and the two answers it produces. Both are refusals of the same write, and
-// telling them apart is the point: answering "not found" for a subscriber that plainly
-// exists sends an operator looking for the wrong problem.
-//
-// # RACE-01: and both answers come from ONE statement
-//
-// The refusal used to be classified by a SECOND, unlocked read — `SELECT 1` against the
-// subscriber id — issued after the UPDATE reported zero rows affected. That read saw a
-// different snapshot from the one the write was refused against, so a concurrent delete, a
-// delete-and-recreate, or a URL cleared in between produced a typed code and an operator
-// remedy describing a state that had never been refused.
-//
-// Every case below therefore expects exactly ONE round trip, and the expectations are what
-// enforce that: sqlmock fails on an unexpected call, so reintroducing a follow-up probe
-// breaks these tests rather than passing them quietly. The statement text is asserted to
-// carry both `FOR UPDATE` — the lock that makes the classification a snapshot rather than a
-// guess — and the `webhook_url IS NULL` predicate that is the invariant itself.
+// The predicate, and the two answers it produces.
 func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository(t *testing.T) {
 	t.Run("the statement carries the webhook_url predicate under a row lock", func(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
@@ -1593,14 +1449,11 @@ func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository(t *
 	})
 }
 
-// TestPurgeMigratedSubscriberWebhookURLs_StillTargetsThePairNoConstraintForbids is the guard
-// that keeps the decision above from being quietly reversed.
+// TestPurgeMigratedSubscriberWebhookURLs_StillTargetsThePairNoConstraintForbids is the
+// guard that keeps the decision above from being quietly reversed.
 //
-// The retention control and a CHECK constraint on the same pair are mutually exclusive: one
-// of them is dead code the moment the other exists. Anybody reintroducing
-// event_subscribers_webhook_migration_chk has to delete this predicate first, and this test
-// is where they find out that deleting it removes the only thing that ever clears a legacy
-// URL from a migrated subscriber.
+// The retention control and a CHECK constraint on the same pair are mutually exclusive:
+// one of them is dead code the moment the other exists.
 func TestPurgeMigratedSubscriberWebhookURLs_StillTargetsThePairNoConstraintForbids(t *testing.T) {
 	db, mock := newSQLMock(t)
 	source := Datasource{Conn: db}

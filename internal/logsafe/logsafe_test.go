@@ -90,7 +90,7 @@ func TestValue_TruncatesOnRuneBoundary(t *testing.T) {
 	assert.True(t, isValidUTF8(got), "truncated value must remain valid UTF-8")
 }
 
-// TestCause_RedactsNetworkTopologyAndKeepsDiagnosis is the core of the finding: the
+// TestCause_RedactsNetworkTopologyAndKeepsDiagnosis is the core of the redaction rule: the
 // words that tell an operator what happened survive, and the addresses that tell a
 // reader where it happened do not.
 func TestCause_RedactsNetworkTopologyAndKeepsDiagnosis(t *testing.T) {
@@ -319,20 +319,10 @@ func isValidUTF8(value string) bool {
 	return true
 }
 
-// TestRedactedValue_RemovesTopologyFromTextTheSameWayCauseDoesFromAnError is the guard on the
-// rendering a failure gets when it arrives as a STRING rather than as an error.
+// TestRedactedValue_RemovesTopologyFromTextTheSameWayCauseDoesFromAnError is the guard
+// on the rendering a failure gets when it arrives as a STRING rather than as an error.
 //
-// The two have to agree. A dead-lettered event's reason is recorded on its outbox row before it
-// is ever logged, so the log site holds text — and it used to pass that text through Value,
-// which makes a value's FORM safe and leaves the broker's address, its port and the internal
-// resolver's address exactly where they were. The consequence was a log line at the default
-// level naming the deployment's internal topology, from the one path whose input was not an
-// error value.
-//
-// The ORDER inside this helper is the reason it exists rather than being composed at the call
-// site: redaction splits on whitespace, so it must run on cleaned text, and it must run BEFORE
-// bounding, or a cap that truncated an address mid-token would leave the fragment unmatched by
-// every endpoint rule and therefore unredacted.
+// The two have to agree.
 func TestRedactedValue_RemovesTopologyFromTextTheSameWayCauseDoesFromAnError(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		text      string
@@ -403,15 +393,11 @@ func TestRedactedValue_SanitizesAndBoundsLikeValue(t *testing.T) {
 		"and a non-positive cap yields nothing at all, exactly as Value does")
 }
 
-// TestCause_RedactsASecretInEverySpellingOfItsKey is the guard on the defect that whole-key
-// matching cannot avoid: the same secret is spelled "password" in a Postgres DSN,
-// "sasl.password" in a Kafka property, "ssl.keystore.password" in a client config and
-// "KAFKA_SASL_ADMIN_SECRET" in this service's own environment, and every one of those
-// reached a log line intact while only the bare words were enumerated.
-//
-// Each case here is a spelling this deployment can actually produce, and each asserts BOTH
-// halves of the contract: the value is gone, and the key that names which setting failed is
-// still there, because "the DSN was rejected" without the field name is not a diagnosis.
+// TestCause_RedactsASecretInEverySpellingOfItsKey is the guard on the defect that
+// whole-key matching cannot avoid: the same secret is spelled "password" in a Postgres
+// DSN, "sasl.password" in a Kafka property, "ssl.keystore.password" in a client config
+// and "KAFKA_SASL_ADMIN_SECRET" in this service's own environment, and every one of
+// those reached a log line intact while only the bare words were enumerated.
 func TestCause_RedactsASecretInEverySpellingOfItsKey(t *testing.T) {
 	t.Parallel()
 
@@ -509,13 +495,11 @@ func TestCause_RedactsASecretInEverySpellingOfItsKey(t *testing.T) {
 	}
 }
 
-// TestCause_KeepsTheAssignmentsThePipelineLogsOnPurpose is the other side of the rule above,
-// and the reason the segment sets are not simply widened until nothing gets through.
+// TestCause_KeepsTheAssignmentsThePipelineLogsOnPurpose is the other side of the rule
+// above, and the reason the segment sets are not simply widened until nothing gets
+// through.
 //
-// Every case here is a value this codebase logs deliberately. "partition_key" in particular
-// is what the relay's ordering diagnosis is written in: redacting it would leave an operator
-// investigating an out-of-order delivery unable to see which key was affected. A test that
-// only proved secrets vanish would be satisfied by a rule that redacts everything.
+// Every case here is a value this codebase logs deliberately.
 func TestCause_KeepsTheAssignmentsThePipelineLogsOnPurpose(t *testing.T) {
 	t.Parallel()
 
@@ -549,13 +533,10 @@ func TestCause_KeepsTheAssignmentsThePipelineLogsOnPurpose(t *testing.T) {
 	}
 }
 
-// TestKeyNamesRedactableValue_HoldsForEverySpellingOfEveryWordItKnows derives its inputs from
-// the word sets themselves rather than restating them, so a word added later is covered in all
-// four spellings the moment it is added, and the three matching layers each stay load-bearing.
-//
-// This is what makes the rule a rule instead of a list. The defect it replaces was not a
-// missing entry; it was that every entry had to be written in advance in the exact spelling it
-// would arrive in.
+// TestKeyNamesRedactableValue_HoldsForEverySpellingOfEveryWordItKnows derives its
+// inputs from the word sets themselves rather than restating them, so a word added
+// later is covered in all four spellings the moment it is added, and the three matching
+// layers each stay load-bearing.
 func TestKeyNamesRedactableValue_HoldsForEverySpellingOfEveryWordItKnows(t *testing.T) {
 	t.Parallel()
 

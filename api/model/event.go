@@ -28,106 +28,29 @@ import (
 )
 
 // This file holds the API-boundary request and response shapes for the Kafka
-// event-streaming endpoints (GET /events/dead-letter,
-// POST /events/dead-letter/:event_id/replay and GET /events/stats), for the
-// subscriber-management endpoints (POST|GET /subscribers,
-// GET|PUT|DELETE /subscribers/:subscriber_id and
-// POST /subscribers/:subscriber_id/kafka-credentials), and for the legacy
-// webhook-subscription surface that exists only for the 30-day dual-delivery
-// window.
-//
-// Every type below is a passive struct: no constructors, no methods, no
-// validation, no normalisation, no conversion. That is deliberate and it
-// matches the rest of this package. The behavioural layer lives in model.go;
-// any normalisation a handler needs, the handler applies itself or delegates to
-// the root package's subscriber service.
+// event-streaming endpoints (GET /events/dead-letter, POST
+// /events/dead-letter/:event_id/replay and GET /events/stats), for the
+// subscriber-management endpoints (POST|GET /subscribers, GET|PUT|DELETE
+// /subscribers/:subscriber_id and POST /subscribers/:subscriber_id/kafka-credentials),
+// and for the legacy webhook-subscription surface that exists only for the 30-day
+// dual-delivery window.
 //
 // Three things are deliberately NOT declared here:
 //
-//   - No error shape. Error responses are the exclusive business of
-//     api/errors.go's respondCode/respondError, which emit
-//     {"error", "error_detail"} from a typed code in
-//     internal/apierror/codes.go. A DTO carrying an HTTP status or an error
-//     code would create a second, competing error contract, and an ad-hoc
-//     status would bypass the single source of truth for code-to-status
-//     mapping.
+//   - No error shape. Error responses are the exclusive business of api/errors.go's
+//     respondCode/respondError, which emit {"error", "error_detail"} from a typed code
+//     in internal/apierror/codes.go.
 //   - No list envelope and no pagination request. api.FilterResponse and
-//     api.FilterRequest already exist in api/filter_helper.go, and the
-//     handlers wrap the item types below in those. A second envelope here
-//     would compete with them.
-//   - No consumer-side shapes. Blnk publishes the <topic>.dlt naming
-//     convention and builds nothing subscriber-side: no consumer error
-//     handling and no subscriber-managed dead-lettering.
-//
-// The JSON tags are a contract rather than a preference. The handler tests
-// assert these shapes over real HTTP, and the tags reuse the column names of
-// blnk.event_outbox and blnk.event_subscribers so that an operator reading a
-// response sees the same keys as the DDL and the same keys as the root
-// model.EventOutbox / model.EventSubscriber entities.
-//
-// Request types define no custom UnmarshalJSON and rely on Gin's default,
-// non-strict JSON binding, which ignores unknown fields. That is required
-// rather than incidental: the API-key middleware rewrites every POST body from
-// a non-master caller, unmarshalling it to a map and injecting
-// meta_data.BLNK_GENERATED_BY before re-marshalling, so every request shape
-// here has to tolerate an unexpected meta_data key. No field is declared for
-// it, because neither blnk.event_subscribers nor blnk.event_outbox has a
-// meta_data column to persist it to, and declaring one would advertise
-// persistence that cannot happen.
-//
-// A note on timestamps, applied consistently below. A nullable instant is
-// *time.Time with omitempty, exactly as model.LineageOutbox does for
-// processed_at and locked_until; an instant the handler always stamps is a
-// plain time.Time with a plain tag. omitempty is deliberately NOT used on any
-// non-pointer time.Time, because encoding/json never treats a struct value as
-// empty, so the tag would be inert and would advertise an omission that can
-// never happen.
+//     api.FilterRequest already exist in api/filter_helper.go, and the handlers wrap
+//     the item types below in those. A second envelope here would compete with them.
+//   - No consumer-side shapes. Blnk publishes the <topic>.dlt naming convention and
+//     builds nothing subscriber-side: no consumer error handling and no
+//     subscriber-managed dead-lettering.
 
-// DeadLetterEvent is the item shape returned by GET /events/dead-letter, and
-// the read shape for a single dead-lettered event. It is a projection of the
-// persisted model.EventOutbox row: the event envelope, the relay's terminal
-// state, and a MINIMIZED account of why the retry budget was spent.
-//
-// # IT IS AN INVENTORY, NOT A DUMP (DATA-01)
-//
-// This type once carried the full event payload, the raw last_error string and
-// the whole model.FailureMetadata struct. That was more than the endpoint needs
-// and more than it should say, on three counts:
-//
-// THE PAYLOAD IS NOT REQUIRED BY ANY OPERATION THIS ENDPOINT SUPPORTS. A
-// dead-lettered event is triaged and then replayed, and replay re-publishes the
-// STORED BYTES server-side — the operator never supplies them, and could not
-// usefully alter them if they did, because replay's guarantee is byte-fidelity
-// against the original. Meanwhile the payload is the marshaled ledger event
-// itself: an identity event carries a name, email, phone, address and date of
-// birth, and a transaction event carries amounts and balance identifiers. Listing
-// a page of dead-lettered events would have returned all of it in one response,
-// to any master-key holder, for a triage task that needs none of it. PayloadBytes
-// is what triage actually uses, and it is a number.
-//
-// THE RAW ERROR TEXT DESCRIBES THE INSIDE OF THE DEPLOYMENT. A Kafka client error
-// renders as "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe", naming
-// internal addresses and broker topology; a database error renders with schema,
-// table, constraint, source file and routine. FailureReason carries the
-// classification instead, which is what distinguishes a broker problem from an
-// oversized event from a denied grant — the actual triage question.
-//
-// THE FULL FAILURE STRUCT ADDED NOTHING THE ENVELOPE DOES NOT ALREADY CARRY. Its
-// original_topic duplicates Topic, its attempt_count duplicates Attempts, and its
-// error_reason is the raw text above. Only the two attempt instants were unique to
-// it, so those are hoisted to fields and the struct is gone.
-//
-// None of this is lost data. The outbox row keeps last_error and failure_metadata
-// in full, and the operations runbook reads them there, through the database,
-// where the audience is a database operator rather than an HTTP response.
-//
-// EVERY listing response wraps these in api.DeadLetterPageResponse — `{data,
-// next_cursor, has_more, total_count?}` — and a client reads `.data[]`, never the
-// body as an array. That is not optional or count-dependent: cursor paging replaced
-// offset paging (PERF-P08), and the cursor has to be returned somewhere, so there is
-// no shape in which the body is a bare array. This comment used to say the handler
-// returned the slice directly and nested it only when a total was asked for, which
-// described a response the code has not produced since.
+// DeadLetterEvent is the item shape returned by GET /events/dead-letter, and the read
+// shape for a single dead-lettered event. It is a projection of the persisted
+// model.EventOutbox row: the event envelope, the relay's terminal state, and a
+// MINIMIZED account of why the retry budget was spent.
 type DeadLetterEvent struct {
 	// EventID is the UUID that uniquely identifies the event. It is the value
 	// callers pass to the replay endpoint, and it doubles as the subscriber
@@ -145,48 +68,12 @@ type DeadLetterEvent struct {
 
 	// LedgerID is the ledger the event belongs to, when it belongs to one.
 	//
-	// PartitionKey below — not this field — is the message key, and this field's
-	// documentation used to claim otherwise. The two coincide when a ledger is
-	// present, because requirement R-6 partitions by ledger ID and the publish
-	// path prefers it; they do not coincide on a LEDGER-LESS event, where the key
-	// is present and this field is empty. An identity, a bulk batch and a system
-	// error are all in that case, so reading this field as the key gives the wrong
-	// answer for exactly the events whose routing is least obvious.
-	//
-	// It is retained beside PartitionKey rather than folded into it because the two
-	// together are what make the routing decision legible: a non-empty ledger_id
-	// means the key IS the ledger, and an empty one means the key came from the
-	// row's stored partition key.
-	//
-	// Optional because not every event category carries a ledger, so it is
-	// omitted rather than reported as an empty string.
+	// Optional because not every event category carries a ledger, so it is omitted rather
+	// than reported as an empty string.
 	LedgerID string `json:"ledger_id,omitempty"`
 
-	// PartitionKey is the Kafka message key this event was published under, and
-	// therefore what pinned it to its partition.
-	//
-	// It is the EFFECTIVE key, resolved from the row exactly as the publish path resolves
-	// it — the ledger id when the event has one, and the stored partition_key column
-	// otherwise — because requirement R-6 partitions by ledger ID. It is not a key
-	// recomputed from the payload or from today's rules: both inputs come from the stored
-	// row, so this is the key the event was ACTUALLY written with rather than the key it
-	// would be written with today.
-	//
-	// Reporting the stored column alone was wrong for the rows where it matters. The column
-	// is the publisher's SECOND choice whenever a ledger is present, so on a row whose
-	// partition key was derived before the ledger was known the two differ — and that row
-	// is precisely the one an operator is investigating. ledger_id is on this response too,
-	// so the stored column remains derivable: an event with a ledger_id was keyed on it.
-	//
-	// This is the field to reason about ordering with. Per-aggregate ordering is
-	// a property of the key: every event sharing a key lands in one partition and
-	// is therefore consumed in publish order, and two events an operator expected
-	// to be ordered but which carry different keys are not ordered and never
-	// were. Without this field on the response, that question could not be
-	// answered from the API at all.
-	//
-	// Optional only for defensiveness: every row the relay writes carries a key,
-	// so an empty value here means a row predating that guarantee.
+	// PartitionKey is the Kafka message key this event was published under, and therefore
+	// what pinned it to its partition.
 	PartitionKey string `json:"partition_key,omitempty"`
 
 	// OccurredAt is the instant the domain action happened, RFC3339 on the
@@ -215,30 +102,25 @@ type DeadLetterEvent struct {
 	// dead-lettered.
 	Attempts int `json:"attempts"`
 
-	// FailureReason is a CLASSIFIED reason the event was dead-lettered, drawn
-	// from a fixed vocabulary — "broker_unavailable", "message_too_large",
-	// "authorization_denied" and so on. It is what an operator triages on, and
-	// it deliberately replaces the raw driver text.
+	// FailureReason is a CLASSIFIED reason the event was dead-lettered, drawn from a fixed
+	// vocabulary — "broker_unavailable", "message_too_large", "authorization_denied" and
+	// so on. It is what an operator triages on, and it deliberately replaces the raw
+	// driver text.
 	//
-	// The raw text is retained in full in the outbox row's last_error column and
-	// in failure_metadata.error_reason, where the operations runbook reads it
-	// through the database. It is not on the wire because it is verbatim client
-	// output: a Kafka write error renders as
-	// "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe", naming Blnk's
-	// internal addressing and broker topology, and a database error renders with
-	// the schema, table, constraint, source file and routine that produced it.
-	// A classified reason answers the triage question — is this the broker, the
-	// event, or the grant? — without describing the inside of the deployment.
-	//
-	// Omitted when the row has never failed.
+	// The raw text is retained in full in the outbox row's last_error column and in
+	// failure_metadata.error_reason, where the operations runbook reads it through the
+	// database. It is not on the wire because it is verbatim client output: a Kafka write
+	// error renders as "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe", naming
+	// Blnk's internal addressing and broker topology, and a database error renders with
+	// the schema, table, constraint, source file and routine that produced it. A
+	// classified reason answers the triage question — is this the broker, the event, or
+	// the grant?
 	FailureReason string `json:"failure_reason,omitempty"`
 
 	// FirstAttemptedAt is when the relay first tried to publish the event, and
-	// LastAttemptedAt is when it last tried. Together with Attempts they are the
-	// whole of what the dead-letter age alert and the triage runbook need from
-	// the failure record, and neither carries transport detail.
-	//
-	// Nil, and so omitted, on a row that has not been dead-lettered.
+	// LastAttemptedAt is when it last tried. Together with Attempts they are the whole of
+	// what the dead-letter age alert and the triage runbook need from the failure record,
+	// and neither carries transport detail.
 	FirstAttemptedAt *time.Time `json:"first_attempted_at,omitempty"`
 	LastAttemptedAt  *time.Time `json:"last_attempted_at,omitempty"`
 
@@ -264,8 +146,8 @@ type DeadLetterEvent struct {
 //   - FailureReasonPersistence: the failure was Blnk's own database rather than Kafka.
 //     The event is intact; the relay's bookkeeping failed.
 //   - FailureReasonUnclassified: the stored text matched nothing above. The full text
-//     is in the outbox row for an operator with database access, and this value says
-//     so rather than guessing.
+//     is in the outbox row for an operator with database access, and this value says so
+//     rather than guessing.
 const (
 	FailureReasonBrokerUnavailable   = "broker_unavailable"
 	FailureReasonAuthorizationDenied = "authorization_denied"
@@ -278,13 +160,6 @@ const (
 
 // failureReasonSignatures maps a lowercase substring of stored failure text to the
 // classification it implies, most specific first.
-//
-// Matching on text is not elegant, and the alternative was considered: storing a
-// classification column on blnk.event_outbox at the moment of failure, where the typed
-// error is still in hand. That is the better long-term shape, and it is a schema change
-// plus a write-path change for a value that is only ever read by one endpoint — so this
-// derives the classification at the boundary instead, where being wrong costs a label
-// and never a decision.
 //
 // Order matters. "authorization" is checked before "unavailable" because a broker can
 // report both in one message, and the authorization failure is the actionable half: it
@@ -319,8 +194,7 @@ var failureReasonSignatures = []struct {
 // The RETURN IS ALWAYS FROM THE VOCABULARY — never a fragment of the input, never the
 // input itself. That is the property that makes this function the sanitizer rather than
 // merely a formatter of one: no input, however constructed, can produce output that
-// describes the deployment. An unrecognised input yields
-// FailureReasonUnclassified, which is honest about the limit and reveals nothing.
+// describes the deployment.
 //
 // Parameters:
 //   - raw string: the stored last_error or failure_metadata.error_reason text.
@@ -349,14 +223,10 @@ func classifyFailureReason(raw string) string {
 // one place. A handler cannot leak them by writing the obvious field assignment,
 // because the fields to assign them to do not exist on the result.
 //
-// The attempt instants are taken from the row's own columns and, when those are unset,
-// from the failure metadata — the two are written by different steps of the same
-// failure, and a row can legitimately carry one and not the other.
-//
 // Parameters:
-//   - row model.DeadLetterInventoryEntry: the NARROW inventory projection. It carries the
-//     body's size and not the body, so this function cannot leak a payload even in principle
-//     (PERF-P06).
+//   - row model.DeadLetterInventoryEntry: the NARROW inventory projection. It carries
+//     the body's size and not the body, so this function cannot leak a payload even in
+//     principle
 //
 // Returns:
 //   - DeadLetterEvent: the response item, carrying no payload and no raw failure text.
@@ -368,18 +238,6 @@ func NewDeadLetterEvent(row model.DeadLetterInventoryEntry) DeadLetterEvent {
 		LedgerID:    row.LedgerID,
 		// THE EFFECTIVE KEY — what the publish path actually keyed on, resolved through the
 		// model's own rule rather than read straight off the stored column.
-		//
-		// The column alone is the SECOND choice for any row carrying a ledger, because
-		// requirement R-6 partitions by ledger ID and the publisher prefers it. The two agree on
-		// almost every row and diverge on exactly the ones an operator is investigating: a row
-		// written before the ledger was threaded through, or one whose partition key was derived
-		// from the payload first. Reporting the column there would name the key the event was NOT
-		// routed by, and both fields are on this response so the stored value stays derivable
-		// from ledger_id.
-		//
-		// It was also, before that, declared and documented while never being assigned: every
-		// dead-letter projection omitted it (the tag is omitempty), so the answer read as "this
-		// event had no key" rather than as a gap.
 		PartitionKey:     row.EffectiveKey(),
 		OccurredAt:       row.OccurredAt,
 		SchemaVersion:    row.SchemaVersion,
@@ -390,16 +248,16 @@ func NewDeadLetterEvent(row model.DeadLetterInventoryEntry) DeadLetterEvent {
 		FailureReason:    classifyFailureReason(row.LastError),
 		FirstAttemptedAt: row.FirstAttemptedAt,
 		LastAttemptedAt:  row.LastAttemptedAt,
-		// Measured in SQL by the projection, not from bytes held in memory here
-		// (PERF-P06). The inventory query never reads the body, so this is the only
-		// place its size can come from — and reading whole rows to compute a length
-		// was what moved gibibytes to build a listing of kilobytes.
+		// Measured in SQL by the projection, not from bytes held in memory here The inventory
+		// query never reads the body, so this is the only place its size can come from — and
+		// reading whole rows to compute a length was what moved gibibytes to build a listing
+		// of kilobytes.
 		PayloadBytes: row.PayloadBytes,
 	}
 
-	// The failure metadata is read ONLY to fill gaps the row's own columns leave, and
-	// only for values that carry no transport detail. error_reason is deliberately not
-	// read here when last_error already classified: both are the same raw text, and the
+	// The failure metadata is read ONLY to fill gaps the row's own columns leave, and only
+	// for values that carry no transport detail. error_reason is deliberately not read
+	// here when last_error already classified: both are the same raw text, and the
 	// classification of either is the same answer.
 	if len(row.FailureMetadata) > 0 {
 		var metadata model.FailureMetadata
@@ -430,12 +288,11 @@ func NewDeadLetterEvent(row model.DeadLetterInventoryEntry) DeadLetterEvent {
 
 // ReplayEventResponse is returned by POST /events/dead-letter/:event_id/replay.
 //
-// Topic is the topic the event was replayed TO, which is its original category
-// topic rather than the dead-letter topic it was read from. The response
-// deliberately does not echo the payload bytes back: replay fidelity is
-// established by what the consumer receives on the original topic, not by the
-// body of this acknowledgement, and echoing a payload would invite callers to
-// diff the wrong pair of byte strings.
+// Topic is the topic the event was replayed TO, which is its original category topic
+// rather than the dead-letter topic it was read from. The response deliberately does
+// not echo the payload bytes back: replay fidelity is established by what the consumer
+// receives on the original topic, not by the body of this acknowledgement, and echoing
+// a payload would invite callers to diff the wrong pair of byte strings.
 type ReplayEventResponse struct {
 	// EventID is the event that was replayed, unchanged from the original.
 	EventID string `json:"event_id"`
@@ -452,32 +309,29 @@ type ReplayEventResponse struct {
 	ReplayedAt time.Time `json:"replayed_at"`
 }
 
-// ProducerAtomicityStats reports how much of the two pre-recorded intents is outstanding.
+// ProducerAtomicityStats reports how much of the two pre-recorded intents is
+// outstanding.
 //
-// # What an intent is, and why it is counted separately from an event
-//
-// Almost every event is written inside the database transaction that performs its mutation. Where
-// something ELSE is written atomically instead — an intent — the event is captured from it later,
-// also atomically, and while the intent is outstanding the event is OWED. It is invisible to the
-// per-status counts, because nothing has been captured for it, which is exactly why these are
-// reported alongside them.
+// Almost every event is written inside the database transaction that performs its
+// mutation. Where something ELSE is written atomically instead — an intent — the event
+// is captured from it later, also atomically, and while the intent is outstanding the
+// event is OWED.
 //
 // There are two intents, and they are not equally common:
 //
-//   - a bulk batch coordinator row, written before the batch begins, meaning "this batch has
-//     not reported an outcome yet". This is the ordinary route for every batch summary, because
-//     a summary belongs to no single member transaction.
-//   - a balance-monitor handoff, written inside the balance's own transaction, meaning "these
-//     monitors have not been judged yet". This is NO LONGER the ordinary route: the atomic
-//     writers evaluate a moved balance's monitors inside their own transaction and insert the
-//     alert row there, so a movement made by any current release records no handoff. The
-//     handoff counts describe a finite, draining population — rows written before that capture
-//     existed, and rows written by a process that has none registered.
+//   - a bulk batch coordinator row, written before the batch begins, meaning "this
+//     batch has not reported an outcome yet". This is the ordinary route for every
+//     batch summary, because a summary belongs to no single member transaction.
+//   - a balance-monitor handoff, written inside the balance's own transaction, meaning
+//     "these monitors have not been judged yet". This is NO LONGER the ordinary route:
+//     the atomic writers evaluate a moved balance's monitors inside their own
+//     transaction and insert the alert row there, so a movement made by any current
+//     release records no handoff.
 type ProducerAtomicityStats struct {
 	// MonitorHandoffPending counts balance movements whose monitors are waiting to be
-	// evaluated. Only pre-capture rows reach this count, so on a deployment that has finished
-	// draining them it sits at zero permanently, and a number that starts climbing again is
-	// worth investigating rather than ignoring.
+	// evaluated. Only pre-capture rows reach this count, so on a deployment that has
+	// finished draining them it sits at zero permanently, and a number that starts
+	// climbing again is worth investigating rather than ignoring.
 	MonitorHandoffPending int64 `json:"monitor_handoff_pending"`
 
 	// MonitorHandoffProcessing counts handoffs a processor currently holds.
@@ -489,22 +343,10 @@ type ProducerAtomicityStats struct {
 	MonitorHandoffCompleted int64 `json:"monitor_handoff_completed"`
 
 	// MonitorHandoffFailed counts handoffs whose evaluation budget is spent.
-	//
-	// This is the number to alert on. Each one is a balance movement whose monitor
-	// conditions were never judged, so any alert it should have produced does not exist
-	// and never will without intervention — a materially different fact from an alert
-	// that was judged and did not fire, and one nothing else in this response can
-	// distinguish.
 	MonitorHandoffFailed int64 `json:"monitor_handoff_failed"`
 
 	// UnfinalizedBatches counts asynchronous bulk batches that began and never reported an
 	// outcome, past a grace period so batches still legitimately running are excluded.
-	//
-	// This is the one window the coordinator cannot close: a process that dies before the
-	// finalising transaction leaves its batch here. It is not silent loss — the member
-	// transactions are durable and carry the batch id — but the batch-level summary was
-	// never computed, and this count is what makes that state queryable instead of
-	// requiring log archaeology.
 	UnfinalizedBatches int64 `json:"unfinalized_batches"`
 
 	// OldestUnfinalizedBatchAt is when the oldest outstanding batch began, omitted when
@@ -513,20 +355,10 @@ type ProducerAtomicityStats struct {
 	OldestUnfinalizedBatchAt *time.Time `json:"oldest_unfinalized_batch_at,omitempty"`
 }
 
-// EventOutboxStatsResponse is returned by GET /events/stats and serves the
-// daily zero-loss reconciliation procedure in the operations runbook: the sum
-// of dispatched and dead-lettered rows is reconciled against the end offsets
-// of the main and dead-letter topics, and the two must agree.
-//
-// The per-status counts are explicit fields rather than a map keyed by
-// status. That is on purpose: the runbook names each one, and a map can
-// silently omit a status whose count happens to be zero, which reads as
-// "no such state" rather than "none in that state". EVERY member of the
-// model.EventOutboxStatus* vocabulary is present, and the wire-contract test is
-// what keeps that true — it drives the check from model.EventOutboxStatuses
-// rather than from a list restated here, so a status added to the model and not
-// added here fails rather than vanishing from the reconciliation silently, which
-// is the one failure mode a zero-loss check cannot tolerate.
+// EventOutboxStatsResponse is returned by GET /events/stats and serves the daily
+// zero-loss reconciliation procedure in the operations runbook: the sum of dispatched
+// and dead-lettered rows is reconciled against the end offsets of the main and
+// dead-letter topics, and the two must agree.
 type EventOutboxStatsResponse struct {
 	// Pending counts rows written and committed but not yet claimed.
 	Pending int64 `json:"pending"`
@@ -534,52 +366,18 @@ type EventOutboxStatsResponse struct {
 	// Processing counts rows currently claimed by a relay instance.
 	Processing int64 `json:"processing"`
 
-	// WebhookPending counts rows whose KAFKA leg is complete and acknowledged and
-	// whose legacy HTTP leg is still owed.
-	//
-	// It exists because the two delivery legs reach their terminal state
-	// independently during the dual-delivery window: a row whose publish succeeded
-	// and whose webhook enqueue failed rests here, claimable for the webhook alone,
-	// and its Kafka message is already on the topic.
-	//
-	// Reporting it is not optional for the reconciliation. Such a row IS published,
-	// so the daily check counts it in TerminalEvents alongside dispatched and
-	// dead-lettered — and a response that omitted the count would leave an operator
-	// unable to see the component of a total they are asked to reconcile, while the
-	// per-status counts summed to less than the table's row count and made a short
-	// total indistinguishable from a lost event.
-	//
-	// It is NOT terminal: a delivery is still owed, so the retention purge must not
-	// reach it.
+	// WebhookPending counts rows whose KAFKA leg is complete and acknowledged and whose
+	// legacy HTTP leg is still owed.
 	WebhookPending int64 `json:"webhook_pending"`
 
 	// Dispatched counts rows the broker has acknowledged, inside the reported window.
 	// Terminal.
-	//
-	// It is a POINTER with omitempty because it is the one count here that is not always
-	// taken (PERF-M05). Dispatched is the only unbounded population in the outbox — 43.2
-	// million rows a day at the target rate — so counting it exactly is a deliberate
-	// operation rather than a routine one, and it is performed only for a request that asked
-	// for the broker side with `include_offsets=true`. Every other count above is exact and
-	// complete for all time on every request.
-	//
-	// Emitting a zero would be the one misreading a zero-loss check cannot survive: "nothing
-	// was dispatched today" and "the dispatched population was not counted" are opposite
-	// findings, and a reconciliation that read the second as the first would report total
-	// loss on a perfectly healthy pipeline. The key is therefore ABSENT rather than zero when
-	// the count was not taken, and DispatchedHistoryCounted below says so explicitly.
 	Dispatched *int64 `json:"dispatched,omitempty"`
 
 	// DispatchedHistoryCounted reports whether the dispatched count above was taken.
 	//
-	// It is emitted ALWAYS, including when false, and it is the companion flag that makes
-	// the omission above readable rather than merely safe: a client that finds no
-	// `dispatched` key can distinguish "not counted" from a serialisation it does not
-	// understand, and a client written before this field existed sees the key it expects
-	// only when the figure behind it is real.
-	//
-	// It is false whenever `include_offsets` was absent or false, which is the cheap reading
-	// every routine caller should take, and true whenever it was true.
+	// It is false whenever `include_offsets` was absent or false, which is the cheap
+	// reading every routine caller should take, and true whenever it was true.
 	DispatchedHistoryCounted bool `json:"dispatched_history_counted"`
 
 	// Failed counts rows whose retry budget is spent but which have not yet
@@ -590,21 +388,16 @@ type EventOutboxStatsResponse struct {
 	// the state from which an event may be replayed.
 	DeadLettered int64 `json:"dead_lettered"`
 
-	// Replaying counts dead-lettered rows a replay has CLAIMED and not yet
-	// finished with.
+	// Replaying counts dead-lettered rows a replay has CLAIMED and not yet finished with.
 	//
-	// It is a lease, not a resting place: the row is held so two concurrent
-	// replays of the same event cannot both publish it, and it returns to
-	// dead_lettered when the replay completes or its lease expires and the
-	// relay's recovery sweep reclaims it.
+	// It is a lease, not a resting place: the row is held so two concurrent replays of the
+	// same event cannot both publish it, and it returns to dead_lettered when the replay
+	// completes or its lease expires and the relay's recovery sweep reclaims it.
 	//
-	// It is reported for two reasons. Omitting it made the six statuses sum to
-	// less than the table's row count whenever a replay was in flight, so a
-	// reconciliation reading the response could not tell a short total from a
-	// lost event — which is precisely the distinction it exists to make. And a
-	// count that stays non-zero across successive snapshots is the visible
-	// symptom of replays whose leases are not being released, which is
-	// otherwise only observable in the database.
+	// It is reported for two reasons. Omitting it made the six statuses sum to less than
+	// the table's row count whenever a replay was in flight, so a reconciliation reading
+	// the response could not tell a short total from a lost event — which is precisely the
+	// distinction it exists to make.
 	//
 	// It is NOT terminal, so it does not contribute to TerminalEvents in the
 	// reconciliation below.
@@ -612,139 +405,83 @@ type EventOutboxStatsResponse struct {
 
 	// ProducerAtomicity reports the two PRE-RECORDED INTENTS an event can still be
 	// captured from, and specifically how much of each is outstanding.
-	//
-	// It belongs in this response rather than in a separate endpoint because it answers
-	// the same question: whether every event that should exist does. The per-status
-	// counts above can only see events that were CAPTURED, and an event captured from an
-	// intent recorded earlier — a bulk batch coordinator, or a balance-monitor handoff
-	// left over from before the writer's in-transaction capture — is owed and not yet in
-	// the table at all. A reconciliation that read only the counts above would find
-	// them consistent while batch summaries were still pending.
-	//
-	// It is a pointer with omitempty so a read failure omits the object rather than
-	// reporting zeros. Zero is a meaningful and reassuring value here — nothing is
-	// outstanding — and emitting it for "we could not tell" would be the one
-	// misreading a zero-loss check cannot afford.
 	ProducerAtomicity *ProducerAtomicityStats `json:"producer_atomicity,omitempty"`
 
-	// TopicEndOffsets is the per-topic end offset read from the broker, the
-	// right-hand side of the reconciliation.
-	//
-	// The omitempty is mandatory rather than cosmetic. A deployment with no
-	// brokers configured is a legitimate steady state, not an error: the
-	// publisher resolves to its no-op implementation and no offsets can be
-	// read. This endpoint must still serialise cleanly there, reporting the
-	// outbox counts it does know and omitting the key entirely rather than
-	// emitting a null the reconciliation script would have to special-case.
+	// TopicEndOffsets is the per-topic end offset read from the broker, the right-hand
+	// side of the reconciliation.
 	TopicEndOffsets map[string]int64 `json:"topic_end_offsets,omitempty"`
 
-	// OffsetsComplete reports whether TopicEndOffsets is a COMPLETE reading of
-	// the broker side, and therefore whether the reconciliation may be performed
-	// at all. It is the single field a script should branch on before comparing
-	// anything.
+	// OffsetsComplete reports whether TopicEndOffsets is a COMPLETE reading of the broker
+	// side, and therefore whether the reconciliation may be performed at all. It is the
+	// single field a script should branch on before comparing anything.
 	//
-	// It carries no omitempty, deliberately, so it is present on every response
-	// and a client never has to infer completeness from a missing key. The three
-	// states it distinguishes are:
+	// It carries no omitempty, deliberately, so it is present on every response and a
+	// client never has to infer completeness from a missing key. The three states it
+	// distinguishes are:
 	//
-	//   - true: every requested topic was found and every partition reported.
-	//     The comparison the runbook makes is valid.
-	//   - false with TopicEndOffsets absent: no offsets could be read at all —
-	//     a deployment with no brokers configured, or a broker that could not be
-	//     reached. There is nothing to compare against, which is not an error.
-	//   - false with TopicEndOffsets present: the reading is PARTIAL. The sums
-	//     are short through unreadability rather than through loss, and
-	//     MissingTopics and PartitionsUnavailable say which part is missing.
+	//   - true: every requested topic was found and every partition reported. The
+	//     comparison the runbook makes is valid.
+	//   - false with TopicEndOffsets absent: no offsets could be read at all — a
+	//     deployment with no brokers configured, or a broker that could not be reached.
+	//     There is nothing to compare against, which is not an error.
+	//   - false with TopicEndOffsets present: the reading is PARTIAL. The sums are short
+	//     through unreadability rather than through loss, and MissingTopics and
+	//     PartitionsUnavailable say which part is missing.
 	OffsetsComplete bool `json:"offsets_complete"`
 
-	// MissingTopics lists topics the reading asked for that do not exist on the
-	// broker. They contribute nothing to TopicEndOffsets, so their absence
-	// lowers the broker side of the comparison without any event having been
-	// lost. Omitted when none were missing.
+	// MissingTopics lists topics the reading asked for that do not exist on the broker.
+	// They contribute nothing to TopicEndOffsets, so their absence lowers the broker side
+	// of the comparison without any event having been lost. Omitted when none were
+	// missing.
 	MissingTopics []string `json:"missing_topics,omitempty"`
 
-	// PartitionsUnavailable counts partitions the broker could not report,
-	// summed across every topic measured. Each one is a partition whose records
-	// are missing from TopicEndOffsets, so a non-zero value invalidates the
-	// comparison in the same way a missing topic does.
-	//
-	// It carries no omitempty because an explicit zero is the meaningful,
-	// reassuring answer — "every partition was readable" — and a key that
-	// vanished on the healthy path would leave a client unable to distinguish
-	// that from an old server that never reported it.
+	// PartitionsUnavailable counts partitions the broker could not report, summed across
+	// every topic measured. Each one is a partition whose records are missing from
+	// TopicEndOffsets, so a non-zero value invalidates the comparison in the same way a
+	// missing topic does.
 	PartitionsUnavailable int `json:"partitions_unavailable"`
 
 	// MeasuredWindows is the per-partition offset window the zero-loss verdict was
 	// computed against: [first_offset, end_offset) for every partition the broker
 	// reported.
 	//
-	// It is reported because the verdict is a statement ABOUT these windows — each
-	// outbox row's stored coordinate is checked for membership in the window of its
-	// own partition — so without them a reader cannot tell what was covered. That
-	// is not a hypothetical gap: the check this replaced compared whole-topic
-	// cumulative end offsets against all-time retained rows, two populations with
-	// no common window, and reported itself as conclusive anyway.
+	// It is reported because the verdict is a statement ABOUT these windows — each outbox
+	// row's stored coordinate is checked for membership in the window of its own partition
+	// — so without them a reader cannot tell what was covered. That is not a hypothetical
+	// gap: the check this replaced compared whole-topic cumulative end offsets against
+	// all-time retained rows, two populations with no common window, and reported itself
+	// as conclusive anyway.
 	//
-	// A partition the broker could not report is ABSENT here rather than present
-	// with zeroed bounds, because a zero-width window would misclassify every row
-	// on it as beyond the log end. Its rows appear in the verdict's
-	// unmeasured_events instead, and partitions_unavailable says how many.
+	// A partition the broker could not report is ABSENT here rather than present with
+	// zeroed bounds, because a zero-width window would misclassify every row on it as
+	// beyond the log end. Its rows appear in the verdict's unmeasured_events instead, and
+	// partitions_unavailable says how many.
 	//
 	// Nil, and so omitted, when no offsets were read.
 	MeasuredWindows []MeasuredOffsetWindow `json:"measured_windows,omitempty"`
 
-	// OffsetsMeasuredAt is when the broker-side reading was taken. It is a
-	// different instant from GeneratedAt: the counts come from PostgreSQL and
-	// the offsets from Kafka, in separate round trips, so under live traffic a
-	// small difference between the two sides is expected rather than suspicious,
-	// and its size is only interpretable against the gap between these two
-	// timestamps. Nil, and so omitted, when no offsets were read.
+	// OffsetsMeasuredAt is when the broker-side reading was taken. It is a different
+	// instant from GeneratedAt: the counts come from PostgreSQL and the offsets from
+	// Kafka, in separate round trips, so under live traffic a small difference between the
+	// two sides is expected rather than suspicious, and its size is only interpretable
+	// against the gap between these two timestamps. Nil, and so omitted, when no offsets
+	// were read.
 	OffsetsMeasuredAt *time.Time `json:"offsets_measured_at,omitempty"`
 
-	// WindowStart is the earliest instant the WINDOWED figures cover, and
-	// WindowSeconds is its length.
-	//
-	// # Which figures are windowed, and which are not (PERF-P04, PERF-P05)
-	//
-	// Dispatched, the reconciliation and the topic offsets are measured from
-	// WindowStart. Every other per-status count is exact and COMPLETE regardless of
-	// the window — pending, processing, webhook_pending, failed and dead_lettered
-	// are the populations an operator acts on, and any of them can legitimately be
-	// older than any window, so bounding them would hide a row stuck for a week from
-	// a one-day reading.
-	//
-	// The window exists because the two unbounded figures could not stay honest
-	// without one. Over the whole history the dispatched count is a scan of a table
-	// gaining 43.2 million rows a day, and the reconciliation compares an outbox that
-	// forgets — the retention sweep deletes rows — against broker end offsets that
-	// never do, so its tolerated surplus grows without bound until it can conceal any
-	// amount of loss. Both sides are now measured from this instant.
+	// WindowStart is the earliest instant the WINDOWED figures cover, and WindowSeconds is
+	// its length.
 	//
 	// The window is chosen with ?window=, defaults to 24h and is capped at 168h.
 	WindowStart   *time.Time `json:"window_start,omitempty"`
 	WindowSeconds int64      `json:"window_seconds,omitempty"`
 
-	// GeneratedAt is the instant the snapshot was taken. The counts and the
-	// offsets are read at slightly different moments under live traffic, so a
-	// reconciliation that compares them needs to know when the snapshot was
-	// made.
+	// GeneratedAt is the instant the snapshot was taken. The counts and the offsets are
+	// read at slightly different moments under live traffic, so a reconciliation that
+	// compares them needs to know when the snapshot was made.
 	GeneratedAt time.Time `json:"generated_at"`
 
-	// Reconciliation is the SERVER'S OWN VERDICT on the zero-loss comparison,
-	// present whenever the broker side could be measured at all.
-	//
-	// Without it this response carried the two sides of the comparison and left
-	// the verdict to whoever read it — so every caller re-implemented the
-	// arithmetic, the retention caveat and the directionality, and each got its
-	// own chance to get them wrong. In particular a caller subtracting the two
-	// sums and alerting on any difference alerts constantly, because redeliveries
-	// and replays legitimately make the broker side LARGER; and a caller
-	// comparing only for equality reports a green result on a reading that
-	// retention has already invalidated.
-	//
-	// Nil, and so omitted, when no offsets could be read: with nothing to compare
-	// against there is no verdict to report, which is not an error. Acceptance
-	// criterion V-2 is read from this object.
+	// Reconciliation is the SERVER'S OWN VERDICT on the zero-loss comparison, present
+	// whenever the broker side could be measured at all.
 	Reconciliation *OutboxReconciliationResult `json:"reconciliation,omitempty"`
 }
 
@@ -753,8 +490,8 @@ type EventOutboxStatsResponse struct {
 //
 // It exists because the zero-loss verdict is a statement ABOUT these windows: each
 // outbox row's stored coordinate is checked for membership in the window of its own
-// partition. Reporting the verdict without the windows would leave a reader unable
-// to tell which offsets were actually covered — which is precisely how an unbounded
+// partition. Reporting the verdict without the windows would leave a reader unable to
+// tell which offsets were actually covered — which is precisely how an unbounded
 // comparison of two whole-topic totals came to present itself as conclusive.
 type MeasuredOffsetWindow struct {
 	// Topic is the fully-qualified topic name.
@@ -771,10 +508,9 @@ type MeasuredOffsetWindow struct {
 	// as loss rather than as a caveat.
 	EndOffset int64 `json:"end_offset"`
 
-	// Records is how many records the window holds: end minus first, never
-	// negative. It is included so a reader does not have to subtract, and because
-	// zero is a meaningful reading — an empty partition, or one every record of
-	// which has aged out.
+	// Records is how many records the window holds: end minus first, never negative. It is
+	// included so a reader does not have to subtract, and because zero is a meaningful
+	// reading — an empty partition, or one every record of which has aged out.
 	Records int64 `json:"records"`
 }
 
@@ -788,8 +524,8 @@ type MeasuredOffsetWindow struct {
 //   - intervals []model.PartitionOffsetInterval: the measured windows.
 //
 // Returns:
-//   - []MeasuredOffsetWindow: one entry per interval, nil when nothing was measured
-//     so the key is omitted rather than rendered as an empty array.
+//   - []MeasuredOffsetWindow: one entry per interval, nil when nothing was measured so
+//     the key is omitted rather than rendered as an empty array.
 func NewMeasuredOffsetWindows(intervals []model.PartitionOffsetInterval) []MeasuredOffsetWindow {
 	if len(intervals) == 0 {
 		return nil
@@ -809,102 +545,48 @@ func NewMeasuredOffsetWindows(intervals []model.PartitionOffsetInterval) []Measu
 	return windows
 }
 
-// OutboxReconciliationResult is the wire form of the daily zero-loss check that
-// acceptance criterion V-2 is scored on: every outbox row claiming publication,
 // placed inside the measured offset window of the partition its record is on.
-//
-// # It is a BOUNDED MAPPING, not a comparison of totals
-//
-// The check used to subtract two numbers: outbox rows claiming publication, against
-// the broker's cumulative end offsets. Those describe different populations, and no
-// arithmetic reconciles them — outbox pruning shrinks one side while the other only
-// climbs, Kafka retention deletes records the end offset still counts, recreating a
-// topic resets it to zero, and on a shared topic any other producer's traffic
-// inflates it by an unknown amount. Worse, the surplus such a comparison tolerates
-// is INDISTINGUISHABLE FROM COMPENSATED LOSS: ten redeliveries and ten lost events
-// produce exactly the totals of a healthy pipeline.
 //
 // So the verdict is now per row. Each row either names a record inside the measured
 // window of its own partition — CorroboratedEvents — or it is counted under the
 // specific reason it could not be placed: it names no record, it names an unmeasured
 // topic or partition, its record has aged out of retention, or its offset is AT OR
-// ABOVE the log end. That last one is the only unambiguous signal in the whole
-// check, and it means the partition was truncated or the topic recreated.
-//
-// # Which is why "conclusive" is a separate question from "no loss"
-//
-// A green result requires BOTH that no row names a vanished record AND that every
-// row was placed. Conclusive false is not a failure — it is the honest statement
-// that today's measurement cannot decide the matter, with Caveats naming why and
-// with the per-reason counts saying how much is unaccounted for.
-//
-// It mirrors the service-layer verdict field for field so the API reports exactly
-// what the runbook computes, rather than a second, quietly different arithmetic.
+// ABOVE the log end.
 type OutboxReconciliationResult struct {
-	// TerminalEvents is how many outbox rows claim to have been published:
-	// dispatched and webhook_pending, whose Kafka leg completed, plus
-	// dead-lettered, each counted exactly once. Rows in pending, processing or
-	// replaying make no such claim and are excluded.
-	//
-	// It counts rows THE OUTBOX STILL RETAINS; see OldestTerminalAt.
+	// TerminalEvents is how many outbox rows claim to have been published: dispatched and
+	// webhook_pending, whose Kafka leg completed, plus dead-lettered, each counted exactly
+	// once. Rows in pending, processing or replaying make no such claim and are excluded.
 	TerminalEvents int64 `json:"terminal_events"`
 
-	// CorroboratedEvents is how many of those rows name a record INSIDE the
-	// measured window of its partition — a record the broker can serve right now.
-	//
-	// It is the only population a green verdict consists of, and it is strictly
-	// stronger than the "names a coordinate" count it replaced: a coordinate whose
-	// record has aged out, or whose partition was not measured, is no longer
-	// counted as corroboration, because nothing available today confirms it.
+	// CorroboratedEvents is how many of those rows name a record INSIDE the measured
+	// window of its partition — a record the broker can serve right now.
 	CorroboratedEvents int64 `json:"corroborated_events"`
 
 	// UnconfirmedEvents is how many rows claim a publication they cannot name a
 	// record for, and it is the field that stops a surplus reading as health.
 	UnconfirmedEvents int64 `json:"unconfirmed_events"`
 
-	// UnmeasuredEvents is how many rows name a topic or partition this measurement
-	// did not cover — a missing topic, an unavailable partition, or a partition
-	// count that has since shrunk. Their records may well be there; this reading
-	// neither confirmed nor ruled them out.
+	// UnmeasuredEvents is how many rows name a topic or partition this measurement did not
+	// cover — a missing topic, an unavailable partition, or a partition count that has
+	// since shrunk. Their records may well be there; this reading neither confirmed nor
+	// ruled them out.
 	UnmeasuredEvents int64 `json:"unmeasured_events"`
 
-	// AgedOutEvents is how many rows name a record Kafka retention has already
-	// deleted: written, evidenced by the stored offset, and no longer readable.
-	//
-	// It is reported as a count of SPECIFIC EVENTS rather than as a topic-wide
-	// caveat, because the old topic-wide form fired whenever anything at all had
-	// aged out of a shared topic — including records Blnk never wrote — and so was
-	// permanently on in any long-lived deployment.
+	// AgedOutEvents is how many rows name a record Kafka retention has already deleted:
+	// written, evidenced by the stored offset, and no longer readable.
 	AgedOutEvents int64 `json:"aged_out_events"`
 
 	// BeyondEndEvents is how many rows name an offset AT OR ABOVE the end of their
 	// partition's log.
-	//
-	// On an intact log this is impossible, because the broker assigned that offset
-	// when it accepted the write. It means the partition was truncated or the topic
-	// was deleted and recreated, so those records are gone — which is why this, and
-	// not a shortfall in totals, is what sets LossDetected.
 	BeyondEndEvents int64 `json:"beyond_end_events"`
 
-	// DuplicatedRecords is how many corroborated rows share a coordinate with
-	// another row. It should be zero always.
-	//
-	// One record is produced by one acknowledged write of one row, and a partial
-	// unique index on the coordinate forbids two rows naming the same one, so a
-	// non-zero value reports a BROKEN SCHEMA rather than tolerable duplication —
-	// and it makes the verdict inconclusive, because two rows sharing one record's
-	// corroboration is double counting.
+	// DuplicatedRecords is how many corroborated rows share a coordinate with another row.
+	// It should be zero always.
 	DuplicatedRecords int64 `json:"duplicated_records"`
 
-	// MessagesWritten is how many records the broker has accepted across the
-	// measured topics, from summed end offsets, and RecordsRetained how many of
-	// those it still holds.
-	//
-	// NEITHER IS THE PROOF, and they are reported for exactly that reason: on a
-	// shared topic they count every redelivery, every replay, every dead-letter
-	// copy and every record any other producer ever wrote, so they can exceed the
-	// number of Blnk events arbitrarily without meaning anything. Read them as
-	// context beside the mapping, never as the verdict.
+	// MessagesWritten is how many records the broker has accepted across the measured
+	// topics, from summed end offsets, and RecordsRetained how many of those it still
+	// holds.
 	MessagesWritten int64 `json:"messages_written"`
 	RecordsRetained int64 `json:"records_retained"`
 
@@ -913,78 +595,29 @@ type OutboxReconciliationResult struct {
 	// reconciled: the surplus is measured against Blnk's share rather than the whole log.
 	BlnkRecordShare int64 `json:"blnk_record_share"`
 
-	// FIVE FIELDS WERE RETIRED FROM HERE, and this note is where each one's question is now
-	// answered. They were purged_events, all_time_terminal_events, verified_records,
-	// unverifiable_records and missing_records, and they belonged to a WHOLE-HISTORY
-	// reconciliation that corrected for retention with a purge log and then checked each
-	// claimed coordinate against the broker in Go.
-	//
-	// The comparison is now drawn INSIDE the per-partition windows the offsets were measured
-	// in, and the audit classifies every claim in SQL over those same windows — which answers
-	// both questions more directly than the two mechanisms it replaced:
-	//
-	//   * purged_events and all_time_terminal_events existed so that an outbox which forgets
-	//     could be compared with offsets that never do. Inside a window there is nothing to
-	//     correct for: rows retention has deleted are older than the window, so they are on
-	//     neither side of it. `windowed` states whether that scoping was achieved, and it is
-	//     the flag to read before believing `overhead`.
-	//   * verified_records is corroborated_events, missing_records is beyond_end_events — the
-	//     one signal that is unambiguous loss — and unverifiable_records split into the two
-	//     causes it used to fuse: aged_out_events, where retention removed a record the stored
-	//     offset still evidences, and unmeasured_events, where the measurement did not cover
-	//     that topic or partition. Fusing them made a healthy cluster with any retention policy
-	//     permanently inconclusive.
-	//
-	// They are removed rather than left at zero because a documented field that can only ever
-	// be zero is worse than an absent one: a reconciliation script reading verified_records: 0
-	// beside a green verdict concludes that nothing was verified.
+	// This DTO reports a WINDOWED comparison: both sides are measured over the same
+	// per-partition windows and every claim is classified in SQL over those windows, which
+	// is what corroborated_events, aged_out_events, beyond_end_events and unmeasured_events
+	// above report. There is deliberately no whole-history field — inside a window there is
+	// nothing for a purge log to correct for, because rows retention has deleted are older
+	// than the window and so are on neither side of it.
 
-	// Overhead is MessagesWritten minus AllTimeTerminalEvents: the redeliveries,
-	// replays and dead-letter copies.
-	//
-	// It is computed from the ALL-TIME count rather than from the surviving rows,
-	// which is what stops retention's deletions being silently absorbed into it.
-	//
-	// It is SIGNED and is never clamped. A negative value is one of the two loss
-	// signals this reconciliation carries — MissingRecords is the other, and the
-	// stronger — and clamping it at zero would erase exactly the finding the check
-	// exists to produce. A healthy system's overhead is small and positive, not
-	// zero.
+	// Overhead is MessagesWritten minus AllTimeTerminalEvents: the redeliveries, replays
+	// and dead-letter copies.
 	Overhead int64 `json:"overhead"`
 
-	// LossDetected is true when specific records this outbox recorded are provably
-	// not on the log — a row naming an offset at or beyond its partition's end.
-	//
-	// False does NOT mean "proven no loss". It means no loss is provable from the
-	// coordinates that were checkable, which is only a meaningful statement when
-	// Conclusive is true.
+	// LossDetected is true when specific records this outbox recorded are provably not on
+	// the log — a row naming an offset at or beyond its partition's end.
 	LossDetected bool `json:"loss_detected"`
 
-	// Conclusive reports whether the mapping accounted for EVERY retained claim:
-	// false when any row was unconfirmed, unmeasured, aged out or beyond the log
-	// end, when two rows shared a coordinate, when a measured topic was missing, or
-	// when a partition did not report.
-	//
-	// It carries no omitempty, deliberately. This is the field a caller must branch
-	// on BEFORE reporting a green reconciliation, and a key that vanished on the
-	// inconclusive path would leave the most dangerous state looking like the
-	// healthiest one.
+	// Conclusive reports whether the mapping accounted for EVERY retained claim: false
+	// when any row was unconfirmed, unmeasured, aged out or beyond the log end, when two
+	// rows shared a coordinate, when a measured topic was missing, or when a partition did
+	// not report.
 	Conclusive bool `json:"conclusive"`
 
 	// WindowStart is the instant BOTH sides of this comparison were measured from, and
 	// Windowed reports whether they were measured over a common window at all.
-	//
-	// # Why a verdict has to say which population it compared (PERF-P05)
-	//
-	// Broker end offsets are cumulative and count records retention has already deleted;
-	// the outbox forgets, because its retention sweep deletes terminal rows. So a
-	// comparison drawn over "everything" compares two different populations, and its
-	// surplus grows by however much the outbox has forgotten — until it can conceal any
-	// amount of loss while still reading as a healthy overhead.
-	//
-	// Windowed false therefore means the verdict is DIAGNOSTIC ONLY, and Caveats says so
-	// in words; it is never Conclusive. WindowStart is omitted when there was no window,
-	// so its absence and Windowed false always agree.
 	WindowStart *time.Time `json:"window_start,omitempty"`
 	Windowed    bool       `json:"windowed"`
 
@@ -999,11 +632,11 @@ type OutboxReconciliationResult struct {
 	CoveredFrom *time.Time `json:"covered_from,omitempty"`
 	CoveredTo   *time.Time `json:"covered_to,omitempty"`
 
-	// OldestTerminalAt is the earliest publication instant among all retained
-	// terminal rows. Events published before it have been pruned from the outbox
-	// and are outside the reach of any verdict, so it is reported rather than left
-	// implicit — a reconciliation over an aggressively pruned outbox would
-	// otherwise look complete. Nil, and omitted, when no terminal rows exist.
+	// OldestTerminalAt is the earliest publication instant among all retained terminal
+	// rows. Events published before it have been pruned from the outbox and are outside
+	// the reach of any verdict, so it is reported rather than left implicit — a
+	// reconciliation over an aggressively pruned outbox would otherwise look complete.
+	// Nil, and omitted, when no terminal rows exist.
 	OldestTerminalAt *time.Time `json:"oldest_terminal_at,omitempty"`
 
 	// Summary is the verdict as one sentence, always naming the numbers it rests
@@ -1019,97 +652,37 @@ type OutboxReconciliationResult struct {
 
 // CreateSubscriber is the request body for POST /subscribers.
 //
-// A subscriber is a Kafka principal: registering one records who may consume,
-// which topics they are entitled to and under which consumer group, and it is
-// the row a later credential issuance attaches its non-reversible reference to.
-// Registration and provisioning are separate steps, so a freshly created
-// subscriber legitimately holds no credential at all.
+// A subscriber is a Kafka principal: registering one records who may consume, which
+// topics they are entitled to and under which consumer group, and it is the row a later
+// credential issuance attaches its non-reversible reference to. Registration and
+// provisioning are separate steps, so a freshly created subscriber legitimately holds
+// no credential at all.
 //
-// Only Name is required. Every other field is either generated by the service
-// when omitted (the subscriber ID, the Kafka principal and the consumer group
-// are all derivable from the subscriber's identity) or genuinely optional. Name
-// cannot be derived: it is the human label an operator recognises the principal
-// by months later, it is NOT NULL in blnk.event_subscribers, and marking it
-// required here matches CreateAPIKeyRequest, the closest analogue in this
-// package.
-//
-// AuthorizedTopics is intentionally not required. The column defaults to the
-// empty array, which means a subscriber registered without an explicit grant is
-// authorised for nothing rather than for everything: the registry fails closed,
-// and widening a grant is a deliberate follow-up call.
-//
-// # THE PRINCIPAL AND THE CONSUMER GROUP ARE NOT FIELDS HERE (SEC-03)
-//
-// Both were once accepted from the caller, "omit to have the service derive it".
-// That is the wrong shape for a value that IS an authorization boundary, and the
-// reason is worth stating plainly, because "optional, derived when absent" reads
-// like a convenience:
-//
-// The Kafka principal is what every ACL binding is granted TO. A request that can
-// choose it is a request that can choose which identity receives a grant — so it
-// can name another subscriber's principal and have its own authorised topics
-// added to that subscriber's grant, or name the administrative principal. The
-// consumer group is what the group ACL is granted OVER, with a PREFIXED pattern
-// type, so a caller choosing it can name a prefix that spans other subscribers'
-// group namespaces and then join their groups and take their partition
-// assignments.
-//
-// Neither is a name the caller wants; each is a boundary the caller would be
-// selecting. So they are DERIVED, always, from the subscriber identifier by
-// model.CanonicalKafkaPrincipal and model.CanonicalConsumerGroupID, and there is
-// no field through which a value can be offered. Removing the fields rather than
-// validating them is deliberate: a field that is validated on every path today
-// can be read by a path added tomorrow, whereas a field that does not exist
-// cannot be read at all.
-//
-// Validate covers what remains caller-supplied — the identifier, the topic list,
-// the recorded key scope and the legacy URL — and must be called before the
-// request is trusted.
+// AuthorizedTopics is intentionally not required. The column defaults to the empty
+// array, which means a subscriber registered without an explicit grant is authorised
+// for nothing rather than for everything: the registry fails closed, and widening a
+// grant is a deliberate follow-up call.
 type CreateSubscriber struct {
-	// SubscriberID is the business key, and the {id} in
-	// POST /subscribers/{id}/kafka-credentials. Omit it to have the service
-	// generate one in the repository's "<prefix>_<uuid>" form.
-	//
-	// When supplied it must be canonical — see
-	// model.CanonicalizeSubscriberIdentifier — because the principal and the
-	// consumer group are derived from it, which makes this value the root of
-	// the subscriber's whole identity rather than a label.
+	// SubscriberID is the business key, and the {id} in POST
+	// /subscribers/{id}/kafka-credentials. Omit it to have the service generate one in the
+	// repository's "<prefix>_<uuid>" form.
 	SubscriberID string `json:"subscriber_id"`
 
-	// Name is the human label the subscriber is triaged by. Required: it is the
-	// one field the service cannot invent a meaningful value for, it is NOT NULL
-	// in blnk.event_subscribers, and it is what an operator recognises a principal
-	// by months later.
-	//
-	// The requirement is enforced by Validate and ValidateCreateSubscriber, NOT by
-	// a binding:"required" tag. The tag refused a missing name in the BINDER, which
-	// made the response GEN_MALFORMED_REQUEST — "this body could not be read" —
-	// while the endpoint's contract, and every other rule this DTO applies,
-	// answers GEN_VALIDATION_ERROR: "this body was read and one field is wrong".
-	// A caller distinguishing a transport problem from a field problem was told the
-	// wrong one, and a blank-but-present name reached validation by a different
-	// path from an omitted one. Both now take the same path and answer the same
-	// code.
+	// Name is the human label the subscriber is triaged by. Required: it is the one field
+	// the service cannot invent a meaningful value for, it is NOT NULL in
+	// blnk.event_subscribers, and it is what an operator recognises a principal by months
+	// later.
 	Name string `json:"name"`
 
-	// AuthorizedTopics is the set of topics this subscriber may Read and
-	// Describe, mapping to the authorized_topics TEXT[] column and to the exact
-	// set of ACL bindings provisioned for the principal. Omitted or empty means
-	// no grant, which is the safe default rather than a missing value.
-	//
-	// Every entry must be a Blnk-owned category topic; Validate enforces that
-	// against model.SubscriberGrantableTopics.
-	//
-	// The binding tags cap the two dimensions a tag can express — how many
-	// topics, and how long each may be — and they do it in the BINDER, before
-	// any handler code runs and whether or not Validate is called at all. That
-	// is what keeps the dimensions bounding allocation from depending on a
-	// handler remembering to validate.
+	// AuthorizedTopics is the set of topics this subscriber may Read and Describe, mapping
+	// to the authorized_topics TEXT[] column and to the exact set of ACL bindings
+	// provisioned for the principal. Omitted or empty means no grant, which is the safe
+	// default rather than a missing value.
 	AuthorizedTopics []string `json:"authorized_topics" binding:"max=16,dive,max=249"`
 
 	// PartitionKeyPrefix names the THIRD SCOPE of the access model: the subscriber is
-	// entitled only to records whose message key carries this prefix. Because every
-	// Blnk event is keyed by ledger id, that is a ledger boundary.
+	// entitled only to records whose message key carries this prefix. Because every Blnk
+	// event is keyed by ledger id, that is a ledger boundary.
 	//
 	// KAFKA DOES NOT ENFORCE IT, and the credential response says so in the same object
 	// that carries it — see SubscriberEnforcedAccess.PartitionKeyPrefixEnforcedBy, which
@@ -1118,65 +691,34 @@ type CreateSubscriber struct {
 	// not created.
 	//
 	// SO REGISTERING ONE IS NOT THE SAME AS BEING ABLE TO USE IT. The row is accepted
-	// here, and a row is cheap; what a prefix costs is a credential. Recording one
-	// narrows the grant issuance will provision — Describe and NO Read on the authorised
-	// topics, so the broker refuses every direct fetch — and the records then have to
-	// reach the subscriber through the key-authorising component the deployment DECLARED
-	// in front of the brokers (KAFKA_KEY_SCOPE_ENFORCEMENT).
+	// here, and a row is cheap; what a prefix costs is a credential.
 	//
 	// BLNK SHIPS NO SUCH COMPONENT AND SERVES NO RECORDS ITSELF. So on the shipped
 	// default, POST /subscribers/:subscriber_id/kafka-credentials answers 409
 	// SUBSCRIBER_KEY_SCOPE_UNENFORCED for a row carrying this field rather than minting a
-	// principal that can fetch nothing. THE TWO REMEDIES ARE: declare a component and
-	// its endpoint, or leave this field out and narrow AuthorizedTopics instead, which
-	// the broker enforces in full. A subscriber that must not see another's records and
-	// has no declared component must not share a topic with it.
+	// principal that can fetch nothing.
 	//
-	// AND A DECLARED COMPONENT IS VERIFIED, NOT TAKEN ON TRUST (SEC-01). Where one is
-	// declared, issuance calls its control endpoint over an authenticated channel before
-	// a secret exists and requires it to confirm that it enforces key scopes, for this
-	// exact principal, with THIS EXACT PREFIX byte-for-byte. An unreachable, refusing or
-	// disagreeing component answers 409 SUBSCRIBER_KEY_SCOPE_UNATTESTED. So the value
-	// recorded here is not merely stored: it is the value a peer has to hold before any
-	// credential describing it is minted, which is why it is compared without trimming or
-	// normalisation anywhere on that path.
+	// AND A DECLARED COMPONENT IS VERIFIED, NOT TAKEN ON TRUST. Where one is declared,
+	// issuance calls its control endpoint over an authenticated channel before a secret
+	// exists and requires it to confirm that it enforces key scopes, for this exact
+	// principal, with THIS EXACT PREFIX byte-for-byte. An unreachable, refusing or
+	// disagreeing component answers 409 SUBSCRIBER_KEY_SCOPE_UNATTESTED.
 	//
 	// OMITTING IT IS ALSO A DECISION, and in a key-scoped deployment it is refused. A row
 	// with no prefix is issued literal topic Read, so it reads every ledger's records on
 	// each granted topic; where the deployment declares the key-scoped model that is the
 	// one principal the boundary does not cover, and issuance answers 409
-	// SUBSCRIBER_KEY_SCOPE_REQUIRED. In a deployment that declares no model at all,
-	// secure-mode issuance answers 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED
-	// until KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS records that whole-topic reads are
-	// intended. Both refusals are about the DEPLOYMENT's declared model rather than about
-	// this field's syntax, which is why neither is raised by Validate.
-	//
-	// It is ACCEPTED HERE rather than refused at registration because refusing the field
-	// would make the boundary unrecordable — an operator could not describe the intent
-	// ahead of standing the component up — and because the refusal belongs where the
-	// consequence is, at issuance, where it can name both remedies.
-	//
-	// What is still refused at registration is a value that cannot be held honestly:
-	// surrounding whitespace, an over-long value, or a control character — with
-	// GEN_VALIDATION_ERROR, because those are malformed rather than unenforceable.
-	//
-	// Omit it, or send an empty string, to register normally — subject to the two
-	// deployment-model refusals above, which apply at issuance rather than here.
+	// SUBSCRIBER_KEY_SCOPE_REQUIRED.
 	PartitionKeyPrefix string `json:"partition_key_prefix,omitempty"`
 
 	// NO webhook_url FIELD, and its absence is the sunset being enforceable.
 	//
-	// This DTO used to accept one. The four deprecated webhook-subscription routes are
-	// each fronted by middleware.WebhookSunsetGuard and answer 410 Gone after the
-	// retirement instant — but this route is not deprecated and is not guarded, so a
-	// caller could keep writing legacy webhook state through it indefinitely after the
-	// surface that owns it had been retired. The sunset was bypassable by using a
-	// different route, which is the same as not having one.
-	//
-	// Legacy webhook state is therefore written ONLY through the guarded routes: POST
-	// and PUT /subscribers/:subscriber_id/webhook-subscription. A subscriber that needs
-	// one recorded is registered here first and has its URL recorded there, which is one
-	// extra call on a path that exists only for a 30-day migration and is being removed.
+	// The four deprecated webhook-subscription routes are each fronted by
+	// middleware.WebhookSunsetGuard and answer 410 Gone after the retirement instant — but
+	// this route is not deprecated and is not guarded, so a caller could keep writing
+	// legacy webhook state through it indefinitely after the surface that owns it had been
+	// retired. The sunset was bypassable by using a different route, which is the same as
+	// not having one.
 }
 
 // errSubscriberNameRequired is the single refusal for a missing subscriber name.
@@ -1188,16 +730,16 @@ var errSubscriberNameRequired = errors.New("name is required")
 
 // Derived returns the Kafka principal and consumer group for this request.
 //
-// It is the ONLY way a handler obtains either, which is what keeps them derived
-// rather than chosen. Calling it on a request whose SubscriberID is empty is a
-// programming error the handler must avoid by generating the identifier first —
-// there is nothing to derive an identity from until one exists.
+// It is the ONLY way a handler obtains either, which is what keeps them derived rather
+// than chosen. Calling it on a request whose SubscriberID is empty is a programming
+// error the handler must avoid by generating the identifier first — there is nothing to
+// derive an identity from until one exists.
 //
 // Returns:
 //   - principal string: "blnk-sub-<subscriber_id>".
 //   - consumerGroup string: "blnk-sub-<subscriber_id>.default".
-//   - err error: wrapping model.ErrInvalidSubscriberIdentifier when the
-//     identifier is not canonical.
+//   - err error: wrapping model.ErrInvalidSubscriberIdentifier when the identifier is
+//     not canonical.
 func (c CreateSubscriber) Derived() (principal, consumerGroup string, err error) {
 	principal, err = model.CanonicalKafkaPrincipal(c.SubscriberID)
 	if err != nil {
@@ -1214,40 +756,27 @@ func (c CreateSubscriber) Derived() (principal, consumerGroup string, err error)
 
 // Validate checks every caller-supplied value on the request.
 //
-// It exists because binding tags cannot express any of these rules, and because
-// the alternative — leaving them to the handler — means the rules hold only for
-// the handlers that remember them. A DTO that can validate itself is validated
-// the same way by every caller.
-//
-// It does NOT check the principal or the consumer group, because neither is a
-// field: see the type comment.
+// It exists because binding tags cannot express any of these rules, and because the
+// alternative — leaving them to the handler — means the rules hold only for the
+// handlers that remember them. A DTO that can validate itself is validated the same way
+// by every caller.
 //
 // Parameters:
-//   - topicPrefix string: the configured KAFKA_TOPIC_PREFIX, needed to resolve
-//     which topic names this deployment owns. A blank value falls back to the
-//     strictest namespace rather than a permissive one.
+//   - topicPrefix string: the configured KAFKA_TOPIC_PREFIX, needed to resolve which
+//     topic names this deployment owns. A blank value falls back to the strictest
+//     namespace rather than a permissive one.
+//   - options ...SubscriberGrantOption: the deployment facts a grant is judged against,
+//     currently WithInternalTopicAccess. Passing no option means nothing is
+//     acknowledged, so `<prefix>.system` is refused; pass WithInternalTopicAccess(true)
+//     only where KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS is declared. Omission is
+//     therefore fail-closed, which is why the variadic form is safe for callers that do
+//     not know about the privileged category at all.
 //
 // Returns:
 //   - error: describing the first violation, nil when the request is usable.
-// ValidateCreateSubscriber and ValidateUpdateSubscriber WERE RETIRED from this file.
-//
-// They were the "prefix-independent half" of the two Validate methods below, and their stated
-// reason for existing was a caller that has no configuration snapshot — a binder hook, a CLI, a
-// table-driven test. No such caller was ever written: every handler calls Validate(topicPrefix),
-// and no test called them either.
-//
-// They are removed rather than left for a future caller because they were STRICTLY WEAKER in a
-// way that would not announce itself. Both applied the grantable allowlist under
-// DefaultEventTopicPrefix instead of the deployment's own prefix, so on any deployment with a
-// custom KAFKA_TOPIC_PREFIX they would have accepted a grant naming topics that do not exist
-// here and refused the ones that do. A future caller reaching for the shorter name would have
-// got that silently. Validate is the only correct entry point, so it is the only one offered.
-
 func (c CreateSubscriber) Validate(topicPrefix string, options ...SubscriberGrantOption) error {
 	// The prefix-independent rules run FIRST and are shared with nothing else, which is
-	// what makes this the single validation entry point. They were once a second exported
-	// method that no handler called — two functions checking overlapping rules, one of them
-	// dead, which is how the two drift apart until the authoritative one is the weaker.
+	// what makes this the single validation entry point.
 	if err := c.validateBodyRules(); err != nil {
 		return err
 	}
@@ -1267,68 +796,43 @@ func (c CreateSubscriber) Validate(topicPrefix string, options ...SubscriberGran
 	return validateSubscriberKeyScope(c.PartitionKeyPrefix)
 }
 
-// UpdateSubscriber is the request body for PUT /subscribers/:subscriber_id and
-// carries the mutable subset of a subscriber only.
+// UpdateSubscriber is the request body for PUT /subscribers/:subscriber_id and carries
+// the mutable subset of a subscriber only.
 //
-// Every field is a pointer so that "omitted" is distinguishable from
-// "explicitly set to empty", which this shape genuinely needs rather than
-// merely benefits from. partition_key_prefix is the clear case: NULL means the
-// subscriber is entitled to whole topics, while the empty string would mean
-// restricted to the empty prefix, and those are opposite intents. A plain
-// string cannot express the difference, so it would make silently inverting an
-// operator's intent possible. The nullable columns are represented the same way
-// on the root model.EventSubscriber entity, so pointers here are the
-// established representation rather than a new convention.
+// Every field is a pointer so that "omitted" is distinguishable from "explicitly set to
+// empty", which this shape genuinely needs rather than merely benefits from.
+// partition_key_prefix is the clear case: NULL means the subscriber is entitled to
+// whole topics, while the empty string would mean restricted to the empty prefix, and
+// those are opposite intents. A plain string cannot express the difference, so it would
+// make silently inverting an operator's intent possible.
 //
 // Four groups of fields are deliberately absent:
 //
-//   - KafkaPrincipal. It is the join key to every ACL binding already
-//     provisioned for this subscriber, so changing it would orphan them all
-//     and leave the registry claiming access the broker does not grant.
-//     Re-pointing a subscriber at a new principal is a re-provisioning
-//     operation, not an attribute edit. It is also derived from the immutable
-//     subscriber ID, so there is no value a caller could legitimately supply.
-//   - ConsumerGroupID, absent for the same two reasons (SEC-03). It is derived
-//     from the subscriber ID, and it is the resource the group ACL is granted
-//     over with a PREFIXED pattern type — so a caller able to edit it could
-//     name a prefix spanning other subscribers' group namespaces, join their
-//     consumer groups, and take their partition assignments. It was previously
-//     editable here; that was the defect.
-//   - CredentialReference and CredentialIssuedAt. Those two together are the
-//     record of an issuance, written only by the credential endpoint. A client
-//     that could set them could claim an issuance that never happened.
-//   - MigratedAt, and any secret of any kind. The service owns stamping the
-//     migration instant, and no request shape anywhere accepts a credential.
+//   - KafkaPrincipal. It is the join key to every ACL binding already provisioned for
+//     this subscriber, so changing it would orphan them all and leave the registry
+//     claiming access the broker does not grant.
+//   - ConsumerGroupID, absent for the same two reasons. It is derived from the
+//     subscriber ID, and it is the resource the group ACL is granted over with a
+//     PREFIXED pattern type — so a caller able to edit it could name a prefix spanning
+//     other subscribers' group namespaces, join their consumer groups, and take their
+//     partition assignments.
+//   - CredentialReference and CredentialIssuedAt. Those two together are the record of
+//     an issuance, written only by the credential endpoint.
+//   - MigratedAt, and any secret of any kind. The service owns stamping the migration
+//     instant, and no request shape anywhere accepts a credential.
 type UpdateSubscriber struct {
 	// Name replaces the human label when present. Bounded in the binder for the
 	// same reason the create request's is; see validateSubscriberName.
 	Name *string `json:"name,omitempty" binding:"omitempty,max=1024"`
 
-	// AuthorizedTopics replaces the whole authorised set when present. It is
-	// already nilable as a slice, so no pointer is needed to tell "omitted"
-	// from "set to empty": nil is omitted, and a present empty array revokes
-	// every topic grant.
-	//
-	// Every entry must be a Blnk-owned category topic; Validate enforces
-	// that. Widening a grant here does not by itself widen
-	// what the subscriber can read — the ACL bindings must be re-provisioned —
-	// but the row is what the next provisioning reads, so it is checked at the
-	// same standard as a fresh registration.
+	// AuthorizedTopics replaces the whole authorised set when present. It is already
+	// nilable as a slice, so no pointer is needed to tell "omitted" from "set to empty":
+	// nil is omitted, and a present empty array revokes every topic grant.
 	AuthorizedTopics []string `json:"authorized_topics,omitempty" binding:"omitempty,max=16,dive,max=249"`
 
-	// PartitionKeyPrefix RECORDS the key-scoped authorization when present and
-	// non-empty, and CLEARS it when present and empty. See the type comment for why
-	// this cannot be a plain string: absent and "clear it" are different requests.
-	//
-	// Both directions are supported. A prefix recorded on an already-provisioned
-	// subscriber takes effect on the NEXT issuance — re-issue to hand the consumer
-	// its new boundary, because the credential already in the field carries the old
-	// one. Nothing is revoked by the edit itself.
-	//
-	// Refusal reads the value in THIS REQUEST, not the resulting row, so an edit
-	// that never mentions the field is unaffected — including on a legacy row that
-	// still carries a prefix, which an operator must be able to rename while
-	// deciding what to do about it.
+	// PartitionKeyPrefix RECORDS the key-scoped authorization when present and non-empty,
+	// and CLEARS it when present and empty. See the type comment for why this cannot be a
+	// plain string: absent and "clear it" are different requests.
 	PartitionKeyPrefix *string `json:"partition_key_prefix,omitempty"`
 
 	// NO webhook_url FIELD. See the note on CreateSubscriber: this route is not
@@ -1340,13 +844,16 @@ type UpdateSubscriber struct {
 
 // Validate checks every caller-supplied value that is present on the request.
 //
-// Absent fields are not checked, because absent means "leave as stored" and the
-// stored value was validated when it was written. A field present but empty IS
-// checked, because that is an explicit instruction to clear, and clearing is
-// legitimate for the key scope, the topic list and the legacy URL alike.
+// Absent fields are not checked, because absent means "leave as stored" and the stored
+// value was validated when it was written. A field present but empty IS checked,
+// because that is an explicit instruction to clear, and clearing is legitimate for the
+// key scope, the topic list and the legacy URL alike.
 //
 // Parameters:
 //   - topicPrefix string: the configured KAFKA_TOPIC_PREFIX.
+//   - options ...SubscriberGrantOption: the deployment facts a grant is judged against,
+//     on the same fail-closed terms as CreateSubscriber.Validate — omitting
+//     WithInternalTopicAccess(true) refuses `<prefix>.system`.
 //
 // Returns:
 //   - error: describing the first violation, nil when the request is usable.
@@ -1362,17 +869,13 @@ func (u UpdateSubscriber) Validate(topicPrefix string, options ...SubscriberGran
 		}
 	}
 
-	// PartitionKeyPrefix is checked at the SAME standard as create, and it used to be skipped
-	// here with a note saying the service refused every non-blank value anyway. It no longer
-	// does: the prefix is issued with the credential as a disclosed, consumer-side filtering
-	// contract, so it is persisted, echoed in the credential response and written into log
-	// fields — and this validator is the only thing standing between a caller and a control
-	// character or a half-kilobyte value in all three. A rule applied only on creation is a rule
-	// with an edit-shaped hole, and an edit is exactly how a hostile value arrives: creation is
-	// scripted from a template, editing is done by hand.
-	//
-	// A present EMPTY value is not a violation. It is the documented remedy for a legacy row
-	// that carries a prefix, and validateSubscriberKeyScope admits it for that reason.
+	// PartitionKeyPrefix is checked at the SAME standard as create. The prefix is issued
+	// with the credential as a disclosed, consumer-side filtering contract, so it is
+	// persisted, echoed in the credential response and written into log fields, and this
+	// validator is the only thing standing between a caller and a control character or a
+	// half-kilobyte value in all three. A rule applied only on creation is a rule with an
+	// edit-shaped hole, and an edit is how a hostile value arrives: creation is scripted
+	// from a template, editing is done by hand.
 	if u.PartitionKeyPrefix != nil {
 		if err := validateSubscriberKeyScope(*u.PartitionKeyPrefix); err != nil {
 			return err
@@ -1382,42 +885,23 @@ func (u UpdateSubscriber) Validate(topicPrefix string, options ...SubscriberGran
 	return nil
 }
 
-// MaxSubscriberNameLength bounds the one free-text, caller-supplied field on a subscriber.
+// MaxSubscriberNameLength bounds the one free-text, caller-supplied field on a
+// subscriber.
 //
-// # Why a bound is needed at all
-//
-// Nothing bounded name, so the effective limit was the global 5 MiB request-body cap — and
-// the value is STORED, returned in every registry response, and written into log fields on
-// every issuance, revocation and provisioning failure. A multi-megabyte name is therefore not
-// merely untidy: it is amplified by every read of the registry and by every log line that
-// names the subscriber, so a single registration could inflate an unrelated response and a
-// day of logs.
-//
-// # Why 256, and why it is enforced in three places
-//
-// 256 characters is generous for a human label in any script — it is not a description field
-// — while staying far below anything that could matter for storage, response size or log
-// volume. The DTO refuses it here so a malformed body is rejected where it is cheapest; the
-// service refuses it so a CLI or migration cannot bypass the DTO; and
+// 256 characters is generous for a human label in any script — it is not a description
+// field — while staying far below anything that could matter for storage, response size
+// or log volume. The DTO refuses it here so a malformed body is rejected where it is
+// cheapest; the service refuses it so a CLI or migration cannot bypass the DTO; and
 // event_subscribers_name_length_chk refuses it so a psql session, a data migration or a
-// restored backup cannot either. Each layer covers callers the layer above does not see.
+// restored backup cannot either. Each layer covers callers the layer above does not
+// see.
 const MaxSubscriberNameLength = 256
 
 // validateBodyRules applies the rules on a create body that need no topic prefix.
 //
-// # Why these are separated from the prefix-dependent ones rather than merged
-//
 // Validate is the single entry point, and it has two kinds of rule inside it. These are
 // facts about the BODY — a name is present, it is bounded, the topic list is within its
-// resource limits — and they hold identically in every deployment. The rest compare the
-// grant against THIS deployment's topic namespace, which requires the configured prefix.
-//
-// Keeping the prefix-independent half here is what removes a real duplication. There used to
-// be a second EXPORTED validator that no handler called, and it applied the grantable
-// allowlist under model.DefaultEventTopicPrefix — the strictest namespace — as a stand-in
-// for the configured one. Folding that call into Validate would have REFUSED a deployment
-// that legitimately renamed its prefix, so the allowlist deliberately stays in Validate,
-// where it is checked exactly once against the prefix that actually applies.
+// resource limits — and they hold identically in every deployment.
 //
 // Returns:
 //   - error: describing the first violation, nil when the body's own rules hold.
@@ -1426,28 +910,18 @@ func (c CreateSubscriber) validateBodyRules() error {
 		return err
 	}
 
-	// The RESOURCE bounds on the grant — cardinality, blank elements, name length, the Kafka
-	// character set and duplicates. They are prefix-independent by nature, and they are
-	// applied here rather than left to the binding tags because the tags can express only
-	// two of the five.
+	// The RESOURCE bounds on the grant — cardinality, blank elements, name length, the
+	// Kafka character set and duplicates. They are prefix-independent by nature, and they
+	// are applied here rather than left to the binding tags because the tags can express
+	// only two of the five.
 	return model.ValidateSubscriberTopics(c.AuthorizedTopics)
 }
 
 // validateBodyRules applies the rules on an update body that need no topic prefix.
 //
-// No field is required: an update carries the mutable subset a caller chose to change, and
-// every field is a pointer or a nilable slice precisely so that "omitted" stays
+// No field is required: an update carries the mutable subset a caller chose to change,
+// and every field is a pointer or a nilable slice precisely so that "omitted" stays
 // distinguishable from "set to empty".
-//
-// The name is checked only when PRESENT, and a present name may not be blank — an update is
-// an instruction, and "set the name to nothing" is not one the registry can honour, because
-// the column is NOT NULL and an unnamed principal cannot be triaged.
-//
-// The grant's resource bounds are likewise checked only when present: nil means the caller is
-// not touching the authorised set, while a present empty array is a deliberate revocation of
-// every topic and must continue to be accepted. When a grant IS present it replaces the whole
-// set, so it is held to exactly the standard a fresh registration is — an update path that
-// checked less would be the way around the create path's bounds.
 //
 // Returns:
 //   - error: describing the first violation, nil when the body's own rules hold.
@@ -1465,32 +939,27 @@ func (u UpdateSubscriber) validateBodyRules() error {
 	return model.ValidateSubscriberTopics(u.AuthorizedTopics)
 }
 
-// validateSubscriberName applies the one bound and the one requirement on a subscriber name.
+// validateSubscriberName applies the one bound and the one requirement on a subscriber
+// name.
 //
-// # What is checked, and what deliberately is not
+// The name is a LABEL, not an authorization: nothing is granted on the strength of it,
+// so the rules are about it being storable, displayable and bounded rather than about
+// isolation.
 //
-// The name is a LABEL, not an authorization: nothing is granted on the strength of it, so the
-// rules are about it being storable, displayable and bounded rather than about isolation.
-//
-//   - PRESENCE, when required. It is the one field no service can invent a meaningful value
-//     for, it is NOT NULL in blnk.event_subscribers, and being able to answer "who is this
-//     principal?" months later is most of the reason the registry exists.
-//   - LENGTH, always. See MaxSubscriberNameLength for why an unbounded value is amplified
-//     by every response and every log line.
-//   - CONTROL CHARACTERS, always. The value is echoed into API responses, log lines and trace
-//     attributes; a newline in it splits a log line in two and forges a second entry, and a
-//     carriage return can overwrite one on a terminal. The service's log fields are
-//     sanitized, but a bound at the boundary means the value never has to be trusted by a
-//     path that forgets.
-//
-// The length is measured on the TRIMMED value, matching what the service stores and what
-// event_subscribers_name_length_chk asserts, so trailing whitespace cannot be used to
-// approach the bound in one layer and exceed it in another.
+//   - PRESENCE, when required. It is the one field no service can invent a meaningful
+//     value for, it is NOT NULL in blnk.event_subscribers, and being able to answer
+//     "who is this principal?" months later is most of the reason the registry exists.
+//   - LENGTH, always. See MaxSubscriberNameLength for why an unbounded value is
+//     amplified by every response and every log line.
+//   - CONTROL CHARACTERS, always. The value is echoed into API responses, log lines and
+//     trace attributes; a newline in it splits a log line in two and forges a second
+//     entry, and a carriage return can overwrite one on a terminal.
 //
 // Parameters:
 //   - name string: the value as supplied.
-//   - required bool: whether a blank value is a violation. False is unused today and exists
-//     so an optional-name shape can reuse the bound rather than reimplementing it.
+//   - required bool: whether a blank value is a violation. False is unused today and
+//     exists so an optional-name shape can reuse the bound rather than reimplementing
+//     it.
 //
 // Returns:
 //   - error: describing the violation, nil when the name is usable.
@@ -1527,38 +996,35 @@ func validateSubscriberName(name string, required bool) error {
 }
 
 // validateGrantableTopics refuses an authorised-topic list containing anything a
-// subscriber may not be granted (SEC-03).
+// subscriber may not be granted.
 //
-// The list becomes the ACL bindings, so whatever is accepted here is what the
-// issued credential can read. Membership is EXACT against
-// model.SubscriberGrantableTopics — not a prefix test, not a normalising test —
-// and that is what makes three distinct attacks plain non-members rather than
-// special cases somebody has to remember to write:
+// The list becomes the ACL bindings, so whatever is accepted here is what the issued
+// credential can read. Membership is EXACT against model.SubscriberGrantableTopics —
+// not a prefix test, not a normalising test — and that is what makes three distinct
+// attacks plain non-members rather than special cases somebody has to remember to
+// write:
 //
 //   - "*", which Kafka reads as matching every resource, so a single such entry
 //     converts a per-topic grant into a cluster-wide one.
-//   - A FOREIGN topic such as "attacker.transactions", which has exactly the
-//     shape of an owned name and none of the meaning: granting it is a grant into
-//     somebody else's data on a broker Blnk may share.
-//   - A DEAD-LETTER topic. Every DLT carries other subscribers' failed events
-//     together with Blnk's own failure metadata, so it has no subscriber
-//     audience. The exclusion is structural: model.SubscriberGrantableTopics
-//     composes only "<prefix>.<category>" names, so a ".dlt" name can never be a
-//     member.
+//   - A FOREIGN topic such as "attacker.transactions", which has exactly the shape of
+//     an owned name and none of the meaning: granting it is a grant into somebody
+//     else's data on a broker Blnk may share.
+//   - A DEAD-LETTER topic. Every DLT carries other subscribers' failed events together
+//     with Blnk's own failure metadata, so it has no subscriber audience.
 //   - THE INTERNAL CATEGORY TOPIC, "<prefix>.system", UNLESS THE DEPLOYMENT HAS
-//     ACKNOWLEDGED IT. It carries system.error's frozen verbatim-error body and is
-//     the catalogue's catch-all, so it is an operator surface: the default grantable
-//     set is the four TENANT category topics. It becomes grantable when
+//     ACKNOWLEDGED IT. It carries system.error's frozen verbatim-error body and is the
+//     catalogue's catch-all, so it is an operator surface: the default grantable set is
+//     the three TENANT category topics. It becomes grantable when
 //     KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS is declared and the caller passes
 //     WithInternalTopicAccess(true), and the refusal names that variable when it is
 //     not, because "not grantable" and "not grantable HERE" are different operator
 //     actions. model.SubscriberPrivilegedEventCategories owns that decision.
 //
 // An EMPTY list is accepted, because a subscriber authorised for nothing is the
-// fail-closed default of a fresh registration. An empty or whitespace-only ENTRY
-// is refused rather than skipped: it is always a bug in whatever assembled the
-// list, and silently dropping it would let a caller believe it had requested a
-// grant it did not receive.
+// fail-closed default of a fresh registration. An empty or whitespace-only ENTRY is
+// refused rather than skipped: it is always a bug in whatever assembled the list, and
+// silently dropping it would let a caller believe it had requested a grant it did not
+// receive.
 //
 // Parameters:
 //   - topics []string: the requested authorised topics.
@@ -1586,12 +1052,12 @@ func validateGrantableTopics(topics []string, topicPrefix string, options ...Sub
 			continue
 		}
 
-		// A PRIVILEGED NAME REFUSED FOR WANT OF THE ACKNOWLEDGEMENT GETS ITS OWN MESSAGE.
-		// The generic refusal below would send the operator to read the allowlist, which
-		// does not contain the answer: the name IS a Blnk category topic and the missing
-		// piece is a deployment declaration. Naming the variable is what makes the refusal
-		// actionable, and it discloses nothing — the variable is documented in
-		// .env.example, both Compose files and the Kubernetes configuration.
+		// A PRIVILEGED NAME REFUSED FOR WANT OF THE ACKNOWLEDGEMENT GETS ITS OWN MESSAGE. The
+		// generic refusal below would send the operator to read the allowlist, which does not
+		// contain the answer: the name IS a Blnk category topic and the missing piece is a
+		// deployment declaration. Naming the variable is what makes the refusal actionable,
+		// and it discloses nothing — the variable is documented in .env.example, both Compose
+		// files and the Kubernetes configuration.
 		if model.IsSubscriberPrivilegedTopicName(topic, topicPrefix) {
 			return fmt.Errorf(
 				"authorized_topics entry %q is the internal category topic: it carries Blnk's own "+
@@ -1619,12 +1085,10 @@ func validateGrantableTopics(topics []string, topicPrefix string, options ...Sub
 // allowlist is for one validation.
 //
 // It is a struct behind an option function rather than a positional parameter for one
-// reason: every existing caller of Validate and validateGrantableTopics — two handlers and
-// forty-odd tests — means "nothing acknowledged", and that is also the fail-closed answer.
-// A required parameter would have made all of them state it explicitly, and a bare boolean
-// at a call site says nothing about which way round it goes. An omitted option is the safe
-// default by construction, which is the same reason the atomic writers in database take
-// their event rows variadically.
+// reason: every existing caller of Validate and validateGrantableTopics — two handlers
+// and forty-odd tests — means "nothing acknowledged", and that is also the fail-closed
+// answer. A required parameter would have made all of them state it explicitly, and a
+// bare boolean at a call site says nothing about which way round it goes.
 type subscriberGrantPolicy struct {
 	// internalTopicAccess is KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS as resolved by the
 	// caller. It widens the allowlist by exactly one name and nothing else.
@@ -1667,30 +1131,23 @@ func resolveSubscriberGrantPolicy(options []SubscriberGrantOption) subscriberGra
 // validateSubscriberKeyScope constrains the recorded key-scoped authorization.
 //
 // The value grants nothing at the broker — it decides whether a credential can be
-// issued at all — so the rules here are about it being STORABLE AND DISPLAYABLE
-// rather than about isolation. Two things are refused, and both are about what the
-// string does after it is stored:
+// issued at all — so the rules here are about it being STORABLE AND DISPLAYABLE rather
+// than about isolation. Two things are refused, and both are about what the string does
+// after it is stored:
 //
-//   - CONTROL CHARACTERS. The value is echoed into API responses, log lines and
-//     trace attributes. A newline in it splits a log line in two and forges a
-//     second entry; a carriage return can overwrite one on a terminal.
+//   - CONTROL CHARACTERS. The value is echoed into API responses, log lines and trace
+//     attributes.
 //   - Surrounding WHITESPACE, because a scope with a trailing space describes a
 //     different set of keys from the one the caller meant, and the difference is
 //     invisible in every rendering of the value.
 //
-// An empty value is legitimate and means no key-scoped authorization is recorded,
-// which is the only state a subscriber can be registered or provisioned in. The
-// length bound is generous — a key prefix is a fragment of a ledger ID, not a
-// document — and exists so that an unbounded string cannot be parked in a log line
-// or an error message.
-//
-// IT VALIDATES SHAPE, NOT MEANING. A well-formed prefix is accepted and recorded;
-// what this refuses is a value that cannot be held honestly — surrounding
-// whitespace, which would make two prefixes filtering different record sets look
-// alike, an unbounded value, which is amplified by every registry read and every
-// log line naming the subscriber, and a control character, which corrupts every
-// log line and dashboard label it reaches. The service applies the identical rules
-// so a CLI caller, a migration and a fixture are held to the same standard.
+// IT VALIDATES SHAPE, NOT MEANING. A well-formed prefix is accepted and recorded; what
+// this refuses is a value that cannot be held honestly — surrounding whitespace, which
+// would make two prefixes filtering different record sets look alike, an unbounded
+// value, which is amplified by every registry read and every log line naming the
+// subscriber, and a control character, which corrupts every log line and dashboard
+// label it reaches. The service applies the identical rules so a CLI caller, a
+// migration and a fixture are held to the same standard.
 //
 // Parameters:
 //   - prefix string: the recorded constraint, empty when none is recorded.
@@ -1733,17 +1190,10 @@ const maxSubscriberKeyScopeLen = 256
 // does not fit in a line, it is not doing that job.
 const maxSubscriberNameLen = MaxSubscriberNameLength
 
-// validateLegacyWebhookURL applies the destination policy to the dual-run webhook URL
-// (SSRF-01).
-//
-// # Why a column with no sender is validated at all
+// validateLegacyWebhookURL applies the destination policy to the dual-run webhook URL.
 //
 // Nothing in Blnk sends to this URL today. It is recorded so a subscriber already
-// receiving HTTP pushes has somewhere to be migrated FROM. But a stored URL is a
-// future sink: the moment any code sends to it, whatever is in this field becomes a
-// request Blnk makes from inside its own network, with its own network position.
-// Constraining it now costs one function; constraining it after a sender exists means
-// auditing every row already written and hoping none was used first.
+// receiving HTTP pushes has somewhere to be migrated FROM.
 //
 // Two rules, each closing a distinct route:
 //
@@ -1752,13 +1202,11 @@ const maxSubscriberNameLen = MaxSubscriberNameLength
 //     wire in clear text. It also refuses the non-HTTP schemes that turn a URL field
 //     into a local-resource read: file://, gopher://, ftp:// and friends.
 //   - NO INTERNAL DESTINATION. Loopback, link-local (including the 169.254.169.254
-//     cloud metadata endpoint), private ranges, the unspecified address, multicast,
-//     and the hostnames that resolve to them. Blnk runs alongside its own database,
-//     Redis, TypeSense, brokers and — in a cloud deployment — an instance metadata
-//     service that hands out credentials to anything that asks from the right place.
+//     cloud metadata endpoint), private ranges, the unspecified address, multicast, and
+//     the hostnames that resolve to them.
 //
-// This is a literal-address check, and it is deliberately not sold as more than that:
-// a hostname resolving to an internal address at send time is not detectable here, and
+// This is a literal-address check, and it is deliberately not sold as more than that: a
+// hostname resolving to an internal address at send time is not detectable here, and
 // defeating that needs resolution-time validation in the sender. The repository layer
 // applies the same policy, so a URL arriving by another path is refused too.
 //
@@ -1768,16 +1216,17 @@ const maxSubscriberNameLen = MaxSubscriberNameLength
 // Returns:
 //   - error: describing the violation without echoing more of the URL than the host.
 func validateLegacyWebhookURL(rawURL string) error {
-	// THE ONE POLICY, in model.ValidateWebhookURL. This function used to carry its own copy of the
-	// https, host, whitespace and internal-destination rules, including its own destination
-	// classifier, beside a second copy in the repository — one column, two rules, with the same
-	// rejected host producing two different reason phrases depending on which door the request came
-	// through. What stays here is the ERROR SHAPE: a DTO validation error rather than a typed
-	// apierror, and prefixed with the field name because that is what a caller of this endpoint
-	// needs in order to know which body key to correct.
+	// THE ONE POLICY, in model.ValidateWebhookURL. This function carries no copy of the
+	// https, host, whitespace and internal-destination rules and no destination classifier
+	// of its own: a second copy beside the repository's would give one column two rules,
+	// with the same rejected host producing two different reason phrases depending on which
+	// door the request came through. What stays here is the ERROR SHAPE: a DTO
+	// validation error rather than a typed apierror, and prefixed with the field name
+	// because that is what a caller of this endpoint needs in order to know which body key
+	// to correct.
 	//
-	// An empty value passes, meaning "no endpoint recorded", which is what the nullable column is
-	// for.
+	// An empty value passes, meaning "no endpoint recorded", which is what the nullable
+	// column is for.
 	message, reason := model.ValidateWebhookURL(rawURL)
 	if message == "" {
 		return nil
@@ -1789,60 +1238,19 @@ func validateLegacyWebhookURL(rawURL string) error {
 	return fmt.Errorf("webhook_url: %s (%s)", strings.ToLower(message[:1])+message[1:], reason)
 }
 
-// SubscriberResponse is the read shape for GET /subscribers,
-// GET /subscribers/:subscriber_id, and the bodies returned by the create and
-// update routes.
+// SubscriberResponse is the read shape for GET /subscribers, GET
+// /subscribers/:subscriber_id, and the bodies returned by the create and update routes.
 //
-// This type deliberately exposes NO credential material of any kind, never the
-// credential itself. That is not merely a convention here, it is structurally
-// guaranteed: blnk.event_subscribers has no column capable of holding a plaintext
-// or reversibly-encrypted secret, so a password field on this type could never be
-// populated from persistence. It could only ever leak one. The posture mirrors
-// blnk.api_keys, where the stored value is a bcrypt hash and the raw key is never
-// kept.
-//
-// # It reports a FINGERPRINT, not the credential reference (SECRET-01)
-//
-// The full reference was once returned here. The reference is not a secret — it is
-// a non-reversible derivation and nobody can authenticate with it — but it is not
-// information a client needs either, and returning it had two costs worth
-// avoiding. It is internal correlation state, so exposing it invites a caller to
-// treat it as an identifier to send back or to compare against something, which
-// makes it an accidental part of the API contract. And "the reference is
-// non-reversible" is a property of the code that DERIVES it, not of the column
-// that stores it: a value mislabeled as a reference by some future path would be
-// published verbatim by this response.
-//
-// model.CredentialFingerprint closes both. It answers the only question a client
-// legitimately has — "is this the same issuance I saw last time?" — and it yields
-// the empty string for anything that fails reference validation, so a mis-stored
-// value produces no output at all rather than a partial rendering of itself.
-//
-// A nil CredentialIssuedAt is the reliable test for "registered, but no
-// credential has ever been issued", which is a real state the registry has to
-// represent.
+// The full reference was once returned here. The reference is not a secret — it is a
+// non-reversible derivation and nobody can authenticate with it — but it is not
+// information a client needs either, and returning it had two costs worth avoiding.
 type SubscriberResponse struct {
 	// SubscriberID is the business key callers address the subscriber by.
 	SubscriberID string `json:"subscriber_id"`
 
-	// SubscriberIDHash is the pseudonym this subscriber appears under in METRICS AND
-	// LOGS, published here so that a token read off a dashboard, an alert notification
-	// or a log line can be resolved back to the subscriber.
-	//
-	// # It is the pivot, and without it the pseudonyms are unusable
-	//
-	// blnk.kafka.consumer_lag carries a hashed 'subscriber' attribute, and every log
-	// line about a subscriber carries subscriber_id_hash, both for the reason
-	// subscriberLagLabel documents: a subscriber identifier is a tenant name, and a
-	// metric label is the most widely readable thing the service emits. That protection
-	// costs nothing only if the operator holding a token can still find the subscriber.
-	// This field is how — GET /subscribers returns it on every row, and the list
-	// endpoint accepts it as a filter so one request resolves a token instead of a walk
-	// through every page.
-	//
-	// Computed rather than stored, by model.HashIdentifier, which is the single rule all
-	// three layers use. docs/kafka-operations.md publishes the shell equivalent for an
-	// operator who wants to hash a candidate identifier without calling the API.
+	// SubscriberIDHash is the pseudonym this subscriber appears under in METRICS AND LOGS,
+	// published here so that a token read off a dashboard, an alert notification or a log
+	// line can be resolved back to the subscriber.
 	SubscriberIDHash string `json:"subscriber_id_hash"`
 
 	// Name is the human label the subscriber is triaged by.
@@ -1860,73 +1268,44 @@ type SubscriberResponse struct {
 	// meaningful, fail-closed state an operator needs to see.
 	AuthorizedTopics []string `json:"authorized_topics"`
 
-	// PartitionKeyPrefix is the key-scoped authorization recorded for this
-	// subscriber: it is entitled only to records whose message key carries this
-	// prefix. Omitted when none is recorded.
+	// PartitionKeyPrefix is the key-scoped authorization recorded for this subscriber: it
+	// is entitled only to records whose message key carries this prefix. Omitted when none
+	// is recorded.
 	//
-	// WHETHER IT CAN BE ISSUED A CREDENTIAL DEPENDS ON THE DEPLOYMENT, not on this
-	// value. Kafka's authorizer has no message-key dimension, so the boundary is
-	// kept by the key-authorising component a deployment declares in
-	// KAFKA_KEY_SCOPE_ENFORCEMENT: with one declared the credential is issued
-	// (granted Describe and no topic Read, records delivered through that
-	// component), and with none declared issuance refuses rather than hand out
-	// access the registry does not describe.
-	//
-	// Read EnforcedAccess.PartitionKeyScopeState for which of those a row is in,
-	// and CredentialIssuanceBlocked for the consequence. This field's own
-	// documentation used to answer for them — "a non-empty value means NO
-	// CREDENTIAL CAN BE ISSUED", and that registration and update both refuse a
-	// non-blank prefix so any value identifies a legacy row to be cleared. Both
-	// statements described a superseded posture: recording a prefix is accepted,
-	// permanently supported, and realisable.
+	// WHETHER IT CAN BE ISSUED A CREDENTIAL DEPENDS ON THE DEPLOYMENT, not on this value.
+	// Kafka's authorizer has no message-key dimension, so the boundary is kept by the
+	// key-authorising component a deployment declares in KAFKA_KEY_SCOPE_ENFORCEMENT: with
+	// one declared the credential is issued (granted Describe and no topic Read, records
+	// delivered through that component), and with none declared issuance refuses rather
+	// than hand out access the registry does not describe.
 	PartitionKeyPrefix string `json:"partition_key_prefix,omitempty"`
 
-	// EnforcedAccess declares which parts of this subscriber's access model are
-	// actually enforced, and where. It is always present, including when no
-	// credential has been issued, because it describes the boundary issuance WILL
-	// establish and an integrator needs it before wiring a consumer.
-	//
-	// It is assembled from this row AND the resolved deployment, so its claims are
-	// answerable rather than inferred; see SubscriberEnforcedAccess.
+	// EnforcedAccess declares which parts of this subscriber's access model are actually
+	// enforced, and where. It is always present, including when no credential has been
+	// issued, because it describes the boundary issuance WILL establish and an integrator
+	// needs it before wiring a consumer.
 	EnforcedAccess SubscriberEnforcedAccess `json:"enforced_access"`
 
-	// CredentialIssuanceBlocked reports that POST
-	// /subscribers/{id}/kafka-credentials will REFUSE for this row as it
-	// currently stands. Always present, including when false, because a client
-	// that had to infer it from the absence of a field would infer it wrong.
-	//
-	// # Why this is a field rather than a documented consequence
-	//
-	// The refusal it predicts was previously discoverable only by triggering
-	// it. A caller could register a subscriber carrying a partition key prefix,
-	// receive 201 Created, wire a consumer around the returned principal and
-	// consumer group, and learn at the credential call — a separate request,
-	// possibly a separate day, possibly a separate person — that no credential
-	// would ever be issued for it. Nothing in the created resource said so. The
-	// state was reported accurately field by field and the CONSEQUENCE, which is
-	// the only part anybody acts on, was in a Go doc comment.
-	//
-	// So the resource now states it at the moment it is created or changed. This
-	// is deliberately a prediction about the NEXT call rather than a description
-	// of this one: it is what turns a late 409 into a fact visible on the row.
+	// CredentialIssuanceBlocked reports that POST /subscribers/{id}/kafka-credentials will
+	// REFUSE for this row as it currently stands. Always present, including when false,
+	// because a client that had to infer it from the absence of a field would infer it
+	// wrong.
 	CredentialIssuanceBlocked bool `json:"credential_issuance_blocked"`
 
-	// CredentialIssuanceBlockedReason names what to change, in the imperative,
-	// and is present only when CredentialIssuanceBlocked is true.
+	// CredentialIssuanceBlockedReason names what to change, in the imperative, and is
+	// present only when CredentialIssuanceBlocked is true.
 	//
-	// It carries the remedy rather than only the diagnosis, because the two
-	// remedies are not interchangeable and an operator cannot pick between them
-	// from the diagnosis alone: clearing the prefix ACCEPTS whole-topic access,
-	// which is a decision somebody has now taken explicitly, while narrowing
-	// authorized_topics is the enforceable form of the same intent whenever the
-	// intended boundary maps onto topics.
+	// It carries the remedy rather than only the diagnosis, because the two remedies are
+	// not interchangeable and an operator cannot pick between them from the diagnosis
+	// alone: clearing the prefix ACCEPTS whole-topic access, which is a decision somebody
+	// has now taken explicitly, while narrowing authorized_topics is the enforceable form
+	// of the same intent whenever the intended boundary maps onto topics.
 	CredentialIssuanceBlockedReason string `json:"credential_issuance_blocked_reason,omitempty"`
 
-	// CredentialFingerprint is a short, non-sensitive digest fragment
-	// identifying which credential issuance this row records. It answers "is
-	// this the same credential I saw last time?" and nothing else — it cannot
-	// be authenticated with, and it is not the stored reference. Empty, and so
-	// omitted, when no credential has been issued.
+	// CredentialFingerprint is a short, non-sensitive digest fragment identifying which
+	// credential issuance this row records. It answers "is this the same credential I saw
+	// last time?" and nothing else — it cannot be authenticated with, and it is not the
+	// stored reference. Empty, and so omitted, when no credential has been issued.
 	CredentialFingerprint string `json:"credential_fingerprint,omitempty"`
 
 	// CredentialIssuedAt is when the current credential was issued. Nil, and so
@@ -1936,13 +1315,8 @@ type SubscriberResponse struct {
 	// NO webhook_url FIELD. The recorded URL is read through GET
 	// /subscribers/:subscriber_id/webhook-subscription, which is fronted by the sunset
 	// guard and stops disclosing it at the retirement instant. Echoing it here as well
-	// would keep it readable through an unguarded route after that, so the two reads
-	// would disagree about whether the legacy surface still exists.
-	//
-	// MigratedAt STAYS. It is migration PROGRESS rather than legacy webhook state — a
-	// timestamp saying this subscriber finished moving to Kafka — and it is what a
-	// migration-progress report counts, before and after the sunset alike. It discloses
-	// no endpoint.
+	// would keep it readable through an unguarded route after that, so the two reads would
+	// disagree about whether the legacy surface still exists.
 
 	// MigratedAt is when the subscriber completed its move to Kafka
 	// consumption. Nil, and so omitted, means not yet migrated, which is what
@@ -1950,51 +1324,31 @@ type SubscriberResponse struct {
 	MigratedAt *time.Time `json:"migrated_at,omitempty"`
 
 	// ===================================================================
-	// ORPHAN-01: the three unsettled-state markers, projected
+	// the three unsettled-state markers, projected
 	//
-	// These were previously readable only from the database, which made every
-	// documented remedy start with a psql session — and made the alerts that
-	// fire on them unactionable through the API they tell an operator to use.
-	// A marker an operator cannot see through the registry is a marker they
-	// cannot triage, whatever a runbook says.
-	//
-	// All three are omitted when unset, which is the healthy state, so a
-	// present field always means something needs attention. They are markers,
-	// never a substitute for the broker: the broker is the authority on what a
-	// principal can actually do.
+	// A marker an operator cannot see through the registry is a marker they cannot triage,
+	// whatever a runbook says.
 	// ===================================================================
 
-	// RevocationPendingAt is when a deregistration began taking this
-	// subscriber's broker-side access away. Present means THE ROW IS NOT AN
-	// ACTIVE SUBSCRIBER — credential issuance is refused for it — and a
-	// principal that may still authenticate is awaiting revocation.
+	// RevocationPendingAt is when a deregistration began taking this subscriber's
+	// broker-side access away. Present means THE ROW IS NOT AN ACTIVE SUBSCRIBER —
+	// credential issuance is refused for it — and a principal that may still authenticate
+	// is awaiting revocation.
 	//
-	// The remedy is to RETRY THE DEREGISTRATION (DELETE this subscriber), which
-	// is idempotent at the broker. Re-issuing is refused while this is set, so
-	// it is not an alternative here.
+	// The remedy is to RETRY THE DEREGISTRATION (DELETE this subscriber), which is
+	// idempotent at the broker. Re-issuing is refused while this is set, so it is not an
+	// alternative here.
 	RevocationPendingAt *time.Time `json:"revocation_pending_at,omitempty"`
 
-	// RevocationFailedAt is when the MOST RECENT revocation attempt was refused
-	// by the broker, as distinct from a deregistration that merely began. It is
-	// cleared at the start of every new attempt, so a present value means no
-	// attempt has been made since the refusal.
-	//
-	// It always accompanies RevocationPendingAt, and it carries the fact that
-	// marker cannot: RETRYING ALONE WILL NOT HELP. A cluster-authorization
-	// failure means the administrative principal has lost its grants; a
-	// transport error means the broker is unreachable. Fix that first.
+	// RevocationFailedAt is when the MOST RECENT revocation attempt was refused by the
+	// broker, as distinct from a deregistration that merely began. It is cleared at the
+	// start of every new attempt, so a present value means no attempt has been made since
+	// the refusal.
 	RevocationFailedAt *time.Time `json:"revocation_failed_at,omitempty"`
 
-	// CredentialOrphanedAt is when an issuance left a credential at the broker
-	// that Blnk could neither record nor revoke. Present means a principal can
-	// authenticate while CredentialFingerprint above does not describe the
-	// credential that works.
-	//
-	// THIS IS NOT RevocationPendingAt AND THE REMEDY IS THE OPPOSITE. The
-	// subscriber is still ACTIVE, so RE-ISSUING settles it by construction —
-	// Kafka stores one credential per principal, so a new issuance replaces the
-	// orphan — and deprovisioning settles it by revoking. Choose by whether the
-	// subscriber should still have access.
+	// CredentialOrphanedAt is when an issuance left a credential at the broker that Blnk
+	// could neither record nor revoke. Present means a principal can authenticate while
+	// CredentialFingerprint above does not describe the credential that works.
 	CredentialOrphanedAt *time.Time `json:"credential_orphaned_at,omitempty"`
 
 	// CreatedAt is when the subscriber was registered.
@@ -2006,29 +1360,12 @@ type SubscriberResponse struct {
 	// RevocationPending reports that broker-side revocation is still owed for this
 	// subscriber: the row is tombstoned for deregistration and its principal may still be
 	// able to authenticate until the revocation completes. Always present, including when
-	// false, because a client that had to infer it from a missing field would infer it wrong.
+	// false, because a client that had to infer it from a missing field would infer it
+	// wrong.
 	RevocationPending bool `json:"revocation_pending"`
 
-	// RevocationPendingReason names what is outstanding and what to do about it.
-	// Present only when RevocationPending is true.
-	//
-	// The state it describes is BROKER-SIDE access that has not been confirmed
-	// gone, and only that: it is the state blnk_subscribers_revocation_pending
-	// counts and SubscriberRevocationOutstanding fires on, so the action is to
-	// retry the deregistration or revoke the principal at the broker by hand.
-	//
-	// The tombstone used to mean this OR "the broker is clean and only the row
-	// deletion failed", which are opposite situations sharing one column — so an
-	// operator answering the alert went after principals that no longer existed.
-	// A confirmed revocation now clears the tombstone with the credential record,
-	// which is why this reason can state one thing rather than branch. Where the
-	// retry itself is what failed, RevocationFailedAt above carries the part this
-	// reason cannot: that retrying alone will not help.
-	//
-	// It exists for the same reason CredentialIssuanceBlockedReason does:
-	// docs/metrics.md answers the revocation alert with "find the affected
-	// subscribers with GET /subscribers", and a response that reported the state
-	// without naming the remedy sent every operator back to a psql session.
+	// RevocationPendingReason names what is outstanding and what to do about it. Present
+	// only when RevocationPending is true.
 	RevocationPendingReason string `json:"revocation_pending_reason,omitempty"`
 }
 
@@ -2041,11 +1378,6 @@ type SubscriberResponse struct {
 const (
 	// EnforcementDimensionTopic is Read and Describe bound to an EXACT topic name, so a
 	// topic absent from the grant is refused at the broker.
-	//
-	// For a KEY-SCOPED subscriber the same dimension is bound to Describe only: record access
-	// is withheld from the broker entirely so that the declared component is the only path
-	// records can take. The dimension is enforced either way, which is why it is listed either
-	// way.
 	EnforcementDimensionTopic = "topic"
 
 	// EnforcementDimensionConsumerGroup is Read bound to the subscriber's consumer-group
@@ -2057,107 +1389,43 @@ const (
 // SubscriberEnforcedAccess declares, inside the response body, WHERE each part of a
 // subscriber's recorded access model is enforced.
 //
-// # Why the API states this rather than leaving it to documentation
+// A subscriber's record carries three access-shaped values: authorized_topics, a
+// consumer group, and partition_key_prefix. Two of them are ACL bindings the broker
+// evaluates.
 //
-// A subscriber's record carries three access-shaped values: authorized_topics, a consumer
-// group, and partition_key_prefix. Two of them are ACL bindings the broker evaluates. The
-// third cannot be: Kafka's authorizer has no message-key dimension, so no ACL confines a
-// consumer to a slice of a topic by key.
+// An integrator reading a response that lists all three together has no way to tell
+// which is which, and for a long time the plausible wrong conclusion was also the true
+// one in the worst sense: two subscribers sharing a topic with different key prefixes
+// really COULD see each other's events, because the platform granted both whole-topic
+// Read and asked them to filter. This object exists so nobody has to guess, and — since
+// the correction described below — so that the answer it gives is an enforced boundary
+// rather than a request for cooperation.
 //
-// An integrator reading a response that lists all three together has no way to tell which is
-// which, and for a long time the plausible wrong conclusion was also the true one in the worst
-// sense: two subscribers sharing a topic with different key prefixes really COULD see each
-// other's events, because the platform granted both whole-topic Read and asked them to filter.
-// This object exists so nobody has to guess, and — since the correction described below — so
-// that the answer it gives is an enforced boundary rather than a request for cooperation.
+// A security review of the running system named the consequence plainly — whole-topic
+// credentials expose records belonging to other ledgers and other subscribers, and
+// disclosure plus client cooperation is not an authorization boundary. A subscriber
+// that ignored the obligation, or simply used a different consumer, read everything on
+// the shared category topic and nothing in the platform could tell.
 //
-// # What changed, and why the previous shape was not acceptable
+// So the boundary moved rather than the wording. A subscriber that records a
+// partition-key prefix is now provisioned WITHOUT Read on any topic: the broker refuses
+// every record fetch it attempts, with any client, from any host. Its records are
+// delivered by the KEY-AUTHORISING COMPONENT THE DEPLOYMENT DECLARED in front of the
+// brokers, which authenticates the credential Blnk issued and applies the recorded
+// prefix to every record's key before returning it.
 //
-// This struct used to report partition_key_prefix_enforced = false and
-// client_side_key_filtering_required = true: an accurate description of a boundary that did not
-// exist. A security review of the running system named the consequence plainly — whole-topic
-// credentials expose records belonging to other ledgers and other subscribers, and disclosure
-// plus client cooperation is not an authorization boundary. A subscriber that ignored the
-// obligation, or simply used a different consumer, read everything on the shared category topic
-// and nothing in the platform could tell.
-//
-// So the boundary moved rather than the wording. A subscriber that records a partition-key
-// prefix is now provisioned WITHOUT Read on any topic: the broker refuses every record fetch it
-// attempts, with any client, from any host. Its records are delivered by the KEY-AUTHORISING
-// COMPONENT THE DEPLOYMENT DECLARED in front of the brokers, which authenticates the credential
-// Blnk issued and applies the recorded prefix to every record's key before returning it.
-// Where such a component IS declared, partition_key is therefore an ENFORCED dimension,
-// partition_key_prefix_enforced_by names the component that enforces it, and NotEnforcedBy is
-// empty.
-//
-// BLNK DOES NOT SHIP THAT COMPONENT and exposes no data-plane route of its own — there is no
-// GET under /subscribers that returns records. Where no component is declared, which is the
-// shipped default, no CREDENTIAL is produced for a key-scoped subscriber: issuance refuses with
-// SUBSCRIBER_KEY_SCOPE_UNENFORCED (409) rather than emitting a credential body that claims an
-// enforcement point nothing is running.
-//
-// # THIS OBJECT IS STILL PRODUCED FOR SUCH A ROW, on every REGISTRY read, and what it says there
-// # is the part that had to be corrected (MAJ-1)
-//
-// GET, POST, PUT and the listings all project a subscriber, declared component or not, and they
-// used to describe the undeclared case identically to the declared one — partition_key_prefix_
-// enforced true, broker_gateway named, gateway delivery required, nothing in NotEnforcedBy —
-// because every field derived from whether the prefix column was non-empty. So a registration
-// announced a verified isolation boundary and the next call refused it for want of the component
-// the announcement had just named.
-//
-// Every enforcement field now derives from the ROW AND THE RESOLVED DEPLOYMENT together — see
-// model.SubscriberAccessDeployment and NewSubscriberEnforcedAccessUnder — and
-// PartitionKeyScopeState says which of four states a reader is looking at. For a prefix nothing
-// can keep: state "requested", both key booleans false, "none" as the point, partition_key in
-// NotEnforcedBy, and credential_issuance_blocked true with the remedy.
-//
-// # This is not per-tenant topics
-//
-// Blnk deliberately does not create a topic per subscriber. Isolation is delivered by the exact
-// topic grant, the reserved consumer-group namespace, and — for a key-scoped subscriber — the
-// declared component's per-record key check. The consequence worth stating to whoever designs on
-// top of it: A SUBSCRIBER THAT MUST NOT SEE ANOTHER'S RECORDS MUST EITHER NOT SHARE A TOPIC WITH
-// IT, OR CARRY A PARTITION-KEY PREFIX AND CONSUME THROUGH THE DECLARED COMPONENT.
-//
-// # The remedy travels with the limitation
-//
-// Guidance carries, in the same object, what a reader has to DO with all of this — which
-// endpoint to consume from, and what a subscriber without a prefix is and is not confined by.
-// That pairing was added when the remedy for the old client-side obligation existed only
-// outside the response, in a runbook and a log line, so an integrator reading a requirement
-// that promised key-prefix scoping and an integrator reading this body could reach opposite
-// conclusions. It says so in-band now, and what it says is a routing instruction rather than a
-// disclaimer.
+// BLNK DOES NOT SHIP THAT COMPONENT and exposes no data-plane route of its own — there
+// is no GET under /subscribers that returns records. Where no component is declared,
+// which is the shipped default, no CREDENTIAL is produced for a key-scoped subscriber:
+// issuance refuses with SUBSCRIBER_KEY_SCOPE_UNENFORCED (409) rather than emitting a
+// credential body that claims an enforcement point nothing is running.
 type SubscriberEnforcedAccess struct {
-	// EnforcedBy names every dimension Blnk enforces for this subscriber, and is exhaustive.
-	//
-	// topic and consumer_group are always present and are kept by the BROKER's authorizer.
-	// partition_key is present exactly when a prefix is recorded, and is kept by the declared
-	// key-authorising component — see PartitionKeyPrefixEnforcedBy, which names the component
-	// rather than leaving a reader to assume the broker does everything in this list.
-	//
-	// It gained the third value with the isolation correction. Before it, partition_key was
-	// absent from this list "by construction, not by omission", and that was honest about the
-	// broker and wrong about the platform: nothing enforced the prefix at all. It is listed now
-	// because a component does.
+	// EnforcedBy names every dimension Blnk enforces for this subscriber, and is
+	// exhaustive.
 	EnforcedBy []string `json:"enforced_by"`
 
-	// NotEnforcedBy names every access-shaped dimension this API accepts and NOTHING enforces.
-	//
-	// IT CARRIES THE KEY DIMENSION FOR EXACTLY ONE STATE: a prefix recorded on a deployment that
-	// declares nothing able to keep it — PartitionKeyScopeState "requested". That is the honest
-	// entry, and asserting the list is always empty was how the projection came to claim a
-	// verified boundary on the shipped default configuration. Where the deployment does declare
-	// an enforcement point the dimension appears in EnforcedBy instead, and this list is empty.
-	//
-	// So a dimension appearing here is not a defect being disclosed; it is an intent recorded and
-	// not yet realisable, and CredentialIssuanceBlockedReason names what to set.
-	//
-	// Together the two lists still enumerate every dimension this API names, so a dimension
-	// moving between them is observable. The pair is what makes the negative claim assertable
-	// at all: an absence from EnforcedBy proves nothing, because a dimension the server forgot
-	// and a dimension a newer version added read identically.
+	// NotEnforcedBy names every access-shaped dimension this API accepts and NOTHING
+	// enforces.
 	NotEnforcedBy []string `json:"not_enforced_by"`
 
 	// Topics is the exact set of topics the principal may Read and Describe. Anything
@@ -2169,246 +1437,81 @@ type SubscriberEnforcedAccess struct {
 	// subscriber's consumer group is not derivable, which registration prevents.
 	ConsumerGroupNamespace string `json:"consumer_group_namespace,omitempty"`
 
-	// PartitionKeyScopeState is HOW FAR this subscriber's key scope has actually got, and it is
-	// the field to read when the booleans below are not enough.
-	//
-	// It is present unconditionally and takes one of four values — not_requested, requested,
-	// available, attested — documented on model.SubscriberKeyScopeState. In one value it
-	// separates the four things this object previously conflated: a column somebody wrote, a
-	// configuration a deployment declared, evidence a component gave, and the broker grant Blnk
-	// read back.
-	//
-	// # Why it was added
-	//
-	// Every enforcement field here used to derive from ONE fact — whether the recorded prefix was
-	// non-blank — so a registration on the shipped default configuration reported the scope
-	// enforced, named broker_gateway as the enforcer, and required gateway delivery, on a
-	// deployment that had declared no gateway at all. The very next call, credential issuance,
-	// refused that same row for precisely the missing gateway. Two consecutive responses
-	// contradicted each other and neither said which was right.
-	//
-	// The booleans could not be fixed by themselves, because "is the prefix enforced?" has three
-	// honest answers rather than two: no scope, a scope nothing can keep, and a scope something
-	// keeps. This field carries the third dimension; PartitionKeyPrefixEnforced remains for the
-	// caller that only needs the safe/unsafe split.
-	//
-	// BRANCH ON THIS when the distinction matters — an operator dashboard showing which
-	// subscribers are waiting on a gateway, a client deciding whether to trust an isolation
-	// claim. It is a closed set of values and safe to switch on; unlike Guidance, it is contract.
+	// PartitionKeyScopeState is HOW FAR this subscriber's key scope has actually got, and
+	// it is the field to read when the booleans below are not enough.
 	PartitionKeyScopeState model.SubscriberKeyScopeState `json:"partition_key_scope_state"`
 
 	// PartitionKeyPrefixEnforced answers the one question whose wrong answer is a
 	// data-disclosure bug, outright rather than by inference from EnforcedBy.
 	//
-	// TRUE exactly when a prefix is recorded AND THIS DEPLOYMENT DECLARES A COMPONENT THAT CAN
-	// KEEP IT — PartitionKeyScopeState available or attested. Under it the subscriber's
-	// credential is granted no record-level Read at the broker, and the declared key-authorising
-	// component applies the prefix to every record's key before returning it. Read it together
-	// with PartitionKeyPrefixEnforcedBy, which names the component, and with BrokerRecordAccess,
-	// which says why direct consumption is refused.
-	//
-	// # The conjunction is the correction, and the missing half was the defect
-	//
-	// This was true for ANY recorded prefix, deployment state unread. On the shipped default —
-	// KAFKA_KEY_SCOPE_ENFORCEMENT unset, so nothing anywhere evaluates a record key — a
-	// registration therefore returned partition_key_prefix_enforced=true with broker_gateway
-	// named as the enforcer, and credential issuance then refused the row with
-	// SUBSCRIBER_KEY_SCOPE_UNENFORCED because no such component existed. An operator auditing
-	// tenancy from the registry, or a client deciding whether it needed filtering of its own, was
-	// told a verified boundary existed when none did. That is a security-relevant false
-	// statement, not a cosmetic one, and it is why the projection now takes the resolved
-	// deployment state as an argument (model.SubscriberAccessDeployment) instead of inferring it.
-	//
-	// A row whose prefix is recorded with nothing declared reports FALSE here, state
-	// "requested", the key dimension in NotEnforcedBy, and CredentialIssuanceBlocked true with
-	// the remedy. Every one of those says the same thing, which is the point.
-	//
-	// It was hard-coded FALSE before the isolation correction, on the reasoning that Kafka's
-	// authorizer has no message-key resource type — which is still true, and was never the
-	// whole question, because the enforcement point need not be the broker. With no prefix
-	// recorded there is nothing to narrow, the topic grant is the whole boundary, and this is
-	// false.
-	//
 	// ON A CREDENTIAL RESPONSE A TRUE HERE IS BACKED BY AN ATTESTATION rather than by
-	// configuration (SEC-01), and PartitionKeyScopeState says so by reporting "attested". A mode
+	// configuration, and PartitionKeyScopeState says so by reporting "attested". A mode
 	// and a distinct bootstrap list are assertions a deployment makes about itself; the
 	// attestation is an authenticated request the declared component answered, naming this
-	// principal and this prefix byte-for-byte, before any secret was generated. A component that
-	// could not be reached or disagreed produces no credential at all —
-	// SUBSCRIBER_KEY_SCOPE_UNATTESTED. On a REGISTRY read no round trip is made, so the strongest
-	// state reachable is "available": the deployment can keep the boundary, and nothing has yet
-	// confirmed it does for this subscriber.
+	// principal and this prefix byte-for-byte, before any secret was generated. A
+	// component that could not be reached or disagreed produces no credential at all —
+	// SUBSCRIBER_KEY_SCOPE_UNATTESTED.
 	PartitionKeyPrefixEnforced bool `json:"partition_key_prefix_enforced"`
 
-	// PartitionKeyPrefix echoes the routing hint recorded on the subscriber, or is empty when
-	// none is recorded.
-	//
-	// It is stated HERE, beside PartitionKeyPrefixEnforced and inside the same object, and that
-	// adjacency is the whole point: the value and the component that keeps it cannot be read
-	// apart. The subscriber body reports the prefix at the top level too, where a reader could
-	// take it for something the broker checks; in here it is unmistakable.
+	// PartitionKeyPrefix echoes the routing hint recorded on the subscriber, or is empty
+	// when none is recorded.
 	PartitionKeyPrefix string `json:"partition_key_prefix,omitempty"`
 
-	// GatewayDeliveryRequired is TRUE exactly when PartitionKeyPrefixEnforced is, and it is the
-	// actionable instruction the rest of this object only implies: CONSUME THROUGH THE
-	// KEY-AUTHORISING COMPONENT THE DEPLOYMENT DECLARED, whose address BrokerEndpoint carries,
-	// not directly from the Kafka brokers.
-	//
-	// It replaced client_side_key_filtering_required, and the replacement is the correction
-	// rather than a rename. That field told a subscriber to discard the records it was not
-	// entitled to, in its own consumer, having just been granted Read on the whole shared
-	// topic — so the boundary depended on the cooperation of the party it constrained. This
-	// field tells a subscriber where its records come from, and the reason it must go there is
-	// that the broker will refuse it: no topic Read binding exists for a key-scoped principal.
-	//
-	// IT IS FALSE FOR A PREFIX NOTHING CAN KEEP — state "requested" — and that is not a
-	// contradiction of the sentence above. There is no declared component to route to, so
-	// naming gateway delivery as required would instruct a client to dial an endpoint that does
-	// not exist. Such a subscriber has no usable consumption path at all until the deployment
-	// declares one, which is exactly what CredentialIssuanceBlocked reports; a false here
-	// alongside a false BrokerRecordAccess is that state said in the transport fields.
-	//
-	// A client should branch on THIS when choosing a transport. A subscriber for which it is
-	// false AND whose BrokerRecordAccess is true consumes from the broker with its SASL
-	// credential exactly as before.
+	// GatewayDeliveryRequired is TRUE exactly when PartitionKeyPrefixEnforced is, and it
+	// is the actionable instruction the rest of this object only implies: CONSUME THROUGH
+	// THE KEY-AUTHORISING COMPONENT THE DEPLOYMENT DECLARED, whose address BrokerEndpoint
+	// carries, not directly from the Kafka brokers.
 	GatewayDeliveryRequired bool `json:"gateway_delivery_required"`
 
 	// BrokerRecordAccess reports whether this subscriber's credential may fetch records
 	// DIRECTLY from the broker. It is TRUE exactly when no key scope is recorded.
 	//
 	// It is stated separately because it is the fact that explains the other: a key-scoped
-	// subscriber is not being ASKED to use the declared component as a courtesy, it is granted
-	// Describe on its topics and Read on its consumer-group namespace and no topic Read at all, so every
-	// fetch it attempts at the broker is refused by the authorizer. An integrator debugging a
-	// TOPIC_AUTHORIZATION_FAILED on a granted topic reads this field and knows immediately that
-	// the refusal is the design.
-	//
-	// It is the complement of GatewayDeliveryRequired for every state EXCEPT "requested", where
-	// both are false: the prefix withholds broker record access and no declared component exists
-	// to supply it instead. A client seeing both false should read CredentialIssuanceBlockedReason
-	// rather than pick a transport.
+	// subscriber is not being ASKED to use the declared component as a courtesy, it is
+	// granted Describe on its topics and Read on its consumer-group namespace and no topic
+	// Read at all, so every fetch it attempts at the broker is refused by the authorizer.
+	// An integrator debugging a TOPIC_AUTHORIZATION_FAILED on a granted topic reads this
+	// field and knows immediately that the refusal is the design.
 	BrokerRecordAccess bool `json:"broker_record_access"`
 
-	// PartitionKeyPrefixEnforcedBy names WHICH COMPONENT enforces the key scope, and it is the
-	// same fact the booleans above state, said as a place rather than as yes/no answers:
-	// "broker_gateway" when a recorded prefix has an enforcement point in this deployment,
-	// "none" when no prefix is recorded OR when nothing is declared to keep the one that is. The
-	// value is the SAME WORD the deployment declares in KAFKA_KEY_SCOPE_ENFORCEMENT, so a
-	// response and the configuration that made it issuable cannot name two different components.
-	//
-	// IT NAMED broker_gateway FOR ANY RECORDED PREFIX, which is the defect
-	// PartitionKeyPrefixEnforced documents: "enforced by" is the most load-bearing sentence in
-	// this object, and it was answering from a column rather than from the deployment. A place
-	// name for a component that was never deployed is worse than "none", because "none" sends a
-	// reader to the configuration and a name sends them looking for a host.
-	//
-	// It is carried IN ADDITION to the booleans rather than instead of them because the two
-	// readings serve different callers. A client choosing a transport wants the boolean it can
-	// branch on; a client or operator asking what the boundary IS wants to know who keeps it,
-	// and "enforced: false" answers that question with a denial rather than an answer — which
-	// is how a field that could only ever be false came once to be read as "unenforceable,
-	// therefore refuse to issue" and once as "disclose it and move on". Its value was
-	// "consumer_side" until the isolation correction; it names the operator-declared component
-	// now, because that component performs the check. All of these are derived from ONE value
-	// here, so they cannot disagree.
+	// PartitionKeyPrefixEnforcedBy names WHICH COMPONENT enforces the key scope, and it is
+	// the same fact the booleans above state, said as a place rather than as yes/no
+	// answers: "broker_gateway" when a recorded prefix has an enforcement point in this
+	// deployment, "none" when no prefix is recorded OR when nothing is declared to keep
+	// the one that is. The value is the SAME WORD the deployment declares in
+	// KAFKA_KEY_SCOPE_ENFORCEMENT, so a response and the configuration that made it
+	// issuable cannot name two different components.
 	PartitionKeyPrefixEnforcedBy model.KeyScopeEnforcementStatus `json:"partition_key_prefix_enforced_by"`
 
-	// ExclusiveGrantVerified reports that Blnk READ the principal's complete ACL grant at the
-	// broker and found no ALLOW binding outside the set described above.
+	// ExclusiveGrantVerified reports that Blnk READ the principal's complete ACL grant at
+	// the broker and found no ALLOW binding outside the set described above.
 	//
-	// # Why this field exists rather than being assumed
-	//
-	// Everything else in this struct describes what Blnk ASKED FOR. This describes what Blnk
-	// OBSERVED, and the two used to be able to disagree without saying so: a principal
-	// carrying a hand-made ALLOW binding — granting a topic outside Topics, or a wildcard, or
-	// a cluster resource — was detected, logged at warning level, and then issued a credential
-	// anyway. The response declared this exact boundary while the broker enforced a wider one,
-	// and nothing an integrator could read said which they had.
-	//
-	// Issuance now REFUSES while any such binding exists, so on a successful response this is
-	// necessarily true. It is stated anyway, for the same reason
+	// Issuance now REFUSES while any such binding exists, so on a successful response this
+	// is necessarily true. It is stated anyway, for the same reason
 	// PartitionKeyPrefixEnforced is: a client hard-coding an assumption about the boundary
-	// should be reading it out of the response, and a future posture in which a broader grant
-	// is tolerated must be visible here rather than silently changing what the other fields
-	// mean.
-	//
-	// A DENY binding outside the set does NOT clear it. A DENY only subtracts from what the
-	// ALLOW bindings grant, so it makes the effective access narrower than declared — which
-	// cannot be an isolation failure.
-	//
-	// It is FALSE on a subscriber read. Reading a registry row makes no broker round trip, so
-	// nothing about the broker's actual grant was observed, and reporting true there would be
-	// the same unverified claim in a different response. Only credential issuance verifies.
+	// should be reading it out of the response, and a future posture in which a broader
+	// grant is tolerated must be visible here rather than silently changing what the other
+	// fields mean.
 	ExclusiveGrantVerified bool `json:"exclusive_grant_verified"`
 
-	// Guidance is the REMEDY, carried in the same object as the boundary it describes, and it
-	// is always SubscriberKeyScopeGuidance.
-	//
-	// # Why a fact was not enough on its own
-	//
-	// Every other field here answers "what is enforced, and by what?". Between them they
-	// establish where the boundary sits — but a reader who has just learned that the broker
-	// does not evaluate message keys still has to work out what to DO, and until this field
-	// existed the API did not say. The answer lived in prose (the operations runbook), in a
-	// line in Blnk's own log, and in a Go constant that no response referenced. None of those
-	// is reachable by the integrator reading this body.
-	//
-	// That gap had a concrete cost, and it is the one the security review named: a partition
-	// key prefix looks like an access boundary in a requirement or a design note, and until the
-	// isolation correction it was not one anywhere in the system. Stating the remedy in-band
-	// collapses the ambiguity — the same bytes that say who enforces the key scope also say
-	// which endpoint delivers the records it applies to.
-	//
-	// # It is prose, and it must not be branched on
-	//
-	// This is guidance for a human reading a response or a support ticket, and its wording may
-	// be reworded. Branch on GatewayDeliveryRequired or BrokerRecordAccess, or assert on the
-	// EnforcedBy and NotEnforcedBy pair — those are the machine-readable contract. A client
-	// matching on this string is matching on documentation.
-	//
-	// # It is present unconditionally
-	//
-	// No omitempty, and it is populated whether or not a prefix is recorded, for the same
-	// reason NotEnforcedBy is: it describes what the BROKER can evaluate and where the boundary
-	// it cannot evaluate is kept instead, neither of which varies by row. A remedy that appeared
-	// only on key-scoped subscribers would leave a reader of any other subscriber guessing.
+	// Guidance is the REMEDY, carried in the same object as the boundary it describes, and
+	// it is always SubscriberKeyScopeGuidance.
 	Guidance string `json:"guidance"`
 }
 
-// EnforcementDimensionPartitionKey names the access-shaped dimension the BROKER does not
-// evaluate: a subscriber's partition-key prefix, enforced by the key-authorising component the
-// deployment declared in front of the brokers.
+// EnforcementDimensionPartitionKey names the access-shaped dimension the BROKER does
+// not evaluate: a subscriber's partition-key prefix, enforced by the key-authorising
+// component the deployment declared in front of the brokers.
 //
-// It is a constant rather than a literal for the same reason the enforced dimensions are: the
-// value appears in a response body — it joins SubscriberEnforcedAccess.EnforcedBy whenever a
-// prefix is recorded — so it is part of the API contract, and a reworded literal would silently
-// change what a client is matching on.
-//
-// It was the sole member of NotEnforcedBy before the isolation correction, which is the one
-// change worth noting about it: the name did not move, the list it appears in did.
+// It was the sole member of NotEnforcedBy before the isolation correction, which is the
+// one change worth noting about it: the name did not move, the list it appears in did.
 const EnforcementDimensionPartitionKey = "partition_key"
 
 // SubscriberKeyScopeGuidance is the routing instruction every subscriber and credential
 // response carries, in SubscriberEnforcedAccess.Guidance.
 //
-// Stated once, so the registry view and the credential view cannot give different advice about
-// the same boundary.
-//
-// It is a constant rather than a literal at the assignment for the same reason the dimension
-// names are: it reaches a response body, so it is part of what a client sees, and one copy is
-// what keeps the two views from drifting apart.
-//
-// Its TEXT is the isolation correction stated to an integrator. It used to say that a
-// partition-key prefix "is never enforced" and that the remedy was to narrow authorized_topics
-// or isolate at the deployment boundary — accurate advice about a platform that granted
-// whole-topic Read and asked the consumer to filter. A key-scoped subscriber is now granted no
-// record-level Read at all, and a credential for one is issued ONLY where the deployment has
-// declared a component that applies the prefix, so what an integrator needs from this sentence is
-// which endpoint to read from and what a prefix-less subscriber is not confined by.
-//
-// It names no Blnk-hosted read path, because there is none: Blnk exposes no data-plane route
-// under /subscribers and serves no records itself. The endpoint a key-scoped subscriber dials is
-// the declared component's own, delivered in this response's broker_endpoint.
+// Stated once, so the registry view and the credential view cannot give different
+// advice about the same boundary.
 const SubscriberKeyScopeGuidance = "Kafka authorises whole topics and consumer groups and has " +
 	"no message-key dimension, so a subscriber's partition-key prefix is enforced outside the " +
 	"broker: a subscriber that records one is granted Describe but NOT Read on its topics, so " +
@@ -2421,20 +1524,12 @@ const SubscriberKeyScopeGuidance = "Kafka authorises whole topics and consumer g
 	"readable in full — including records written for other ledgers and other subscribers on " +
 	"that topic."
 
-// NewSubscriberEnforcedAccess builds the enforced-access declaration for a subscriber whose
-// DEPLOYMENT STATE THE CALLER DOES NOT HOLD.
+// NewSubscriberEnforcedAccess builds the enforced-access declaration for a subscriber
+// whose DEPLOYMENT STATE THE CALLER DOES NOT HOLD.
 //
-// It is the fail-closed form, and it answers as if no key-scope enforcement point were declared:
-// a recorded prefix reports state "requested", partition_key in NotEnforcedBy, and "none" as the
-// enforcement point. That is the only safe answer for a caller with no configuration in hand,
-// because the alternative — inferring an enforcement point from the presence of a column, which
-// is what this constructor used to do — publishes an isolation claim nothing backs.
-//
-// EVERY PRODUCTION PROJECTION MUST USE NewSubscriberEnforcedAccessUnder instead, with the
-// resolved model.SubscriberAccessDeployment. NewSubscriberResponse does, and it is the only
-// assembler of a subscriber body. This overload remains for callers that genuinely have no
-// deployment state — tests exercising the shape, and any future path that projects a row outside
-// a configured process — so that "I do not know" produces an understatement rather than a lie.
+// It is the fail-closed form, and it answers as if no key-scope enforcement point were
+// declared: a recorded prefix reports state "requested", partition_key in
+// NotEnforcedBy, and "none" as the enforcement point.
 //
 // Parameters:
 //   - subscriberID string: the business key the principal and group are derived from.
@@ -2453,48 +1548,26 @@ func NewSubscriberEnforcedAccess(
 	)
 }
 
-// NewSubscriberEnforcedAccessUnder builds the declaration for a KNOWN enforcement point, and it
-// is the form every truthful projection uses.
+// NewSubscriberEnforcedAccessUnder builds the declaration for a KNOWN enforcement
+// point, and it is the form every truthful projection uses.
 //
-// # Why the enforcement point has to be passed in
-//
-// It is a property of the DEPLOYMENT and not of the registry row. A row records a prefix;
-// whether anything evaluates that prefix depends on whether the operator declared a
-// key-authorising component with a reachable attestation endpoint
-// (config.KafkaConfig.KeyScopeGateway), which only a caller holding the configuration knows.
-// api/model cannot read configuration — the root package that owns the decision imports it in
-// its own tests, so the reverse edge would close a cycle — so the answer is passed in.
-//
-// This constructor previously ACCEPTED that answer AND IGNORED IT, deriving every field from
-// whether the trimmed prefix was non-empty. The consequence was the defect the security review
-// named: on the shipped default configuration a registration reported
-// partition_key_prefix_enforced=true and named broker_gateway as the enforcer, and the next call
-// refused a credential for that same row because no such component was declared. The parameter is
-// now the fact the fields derive from, which is the whole of the correction.
-//
-// # The one thing it still cannot know
-//
-// Whether the declared component has CONFIRMED this subscriber's binding. That is an
-// authenticated round trip only credential issuance makes, so the strongest state reachable here
-// is "available"; NewVerifiedSubscriberEnforcedAccessUnder reports "attested" because issuance
-// obtained the confirmation before minting anything.
+// The parameter is now the fact the fields derive from, which is the whole of the
+// correction.
 //
 // Parameters:
 //   - subscriberID string: used to derive the consumer-group namespace.
 //   - topics []string: the exact topics the principal may Read and Describe.
 //   - partitionKeyPrefix string: the recorded prefix, trimmed here.
-//   - enforcement model.KeyScopeEnforcementStatus: where this DEPLOYMENT can enforce a key
-//     scope. Only broker_gateway can make PartitionKeyPrefixEnforced true, and only for a row
-//     that records a prefix.
+//   - enforcement model.KeyScopeEnforcementStatus: where this DEPLOYMENT can enforce a
+//     key scope. Only broker_gateway can make PartitionKeyPrefixEnforced true, and only
+//     for a row that records a prefix.
 //
 // Returns:
-//   - SubscriberEnforcedAccess: the declaration, internally consistent by construction. With a
-//     prefix recorded AND enforcement declared: partition_key joins EnforcedBy,
-//     PartitionKeyPrefixEnforced and GatewayDeliveryRequired are true, BrokerRecordAccess is
-//     false, the point is broker_gateway and the state is available. With a prefix recorded and
-//     NOTHING declared: partition_key joins NotEnforcedBy, all three booleans are false, the
-//     point is none and the state is requested. With no prefix: two enforced dimensions, both key
-//     booleans false, BrokerRecordAccess true, the point none and the state not_requested.
+//   - SubscriberEnforcedAccess: the declaration, internally consistent by construction.
+//     With a prefix recorded AND enforcement declared: partition_key joins EnforcedBy,
+//     PartitionKeyPrefixEnforced and GatewayDeliveryRequired are true,
+//     BrokerRecordAccess is false, the point is broker_gateway and the state is
+//     available.
 func NewSubscriberEnforcedAccessUnder(
 	subscriberID string,
 	topics []string,
@@ -2508,10 +1581,11 @@ func NewSubscriberEnforcedAccessUnder(
 	// one must not be reported as narrowed when nothing narrows it.
 	keyScoped := partitionKeyPrefix != ""
 
-	// THE DEPLOYMENT'S HALF, and the conjunction is what every enforcement field below is derived
-	// from. Two facts, not one: an intent recorded on the row, and a component declared in the
-	// environment able to keep it. Neither alone is an enforced boundary, and treating the first
-	// as though it were the pair is exactly what made this projection untruthful.
+	// THE DEPLOYMENT'S HALF, and the conjunction is what every enforcement field below is
+	// derived from. Two facts, not one: an intent recorded on the row, and a component
+	// declared in the environment able to keep it. Neither alone is an enforced boundary,
+	// and treating the first as though it were the pair is exactly what made this
+	// projection untruthful.
 	keyScopeEnforced := keyScoped && enforcement == model.KeyScopeEnforcementGateway
 
 	// THE STATE, resolved by the one derivation in model so a caller reading the scale and a
@@ -2525,10 +1599,10 @@ func NewSubscriberEnforcedAccessUnder(
 			EnforcementDimensionTopic,
 			EnforcementDimensionConsumerGroup,
 		},
-		// An explicitly allocated empty slice rather than nil, so the body carries [] instead of
-		// null: "nothing is unenforced" is a claim the response makes, and null would read as
-		// "not stated". Populated below for the one state in which a dimension really is kept by
-		// nobody.
+		// An explicitly allocated empty slice rather than nil, so the body carries [] instead
+		// of null: "nothing is unenforced" is a claim the response makes, and null would read
+		// as "not stated". Populated below for the one state in which a dimension really is
+		// kept by nobody.
 		NotEnforcedBy:          []string{},
 		Topics:                 topics,
 		PartitionKeyScopeState: state,
@@ -2536,11 +1610,11 @@ func NewSubscriberEnforcedAccessUnder(
 		// below applies it to every record's key before returning one; where none is declared
 		// there is nothing to name and nothing to claim.
 		PartitionKeyPrefixEnforced: keyScopeEnforced,
-		// THE RECORDED VALUE, trimmed, and empty when there is none. It is reported whatever the
-		// deployment state, because an operator inspecting a blocked row needs to see the prefix
-		// that is blocking it. A sentinel was tried here and removed: this string is the prefix
-		// record keys are matched against, so any stand-in for "no restriction" describes a
-		// filter that matches nothing.
+		// THE RECORDED VALUE, trimmed, and empty when there is none. It is reported whatever
+		// the deployment state, because an operator inspecting a blocked row needs to see the
+		// prefix that is blocking it. A sentinel was tried here and removed: this string is
+		// the prefix record keys are matched against, so any stand-in for "no restriction"
+		// describes a filter that matches nothing.
 		PartitionKeyPrefix: partitionKeyPrefix,
 		// The transport instruction, and it points somewhere only when there IS somewhere to
 		// point. A key-scoped row with nothing declared has neither this nor broker record
@@ -2548,19 +1622,19 @@ func NewSubscriberEnforcedAccessUnder(
 		GatewayDeliveryRequired: keyScopeEnforced,
 		BrokerRecordAccess:      !keyScoped,
 		// The place-shaped form of the same conjunction, so a caller reading the enforcement
-		// point and a caller reading the booleans are told the same thing. Derived rather than
-		// echoed from the parameter: the parameter is a deployment-wide fact, and a row with no
-		// prefix has no key scope for that component to enforce.
+		// point and a caller reading the booleans are told the same thing. Derived rather
+		// than echoed from the parameter: the parameter is a deployment-wide fact, and a row
+		// with no prefix has no key scope for that component to enforce.
 		PartitionKeyPrefixEnforcedBy: model.KeyScopeEnforcementNone,
-		// THE ROUTING INSTRUCTION, in the same object as the boundary, and the same sentence for
-		// every caller of this constructor. Assigned unconditionally: it describes what Kafka's
-		// authorizer can evaluate and where Blnk puts the boundary it cannot, neither of which
-		// is a property of this row. Its text already covers the undeclared case, which is why
-		// there is one sentence rather than one per state.
+		// THE ROUTING INSTRUCTION, in the same object as the boundary, and the same sentence
+		// for every caller of this constructor. Assigned unconditionally: it describes what
+		// Kafka's authorizer can evaluate and where Blnk puts the boundary it cannot, neither
+		// of which is a property of this row. Its text already covers the undeclared case,
+		// which is why there is one sentence rather than one per state.
 		Guidance: SubscriberKeyScopeGuidance,
 		// FALSE by default, and the default is the honest answer for every caller of this
-		// constructor except issuance. This builds the REQUESTED boundary from a registry row,
-		// which involves no broker round trip, so nothing here observed what the broker
+		// constructor except issuance. This builds the REQUESTED boundary from a registry
+		// row, which involves no broker round trip, so nothing here observed what the broker
 		// actually grants. Only NewVerifiedSubscriberEnforcedAccess sets it, and only because
 		// issuance really did read the grant and refuse a broader one.
 		ExclusiveGrantVerified: false,
@@ -2587,26 +1661,23 @@ func NewSubscriberEnforcedAccessUnder(
 	return enforced
 }
 
-// NewVerifiedSubscriberEnforcedAccess builds the enforced-access declaration for a boundary
-// Blnk has just READ AT THE BROKER and found exclusive.
+// NewVerifiedSubscriberEnforcedAccess builds the enforced-access declaration for a
+// boundary Blnk has just READ AT THE BROKER and found exclusive.
 //
-// It is the credential-issuance form, and it exists as a separate constructor rather than as a
-// boolean parameter so that the claim cannot be made by accident. Provisioning describes the
-// principal's complete ACL grant and REFUSES to return a password while any ALLOW binding sits
-// outside the declared set, so a response assembled here is one whose boundary was verified and
-// not merely requested. Every other caller — every read of a registry row — must use
-// NewSubscriberEnforcedAccess or its Under form, which report the claim as unverified because no
-// broker round trip happened.
-//
-// It claims NO key-scope enforcement point, exactly as NewSubscriberEnforcedAccess does and for
-// the same reason: the point is a deployment fact this overload is not given. Issuance holds it
-// and uses NewVerifiedSubscriberEnforcedAccessUnder.
+// It is the credential-issuance form, and it exists as a separate constructor rather
+// than as a boolean parameter so that the claim cannot be made by accident.
+// Provisioning describes the principal's complete ACL grant and REFUSES to return a
+// password while any ALLOW binding sits outside the declared set, so a response
+// assembled here is one whose boundary was verified and not merely requested. Every
+// other caller — every read of a registry row — must use NewSubscriberEnforcedAccess or
+// its Under form, which report the claim as unverified because no broker round trip
+// happened.
 //
 // Parameters:
 //   - subscriberID string: the business key the principal and group are derived from.
 //   - topics []string: the subscriber's exact topic grant.
-//   - partitionKeyPrefix string: the routing hint the credential was issued under. Empty when
-//     none is recorded.
+//   - partitionKeyPrefix string: the routing hint the credential was issued under.
+//     Empty when none is recorded.
 //
 // Returns:
 //   - SubscriberEnforcedAccess: the declaration, with ExclusiveGrantVerified true.
@@ -2620,23 +1691,13 @@ func NewVerifiedSubscriberEnforcedAccess(
 	)
 }
 
-// NewVerifiedSubscriberEnforcedAccessUnder is the issuance form: a verified grant AND a known
-// enforcement point.
+// NewVerifiedSubscriberEnforcedAccessUnder is the issuance form: a verified grant AND a
+// known enforcement point.
 //
-// Issuance is the only caller. It read the broker's complete ACL grant for this principal and
-// refused a broader one, and it read the deployment's key-scope enforcement mode to decide
-// whether to mint at all — so it is the one caller able to answer both questions truthfully in
-// one object.
-//
-// # It is the only constructor that can report an ATTESTED key scope
-//
-// A key-scoped credential exists only where issuance obtained an authenticated confirmation from
-// the declared component naming this principal and this prefix — see
-// (*EventSubscriberService).attestKeyScope — before any secret was generated. So on a response
-// assembled here a declared enforcement point is not merely available, it answered, and the state
-// is upgraded from available to attested. A registry read cannot reach that state, because it
-// makes no round trip; a prefix-less credential does not reach it either, because there is no
-// binding to attest.
+// Issuance is the only caller. It read the broker's complete ACL grant for this
+// principal and refused a broader one, and it read the deployment's key-scope
+// enforcement mode to decide whether to mint at all — so it is the one caller able to
+// answer both questions truthfully in one object.
 //
 // Parameters:
 //   - subscriberID string: used to derive the consumer-group namespace.
@@ -2645,8 +1706,8 @@ func NewVerifiedSubscriberEnforcedAccess(
 //   - enforcement model.KeyScopeEnforcementStatus: where the scope is enforced.
 //
 // Returns:
-//   - SubscriberEnforcedAccess: with ExclusiveGrantVerified set, and the key-scope state
-//     attested whenever a prefix was issued under a declared enforcement point.
+//   - SubscriberEnforcedAccess: with ExclusiveGrantVerified set, and the key-scope
+//     state attested whenever a prefix was issued under a declared enforcement point.
 func NewVerifiedSubscriberEnforcedAccessUnder(
 	subscriberID string,
 	topics []string,
@@ -2656,11 +1717,11 @@ func NewVerifiedSubscriberEnforcedAccessUnder(
 	enforced := NewSubscriberEnforcedAccessUnder(subscriberID, topics, partitionKeyPrefix, enforcement)
 	enforced.ExclusiveGrantVerified = true
 
-	// THE UPGRADE, and it is conditioned on the state the shared constructor resolved rather than
-	// on the parameters again. Available is precisely "a prefix is recorded and this deployment
-	// declares a component that can keep it", which is the state issuance had to be in to have
-	// asked for an attestation at all — so reading it back is what keeps this from being a second,
-	// drifting derivation of the same conjunction.
+	// THE UPGRADE, and it is conditioned on the state the shared constructor resolved
+	// rather than on the parameters again. Available is precisely "a prefix is recorded
+	// and this deployment declares a component that can keep it", which is the state
+	// issuance had to be in to have asked for an attestation at all — so reading it back
+	// is what keeps this from being a second, drifting derivation of the same conjunction.
 	if enforced.PartitionKeyScopeState == model.SubscriberKeyScopeStateAvailable {
 		enforced.PartitionKeyScopeState = model.SubscriberKeyScopeStateAttested
 	}
@@ -2670,35 +1731,20 @@ func NewVerifiedSubscriberEnforcedAccessUnder(
 
 // NewSubscriberResponse projects a stored subscriber into its response shape.
 //
-// Every handler that returns a subscriber goes through here, and that is the point:
-// the credential reference is reduced to a fingerprint in exactly one place, so no
-// handler can return the raw reference by writing the obvious assignment. A
-// projection that must be constructed is a projection that cannot be assembled
-// wrongly by omission.
+// Every handler that returns a subscriber goes through here, and that is the point: the
+// credential reference is reduced to a fingerprint in exactly one place, so no handler
+// can return the raw reference by writing the obvious assignment. A projection that
+// must be constructed is a projection that cannot be assembled wrongly by omission.
 //
-// The nullable columns are flattened to their zero values, which the omitempty tags
-// then drop from the body. That is correct for every one of them: an absent key
-// scope, an absent legacy URL and an absent credential are all "not recorded",
-// which is precisely what an omitted key means.
-//
-// # Why it takes the deployment state
-//
-// Two of the things this body asserts are not properties of the row at all: whether the recorded
-// key scope is enforced anywhere, and whether the next credential call will succeed. Both were
-// answered from the row alone, and both were wrong on the shipped default configuration — a
-// registration announced a verified key-scope boundary and reported issuance unblocked, and the
-// very next call refused for want of the component the announcement had just named. Passing the
-// resolved deployment state in makes this projection read the SAME three predicates
-// IssueSubscriberCredential reads, so the two cannot disagree.
-//
-// The zero deployment value is the fail-closed reading and safe to pass when nothing is known;
-// blnk.SubscriberAccessDeployment resolves the real one.
+// The zero deployment value is the fail-closed reading and safe to pass when nothing is
+// known; blnk.SubscriberAccessDeployment resolves the real one.
 //
 // Parameters:
 //   - subscriber model.EventSubscriber: the stored registry row.
-//   - deployment model.SubscriberAccessDeployment: the resolved configuration this subscriber
-//     lives in — where a key scope can be enforced, whether subscriber-facing brokers are
-//     advertised, and whether whole-topic access has been declared.
+//   - deployment model.SubscriberAccessDeployment: the resolved configuration this
+//     subscriber lives in — where a key scope can be enforced, whether
+//     subscriber-facing brokers are advertised, and whether whole-topic access has been
+//     declared.
 //
 // Returns:
 //   - SubscriberResponse: the response body, carrying no credential material.
@@ -2708,9 +1754,9 @@ func NewSubscriberResponse(
 ) SubscriberResponse {
 	response := SubscriberResponse{
 		SubscriberID: subscriber.SubscriberID,
-		// The pivot back from a metric label or a log line. Projected here rather than by
-		// the handler for the same reason the credential fingerprint is: a field that must
-		// be constructed cannot be omitted by a handler that forgot it, and a subscriber
+		// The pivot back from a metric label or a log line. Projected here rather than by the
+		// handler for the same reason the credential fingerprint is: a field that must be
+		// constructed cannot be omitted by a handler that forgot it, and a subscriber
 		// response missing it is a token nothing can resolve.
 		SubscriberIDHash:   model.HashIdentifier(subscriber.SubscriberID),
 		Name:               subscriber.Name,
@@ -2719,7 +1765,7 @@ func NewSubscriberResponse(
 		AuthorizedTopics:   subscriber.AuthorizedTopics,
 		CredentialIssuedAt: subscriber.CredentialIssuedAt,
 		MigratedAt:         subscriber.MigratedAt,
-		// ORPHAN-01: the unsettled-state markers travel with the row. Copied
+		// the unsettled-state markers travel with the row. Copied
 		// rather than derived, because each is a durable fact the registry
 		// recorded and the response must not soften or summarise it.
 		RevocationPendingAt:  subscriber.RevocationPendingAt,
@@ -2773,20 +1819,10 @@ func NewSubscriberResponse(
 // outstandingRevocation reports whether broker-side revocation is still owed for this
 // subscriber, and names the remedy when it is.
 //
-// # Why the reason is separate from the marker
-//
-// The tombstone this reads is the SAME column CountSubscriberRevocationsPending counts and
-// SubscriberRevocationOutstanding fires on, so the gauge, the alert and this response cannot
-// disagree about which rows are outstanding. What the column alone cannot say is which of two
-// opposite situations produced it. It once meant "the broker still honours this principal" OR
-// "the broker is clean and only the registry deletion failed", and an operator answering the
-// alert had no way to tell, so they went hunting for principals that no longer existed. A
-// confirmed revocation now clears the tombstone along with the credential record, which is
-// what lets this reason state ONE thing instead of branching — the debt it names is
-// broker-side access that has not been confirmed gone.
-//
-// The instant is reported separately, in RevocationPendingAt, because the age is what the
-// alert is stated over; this pair carries the fact and the action.
+// The tombstone this reads is the SAME column CountSubscriberRevocationsPending counts
+// and SubscriberRevocationOutstanding fires on, so the gauge, the alert and this
+// response cannot disagree about which rows are outstanding. What the column alone
+// cannot say is which of two opposite situations produced it.
 //
 // Parameters:
 //   - subscriber model.EventSubscriber: the row being projected.
@@ -2805,50 +1841,28 @@ func outstandingRevocation(subscriber model.EventSubscriber) (bool, string) {
 		"which is idempotent at the broker, or revoke the principal at the broker by hand."
 }
 
-// credentialIssuanceBlock predicts whether POST /subscribers/{id}/kafka-credentials will refuse
-// for this row in this deployment, and names the remedy when it will.
+// credentialIssuanceBlock predicts whether POST /subscribers/{id}/kafka-credentials
+// will refuse for this row in this deployment, and names the remedy when it will.
 //
-// # Why the projection predicts a later refusal
-//
-// Every condition below is knowable the moment the row is read together with the configuration —
-// none of them depends on the request — and an operator who learns them from a 409 or a 503 on
-// the credential call learns them at the least convenient moment, often in a script that has
-// already reported success for the registration. Stating the prediction on the resource turns a
-// late refusal into a fact visible on every read of it.
-//
-// # IT MIRRORS THE ISSUANCE PRECONDITIONS, IN ISSUANCE ORDER
-//
-// This checked only the two ROW conditions and reported unblocked for everything else, which made
-// it actively misleading rather than merely incomplete: a key-scoped row on a deployment with no
-// declared enforcement component reported credential_issuance_blocked=false, and
-// IssueSubscriberCredential then refused it with SUBSCRIBER_KEY_SCOPE_UNENFORCED. A prediction
-// that contradicts the thing it predicts is worse than no prediction.
-//
-// The six conditions below are the six IssueSubscriberCredential applies before it touches the
-// broker, in the same order, so the reason reported here is the reason that would come back:
+// The six conditions below are the six IssueSubscriberCredential applies before it
+// touches the broker, in the same order, so the reason reported here is the reason that
+// would come back:
 //
 //  1. requireActiveSubscriber — a deregistration in flight.
-//  2. requireProvisionableKeyScope — a recorded prefix with no enforcement point declared.
-//  3. requireKeyScopeWhenEnforced — no prefix in a deployment that declares the key-scoped model.
-//  4. requireAcknowledgedSharedTopicAccess — a whole-topic credential in a secure deployment that
-//     has declared neither access model.
+//  2. requireProvisionableKeyScope — a recorded prefix with no enforcement point
+//     declared.
+//  3. requireKeyScopeWhenEnforced — no prefix in a deployment that declares the
+//     key-scoped model.
+//  4. requireAcknowledgedSharedTopicAccess — a whole-topic credential in a secure
+//     deployment that has declared neither access model.
 //  5. requireGrantedTopics — an empty topic grant.
 //  6. subscriberFacingBrokers — no externally advertised bootstrap list.
 //
-// # The one refusal it does NOT predict, deliberately
-//
-// SUBSCRIBER_KEY_SCOPE_UNATTESTED. Attestation is an authenticated round trip to the declared
-// component, made once per issuance, and its answer is not a property of the row or of the
-// configuration — a component can be declared, reachable and still decline this binding. Claiming
-// to predict it would put a live dependency's health into a registry read, which is both untrue
-// and a way to make every listing slow. So a row this function reports as unblocked is one whose
-// KNOWABLE preconditions are satisfied; SubscriberEnforcedAccess.PartitionKeyScopeState is what
-// distinguishes "available" from "attested", and only an issuance response can report the latter.
-//
 // Parameters:
 //   - subscriber model.EventSubscriber: the row being projected.
-//   - deployment model.SubscriberAccessDeployment: the resolved configuration. Its zero value is
-//     the fail-closed reading, under which a blocked row is reported as blocked.
+//   - deployment model.SubscriberAccessDeployment: the resolved configuration. Its zero
+//     value is the fail-closed reading, under which a blocked row is reported as
+//     blocked.
 //
 // Returns:
 //   - bool: true when the next credential call will refuse for a reason knowable now.
@@ -2869,8 +1883,8 @@ func credentialIssuanceBlock(
 	// (2) A RECORDED PREFIX WITH NOTHING TO KEEP IT. Kafka's authorizer has no message-key
 	// dimension, so this row's boundary can only be applied by a component in front of the
 	// brokers, and this deployment declares none — issuance refuses rather than minting a
-	// credential whose declared scope nothing enforces. All three remedies are real, which is why
-	// all three are named.
+	// credential whose declared scope nothing enforces. All three remedies are real, which
+	// is why all three are named.
 	if keyScoped && !keyScopeAvailable {
 		return true, "This subscriber records a partition key prefix and this deployment declares " +
 			"no component that can enforce one, so no credential will be issued for it: Kafka " +
@@ -2909,10 +1923,10 @@ func credentialIssuanceBlock(
 			"the category topics it is entitled to."
 	}
 
-	// (6) THE ADDRESS THE SUBSCRIBER WOULD DIAL. There is no fallback to KAFKA_BROKERS — those are
-	// the addresses Blnk dials, internal in every real deployment — so issuance answers a typed
-	// 503 rather than handing out a one-time secret together with an endpoint nothing outside can
-	// reach.
+	// (6) THE ADDRESS THE SUBSCRIBER WOULD DIAL. There is no fallback to KAFKA_BROKERS —
+	// those are the addresses Blnk dials, internal in every real deployment — so issuance
+	// answers a typed 503 rather than handing out a one-time secret together with an
+	// endpoint nothing outside can reach.
 	if !deployment.SubscriberBrokersAdvertised {
 		return true, "This deployment advertises no subscriber-facing Kafka brokers, so a " +
 			"credential issued now would name no endpoint the subscriber could dial and issuance " +
@@ -2923,77 +1937,27 @@ func credentialIssuanceBlock(
 	return false, ""
 }
 
-// KafkaCredentialsResponse is returned by
-// POST /subscribers/:subscriber_id/kafka-credentials. It hands a subscriber
-// everything needed to start consuming: where the brokers are, which topics it
-// may read, which consumer group to read under, and the SASL/SCRAM credential
-// to authenticate with.
+// KafkaCredentialsResponse is returned by POST
+// /subscribers/:subscriber_id/kafka-credentials. It hands a subscriber everything
+// needed to start consuming: where the brokers are, which topics it may read, which
+// consumer group to read under, and the SASL/SCRAM credential to authenticate with.
 //
-// SECURITY: this is the ONLY type in the API surface that carries a password,
-// and it must stay that way.
-//
-// Password is populated exactly once, in the response to the issuing call. It
-// is never persisted: blnk.event_subscribers stores only a non-reversible
-// reference and the issuance instant, and has no column capable of holding the
-// secret. It is therefore not retrievable afterwards by any route, including
-// this one re-called, which mints a NEW credential rather than returning the
-// old one. A lost password can only be replaced, never recovered. It must never
-// be logged, echoed into an error message, or written to a trace attribute.
-// This mirrors Blnk's API-key posture, where the stored value is a bcrypt hash
-// and the raw key is never kept.
-//
-// # THE ACCESS BOUNDARY THIS RESPONSE DESCRIBES
-//
-// The credential grants TOPIC-LEVEL Read and Describe on AuthorizedTopics, plus
-// Read on the subscriber's prefixed consumer-group namespace. Nothing further.
+// SECURITY: this is the ONLY type in the API surface that carries a password, and it
+// must stay that way.
 //
 // Two limits are stated here rather than left to be inferred, because a caller
 // integrating against this response will otherwise assume the narrower boundary:
 //
-//   - WITHIN an authorised topic there is NO further restriction. The credential
-//     reads every record on that topic, including records belonging to other
-//     tenants, ledgers or organisations. Kafka authorises at topic and group
-//     granularity and has no message-key dimension, so per-key filtering cannot
-//     be enforced by the broker and is not claimed anywhere.
+//   - WITHIN an authorised topic there is NO further restriction. The credential reads
+//     every record on that topic, including records belonging to other tenants, ledgers
+//     or organisations.
 //   - The recorded partition-key prefix IS carried, inside
-//     EnforcedAccess.PartitionKeyScope, and only there. That placement is the
-//     whole design: it sits beside PartitionKeyPrefixEnforced, which is false, so
-//     it cannot be read as a limit on the credential's reach. This response
-//     previously withheld it altogether — which did not make the boundary
-//     enforceable, it made it undeliverable, leaving a key-scoped subscriber with
-//     no way to learn the scope it is expected to apply.
-//
-// Dead-letter topics are never granted to a subscriber, so no '<topic>.dlt' can
-// appear in AuthorizedTopics.
-//
-// Being response-only, no field carries a binding tag.
+//     EnforcedAccess.PartitionKeyScope, and only there. That placement is the whole
+//     design: it sits beside PartitionKeyPrefixEnforced, which is false, so it cannot
+//     be read as a limit on the credential's reach.
 type KafkaCredentialsResponse struct {
-	// Brokers is the SUBSCRIBER-FACING bootstrap broker list: the externally
-	// advertised addresses this subscriber connects to, from
-	// KAFKA_SUBSCRIBER_BROKERS.
-	//
-	// It is NOT the address list Blnk itself dials. Those are internal —
-	// "kafka:9092" on a compose network, a ClusterIP Service name in Kubernetes
-	// — and they do not resolve outside the deployment; a broker also answers
-	// each client with the advertised address of the listener it arrived on, so
-	// an external subscriber must be given an externally advertised address.
-	//
-	// KAFKA_SUBSCRIBER_BROKERS IS REQUIRED FOR ISSUANCE AND THERE IS NO FALLBACK. With it
-	// unset, issuance answers 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED and mints nothing;
-	// KAFKA_BROKERS is never substituted. See config.KafkaConfig.SubscriberFacingBrokers,
-	// which owns that policy: a fallback existed, warned on every issuance, and the
-	// warning landed in Blnk's log while the consequence — an internal address handed to
-	// an outside consumer — landed on the subscriber days later as a connection timeout,
-	// holding a secret shown exactly once and only replaceable by reissue.
-	//
-	// A deployment whose subscribers really do run inside it says so in one line, by
-	// setting this to the same value as KAFKA_BROKERS. That is a claim an operator has
-	// made rather than one the service invented.
-	//
-	// FOR A KEY-SCOPED SUBSCRIBER THIS IS THE DECLARED COMPONENT'S ADDRESS instead, not
-	// the brokers': such a credential has no topic Read binding, so the brokers would
-	// refuse every fetch. EnforcedAccess.GatewayDeliveryRequired is the field that says
-	// which of the two this is.
+	// Brokers is the SUBSCRIBER-FACING bootstrap broker list: the externally advertised
+	// addresses this subscriber connects to, from KAFKA_SUBSCRIBER_BROKERS.
 	Brokers []string `json:"brokers"`
 
 	// BrokerEndpoint is a convenience rendering of the same subscriber-facing
@@ -3011,10 +1975,10 @@ type KafkaCredentialsResponse struct {
 	// this is the default leaf, not the only permitted value.
 	ConsumerGroupID string `json:"consumer_group_id"`
 
-	// EnforcedAccess declares which parts of the subscriber's access model the
-	// broker enforces for this credential. It is the field a consumer is
-	// configured from: the topic set is exact and the group namespace is
-	// reserved, and no key-based filtering is applied by the broker to either.
+	// EnforcedAccess declares which parts of the subscriber's access model the broker
+	// enforces for this credential. It is the field a consumer is configured from: the
+	// topic set is exact and the group namespace is reserved, and no key-based filtering
+	// is applied by the broker to either.
 	EnforcedAccess SubscriberEnforcedAccess `json:"enforced_access"`
 
 	// Username is the SASL/SCRAM username, i.e. the subscriber's Kafka
@@ -3037,86 +2001,42 @@ type KafkaCredentialsResponse struct {
 	// CredentialFingerprint is the short, non-sensitive digest fragment of the stored
 	// credential reference — the SAME value GET /subscribers reports for this row once the
 	// issuance is recorded.
-	//
-	// It is what makes an issuance identifiable after the fact. The password is returned
-	// exactly once and nothing persists it, so without this field a client holding a
-	// credential had no way to ask "is the credential I am using the one the registry
-	// records?": it could read credential_fingerprint from a subscriber read and have
-	// nothing to compare it against. The service computed it on every issuance and the
-	// response dropped it.
-	//
-	// It is not a secret and cannot be authenticated with, and the reference cannot be
-	// recovered from it — which is why it is safe to return beside the password and safe to
-	// log, unlike either of them.
 	CredentialFingerprint string `json:"credential_fingerprint"`
 
-	// Replaced reports that this principal ALREADY held a SCRAM credential and this issuance
-	// replaced it.
-	//
-	// Kafka stores one credential per principal, so a re-issue is destructive by
-	// construction: the moment this returns true, any consumer still authenticating with the
-	// previous password has stopped working. That is a fact the caller needs at the moment of
-	// issuance — it is the difference between "provision a new subscriber" and "you have just
-	// cut off a live consumer" — and the service established it from the broker's own
-	// describe while the response said nothing.
-	//
-	// It is also the honest form of the orphan remedy: re-issuing is what settles a
-	// credential Blnk could not account for, precisely because it replaces it, and this field
-	// is the confirmation that the replacement happened.
+	// Replaced reports that this principal ALREADY held a SCRAM credential and this
+	// issuance replaced it.
 	Replaced bool `json:"replaced"`
 }
 
-// CreateWebhookSubscription is the request body for
-// POST /subscribers/:subscriber_id/webhook-subscription.
+// CreateWebhookSubscription is the request body for POST
+// /subscribers/:subscriber_id/webhook-subscription.
 //
-// The route exists because the requirement to migrate existing subscribers off
-// the webhook subscription REST API meets a repository in which no such API
-// exists: the entire subscription surface today is one global webhook URL in the
-// configuration, with no per-subscriber storage and no registration endpoint.
-// Recording a legacy URL per subscriber gives an existing subscriber somewhere
-// to be recorded and migrated FROM, and it is what makes the sunset behaviour
-// observable at all, since without a subscription route there is no request on
-// which a 410 could ever be seen.
+// This is not the /hooks surface. Those are the PRE_TRANSACTION and POST_TRANSACTION
+// request-time callouts, they carry a response contract that can influence transaction
+// processing, they remain fully functional, and they have nothing to do with these
+// types.
 //
-// This is not the /hooks surface. Those are the PRE_TRANSACTION and
-// POST_TRANSACTION request-time callouts, they carry a response contract that
-// can influence transaction processing, they remain fully functional, and they
-// have nothing to do with these types.
-//
-// Deprecated: the legacy webhook-subscription surface exists only for the
-// 30-day dual-delivery window during which Kafka publishing and HTTP webhook
-// delivery run side by side from the same outbox events. Once
-// WEBHOOK_DEPRECATION_SUNSET_DATE has passed, every request to these routes is
-// answered with 410 Gone by the sunset guard. Use the Kafka event stream and the
-// subscriber credential endpoint instead; see docs/webhook-to-kafka-migration.md.
-//
-// WHAT THIS SURFACE DOES NOT DO, stated plainly because the name invites the
-// opposite reading: recording a URL here does NOT cause anything to be delivered
-// to it. Blnk has one webhook destination and it is deployment-wide —
-// Notification.Webhook.Url — and the relay's legacy leg posts every event of the
-// dual-delivery window to that one endpoint. The column is a MIGRATION RECORD:
-// it is where a subscriber's existing endpoint is written down so the move to
-// Kafka can be tracked and so the sunset has a route on which a 410 is
-// observable. Per-subscriber HTTP fan-out is deliberately not built, because
-// building new delivery into the transport being retired is the opposite of
-// retiring it.
+// Deprecated: the legacy webhook-subscription surface exists only for the 30-day
+// dual-delivery window during which Kafka publishing and HTTP webhook delivery run side
+// by side from the same outbox events. Once WEBHOOK_DEPRECATION_SUNSET_DATE has passed,
+// every request to these routes is answered with 410 Gone by the sunset guard. Use the
+// Kafka event stream and the subscriber credential endpoint instead; see
+// docs/webhook-to-kafka-migration.md.
 type CreateWebhookSubscription struct {
-	// WebhookURL is the legacy HTTP endpoint to record for this subscriber.
-	// Required: a record whose only field is absent records nothing. It is the
-	// subscriber's own endpoint, written down for migration tracking — see the
-	// type comment for why nothing is delivered to it.
-	//
-	// Must be HTTPS and must not address an internal destination — see Validate.
+	// WebhookURL is the legacy HTTP endpoint to record for this subscriber. Required: a
+	// record whose only field is absent records nothing. It is the subscriber's own
+	// endpoint, written down for migration tracking — see the type comment for why nothing
+	// is delivered to it.
 	WebhookURL string `json:"webhook_url" binding:"required"`
 }
 
-// Validate applies the destination policy to the recorded URL (SSRF-01).
+// Validate applies the destination policy to the recorded URL.
 //
-// This route is the ONLY one whose entire purpose is to accept a URL, which makes
-// it the most likely way an internal address reaches the column. The rules and the
+// This route is the ONLY one whose entire purpose is to accept a URL, which makes it
+// the most likely way an internal address reaches the column. The rules and the
 // reasoning are in validateLegacyWebhookURL; the same policy is applied by the
-// subscriber DTOs and again at the persistence boundary, so no path stores a URL
-// that another would have refused.
+// subscriber DTOs and again at the persistence boundary, so no path stores a URL that
+// another would have refused.
 //
 // Returns:
 //   - error: describing the violation, nil when the URL is acceptable.
@@ -3124,42 +2044,30 @@ func (c CreateWebhookSubscription) Validate() error {
 	return validateLegacyWebhookURL(c.WebhookURL)
 }
 
-// UpdateWebhookSubscription is the request body for
-// PUT /subscribers/:subscriber_id/webhook-subscription. It follows the
-// Create/Update split this package uses, and carries the same single mutable
-// field, so correcting a recorded URL does not have to go through a delete and
-// re-create.
+// UpdateWebhookSubscription is the request body for PUT
+// /subscribers/:subscriber_id/webhook-subscription. It follows the Create/Update split
+// this package uses, and carries the same single mutable field, so correcting a
+// recorded URL does not have to go through a delete and re-create.
 //
-// Deprecated: the legacy webhook-subscription surface exists only for the
-// 30-day dual-delivery window during which Kafka publishing and HTTP webhook
-// delivery run side by side from the same outbox events. Once
-// WEBHOOK_DEPRECATION_SUNSET_DATE has passed, every request to these routes is
-// answered with 410 Gone by the sunset guard. Use the Kafka event stream and the
-// subscriber credential endpoint instead; see docs/webhook-to-kafka-migration.md.
-//
-// WHAT THIS SURFACE DOES NOT DO, stated plainly because the name invites the
-// opposite reading: recording a URL here does NOT cause anything to be delivered
-// to it. Blnk has one webhook destination and it is deployment-wide —
-// Notification.Webhook.Url — and the relay's legacy leg posts every event of the
-// dual-delivery window to that one endpoint. The column is a MIGRATION RECORD:
-// it is where a subscriber's existing endpoint is written down so the move to
-// Kafka can be tracked and so the sunset has a route on which a 410 is
-// observable. Per-subscriber HTTP fan-out is deliberately not built, because
-// building new delivery into the transport being retired is the opposite of
-// retiring it.
+// Deprecated: the legacy webhook-subscription surface exists only for the 30-day
+// dual-delivery window during which Kafka publishing and HTTP webhook delivery run side
+// by side from the same outbox events. Once WEBHOOK_DEPRECATION_SUNSET_DATE has passed,
+// every request to these routes is answered with 410 Gone by the sunset guard. Use the
+// Kafka event stream and the subscriber credential endpoint instead; see
+// docs/webhook-to-kafka-migration.md.
 type UpdateWebhookSubscription struct {
-	// WebhookURL is the replacement legacy HTTP endpoint. Required for the same
-	// reason it is on create, and delivered to for the same reason: none.
+	// WebhookURL is the replacement legacy HTTP endpoint. Required for the same reason it
+	// is on create, and delivered to for the same reason: none.
 	//
 	// Must be HTTPS and must not address an internal destination — see Validate.
 	WebhookURL string `json:"webhook_url" binding:"required"`
 }
 
-// Validate applies the destination policy to the replacement URL (SSRF-01).
+// Validate applies the destination policy to the replacement URL.
 //
-// Update is checked at exactly the same standard as create, because a URL that
-// arrives by an edit is stored in the same column and read by the same readers.
-// A policy applied only on creation is a policy with an edit-shaped hole.
+// Update is checked at exactly the same standard as create, because a URL that arrives
+// by an edit is stored in the same column and read by the same readers. A policy
+// applied only on creation is a policy with an edit-shaped hole.
 //
 // Returns:
 //   - error: describing the violation, nil when the URL is acceptable.
@@ -3167,32 +2075,16 @@ func (u UpdateWebhookSubscription) Validate() error {
 	return validateLegacyWebhookURL(u.WebhookURL)
 }
 
-// WebhookSubscriptionResponse is the read shape for the legacy
-// webhook-subscription routes, returned by the create, read and update calls.
-// The delete route answers 204 with no body and so needs no shape.
+// WebhookSubscriptionResponse is the read shape for the legacy webhook-subscription
+// routes, returned by the create, read and update calls. The delete route answers 204
+// with no body and so needs no shape.
 //
-// It carries no credential and no headers: the legacy transport's signing secret
-// and configured headers are deployment-wide configuration, never per-subscriber
-// data, and surfacing them here would turn a migration-tracking response into a
-// secret-bearing one.
-//
-// Deprecated: the legacy webhook-subscription surface exists only for the
-// 30-day dual-delivery window during which Kafka publishing and HTTP webhook
-// delivery run side by side from the same outbox events. Once
-// WEBHOOK_DEPRECATION_SUNSET_DATE has passed, every request to these routes is
-// answered with 410 Gone by the sunset guard. Use the Kafka event stream and the
-// subscriber credential endpoint instead; see docs/webhook-to-kafka-migration.md.
-//
-// WHAT THIS SURFACE DOES NOT DO, stated plainly because the name invites the
-// opposite reading: recording a URL here does NOT cause anything to be delivered
-// to it. Blnk has one webhook destination and it is deployment-wide —
-// Notification.Webhook.Url — and the relay's legacy leg posts every event of the
-// dual-delivery window to that one endpoint. The column is a MIGRATION RECORD:
-// it is where a subscriber's existing endpoint is written down so the move to
-// Kafka can be tracked and so the sunset has a route on which a 410 is
-// observable. Per-subscriber HTTP fan-out is deliberately not built, because
-// building new delivery into the transport being retired is the opposite of
-// retiring it.
+// Deprecated: the legacy webhook-subscription surface exists only for the 30-day
+// dual-delivery window during which Kafka publishing and HTTP webhook delivery run side
+// by side from the same outbox events. Once WEBHOOK_DEPRECATION_SUNSET_DATE has passed,
+// every request to these routes is answered with 410 Gone by the sunset guard. Use the
+// Kafka event stream and the subscriber credential endpoint instead; see
+// docs/webhook-to-kafka-migration.md.
 type WebhookSubscriptionResponse struct {
 	// SubscriberID is the subscriber the recorded subscription belongs to.
 	SubscriberID string `json:"subscriber_id"`

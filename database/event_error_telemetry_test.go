@@ -38,19 +38,8 @@ import (
 	"github.com/blnkfinance/blnk/internal/apierror"
 )
 
-// event_error_telemetry_test.go covers DATA-02: the driver's own words must not reach the
+// event_error_telemetry_test.go covers the driver's own words must not reach the
 // standard log or a span.
-//
-// DATA-01 stopped a *pq.Error being serialised into an API RESPONSE. The same value was still
-// rendered into an "error" log field and written as a span's exception.message, and both of
-// those leave the process — the log to an indexed aggregator, the span to a trace backend that
-// is routinely readable by more people than the database is. A PostgreSQL message names the
-// schema, the table, the column, the violated constraint and the server source file that raised
-// it; a connection failure names the host and port.
-//
-// The fixture below is therefore a fully populated *pq.Error rather than a bare errors.New:
-// every field it carries is a thing that must not appear, and asserting on a stub would prove
-// nothing about the case that matters.
 
 // disclosivePostgresError is a driver error carrying every field lib/pq exposes.
 //
@@ -73,15 +62,10 @@ func disclosivePostgresError() *pq.Error {
 	}
 }
 
-// disclosiveSubstrings is what must never appear in a bounded log line or a span status.
+// disclosiveSubstrings is what must never appear in a bounded log line or a span
+// status.
 //
-// Every entry is a value that can ONLY have come from the driver. The bare table name
-// "event_outbox" is deliberately absent even though a *pq.Error carries it: Blnk's own fixed
-// operation literals are named after the operations they describe — "insert_event_outbox" —
-// and forbidding the substring would flag a value this code chose and controls, which is the
-// false positive that makes a rule like this get deleted rather than fixed. The constraint
-// name, the server source path and the routine are unambiguous, and they are the parts that
-// actually map the database.
+// Every entry is a value that can ONLY have come from the driver.
 func disclosiveSubstrings() []string {
 	return []string{
 		"uq_event_outbox_event_id",
@@ -93,11 +77,8 @@ func disclosiveSubstrings() []string {
 	}
 }
 
-// TestDatabaseErrorClass_MapsEverySQLStateClassAndTheGoLevelConditions pins the vocabulary.
-//
-// The SQLSTATE CLASS is what decides where an operator looks — 08 is the network or the pool,
-// 23 is the data, 40 is contention a retry resolves, 42 is the schema or the grant and is a
-// genuine deployment fault — so each is asserted rather than lumped into "some class".
+// TestDatabaseErrorClass_MapsEverySQLStateClassAndTheGoLevelConditions pins the
+// vocabulary.
 func TestDatabaseErrorClass_MapsEverySQLStateClassAndTheGoLevelConditions(t *testing.T) {
 	apiErr := apierror.APIError{Code: apierror.ErrSubscriberNotFound, Message: "Subscriber not found"}
 
@@ -177,11 +158,9 @@ func TestDatabaseErrorClass_MapsEverySQLStateClassAndTheGoLevelConditions(t *tes
 	})
 }
 
-// TestLoggedDatabaseError_LogsTheClassAndNotTheDriversWords is the log half of DATA-02.
+// TestLoggedDatabaseError_LogsTheClassAndNotTheDriversWords is the log half of the redaction rule.
 //
-// Both the field NAME and every field VALUE are inspected. Asserting only that there is no
-// field called "error" would pass for an implementation that renamed the field and kept the
-// text, which is the mistake this guards.
+// Both the field NAME and every field VALUE are inspected.
 func TestLoggedDatabaseError_LogsTheClassAndNotTheDriversWords(t *testing.T) {
 	restore := pinDatabaseLogLevel(t, logrus.InfoLevel)
 	defer restore()
@@ -221,12 +200,10 @@ func TestLoggedDatabaseError_LogsTheClassAndNotTheDriversWords(t *testing.T) {
 	})
 }
 
-// TestLogDatabaseDiagnostic_EmitsTheRawCauseOnlyAtTrace proves the sink is separate from the
-// level operators already raise.
+// TestLogDatabaseDiagnostic_EmitsTheRawCauseOnlyAtTrace proves the sink is separate
+// from the level operators already raise.
 //
-// DEBUG is asserted SILENT. That is the substance of the design rather than a detail: debug is
-// already the event pipeline's routine per-event volume, so if the sink lived there, following
-// a delivery would begin shipping schema detail as a side effect.
+// DEBUG is asserted SILENT.
 func TestLogDatabaseDiagnostic_EmitsTheRawCauseOnlyAtTrace(t *testing.T) {
 	cause := disclosivePostgresError()
 
@@ -268,11 +245,8 @@ func TestLogDatabaseDiagnostic_EmitsTheRawCauseOnlyAtTrace(t *testing.T) {
 	})
 }
 
-// TestFailDatabaseSpan_SetsABoundedStatusAndRecordsNoException is the trace half of DATA-02.
-//
-// A real SDK span is recorded and its exported snapshot inspected, because the defect is only
-// observable in what the exporter emits: RecordError adds an EVENT, not an attribute, so a test
-// that looked only at attributes would miss the disclosure entirely.
+// TestFailDatabaseSpan_SetsABoundedStatusAndRecordsNoException is the trace half of
+// the redaction rule.
 func TestFailDatabaseSpan_SetsABoundedStatusAndRecordsNoException(t *testing.T) {
 	recorder := tracetest.NewSpanRecorder()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
@@ -323,12 +297,9 @@ func TestFailDatabaseSpan_SetsABoundedStatusAndRecordsNoException(t *testing.T) 
 
 // TestNeitherEventRepositoryCallsSpanRecordError is the lasting guard.
 //
-// The two repositories hold a hundred failure paths between them, and a single reintroduced
-// span.RecordError re-opens the disclosure on whichever path nobody happened to exercise. No
-// runtime assertion can see an unexercised call, so the absence is asserted over the source.
-//
-// Comments are excluded from the parse deliberately: the DATA-02 note explains what
-// span.RecordError did, and a text scan would count the explanation as the violation.
+// The two repositories hold a hundred failure paths between them, and a single
+// reintroduced span.RecordError re-opens the disclosure on whichever path nobody
+// happened to exercise.
 func TestNeitherEventRepositoryCallsSpanRecordError(t *testing.T) {
 	for _, name := range []string{"event_outbox.go", "event_subscriber.go"} {
 		t.Run(name, func(t *testing.T) {
@@ -341,12 +312,8 @@ func TestNeitherEventRepositoryCallsSpanRecordError(t *testing.T) {
 	}
 }
 
-// TestExportedErrorTelemetryHelpers_MatchTheirUnexportedForms covers the exported surface the
-// API layer and the server role use.
-//
-// They exist so a handler classifies an error the repository returned instead of rendering it,
-// and thin as they are, a delegation that drifted would leave those callers logging under a
-// different vocabulary from the repository's own lines.
+// TestExportedErrorTelemetryHelpers_MatchTheirUnexportedForms covers the exported
+// surface the API layer and the server role use.
 func TestExportedErrorTelemetryHelpers_MatchTheirUnexportedForms(t *testing.T) {
 	for _, cause := range []error{
 		nil,
@@ -374,10 +341,11 @@ func TestExportedErrorTelemetryHelpers_MatchTheirUnexportedForms(t *testing.T) {
 	})
 }
 
-// pinDatabaseLogLevel sets the standard logger's level for one test and returns the restorer.
+// pinDatabaseLogLevel sets the standard logger's level for one test and returns the
+// restorer.
 //
-// The level is process-wide, so restoring is not tidiness: a test that left it at trace would
-// make every later test in the package emit its diagnostics.
+// The level is process-wide, so restoring is not tidiness: a test that left it at trace
+// would make every later test in the package emit its diagnostics.
 //
 // Parameters:
 //   - t *testing.T: the test, for the helper marker.
@@ -399,9 +367,10 @@ func pinDatabaseLogLevel(t *testing.T, level logrus.Level) func() {
 // call site here and fail against the otel no-op span a caller without a provider receives.
 var _ func(trace.Span, error) = failDatabaseSpan
 
-// recordErrorCallCount counts calls to a method named RecordError in a database-package file.
+// recordErrorCallCount counts calls to a method named RecordError in a database-package
+// file.
 //
-// The file is parsed rather than scanned, and comments are not parsed, so the DATA-02 note that
+// The file is parsed rather than scanned, and comments are not parsed, so the note that
 // names span.RecordError in prose cannot be mistaken for a call to it.
 //
 // Parameters:

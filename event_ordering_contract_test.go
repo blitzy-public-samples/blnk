@@ -14,43 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// SOURCE-TO-DOCUMENTATION CONTRACT ASSERTIONS for the two published contracts a subscriber
-// builds against and that nothing else can check: the PARTITION KEY of each event type, and
-// which event types are at-most-once.
+// SOURCE-TO-DOCUMENTATION CONTRACT ASSERTIONS for the two published contracts a
+// subscriber builds against and that nothing else can check: the PARTITION KEY of each
+// event type, and which event types are at-most-once.
 //
-// # Why these need a test at all
+// Both contracts are stated in docs/event-streaming.md, and a subscriber reading them
+// makes design decisions that cannot be walked back cheaply: which events it may assume
+// are mutually ordered, and whether it needs a reconciliation path for an event that
+// may never arrive. Neither statement has a compiler behind it.
 //
-// Both contracts are stated in docs/event-streaming.md, and a subscriber reading them makes
-// design decisions that cannot be walked back cheaply: which events it may assume are mutually
-// ordered, and whether it needs a reconciliation path for an event that may never arrive. Neither
-// statement has a compiler behind it. Documentation drifted from the implementation on exactly
-// these two points and the drift was invisible from both sides:
-//
-//   - The partition-key table said a transaction event keys on its SOURCE BALANCE and a monitor
-//     alert on the WATCHED BALANCE, while every production call site was already supplying the
-//     LEDGER, which overrides the payload-derived key. It further claimed Kafka partitioning
-//     "agrees with" the internal transaction queue's sharding, which is false precisely because
-//     the ledger overrides: the queue shards on the source balance. A subscriber that had built
-//     per-balance ordering assumptions on that paragraph would have been wrong about the one
-//     property it was reading the paragraph for.
+//   - The partition-key table said a transaction event keys on its SOURCE BALANCE and a
+//     monitor alert on the WATCHED BALANCE, while every production call site was
+//     already supplying the LEDGER, which overrides the payload-derived key.
 //   - The at-most-once section named `balance.monitor` as "the one exception", while
-//     transaction_bulk.go separately described the bulk summary as the event that "cannot be
-//     enrolled" — two mutually exclusive claims to the same status, twelve files apart, and a
-//     subscriber told that exactly one event type could be lost.
+//     transaction_bulk.go separately described the bulk summary as the event that
+//     "cannot be enrolled" — two mutually exclusive claims to the same status, twelve
+//     files apart, and a subscriber told that exactly one event type could be lost.
 //
-// # What is asserted, and what is deliberately not
-//
-// These tests compare BEHAVIOUR against the document. The key for each event type is produced by
-// running PrepareEventOutbox over a representative payload, exactly as a producer does, and the
-// resulting key is then required to be the value the document's table names. Parsing the Markdown
-// table itself would test the parser; instead the table's claims are transcribed here once, with
-// the document's own wording quoted in each assertion message, so a change to either side that is
-// not made to the other fails here with a message that says which document section to fix.
-//
-// Prose is NOT asserted verbatim — that would make every editorial improvement a test failure.
-// What is asserted is the presence of the specific claims whose absence or reversal is a
-// subscriber-visible contract change: the ledger-keying rule, the three at-most-once event types,
-// and the explicit correction that partitioning and queue sharding do not agree.
+// Prose is NOT asserted verbatim — that would make every editorial improvement a test
+// failure. What is asserted is the presence of the specific claims whose absence or
+// reversal is a subscriber-visible contract change: the ledger-keying rule, the three
+// at-most-once event types, and the explicit correction that partitioning and queue
+// sharding do not agree.
 package blnk
 
 import (
@@ -88,26 +73,24 @@ type orderingContractCase struct {
 	// payload is the object the producer passes, unchanged.
 	payload interface{}
 
-	// ledgerOption is the ledger the PRODUCER supplies, or the empty string for the event types
-	// that genuinely belong to no ledger. This mirrors the production call site exactly: it is
-	// the presence or absence of WithEventLedgerID that the table's two halves describe.
+	// ledgerOption is the ledger the PRODUCER supplies, or the empty string for the event
+	// types that genuinely belong to no ledger. This mirrors the production call site
+	// exactly: it is the presence or absence of WithEventLedgerID that the table's two
+	// halves describe.
 	ledgerOption string
 
 	// wantKey is the partition key the document promises.
 	wantKey string
 
-	// wantLedgerColumn is what ledger_id must hold: the ledger for a ledger-scoped event, and
-	// the empty string — stored as SQL NULL — for one that belongs to no ledger. A fabricated
-	// ledger would corrupt both the daily reconciliation and any consumer grouping by ledger,
-	// so the NULL cases are asserted with the same weight as the populated ones.
+	// wantLedgerColumn is what ledger_id must hold: the ledger for a ledger-scoped event,
+	// and the empty string — stored as SQL NULL — for one that belongs to no ledger. A
+	// fabricated ledger would corrupt both the daily reconciliation and any consumer
+	// grouping by ledger, so the NULL cases are asserted with the same weight as the
+	// populated ones.
 	wantLedgerColumn string
 }
 
 // orderingContractCases transcribes the documented table, one entry per row.
-//
-// The bulk, identity and system rows are the ones worth reading: each asserts that the key is the
-// aggregate the event describes AND that ledger_id is empty, which together are the documented
-// claim "not a degraded fallback — it is the only ordering domain those events have".
 func orderingContractCases() []orderingContractCase {
 	return []orderingContractCase{
 		{
@@ -193,13 +176,9 @@ func orderingContractCases() []orderingContractCase {
 	}
 }
 
-// TestPartitionKeyContract_MatchesTheDocumentedTable runs every documented row through the real
-// capture path and requires the stored key and ledger column to be what the document promises.
-//
-// It uses PrepareEventOutbox rather than eventPartitionKey directly, and that is the whole point:
-// the drift this exists to catch lived in the INTERACTION between the payload derivation and the
-// producer-supplied ledger — the derivation was documented and the override was not — so a test
-// of the derivation alone would have agreed with the stale table.
+// TestPartitionKeyContract_MatchesTheDocumentedTable runs every documented row through
+// the real capture path and requires the stored key and ledger column to be what the
+// document promises.
 func TestPartitionKeyContract_MatchesTheDocumentedTable(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -233,13 +212,11 @@ func TestPartitionKeyContract_MatchesTheDocumentedTable(t *testing.T) {
 	}
 }
 
-// TestPartitionKeyContract_LedgerKeyingIsUniversalWhereALedgerExists is the rule behind the table,
-// asserted as a rule so that a NEW ledger-scoped event type cannot be added on a different
-// ordering domain without failing here.
+// TestPartitionKeyContract_LedgerKeyingIsUniversalWhereALedgerExists is the rule behind
+// the table, asserted as a rule so that a NEW ledger-scoped event type cannot be added
+// on a different ordering domain without failing here.
 //
-// The table above is a list; this is the invariant. Every case that supplies a ledger must key on
-// it, and no case that supplies one may key on anything else — which is what makes "the key is the
-// ledger id wherever a ledger exists" a checkable statement rather than an aspiration.
+// The table above is a list; this is the invariant.
 func TestPartitionKeyContract_LedgerKeyingIsUniversalWhereALedgerExists(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -264,15 +241,10 @@ func TestPartitionKeyContract_LedgerKeyingIsUniversalWhereALedgerExists(t *testi
 	}
 }
 
-// TestPartitionKeyContract_TheSuppliedLedgerOverridesTheDerivedKey pins the precedence the
-// document's correction depends on.
+// TestPartitionKeyContract_TheSuppliedLedgerOverridesTheDerivedKey pins the precedence
+// the document's correction depends on.
 //
-// A transaction payload derives its key from the source balance. The producer supplies the ledger.
-// If the derivation won, the documented table would be wrong in the other direction and the
-// queue-sharding-alignment claim would be true. Asserting the precedence directly means the
-// document's statement is checked at its root rather than only through its consequences — and the
-// second case, where the supplied ledger differs from the payload's own, is the one that proves it
-// is the SUPPLIED value being used rather than a coincidence.
+// A transaction payload derives its key from the source balance.
 func TestPartitionKeyContract_TheSuppliedLedgerOverridesTheDerivedKey(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -324,15 +296,15 @@ func TestPartitionKeyContract_TheSuppliedLedgerOverridesTheDerivedKey(t *testing
 	})
 }
 
-// TestAtMostOnceContract_NamesAllThreeProducersAndNoOthers is the second published contract.
+// TestAtMostOnceContract_NamesAllThreeProducersAndNoOthers is the second published
+// contract.
 //
-// A subscriber reads this section to decide which events need a reconciliation path of their own.
-// Naming one event type when there are three understates the obligation for two of them, and the
-// two competing "the one exception" claims meant the codebase itself did not agree on the number.
+// A subscriber reads this section to decide which events need a reconciliation path of
+// their own.
 //
-// The set is asserted against the code's own single declaration, PostCommitEventCaptureContract,
-// so the document and the code cannot drift: adding a fourth post-commit producer to the code
-// without documenting it fails here.
+// The set is asserted against the code's own single declaration,
+// PostCommitEventCaptureContract, so the document and the code cannot drift: adding a
+// fourth post-commit producer to the code without documenting it fails here.
 func TestAtMostOnceContract_NamesAllThreeProducersAndNoOthers(t *testing.T) {
 	doc := readRepoFile(t, "docs/event-streaming.md")
 
@@ -342,9 +314,9 @@ func TestAtMostOnceContract_NamesAllThreeProducersAndNoOthers(t *testing.T) {
 		"system.error",
 	}
 
-	// The code's declaration is the source of truth for the SET. Deriving the expectation from it
-	// rather than restating it here is what makes this a contract assertion rather than a second
-	// copy of the list.
+	// The code's declaration is the source of truth for the SET. Deriving the expectation
+	// from it rather than restating it here is what makes this a contract assertion rather
+	// than a second copy of the list.
 	for _, eventType := range postCommitProducers {
 		assert.Containsf(t, PostCommitEventCaptureContract, eventType,
 			"PostCommitEventCaptureContract is the code's single declaration of the producers with "+
@@ -369,13 +341,9 @@ func TestAtMostOnceContract_NamesAllThreeProducersAndNoOthers(t *testing.T) {
 			"distinction that tells a subscriber whether to expect the set to grow")
 }
 
-// TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim guards the specific false statement
-// the documentation used to make, because its absence is what a reader has to be able to rely on.
-//
-// The claim was that Kafka partitioning and the internal transaction queue's sharding "agree". They
-// do not: the queue shards on the source balance and Kafka keys on the ledger. A subscriber that
-// believed them aligned would infer per-balance ordering from a per-ledger guarantee — a strictly
-// wrong inference in the direction that matters, since it is weaker than what it would assume.
+// TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim guards the specific false
+// statement the documentation used to make, because its absence is what a reader has to
+// be able to rely on.
 func TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim(t *testing.T) {
 	doc := readRepoFile(t, "docs/event-streaming.md")
 
@@ -391,10 +359,10 @@ func TestPartitionKeyDocumentation_CorrectsTheQueueShardingClaim(t *testing.T) {
 
 // atMostOnceSection extracts the at-most-once section from the document.
 //
-// Scoping the assertions to one section rather than to the whole file matters: `balance.monitor`
-// appears in the event-type table and in the idempotency notes as well, so a whole-file Contains
-// would pass while the section itself said nothing. The section is delimited by its own heading and
-// the next heading of the same level.
+// Scoping the assertions to one section rather than to the whole file matters:
+// `balance.monitor` appears in the event-type table and in the idempotency notes as
+// well, so a whole-file Contains would pass while the section itself said nothing. The
+// section is delimited by its own heading and the next heading of the same level.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when the section is absent.

@@ -615,21 +615,12 @@ func TestToBalanceMonitor(t *testing.T) {
 	assert.Equal(t, createMonitor.Condition.Precision, monitor.Condition.Precision)
 }
 
-// TestCreateSubscriberValidate_BoundsTheTopicGrant checks the request-body
-// validation for POST /subscribers.
+// TestCreateSubscriberValidate_BoundsTheTopicGrant checks the request-body validation
+// for POST /subscribers.
 //
-// Both directions are asserted. The refusals are the resource bound and the
-// authorization narrowing; the acceptances are what keeps that bound from breaking
-// legitimate requests — a subscriber registered with no grant at all is the
-// registry's normal fail-closed state, and a sixteen-topic grant is exactly what a
-// topic-prefix migration needs.
+// Both directions are asserted.
 //
-// It drives Validate(prefix), which is now the SINGLE validation entry point. There
-// used to be a second, exported, prefix-independent validator that no handler called
-// and that re-checked a subset of these rules under a hard-coded prefix; two
-// functions checking overlapping rules with one of them dead is how the
-// authoritative one ends up the weaker. Its prefix-independent rules are now applied
-// by Validate itself, so this test exercises the code a request actually takes.
+// It drives Validate(prefix), which is now the SINGLE validation entry point.
 func TestCreateSubscriberValidate_BoundsTheTopicGrant(t *testing.T) {
 	oversized := make([]string, model.MaxSubscriberTopics+1)
 	for i := range oversized {
@@ -738,11 +729,8 @@ func TestCreateSubscriberValidate_BoundsTheTopicGrant(t *testing.T) {
 // TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent pins the
 // omitted-versus-empty distinction the update shape exists for.
 //
-// nil means the caller is not touching the authorised set, so an update to an
-// unrelated field must not be rejected on account of it. A PRESENT empty array is a
-// deliberate revocation of every grant and must be accepted. A present non-empty
-// grant replaces the whole set and so is validated exactly as strictly as on create —
-// otherwise the update path would be the way around the create path's bounds.
+// nil means the caller is not touching the authorised set, so an update to an unrelated
+// field must not be rejected on account of it.
 func TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent(t *testing.T) {
 	name := "renamed"
 	oversized := make([]string, model.MaxSubscriberTopics+1)
@@ -774,15 +762,10 @@ func TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent(t *testing.T)
 	})
 }
 
-// TestSubscriberDTOs_CapTheTopicArrayInTheBindingTags asserts the caps are applied
-// by the BINDER, before any handler code runs.
+// TestSubscriberDTOs_CapTheTopicArrayInTheBindingTags asserts the caps are applied by
+// the BINDER, before any handler code runs.
 //
-// This is a different guarantee from the Validate methods above and is why both
-// exist. A handler that forgets to call Validate still cannot accept
-// an unbounded topic array, because gin applies these tags while decoding the body —
-// so the dimensions that bound allocation hold regardless of handler code. The
-// assertion goes through gin's own validator, which is the exact code path a bind
-// takes.
+// This is a different guarantee from the Validate methods above and is why both exist.
 func TestSubscriberDTOs_CapTheTopicArrayInTheBindingTags(t *testing.T) {
 	oversizedCount := make([]string, model.MaxSubscriberTopics+1)
 	for i := range oversizedCount {

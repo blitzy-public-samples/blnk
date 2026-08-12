@@ -37,12 +37,6 @@ const (
 	KeyHeader = "X-Blnk-Key"
 
 	// lastUsedUpdateBudget bounds the background last-used write.
-	//
-	// The update is off the response path — see the comment at its call site — so it needs a
-	// deadline of its own or a stalled database would leave a goroutine per authenticated
-	// request outstanding for as long as the connection took to fail. Five seconds is far longer
-	// than a single-row UPDATE by primary key can legitimately take and short enough that a
-	// dependency in trouble cannot accumulate work indefinitely.
 	lastUsedUpdateBudget = 5 * time.Second
 )
 
@@ -283,38 +277,16 @@ func (m *AuthMiddleware) Authenticate() gin.HandlerFunc {
 		// For POST requests, inject the API key ID into the metadata
 		if c.Request.Method == "POST" && c.Request.Body != nil {
 			if err := injectAPIKeyToMetadata(c, apiKey.APIKeyID); err != nil {
-				// The cause is sanitized, bounded and redacted rather than concatenated
-				// raw: this runs on an authenticated request, and the error comes from
-				// reading and rewriting a caller-supplied body, so its text is partly
-				// the caller's own. See internal/logsafe.
+				// The cause is sanitized, bounded and redacted rather than concatenated raw: this
+				// runs on an authenticated request, and the error comes from reading and rewriting
+				// a caller-supplied body, so its text is partly the caller's own. See
+				// internal/logsafe.
 				logrus.WithField("cause", logsafe.Cause(err)).
 					Error("failed to inject the API key id into the request metadata")
 			}
 		}
 
 		// UPDATE THE LAST-USED TIMESTAMP OFF THE RESPONSE PATH.
-		//
-		// Both values the goroutine needs are READ HERE, on the request goroutine, and captured
-		// by value. That is the whole of the concurrency fix: the goroutine used to read
-		// c.Request.Context() from inside itself, while otelgin's middleware REPLACES c.Request
-		// in a deferred function as the handler chain unwinds. Two goroutines touching
-		// c.Request — one reading it, one writing it — is a data race, reported as such by
-		// `go test -race`, and it is a genuine one rather than a test artefact: nothing orders
-		// the read against the write, so on a fast handler the two interleave routinely. The
-		// gin context and everything reachable from it are off limits below this line.
-		//
-		// The captured context is then DETACHED FROM CANCELLATION and given its own deadline.
-		// net/http cancels a request's context the moment the handler returns, so a background
-		// write that merely inherited it would be cancelled before it ran for exactly the fast
-		// requests that make the race likely — the update would silently never happen, and
-		// last_used_at would only ever advance for slow requests. context.WithoutCancel keeps
-		// the values on the context, so the trace and any request-scoped values still reach the
-		// query, while WithTimeout bounds the work that outlives the response.
-		//
-		// The error is deliberately not surfaced: last_used_at is an audit convenience, the
-		// caller has already been authenticated and answered, and a failed touch must not turn
-		// a successful request into a failure. It is logged at debug so a persistent failure is
-		// discoverable without adding a line to every authenticated request.
 		requestCtx := c.Request.Context()
 		apiKeyID := apiKey.APIKeyID
 

@@ -548,35 +548,8 @@ func TestGetTotalCommittedTransactions_Error(t *testing.T) {
 // atomicWriterDatasource opens the datasource for the two integration tests below,
 // which are the only coverage RecordTransactionWithBalances' real atomicity has.
 //
-// # Why it does not go through NewDataSource
-//
 // NewDataSource calls GetDBConnection, which memoises its result in a package-level
-// sync.Once. On a FAILED first attempt that function records the error locally,
-// leaves `instance` nil, and CONSUMES the once — so every later call returns
-// (nil, nil), and NewDataSource then dereferences the nil to run `SET search_path`.
-// TestGetDBConnection_Failure in db_test.go deliberately connects to `invalid-dns`,
-// and db_test.go sorts before transactions_test.go, so by the time these two tests
-// ran the singleton was already poisoned and NewDataSource panicked on every
-// invocation. Each test wrapped itself in `recover()` and turned that panic into
-// `t.Skipf("...likely database connection issue...")`, so the two tests reported a
-// skip on every run of the suite and had NEVER executed a single assertion — while
-// the database was up and healthy the whole time.
-//
-// openRealTestDB constructs the Datasource directly and shares no state with the
-// singleton, which is why the rest of this package's real-database tests already use
-// it. It also honours TEST_DATABASE_URL, so this tier relocates with the others, and
-// it skips only when the database genuinely does not answer a ping — the one
-// condition a skip should ever mean here.
-//
-// # What is deliberately NOT restored
-//
-// No configuration is installed. The removed preamble stored a Configuration into
-// the process-wide config.ConfigStore and never put the previous value back, which
-// would have leaked a fixture DSN into every test that ran afterwards. Nothing on
-// these paths reads the store: CreateLedger and CreateBalance are called without an
-// EventPreparer so no event is captured, and config.Fetch is reached only from the
-// event-outbox writer. The other real-database tests in this package install nothing
-// either.
+// sync.Once.
 func atomicWriterDatasource(t *testing.T) Datasource {
 	t.Helper()
 	return openRealTestDB(t)
@@ -2329,14 +2302,9 @@ func TestUpdateBalanceSet_ReturnsConflictWhenAChunkMissesABalance(t *testing.T) 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestRecordTransaction_CommitsTheEventWithTheTransaction is requirement R-2 for the REJECTION
-// path, which is the one path that persists a status mutation through RecordTransaction.
-//
-// transaction.rejected used to be captured after this insert had committed — twice, in fact, once
-// from the rejection's own post-transaction actions and once from the worker's handler — so a
-// crash in between left a transaction durably recorded as REJECTED with nothing telling any
-// subscriber it had been. Supplying an event row moves this method onto a transaction, and the
-// ordered expectations are what pin that: BEGIN, the transaction INSERT, the event INSERT, COMMIT.
+// TestRecordTransaction_CommitsTheEventWithTheTransaction is the requirement for the
+// REJECTION path, which is the one path that persists a status mutation through
+// RecordTransaction.
 func TestRecordTransaction_CommitsTheEventWithTheTransaction(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
@@ -2383,13 +2351,8 @@ func TestRecordTransaction_CommitsTheEventWithTheTransaction(t *testing.T) {
 	assert.NotZero(t, event.ID, "the insert must write the generated id back onto the row")
 }
 
-// TestRecordTransaction_AFailedEventInsertPersistsNothing pins the direction of the guarantee that
-// matters most: the mutation cannot outlive its event.
-//
-// A duplicate event id is the realistic cause — the id is derived from the transaction's identity
-// and status, so a retried rejection presents the same one — and the correct outcome is that the
-// whole attempt fails and nothing is committed, leaving the caller free to retry. Committing the
-// REJECTED row while the event was refused would produce a rejection nobody is told about.
+// TestRecordTransaction_AFailedEventInsertPersistsNothing pins the direction of the
+// guarantee that matters most: the mutation cannot outlive its event.
 func TestRecordTransaction_AFailedEventInsertPersistsNothing(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
@@ -2427,12 +2390,13 @@ func TestRecordTransaction_AFailedEventInsertPersistsNothing(t *testing.T) {
 		"the transaction INSERT must be rolled back when its event cannot be recorded")
 }
 
-// TestRecordTransaction_RejectsMoreThanOneEventPerTransaction pins the cardinality invariant at
-// this writer too.
+// TestRecordTransaction_RejectsMoreThanOneEventPerTransaction pins the cardinality
+// invariant at this writer too.
 //
-// Two rows for one transaction is a duplicate publication, and it is undetectable afterwards
-// because the transaction row is there and the extra event looks like any other. resolveEventOutboxes
-// refuses it BEFORE anything is persisted, so the refusal costs nothing.
+// Two rows for one transaction is a duplicate publication, and it is undetectable
+// afterwards because the transaction row is there and the extra event looks like any
+// other. resolveEventOutboxes refuses it BEFORE anything is persisted, so the refusal
+// costs nothing.
 func TestRecordTransaction_RejectsMoreThanOneEventPerTransaction(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
@@ -2466,12 +2430,11 @@ func TestRecordTransaction_RejectsMoreThanOneEventPerTransaction(t *testing.T) {
 		"the refusal must happen before any statement is issued, so no transaction is opened")
 }
 
-// TestRecordTransaction_WithoutAnEventIssuesOneStatement keeps the frozen transaction-queue
-// callers on exactly the path they had.
+// TestRecordTransaction_WithoutAnEventIssuesOneStatement keeps the frozen
+// transaction-queue callers on exactly the path they had.
 //
-// transaction_queue.go and transaction_inflight.go call this method with no event row and belong
-// to the transaction-processing pipeline this change may not edit. A BEGIN appearing here would
-// change their SQL for no benefit, and would break every expectation written against them.
+// transaction_queue.go and transaction_inflight.go call this method with no event row
+// and belong to the transaction-processing pipeline this change may not edit.
 func TestRecordTransaction_WithoutAnEventIssuesOneStatement(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)

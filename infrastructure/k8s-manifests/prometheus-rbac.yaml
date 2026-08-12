@@ -1,6 +1,6 @@
 # Prometheus service account and the pod-read permission its service discovery needs.
 #
-# PERF-P19. This file exists because of one property of Kubernetes service discovery: it
+# This file exists because of one property of Kubernetes service discovery: it
 # FAILS SILENTLY WITHOUT PERMISSION. Prometheus asks the API server to list and watch pods,
 # and when the request is refused it discovers no targets, reports no configuration error,
 # and starts cleanly. /targets is simply empty. Every series is then absent, every rule in
@@ -42,7 +42,7 @@ rules:
   # get, list AND watch. All three are required: Prometheus performs an initial list and
   # then maintains a watch, so a Role granting only list produces discovery that works once
   # and then never notices a pod being added or replaced — which is precisely the case
-  # PERF-P19 is about, since an HPA replaces pods continuously.
+  # pod churn is about, since an HPA replaces pods continuously.
   - apiGroups: ['']
     resources: ['pods']
     verbs: ['get', 'list', 'watch']

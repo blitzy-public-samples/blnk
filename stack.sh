@@ -27,97 +27,54 @@ declare env=".env"                  # name of the standard environment file
 declare example=".env.example"      # name of the sample environment file
 
 # The Compose command line, DETECTED rather than assumed. Empty here and resolved by
-# resolve_compose_cl once ${env} has been sourced, so an explicit pin in ${env} still wins.
-#
-# It was pinned to "docker-compose" - the standalone v1 script - and ${example} shipped the same
-# pin uncommented. On any host with only the Compose v2+ plugin, which is every current Docker
-# installation, every compose call in this script failed with "command not found": the ledger
-# never started, and the Kafka stages this file now owns could not run at all. A default that
-# names a binary the host may not have is not a default.
-#
-# The v1 script is no longer accepted at all, by detection or by an explicit pin: the compose
-# files need Compose ${COMPOSE_MINIMUM_VERSION} or newer for depends_on.required, and v1 cannot
-# parse them. resolve_compose_cl version-checks whatever it ends up with.
+# resolve_compose_cl once ${env} has been sourced, so an explicit pin in ${env} still
+# wins.
 declare COMPOSE_CL=""
 
 # The provisioning script this stack delegates topic and principal creation to. Path is
-# relative to the working directory, exactly as ${env}, ${example} and $COMPOSE_FILE are,
-# so all four resolve against the same tree - deriving this one from $0 instead would let it
-# come from a different checkout than the .env it is being configured by.
+# relative to the working directory, exactly as ${env}, ${example} and $COMPOSE_FILE
+# are, so all four resolve against the same tree - deriving this one from $0 instead
+# would let it come from a different checkout than the .env it is being configured by.
 declare kafka_provision_script="scripts/kafka-provision.sh"
 
-# The administrative Kafka principal --init writes into ${env}. A principal NAME, not a secret,
-# which is why it is a literal here at all: no compose service defaults it any more - a default
-# for a cluster superuser's credential is a hardcoded credential, and both Kafka scripts refuse a
-# half-configured pair by name - so ${env} is the single place the name and its password are
-# written, and every service reads them from there. That is what keeps the credential the broker
-# is bootstrapped with and the one its clients present from drifting apart. The password is
-# generated per stack by --init and never written down in this file.
+# The administrative Kafka principal --init writes into ${env}. A principal NAME, not a
+# secret, which is why it is a literal here at all: no compose service defaults it any
+# more - a default for a cluster superuser's credential is a hardcoded credential, and
+# both Kafka scripts refuse a half-configured pair by name - so ${env} is the single
+# place the name and its password are written, and every service reads them from there.
+# That is what keeps the credential the broker is bootstrapped with and the one its
+# clients present from drifting apart.
 declare kafka_admin_principal="admin"
 
-# The steady-state producer principal --init writes into ${env}, and the same default the
-# kafka-init service carries so that the principal the script mints is the principal the
-# server and worker present. A principal NAME, not a secret; its password is generated per
-# stack and never written down here.
+# The steady-state producer principal --init writes into ${env}, and the same default
+# the kafka-init service carries so that the principal the script mints is the principal
+# the server and worker present. A principal NAME, not a secret; its password is
+# generated per stack and never written down here.
 #
-# It exists as a SEPARATE identity from the administrative one above because Blnk refuses to
-# publish as a cluster superuser: an administrative credential can create topics, mint SCRAM
-# credentials and rewrite ACLs, so a leaked publisher credential that happened to be the
-# administrative one would compromise the cluster's authorization state rather than merely
-# allow publishing.
+# It exists as a SEPARATE identity from the administrative one above because Blnk
+# refuses to publish as a cluster superuser: an administrative credential can create
+# topics, mint SCRAM credentials and rewrite ACLs, so a leaked publisher credential that
+# happened to be the administrative one would compromise the cluster's authorization
+# state rather than merely allow publishing.
 declare kafka_producer_principal="blnk-producer"
 
-# The only mode ${env} may ever have: read and write for its owner, nothing for anyone else.
-#
-# ${env} holds the PostgreSQL password, the Kafka broker superuser secret and the Kafka
-# producer secret. It was created by copying ${example}, which is a committed file and
-# therefore world-readable, so a mode-0644 ${env} handed every local account and every
-# process outside this stack the credential that can rewrite every ACL in the broker. On a
-# shared or multi-tenant host that is a credential disclosure, not a theoretical one.
+# The only mode ${env} may ever have: read and write for its owner, nothing for anyone
+# else.
 declare env_file_mode="600"
 # The number of RANDOM BYTES behind each generated Kafka credential.
 #
-# THE BYTE COUNT MUST STAY A MULTIPLE OF THREE. base64 pads a remainder with "=", and "=" is
-# outside the credential alphabet kafka-bootstrap.sh and kafka-provision.sh share - Kafka's
-# --add-scram value grammar has no escape sequence for it - so a padded password is refused
-# and the broker never bootstraps. 24 bytes give 32 unpadded characters, which is exactly the
-# 32-character floor both scripts and event_admin.go's MinSCRAMPasswordLength enforce.
+# THE BYTE COUNT MUST STAY A MULTIPLE OF THREE. base64 pads a remainder with "=", and
+# "=" is outside the credential alphabet kafka-bootstrap.sh and kafka-provision.sh share
+# - Kafka's --add-scram value grammar has no escape sequence for it - so a padded
+# password is refused and the broker never bootstraps. 24 bytes give 32 unpadded
+# characters, which is exactly the 32-character floor both scripts and event_admin.go's
+# MinSCRAMPasswordLength enforce.
 declare kafka_secret_bytes=24
-# EVERY VARIABLE THE PROVISIONING SCRIPT READS, forwarded to it when the host fallback runs it
-# directly — READ FROM THE SCRIPT ITSELF rather than restated here.
-#
-# It used to be a literal list, and before that a hand-written argument sequence, and both had
-# drifted. The literal list carried the wrong producer skip flag and omitted the CLI timeout
-# pair and the producer secret file; the argument sequence before it carried ten names out of
-# the twenty-odd the script documents. Either way a stack whose ${env} pinned one of the missing
-# settings got it when compose ran the one-shot and SILENTLY LOST IT when this fallback ran
-# instead — the two paths provisioning differently from the same ${env}, with which one ran
-# decided by nothing more than whether the host happened to have the Kafka CLI. Invisible, and
-# unreproducible.
-#
-# "scripts/kafka-provision.sh --print-interface-host" emits one variable name per line and
-# exits without touching anything, so this is not a copy that can fall behind: it IS the
-# script's declaration. --host adds the delegation targets (KAFKA_CONTAINER,
-# KAFKA_PROVISION_CONTAINER_SCRIPT and the client-configuration container path), which a
-# host-side invoker may set and which the script deliberately does not forward into the
-# container.
-#
-# Deliberately absent from what the script emits, and therefore from this: KAFKA_BROKERS and
-# KAFKA_COMPOSE_SERVICE, because provision_kafka computes both — the effective broker list and
-# the service it was asked about — and a stale ${env} value must not win over either.
-#
-# Read here at startup rather than inside provision_kafka so that a script that cannot be read
-# is reported once, at the point the list would have been built, rather than as an empty
-# forwarding later. An empty list is treated as fatal by resolve_kafka_provision_interface,
-# because silently forwarding nothing is the exact failure this replaced.
+# EVERY VARIABLE THE PROVISIONING SCRIPT READS, forwarded to it when the host fallback
+# runs it directly — READ FROM THE SCRIPT ITSELF rather than restated here.
 declare -a kafka_provision_passthrough=()
 
 # Populate kafka_provision_passthrough from the provisioning script's own declaration.
-#
-# Called from main before any Kafka work. It is a function rather than a top-level command
-# substitution so that a failure can be REPORTED with the reason instead of leaving an empty
-# array behind: forwarding no variables at all would provision defaults and report success,
-# which is the silent-divergence failure mode this whole mechanism exists to remove.
 resolve_kafka_provision_interface() {
     if [ ! -r "${kafka_provision_script}" ]
     then
@@ -152,23 +109,23 @@ resolve_kafka_provision_interface() {
 }
 
 # KAFKA_BROKERS as the SHELL supplied it, captured before anything can overwrite it:
-# showenv() sources ${env} ahead of main(), so an assignment there would replace it. Compose
-# resolves interpolation from the shell environment FIRST and from --env-file only after, and
-# this reproduces that precedence - reading the post-source value alone would skip the Kafka
-# checks for someone running "KAFKA_BROKERS=kafka:9092 ${0} -u" against a .env that leaves
-# the key empty.
+# showenv() sources ${env} ahead of main(), so an assignment there would replace it.
+# Compose resolves interpolation from the shell environment FIRST and from --env-file
+# only after, and this reproduces that precedence - reading the post-source value alone
+# would skip the Kafka checks for someone running "KAFKA_BROKERS=kafka:9092 ${0} -u"
+# against a .env that leaves the key empty.
 #
-# TWO VARIABLES, BECAUSE "UNSET" AND "SET TO EMPTY" ARE DIFFERENT ANSWERS. Capturing the value
-# alone conflated them, and the conflation broke precedence in one direction: compose treats an
-# explicitly empty shell KAFKA_BROKERS as a real value that overrides --env-file, so
-# "KAFKA_BROKERS= ${0} -u" turns publishing OFF for the containers - but this script, seeing an
-# empty capture, fell through to the .env value and then verified a broker the application was
-# not going to use. Someone deliberately disabling Kafka for one run would have had their
-# bring-up fail on a Kafka problem that did not concern them.
+# TWO VARIABLES, BECAUSE "UNSET" AND "SET TO EMPTY" ARE DIFFERENT ANSWERS. Capturing the
+# value alone conflated them, and the conflation broke precedence in one direction:
+# compose treats an explicitly empty shell KAFKA_BROKERS as a real value that overrides
+# --env-file, so "KAFKA_BROKERS= ${0} -u" turns publishing OFF for the containers - but
+# this script, seeing an empty capture, fell through to the .env value and then verified
+# a broker the application was not going to use.
 #
-# ${VAR+yes} expands to "yes" when VAR is declared AT ALL, empty or not, and to nothing when it
-# is unset - which is exactly the distinction, and the only portable way to make it. The value
-# uses ${VAR-} rather than ${VAR} so that this file does not depend on nounset staying off.
+# ${VAR+yes} expands to "yes" when VAR is declared AT ALL, empty or not, and to nothing
+# when it is unset - which is exactly the distinction, and the only portable way to make
+# it. The value uses ${VAR-} rather than ${VAR} so that this file does not depend on
+# nounset staying off.
 declare KAFKA_BROKERS_DECLARED_IN_SHELL="${KAFKA_BROKERS+yes}"
 declare KAFKA_BROKERS_FROM_SHELL="${KAFKA_BROKERS-}"
 
@@ -205,11 +162,12 @@ help() {
 showenv() {
     if [ -r "${env}" ]
     then
-        # ${env} is a fixed relative path declared at the top of this file, not a value from
-        # the caller, so there is nothing dynamic to follow - but ShellCheck cannot know that
-        # from a variable, and SC1090 is the right warning for the general case. The directive
-        # records the judgement rather than silencing it blindly: .env is generated data whose
-        # keys ShellCheck could not usefully check even if it could find the file.
+        # ${env} is a fixed relative path declared at the top of this file, not a value
+        # from the caller, so there is nothing dynamic to follow - but ShellCheck cannot
+        # know that from a variable, and SC1090 is the right warning for the general
+        # case. The directive records the judgement rather than silencing it blindly:
+        # .env is generated data whose keys ShellCheck could not usefully check even if
+        # it could find the file.
         # shellcheck source=/dev/null
         source "${env}"
     fi
@@ -235,74 +193,18 @@ showenv() {
 
 # Writes a value into a key of ${env}, in whichever shape ${example} declares that key.
 #
-# ${example} declares keys in TWO shapes and both are handled here, so neither can produce a
-# .env that looks configured and is not:
+# ${example} declares keys in TWO shapes and both are handled here, so neither can
+# produce a .env that looks configured and is not:
 #
-# THAT SECOND SHAPE IS WHY THIS FUNCTION EXISTS RATHER THAN A SECOND SED LINE. A second brace
-# placeholder was never an option, and handling the empty assignment is what lets ${example}
-# ship the Kafka keys empty and still yield a correct ${env}.
+# $1 mode - "placeholder" to replace every {KEY} occurrence, "blank" to fill a valueless
+# KEY= line $2 key - the environment key name $3 value - the value to write; never
+# printed, never passed as an argument require_env_key_name refuses anything that is not
+# a usable environment key name.
 #
-# ${example}, scripts/kafka-bootstrap.sh and scripts/kafka-provision.sh all described --init as
-# substituting {POSTGRES_PASSWORD} and nothing else, and each drew a conclusion from it - that
-# --init generates none of the Kafka credentials - which stopped being true here and left three
-# diagnostics telling an operator the one command that would fix their problem would not. All
-# three now say what --init actually does. Their BEHAVIOUR was always unaffected: they read the
-# admin pair from the environment and refuse an empty or still-braced value, and --init fills
-# it, so those paths are simply unreachable on a stack initialised from here.
-#
-# The sed delimiter is "|" because base64 output contains "/" and "+", which a "/" delimiter
-# could not carry. It contains no "&", no "\" and no "|" - the characters sed reads specially
-# on the replacement side - so a generated value needs no escaping. Keep any future value
-# inside that alphabet.
-#
-# An assignment that ALREADY carries a value is left alone. That is an operator's deliberate
-# pin, and overwriting it would replace a credential the broker may already be holding. That
-# property is also what makes it safe to run this over an ${env} that is already in service:
-# only a placeholder, an empty assignment or an absent key is ever written, so a PostgreSQL
-# password the running database is still authenticating with cannot be swapped out from under
-# it. See initialize_env.
-#
-# Each outcome is reported by KEY NAME and never by value, so that the operator can see which
-# keys were filled without the credential reaching a terminal, a scrollback buffer or - when
-# this runs in CI - a build log.
-#
-# write_env_substitution performs the edit. It exists as a separate function because the
-# mechanism matters as much as the result, and the mechanism is the fix for two defects.
-#
-# THE VALUE NEVER REACHES ARGV. This used to be `sed -i "s|{KEY}|${value}|g"`, which places the
-# credential in sed's command line - and on Linux /proc/<pid>/cmdline is mode 444, readable by
-# every account on the host, while /proc/<pid>/environ is mode 400, readable only by the owner.
-# So the old form published the PostgreSQL password and the Kafka superuser password to any
-# local user who ran `ps` or read /proc during the fraction of a second sed lived, and it did so
-# in the same function whose comment promises that values are "never" printed. The value now
-# crosses into awk through the ENVIRONMENT, which is the private one of those two channels.
-#
-# THE REPLACEMENT IS LITERAL. A value reaching a sed replacement is not literal text: "&" means
-# "the whole match" and "\1" a backreference, so a generated secret containing either produced a
-# .env holding something other than the secret, and the service then failed to authenticate with
-# a credential that had been silently altered. awk's index()/substr() splice below has no
-# metacharacters at all.
-#
-# IT DOES NOT DEPEND ON GNU sed. `sed -i` with no suffix argument is a GNU extension; BSD and
-# macOS sed read the next argument as the backup suffix, so on those platforms the old form
-# consumed "${env}" as a suffix and edited nothing, or errored. awk plus an explicit rename is
-# POSIX and behaves the same everywhere.
-#
-# $1 mode  - "placeholder" to replace every {KEY} occurrence, "blank" to fill a valueless KEY= line
-# $2 key   - the environment key name
-# $3 value - the value to write; never printed, never passed as an argument
-# require_env_key_name refuses anything that is not a usable environment key name.
-#
-# Called from set_env_value BEFORE it chooses a branch, and again from write_env_substitution,
-# because the two are reachable independently and the check has to hold for both. The append
-# branch is why this is factored out at all: it writes "KEY=value" straight onto the end of
-# ${env} without rewriting the file, so a check living only in write_env_substitution left it
-# unguarded - a malformed key was appended and reported as a success, and a key containing a
-# newline would have injected whole lines of its own into a file full of credentials.
-#
-# The permitted set is [A-Za-z0-9_], which is what a shell, docker compose and envconfig can all
-# read back. Everything else is refused by name rather than sanitised, because silently altering
-# the key an operator asked for produces a .env that does not say what they think it says.
+# The permitted set is [A-Za-z0-9_], which is what a shell, docker compose and envconfig
+# can all read back. Everything else is refused by name rather than sanitised, because
+# silently altering the key an operator asked for produces a .env that does not say what
+# they think it says.
 require_env_key_name() {
     case "${1}" in
         "" | *[!A-Za-z0-9_]* )
@@ -320,12 +222,8 @@ write_env_substitution() {
 
     # The temporary file is created BESIDE ${env} and under umask 077.
     #
-    # Beside it, because the rename at the end is only atomic within one filesystem - a reader
-    # of ${env} sees either the old content or the new, never a partial write.
-    #
-    # Under umask 077, because the temporary file holds the same secrets as the file it will
-    # become. Creating it under the ambient umask would leave the credentials world-readable in
-    # the temporary copy even though the final file is 600.
+    # Beside it, because the rename at the end is only atomic within one filesystem - a
+    # reader of ${env} sees either the old content or the new, never a partial write.
     tmp="$( umask 077; mktemp "${env}.XXXXXX" )" || {
         printf '%b\n' " ${RED}Could not create a temporary file beside ${env}${NC}; nothing was written."
         return 1
@@ -407,21 +305,8 @@ set_env_value() {
     fi
 }
 
-# Generate a Kafka SCRAM credential that satisfies the floors every consumer of it enforces.
-#
-# Both floors are checked rather than assumed, and the draw is repeated until one passes. The
-# length is deterministic - 24 bytes always base64-encode to 32 unpadded characters - but the
-# DISTINCT-CHARACTER count is not: kafka-bootstrap.sh, kafka-provision.sh and
-# event_admin.go all refuse a secret using fewer than 16 distinct characters, and while a
-# 32-character draw from base64's 64-character alphabet clears that with overwhelming
-# probability, "overwhelming" is not "always". An unlucky draw would produce a .env that every
-# one of those three refuses, and the operator would be left reading a weak-credential error
-# about a credential they never chose.
-#
-# The alphabet is filtered to the characters those grammars can carry, so a secret containing
-# "+", "/" or "=" is re-drawn rather than escaped - there is no escape sequence available in
-# either grammar. Filtering can shorten the result, which is why the length is re-checked
-# after it rather than trusted from the byte count.
+# Generate a Kafka SCRAM credential that satisfies the floors every consumer of it
+# enforces.
 generate_kafka_secret() {
     local secret="" attempt=0 distinct=0
 
@@ -448,25 +333,16 @@ generate_kafka_secret() {
     exit 1
 }
 
-# NOTE ON A CONTROL THAT USED TO LIVE HERE.
-#
-# A second, weaker copy of the permission check stood at this point: require_private_env_file.
-# It was DEAD CODE - defined, never called - and it duplicated enforce_env_permissions above,
-# which does the same job better and is called from initialize_env, the Kafka credential
-# backfill and --init. Two competing implementations of one security control is worse than one,
-# because a reader cannot tell which is authoritative and a fix applied to the wrong copy looks
-# applied while changing nothing.
-#
-# It is deleted rather than wired up, and its one genuine advantage was carried across first:
-# it tried BSD's `stat -f '%Lp'` as well as GNU's `stat -c '%a'`, so enforce_env_permissions now
-# tries both. Nothing was lost with it.
+# It is deleted rather than wired up, and its one genuine advantage was carried across
+# first: it tried BSD's `stat -f '%Lp'` as well as GNU's `stat -c '%a'`, so
+# enforce_env_permissions now tries both. Nothing was lost with it.
 
 
-# Reports any {PLACEHOLDER} that survived into ${env}. A surviving one IS a literal password:
-# nothing downstream replaces it, so the service it belongs to authenticates with the brace
-# text itself and fails in a way that names neither this file nor that one. It means
-# ${example} has grown a placeholder --init does not know about, so the name is printed and
-# the remedy is to teach --init about it.
+# Reports any {PLACEHOLDER} that survived into ${env}. A surviving one IS a literal
+# password: nothing downstream replaces it, so the service it belongs to authenticates
+# with the brace text itself and fails in a way that names neither this file nor that
+# one. It means ${example} has grown a placeholder --init does not know about, so the
+# name is printed and the remedy is to teach --init about it.
 warn_unsubstituted_placeholders() {
     local leftovers=""
 
@@ -478,18 +354,8 @@ warn_unsubstituted_placeholders() {
     fi
 }
 
-# Force ${env} to owner-only permissions, repairing an insecure file rather than refusing it.
-#
-# WHY THIS IS NOT A CHECK-AND-ABORT. An abort would leave the insecure file exactly as it
-# found it and block the operator from doing anything about it with this script, so the
-# credential stays exposed and the only route forward is a chmod the message has to teach.
-# Repairing closes the exposure immediately and says so. The one thing it must never do is
-# stay silent: a permission that was wrong yesterday means the secret has already been
-# readable, so the operator needs to know in order to decide whether to rotate.
-#
-# Ownership is deliberately NOT changed. chown requires privilege this script does not ask
-# for, and a file owned by another user is a situation an operator must resolve knowingly -
-# so it is reported and the mode is still tightened, which is the part that can be done.
+# Force ${env} to owner-only permissions, repairing an insecure file rather than
+# refusing it.
 enforce_env_permissions() {
     local mode="" owner=""
 
@@ -498,12 +364,10 @@ enforce_env_permissions() {
         return 0
     fi
 
-    # stat's spelling differs between GNU and BSD, and BOTH are tried. GNU coreutils uses
-    # -c '%a'; BSD and macOS use -f '%Lp'. Only the GNU form used to be attempted, so on macOS
-    # every invocation fell into the unverifiable branch below and re-chmod'd a file that was
-    # already correct, announcing a permission change that had not happened. An unknown third
-    # spelling is still left empty and handled as unverifiable, because a wrong format string
-    # would report a mode that is not the file's.
+    # stat's spelling differs between GNU and BSD, and BOTH are tried. GNU coreutils
+    # uses -c '%a'; BSD and macOS use -f '%Lp'. An unknown third spelling is still left
+    # empty and handled as unverifiable, because a wrong format string would report a
+    # mode that is not the file's.
     mode="$(stat -c '%a' "${env}" 2>/dev/null || stat -f '%Lp' "${env}" 2>/dev/null || true)"
 
     # A mode this script cannot read is a mode it cannot verify, so it is tightened anyway:
@@ -532,11 +396,8 @@ enforce_env_permissions() {
 
 # Generate a per-stack secret in the alphabet every consumer of ${env} can carry.
 #
-# Report whether a key in ${env} still needs a value: absent, empty, or still a placeholder.
-#
-# It is what lets the ensure step below be quiet on a stack that is already configured while
-# still filling a gap. set_env_value alone would print "already carries a value" for every key
-# on every bring-up, which trains an operator to ignore this script's output.
+# Report whether a key in ${env} still needs a value: absent, empty, or still a
+# placeholder.
 env_value_missing() {
     local key="${1}" line=""
 
@@ -557,17 +418,8 @@ env_value_missing() {
     esac
 }
 
-# The value a key currently carries in ${env}, or nothing when the key is absent, empty or
-# still a brace placeholder.
-#
-# It exists so that a credential can be written under a SECOND name with the value the first
-# already holds, rather than with a fresh draw. The two producer names are resolved in a fixed
-# order, so two independent generations would have the application present one credential
-# while the broker was minted with the other.
-#
-# The LAST matching assignment wins, matching env_value_missing and matching how a shell
-# sourcing the file would read it: a key appended by an earlier --init run sits below the
-# template's own line for the same key.
+# The value a key currently carries in ${env}, or nothing when the key is absent, empty
+# or still a brace placeholder.
 env_value_from() {
     local key="${1}" line=""
 
@@ -588,22 +440,8 @@ env_value_from() {
     esac
 }
 
-# Make sure ${env} carries every credential the compose stack REQUIRES, generating what is
-# missing, and leaving every existing value alone.
-#
-# WHY THIS RUNS ON EVERY BRING-UP AND NOT ONLY ON --init. The kafka and kafka-init services
-# declare KAFKA_SASL_ADMIN_SECRET with compose's required-variable form, because a broker
-# superuser password with a known default committed to this repository handed the cluster's
-# whole access model to anyone who could reach the published port. Requiring it means a .env
-# written before this change - or one an operator hand-copied from ${example}, which ships the
-# key empty - now fails interpolation before a single container starts. Filling the gap here
-# is what keeps the sanctioned path ("${0} --up") working while leaving the insecure default
-# genuinely unavailable: an operator running "docker compose up" directly still has to supply
-# one, and the refusal message tells them how.
-#
-# An existing value is NEVER overwritten. The broker's KRaft metadata log was formatted with
-# the admin password and holds the producer's SCRAM credential, so replacing either here would
-# lock the stack out of its own broker and the only copy of the old value would be gone.
+# Make sure ${env} carries every credential the compose stack REQUIRES, generating what
+# is missing, and leaving every existing value alone.
 ensure_env_secrets() {
     local generated=""
 
@@ -638,11 +476,12 @@ ensure_env_secrets() {
         generated="${generated} KAFKA_PRODUCER_SECRET"
     fi
 
-    # THE SAME IDENTITY UNDER ITS OTHER PAIR OF NAMES, and it must be the same VALUE rather
-    # than a fresh draw: KAFKA_SASL_* is resolved BEFORE KAFKA_PRODUCER_* everywhere, so two
-    # independent generations would have the application present one credential while the
-    # broker was minted with the other. env_value_from reads what was just written, or what
-    # was already there, which is what keeps the two pairs equal in both cases.
+    # THE SAME IDENTITY UNDER ITS OTHER PAIR OF NAMES, and it must be the same VALUE
+    # rather than a fresh draw: KAFKA_SASL_* is resolved BEFORE KAFKA_PRODUCER_*
+    # everywhere, so two independent generations would have the application present one
+    # credential while the broker was minted with the other. env_value_from reads what
+    # was just written, or what was already there, which is what keeps the two pairs
+    # equal in both cases.
     if env_value_missing "KAFKA_SASL_USER"
     then
         set_env_value "KAFKA_SASL_USER" "$(env_value_from "KAFKA_PRODUCER_USER")" >/dev/null
@@ -655,10 +494,11 @@ ensure_env_secrets() {
         generated="${generated} KAFKA_SASL_SECRET"
     fi
 
-    # Re-asserted after writing: set_env_value replaces ${env} by writing a temporary file and
-    # renaming it over the original, so the mode ${env} ends up with is the temporary file's.
-    # write_env_substitution creates that file under umask 077 and chmods it 600 before the
-    # rename, but this is the check that makes the guarantee rather than trusting it.
+    # Re-asserted after writing: set_env_value replaces ${env} by writing a temporary
+    # file and renaming it over the original, so the mode ${env} ends up with is the
+    # temporary file's. write_env_substitution creates that file under umask 077 and
+    # chmods it 600 before the rename, but this is the check that makes the guarantee
+    # rather than trusting it.
     enforce_env_permissions
 
     if [ -n "${generated}" ]
@@ -673,28 +513,23 @@ ensure_env_secrets() {
 # =======================================================================================
 # The Kafka compose profile
 #
-# Both compose files put the broker and its provisioning one-shot behind
-# `profiles: ["kafka"]`, so a plain bring-up starts the ledger with NO broker. That is the
-# state .env.example ships: KAFKA_BROKERS empty, the event publisher resolved to its no-op,
-# and Blnk serving and processing transactions exactly as it did before Kafka existed. It is
-# a supported steady state and a documented validation gate, not a degraded one, and it is
-# also what keeps a developer who has no interest in event streaming from paying for a JVM.
+# Both compose files put the broker and its provisioning one-shot behind `profiles:
+# ["kafka"]`, so a plain bring-up starts the ledger with NO broker. That is the state
+# .env.example ships: KAFKA_BROKERS empty, the event publisher resolved to its no-op,
+# and Blnk serving and processing transactions exactly as it did before Kafka existed.
 #
 # Starting the broker is therefore a decision - and the decision has already been made
-# somewhere. KAFKA_BROKERS is what makes Blnk publish, so it is what brings the broker up:
-# nobody has to learn a second switch, and the two cannot disagree.
+# somewhere. KAFKA_BROKERS is what makes Blnk publish, so it is what brings the broker
+# up: nobody has to learn a second switch, and the two cannot disagree.
 #
 # COMPOSE_PROFILES rather than a --profile flag, for two reasons. It cannot be misplaced
-# relative to a subcommand the way a global flag can, and it reaches the compose invocations
-# inside compose_container_id, wait_for_kafka_init and provision_kafka without each of them
-# having to thread a flag through.
+# relative to a subcommand the way a global flag can, and it reaches the compose
+# invocations inside compose_container_id, wait_for_kafka_init and provision_kafka
+# without each of them having to thread a flag through.
 # =======================================================================================
 
-# The value COMPOSE_PROFILES should carry for a command that must include the Kafka services,
-# preserving whatever profiles are already selected.
-#
-# Merged rather than assigned, because .env may legitimately set COMPOSE_PROFILES=monitoring:
-# overwriting it would silently drop Prometheus from the very bring-up an operator asked for.
+# The value COMPOSE_PROFILES should carry for a command that must include the Kafka
+# services, preserving whatever profiles are already selected.
 compose_profiles_with_kafka() {
     local existing="${COMPOSE_PROFILES:-}"
 
@@ -725,43 +560,17 @@ startup_compose_profiles() {
 
 # The profiles a TEARDOWN command runs with: Kafka ALWAYS, whatever the brokers say.
 #
-# Teardown is not symmetrical with bring-up and must not be. A broker container can have been
-# started by an earlier run whose .env did configure brokers, or by "docker compose --profile
-# kafka up" by hand; a "down" that omitted the profile would leave that container running and
-# its kafka_data volume held while reporting success - verified behaviour, not caution: compose
-# excludes a profiled service from "down" unless its profile is active. Including the profile
-# when there is nothing to remove costs nothing at all.
+# Teardown is not symmetrical with bring-up and must not be. Including the profile when
+# there is nothing to remove costs nothing at all.
 teardown_compose_profiles() {
     compose_profiles_with_kafka
 }
 
 # =======================================================================================
 # Local Kafka stack
-#
-# The event-publishing pipeline needs a broker that is not merely created but LISTENING and
-# answering AUTHENTICATED requests, and a topic catalogue that already exists - the broker is
-# configured with auto-creation off, so a topic nobody provisioned is a topic the relay
-# cannot publish to.
-#
-# Compose does both jobs: the kafka service healthcheck completes a full SASL/SCRAM handshake
-# and an authorized metadata request, and the kafka-init one-shot provisions the catalogue
-# behind that gate. What follows therefore WAITS FOR AND VERIFIES that work rather than
-# duplicating it, and runs scripts/kafka-provision.sh directly only when the one-shot did not
-# run or did not succeed.
-#
-# WHAT COMPOSE NO LONGER DOES is gate the application services on any of it. server and worker
-# used to carry "kafka: condition: service_healthy", which made the API wait on a broker the
-# shipped configuration tells it to ignore - and gated it on the wrong property anyway, since a
-# healthy broker says a handshake works and says nothing about whether the topics exist. The
-# ORDERING now lives here instead, in stage_kafka, which starts the broker and provisions it
-# before the ledger is launched at all.
 # =======================================================================================
 
 # Kafka status lines, with any continuation arguments indented beneath the first.
-#
-# %b rather than the variable-bearing format string used elsewhere in this file: the colours
-# are stored as literal escape sequences, %b is what expands them, and the rendered output is
-# identical while no caller's text is ever read as a format.
 kafka_message() {
     local colour="${1}" line
 
@@ -780,17 +589,15 @@ kafka_error() { kafka_message "${RED}" "$@"; }
 # The broker list this stack is actually configured with, resolved exactly as Compose
 # resolves it: the shell environment first, ${env} second.
 #
-# THERE IS NO THIRD STEP, because the Compose files declare ${KAFKA_BROKERS:-} — an EMPTY
-# default. Publishing is opt-in in two halves (the "kafka" profile so a broker exists, and a
-# non-empty KAFKA_BROKERS so Blnk speaks to it), so an absent name means "no brokers" both
-# here and in the containers. A local default reproduced in this file would have to be kept
-# in step with two Compose projections by hand, and a divergence would make this script
-# verify a broker the application is not publishing to — or skip verifying one it is.
+# THERE IS NO THIRD STEP, because the Compose files declare ${KAFKA_BROKERS:-} — an
+# EMPTY default. Publishing is opt-in in two halves (the "kafka" profile so a broker
+# exists, and a non-empty KAFKA_BROKERS so Blnk speaks to it), so an absent name means
+# "no brokers" both here and in the containers.
 #
-# AN EMPTY LIST REMAINS A LEGITIMATE STEADY STATE, NOT AN ERROR. Setting KAFKA_BROKERS= to an
-# explicit empty value — in the shell or in ${env} — selects it, the event publisher resolves
-# to its no-op implementation, and Blnk starts, serves and processes transactions exactly as
-# it did before Kafka existed. Every check below is then skipped, never failed.
+# AN EMPTY LIST REMAINS A LEGITIMATE STEADY STATE, NOT AN ERROR. Setting KAFKA_BROKERS=
+# to an explicit empty value — in the shell or in ${env} — selects it, the event
+# publisher resolves to its no-op implementation, and Blnk starts, serves and processes
+# transactions exactly as it did before Kafka existed.
 effective_kafka_brokers() {
     # DECLARED, not non-empty. A shell KAFKA_BROKERS= is a deliberate "no brokers for this run"
     # and compose honours it over --env-file, so this must too; testing the value instead would
@@ -805,44 +612,16 @@ effective_kafka_brokers() {
     fi
 }
 
-# Run docker compose with the EFFECTIVE broker list pinned, and with this stack's env file and
-# compose file already applied.
-#
-# EVERY COMPOSE INVOCATION IN THIS FILE GOES THROUGH HERE, and the reason is a cascade that made
-# the script and the containers disagree about the one value that decides whether Blnk publishes
-# at all.
-#
-# showenv() sources ${env} before main() runs. If the caller had already EXPORTED KAFKA_BROKERS,
-# that source does not shadow it - assigning to an exported name keeps the export attribute and
-# replaces the value, so every later child process inherits ${env}'s value. Meanwhile this script
-# decides with KAFKA_BROKERS_FROM_SHELL, captured before the source, which is correct: compose
-# resolves the shell environment ahead of --env-file. The two then differ. "KAFKA_BROKERS=broker-a
-# ./stack.sh -u" against a .env naming broker-b had this script wait for, authenticate to and
-# verify the catalogue on broker-a while the server published to broker-b - and the
-# bring-up reported success.
-#
-# Pinning the value on the invocation removes the disagreement at its source rather than
-# reproducing the precedence rule in two places: compose prefers the invocation environment over
-# --env-file, so what it interpolates is exactly what effective_kafka_brokers decided. An empty
-# result is passed as an explicit empty value, which is the right answer and not an omission -
-# it is how "no brokers for this run" reaches the containers, and the compose files declare
-# ${KAFKA_BROKERS:-} so an empty value selects the documented no-op publisher.
-#
-# Going through one function is also what keeps it true: a compose call added later that forgets
-# the pin is visible as a call that does not use this helper.
+# Run docker compose with the EFFECTIVE broker list pinned, and with this stack's env
+# file and compose file already applied.
 compose() {
     KAFKA_BROKERS="$(effective_kafka_brokers)" \
         ${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" "$@"
 }
 
-# The container id backing a compose service, or nothing when that service has no container -
-# because $COMPOSE_FILE does not declare it, or because it was never started.
-#
-# Both forms of "ps" are tried. "-aq" includes a one-shot that has already EXITED, which is
-# precisely the state a successful kafka-init is in, but it is not accepted by every release
-# the COMPOSE_CL override can point at, so "-q" is the fallback. Failures are swallowed on
-# purpose: "does this service have a container" is the question being asked, and errexit must
-# not turn the answer "no" into an aborted bring-up.
+# The container id backing a compose service, or nothing when that service has no
+# container - because $COMPOSE_FILE does not declare it, or because it was never
+# started.
 compose_container_id() {
     local service="${1}" id=""
 
@@ -862,16 +641,9 @@ container_field() {
     docker inspect --format "${2}" "${1}" 2>/dev/null || true
 }
 
-# Waits for the broker to report HEALTHY rather than merely to exist, because a listening
-# socket says nothing about whether SASL is usable and everything downstream assumes it is.
-#
-# 0 healthy, 1 the broker's own probe says unhealthy, 2 still starting at the deadline,
-# 3 the container is not running at all. 1 and 2 share a diagnosis - a broker that is up and
-# refusing the handshake - while 3 is a broker that stopped, and the caller says so
-# differently because the two are read in different places.
-#
-# A container with no healthcheck - possible with a custom $COMPOSE_FILE - is accepted as
-# soon as it is running, there being nothing better to wait for.
+# Waits for the broker to report HEALTHY rather than merely to exist, because a
+# listening socket says nothing about whether SASL is usable and everything downstream
+# assumes it is.
 wait_for_kafka_healthy() {
     local id="${1}" health="" state="" deadline="" announced="no"
     local timeout="${KAFKA_WAIT_TIMEOUT_SECONDS:-180}"
@@ -915,11 +687,12 @@ wait_for_kafka_healthy() {
             return 2
         fi
 
-        # Announced once, and only when there is actually a wait: the staged bring-up names
-        # kafka-init alongside the broker and compose blocks on ITS "service_healthy" condition
-        # before starting it, so the common case is a single conclusive probe here and silence is
-        # the right output for it. (The application services carry no such condition - see the
-        # section header - so on a bring-up that skipped staging this really can wait.)
+        # Announced once, and only when there is actually a wait: the staged bring-up
+        # names kafka-init alongside the broker and compose blocks on ITS
+        # "service_healthy" condition before starting it, so the common case is a single
+        # conclusive probe here and silence is the right output for it. (The application
+        # services carry no such condition - see the section header - so on a bring-up
+        # that skipped staging this really can wait.)
         if [ "${announced}" = "no" ]
         then
             kafka_note "waiting up to ${timeout}s for the broker to complete its first SASL handshake..."
@@ -930,13 +703,10 @@ wait_for_kafka_healthy() {
     done
 }
 
-# Verifies that the one-shot provisioning service RAN AND SUCCEEDED, waiting for it while it
-# is still going. Compose starts it behind the broker's healthcheck, but "up -d" does not wait
-# for a one-shot to finish, so its outcome can only be read afterwards - here.
-#
-# 0 it exited 0, 1 it exited non-zero or is still running at the deadline, 2 the service has
-# no container at all. The caller provisions directly in the last two cases, which is the
-# whole reason 2 is distinguished rather than folded into 1.
+# Verifies that the one-shot provisioning service RAN AND SUCCEEDED, waiting for it
+# while it is still going. Compose starts it behind the broker's healthcheck, but "up
+# -d" does not wait for a one-shot to finish, so its outcome can only be read afterwards
+# - here.
 wait_for_kafka_init() {
     local service="${1}" id="" state="" code="" deadline=""
     local timeout="${KAFKA_WAIT_TIMEOUT_SECONDS:-180}"
@@ -980,28 +750,11 @@ wait_for_kafka_init() {
     done
 }
 
-# Provisions the topic catalogue and the sample subscriber principal directly. A FALLBACK,
-# never the primary path: the catalogue is created by exactly one script whether compose runs
-# it inside the broker image or this runs it on the host, so the work is delegated rather than
-# restated - a second implementation is a second thing to drift.
-#
-# That script takes no arguments and reads everything from the environment, so the hand-off
-# below is the entire interface, and kafka_provision_passthrough is the whole of it — read from
-# the script's own "--print-interface-host" at startup rather than restated here, so it cannot
-# fall behind. Values are ${env}'s, because showenv sourced it before main ran. On a host the
-# Kafka CLI is normally absent; the script handles that itself by re-executing inside the broker
-# container over docker, and KAFKA_CONTAINER and KAFKA_PROVISION_CONTAINER_SCRIPT - both in the
-# host-only half of that interface - are what tell it where to go.
-#
-# WHY THE FULL LIST MATTERS, with one variable as the illustration.
-# KAFKA_ALLOW_PARTITION_GROWTH is CONSENT to an operation that re-maps keys already written: add
-# partitions to a topic that holds records and one ledger's events split across partitions,
-# after which a consumer can observe them out of order with nothing failing to say so. Compose
-# passes it to kafka-init and the Go admin client reads it from configuration. A fallback that
-# dropped it would have the same ${env} refuse a growth through one path and answer differently
-# through the other, decided by nothing more than whether this host has the Kafka CLI. Every
-# other name on that list has its own version of the same argument, which is why the list is
-# read from the script rather than curated by hand.
+# Provisions the topic catalogue and the sample subscriber principal directly. A
+# FALLBACK, never the primary path: the catalogue is created by exactly one script
+# whether compose runs it inside the broker image or this runs it on the host, so the
+# work is delegated rather than restated - a second implementation is a second thing to
+# drift.
 provision_kafka() {
     local brokers="${1}" service="${2}"
 
@@ -1012,15 +765,15 @@ provision_kafka() {
         return 1
     fi
 
-    # Built from the allowlist, and ONLY for names that are actually declared. Forwarding an
-    # undeclared name as an empty assignment is not neutral: the script defaults each of these
-    # with the ${VAR:-default} form, and an empty value satisfies that form, so passing
-    # KAFKA_SAMPLE_SUBSCRIBER_USER= would replace "blnk-sample-subscriber" with nothing and the
-    # run would fail on an empty principal it was never given. ${!name+declared} tests
-    # declaration rather than content, so an operator's deliberate empty value still crosses.
-    # An empty interface means resolve_kafka_provision_interface could not read the script's
-    # declaration, and it has already said so. Forwarding nothing would provision DEFAULTS and
-    # report success — the silent divergence this mechanism exists to remove — so it refuses.
+    # Built from the allowlist, and ONLY for names that are actually declared.
+    # Forwarding an undeclared name as an empty assignment is not neutral: the script
+    # defaults each of these with the ${VAR:-default} form, and an empty value satisfies
+    # that form, so passing KAFKA_SAMPLE_SUBSCRIBER_USER= would replace
+    # "blnk-sample-subscriber" with nothing and the run would fail on an empty principal
+    # it was never given. ${!name+declared} tests declaration rather than content, so an
+    # operator's deliberate empty value still crosses. An empty interface means
+    # resolve_kafka_provision_interface could not read the script's declaration, and it
+    # has already said so.
     if [ "${#kafka_provision_passthrough[@]}" -eq 0 ]
     then
         kafka_warn "the provisioning interface is empty, so nothing would be forwarded." \
@@ -1029,34 +782,9 @@ provision_kafka() {
         return 1
     fi
 
-    # THE PRODUCER PAIR IS NOT REWRITTEN HERE, and it used to be: two assignments mapped
-    # KAFKA_SASL_* onto KAFKA_PRODUCER_* unconditionally, AFTER the allowlist, so they won.
-    # ${example} documents setting only the KAFKA_PRODUCER_* pair as the normal compose route,
-    # and for such a .env those assignments forwarded two EMPTY values - erasing the
-    # operator's producer credential on this path alone and failing the run on a secret it was
-    # never given. Both pairs now cross verbatim through the allowlist above, and the script
-    # applies the same KAFKA_SASL_* first, KAFKA_PRODUCER_* second precedence the compose
+    # Both pairs now cross verbatim through the allowlist above, and the script applies
+    # the same KAFKA_SASL_* first, KAFKA_PRODUCER_* second precedence the compose
     # services and config.KafkaConfig apply, so all three agree by construction.
-    #
-    # A SUBSHELL WITH export, NOT `env KEY=value`.
-    #
-    # The goal has not changed: nothing here may leak a credential into this shell's environment
-    # for every later command in the bring-up to inherit. A subshell achieves that as completely
-    # as `env` did - the exports die with the subshell - while fixing what `env` got wrong.
-    #
-    # What it got wrong is that `env KAFKA_SASL_ADMIN_SECRET=... script` places the broker
-    # superuser's password in env's ARGV, and /proc/<pid>/cmdline is mode 444 on Linux: readable
-    # by every account on the host for as long as provisioning runs, which is seconds, not
-    # microseconds. The `export` builtin is executed by this shell itself, so there is no new
-    # command line for anyone to read; the values reach the script through its environment,
-    # /proc/<pid>/environ, which is mode 400 and readable only by its owner.
-    #
-    # The two computed values are exported last so they win over any ${env} entry of the same
-    # name that reached the passthrough list: the broker list is the EFFECTIVE one, which honours
-    # a shell-level override, and the service is the one the caller asked about.
-    #
-    # `exec` replaces the subshell rather than forking under it, so the exit status is the
-    # script's own and there is one fewer process holding the credentials.
     (
         local name
         for name in "${kafka_provision_passthrough[@]}"
@@ -1074,8 +802,8 @@ provision_kafka() {
     )
 }
 
-# Confirms that events have somewhere to go: a broker that authenticates and a catalogue that
-# exists.
+# Confirms that events have somewhere to go: a broker that authenticates and a catalogue
+# that exists.
 #
 # THE VERDICT IS THE RETURN VALUE, and it turns on whether this stack owns the broker.
 #
@@ -1084,26 +812,6 @@ provision_kafka() {
 #       catalogue exists.
 #   1 - Kafka is configured AND local, and its state could not be verified: the broker never
 #       became healthy, its container is not running, or provisioning did not complete.
-#
-# WHY A LOCAL FAILURE IS FATAL AND AN EXTERNAL ONE IS NOT. This used to return 0 on every path
-# and every call site added "|| true" on top, so "./stack.sh -u" printed the diagnosis in red
-# and then exited 0. A bring-up that reports success without the topics and ACLs the relay
-# needs is not a bring-up: the next thing to happen is a publish failure nobody connects to
-# this run, and in CI the step that was supposed to prove the stack works goes green. The
-# outbox argument - that events wait durably until a broker accepts them - is about DURABILITY,
-# and it is still true; it was never an argument for reporting success.
-#
-# The distinction is ownership, not severity. When ${COMPOSE_FILE} declares the broker service
-# this script started it and is the only thing that can be held responsible for its state. When
-# it does not, the broker belongs to somebody else - a managed cluster, a shared development
-# broker - and this script can neither fix nor be blamed for it, so it says what it observed
-# and stays out of the way. An empty broker list is the same case in the other direction: the
-# publisher resolves to its no-op implementation on purpose, and there is nothing to verify.
-#
-# NOTHING IS TORN DOWN on a failure. "up -d" has already completed and the database, the queue,
-# the search index and the API are serving; what changes is the exit status, so that a human
-# sees a red summary and a script chained with "&&" stops instead of continuing against a
-# broker that cannot take an event.
 ensure_kafka() {
     local brokers="" service="" init_service="" id="" health=0 init=0
 
@@ -1194,29 +902,25 @@ ensure_kafka() {
     return 1
 }
 
-# Starts the broker and its provisioning one-shot, then waits until the catalogue exists.
+# Starts the broker and its provisioning one-shot, then waits until the catalogue
+# exists.
 #
-# ONLY those two services are started here. The application services follow in the caller, so
-# the relay's first poll happens against a broker whose topics are already there.
+# ONLY those two services are started here. The application services follow in the
+# caller, so the relay's first poll happens against a broker whose topics are already
+# there.
 #
 # Whether the staged broker bring-up applies to this invocation.
 #
-# THREE SITUATIONS ARE NOT PROBLEMS and must not be reported as any. Each returns 1, and a 1
-# here means "nothing to stage", never "something is wrong":
+# THREE SITUATIONS ARE NOT PROBLEMS and must not be reported as any. Each returns 1, and
+# a 1 here means "nothing to stage", never "something is wrong":
 #
-#   1. The caller NAMED SERVICES. "./stack.sh --up postgres redis" asks for two services, and
-#      staging a broker into that would start a container the operator did not ask for. Flags
-#      are ignored in that judgement, because "--build" is not a service name.
-#   2. THE BROKER LIST IS EMPTY. Event publishing is off, which is a supported steady state;
-#      ensure_kafka reports on it in full. Staging a broker for a stack configured to ignore
-#      it would start a JVM nobody asked for and gate the API on it - exactly what the Compose
-#      files no longer do.
-#   3. ${COMPOSE_FILE} DECLARES NO BROKER. A custom projection, or an external managed broker,
-#      has nothing to stage. ensure_kafka says so afterwards.
-#
-# The third check runs "config --services" WITH the Kafka profile selected, because the broker
-# and its one-shot sit behind it: without the profile the service is absent from the listing
-# and a perfectly ordinary projection would look like case 3.
+#   1. The caller NAMED SERVICES. "./stack.sh --up postgres redis" asks for two
+#      services, and staging a broker into that would start a container the operator did
+#      not ask for.
+#   2. THE BROKER LIST IS EMPTY. Event publishing is off, which is a supported steady
+#      state; ensure_kafka reports on it in full.
+#   3. ${COMPOSE_FILE} DECLARES NO BROKER. A custom projection, or an external managed
+#      broker, has nothing to stage. ensure_kafka says so afterwards.
 #
 # Parameters: the arguments the caller is forwarding to "compose up".
 kafka_staging_applicable() {
@@ -1252,10 +956,11 @@ kafka_staging_applicable() {
     return 0
 }
 
-# 0 when the broker is ready, or when the operator has opted out through KAFKA_REQUIRE_READY.
-# 1 when Kafka is configured and could not be made ready, which fails the bring-up before the
-# ledger is started - deliberately, because a bring-up that reports success while the event
-# pipeline cannot deliver is the failure mode this whole section exists to remove.
+# 0 when the broker is ready, or when the operator has opted out through
+# KAFKA_REQUIRE_READY. 1 when Kafka is configured and could not be made ready, which
+# fails the bring-up before the ledger is started - deliberately, because a bring-up
+# that reports success while the event pipeline cannot deliver is the failure mode this
+# whole section exists to remove.
 stage_kafka() {
     local service init_service
 
@@ -1264,13 +969,14 @@ stage_kafka() {
 
     kafka_note "starting the broker and provisioning its topics before the application services..."
 
-    # Both named together so that compose applies kafka-init's own "service_healthy" condition:
-    # it waits for the broker's SASL handshake to succeed before the one-shot is started. "up"
-    # does not wait for a one-shot to FINISH, which is what ensure_kafka does below.
-    # THE PROFILE IS SELECTED HERE, and it has to be: both services sit behind
-    # profiles: ["kafka"], so naming them without it starts nothing at all and compose says
-    # so only in passing. kafka_staging_applicable has already established that brokers are
-    # configured, which is what makes selecting it correct rather than presumptuous.
+    # Both named together so that compose applies kafka-init's own "service_healthy"
+    # condition: it waits for the broker's SASL handshake to succeed before the one-shot
+    # is started. "up" does not wait for a one-shot to FINISH, which is what
+    # ensure_kafka does below. THE PROFILE IS SELECTED HERE, and it has to be: both
+    # services sit behind profiles: ["kafka"], so naming them without it starts nothing
+    # at all and compose says so only in passing. kafka_staging_applicable has already
+    # established that brokers are configured, which is what makes selecting it correct
+    # rather than presumptuous.
     if ! COMPOSE_PROFILES="$(compose_profiles_with_kafka)" \
         compose up -d "${service}" "${init_service}"
     then
@@ -1315,9 +1021,10 @@ staged_up() {
     local staged="no"
 
     # Every bring-up path routes through here, so this is where ${env} is completed. The
-    # broker cannot be bootstrapped without an administrative secret and the publisher cannot
-    # authenticate without a producer pair, and both are generated per stack rather than
-    # shipped, so a .env written before either existed is repaired before anything starts.
+    # broker cannot be bootstrapped without an administrative secret and the publisher
+    # cannot authenticate without a producer pair, and both are generated per stack
+    # rather than shipped, so a .env written before either existed is repaired before
+    # anything starts.
     ensure_env_secrets
 
     if kafka_staging_applicable "$@"
@@ -1345,10 +1052,10 @@ staged_up() {
 # Teardown that deletes data
 # =======================================================================================
 
-# Whether an explicit consent flag was given. Accepted anywhere among the arguments so that
-# both "--purge --yes" and "--purge -y" work, and nothing is forwarded to compose: "down
-# --volumes" takes what it needs from $COMPOSE_FILE, and a consent flag reaching it would
-# only make it fail.
+# Whether an explicit consent flag was given. Accepted anywhere among the arguments so
+# that both "--purge --yes" and "--purge -y" work, and nothing is forwarded to compose:
+# "down --volumes" takes what it needs from $COMPOSE_FILE, and a consent flag reaching
+# it would only make it fail.
 purge_consent_given() {
     local argument
 
@@ -1365,18 +1072,6 @@ purge_consent_given() {
 }
 
 # Shuts the stack down AND DELETES its data volumes.
-#
-# Separate from --down, and deliberately so. --down keeps every volume, which is what makes
-# it safe to run a hundred times a day, and adding --volumes to it would have silently
-# destroyed developers' ledger data. The two are different operations and this is the
-# destructive one, so it is spelled in full with no single-letter alias - a typo cannot reach
-# it - and it does nothing until consent is explicit.
-#
-# It exists because bootstrapping a KRaft broker is one-shot: the SCRAM credential is seeded
-# while storage is formatted, and an already-formatted volume is skipped on every later start.
-# So once ${env} carries a new KAFKA_SASL_ADMIN_SECRET, discarding kafka_data is the only way
-# the broker can be re-seeded with it. Removing just that volume is the surgical alternative
-# and is named in the message below.
 purge() {
     local answer=""
 
@@ -1406,10 +1101,10 @@ purge() {
         return 0
     fi
 
-    # The teardown profile set, so that the broker's container and its kafka_data volume are
-    # actually removed. Without it a profiled service is excluded and the volume this
-    # operation exists to discard survives - which is precisely the volume an operator runs
-    # --purge to re-bootstrap.
+    # The teardown profile set, so that the broker's container and its kafka_data volume
+    # are actually removed. Without it a profiled service is excluded and the volume
+    # this operation exists to discard survives - which is precisely the volume an
+    # operator runs --purge to re-bootstrap.
     COMPOSE_PROFILES="$(teardown_compose_profiles)" compose down --volumes
 }
 
@@ -1418,31 +1113,14 @@ purge() {
 # =======================================================================================
 
 # The lowest Compose release that can read this repository's compose files.
-#
-# It is not a preference. Both docker-compose.yaml and docker-compose.dev.yaml declare
-# "depends_on: <service>: required: false" on the Kafka dependency, and that field is what makes
-# the broker OPT-IN: without it a profiled service that was never started is a hard dependency
-# failure and the default bring-up cannot start at all. Compose added "required" in 2.20.0, so a
-# host below that version does not merely lose a feature - it cannot parse the file, and the
-# error it prints names a field rather than a version.
 declare -r COMPOSE_MINIMUM_VERSION="2.20.0"
 
-# The version of a Compose invocation, as "MAJOR.MINOR.PATCH", or nothing when it cannot be
-# determined.
-#
-# "version --short" is used rather than parsing the human-readable banner, because the banner's
-# wording has changed across releases while --short has always printed the bare number. A
-# leading "v" is stripped and any pre-release or build suffix is discarded, so "v2.20.0-rc.1"
-# reads as 2.20.0 - the field this requirement is about landed in the release, and a release
-# candidate of it has the field.
-#
-# Every failure is swallowed and reported as an empty string: a wrapper that does not implement
-# "version --short" is a legitimate thing for an operator to point COMPOSE_CL at, and errexit
-# must not turn "cannot tell" into an aborted bring-up.
+# The version of a Compose invocation, as "MAJOR.MINOR.PATCH", or nothing when it cannot
+# be determined.
 #
 # Parameters:
-#   - $1: the Compose invocation to interrogate, word-split on purpose because "docker compose"
-#     is two words.
+#   - $1: the Compose invocation to interrogate, word-split on purpose because "docker
+#     compose" is two words.
 compose_version_of() {
     local invocation="${1}" raw=""
 
@@ -1458,9 +1136,6 @@ compose_version_of() {
 }
 
 # Whether a "MAJOR.MINOR.PATCH" string is at least COMPOSE_MINIMUM_VERSION.
-#
-# Compared field by field as integers rather than lexically, because "2.9.0" sorts after
-# "2.20.0" as text and that is exactly the comparison this repository needs to get right.
 #
 # Parameters:
 #   - $1: the version to test. An empty or unparseable value answers "no".
@@ -1510,35 +1185,19 @@ refuse_compose_cl() {
 
 # Decide how to invoke Compose, once, before any command runs.
 #
-# WHY THIS IS DETECTED. Docker ships the Compose v2+ plugin with every current release, invoked
-# as "docker compose". This script used to pin the standalone "docker-compose" script and
-# ${example} shipped that pin uncommented, so on a host without it every call here died with
-# "docker-compose: command not found" - the ledger never came up, and the Kafka staging this file
-# owns never ran. Detecting costs one probe and removes a whole class of "it does not work on my
-# machine".
+# WHY THIS IS DETECTED. Docker ships the Compose v2+ plugin with every current release,
+# invoked as "docker compose".
 #
-# WHY THERE IS NO v1 FALLBACK. The standalone script is Compose v1, it is end-of-life, and it
-# cannot read this repository's compose files at all: depends_on.required arrived in v2.20.0.
-# Falling back to it would replace a clear "install a newer Compose" with a parse error naming a
-# field, on a host that was never going to work - so the version is checked and the fallback is
-# gone.
-#
-# PRECEDENCE, and it matters. An explicit COMPOSE_CL - exported by the caller or pinned in
-# ${env}, which showenv has already sourced by the time this runs - is used verbatim and is never
-# replaced: an operator who names a wrapper, a remote context or an absolute path has said
-# something this function has no business second-guessing. It is still VERSION-CHECKED, which is
-# a different act: the requirement belongs to the compose files rather than to the invocation, so
-# it holds however Compose is reached. A wrapper whose version cannot be read is warned about and
-# then trusted, because refusing there would break the very indirection the override exists for.
-#
-# WHY IT CAN REFUSE. With no usable Compose, every command in this script would fail anyway, one
-# confusing message at a time. Saying so once, by name and with the version required, is the
-# difference between a missing prerequisite and a broken script. --init and the help text are
-# exempt because neither touches Compose, and an operator's first act on a fresh checkout is
-# usually --init.
+# PRECEDENCE, and it matters. An explicit COMPOSE_CL - exported by the caller or pinned
+# in ${env}, which showenv has already sourced by the time this runs - is used verbatim
+# and is never replaced: an operator who names a wrapper, a remote context or an
+# absolute path has said something this function has no business second-guessing. It is
+# still VERSION-CHECKED, which is a different act: the requirement belongs to the
+# compose files rather than to the invocation, so it holds however Compose is reached.
 #
 # Parameters:
-#   - $1: the subcommand being run, so the Compose-free ones are not held to this requirement.
+#   - $1: the subcommand being run, so the Compose-free ones are not held to this
+#     requirement.
 resolve_compose_cl() {
     # Named for what it is rather than "command", which would read as the shell builtin used
     # in the probe below.
@@ -1596,15 +1255,15 @@ main() {
     # run. It is passed the subcommand so a Docker-less host can still be initialised.
     resolve_compose_cl "${1}"
 
-    # Read the provisioning interface from the script that owns it, before any subcommand can
-    # need it. A failure here is reported by the resolver and is not fatal: provision_kafka
-    # refuses with its own message when the script is unusable, and every subcommand that does
-    # not provision is unaffected.
+    # Read the provisioning interface from the script that owns it, before any
+    # subcommand can need it. A failure here is reported by the resolver and is not
+    # fatal: provision_kafka refuses with its own message when the script is unusable,
+    # and every subcommand that does not provision is unaffected.
     resolve_kafka_provision_interface || true
 
     case "${1}" in
         --pull | -p )
-            # NO HOST-GLOBAL PRUNE BY DEFAULT (SEC-8). This arm used to begin with
+            # NO HOST-GLOBAL PRUNE BY DEFAULT. This arm does NOT run
             #     docker image prune -a --force --filter "until=72h"
             # which deletes EVERY unused image on the Docker host older than 72 hours — not
             # this project's images, every image reachable by this daemon, including those
@@ -1614,9 +1273,6 @@ main() {
             # reclaim of the whole image cache, with no confirmation and no way to opt out;
             # on a shared or CI host what it reclaimed was somebody else's build cache, and
             # the cost reappeared as an unexplained cold rebuild somewhere unrelated.
-            #
-            # Reclaiming is still available, but it must be asked for by name and it says
-            # what it is about to do first.
             if [[ "${STACK_PRUNE_IMAGES:-}" == "1" || "${STACK_PRUNE_IMAGES:-}" == "true" ]]; then
                 printf '%b\n' " ${YEL}STACK_PRUNE_IMAGES is set: pruning ALL unused Docker images older than 72h${NC}" \
                     " This is ${RED}HOST-GLOBAL${NC} and is not limited to this project. Images belonging to" \
@@ -1643,8 +1299,6 @@ main() {
             staged_up --build "${@:2}"
             ;;
         --restart | -r )
-            # The teardown profile set, so a broker started by an earlier run is actually
-            # stopped rather than left holding its port while the stack comes back up.
             COMPOSE_PROFILES="$(teardown_compose_profiles)" compose down
             staged_up "${@:2}"
             ;;
@@ -1653,51 +1307,24 @@ main() {
             if [ -r ${env} ]
             then
                 printf "The environment file ${RED}%s${NC} is already available. If you want to start from scratch, delete it and restart.\n" "${env}"
-                # An existing file is not left as found. Its permissions are still repaired
-                # and any missing Kafka credential is still generated, because the two
-                # defects this guards against are exactly the ones an ALREADY-EXISTING file
-                # has: it was created by an older --init that never set a mode, and it
-                # predates the credentials the compose stack now requires. Saying "already
-                # available" and returning would leave a world-readable superuser secret in
-                # place and a stack that cannot start.
+                # An existing file is not left as found. Its permissions are still
+                # repaired and any missing Kafka credential is still generated, because
+                # the two defects this guards against are exactly the ones an
+                # ALREADY-EXISTING file has: it was created by an older --init that
+                # never set a mode, and it predates the credentials the compose stack
+                # now requires. Saying "already available" and returning would leave a
+                # world-readable superuser secret in place and a stack that cannot
+                # start.
                 ensure_env_secrets
             else
                 # CREATED PRIVATE FROM THE FIRST BYTE, not created and then tightened.
                 #
-                # This used to be a plain `cp` under the ambient umask, so .env was typically
-                # mode 644 - world-readable - and every secret --init generates went into it:
-                # the Postgres password, the Kafka administrative password whose principal is
-                # in super.users, and the producer password. Any local account, and any
-                # process running as any other user, could read all three.
-                #
-                # `install -m 600` sets the mode as part of the copy rather than afterwards.
-                # That ordering is the point: a create-then-chmod leaves a window, however
-                # brief, in which the file exists with the permissive mode and the secrets are
-                # already being written into it. The surrounding umask is set as well, because
-                # every later edit writes a TEMPORARY FILE in the same directory and takes its
-                # mode from the umask, not from the file it is replacing - so without it the
-                # secrets would appear world-readable in that temporary copy even though the
-                # final file was private. write_env_substitution sets umask 077 itself for the
-                # same reason; this is the belt to that braces.
+                # Any local account, and any process running as any other user, could
+                # read all three.
                 printf "Creating file: ${YEL}%s${NC} with secrets... Check it before you spin up the stack.\n" "${env}"
 
-                # THE MODE IS SET BEFORE THE FIRST SECRET EXISTS, and that ordering is the
-                # whole of this fix.
-                #
-                # ${example} is a committed template and is mode 0644, as it should be — it
-                # contains no secrets. "cp" preserves nothing and creates the destination
-                # under the process umask, which on a typical developer machine is 022, so
-                # ${env} was created world-readable and every credential generated below was
-                # written into a world-readable file: a PostgreSQL password and a Kafka
-                # SUPERUSER password, on a stack that publishes the broker to the host.
-                #
-                # Two changes, both needed. "umask 077" makes the file 0600 AT CREATION, so
-                # there is no window in which it exists readable and empty-of-secrets — a
-                # chmod after the writes would leave exactly that window, and a chmod after
-                # the copy would still be one syscall late. The explicit chmod that follows
-                # is belt and braces for a filesystem or umask that did not honour it, and it
-                # is checked rather than assumed: a .env this script could not protect must
-                # not then have credentials written into it.
+                # THE MODE IS SET BEFORE THE FIRST SECRET EXISTS, and that ordering is
+                # the whole of this fix.
                 umask 077
                 cp ${example} ${env}
                 chmod 600 ${env}
@@ -1712,82 +1339,41 @@ main() {
                     exit 1
                 fi
 
-                # ROUTED THROUGH set_env_value LIKE EVERY OTHER SECRET, and it used not to be:
-                # this line was a bare `sed -i "s|{POSTGRES_PASSWORD}|$POSTGRES_PASSWORD|g"`,
-                # which put the database password into sed's world-readable argv and depended on
-                # GNU sed's in-place extension. One writer for every credential means one place
+                # ROUTED THROUGH set_env_value LIKE EVERY OTHER SECRET, and it used not
+                # to be: this line was a bare `sed -i
+                # "s|{POSTGRES_PASSWORD}|$POSTGRES_PASSWORD|g"`, which put the database
+                # password into sed's world-readable argv and depended on GNU sed's
+                # in-place extension. One writer for every credential means one place
                 # where that is fixed, and it already is - see write_env_substitution.
                 POSTGRES_PASSWORD=$(openssl rand -base64 15)
                 set_env_value "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD" >/dev/null
-                # The Kafka administrative principal and its password, generated the same way
-                # and for the same reason: one credential per stack, created locally, written
-                # only into ${env} - which is git-ignored - and never into this file.
+                # The Kafka administrative principal and its password, generated the
+                # same way and for the same reason: one credential per stack, created
+                # locally, written only into ${env} - which is git-ignored - and never
+                # into this file.
                 #
-                # The broker's storage is formatted with this password and its clients then
-                # authenticate with it, so the pair has to be set together; ${example} ships
-                # both empty and each script refuses a half-configured pair by name. The
-                # kafka and kafka-init services now REQUIRE the secret rather than defaulting
-                # it, so generating it here is what makes a fresh stack start at all.
-                #
-                # GENERATED, THEN WRITTEN. Writing an unassigned variable here left the key
-                # EMPTY while set_env_value still printed "generated into .env" - a stack
-                # whose broker cannot bootstrap at all, reported as a success.
+                # The broker's storage is formatted with this password and its clients
+                # then authenticate with it, so the pair has to be set together;
+                # ${example} ships both empty and each script refuses a half-configured
+                # pair by name. The kafka and kafka-init services now REQUIRE the secret
+                # rather than defaulting it, so generating it here is what makes a fresh
+                # stack start at all.
                 KAFKA_SASL_ADMIN_SECRET=$(generate_kafka_secret)
                 set_env_value "KAFKA_SASL_ADMIN_USER" "${kafka_admin_principal}"
                 set_env_value "KAFKA_SASL_ADMIN_SECRET" "$KAFKA_SASL_ADMIN_SECRET"
 
-                # THE STEADY-STATE PRODUCER PRINCIPAL: a SECOND, separate credential, and the
-                # separation is the point rather than an inconvenience.
-                #
-                # The administrative principal above is a cluster superuser — it creates
-                # topics, mints SCRAM credentials for any principal and rewrites every ACL.
-                # The server and worker do none of that; they publish. Blnk therefore REFUSES
-                # to publish as the administrator: with an administrative pair configured and
-                # no producer pair its event publisher fails to construct and neither process
-                # starts. Generating this pair here is what makes the correct configuration
-                # the default one, instead of leaving an operator to discover the refusal.
+                # THE STEADY-STATE PRODUCER PRINCIPAL: a SECOND, separate credential,
+                # and the separation is the point rather than an inconvenience.
                 #
                 # ONE IDENTITY, WRITTEN UNDER BOTH NAMES IT IS READ UNDER.
-                #
-                # The producer pair is resolved from KAFKA_SASL_USER / KAFKA_SASL_SECRET first
-                # and from KAFKA_PRODUCER_USER / KAFKA_PRODUCER_SECRET second - by
-                # config.KafkaConfig, by the compose server and worker services, and by
-                # scripts/kafka-provision.sh, all three in that order. Writing only one of the
-                # two pairs would leave the other empty in ${env}, which reads as "not
-                # configured" to anyone editing the file by hand and invites a second,
-                # different credential being filled in beside the first. The symptom of that
-                # divergence is a SASL handshake failure with two correct-looking
-                # configurations.
-                #
-                # So both pairs are written, from ONE generated value. The credential the
-                # broker is minted with and the credential the application presents are then
-                # the same string however it is resolved, and there is no ordering in which
-                # they can disagree.
                 KAFKA_PRODUCER_SECRET=$(generate_kafka_secret)
                 set_env_value "KAFKA_PRODUCER_USER" "${kafka_producer_principal}"
                 set_env_value "KAFKA_PRODUCER_SECRET" "$KAFKA_PRODUCER_SECRET"
                 set_env_value "KAFKA_SASL_USER" "${kafka_producer_principal}"
                 set_env_value "KAFKA_SASL_SECRET" "$KAFKA_PRODUCER_SECRET"
 
-                # The sample subscriber's password, generated here for a reason that is about
-                # DISCLOSURE rather than about convenience.
-                #
-                # scripts/kafka-provision.sh no longer prints a generated password: it runs as
-                # the compose kafka-init service, so its stdout is a container log that retains
-                # the credential for the container's lifetime, hands it to anyone who can run
-                # "docker compose logs", and forwards it to whatever collects the host's logs.
-                # Generating it here instead puts it in a mode-0600 file the operator already
-                # owns, and the script then applies a SUPPLIED secret, which it never echoes.
-                #
-                # Unlike the two pairs above this one is optional: with it empty the sample
-                # principal is skipped and Blnk publishes normally. It is generated anyway so
-                # that a local consumer works out of the box.
-                # Generated with the same helper as the two pairs above, so it clears the same
-                # 32-character and 16-distinct-character floors kafka-provision.sh enforces on a
-                # SUPPLIED secret. A raw base64 draw can carry "+" and "/", which the shared
-                # credential alphabet does accept, but it checks neither floor - and a secret the
-                # script then refuses would skip the sample principal with a weak-credential
-                # error about a credential the operator never chose.
+                # The sample subscriber's password, generated here for a reason that is
+                # about DISCLOSURE rather than about convenience.
                 KAFKA_SAMPLE_SUBSCRIBER_SECRET=$(generate_kafka_secret)
                 set_env_value "KAFKA_SAMPLE_SUBSCRIBER_SECRET" "$KAFKA_SAMPLE_SUBSCRIBER_SECRET"
 
@@ -1814,17 +1400,12 @@ main() {
             ;;
         # ANYTHING ELSE IS A MISTAKE, AND IT EXITS NON-ZERO.
         #
-        # This arm used to be `* ) help`, sharing the success path above, so `./stack.sh
-        # --buld` printed the usage banner and returned 0. Nothing was brought up, nothing was
-        # torn down, and every caller was told it had worked — a CI job or a provisioning
-        # wrapper that mistyped a subcommand recorded success against a stack that had never
-        # started. That is the one class of failure this script otherwise avoids everywhere:
-        # `--down` with no ${env} exits 1, a broker that never becomes healthy exits non-zero,
-        # and a purge without consent refuses. A typo was the sole exception.
-        #
-        # The argument is named back rather than only the usage printed, because the mistake is
-        # usually a single transposed character and an operator reading a wall of usage text
-        # does not always see which word of theirs was not understood.
+        # Nothing was brought up, nothing was torn down, and every caller was told it
+        # had worked — a CI job or a provisioning wrapper that mistyped a subcommand
+        # recorded success against a stack that had never started. That is the one class
+        # of failure this script otherwise avoids everywhere: `--down` with no ${env}
+        # exits 1, a broker that never becomes healthy exits non-zero, and a purge
+        # without consent refuses. A typo was the sole exception.
         * )
             printf "\n ${RED}==> error:${NC} unrecognised argument ${YEL}%s${NC}. Nothing was started, stopped or changed.\n" "${1}"
             help

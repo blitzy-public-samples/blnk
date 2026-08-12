@@ -87,11 +87,6 @@ func (s *retentionFakeStore) snapshot() []retentionPurgeCall {
 }
 
 // newRetentionSweeper builds a sweeper over the fake store with the clock pinned.
-//
-// It carries the SAME purge capacity the constructor applies, deliberately: a helper that left
-// maxBatches at its zero value would give every test that uses it an unbounded sweep, which is
-// a different mechanism from the one the production path runs and would hide a regression in
-// the bound rather than catch it.
 func newRetentionSweeper(store *retentionFakeStore, retention time.Duration) *EventRetentionSweeper {
 	return &EventRetentionSweeper{
 		store:      store,
@@ -105,12 +100,6 @@ func newRetentionSweeper(store *retentionFakeStore, retention time.Duration) *Ev
 
 // TestEventRetentionSweeper_IsDisabledUntilAPeriodIsConfigured asserts the default, and
 // asserts it as a SAFETY property rather than a convenience.
-//
-// Deleting ledger-adjacent records is a decision only an operator can take: the period a
-// jurisdiction, an audit programme or a legal hold requires is not something a default can
-// guess, and a default that silently deleted evidence would be far worse than one that keeps
-// too much. So the mechanism ships switched off, and the disabled state is reported as a
-// distinct, exported error so the caller can log it as the unremarkable default it is.
 func TestEventRetentionSweeper_IsDisabledUntilAPeriodIsConfigured(t *testing.T) {
 	store := &retentionFakeStore{}
 
@@ -139,12 +128,8 @@ func TestEventRetentionSweeper_IsDisabledUntilAPeriodIsConfigured(t *testing.T) 
 	}
 }
 
-// TestEventRetentionSweeper_RefusesToRunWithoutADatasource asserts the other obstacle, and
-// that it is NOT the disabled one.
-//
-// The distinction is what lets the caller log them differently: retention switched off is the
-// default, while retention configured and not running means the control the operator asked for
-// is absent and the table is quietly growing.
+// TestEventRetentionSweeper_RefusesToRunWithoutADatasource asserts the other obstacle,
+// and that it is NOT the disabled one.
 func TestEventRetentionSweeper_RefusesToRunWithoutADatasource(t *testing.T) {
 	sweeper := &EventRetentionSweeper{retention: 30 * 24 * time.Hour}
 
@@ -156,13 +141,8 @@ func TestEventRetentionSweeper_RefusesToRunWithoutADatasource(t *testing.T) {
 	assert.Contains(t, obstacle.Error(), "datasource")
 }
 
-// TestEventRetentionSweeper_ComputesTheCutoffFromTheConfiguredPeriodInDays is the arithmetic
-// assertion, and it is the one with teeth.
-//
-// The configured value is DAYS and the cutoff is an instant, so the conversion is where an
-// order-of-magnitude error hides — hours instead of days would delete rows an operator
-// expected to keep for a month, irreversibly and without any error to notice. The clock is
-// pinned so the expected instant is exact.
+// TestEventRetentionSweeper_ComputesTheCutoffFromTheConfiguredPeriodInDays is the
+// arithmetic assertion, and it is the one with teeth.
 func TestEventRetentionSweeper_ComputesTheCutoffFromTheConfiguredPeriodInDays(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		days       int
@@ -191,13 +171,8 @@ func TestEventRetentionSweeper_ComputesTheCutoffFromTheConfiguredPeriodInDays(t 
 	}
 }
 
-// TestEventRetentionSweeper_SweepsInBoundedBatchesUntilTheEligibleSetIsDrained asserts the
-// loop's two exits.
-//
-// The bound is what makes this safe to run beside a live relay: an unbounded DELETE over a
-// large backlog would hold locks for its whole duration and bloat the WAL in one transaction.
-// Stopping on the first SHORT batch is what stops the sweep issuing a pointless extra
-// statement every hour once the backlog is gone.
+// TestEventRetentionSweeper_SweepsInBoundedBatchesUntilTheEligibleSetIsDrained asserts
+// the loop's two exits.
 func TestEventRetentionSweeper_SweepsInBoundedBatchesUntilTheEligibleSetIsDrained(t *testing.T) {
 	t.Run("a full batch continues and a short batch ends the sweep", func(t *testing.T) {
 		store := &retentionFakeStore{results: []int64{
@@ -224,12 +199,8 @@ func TestEventRetentionSweeper_SweepsInBoundedBatchesUntilTheEligibleSetIsDraine
 
 	t.Run("one sweep is bounded even when the backlog is not", func(t *testing.T) {
 		// Every batch comes back full, so the eligible set never drains. Without the
-		// per-sweep bound this loop would run until the timeout, holding a table the relay
-		// is claiming from for ten minutes on the first sweep after retention is enabled.
-		//
-		// The ceiling is set explicitly and small rather than exercising the shipped default,
-		// so this asserts the BOUND rather than its value — the value is configuration and is
-		// asserted where configuration is asserted, below.
+		// per-sweep bound this loop would run until the timeout, holding a table the relay is
+		// claiming from for ten minutes on the first sweep after retention is enabled.
 		const ceiling = 7
 
 		results := make([]int64, ceiling+50)
@@ -248,7 +219,7 @@ func TestEventRetentionSweeper_SweepsInBoundedBatchesUntilTheEligibleSetIsDraine
 	})
 
 	t.Run("an unbounded sweep drains the eligible set in one pass", func(t *testing.T) {
-		// PERF-P23. config.EventRetentionUnboundedSweep is what a deliberate one-off catch-up
+		// Config.EventRetentionUnboundedSweep is what a deliberate one-off catch-up
 		// asks for after retention has been off on a busy deployment, and it must reach the
 		// loop as "no ceiling" rather than being normalised away to the default. The outer
 		// sweep timeout is still in force, so this is bounded by time rather than by nothing.
@@ -271,20 +242,12 @@ func TestEventRetentionSweeper_SweepsInBoundedBatchesUntilTheEligibleSetIsDraine
 	})
 }
 
-// TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals asserts PERF-P23
-// at the level the finding was raised: the amount of deletion one deployment can perform in an
-// hour, measured against the rate at which rows arrive.
-//
-// The mechanism was previously a compile-time constant of 100 batches of 1,000 rows — 100,000
-// rows an hour — carrying a comment claiming that "overtakes any realistic arrival rate". For
-// the rate this system is specified for, 500 events a second, rows arrive at 1,800,000 an hour:
-// eighteen times faster than they could be removed. Capacity below arrivals does not slow
-// growth, it permits it, and the configured retention period is then never actually enforced no
-// matter what it is set to. So the assertion below is arithmetic on the shipped defaults, not a
-// restatement of a literal.
+// TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals asserts
+// Purge capacity at deployment level: the amount of deletion one deployment
+// can perform in an hour, measured against the rate at which rows arrive.
 func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals(t *testing.T) {
 	t.Run("the shipped default capacity exceeds the specified peak arrival rate", func(t *testing.T) {
-		// The acceptance rate this system is validated against (V-1), expressed as rows per
+		// The acceptance rate this system is validated against, expressed as rows per
 		// hour so it is comparable with one hourly sweep's capacity.
 		const (
 			peakEventsPerSecond = 500
@@ -300,18 +263,9 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 			"purge capacity must EXCEED peak arrivals; at or below it the retention period is "+
 				"not enforced however it is configured, which is the defect PERF-P23 records")
 
-		// AND BY A MARGIN THAT CAN RECOVER, not merely by a margin (PERF-C03).
+		// AND BY A MARGIN THAT CAN RECOVER, not merely by a margin.
 		//
-		// Exceeding peak is necessary and was not sufficient. The default first cleared it by
-		// 11% — 2,000,000 an hour against 1,800,000 — and a sweeper that cannot catch up needs
-		// recovery capacity rather than break-even: one sweep cut short by its ten-minute
-		// timeout leaves a deficit that 11% works off over ten hours, and the deficit is rows
-		// the retention period says should already be gone.
-		//
-		// 2x is the floor asserted here because it recovers a wholly missed sweep inside one
-		// hour, which is the failure this margin exists for. It costs nothing in steady state:
-		// a sweep stops when it runs out of ELIGIBLE rows, so at peak it deletes 1,800,000 and
-		// stops whatever the ceiling is.
+		// Exceeding peak is necessary and was not sufficient.
 		assert.GreaterOrEqual(t, capacityPerSweep*sweepsPerHour, 2*peakRowsPerHour,
 			"purge capacity must clear peak arrivals at least TWICE OVER, or a single missed "+
 				"sweep cannot be recovered inside an hour; got %d rows/hour against %d arriving",
@@ -319,11 +273,10 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 	})
 
 	t.Run("the sweeper's fallbacks are the configured defaults, not copies of them", func(t *testing.T) {
-		// A sweeper built before configuration can be read falls back to these, and every other
-		// sweeper takes the configured pair. Two literals for one default are two numbers that
-		// can disagree, and which one a deployment ran at would then depend on start-up
-		// ordering, so they are derived rather than restated. This asserts the derivation
-		// survives — a future edit that pasted a literal back in would fail it.
+		// A sweeper built before configuration can be read falls back to these, and every
+		// other sweeper takes the configured pair. Two literals for one default are two
+		// numbers that can disagree, and which one a deployment ran at would then depend on
+		// start-up ordering, so they are derived rather than restated.
 		assert.Equal(t, config.DefaultEventRetentionBatchSize, defaultEventRetentionBatchSize,
 			"the sweeper's fallback batch size must BE the configured default")
 		assert.Equal(t,
@@ -346,12 +299,12 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 	})
 
 	t.Run("an unread configuration leaves the bound in place rather than removing it", func(t *testing.T) {
-		// The case that matters most, and the one this method exists to get right: it also runs
-		// against configurations that never passed through validateAndAddDefaults — a
-		// hand-built Configuration, or one published before the defaults were applied — and in
-		// those an unset ceiling is a plain zero. Reading that as "no ceiling" would silently
-		// remove the bound that keeps one sweep from attempting an entire backlog beside a
-		// live relay, on exactly the deployments that never configured anything.
+		// The case that matters most, and the one this method exists to get right: it also
+		// runs against configurations that never passed through validateAndAddDefaults — a
+		// hand-built Configuration, or one published before the defaults were applied — and
+		// in those an unset ceiling is a plain zero. Reading that as "no ceiling" would
+		// silently remove the bound that keeps one sweep from attempting an entire backlog
+		// beside a live relay, on exactly the deployments that never configured anything.
 		sweeper := newRetentionSweeper(&retentionFakeStore{}, 30*24*time.Hour)
 
 		sweeper.applyPurgeCapacity(&config.Configuration{
@@ -417,13 +370,10 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 	})
 
 	t.Run("exhausting the ceiling with rows remaining is reported", func(t *testing.T) {
-		// The observability half of PERF-P23, and the half that decides whether the other half
-		// is ever acted on. Insufficient capacity has no symptom an operator would notice: the
-		// sweep reports a healthy deletion count every hour, the retention period looks
-		// configured, and the table grows anyway. The previous default was eighteen times under
-		// peak and nothing said so. So the one distinguishable moment — a sweep that used its
-		// last permitted batch and still had rows to delete — is reported at warning level,
-		// naming the variables to raise.
+		// The observability half of purge capacity, and the half that decides whether the other
+		// half is ever acted on. Insufficient capacity has no symptom an operator would
+		// notice: the sweep reports a healthy deletion count every hour, the retention period
+		// looks configured, and the table grows anyway.
 		const ceiling = 4
 
 		results := make([]int64, ceiling+10)
@@ -478,10 +428,6 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 	t.Run("the constructor applies the configured capacity", func(t *testing.T) {
 		// The wiring, end to end: an operator's setting has to reach the sweeper the server
 		// actually starts, not just the field.
-		//
-		// The process configuration is a package-level store shared by every test in this
-		// package, so the previous value is put back before returning; leaving this one in
-		// place would silently change what an unrelated test downstream reads.
 		previous := config.ConfigStore.Load()
 		t.Cleanup(func() {
 			if previous != nil {
@@ -506,13 +452,8 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 	})
 }
 
-// TestEventRetentionSweeper_StopsOnAPurgeFailureAndReportsWhatItDeleted asserts a mid-sweep
-// failure is reported and does not lose the count of what already succeeded.
-//
-// Each delete is its own committed statement, so an interrupted sweep has no partial state to
-// repair — the rows that were deleted are gone and the rest are simply still there. Returning
-// the partial count matters because it is what a caller records as the metric, and reporting
-// zero would make a partially-successful sweep look like a sweep that did nothing.
+// TestEventRetentionSweeper_StopsOnAPurgeFailureAndReportsWhatItDeleted asserts a
+// mid-sweep failure is reported and does not lose the count of what already succeeded.
 func TestEventRetentionSweeper_StopsOnAPurgeFailureAndReportsWhatItDeleted(t *testing.T) {
 	store := &retentionFakeStore{
 		results: []int64{defaultEventRetentionBatchSize, defaultEventRetentionBatchSize},
@@ -528,13 +469,11 @@ func TestEventRetentionSweeper_StopsOnAPurgeFailureAndReportsWhatItDeleted(t *te
 			"struggling; the remaining rows are eligible again on the next tick")
 }
 
-// TestEventRetentionSweeper_HonoursCancellationMidSweep asserts a shutdown ends the sweep
-// promptly.
+// TestEventRetentionSweeper_HonoursCancellationMidSweep asserts a shutdown ends the
+// sweep promptly.
 //
-// Unlike the relay's bookkeeping, retention owes nothing: a row not yet deleted is simply a
-// row that is still there, and it will be eligible on the next sweep. So cancellation is
-// honoured rather than detached from, which is the opposite of the dead-letter hand-off's
-// treatment and correct for the same underlying reason — what is owed, and what is not.
+// Unlike the relay's bookkeeping, retention owes nothing: a row not yet deleted is
+// simply a row that is still there, and it will be eligible on the next sweep.
 func TestEventRetentionSweeper_HonoursCancellationMidSweep(t *testing.T) {
 	results := make([]int64, 10)
 	for i := range results {
@@ -604,13 +543,8 @@ func TestEventRetentionSweeper_ADisabledSweeperNeverStarts(t *testing.T) {
 	assert.NotPanics(t, sweeper.Stop, "and stopping one that never started must be safe")
 }
 
-// TestEventRetentionSweeper_ConfiguratorsRejectNonPositiveValues asserts a misconfigured
-// cadence or batch size cannot switch retention off.
-//
-// The failure mode of accepting them is silent: an interval of zero would make time.NewTicker
-// panic, and a batch size of zero would have the repository substitute its own default while
-// the sweeper's short-batch test compared against zero and ended every sweep after one
-// statement. Falling back is the safe direction for a control whose absence has no symptom.
+// TestEventRetentionSweeper_ConfiguratorsRejectNonPositiveValues asserts a
+// misconfigured cadence or batch size cannot switch retention off.
 func TestEventRetentionSweeper_ConfiguratorsRejectNonPositiveValues(t *testing.T) {
 	store := &retentionFakeStore{}
 	sweeper := newRetentionSweeper(store, 30*24*time.Hour)

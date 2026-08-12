@@ -23,20 +23,6 @@ import (
 
 // -----------------------------------------------------------------------------
 // Subscriber key-scope predicates.
-//
-// These six functions decide what boundary the credential contract CLAIMS, and —
-// for IsRevocationPending — whether a credential may be issued at all. They were
-// exercised only from the root package, so the mutation gate — which scores a
-// package by running that package's own tests — reported them NOT COVERED and
-// never scored them. A predicate whose wrong answer makes a credential response
-// overstate its own boundary is the least acceptable place to have no mutation
-// score, hence this file.
-//
-// Each assertion pins something a mutant would break: a connective, a
-// comparison, a normalisation, or the nil-receiver answer. The receiver cases
-// are not defensive padding — the repository represents "subscriber not found"
-// as a nil pointer, so every one of these predicates is genuinely called on nil
-// and must refuse rather than panic.
 // -----------------------------------------------------------------------------
 
 // stringPtr addresses the nullable partition_key_prefix column.
@@ -51,24 +37,24 @@ func TestEventSubscriber_RequestedKeyScopeFlattensTheNullableColumn(t *testing.T
 	assert.Equal(t, "", absent.RequestedKeyScope(),
 		"a subscriber that does not exist requested no scope")
 
-	// A nil column answers the empty string too: no scope requested and "every
-	// key on the authorised topics" are the same reading, and collapsing them
-	// here is what spares every caller a third state.
+	// A nil column answers the empty string too: no scope requested and "every key on the
+	// authorised topics" are the same reading, and collapsing them here is what spares
+	// every caller a third state.
 	assert.Equal(t, "", (&EventSubscriber{}).RequestedKeyScope(),
 		"an unset prefix column means no scope was requested")
 
-	// A recorded scope is returned VERBATIM. The value is a message-key prefix and
-	// keys are opaque identifiers, so any normalisation applied here would filter
-	// a different set of records than the registry recorded.
+	// A recorded scope is returned VERBATIM. The value is a message-key prefix and keys
+	// are opaque identifiers, so any normalisation applied here would filter a different
+	// set of records than the registry recorded.
 	assert.Equal(t, "ldg_9f2c",
 		(&EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}).RequestedKeyScope(),
 		"a recorded scope is returned exactly as recorded")
 }
 
 func TestEventSubscriber_HasKeyAccessIsAByteExactPrefixTest(t *testing.T) {
-	// With NO scope recorded every key is in bounds, including the empty key. This
-	// is the branch that makes an unprovisioned prefix and an explicit whole-topic
-	// entitlement read identically.
+	// With NO scope recorded every key is in bounds, including the empty key. This is the
+	// branch that makes an unprovisioned prefix and an explicit whole-topic entitlement
+	// read identically.
 	open := &EventSubscriber{}
 	assert.True(t, open.HasKeyAccess("ldg_9f2c"), "with no scope recorded every key is in bounds")
 	assert.True(t, open.HasKeyAccess(""), "including the empty key")
@@ -83,15 +69,15 @@ func TestEventSubscriber_HasKeyAccessIsAByteExactPrefixTest(t *testing.T) {
 	// A different ledger is out of bounds — the whole purpose of the rule.
 	assert.False(t, scoped.HasKeyAccess("ldg_0000"), "another ledger's keys are out of bounds")
 
-	// A key SHORTER than the scope is out of bounds. A mutant that reversed the
-	// prefix test — asking whether the scope starts with the key — would admit
-	// this one, and with it every ancestor of the boundary.
+	// A key SHORTER than the scope is out of bounds. A mutant that reversed the prefix
+	// test — asking whether the scope starts with the key — would admit this one, and with
+	// it every ancestor of the boundary.
 	assert.False(t, scoped.HasKeyAccess("ldg_"),
 		"a key shorter than the scope is not inside it; reversing the prefix test would admit it")
 
-	// NO trimming and NO case folding. Keys are opaque identifiers, so a key that
-	// differs by whitespace or case is a different key, and admitting it would
-	// hand over records the registry never authorised.
+	// NO trimming and NO case folding. Keys are opaque identifiers, so a key that differs
+	// by whitespace or case is a different key, and admitting it would hand over records
+	// the registry never authorised.
 	assert.False(t, scoped.HasKeyAccess(" ldg_9f2c"),
 		"a leading space makes it a different key — no trimming is applied")
 	assert.False(t, scoped.HasKeyAccess("LDG_9F2C"),
@@ -122,12 +108,10 @@ func TestEventSubscriber_EffectiveKeyScopeReportsWhatACredentialWouldActuallyCar
 			"comparing against it must not be comparing against an ACL pattern")
 	assert.True(t, enforced, "and that boundary is the one the broker really keeps")
 
-	// A scope requested: reported back as itself and as UNENFORCED. This pair is
-	// the defect the method closes — echoing a requested prefix beside a
-	// credential that can read the whole topic, without saying which of the two is
-	// real, would state a boundary that does not exist. Both halves are asserted,
-	// because a mutant that returned true here would make the contract claim
-	// enforcement Kafka cannot perform.
+	// A scope requested: reported back as itself and as UNENFORCED. This pair is the
+	// defect the method closes — echoing a requested prefix beside a credential that can
+	// read the whole topic, without saying which of the two is real, would state a
+	// boundary that does not exist.
 	scope, enforced = (&EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}).EffectiveKeyScope()
 	assert.Equal(t, "ldg_9f2c", scope, "a requested scope is reported as the boundary asked for")
 	assert.False(t, enforced,
@@ -153,10 +137,10 @@ func TestEventSubscriber_IsRevocationPendingTestsOnlyThePresenceOfTheTimestamp(t
 	assert.False(t, (&EventSubscriber{}).IsRevocationPending(),
 		"no revocation timestamp means no revocation in flight")
 
-	// The ZERO time still counts as present. The predicate is about the pointer,
-	// not about what it addresses: a row whose timestamp somehow serialised as the
-	// zero instant is still a row with a revocation in flight, and treating it as
-	// active would re-arm exactly the principal this guards.
+	// The ZERO time still counts as present. The predicate is about the pointer, not about
+	// what it addresses: a row whose timestamp somehow serialised as the zero instant is
+	// still a row with a revocation in flight, and treating it as active would re-arm
+	// exactly the principal this guards.
 	zero := time.Time{}
 	assert.True(t, (&EventSubscriber{RevocationPendingAt: &zero}).IsRevocationPending(),
 		"a set-but-zero timestamp is still a revocation in flight")
@@ -169,29 +153,15 @@ func TestEventSubscriber_IsRevocationPendingTestsOnlyThePresenceOfTheTimestamp(t
 		"a subscriber that does not exist has no revocation in flight")
 }
 
-// TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept pins the accessor that
-// replaced a boolean predicate named for unenforceability, now deleted.
+// TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept pins the accessor
+// that replaced a boolean predicate named for unenforceability, now deleted.
 //
-// The old predicate answered this same boolean under a name asserting a policy, and three
-// barriers read it as licence to deny the subscriber a credential outright. Reporting the
-// enforcement POINT is what let the credential be issued while every surface showing the prefix
-// shows the component that keeps it beside the value.
-//
-// Its VALUE changed with the isolation correction, and the change is the point of this test: it
-// used to answer "consumer_side", meaning the platform granted whole-topic Read and asked the
-// subscriber to discard what it was not entitled to. It answers "broker_gateway" now — the same
-// word a deployment declares in KAFKA_KEY_SCOPE_ENFORCEMENT — because a key-scoped subscriber is
-// granted no topic Read at all and its records are filtered by the component the operator declared
-// in front of the brokers. A regression to the old value would be a regression to the old exposure.
-//
-// This method reads the ROW and nothing else, so it reports where a recorded prefix WOULD be kept.
-// Whether a credential may be issued at all is config.KafkaConfig.KeyScopeGateway's question,
-// asked once at issuance — which is why a registry read of a row on a deployment that declared
-// nothing still describes the row truthfully instead of reporting "none" and hiding the intent.
+// The old predicate answered this same boolean under a name asserting a policy, and
+// three barriers read it as licence to deny the subscriber a credential outright.
 func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.T) {
-	// A real prefix: recorded, and kept by the DECLARED KEY-AUTHORISING COMPONENT, because Kafka
-	// has no message-key dimension to enforce it with and the subscriber therefore holds no topic
-	// Read.
+	// A real prefix: recorded, and kept by the DECLARED KEY-AUTHORISING COMPONENT, because
+	// Kafka has no message-key dimension to enforce it with and the subscriber therefore
+	// holds no topic Read.
 	scoped := &EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}
 	assert.True(t, scoped.DeclaresKeyScope(), "a recorded prefix is a recorded scope")
 	assert.Equal(t, KeyScopeEnforcementGateway, scoped.KeyScopeEnforcement(),
@@ -213,16 +183,16 @@ func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.
 		"so such a subscriber consumes directly, exactly as the access model describes")
 
 	// A BLANK prefix is absent, not a constraint on the empty string. Without the
-	// TrimSpace this reports gateway enforcement of nothing — which would withhold record access
-	// from a subscriber that asked for no narrowing, breaking its direct consumption over
-	// whitespace.
+	// TrimSpace this reports gateway enforcement of nothing — which would withhold record
+	// access from a subscriber that asked for no narrowing, breaking its direct
+	// consumption over whitespace.
 	//
 	// Note that RequestedKeyScope returns such a value verbatim, so this accessor and a
-	// predicate reading the scope untrimmed would disagree about a whitespace-only prefix. That row
-	// cannot be persisted: normalizeSubscriberKeyScope collapses a blank prefix to nil and
-	// REFUSES any value with surrounding whitespace, so the disagreement is unreachable
-	// defence-in-depth rather than a contract. It is recorded here so a reader does not
-	// mistake the asymmetry for intent.
+	// predicate reading the scope untrimmed would disagree about a whitespace-only prefix.
+	// That row cannot be persisted: normalizeSubscriberKeyScope collapses a blank prefix
+	// to nil and REFUSES any value with surrounding whitespace, so the disagreement is
+	// unreachable defence-in-depth rather than a contract. It is recorded here so a reader
+	// does not mistake the asymmetry for intent.
 	for name, blank := range map[string]string{"empty": "", "space": " ", "tab": "\t", "newline": "\n"} {
 		t.Run(name, func(t *testing.T) {
 			blankScoped := &EventSubscriber{PartitionKeyPrefix: stringPtr(blank)}
@@ -241,15 +211,10 @@ func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.
 			"of it, because provisioning derives bindings from a row it has loaded")
 }
 
-// TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary is the surviving guard on
-// the registry's own presence question.
+// TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary is the surviving
+// guard on the registry's own presence question.
 //
-// A near-identical test over RequiresKeyScopeEnforcement stood beside it. That predicate was a
-// FOURTH spelling of this one question, and its name claimed something remained to be ENFORCED
-// after the topic and group ACLs had been checked. Nothing enforces it — Kafka has no message-key
-// resource type, so the narrowing is the consumer's own filter — so the name has been deleted
-// along with the unenforceability spelling, and its coverage collapses into this test rather than
-// being duplicated under a second name.
+// A near-identical test over RequiresKeyScopeEnforcement stood beside it.
 func TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary(t *testing.T) {
 	// No scope: a whole-topic entitlement, which a Kafka ACL expresses exactly, so nothing
 	// is left for the consumer to apply.
@@ -258,9 +223,9 @@ func TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary(t *testi
 
 	// A scope: narrower than any ACL can express, so this must be true and the credential
 	// contract must deliver the prefix to the consumer. Killing the mutant that flips the
-	// comparison matters more here than anywhere else in the file — inverted, it would tell
-	// every whole-topic subscriber to filter and tell every key-scoped one not to, which is
-	// the exact opposite of the intended boundary and silences a real consumer.
+	// comparison matters more here than anywhere else in the file — inverted, it would
+	// tell every whole-topic subscriber to filter and tell every key-scoped one not to,
+	// which is the exact opposite of the intended boundary and silences a real consumer.
 	assert.True(t,
 		(&EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}).DeclaresKeyScope(),
 		"a recorded key prefix is narrower than a topic ACL and must be reported as a declared "+
@@ -273,19 +238,13 @@ func TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary(t *testi
 		"a subscriber that does not exist declares no boundary")
 }
 
-// TestEventSubscriber_EffectiveKeyScopeNeverDeliversABlankScope is a narrow guard on one
-// asymmetry, and it earns its place because the consequence is total and silent.
+// TestEventSubscriber_EffectiveKeyScopeNeverDeliversABlankScope is a narrow guard on
+// one asymmetry, and it earns its place because the consequence is total and silent.
 //
-// RequestedKeyScope returns the column verbatim, which is right: message keys are opaque, so
-// trimming one would select a different set of records than the registry recorded.
-// DeclaresKeyScope trims, which is also right: whitespace is not a recorded intent. The two
-// therefore differ on a whitespace-only prefix, and EffectiveKeyScope is where that difference
-// would escape — it is the pair the credential endpoint delivers to a consumer.
-//
-// A consumer told its key scope is "\t" applies it and discards EVERY record, because no ledger
-// id starts with a tab. Nothing errors, nothing is logged, and the subscriber simply receives
-// nothing — the worst shape of failure for this feature. So the presence test must be shared,
-// and this is the assertion that keeps it shared.
+// RequestedKeyScope returns the column verbatim, which is right: message keys are
+// opaque, so trimming one would select a different set of records than the registry
+// recorded. DeclaresKeyScope trims, which is also right: whitespace is not a recorded
+// intent.
 func TestEventSubscriber_EffectiveKeyScopeNeverDeliversABlankScope(t *testing.T) {
 	for name, blank := range map[string]string{
 		"empty":   "",
@@ -320,17 +279,18 @@ func TestEventSubscriber_DeclaresKeyScopeTreatsABlankPrefixAsAbsent(t *testing.T
 	assert.False(t, (&EventSubscriber{}).DeclaresKeyScope(),
 		"an unset prefix records no scope")
 
-	// A BLANK prefix is absent, not a constraint on the empty string. Without the TrimSpace
-	// this returns true and hands a consumer a boundary nobody asked for — which, applied,
-	// discards nothing but reports a scope in every response.
+	// A BLANK prefix is absent, not a constraint on the empty string. Without the
+	// TrimSpace this returns true and hands a consumer a boundary nobody asked for —
+	// which, applied, discards nothing but reports a scope in every response.
 	//
-	// RequestedKeyScope returns such a value VERBATIM — deliberately, because message keys are
-	// opaque and normalising one would select a different set of records — so this predicate and
-	// that accessor genuinely differ on a whitespace-only prefix. EffectiveKeyScope resolves it
-	// by branching on THIS predicate rather than on the raw value, which is what stops a tab in
-	// the column being delivered to a consumer as its key scope: applied, it would discard the
-	// subscriber's entire stream. normalizeSubscriberKeyScope refusing such a value at
-	// persistence is the outer layer of the same defence.
+	// RequestedKeyScope returns such a value VERBATIM — deliberately, because message keys
+	// are opaque and normalising one would select a different set of records — so this
+	// predicate and that accessor genuinely differ on a whitespace-only prefix.
+	// EffectiveKeyScope resolves it by branching on THIS predicate rather than on the raw
+	// value, which is what stops a tab in the column being delivered to a consumer as its
+	// key scope: applied, it would discard the subscriber's entire stream.
+	// normalizeSubscriberKeyScope refusing such a value at persistence is the outer layer
+	// of the same defence.
 	for name, blank := range map[string]string{"empty": "", "space": " ", "tab": "\t", "newline": "\n"} {
 		t.Run(name, func(t *testing.T) {
 			assert.False(t,

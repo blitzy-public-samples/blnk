@@ -151,26 +151,12 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 	return nil
 }
 
-// handleTransactionRejection rejects a transaction that has exhausted its retries or hit a
-// terminal processing error.
+// handleTransactionRejection rejects a transaction that has exhausted its retries or
+// hit a terminal processing error.
 //
-// # There is exactly ONE producer of transaction.rejected, and it is not here
-//
-// This function used to publish the event itself, immediately after RejectTransaction
-// returned. That was a DUPLICATE: RejectTransaction runs postTransactionActions, whose
-// status-derived producer already emits transaction.rejected for the very transaction being
-// rejected here.
-//
-// Under the legacy HTTP transport a duplicate merely meant two pushes. Under the outbox it
-// is worse than redundant. The event id is DERIVED from the transaction's identity, so both
-// captures compute the same id, the unique index on event_id refuses the second insert, and
-// the conflict was returned from here as the task's error — failing an asynq task whose
-// rejection had already committed, which then retried and failed again on the same conflict.
-//
-// Removing the second publish keeps coverage intact (the remaining producer runs on every
-// rejection, from every caller, not only from this worker) and removes the failure mode. Do
-// not reinstate it: if the rejection event ever needs enriching, enrich the single producer
-// in postTransactionActions.
+// That was a DUPLICATE: RejectTransaction runs postTransactionActions, whose
+// status-derived producer already emits transaction.rejected for the very transaction
+// being rejected here.
 func handleTransactionRejection(ctx context.Context, b *blnkInstance, txn *model.Transaction, err error) error {
 	_, rejectErr := b.blnk.RejectTransaction(ctx, txn, err.Error())
 
@@ -459,26 +445,29 @@ func initializeWebhookTaskHandlers(b *blnkInstance, mux *asynq.ServeMux) {
 		return
 	}
 
-	// FOUR HANDLERS ON ONE MUX, AND ONLY THE FIRST BELONGS TO THE LEGACY WEBHOOK TRANSPORT.
+	// FOUR HANDLERS ON ONE MUX, AND ONLY THE FIRST BELONGS TO THE LEGACY WEBHOOK
+	// TRANSPORT.
 	//
 	// The terminal release of the Kafka event-streaming feature — the one enumerated in
-	// docs/webhook-to-kafka-migration.md and in the sunset block at the foot of webhooks.go —
-	// removes the ProcessWebhook line below AND NOTHING ELSE HERE. That is the whole of this
-	// function's part in it, and the AAP schedules it for after the 30-day dual-delivery window
-	// has closed, not before: until then the handler must stay registered, because a delivery
-	// enqueued inside the window has to be drained by something.
+	// docs/webhook-to-kafka-migration.md and in the sunset block at the foot of
+	// webhooks.go — removes the ProcessWebhook line below AND NOTHING ELSE HERE. That is
+	// the whole of this function's part in it, not before: until then the handler must
+	// stay registered, because a delivery enqueued inside the window has to be drained by
+	// something.
 	//
-	// The three lines after it belong to other features and must SURVIVE that release. Nothing
-	// here fails to compile if they are removed by mistake — the failure is silent, and it is
-	// transaction hooks and search indexing that stop:
+	// The three lines after it belong to other features and must SURVIVE that release.
+	// Nothing here fails to compile if they are removed by mistake — the failure is
+	// silent, and it is transaction hooks and search indexing that stop:
 	//
 	//   - new:hook_execution is the /hooks feature's PRE_TRANSACTION and POST_TRANSACTION
-	//     callouts, which internal/hooks/manager.go enqueues onto cfg.Queue.WebhookQueue BY
-	//     NAME. That is why the queue itself outlives this transport.
+	//     callouts, which internal/hooks/manager.go enqueues onto cfg.Queue.WebhookQueue
+	//     BY NAME. That is why the QUEUE ITSELF outlives this transport: only the handler
+	//     mapping below goes, never the queue, its config key or its worker server.
 	//   - cfg.Queue.IndexQueue and new:index:batch are TypeSense indexing.
 	//
-	// TestWebhookTerminalRelease_ChecklistMatchesTheSurface asserts all three are still here, so
-	// an over-applied deletion fails a test rather than degrading a deployment quietly.
+	// TestWebhookTerminalRelease_ChecklistMatchesTheSurface asserts all three survivors are
+	// still here, so an over-applied deletion fails a test rather than degrading a
+	// deployment quietly.
 	mux.HandleFunc(cfg.Queue.WebhookQueue, b.blnk.ProcessWebhook)
 	mux.HandleFunc("new:hook_execution", b.blnk.Hooks.ProcessHookTask)
 	mux.HandleFunc(cfg.Queue.IndexQueue, b.indexData)
@@ -577,26 +566,7 @@ func runWorkers(ctx context.Context, b *blnkInstance, conf *config.Configuration
 	}
 	srv.Shutdown()
 
-	// Close the service container (PERF-P17), and only now that every worker server has
-	// stopped.
-	//
-	// THIS ROLE IS NOT A PRODUCER, and an earlier version of this comment said it was — that
-	// handleTransactionRejection published transaction.rejected through the container's
-	// publisher. Neither half is true. That function's own comment records why it no longer
-	// publishes anything (the duplicate capture conflicted on the derived event id), and
-	// blnk.ProcessRole.PublishesEvents names only the server, so initializeEventPublisher
-	// hands this role the no-op — there is no writer here to fail a publish.
-	//
-	// The ordering is still load-bearing, for the resources Close DOES release: the asynq
-	// client, the Kafka admin client, and the drain of scheduled background cleanups. A task
-	// handler still running holds the asynq client to enqueue follow-on work, so closing it
-	// first would fail live work rather than tidy up after it. The asynq Shutdown calls above
-	// are synchronous and wait for in-flight tasks, which is what makes this line safe here
-	// and unsafe anywhere above it.
-	//
-	// Event CAPTURE is unaffected either way: a captured event is a row committed to Postgres
-	// inside the ledger transaction, so it is durable before this point is reached and is
-	// published later by the relay in the server role.
+	// Close the service container, and only now that every worker server has stopped.
 	if err := b.blnk.Close(); err != nil {
 		logrus.WithError(err).Error(
 			"closing the service container reported an error; the asynq client or a scheduled " +
@@ -670,9 +640,9 @@ func startMonitoringServer(conf *config.Configuration) *http.Server {
 
 	monitoringAddr := fmt.Sprintf(":%s", conf.Queue.MonitoringPort)
 
-	// Bounded with exactly the same limits as the API listener (PERF-P25), through the shared
-	// helper rather than a second opinion written out here. This listener is the one more
-	// likely to be forgotten and the less likely to be behind an ingress that would bound it
+	// Bounded with exactly the same limits as the API listener, through the shared helper
+	// rather than a second opinion written out here. This listener is the one more likely
+	// to be forgotten and the less likely to be behind an ingress that would bound it
 	// anyway — it exists to serve the asynqmon dashboard and /metrics to an operator or a
 	// scraper, so it is reached directly.
 	srv := hardenHTTPServer(&http.Server{

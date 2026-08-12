@@ -39,37 +39,24 @@ const (
 	DEFAULT_PORT        = "5001"
 	DEFAULT_CLEANUP_SEC = 10800 // 3 hours in seconds
 	// DEFAULT_TYPESENSE_KEY is the api-key a LOCAL TypeSense is started with, and it is
-	// applied only when secure mode is off. It is emphatically NOT a secret — it is published
-	// in this repository's compose files and README — which is why resolveSearchCredential
-	// refuses to substitute it in a production posture. See SEC-07 there.
+	// applied only when secure mode is off. It is emphatically NOT a secret — it is
+	// published in this repository's compose files and README — which is why
+	// resolveSearchCredential refuses to substitute it in a production posture.
 	DEFAULT_TYPESENSE_KEY = "blnk-api-key"
-	// DEFAULT_RATE_LIMIT_RPS and DEFAULT_RATE_LIMIT_BURST are the PER-CLIENT request rate a
-	// deployment that configures none is held to. SEC-14.
+	// DEFAULT_RATE_LIMIT_RPS and DEFAULT_RATE_LIMIT_BURST are the PER-CLIENT request rate
+	// a deployment that configures none is held to.
 	//
-	// # Why the previous numbers were not a limit
-	//
-	// They were 5,000,000 requests per second with a burst of 10,000,000. tollbooth keys its
-	// limiter per client address, and no single client can issue five million requests a second
-	// against one Blnk instance, so the limiter never engaged: rate limiting was configured,
-	// reported as configured, and had no effect. That is CWE-770 — a control that exists on
-	// paper only, which is worse than none, because it reads as present in every review.
-	//
-	// # Where these numbers come from
-	//
-	// 2,000 per second is FOUR TIMES the throughput the project's own acceptance criterion
-	// states (AAP V-1: 500 events per second sustained), so it cannot throttle a deployment
-	// operating at the volume Blnk is specified for, nor the k6 harness that measures it. The
-	// burst is twice the rate, which is the same relationship this function already applies
-	// when only one of the pair is supplied — so a reader finds one rule rather than two.
-	//
-	// # Why not tighter
+	// The value is low enough that the limiter actually engages — a ceiling no single
+	// client can reach is a control that exists on paper only (CWE-770) — and high enough
+	// not to throttle a deployment operating at the volume Blnk is specified for, nor the
+	// k6 harness that measures it. The burst is twice the rate, the same relationship
+	// setupRateLimiting applies when only one of the pair is supplied, so a reader finds
+	// one rule rather than two.
 	//
 	// The limit is per CLIENT ADDRESS, and a ledger's callers are usually backend services
-	// behind a proxy or NAT. Unless BLNK_SERVER_TRUSTED_PROXIES is set, every request keys to
-	// the proxy's address, so a per-client limit behaves as a GLOBAL one — and a tight default
-	// would then throttle an entire deployment rather than one abusive caller. Finite and
-	// generous is the correct default; the operator tightens it once the client identity is
-	// resolvable.
+	// behind a proxy or NAT. Unless BLNK_SERVER_TRUSTED_PROXIES is set, every request keys
+	// to the proxy's address, so a per-client limit behaves as a GLOBAL one — and a tight
+	// default would then throttle an entire deployment rather than one abusive caller.
 	DEFAULT_RATE_LIMIT_RPS     = 2000.0
 	DEFAULT_RATE_LIMIT_BURST   = 4000
 	DEFAULT_MONITORING_PORT    = "5004"
@@ -81,69 +68,18 @@ const (
 	// upload may spend fetching the remote body, preventing a slow or stalled
 	// upstream from hanging the handler.
 	DEFAULT_UPLOAD_URL_TIMEOUT_SEC = 30
-	// DEFAULT_LOG_LEVEL is the verbosity a deployment runs at when it states none,
-	// and it is logrus's own default spelled out rather than a new choice: filling
-	// the field is about making the effective level READABLE, not about changing it.
-	//
-	// Info is the right production level because the level below it is used by the
-	// event pipeline for per-event diagnostics — one line per published event, which
-	// is five hundred lines a second at the throughput this feature is built for.
-	// Those lines exist to be turned on for an investigation, not to be shipped.
+	// DEFAULT_LOG_LEVEL is the verbosity a deployment runs at when it states none, and it
+	// is logrus's own default spelled out rather than a new choice: filling the field is
+	// about making the effective level READABLE, not about changing it.
 	DEFAULT_LOG_LEVEL = "info"
 
-	// MINIMUM_LOG_LEVEL is the LEAST verbose level Blnk will actually run at,
-	// whatever a deployment configures. A quieter request is honoured as far as this
-	// and no further.
-	//
-	// # Why a floor exists at all
-	//
-	// One class of record in this codebase is mandatory rather than discretionary.
-	// The event relay must log the attempt count and the error reason on EVERY failed
-	// publish attempt — not only on the last one — because that per-attempt trail is
-	// the only evidence of why an event was delayed or eventually dead-lettered, and
-	// the retry schedule is otherwise invisible: a row that succeeds on its fourth
-	// attempt looks identical afterwards to one that succeeded on its first.
-	//
-	// Those records are warnings, which is the correct severity for "this failed and
-	// will be retried". logrus emits an entry only when the logger's level is at
-	// least as verbose as the entry's, so a deployment setting error, fatal or panic
-	// discards every one of them. The requirement and the configuration surface were
-	// therefore in direct contradiction: the quiet levels did not reduce noise, they
-	// deleted the audit trail, silently and with no indication in the logs that
-	// anything had been withheld.
-	//
-	// # Why the floor rather than a separate sink
-	//
-	// The alternative is a dedicated logger whose level cannot be configured. It was
-	// rejected: logrus fires hooks only AFTER the level check, so a second logger does
-	// not escape level gating, it merely moves it — and it would take the mandatory
-	// records out of the standard logger that every hook, formatter and log-capturing
-	// test in this repository is attached to. The result would be a compliance record
-	// that no existing tooling could see, which is a worse failure than the one being
-	// fixed.
-	//
-	// # What is actually given up
-	//
-	// Exactly three settings — error, fatal and panic — and only their effect on
-	// warnings. Every level from warn upwards behaves precisely as before, and warn
-	// itself still suppresses the per-event info and debug diagnostics that make up
-	// almost all of the pipeline's volume. A deployment wanting less than warn is
-	// asking not to be told that its event delivery is failing.
-	//
-	// Spelled "warning" rather than "warn" because that is what logrus.Level.String()
-	// returns, and this constant is compared against the normalised LogLevel field.
-	// logrus.ParseLevel accepts both spellings, so an operator may write either.
+	// MINIMUM_LOG_LEVEL is the LEAST verbose level Blnk will actually run at, whatever a
+	// deployment configures. A quieter request is honoured as far as this and no further.
 	MINIMUM_LOG_LEVEL = "warning"
 )
 
 // WebhookDualDeliveryWindowDays is the exact length of the window in which Kafka
 // publishing and legacy HTTP webhook delivery run side by side, in days.
-//
-// It is a constant rather than a configurable value because the length is part of
-// the deprecation contract published to subscribers, not an operational knob: a
-// deployment that quietly shortened it would retire a transport subscribers were
-// told they had until a stated date to move off. Operators choose WHEN the window
-// opens; they do not choose how long it lasts.
 const WebhookDualDeliveryWindowDays = 30
 
 // webhookDualDeliveryWindow is WebhookDualDeliveryWindowDays as a duration, used to
@@ -156,8 +92,8 @@ const webhookDualDeliveryWindow = WebhookDualDeliveryWindowDays * 24 * time.Hour
 // The dual-delivery decision lives in package blnk, which needs the same span this
 // package derives and validates against. Exporting the duration — rather than letting
 // the caller multiply WebhookDualDeliveryWindowDays out for itself — keeps one
-// definition of "exactly 30 days" for both the configuration that refuses a
-// mis-stated window and the predicate that decides whether an event is inside one.
+// definition of "exactly 30 days" for both the configuration that refuses a mis-stated
+// window and the predicate that decides whether an event is inside one.
 //
 // Returns:
 //   - time.Duration: WebhookDualDeliveryWindowDays expressed as a duration.
@@ -217,19 +153,17 @@ var (
 		ConnMaxIdleTime: 5 * time.Minute,
 	}
 
-	// defaultKafka deliberately leaves Brokers and all four SASL fields zero-valued.
-	// An empty broker list is a legitimate steady state, not an error: it selects the
-	// no-op event publisher, reproducing the historic no-op-when-unconfigured
-	// contract so a deployment without Kafka keeps working. The SASL fields are
-	// credentials and must never carry a shipped default. ReplicationFactor defaults
-	// to 3 for production durability; a single-broker cluster must set it to 1
-	// explicitly, which setKafkaDefaults preserves because it only fills zero values.
+	// defaultKafka deliberately leaves Brokers and all four SASL fields zero-valued. An
+	// empty broker list is a legitimate steady state, not an error: it selects the no-op
+	// event publisher, reproducing the historic no-op-when-unconfigured contract so a
+	// deployment without Kafka keeps working. The SASL fields are credentials and must
+	// never carry a shipped default.
 	//
 	// TLS.Enabled and InsecureLocalDev are both false by default, which is not a
-	// contradiction: it is the ONE combination that refuses to build a Kafka client
-	// at all. A deployment must choose, in writing, between verified TLS and an
-	// explicitly acknowledged local-dev plaintext connection — neither can be
-	// arrived at by leaving a variable unset.
+	// contradiction: it is the ONE combination that refuses to build a Kafka client at
+	// all. A deployment must choose, in writing, between verified TLS and an explicitly
+	// acknowledged local-dev plaintext connection — neither can be arrived at by leaving a
+	// variable unset.
 	defaultKafka = KafkaConfig{
 		TopicPrefix:       "blnk",
 		MinPartitions:     6,
@@ -240,19 +174,9 @@ var (
 		MetricsSubscriberBudget: 200,
 	}
 
-	// defaultRelay encodes the bounded exponential backoff schedule requirement R-4
-	// mandates: five publish attempts and the delay sequence 1s, 2s, 4s, 8s, 16s,
-	// capped at 30s.
-	//
-	// The relay produces and durably records EVERY ONE of those five delays — each is
-	// stamped on the row's next_attempt_at by the same statement that decides whether
-	// the budget is spent. Five attempts have four gaps between them, so the delays a
-	// retried event actually WAITS are the first four, 15s in total, and the fifth is
-	// recorded on the attempt that spends the budget rather than separating two
-	// publishes. Raising MaxRetryAttempts is what turns it into a wait as well.
-	//
-	// The 30s cap is out of reach with these parameters, which is intentional: it
-	// engages only when the configured base or attempt count is raised.
+	// defaultRelay encodes the bounded exponential backoff schedule the requirement
+	// mandates: five publish attempts and the delay sequence 1s, 2s, 4s, 8s, 16s, capped
+	// at 30s.
 	defaultRelay = RelayConfig{
 		MaxRetryAttempts:   MaxRelayRetryAttempts,
 		RetryBaseBackoffMS: 1000,
@@ -273,42 +197,27 @@ var (
 	}
 )
 
-// The shipped purge capacity, EXPORTED because the sweeper in the root package needs the same
-// two numbers as its fallback for a configuration it cannot read, and two copies of a default
-// are two numbers that can disagree. Which one a deployment ran at would then depend on
-// start-up ordering, and nothing would report the difference.
+// The shipped purge capacity, EXPORTED because the sweeper in the root package needs
+// the same two numbers as its fallback for a configuration it cannot read, and two
+// copies of a default are two numbers that can disagree. Which one a deployment ran at
+// would then depend on start-up ordering, and nothing would report the difference.
 //
-// PERF-P23: 2,000 x 1,000 = 2,000,000 rows an hour, which EXCEEDS the 1,800,000 an hour that
-// 500 events a second produces. Capacity below ingestion does not slow the table's growth, it
-// permits it, and the retention period is then never actually enforced however short it is. So
-// the default has to clear peak rather than approach it. See RelayConfig for the full
-// arithmetic and for why the previous fixed ceiling of 100 batches failed it.
+// 2,000 x 1,000 = 2,000,000 rows an hour, which EXCEEDS the 1,800,000 an hour that 500
+// events a second produces. Capacity below ingestion does not slow the table's growth,
+// it permits it, and the retention period is then never actually enforced however short
+// it is.
 const (
 	// DefaultEventRetentionBatchSize is how many rows one DELETE statement removes by default.
 	// It is the lock-footprint factor: small keeps each statement's row locks and WAL
 	// contribution light on a table the relay is concurrently claiming from.
 	DefaultEventRetentionBatchSize = 1000
 
-	// DefaultEventRetentionMaxBatchesPerSweep is how many such statements one sweep issues by
-	// default. It is the throughput factor, and it is the safer of the two to raise.
-	//
-	// PERF-C03: 4000, raised from 2000. Two thousand batches of a thousand rows is 2,000,000
-	// an hour against an arrival rate of 1,800,000 at the validated 500 events a second —
-	// 1.11x, and 11% is not headroom on a mechanism that CANNOT CATCH UP once it falls
-	// behind. One sweep cut short by the ten-minute timeout leaves a deficit that takes ten
-	// hours of steady state to work off, and the deficit is rows the retention period says
-	// should already be gone. 4000 gives 2.2x, which recovers a missed sweep inside one hour.
-	//
-	// It costs nothing in steady state, which is what makes the larger number the right
-	// default rather than merely a safer one: the ceiling bounds what ONE sweep may attempt,
-	// and a sweep stops as soon as it runs out of ELIGIBLE rows. At 500 events a second it
-	// still deletes 1,800,000 and stops. The ceiling is reached only while catching up, which
-	// is exactly when the capacity is wanted, and such a sweep is bounded by the ten-minute
-	// timeout regardless.
+	// DefaultEventRetentionMaxBatchesPerSweep is how many such statements one sweep issues
+	// by default. It is the throughput factor, and it is the safer of the two to raise.
 	DefaultEventRetentionMaxBatchesPerSweep = 4000
 )
 
-// The shipped REPAIR capacity (PERF-M06), EXPORTED for the same reason the retention capacity
+// The shipped REPAIR capacity, EXPORTED for the same reason the retention capacity
 // above is: the relay needs these numbers as its fallback for a configuration it cannot read,
 // and two copies of a default are two numbers that can disagree about what a deployment ran at.
 //
@@ -326,42 +235,23 @@ const (
 	DefaultRelayRepairMaxBatchesPerTick = 25
 
 	// DefaultRelayRepairConcurrency is how many message-key groups of a repair batch are
-	// written at once by default. The same 8 the publish loop uses, for the same reason: one
-	// goroutine at a realistic 10ms acknowledgement sustains about 100 writes a second, which
-	// is an order of magnitude under what a recovery needs.
+	// written at once by default. The same 8 the publish loop uses, for the same reason:
+	// one goroutine at a realistic 10ms acknowledgement sustains about 100 writes a
+	// second, which is an order of magnitude under what a recovery needs.
 	DefaultRelayRepairConcurrency = 8
 )
 
 // MaxRelayRetryAttempts is the CEILING on RELAY_MAX_RETRY_ATTEMPTS, not merely its
 // default. A configured value above it is clamped down to it by setRelayDefaults.
 //
-// It is a hard bound rather than advice because the attempt number is an EXPORTED METRIC
-// LABEL. blnk.events.publish.duration carries the attempt as an attribute and multiplies it
-// by its bucket count, and blnk.events.publish.attempts.total is read per attempt, so the
-// attempt domain is part of the observability contract: it is documented as 1..5 in
-// internal/metrics, the alert queries select on attempt="1", and a deployment that set 5000
-// here would silently mint 5000 label values and make the histogram the most expensive
-// series in the exporter.
-//
-// Five is also the retry budget requirement itself, so clamping does not restrict any
-// supported configuration — it only rejects one that was never valid. Clamping rather than
-// refusing to start is deliberate and matches how every other bad value in this file is
-// handled: a misconfigured relay must never stop the ledger from serving, so the value is
-// corrected, the correction is logged loudly, and the process continues.
-//
-// The recording path in the root package bounds the label independently as well, collapsing
-// anything above this into a single "over" bucket, so the domain stays closed even for a row
-// whose per-row max_attempts was raised directly in the database.
+// The recording path in the root package bounds the label independently as well,
+// collapsing anything above this into a single "over" bucket, so the domain stays
+// closed even for a row whose per-row max_attempts was raised directly in the database.
 const MaxRelayRetryAttempts = 5
 
-// DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS bounds one call to the key-authorising component's
-// control endpoint when KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS is unset.
-//
-// Two seconds, chosen against the budget it lives inside rather than against a network: credential
-// issuance answers within five seconds (requirement R-7) and the attestation is one of several
-// steps in it, so the call must fail fast enough to leave the broker round trips and the registry
-// write their share. A component that cannot answer a single authenticated POST in two seconds is
-// not one a five-second issuance can depend on, and the refusal names it.
+// DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS bounds one call to the key-authorising
+// component's control endpoint when KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS is
+// unset.
 const DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS = 2000
 
 // MaxKeyScopeAttestationTimeout caps a configured attestation timeout.
@@ -372,19 +262,13 @@ const DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS = 2000
 // KafkaConfig.KeyScopeAttestationTimeout.
 const MaxKeyScopeAttestationTimeout = 5 * time.Second
 
-// EventRetentionUnboundedSweep is the value of RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
-// that removes the per-sweep batch ceiling entirely. PERF-P23.
+// EventRetentionUnboundedSweep is the value of
+// RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP that removes the per-sweep batch ceiling
+// entirely.
 //
-// It exists because zero cannot carry that meaning. An unset int field IS zero, so a zero
-// ceiling is indistinguishable from a deployment that never mentioned the setting, and only
-// one of those two readings can be honoured. The bound is taken as the safe reading — it is
-// what stops the first sweep after retention is enabled from attempting the entire historical
-// backlog in one pass on a table the relay is claiming from — so zero defaults and "no
-// ceiling" needs a value of its own.
-//
-// A sweep with no ceiling is still bounded by the sweep timeout, so this means "delete as much
-// as you can in one sweep" rather than "run for as long as it takes". It is the setting for a
-// deliberate one-off catch-up, not a steady state.
+// It exists because zero cannot carry that meaning. An unset int field IS zero, so a
+// zero ceiling is indistinguishable from a deployment that never mentioned the setting,
+// and only one of those two readings can be honoured.
 const EventRetentionUnboundedSweep = -1
 
 var ConfigStore atomic.Value
@@ -410,109 +294,48 @@ type ServerConfig struct {
 	// (BLNK_UPLOAD_URL_TIMEOUT_SEC). Defaults to DEFAULT_UPLOAD_URL_TIMEOUT_SEC.
 	UploadURLTimeoutSec int `json:"upload_url_timeout_sec" envconfig:"BLNK_UPLOAD_URL_TIMEOUT_SEC"`
 
-	// TrustForwardedProto declares that every request reaching this process has
-	// passed through a proxy — an ingress controller, a load balancer, a service
-	// mesh sidecar — that TERMINATED TLS and that sets X-Forwarded-Proto,
-	// overwriting any value a client supplied
-	// (BLNK_SERVER_TRUST_FORWARDED_PROTO).
+	// TrustForwardedProto declares that every request reaching this process has passed
+	// through a proxy — an ingress controller, a load balancer, a service mesh sidecar —
+	// that TERMINATED TLS and that sets X-Forwarded-Proto, overwriting any value a client
+	// supplied (BLNK_SERVER_TRUST_FORWARDED_PROTO).
 	//
 	// It exists because one endpoint returns a secret: POST
-	// /subscribers/{id}/kafka-credentials answers with a one-time SASL password,
-	// and the request carrying it is the only chance to disclose that password to
-	// anything watching the wire. When Blnk terminates TLS itself (SSL above) the
-	// process can see that for itself. When TLS terminates in front of it — the
-	// normal Kubernetes shape, where the hop from ingress to pod is plaintext — it
-	// cannot, and X-Forwarded-Proto is a header any client can set, so believing it
-	// unconditionally would let a caller assert its own confidentiality. This flag
-	// is the deployment stating, once and explicitly, that the header is now under
-	// the proxy's control and may be believed.
+	// /subscribers/{id}/kafka-credentials answers with a one-time SASL password, and the
+	// request carrying it is the only chance to disclose that password to anything
+	// watching the wire. When Blnk terminates TLS itself (SSL above) the process can see
+	// that for itself.
 	//
-	// Default false, which is deny-by-default: with no in-process TLS and no
-	// declaration, credential issuance refuses with
-	// SUBSCRIBER_INSECURE_TRANSPORT rather than putting a password on a channel
-	// nobody has established as confidential.
+	// Default false, which is deny-by-default: with no in-process TLS and no declaration,
+	// credential issuance refuses with SUBSCRIBER_INSECURE_TRANSPORT rather than putting a
+	// password on a channel nobody has established as confidential.
 	//
-	// # IT IS ONLY HALF THE DECLARATION. TrustedProxies below is the other half
+	// This flag is a statement about the intended PATH — "requests reach this process
+	// through our ingress, which owns that header" — and it is silent about a request that
+	// arrived by a different one. A caller reaching the process directly (a pod IP, a
+	// port-forward, a second Service, an ingress rule that passes the client's header
+	// through) sends its own X-Forwarded-Proto, so believing the flag alone hands that
+	// caller the one-time password.
 	//
-	// This flag is a statement about the intended PATH — "requests reach this
-	// process through our ingress, which owns that header" — and it is silent about
-	// a request that arrived by a different one. A caller reaching the process
-	// directly (a pod IP, a port-forward, a second Service, an ingress rule that
-	// passes the client's header through) sends its own X-Forwarded-Proto, so
-	// believing the flag alone hands that caller the one-time password.
-	//
-	// The header is therefore believed only from a socket peer TrustedProxies names
-	// — see TrustsForwardedProtoFrom, which requires both — and a declaration with
-	// no usable allowlist establishes nothing. In secure mode that combination is
-	// refused at configuration load by validateForwardedProtoTrust rather than
-	// running as a per-request refusal nobody notices until a 403.
-	//
-	// SETTING THIS WITHOUT SUCH A PROXY STILL BUYS NOTHING SAFE: two obligations
-	// remain the operator's, because no process can verify them — the proxy must
-	// OVERWRITE the header rather than append to it, and the hop in front of the
-	// proxy must be the TLS one. Nothing else in Blnk's behaviour depends on it.
+	// The header is therefore believed only from a socket peer TrustedProxies names — see
+	// TrustsForwardedProtoFrom, which requires both — and a declaration with no usable
+	// allowlist establishes nothing. In secure mode that combination is refused at
+	// configuration load by validateForwardedProtoTrust rather than running as a
+	// per-request refusal nobody notices until a 403.
 	TrustForwardedProto bool `json:"trust_forwarded_proto" envconfig:"BLNK_SERVER_TRUST_FORWARDED_PROTO"`
 
-	// AllowLoopbackCredentialIssuance permits POST /subscribers/{id}/kafka-credentials
-	// to answer over a plaintext connection whose PEER is a loopback address
+	// AllowLoopbackCredentialIssuance permits POST /subscribers/{id}/kafka-credentials to
+	// answer over a plaintext connection whose PEER is a loopback address
 	// (BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE). It is a LOCAL-DEVELOPMENT
 	// convenience and nothing else.
-	//
-	// # Why a loopback peer is not, by itself, evidence of anything
-	//
-	// A loopback peer proves only that the LAST hop never touched a network. It says
-	// nothing about the hop before it. The common deployment where that distinction
-	// matters is a reverse proxy on the same host: the proxy accepts a request from the
-	// internet — possibly over plain http — and forwards it to Blnk over 127.0.0.1, so
-	// the peer Blnk sees is loopback while the client's hop was public and readable.
-	// Treating the loopback peer as proof of end-to-end confidentiality would disclose a
-	// one-time SASL password to whoever was watching that public hop, and the process
-	// cannot tell that shape apart from an operator running curl inside the container.
-	//
-	// Only the deployment knows which it is, which is why this is a declaration rather
-	// than an inference — the same posture as TrustForwardedProto above, in the same
-	// direction: the operator states the topology once, explicitly.
-	//
-	// Default false. A loopback caller with no in-process TLS and no declared proxy is
-	// therefore REFUSED with SUBSCRIBER_INSECURE_TRANSPORT, which is the correct answer
-	// for a production host that happens to have something local in front of it. The
-	// local stack sets it, because there the plaintext listener and the loopback caller
-	// are the whole topology.
-	//
-	// DO NOT SET THIS IN PRODUCTION. Use in-process TLS (SSL above) or terminate TLS at a
-	// proxy and declare it with TrustForwardedProto.
 	AllowLoopbackCredentialIssuance bool `json:"allow_loopback_credential_issuance" envconfig:"BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE"`
 	// TrustedProxies is a comma-separated list of CIDR blocks or bare IP literals whose
-	// X-Forwarded-For and X-Real-IP headers may be BELIEVED
-	// (BLNK_SERVER_TRUSTED_PROXIES).
-	//
-	// Empty/unset means trust NOTHING, which is the safe default and the one this
-	// repository's manifests deploy: the client address resolves to the peer that
-	// actually opened the connection, which a caller cannot forge. It is deliberately
-	// the same deny-by-default posture as UploadDomainWhitelist above.
-	//
-	// # Why the default has to be "trust nothing" rather than "trust everything"
-	//
-	// Gin's own default is to trust every proxy, which means it believes the leftmost
-	// X-Forwarded-For value on any request. Any client can then choose the address that
-	// appears in the access log and in anything built on it, so a log becomes evidence of
-	// what the caller claimed rather than of what happened. Setting this to a real proxy
-	// range is what makes a forwarded address trustworthy again.
-	//
-	// Set it ONLY to the addresses of proxies you operate. Listing 0.0.0.0/0 restores the
-	// forgeable behaviour and defeats the point.
-	//
-	// # IT ALSO SCOPES TrustForwardedProto, and that is the higher-stakes of its two uses
+	// X-Forwarded-For and X-Real-IP headers may be BELIEVED (BLNK_SERVER_TRUSTED_PROXIES).
 	//
 	// A forgeable client address costs the truthfulness of an access log. A forgeable
 	// X-Forwarded-Proto costs a one-time SASL password, because it is what establishes the
 	// channel POST /subscribers/{id}/kafka-credentials will disclose one over. This list
-	// answers both questions, deliberately: they are the same question about the same proxy,
-	// and two lists could only let a deployment give them different answers.
-	//
-	// So a universal range is rejected for the forwarded-proto decision rather than merely
-	// discouraged — see ForwardedProtoTrustedPeers — and an empty list makes that channel
-	// establish nothing at all.
+	// answers both questions, deliberately: they are the same question about the same
+	// proxy, and two lists could only let a deployment give them different answers.
 	TrustedProxies string `json:"trusted_proxies" envconfig:"BLNK_SERVER_TRUSTED_PROXIES"`
 }
 
@@ -563,32 +386,14 @@ type WebhookConfig struct {
 
 	// AllowPrivateDestination asserts that the configured webhook destination is on a
 	// network the operator owns, permitting http and permitting delivery to loopback and
-	// private addresses (SSRF-01).
+	// private addresses.
 	//
-	// # Why a flag exists at all
-	//
-	// The legacy transport refuses internal destinations at dial time, which is what
-	// stops a redirect or a rebound DNS answer from turning a webhook into a request
-	// against Blnk's own Postgres, Redis, broker or cloud metadata endpoint. But two
-	// entirely legitimate deployments are internal by nature: an on-premise install
-	// delivering to https://webhooks.corp:8443 behind RFC1918, and a developer
-	// delivering to a loopback sink. Refusing those outright would not make anyone safer,
-	// it would make the deny-list something operators route around.
-	//
-	// # What it can and cannot open
-	//
-	// It is NOT a switch that turns the guard off, and it is deliberately not named as
-	// one. It opens exactly the two tiers an operator can plausibly own — loopback and
-	// private/ULA — and it opens http. It CANNOT open the ranges no configuration should
-	// reach: link-local (169.254.169.254), the unspecified address, multicast, the
-	// carrier-grade NAT range, the benchmarking and protocol-assignment ranges, or an
-	// internal address smuggled through the NAT64 well-known prefix. Those stay refused
-	// with this set to true. Redirects likewise stay refused unconditionally, because a
-	// webhook POST has no legitimate reason to be redirected and following one is the
-	// exact vector this closes.
-	//
-	// Default false. Enabling it logs a warning naming what it permitted, so the
-	// assertion is visible in the log of any deployment that made it.
+	// The legacy transport refuses internal destinations at dial time, which is what stops
+	// a redirect or a rebound DNS answer from turning a webhook into a request against
+	// Blnk's own Postgres, Redis, broker or cloud metadata endpoint. But two entirely
+	// legitimate deployments are internal by nature: an on-premise install delivering to
+	// https://webhooks.corp:8443 behind RFC1918, and a developer delivering to a loopback
+	// sink.
 	AllowPrivateDestination bool `json:"allow_private_destination" envconfig:"BLNK_WEBHOOK_ALLOW_PRIVATE_DESTINATION"`
 }
 
@@ -637,60 +442,32 @@ type QueueConfig struct {
 	TransactionWorkerConcurrency    int           `json:"transaction_worker_concurrency"     envconfig:"BLNK_QUEUE_TRANSACTION_WORKER_CONCURRENCY"`
 }
 
-// KafkaConfig configures the Kafka event-publishing pipeline: the brokers the
-// producer and admin client dial, the prefix every category and dead-letter topic
-// is derived from, the SASL/SCRAM administrative principal used to provision
-// subscriber credentials and ACLs, and the topic geometry applied when topics are
-// created or grown.
+// KafkaConfig configures the Kafka event-publishing pipeline: the brokers the producer
+// and admin client dial, the prefix every category and dead-letter topic is derived
+// from, the SASL/SCRAM administrative principal used to provision subscriber
+// credentials and ACLs, and the topic geometry applied when topics are created or
+// grown.
 //
-// Note on the environment variable names: unlike every other struct in this file,
-// these tags carry no BLNK_ prefix, because the deployment contract mandates the
-// bare names (KAFKA_BROKERS, KAFKA_TOPIC_PREFIX, ...). Do NOT add one.
+// Note on the environment variable names: unlike every other struct in this file, these
+// tags carry no BLNK_ prefix, because the deployment contract mandates the bare names
+// (KAFKA_BROKERS, KAFKA_TOPIC_PREFIX, ...). Do NOT add one.
 //
-// Those bare names are honoured through envconfig's alternate-key fallback. For
-// each field envconfig derives a primary key by accumulating the prefix through
-// every enclosing struct, and uses the raw tag literal as an alternate key that is
-// consulted only when the primary is unset. Because Configuration.Kafka is itself a
-// prefix segment, the primary key envconfig derives here is BLNK_KAFKA_<TAG> — for
-// example BLNK_KAFKA_KAFKA_BROKERS, not BLNK_KAFKA_BROKERS.
+// Those bare names are honoured through envconfig's alternate-key fallback. For each
+// field envconfig derives a primary key by accumulating the prefix through every
+// enclosing struct, and uses the raw tag literal as an alternate key that is consulted
+// only when the primary is unset.
 //
-// BOTH FORMS RESOLVE ANYWAY. The house convention across this file is that a
-// setting also answers to its BLNK_-prefixed name, and a deployment that writes
-// BLNK_KAFKA_BROKERS out of habit must not silently select default behaviour. So
-// after envconfig has run, the ordinary BLNK_-prefixed alias of EVERY variable in
-// this struct and in RelayConfig is overlaid, and the prefixed form wins when both
-// are set — the same precedence the top-level WebhookDeprecationSunsetDate already
-// has, where envconfig itself provides it.
+// BOTH FORMS RESOLVE ANYWAY. The house convention across this file is that a setting
+// also answers to its BLNK_-prefixed name, and a deployment that writes
+// BLNK_KAFKA_BROKERS out of habit must not silently select default behaviour.
 //
 // TWO MECHANISMS DO THAT OVERLAY, split by type rather than by policy, and adding a
 // field here means adding it to whichever one fits:
 //
 //   - eventStreamingEnvOverride, a flat struct envconfig processes a second time.
 //     Everything it carries is resolved by the library, so a LIST splits on commas and
-//     a number is parsed and reported by the library naming the variable. Lists belong
-//     here; so do the contract variables.
+//     a number is parsed and reported by the library naming the variable.
 //   - applyPrefixedEnvAliases, three explicit string/int/bool tables. Everything else.
-//
-// A field in NEITHER answers only to its bare name and to envconfig's own
-// BLNK_KAFKA_<TAG> artefact, which is the gap this comment used to describe as covered
-// when it was not.
-//
-// Brokers and the four SASL fields have no defaults by design — see defaultKafka.
-//
-// # THE DEPLOYMENT CONTRACT, AND WHAT IS AN ADDITION TO IT
-//
-// Requirement R-10 freezes the deployment contract at EIGHT environment variables. Four
-// of them are declared in this struct and are marked below; the other four are
-// RELAY_MAX_RETRY_ATTEMPTS, RELAY_RETRY_BASE_BACKOFF_MS and RELAY_RETRY_MAX_BACKOFF_MS
-// in RelayConfig, and WEBHOOK_DEPRECATION_SUNSET_DATE on Configuration.
-//
-// Every other variable in this struct is a SUPPLEMENTARY SETTING. The distinction is
-// recorded in the source rather than left to a document because the two have different
-// standing: the eight are a contract with the deployment and must not change name,
-// default or meaning, while a supplementary setting is Blnk's own and may be revised.
-// Each supplementary setting below names the reason it exists, and none of them is
-// required for a working deployment — every one has a safe default or a documented
-// fallback, so the eight remain sufficient on their own.
 //
 // The supplementary settings, and why each is not merely convenience:
 //
@@ -702,288 +479,123 @@ type QueueConfig struct {
 //     identity payloads over a channel an observer can read.
 //   - KAFKA_INSECURE_LOCAL_DEV — the single, explicit acknowledgement that lets the
 //     local stack run without TLS, so that not having it is never the silent default.
-//   - KAFKA_MIN_PARTITIONS / KAFKA_REPLICATION_FACTOR — topic geometry. AAP §0.5.2
-//     sanctions both as fields, and §0.4.5 requires the replication factor in
-//     particular to be configuration-driven: a single-broker local stack cannot
-//     satisfy the production factor of 3, so hardcoding either value breaks one
-//     environment or the other.
+//   - KAFKA_MIN_PARTITIONS / KAFKA_REPLICATION_FACTOR — topic geometry. and §0.4.5
+//     requires the replication factor in particular to be configuration-driven: a
+//     single-broker local stack cannot satisfy the production factor of 3, so
+//     hardcoding either value breaks one environment or the other.
 //   - KAFKA_ALLOW_PARTITION_GROWTH — the explicit consent adding partitions to a
-//     non-empty topic requires, because doing so changes which partition a key lands
-//     on and therefore breaks per-aggregate ordering for keys already in flight.
+//     non-empty topic requires, because doing so changes which partition a key lands on
+//     and therefore breaks per-aggregate ordering for keys already in flight.
 type KafkaConfig struct {
-	// Brokers and TopicPrefix are R-10 CONTRACT VARIABLES.
+	// Brokers and TopicPrefix are the two published Kafka contract variables.
 	Brokers     []string `json:"brokers"      envconfig:"KAFKA_BROKERS"`
 	TopicPrefix string   `json:"topic_prefix" envconfig:"KAFKA_TOPIC_PREFIX"`
 
-	// HistoricalTopicPrefixes lists topic namespaces this deployment USED TO OWN and
-	// must still be able to publish to. It is empty in every deployment that has never
-	// renamed its namespace, which is almost all of them.
-	//
-	// # Why renaming the prefix needs this, and what happened without it
-	//
-	// An outbox row records its fully-resolved destination topic at INSERT time, so that
-	// a committed event stays bound to the topic it was always meant for. Change
-	// KAFKA_TOPIC_PREFIX from "blnk" to "acme" and the rows already in the table still
-	// name blnk.transactions, while the publisher, the topic-assurance pass and the
-	// ownership test all now speak of acme.transactions.
-	//
-	// A running process survived that, because it had pre-created a writer for every
-	// blnk.* topic at start-up and served those rows from that inventory. A RESTART did
-	// not: the new process pre-created acme.* only, and every stored blnk.* row then
-	// failed the ownership test at writer resolution. Those rows are not lost — they stay
-	// claimable and each failure names the topic — but nothing drains them, and the same
-	// refusal strands the dead-letter write of a failing row and the replay of an already
-	// dead-lettered one. A prefix rename plus a rolling restart is an ordinary
-	// maintenance operation, and it silently stopped delivery of every event captured
-	// before it.
-	//
-	// # What listing a prefix here does
+	// HistoricalTopicPrefixes lists topic namespaces this deployment USED TO OWN and must
+	// still be able to publish to. It is empty in every deployment that has never renamed
+	// its namespace, which is almost all of them.
 	//
 	// Every name in this list is treated as owned, exactly as TopicPrefix is: writers are
 	// pre-created for its whole topic inventory, the ownership test admits it, topic
 	// assurance keeps its topics present, and the metrics layer reports its topic names
-	// verbatim instead of collapsing them to the "unowned" label. It does NOT change
-	// where NEW events go — TopicPrefix alone decides that — so the list is drained
-	// rather than accumulated: once no non-terminal and no replayable row names a prefix,
-	// remove it.
-	//
-	// It is an explicit allowlist rather than a blanket "any prefix with a known
-	// category" rule on purpose. That looser rule would also admit
-	// "attacker.transactions", which has precisely the same shape as a real topic name,
-	// and writer resolution is the one place a stored string turns into an outbound
-	// connection carrying Blnk's own producer credentials. An operator naming the
-	// namespaces this deployment actually owned is the only source that can tell the two
-	// apart.
-	//
-	// Blank entries are dropped and duplicates — including a repeat of TopicPrefix — are
-	// collapsed, so a trailing comma or a value left in place after the rename completed
-	// is harmless. The count is bounded by MaxHistoricalTopicPrefixes, because each
-	// prefix multiplies the pre-created writer inventory and an unbounded list would be a
-	// memory cost paid on every process start for topics nothing writes to.
+	// verbatim instead of collapsing them to the "unowned" label. It does NOT change where
+	// NEW events go — TopicPrefix alone decides that — so the list is drained rather than
+	// accumulated: once no non-terminal and no replayable row names a prefix, remove it.
 	HistoricalTopicPrefixes []string `json:"historical_topic_prefixes" envconfig:"KAFKA_HISTORICAL_TOPIC_PREFIXES"`
 
 	// SubscriberBrokers is the SUBSCRIBER-FACING bootstrap list, and it is a DIFFERENT
 	// LIST FROM Brokers rather than a convenience alias for it.
-	//
-	// Brokers is what Blnk itself dials, and inside a deployment that is an internal
-	// address: "kafka:9092" on a compose network, a headless or ClusterIP Service name in
-	// Kubernetes. Neither resolves for a subscriber outside the deployment, and Kafka
-	// compounds it — a broker answers every client with the ADVERTISED address of the
-	// listener the connection arrived on, so even an external address that does resolve
-	// leads to a bootstrap that hands back internal ones. A subscriber must therefore be
-	// given the addresses of the externally advertised listener, which only an operator
-	// can know.
-	//
-	// So POST /subscribers/{id}/kafka-credentials reports this list, and REQUIRES it: with it
-	// empty, issuance answers the typed 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED naming this
-	// variable, before a password is generated and before the broker is touched. It does NOT
-	// fall back to Brokers.
-	//
-	// A fallback existed, warning on every issuance, and a warning is not a control: it landed
-	// in Blnk's log while the consequence landed on the subscriber, days later, as a connection
-	// timeout against an internal address — holding a secret shown exactly once, so diagnosing
-	// it costs a reissue that invalidates the credential the subscriber holds. It also published
-	// the deployment's internal topology in a response body.
-	//
-	// Requirement R-10 fixes the mandatory configuration surface for PUBLISHING at eight
-	// variables and this is not one of them; it gates one endpoint whose entire output is an
-	// address a third party will dial, and there is no value Blnk can infer, because only an
-	// operator knows its externally advertised listener. A deployment whose subscribers really
-	// do run inside it sets this to the same value as Brokers, which makes that an explicit
-	// claim in one line rather than an implicit one in a fallback. Start-up warns that issuance
-	// will refuse while it is unset. See SubscriberFacingBrokers, which owns this policy.
 	SubscriberBrokers []string `json:"subscriber_brokers" envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
 
 	// KeyScopeEnforcement names WHERE a subscriber's partition_key_prefix is enforced, and
 	// it exists so that Blnk can never issue a credential whose declared key scope nothing
 	// evaluates.
 	//
-	// Kafka's authorizer has no record-key dimension — see KeyScopeEnforcementBrokerGateway
-	// — so on the shipped default of "none" a granted topic is readable in full and a
-	// prefix is a hint the consumer applies to itself. Issuance therefore REFUSES a
-	// subscriber that records a prefix while this is "none": handing out a principal whose
-	// response says the prefix is not enforced still hands out a principal that can read
-	// every other ledger's records on that topic, and a field in a JSON body is not a
-	// control. An operator that wants key-scoped subscribers deploys an enforcing gateway
-	// and declares it here.
-	//
-	// Valid values are "none" and "broker_gateway". Anything else is normalised to "none" by
-	// setKafkaDefaults, with a warning naming the value, because failing closed is the only
-	// safe reading of a misspelled enforcement mode.
+	// Kafka's authorizer has no record-key dimension — see
+	// KeyScopeEnforcementBrokerGateway — so on the shipped default of "none" a granted
+	// topic is readable in full and a prefix is a hint the consumer applies to itself.
+	// Issuance therefore REFUSES a subscriber that records a prefix while this is "none":
+	// handing out a principal whose response says the prefix is not enforced still hands
+	// out a principal that can read every other ledger's records on that topic, and a
+	// field in a JSON body is not a control. An operator that wants key-scoped subscribers
+	// deploys an enforcing gateway and declares it here.
 	KeyScopeEnforcement string `json:"key_scope_enforcement" envconfig:"KAFKA_KEY_SCOPE_ENFORCEMENT"`
 
-	// KeyScopeGatewayBrokers is the bootstrap list a key-scoped subscriber is told to dial,
-	// and it must be the ENFORCING component rather than the brokers.
-	//
-	// Required whenever KeyScopeEnforcement is "broker_gateway", and refused when it equals
-	// Brokers: a gateway list pointing at the brokers means nothing evaluates record keys,
-	// which is the state the declaration would be lying about. See KeyScopeGateway.
+	// KeyScopeGatewayBrokers is the bootstrap list a key-scoped subscriber is told to
+	// dial, and it must be the ENFORCING component rather than the brokers.
 	KeyScopeGatewayBrokers []string `json:"key_scope_gateway_brokers" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
 
-	// KeyScopeGatewayAttestationURL is the CONTROL endpoint of the key-authorising component,
-	// and it is what turns the declaration above from a claim into a verified fact.
+	// KeyScopeGatewayAttestationURL is the CONTROL endpoint of the key-authorising
+	// component, and it is what turns the declaration above from a claim into a verified
+	// fact.
 	//
-	// # Why an address and a mode were not enough
-	//
-	// KeyScopeEnforcement plus KeyScopeGatewayBrokers say "a component in front of the brokers
-	// applies each principal's recorded prefix". Nothing checked it. A deployment could set both
-	// to any distinct address and Blnk would mint a credential carrying no topic Read, tell the
-	// subscriber its key scope was enforced at the gateway, and be wrong — the same false
-	// assurance as the client-side-filter reading it replaced, moved one layer out.
-	//
-	// So issuance now BINDS AND ATTESTS before a secret exists: it posts the principal, the
-	// recorded prefix, the authorised topics and the consumer-group prefix to this endpoint over
-	// an authenticated channel, and requires the component to answer that it enforces key scopes,
-	// for that principal, with that prefix byte-for-byte. Deregistration deletes the binding at
-	// the same endpoint. See blnk.KeyScopeGatewayClient for the wire contract, which
-	// docs/kafka-operations.md publishes so a component can implement it.
-	//
-	// # It is REQUIRED for enforcement to be active
+	// So issuance now BINDS AND ATTESTS before a secret exists: it posts the principal,
+	// the recorded prefix, the authorised topics and the consumer-group prefix to this
+	// endpoint over an authenticated channel, and requires the component to answer that it
+	// enforces key scopes, for that principal, with that prefix byte-for-byte.
+	// Deregistration deletes the binding at the same endpoint.
 	//
 	// KeyScopeGateway reports enforcement active only when this URL and its token are both
 	// usable, so a deployment that declares the mode and the bootstrap list but no control
-	// endpoint is treated exactly as an undeclared one: key-scoped subscribers are refused a
-	// credential rather than issued an unverified one. That is the fail-closed direction, and it
-	// is deliberate that the stricter behaviour is what an incomplete configuration gets.
-	//
-	// Must be an absolute http or https URL. https is required unless the host is a loopback
-	// literal, because the request carries a bearer token; see KeyScopeAttestation, which owns
-	// the whole predicate.
+	// endpoint is treated exactly as an undeclared one: key-scoped subscribers are refused
+	// a credential rather than issued an unverified one. That is the fail-closed
+	// direction, and it is deliberate that the stricter behaviour is what an incomplete
+	// configuration gets.
 	KeyScopeGatewayAttestationURL string `json:"key_scope_gateway_attestation_url" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL"`
 
-	// KeyScopeGatewayAttestationToken is the bearer credential Blnk presents to the control
-	// endpoint above.
+	// KeyScopeGatewayAttestationToken is the bearer credential Blnk presents to the
+	// control endpoint above.
 	//
-	// It authenticates BLNK TO THE GATEWAY, which is the direction that matters: without it any
-	// party that could reach the endpoint could register or delete key-scope bindings, and the
-	// component would be a boundary anybody could rewrite. It is required for the same reason
-	// the URL is — enforcement is not active without both — and it is never logged, never
-	// echoed in an API response and never included in an error message.
+	// It authenticates BLNK TO THE GATEWAY, which is the direction that matters: without
+	// it any party that could reach the endpoint could register or delete key-scope
+	// bindings, and the component would be a boundary anybody could rewrite. It is
+	// required for the same reason the URL is — enforcement is not active without both —
+	// and it is never logged, never echoed in an API response and never included in an
+	// error message.
 	KeyScopeGatewayAttestationToken string `json:"key_scope_gateway_attestation_token" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN"`
 
 	// KeyScopeGatewayAttestationTimeoutMS bounds a single attestation or revocation call.
-	//
-	// It is bounded because the call sits inside credential issuance, which has a five-second
-	// wall-clock contract (requirement R-7). A gateway that hangs must cost the request a
-	// bounded slice of that budget and then refuse, rather than consuming it and turning a
-	// deterministic 409 into a 504.
-	//
-	// Defaults to DEFAULT_KEY_SCOPE_ATTESTATION_TIMEOUT_MS. A non-positive value takes the
-	// default; a value above the issuance budget is capped, because a timeout longer than the
-	// budget it lives inside is not a timeout.
 	KeyScopeGatewayAttestationTimeoutMS int `json:"key_scope_gateway_attestation_timeout_ms" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS"`
 
-	// SubscriberSharedTopicAccess is the deployment ACKNOWLEDGING that a subscriber granted a
-	// category topic reads every record on it — every ledger's, every other subscriber's.
+	// SubscriberSharedTopicAccess is the deployment ACKNOWLEDGING that a subscriber
+	// granted a category topic reads every record on it — every ledger's, every other
+	// subscriber's.
 	//
-	// # Why an acknowledgement exists at all
-	//
-	// It is not a feature toggle and it changes no behaviour beyond one refusal. The access
-	// model is fixed by the requirement: category topics, no per-tenant topics, and an
-	// authorizer with no message-key dimension. Whole-topic reads are therefore what a grant
-	// MEANS, and that is fine for a single-tenant deployment or a trusted internal consumer and
-	// unacceptable for a multi-tenant one. Only the operator knows which they are running.
-	//
-	// Before this existed, the widest reading was the DEFAULT: a deployment that had declared
-	// nothing got whole-topic credentials, and the registry, the response and the runbook all
-	// described that correctly while nobody had decided it. This variable is the decision. In
-	// secure mode (Server.Secure — the same production signal the search-credential refusal
-	// reads), credential issuance for a subscriber with NO key scope refuses with
-	// SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED until either this is true or
-	// KeyScopeEnforcement declares — and proves — a key-authorising component.
-	//
-	// Default false. It is NOT read outside secure mode, so the local stack, the compose files
-	// and the test suite are unaffected: the declaration exists to make a production decision
-	// explicit, not to break a walkthrough.
+	// Before this existed, the widest reading was the DEFAULT: a deployment that had
+	// declared nothing got whole-topic credentials, and the registry, the response and the
+	// runbook all described that correctly while nobody had decided it. This variable is
+	// the decision.
 	SubscriberSharedTopicAccess bool `json:"subscriber_shared_topic_access" envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
 
-	// SubscriberInternalTopicAccess is the deployment ACKNOWLEDGING that a subscriber granted
-	// the internal category topic — `<KAFKA_TOPIC_PREFIX>.system` — reads Blnk's own error text
-	// verbatim, for the whole deployment, plus every event type the catalogue does not yet
-	// recognise.
-	//
-	// # Why the acknowledgement exists
-	//
-	// `system.error` was delivered to webhook subscribers, so requirement R-12 needs it to have
-	// a credential-reachable route once the HTTP transport retires: a subscriber that watched
-	// Blnk's own error stream must be able to keep watching it. But its payload is frozen
-	// field-for-field by requirement R-8 and renders the error as it comes — a PostgreSQL error
-	// names schema, table, column and routine; a broker error names internal addresses — so the
-	// disclosure cannot be narrowed by redaction, and the category is also the catalogue's
-	// catch-all, which makes a grant of it a standing grant over payloads of unknown
-	// provenance.
-	//
-	// Those two facts make it a decision rather than a default. Only an operator knows whether
-	// the subscribers of this deployment are internal consumers who may see its internals or
-	// third parties who may not, and the previous two attempts at answering it in code both
-	// failed: making the category ordinarily grantable put the disclosure one PUT away, and
-	// withholding it entirely stranded the ordinary ledger event that used to share the topic
-	// (now `<prefix>.ledgers`, which needs no acknowledgement).
-	//
-	// # What it changes, exactly
-	//
-	// One thing: whether `<prefix>.system` may appear in a subscriber's authorized_topics. With
-	// it false — the shipped default — the request DTO, the persistence boundary and the ACL
-	// provisioner all refuse that name, naming this variable as the remedy. With it true the
-	// name becomes grantable, and a subscriber still receives it only by listing it explicitly;
-	// nothing derives it, no default includes it, and no wildcard reaches it.
-	//
-	// It grants nothing on its own, changes no topic, and does not affect publishing: the
-	// internal topic is created and written to either way.
-	//
-	// Unlike SubscriberSharedTopicAccess this is read in EVERY mode, not only secure mode. The
-	// shared-topic acknowledgement decides how wide an already-authorised grant is, which is a
-	// production judgement; this one decides whether Blnk's internal diagnostics may leave the
-	// deployment at all, and a local stack that granted them by default would teach the wrong
-	// default to whoever copied its configuration.
+	// SubscriberInternalTopicAccess is the deployment ACKNOWLEDGING that a subscriber
+	// granted the internal category topic — `<KAFKA_TOPIC_PREFIX>.system` — reads Blnk's
+	// own error text verbatim, for the whole deployment, plus `ledger.created` and every
+	// event type the catalogue does not yet recognise.
 	SubscriberInternalTopicAccess bool `json:"subscriber_internal_topic_access" envconfig:"KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS"`
 
 	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
-	// PRODUCER principal: the identity the event publisher authenticates as. It needs
-	// only Write and Describe on the topics Blnk owns.
+	// PRODUCER principal: the identity the event publisher authenticates as. It needs only
+	// Write and Describe on the topics Blnk owns.
 	//
-	// ONE ROLE READS IT — the SERVER. blnk.ProcessRole.PublishesEvents names only that
-	// role, and initializeEventPublisher returns the no-op implementation for every
-	// other one WITHOUT reading the broker list, this pair or the TLS material. The
-	// worker role therefore builds no producer: the events it originates (notably
-	// transaction.rejected) are CAPTURED into the outbox inside their ledger
-	// transaction, and the relay — which runs in the server role only — is what
-	// publishes them. infrastructure/k8s-manifests/worker-deployment.yaml projects
-	// neither this pair nor the TLS material for exactly that reason, and says so
-	// beside the four keys it does project.
-	//
-	// It is deliberately separate from the administrative principal below. A producer
-	// process that authenticates as the administrator holds authority to create
-	// topics, mint SCRAM credentials and rewrite ACLs, so compromising the busiest,
-	// most exposed process in the deployment would hand over the whole cluster's
-	// authorization state. Least privilege is the point: configure these two, and the
-	// admin credentials never leave the provisioning path.
-	//
-	// There is NO fallback to the administrative principal. When these are empty and
-	// the administrative pair is not, ProducerSASL reports adminOnly and the publisher
-	// REFUSES to build, returning ErrProducerPrincipalRequired. That path used to
-	// downgrade to the administrative pair and log an excess-privilege warning, which
-	// recorded the problem without preventing it — and a warning nobody reads is how a
-	// temporary allowance becomes the permanent configuration. See ProducerSASL.
-	//
-	// Both pairs empty is a different, legitimate case: a broker requiring no
-	// authentication, for which no SASL mechanism is built and no error is raised.
-	//
-	// scripts/kafka-provision.sh creates this principal for the local stack and grants
-	// it Write and Describe on the Blnk-owned topics only.
+	// There is NO fallback to the administrative principal. When these are empty and the
+	// administrative pair is not, ProducerSASL reports adminOnly and the publisher REFUSES
+	// to build, returning ErrProducerPrincipalRequired. Downgrading to the administrative
+	// pair and logging an excess-privilege warning would record the problem without
+	// preventing it, and a warning nobody reads is how a temporary allowance becomes the
+	// permanent configuration.
 	SASLUser   string `json:"sasl_user"   envconfig:"KAFKA_SASL_USER"`
 	SASLSecret string `json:"sasl_secret" envconfig:"KAFKA_SASL_SECRET"`
 
-	// SASLAdminUser and SASLAdminSecret are R-10 CONTRACT VARIABLES, and are the
-	// ADMINISTRATIVE principal: used only for topic assurance, subscriber SCRAM
-	// credential provisioning, ACL grants and revocation, and the offset/lag reads
-	// behind reconciliation. Keep them out of every process that only publishes.
+	// SASLAdminUser and SASLAdminSecret are published contract variables, and are the
+	// ADMINISTRATIVE principal: used only for topic assurance, subscriber SCRAM credential
+	// provisioning, ACL grants and revocation, and the offset/lag reads behind
+	// reconciliation. Keep them out of every process that only publishes.
 	SASLAdminUser   string `json:"sasl_admin_user"   envconfig:"KAFKA_SASL_ADMIN_USER"`
 	SASLAdminSecret string `json:"sasl_admin_secret" envconfig:"KAFKA_SASL_ADMIN_SECRET"`
 
-	// SUPPLEMENTARY (topic geometry). Sanctioned as fields by AAP §0.5.2; the
-	// replication factor must be configuration-driven per §0.4.5, because a
-	// single-broker local stack cannot satisfy the production factor of 3.
+	// SUPPLEMENTARY (topic geometry). the replication factor must be configuration-driven
+	// per §0.4.5, because a single-broker local stack cannot satisfy the production factor
+	// of 3.
 	MinPartitions     int `json:"min_partitions"     envconfig:"KAFKA_MIN_PARTITIONS"`
 	ReplicationFactor int `json:"replication_factor" envconfig:"KAFKA_REPLICATION_FACTOR"`
 
@@ -992,98 +604,32 @@ type KafkaConfig struct {
 	TLS KafkaTLSConfig `json:"tls"`
 
 	// InsecureLocalDev permits an UNENCRYPTED Kafka connection.
-	//
-	// Ledger events carry financial amounts and identity events carry names, email
-	// addresses, phone numbers, addresses and dates of birth, so an unencrypted
-	// broker connection exposes exactly the data this system exists to protect. Both
-	// Kafka clients therefore REFUSE to dial without TLS unless this flag is
-	// explicitly set, which is what makes plaintext an opt-in rather than the
-	// accident of an unset variable.
-	//
-	// It exists because the local single-broker KRaft stack listens on
-	// SASL_PLAINTEXT, and only for that. Setting it in production defeats the
-	// protection; it is logged as a warning on every configuration load so that its
-	// presence in a real deployment cannot go unnoticed.
-	// SUPPLEMENTARY (explicit local-dev acknowledgement).
 	InsecureLocalDev bool `json:"insecure_local_dev" envconfig:"KAFKA_INSECURE_LOCAL_DEV"`
 
-	// AllowPartitionGrowth permits the topic-assurance pass to raise the partition
-	// count of a topic that ALREADY HOLDS MESSAGES.
-	//
-	// Growing a live topic re-maps keys to partitions — a key hashed into partition 2
-	// of six lands somewhere else out of twelve — so one aggregate's history is split
-	// across two partitions and its events can be consumed out of order. That breaks
-	// the per-aggregate ordering guarantee irreversibly for every key already
-	// written. Assurance therefore refuses to grow a non-empty topic and reports it
-	// instead, unless an operator has planned the migration and set this flag.
-	//
-	// An EMPTY topic is grown regardless of this flag: with no records written there
-	// is no mapping to preserve.
-	// SUPPLEMENTARY (explicit consent for a reordering-unsafe operation).
+	// AllowPartitionGrowth permits the topic-assurance pass to raise the partition count
+	// of a topic that ALREADY HOLDS MESSAGES.
 	AllowPartitionGrowth bool `json:"allow_partition_growth" envconfig:"KAFKA_ALLOW_PARTITION_GROWTH"`
 
 	// MetricsSubscriberBudget caps how many registry rows ONE consumer-lag sweep examines.
-	//
-	// # Why it is a knob and not a constant
-	//
-	// The periodic collector measures each subscriber's lag with two broker round trips per
-	// authorised topic, so an unbounded registry could make one tick outlast the collection
-	// interval; and each subscriber-topic pair is an exported gauge series, so the registry's
-	// size is also the series count. A budget is therefore necessary. Hard-coding it is not:
-	// a deployment with more subscribers than the budget had every one beyond it measured on a
-	// LATER tick at best, and the only remedy was a rebuild.
-	//
-	// The sweep resumes from a rotating cursor rather than restarting at the newest row, so a
-	// registry larger than the budget is covered across successive ticks instead of leaving a
-	// permanent hole. Raising this value is what compresses that coverage into a single tick —
-	// set it above the registry size and every subscriber is measured every tick, which is what
-	// blnk.kafka.consumer_lag_inventory_complete reports.
-	//
-	// Defaulted to 200 by setKafkaDefaults and clamped to MaxMetricsSubscriberBudget, because
-	// the two costs it bounds are real: the value is not a preference about strictness but a
-	// limit on tick duration and exported series.
 	MetricsSubscriberBudget int `json:"metrics_subscriber_budget" envconfig:"EVENT_METRICS_SUBSCRIBER_BUDGET"`
 
 	// AllowAdminProducer permits the event publisher to authenticate with the
 	// ADMINISTRATIVE credentials when no dedicated producer principal is configured.
 	//
-	// The publisher's own principal is SASLUser/SASLSecret. When those are empty the
-	// only other credential in the configuration is the administrative pair — the
-	// principal that creates topics, alters SCRAM credentials and grants or revokes
-	// ACLs. Publishing every ledger event as that principal makes a leaked producer
-	// credential a full compromise of the cluster's authorization state rather than
-	// the ability to publish events, and it erases the audit distinction between
-	// routine publishing and administration.
-	//
-	// So the fallback is REFUSED by default: a deployment that has brokers but no
-	// producer principal fails at start-up, naming KAFKA_SASL_USER and
-	// KAFKA_SASL_SECRET, rather than quietly running at maximum privilege. This flag
-	// is the deliberate, documented escape hatch for the one case that justifies it —
-	// an existing deployment mid-upgrade that has not provisioned its producer
-	// principal yet and must keep publishing while it does. It warns on every
-	// publisher construction, because a compatibility path nobody is reminded of
-	// becomes the permanent configuration.
-	//
-	// Default false. It is the least-privilege posture that has to be the default: an
-	// unset variable must not be the thing standing between a deployment and running
-	// its data plane as an administrator.
+	// So the fallback is REFUSED by default: a deployment that has brokers but no producer
+	// principal fails at start-up, naming KAFKA_SASL_USER and KAFKA_SASL_SECRET, rather
+	// than quietly running at maximum privilege. This flag is the deliberate, documented
+	// escape hatch for the one case that justifies it — an existing deployment mid-upgrade
+	// that has not provisioned its producer principal yet and must keep publishing while
+	// it does.
 	AllowAdminProducer bool `json:"allow_admin_producer" envconfig:"KAFKA_ALLOW_ADMIN_PRODUCER"`
 }
 
 // KafkaTLSConfig configures the TLS client both Kafka transports use.
 //
-// Enabled turns TLS on. CAFile names a PEM bundle to verify the broker's
-// certificate against, which is required whenever the broker presents a
-// certificate signed by a private authority; leaving it empty uses the host trust
-// store. CertFile and KeyFile supply a client certificate for mutual TLS and must
-// be set together. ServerName overrides the name verified against the certificate,
-// which is needed when brokers are reached through an address that does not match
-// their advertised name.
-//
-// InsecureSkipVerify disables certificate verification entirely. It is a
-// LAST-RESORT development switch: with it set, TLS still encrypts but no longer
-// authenticates, so an interposed broker is indistinguishable from the real one.
-// It is warned about on every configuration load.
+// Enabled turns TLS on. CAFile names a PEM bundle to verify the broker's certificate
+// against, which is required whenever the broker presents a certificate signed by a
+// private authority; leaving it empty uses the host trust store.
 type KafkaTLSConfig struct {
 	// ALL SUPPLEMENTARY (transport security).
 	Enabled            bool   `json:"enabled"              envconfig:"KAFKA_TLS_ENABLED"`
@@ -1094,19 +640,15 @@ type KafkaTLSConfig struct {
 	InsecureSkipVerify bool   `json:"insecure_skip_verify" envconfig:"KAFKA_TLS_INSECURE_SKIP_VERIFY"`
 }
 
-// RelayConfig tunes the transactional-outbox relay that publishes event rows to
-// Kafka. The three values define a bounded exponential backoff: the relay makes at
-// most MaxRetryAttempts attempts, waiting RetryBaseBackoffMS before the first retry
-// and doubling thereafter, never sleeping longer than RetryMaxBackoffMS. Both delay
-// values are milliseconds and are used verbatim — they are never reinterpreted as
-// another unit. Bad tuning is reported as a warning, never as a fatal error, so a
-// misconfigured relay can never stop the server from starting.
-//
-// Env tags are un-prefixed for the same reason as KafkaConfig's, and both the bare
-// RELAY_* names and the conventional BLNK_RELAY_* names resolve through the same
-// mechanism; see the notes on KafkaConfig and eventStreamingEnvOverride.
+// RelayConfig tunes the transactional-outbox relay that publishes event rows to Kafka.
+// The three values define a bounded exponential backoff: the relay makes at most
+// MaxRetryAttempts attempts, waiting RetryBaseBackoffMS before the first retry and
+// doubling thereafter, never sleeping longer than RetryMaxBackoffMS. Both delay values
+// are milliseconds and are used verbatim — they are never reinterpreted as another
+// unit. Bad tuning is reported as a warning, never as a fatal error, so a misconfigured
+// relay can never stop the server from starting.
 type RelayConfig struct {
-	// ALL THREE ARE R-10 CONTRACT VARIABLES, with the defaults the requirement fixes:
+	// ALL THREE ARE PUBLISHED CONTRACT VARIABLES, with fixed defaults:
 	// 5 attempts, a 1000 ms base delay and a 30000 ms ceiling. See defaultRelay.
 	MaxRetryAttempts   int `json:"max_retry_attempts"    envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RetryBaseBackoffMS int `json:"retry_base_backoff_ms" envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
@@ -1118,297 +660,145 @@ type RelayConfig struct {
 	// Exactly one status is age-eligible: dispatched. No other row is ever deleted by this
 	// period, however old it is — see TWO POPULATIONS, TWO LIFECYCLES below.
 	//
-	// WHAT THE OUTBOX HOLDS IS SENSITIVE. Each row's payload is the webhook body
-	// verbatim: a transaction event carries amounts and balance identifiers, and an
-	// identity event carries names, email addresses, phone numbers, postal addresses and
-	// dates of birth. Once the event has been delivered none of that has any operational
-	// value, so keeping it indefinitely turns a delivery buffer into an unbounded second
-	// copy of the ledger's most sensitive data — without the access controls the primary
-	// tables have around them, and with a blast radius that only grows.
+	// WHAT THE OUTBOX HOLDS IS SENSITIVE. Each row's payload is the webhook body verbatim:
+	// a transaction event carries amounts and balance identifiers, and an identity event
+	// carries names, email addresses, phone numbers, postal addresses and dates of birth.
+	// Once the event has been delivered none of that has any operational value, so keeping
+	// it indefinitely turns a delivery buffer into an unbounded second copy of the
+	// ledger's most sensitive data — without the access controls the primary tables have
+	// around them, and with a blast radius that only grows.
 	//
 	// TWO POPULATIONS, TWO LIFECYCLES, and the distinction is what makes any finite value
 	// here safe to set.
 	//
-	// A DISPATCHED row is a receipt: the event reached the broker, a subscriber has had it,
-	// and after this period the row says nothing anyone needs. Age alone governs it.
-	//
-	// A DEAD-LETTERED row is the opposite — the record of an event NO SUBSCRIBER EVER
-	// RECEIVED, together with the failure metadata explaining why and the bytes a replay is
-	// driven from. It is NEVER deleted by this period, however old it is, and it keeps the
-	// DeadLetterMessageStuck alert firing until the event actually reaches a subscriber. The
-	// workflow that ends its life is REPLAY, through
-	// POST /events/dead-letter/:event_id/replay: a re-publish the broker acknowledges makes
-	// the row dispatched, and this period then applies to it as it does to any other
-	// receipt.
+	// A DISPATCHED row is a receipt: the event reached the broker, a subscriber has had
+	// it, and after this period the row says nothing anyone needs. Age alone governs it.
 	//
 	// Every other state is still owed a delivery attempt and is never deleted however old
 	// it is; a failed row in particular is excluded because its dead-letter write is still
 	// owed, which makes this table the only copy of that event in existence.
-	//
-	// ZERO DISABLES RETENTION and is the default, deliberately. Deleting ledger-adjacent
-	// records is a decision only an operator can take: a jurisdiction, an audit programme
-	// or a legal hold may require a longer period than any default could guess, and a
-	// default that silently deleted evidence would be worse than one that keeps too much.
-	// So the mechanism ships switched off and the period is an explicit choice. The
-	// resulting storage growth is observable through blnk.outbox.pending and the
-	// statistics endpoint.
 	EventRetentionDays int `json:"event_retention_days" envconfig:"RELAY_EVENT_RETENTION_DAYS"`
 
-	// EventRetentionBatchSize is how many rows ONE delete statement removes. PERF-P23.
-	//
-	// This is the lock-footprint knob, not the throughput knob. Each statement takes row
-	// locks and writes WAL for the rows it removes, and the sweeper runs beside a live relay
-	// claiming from the same table, so a large single delete trades a brief pause for the
-	// relay against fewer statements. The default keeps each statement small and reaches
-	// throughput through the batch COUNT below instead, which is the safer of the two ways to
-	// buy capacity.
+	// EventRetentionBatchSize is how many rows ONE delete statement removes.
 	EventRetentionBatchSize int `json:"event_retention_batch_size" envconfig:"RELAY_EVENT_RETENTION_BATCH_SIZE"`
 
-	// EventRetentionMaxBatchesPerSweep is how many delete statements one sweep may issue, and
-	// with the batch size it is what sets the sweeper's CAPACITY. PERF-P23.
-	//
-	// # The arithmetic, because the previous default failed it
-	//
-	// Capacity is batches x batch size per sweep, and the sweep runs hourly, so:
-	//
-	//	rows per hour = EventRetentionMaxBatchesPerSweep x EventRetentionBatchSize
-	//
-	// The old fixed ceiling was 100 batches of 1,000 rows — 100,000 rows an hour — while the
-	// throughput this system is specified for, 500 events a second, ARRIVES at 1,800,000 rows
-	// an hour. A sweeper eighteen times slower than ingestion does not slow growth down; the
-	// table grows unboundedly anyway and the retention period is never actually enforced. The
-	// bound was documented as overtaking "any realistic arrival rate", which was true of the
-	// deployments it was written for and false of the one the acceptance criteria describe.
-	//
-	// The default is therefore set ABOVE peak ingestion rather than below it, and it is
-	// configurable so an operator whose ingestion is higher still can raise it, and one who
-	// would rather protect a small database can lower it.
-	//
-	// ABOVE, not merely at: the default is now 4,000,000 rows an hour, 2.2x arrival, because
-	// the 2,000,000 it was set to first is 1.11x and a sweeper that cannot catch up needs
-	// recovery capacity rather than a break-even margin (PERF-C03). See
-	// DefaultEventRetentionMaxBatchesPerSweep for why raising it is free in steady state.
-	//
-	// # This setting cannot be read without the storage arithmetic beside it
-	//
-	// Capacity decides whether the retention PERIOD is enforced. The period then decides how
-	// much storage the table occupies, and that is measured rather than estimated: 2,372 bytes
-	// per row including all seventeen indexes, of which roughly 88% is the event body held
-	// three times over, giving 95.4 GiB a day at 500 events a second. The full derivation is
-	// at the payload columns in sql/1781248800.sql, and the pg-data volume in the reference
-	// manifests is sized from it. A period configured without that arithmetic is how a shipped
-	// 90 days came to sit against a 10Gi volume, 858x apart.
-	//
-	// # Zero means UNSET, and unbounded has its own value
-	//
-	// An unset int field is indistinguishable from a deliberate zero, so the two readings of
-	// zero — "I did not configure this" and "I want no ceiling" — cannot both be honoured.
-	// Zero is taken as UNSET and defaulted, because that is the safe reading: the per-sweep
-	// bound is what stops the first sweep after retention is enabled from trying to delete an
-	// entire historical backlog in one pass, holding locks on a table the relay is claiming
-	// from, and a deployment that never mentions this setting must keep that protection.
-	//
-	// EventRetentionUnboundedSweep (-1) is the explicit way to ask for no ceiling, which is
-	// what a deliberate one-off catch-up wants.
+	// EventRetentionMaxBatchesPerSweep is how many delete statements one sweep may issue,
+	// and with the batch size it is what sets the sweeper's CAPACITY: batches x batch size
+	// per sweep, with the sweep running hourly.
 	EventRetentionMaxBatchesPerSweep int `json:"event_retention_max_batches_per_sweep" envconfig:"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP"`
 
 	// TWO SPELLINGS, ONE KNOB. This is the same ceiling as Kafka.MetricsSubscriberBudget:
-	// RELAY_SUBSCRIBER_METRICS_BUDGET and EVENT_METRICS_SUBSCRIBER_BUDGET are both accepted
-	// because both were published, and setRelayDefaults reconciles them so the two fields can
-	// never disagree about the value the collector actually uses.
+	// RELAY_SUBSCRIBER_METRICS_BUDGET and EVENT_METRICS_SUBSCRIBER_BUDGET are both
+	// accepted because both were published, and setRelayDefaults reconciles them so the
+	// two fields can never disagree about the value the collector actually uses.
 	// SubscriberMetricsBudget caps how many subscribers ONE metrics collection measures
 	// consumer lag for, and it is a MONITORING COVERAGE control.
 	//
-	// # What the budget costs when it is reached
-	//
-	// A subscriber past the budget is not measured approximately — it gets NO
-	// consumer-lag series at all. blnk_kafka_consumer_lag is simply absent for it, so the
+	// A subscriber past the budget is not measured approximately — it gets NO consumer-lag
+	// series at all. blnk_kafka_consumer_lag is simply absent for it, so the
 	// SubscriberConsumerLagHigh rule has nothing to evaluate and the subscriber can fall
 	// arbitrarily far behind while every dashboard reads clean. Silence and health become
 	// indistinguishable, which is why the shortfall is published on
 	// blnk.kafka.subscribers_unmeasured, attributed by reason, and alerted on rather than
 	// only logged.
 	//
-	// # Why there is a budget at all
-	//
 	// It bounds two scarce things at once. Each subscriber costs an OffsetFetch and a
 	// ListOffsets round trip per authorised topic, so an unbounded registry could make one
-	// collection longer than the interval between collections. And each subscriber-topic
-	// pair is a retained gauge series, so the registry's size is also the exported series
-	// count. Neither cost is a reason to leave subscribers unmeasured silently; both are
-	// reasons to make the ceiling an explicit, observable, operator-set number.
-	//
-	// ZERO TAKES THE DEFAULT of 200, which is far above any plausible subscriber count for
-	// one ledger deployment. Raise it when blnk.kafka.subscribers_unmeasured is non-zero
-	// UNDER THE reason="budget" LABEL specifically — that is the only one of its five reasons
-	// a larger budget closes — and the collection is comfortably inside its interval; that
-	// gauge and blnk.subscribers.registered together say whether there is headroom.
+	// collection longer than the interval between collections.
 	SubscriberMetricsBudget int `json:"subscriber_metrics_budget" envconfig:"RELAY_SUBSCRIBER_METRICS_BUDGET"`
 
-	// REPAIR CAPACITY (PERF-M06): how fast the relay clears the two REPAIR backlogs, which
-	// is a different question from how fast it publishes new events.
+	// REPAIR CAPACITY: how fast the relay clears the two REPAIR backlogs, which is a
+	// different question from how fast it publishes new events.
 	//
-	// # The two backlogs, and why they need their own capacity
+	// Two populations are outside the publish claim's reach by design and are reached by
+	// their own passes each tick:
 	//
-	// Two populations are outside the publish claim's reach by design and are reached by their
-	// own passes each tick:
-	//
-	//   * rows whose retry budget is spent and whose `<topic>.dlt` write still failed — each
-	//     is the ONLY copy of an event that reached no topic at all; and
+	//   * rows whose retry budget is spent and whose `<topic>.dlt` write still failed —
+	//     each is the ONLY copy of an event that reached no topic at all; and
 	//   * rows whose Kafka leg finished and whose legacy webhook enqueue never succeeded,
 	//     which is the dual-delivery promise for the migration window.
-	//
-	// Both sets are empty in normal operation, which is precisely why their capacity was easy
-	// to under-size: an idle pass costs one indexed query and any batch size looks adequate.
-	// They fill during an OUTAGE, all at once. A 15-minute broker outage at the 500 events per
-	// second acceptance rate produces about 450,000 rows, and the previous fixed 20 rows per
-	// tick — one pass, sequential, un-chained — drains that at 20 rows a second: roughly
-	// SIX AND A QUARTER HOURS on one replica, with the dead-letter age alert firing throughout.
-	//
-	// # The arithmetic these three multiply into
 	//
 	//	rows per tick   = RepairMaxBatchesPerTick x RepairBatchSize
 	//	drain rate      = rows per tick / poll interval, capped by broker acknowledgement time
 	//	                  divided by RepairConcurrency
-	//
-	// At the shipped 25 x 100 with 8-way concurrency and a realistic 10ms acknowledgement, one
-	// tick's 2,500 rows take about three seconds of wall time, so the drain rate is on the
-	// order of 800 rows a second and the 450,000-row backlog above clears in about ten minutes
-	// rather than in a working day. The bound still exists — it is what stops one tick
-	// attempting an entire historical backlog and holding leases it cannot finish inside — and
-	// blnk.events.repair.saturated reports when it is the binding constraint, which is the
-	// signal to raise these numbers rather than to guess at them.
-	//
-	// EACH CHAINED BATCH TAKES ITS OWN CLAIM AND ITS OWN LEASE, so chaining does not widen the
-	// window in which a row is held: a batch that finishes leaves its rows terminal and the
-	// next batch claims fresh rows under a new token. That is what makes chaining safe here
-	// where a single enormous batch would not be.
-	//
-	// RepairBatchSize is how many rows ONE repair claim takes. It is the lease-footprint
-	// factor: every row in a batch needs its own Kafka write, and the whole batch must finish
-	// inside the lease.
 	RepairBatchSize int `json:"repair_batch_size" envconfig:"RELAY_REPAIR_BATCH_SIZE"`
 
-	// RepairMaxBatchesPerTick is how many repair claims ONE tick chains before returning to
-	// the publish loop. It is the throughput factor and the safer of the three to raise.
-	//
-	// It is bounded rather than unbounded so that a large repair backlog cannot starve the
-	// publish loop: new events keep flowing while the backlog drains, which matters because
-	// the backlog exists precisely when the pipeline is recovering.
+	// RepairMaxBatchesPerTick is how many repair claims ONE tick chains before returning
+	// to the publish loop. It is the throughput factor and the safer of the three to
+	// raise.
 	RepairMaxBatchesPerTick int `json:"repair_max_batches_per_tick" envconfig:"RELAY_REPAIR_MAX_BATCHES_PER_TICK"`
 
 	// RepairConcurrency is how many message-key groups of one repair batch are written at
 	// once, mirroring the publish loop's own concurrency.
-	//
-	// ORDERING IS NOT AT RISK. The rows are grouped by the same effective key the publisher
-	// hashes and each group is written sequentially by one goroutine, exactly as the publish
-	// loop does — so two rows that must stay ordered are never written concurrently.
 	RepairConcurrency int `json:"repair_concurrency" envconfig:"RELAY_REPAIR_CONCURRENCY"`
 }
 
-// eventStreamingEnvOverride is how the CONVENTIONAL BLNK_-prefixed names for the
-// nested Kafka and relay blocks are resolved. It exists because one envconfig pass
-// cannot honour both name forms for the same field, and the deployment contract
-// requires both.
-//
-// # Why a second, flat struct is necessary rather than a prefix on the tags
-//
-// envconfig derives a field's PRIMARY key by accumulating the prefix through every
-// enclosing struct and appending the tag literal, then consults the bare tag literal
-// as an ALTERNATE key only when the primary is unset. Configuration.Kafka is itself a
-// prefix segment, so for Configuration.Kafka.Brokers — tagged KAFKA_BROKERS — the
-// primary key is BLNK_KAFKA_KAFKA_BROKERS and the alternate is the mandated bare
-// KAFKA_BROKERS. The conventional BLNK_KAFKA_BROKERS is neither key, so nesting alone
-// silently drops it.
+// eventStreamingEnvOverride is how the CONVENTIONAL BLNK_-prefixed names for the nested
+// Kafka and relay blocks are resolved. It exists because one envconfig pass cannot
+// honour both name forms for the same field, and the deployment contract requires both.
 //
 // Renaming the tags cannot fix that. A tag of BROKERS would make the primary
 // BLNK_KAFKA_BROKERS and the alternate a bare BROKERS, honouring the convention but
-// breaking the mandated KAFKA_BROKERS. Either way one form is lost, because a field
-// has exactly one primary key and one alternate. Two forms therefore need two
-// sources, which is what this struct is.
-//
-// This struct is FLAT, so envconfig accumulates no intermediate segment: for
-// KafkaBrokers, tagged KAFKA_BROKERS, the primary key is BLNK_KAFKA_BROKERS and the
-// alternate is KAFKA_BROKERS. Both forms resolve here, the library performs all
-// parsing, and a malformed integer is reported by the library naming the exact
-// variable that carried it.
-//
-// # Every field is a POINTER, and that is the whole mechanism
-//
-// envconfig skips a field whose variable is unset, leaving a pointer nil, and
-// allocates one whose variable is set — even when the value is empty. Nil therefore
-// means "not configured through this name" and non-nil means "configured, use it",
-// which is exactly the distinction an overlay needs. A value struct could not tell an
-// explicit empty value from an absent one and would erase a value the file or the bare
-// name supplied.
-//
-// # The resulting precedence, highest first
+// breaking the mandated KAFKA_BROKERS.
 //
 //  1. BLNK_KAFKA_BROKERS / BLNK_RELAY_MAX_RETRY_ATTEMPTS — the conventional prefixed
 //     name, this struct's primary key. Highest because it matches the prefixed
 //     convention every other variable in this file follows.
-//  2. KAFKA_BROKERS / RELAY_MAX_RETRY_ATTEMPTS — the bare name the deployment
-//     contract mandates, this struct's alternate key.
+//  2. KAFKA_BROKERS / RELAY_MAX_RETRY_ATTEMPTS — the bare name the deployment contract
+//     mandates, this struct's alternate key.
 //  3. BLNK_KAFKA_KAFKA_BROKERS / BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS — the key
-//     envconfig derives from the nested struct. Still honoured, because it is what
-//     the nested pass applies and removing it would break any deployment that found
-//     it; lowest of the three because it is an artefact of the nesting rather than a
-//     name anybody would choose.
+//     envconfig derives from the nested struct. Still honoured, because it is what the
+//     nested pass applies and removing it would break any deployment that found it;
+//     lowest of the three because it is an artefact of the nesting rather than a name
+//     anybody would choose.
 //  4. The matching key under "kafka" or "relay" in blnk.json.
 //  5. The defaults in defaultKafka and defaultRelay.
-//
-// Levels 1 to 3 order themselves without any lookup gymnastics: the nested pass runs
-// first and applies level 3, this overlay runs second and applies level 1 or 2 over
-// it, and within the overlay envconfig's own primary-before-alternate rule orders 1
-// above 2.
-//
-// WebhookDeprecationSunsetDate is deliberately absent. It is a top-level field on
-// Configuration, so it accumulates no intermediate segment and the nested pass already
-// resolves both WEBHOOK_DEPRECATION_SUNSET_DATE and its BLNK_-prefixed form. Adding it
-// here would be redundant.
 type eventStreamingEnvOverride struct {
 	KafkaBrokers *[]string `envconfig:"KAFKA_BROKERS"`
 	// KafkaSubscriberBrokers belongs HERE rather than in applyPrefixedEnvAliases for one
 	// mechanical reason: it is a LIST, and that function's three alias tables are typed
-	// string, int and bool. Resolving it through this struct also means the library performs
-	// the comma splitting, so the prefixed alias splits exactly as the bare name does
-	// instead of through a second, hand-written parse.
+	// string, int and bool. Resolving it through this struct also means the library
+	// performs the comma splitting, so the prefixed alias splits exactly as the bare name
+	// does instead of through a second, hand-written parse.
 	KafkaSubscriberBrokers *[]string `envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
 	// KafkaHistoricalTopicPrefixes is here for the same reason, and its absence was a real
 	// defect rather than an omission of convenience. Both compose files forward
 	// BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES and .env.example documents that either form
-	// resolves, but with no field here the only names that reached the configuration were the
-	// bare KAFKA_HISTORICAL_TOPIC_PREFIXES and the alias envconfig DERIVES for a nested field,
-	// BLNK_KAFKA_KAFKA_HISTORICAL_TOPIC_PREFIXES. So the documented and forwarded name was
-	// silently ignored, and the symptom is the worst kind this variable has: every event
-	// captured under a previous KAFKA_TOPIC_PREFIX is refused at writer resolution after the
-	// next restart, having been configured to be publishable.
+	// resolves, but with no field here the only names that reached the configuration were
+	// the bare KAFKA_HISTORICAL_TOPIC_PREFIXES and the alias envconfig DERIVES for a
+	// nested field, BLNK_KAFKA_KAFKA_HISTORICAL_TOPIC_PREFIXES. So the documented and
+	// forwarded name was silently ignored, and the symptom is the worst kind this variable
+	// has: every event captured under a previous KAFKA_TOPIC_PREFIX is refused at writer
+	// resolution after the next restart, having been configured to be publishable.
 	KafkaHistoricalTopicPrefixes *[]string `envconfig:"KAFKA_HISTORICAL_TOPIC_PREFIXES"`
-	// KafkaKeyScopeGatewayBrokers is a list for the same mechanical reason, and it is resolved
-	// here rather than in applyPrefixedEnvAliases so that the mode and the gateway list cannot
-	// be resolved by different mechanisms — a deployment that set the mode through one name
-	// and the list through the other would declare an enforcement point with no addresses,
-	// which KeyScopeGateway reads as "not declared" and refuses issuance on.
+	// KafkaKeyScopeGatewayBrokers is a list for the same mechanical reason, and it is
+	// resolved here rather than in applyPrefixedEnvAliases so that the mode and the
+	// gateway list cannot be resolved by different mechanisms — a deployment that set the
+	// mode through one name and the list through the other would declare an enforcement
+	// point with no addresses, which KeyScopeGateway reads as "not declared" and refuses
+	// issuance on.
 	KafkaKeyScopeGatewayBrokers *[]string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
 	KafkaKeyScopeEnforcement    *string   `envconfig:"KAFKA_KEY_SCOPE_ENFORCEMENT"`
-	// The attestation trio belongs here with the mode and the gateway list, and for the same
-	// reason: enforcement is active only when the mode, the addresses AND the control endpoint
-	// all resolve, so resolving one of them by a different mechanism from the others is how a
-	// deployment ends up declaring an enforcement point it cannot reach — which fails closed and
-	// refuses every key-scoped subscriber, on a configuration the operator believes is complete.
+	// The attestation trio belongs here with the mode and the gateway list, and for the
+	// same reason: enforcement is active only when the mode, the addresses AND the control
+	// endpoint all resolve, so resolving one of them by a different mechanism from the
+	// others is how a deployment ends up declaring an enforcement point it cannot reach —
+	// which fails closed and refuses every key-scoped subscriber, on a configuration the
+	// operator believes is complete.
 	KafkaKeyScopeGatewayAttestationURL       *string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL"`
 	KafkaKeyScopeGatewayAttestationToken     *string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN"`
 	KafkaKeyScopeGatewayAttestationTimeoutMS *int    `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS"`
-	// KafkaSubscriberSharedTopicAccess is the whole-topic ACKNOWLEDGEMENT, and it is a bool, so
-	// applyPrefixedEnvAliases could carry it. It is here instead so that every variable
-	// governing the subscriber access model resolves through one mechanism: a deployment that
-	// declared the acknowledgement by a name this struct honoured and the mode by one it did not
-	// would get the widest behaviour from the narrowest-looking configuration.
+	// KafkaSubscriberSharedTopicAccess is the whole-topic ACKNOWLEDGEMENT, and it is a
+	// bool, so applyPrefixedEnvAliases could carry it. It is here instead so that every
+	// variable governing the subscriber access model resolves through one mechanism: a
+	// deployment that declared the acknowledgement by a name this struct honoured and the
+	// mode by one it did not would get the widest behaviour from the narrowest-looking
+	// configuration.
 	KafkaSubscriberSharedTopicAccess *bool `envconfig:"KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS"`
-	// KafkaSubscriberInternalTopicAccess is the internal-topic ACKNOWLEDGEMENT, and it is here
-	// for the same reason as the acknowledgement above: every variable governing the subscriber
-	// access model resolves through one mechanism, so a deployment cannot declare one of them by
-	// a name this struct honours and another by a name it does not.
+	// KafkaSubscriberInternalTopicAccess is the internal-topic ACKNOWLEDGEMENT, and it is
+	// here for the same reason as the acknowledgement above: every variable governing the
+	// subscriber access model resolves through one mechanism, so a deployment cannot
+	// declare one of them by a name this struct honours and another by a name it does not.
 	KafkaSubscriberInternalTopicAccess *bool   `envconfig:"KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS"`
 	KafkaTopicPrefix                   *string `envconfig:"KAFKA_TOPIC_PREFIX"`
 	KafkaSASLAdminUser                 *string `envconfig:"KAFKA_SASL_ADMIN_USER"`
@@ -1431,26 +821,13 @@ type eventStreamingEnvOverride struct {
 // applyEventStreamingEnvOverride resolves the Kafka and relay environment variables
 // through eventStreamingEnvOverride and copies whatever was set onto cnf.
 //
-// It is called from loadConfigFromFile immediately after the nested envconfig pass and
-// before validateAndAddDefaults, which is what produces the precedence documented on
-// eventStreamingEnvOverride. It does not re-process Configuration, add a configuration
-// source, or reorder the load pipeline: the pipeline remains file, then environment,
-// then defaults and validation, then publish.
-//
-// Only non-nil fields are copied, so a name that was never set cannot erase a value
-// the file or a lower-precedence name supplied. An explicitly EMPTY value is copied,
-// because emptying a variable is how an operator turns a setting off — most visibly
-// KAFKA_BROKERS, where empty is the supported "no Kafka configured" steady state that
-// selects the no-op event publisher.
-//
 // Parameters:
 //   - cnf *Configuration: the configuration being loaded, mutated in place.
 //
 // Returns:
-//   - error: the library's own error when a value cannot be parsed into its field —
-//     for example a non-numeric KAFKA_MIN_PARTITIONS. The message names the offending
-//     variable. It never contains KAFKA_SASL_ADMIN_SECRET's value, because that field
-//     is a string and a string conversion cannot fail.
+//   - error: the library's own error when a value cannot be parsed into its field — for
+//     example a non-numeric KAFKA_MIN_PARTITIONS. The message names the offending
+//     variable.
 func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	var override eventStreamingEnvOverride
 	if err := envconfig.Process("blnk", &override); err != nil {
@@ -1566,92 +943,26 @@ type Configuration struct {
 	// LogLevel is the verbosity of the standard logger: one of trace, debug, info,
 	// warn/warning, error, fatal or panic, matched case-insensitively by
 	// logrus.ParseLevel.
-	//
-	// # Why this exists at all
-	//
-	// Several of the event pipeline's diagnostics are deliberately emitted at DEBUG,
-	// because they are per-event and the pipeline is built for 500 events a second:
-	// the successful-publish line in the relay and in the publisher, the metrics
-	// collector's per-tick summary, and the consumer-lag series retirement notice.
-	// Suppressing them by default is correct — a line per published event whose
-	// content is "it worked" is not observability, it is volume. Having NO WAY TO
-	// TURN THEM ON was the defect: nothing in the codebase called logrus.SetLevel, so
-	// every deployed binary sat at logrus's default of info and a delivery
-	// investigation had only failure lines and batch counts to work from. Those
-	// diagnostics were unreachable without recompiling.
-	//
-	// # An unparseable value warns rather than refusing to start
-	//
-	// Deliberately different from WebhookDeprecationSunsetDate, which is fatal. A
-	// mis-typed sunset silently keeps the deprecated transport alive, so the only
-	// safe response is to refuse; a mis-typed log level silently keeps the SAFE
-	// default, changes nothing about how traffic is served, and is announced by the
-	// warning itself. Failing the load would turn a typo in a diagnostic control into
-	// an outage.
-	//
-	// Blank means "leave the logger alone", which is info. That distinction matters
-	// beyond tidiness: an unconditional SetLevel here would reach into every process
-	// that loads a configuration, including a test that has pinned the level to
-	// capture a debug line.
 	LogLevel string `json:"log_level" envconfig:"BLNK_LOG_LEVEL"`
 
-	// WebhookDeprecationStartDate is the RFC3339 instant at which the dual-delivery
-	// window OPENS. IT IS DERIVED, NOT CONFIGURED: it is always computed as
-	// WebhookDeprecationSunsetDate minus exactly WebhookDualDeliveryWindowDays, and
-	// any value present on input is overwritten by resolveWebhookDeprecationWindow.
-	//
-	// It carries no envconfig tag on purpose. Requirement R-10 freezes the deployment
-	// contract at eight environment variables, of which exactly one describes this
-	// window — WEBHOOK_DEPRECATION_SUNSET_DATE. A second variable for the other end
-	// was a genuine convenience and still a contract violation, and it bought nothing
-	// that could not be derived: the window is exactly
-	// WebhookDualDeliveryWindowDays long by definition, so either end determines the
-	// other and the sunset is the end the requirement names.
-	//
-	// Deriving rather than accepting also removes a whole class of misconfiguration.
-	// Two independently settable ends can disagree, which previously had to be
-	// detected and refused; one settable end cannot, so "exactly 30 days" is a
-	// property of the arithmetic instead of a rule that has to be enforced.
-	//
-	// The field remains exported because the window's opening instant is worth
-	// reading — the migration documentation and the dual-delivery logging both state
-	// it — and because a derived value nobody can see is a value nobody can check.
+	// WebhookDeprecationStartDate is the RFC3339 instant at which the dual-delivery window
+	// OPENS. IT IS DERIVED, NOT CONFIGURED: it is always computed as
+	// WebhookDeprecationSunsetDate minus exactly WebhookDualDeliveryWindowDays, and any
+	// value present on input is overwritten by resolveWebhookDeprecationWindow.
 	WebhookDeprecationStartDate string `json:"webhook_deprecation_start_date"`
 
-	// AN R-10 CONTRACT VARIABLE, and the ONLY one describing the dual-delivery window.
-	// WebhookDeprecationSunsetDate is the RFC3339 instant at which the legacy HTTP
-	// webhook transport is retired. Before it, Kafka publishing and legacy webhook
-	// delivery run concurrently from the same outbox rows; from it onwards Kafka is
-	// the only transport and the deprecated webhook routes answer 410 Gone.
-	//
-	// A VALUE THAT WILL NOT PARSE IS FATAL. An operator who states a retirement
-	// instant and mis-types it would otherwise get the silent resolution "keep the
-	// legacy behaviour", so a single typo keeps the deprecated, less protected of the
-	// two transports alive indefinitely with nothing failing and nothing to notice.
-	// Refusing to start is the only signal that cannot be overlooked, and it happens
-	// before any traffic is served.
+	// A PUBLISHED CONTRACT VARIABLE, and the ONLY one describing the dual-delivery window.
+	// WebhookDeprecationSunsetDate is the RFC3339 instant at which the legacy HTTP webhook
+	// transport is retired. Before it, Kafka publishing and legacy webhook delivery run
+	// concurrently from the same outbox rows; from it onwards Kafka is the only transport
+	// and the deprecated webhook routes answer 410 Gone.
 	//
 	// IT IS REQUIRED WHENEVER KAFKA_BROKERS IS SET, and absent one the load FAILS. The
 	// runtime's sunset predicate fails closed on a publishing deployment with no usable
 	// window — it answers "the sunset has already passed", stopping dual delivery and
-	// answering 410 Gone on the deprecated routes — so accepting the combination here
-	// with a warning that promised the opposite let configuration and behaviour
-	// disagree about the one decision R-12 is made of. See
-	// resolveWebhookDeprecationWindow for the full reasoning.
-	//
-	// With NO brokers it stays optional and empty is the norm: there is no transport to
-	// migrate to, so there is no window to describe, and AAP §0.7.2's graceful
-	// degradation is untouched.
-	//
-	// The other end of the window is DERIVED from this one — see
-	// WebhookDeprecationStartDate — so there is no second value to keep in step and
-	// the window is exactly WebhookDualDeliveryWindowDays long by construction.
-	//
-	// Being a top-level field, it accumulates no intermediate prefix segment, so both
-	// the mandated bare WEBHOOK_DEPRECATION_SUNSET_DATE and the house-convention
-	// BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE are honoured, the prefixed form winning
-	// if both are set. KafkaConfig's nested fields get the same behaviour from
-	// applyPrefixedEnvAliases.
+	// answering 410 Gone on the deprecated routes — so accepting the combination here with
+	// accepting the combination here would let configuration and behaviour disagree about
+	// the one decision the sunset is made of. See resolveWebhookDeprecationWindow.
 	WebhookDeprecationSunsetDate string `json:"webhook_deprecation_sunset_date" envconfig:"WEBHOOK_DEPRECATION_SUNSET_DATE"`
 }
 
@@ -1675,26 +986,10 @@ func (cnf *Configuration) RemoteMonitoringDSN() string {
 // EventPublishingConfigured reports whether this deployment has at least one usable
 // Kafka broker, and therefore whether the event pipeline captures anything at all.
 //
-// # Why the predicate lives on the configuration
-//
 // Two packages need this same answer and MUST NOT disagree about it. The root package
 // decides whether to capture an event and whether the legacy transport is the one to
 // use; the database package decides whether to write a balance-monitor handoff inside a
-// ledger transaction. If those two answers ever differed, one of two silent faults
-// would follow: handoffs written that nothing drains, or a movement whose monitors are
-// evaluated by neither the handoff nor the post-commit path — an alert lost with nothing
-// failing to say so.
-//
-// Putting the predicate here makes the disagreement unrepresentable rather than
-// unlikely. The root package's eventPublishingConfigured delegates to it, and the
-// database layer calls it directly.
-//
-// # What counts as configured
-//
-// A broker list containing only blank entries is NOT configured. A whitespace-only
-// entry survives environment-variable splitting and list parsing but cannot be dialled,
-// so treating it as a broker would arm the whole pipeline against an endpoint that
-// cannot exist.
+// ledger transaction.
 //
 // Returns:
 //   - bool: true when at least one broker address is non-blank. A nil receiver answers
@@ -1743,9 +1038,9 @@ func loadConfigFromFile(file string) error {
 		return err
 	}
 
-	// Then let the conventional BLNK_-prefixed names for the nested Kafka and relay
-	// blocks take effect. This runs between the environment overlay and the defaults so
-	// that the precedence documented on eventStreamingEnvOverride holds, and so that
+	// Then let the conventional BLNK_-prefixed names for the nested Kafka and relay blocks
+	// take effect. This runs between the environment overlay and the defaults so that the
+	// precedence documented on eventStreamingEnvOverride holds, and so that
 	// setKafkaDefaults and setRelayDefaults still see the final configured values.
 	if err = applyEventStreamingEnvOverride(&cnf); err != nil {
 		return err
@@ -1767,38 +1062,16 @@ const envAliasPrefix = "BLNK_"
 // explainEnvProcessError re-states an envconfig parse failure in terms of the variable
 // the operator actually set.
 //
-// # The problem it solves
-//
-// envconfig derives a nested field's PRIMARY key by accumulating the prefix through every
-// enclosing struct and treats the raw tag literal as an ALTERNATE. Configuration.Relay.
-// MaxRetryAttempts, tagged RELAY_MAX_RETRY_ATTEMPTS, therefore has the primary key
-// BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS and the alternate RELAY_MAX_RETRY_ATTEMPTS. The value
-// is read from whichever is set, but *envconfig.ParseError always reports the PRIMARY.
-//
-// So an operator who sets the mandated bare name RELAY_MAX_RETRY_ATTEMPTS=five is told
-// "assigning BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS to MaxRetryAttempts" — a variable name
-// that appears nowhere in their configuration and that a search of it will not find. The
-// failure is correct and it is loud; only the name is unhelpful, and the name is the one
-// piece of information the operator needs.
-//
-// # What it does and, deliberately, does not do
-//
-// It rewrites the MESSAGE and nothing else. Which values are accepted is left entirely to
-// envconfig, because that acceptance is subtle — integers are parsed with base 0, so
-// "0x10" is 16, and no trimming is performed, so " 4 " is rejected — and a hand-written
-// pre-flight check would have to reproduce it exactly or would silently change behaviour.
-// The original error is wrapped, so errors.As still recovers the *envconfig.ParseError.
-//
-// The primary key is only rewritten when it is genuinely ABSENT from the environment and a
-// name the operator could have set is present. When the primary itself is set, it is the
-// variable at fault and it is already named correctly.
+// envconfig derives a nested field's PRIMARY key by accumulating the prefix through
+// every enclosing struct and treats the raw tag literal as an ALTERNATE.
+// Configuration.Relay.
 //
 // Parameters:
 //   - err error: the error returned by envconfig.Process. Never nil at the call site.
 //
 // Returns:
-//   - error: err unchanged when it is not a parse failure or the reported key is the one
-//     that was set; otherwise a wrapping error naming the variable that was set.
+//   - error: err unchanged when it is not a parse failure or the reported key is the
+//     one that was set; otherwise a wrapping error naming the variable that was set.
 func explainEnvProcessError(err error) error {
 	var parseErr *envconfig.ParseError
 	if !errors.As(err, &parseErr) {
@@ -1813,8 +1086,8 @@ func explainEnvProcessError(err error) error {
 	// The names an operator may legitimately have used for this field, in the order
 	// envconfig itself consults them: the house-prefixed alias applyPrefixedEnvAliases
 	// adds, then the bare name the deployment contract mandates. The bare name is
-	// recovered from the primary key rather than from a second table, so this cannot
-	// drift out of step with the tags.
+	// recovered from the primary key rather than from a second table, so this cannot drift
+	// out of step with the tags.
 	bare := bareEnvNameFrom(parseErr.KeyName)
 	if bare == "" {
 		return err
@@ -1841,19 +1114,9 @@ func explainEnvProcessError(err error) error {
 // A nested primary key is "BLNK_" + every enclosing struct field name + "_" + the tag
 // literal:
 //
-//	BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS      accumulated "BLNK_RELAY",     tag RELAY_MAX_RETRY_ATTEMPTS
-//	BLNK_KAFKA_KAFKA_MIN_PARTITIONS          accumulated "BLNK_KAFKA",     tag KAFKA_MIN_PARTITIONS
-//	BLNK_KAFKA_TLS_KAFKA_TLS_ENABLED         accumulated "BLNK_KAFKA_TLS", tag KAFKA_TLS_ENABLED
-//
-// Every struct this feature adds is NAMED AFTER the prefix its tags already carry, and
-// that is what makes the literal recoverable rather than guessed: the accumulated segment
-// is repeated as the head of the tag, so the split point is the position where the
-// remainder begins with the segment that precedes it. The loop below walks the underscore
-// boundaries and returns at the first such position, which handles a struct nested one or
-// two levels deep without a table to keep in step with the tags.
-//
 // Anything that does not match that shape returns the empty string, so a field outside
-// these structs is left to envconfig's own wording rather than being described by a guess.
+// these structs is left to envconfig's own wording rather than being described by a
+// guess.
 //
 // Parameters:
 //   - key string: the primary key envconfig reported.
@@ -1887,38 +1150,14 @@ func bareEnvNameFrom(key string) string {
 // applyPrefixedEnvAliases overlays the BLNK_-prefixed alias of every Kafka and relay
 // environment variable onto an already-processed Configuration.
 //
-// # Why this function has to exist
-//
 // envconfig derives a field's primary key by accumulating the prefix through every
 // enclosing struct and consults the raw tag literal only as an alternate key. For
 // Configuration.Kafka.Brokers, tagged KAFKA_BROKERS, the primary key is therefore
-// BLNK_KAFKA_KAFKA_BROKERS and the alternate is KAFKA_BROKERS. BLNK_KAFKA_BROKERS —
-// the name a reader of this file would naturally write, because every other setting
-// here is spelled that way — matches NEITHER, so it used to be read by nothing at
-// all. A deployment that set it got default behaviour: no brokers, the no-op
-// publisher, and no error anywhere to say why events were not being published.
-//
-// Rather than change the tags (which would break the mandated bare names) or flatten
-// the struct (which would break the blnk.json shape), the aliases are applied here,
-// explicitly and by name. Explicit beats reflective for a table this small: the set
-// of variables is fixed by the deployment contract, and a reader can check the list
-// against the two structs by eye.
-//
-// # Precedence
-//
-// The prefixed alias WINS over the bare name when both are set. That is the same
-// precedence envconfig itself gives the top-level WebhookDeprecationSunsetDate,
-// where the accumulated BLNK_ primary beats the bare alternate, so the behaviour is
-// uniform across every variable this feature adds rather than depending on whether a
-// given field happens to sit inside a nested struct.
-//
-// A malformed integer or boolean alias is an ERROR, not a silently ignored value:
-// BLNK_RELAY_MAX_RETRY_ATTEMPTS=five must not resolve to the default 5 and leave an
-// operator believing they had configured something.
+// BLNK_KAFKA_KAFKA_BROKERS and the alternate is KAFKA_BROKERS.
 //
 // Returns:
-//   - error: when a prefixed alias holds a value that cannot be parsed as the
-//     field's type.
+//   - error: when a prefixed alias holds a value that cannot be parsed as the field's
+//     type.
 func applyPrefixedEnvAliases(cnf *Configuration) error {
 	stringAliases := map[string]*string{
 		"KAFKA_TOPIC_PREFIX":              &cnf.Kafka.TopicPrefix,
@@ -2016,20 +1255,20 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 	cnf.trimWhitespace()
 	cnf.setupRateLimiting()
 
-	// AFTER trimWhitespace, so a key of nothing but spaces is treated as absent rather than
-	// accepted as a credential, and BEFORE the secure-mode warning below, so a production
-	// deployment that would authenticate to its search index with a publicly known key is
-	// refused rather than warned about among other warnings.
+	// AFTER trimWhitespace, so a key of nothing but spaces is treated as absent rather
+	// than accepted as a credential, and BEFORE the secure-mode warning below, so a
+	// production deployment that would authenticate to its search index with a publicly
+	// known key is refused rather than warned about among other warnings.
 	if err := cnf.resolveSearchCredential(); err != nil {
 		return err
 	}
 
-	// IMMEDIATELY AFTER, and for the same reason: it is the other check whose failure would
-	// leave a secret readable. resolveSearchCredential refuses a publicly known search key;
-	// this refuses a forwarded-HTTPS declaration that would put a one-time SASL password on a
-	// channel established by a header any caller can send. Both are ahead of the secure-mode
-	// warning below so a production deployment is refused rather than warned about among
-	// other warnings.
+	// IMMEDIATELY AFTER, and for the same reason: it is the other check whose failure
+	// would leave a secret readable. resolveSearchCredential refuses a publicly known
+	// search key; this refuses a forwarded-HTTPS declaration that would put a one-time
+	// SASL password on a channel established by a header any caller can send. Both are
+	// ahead of the secure-mode warning below so a production deployment is refused rather
+	// than warned about among other warnings.
 	if err := cnf.validateForwardedProtoTrust(); err != nil {
 		return err
 	}
@@ -2077,61 +1316,34 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 // ReservedSubscriberPrincipalNamespace is the principal prefix Blnk reserves for the
 // subscriber identities it mints.
 //
-// # It is a PINNED COPY, and it must equal model.SubscriberPrincipalNamespace
-//
 // This package cannot import the model package: model already depends on config, and an
-// import here would close the cycle. So the value is restated, and a test in each package
-// asserts the two are equal — which is the only thing that keeps them from drifting. If you
-// change one, change the other; the test will tell you if you forget.
-//
-// It is exported so that test, and any operator tooling validating a deployment, can read the
-// same value the check below applies.
+// import here would close the cycle. So the value is restated, and a test in each
+// package asserts the two are equal — which is the only thing that keeps them from
+// drifting.
 const ReservedSubscriberPrincipalNamespace = "blnk-sub-"
 
-// validateKafkaPrincipalSeparation refuses a Kafka identity configuration in which Blnk's own
-// principals could be mistaken for — or could overwrite — a subscriber's.
+// validateKafkaPrincipalSeparation refuses a Kafka identity configuration in which
+// Blnk's own principals could be mistaken for — or could overwrite — a subscriber's.
 //
-// # The escalation this closes
-//
-// Blnk mints a subscriber principal by prefixing the subscriber's identifier with the reserved
-// namespace, and issuing credentials for it performs a SCRAM UPSERT: an existing credential for
-// that principal is REPLACED with a freshly generated password, which is then returned to the
-// caller in the response body.
-//
-// Nothing previously stopped the administrative or producer username from living inside that
-// same reserved namespace. A deployment whose KAFKA_SASL_ADMIN_USER was, say,
-// "blnk-sub-admin" could therefore be made to rotate and hand out its own Kafka superuser
-// credential: register a subscriber whose identifier derives that exact principal, call the
-// credential endpoint, and the response contains a working administrative password. The same
-// applies to the producer principal, which holds Write on every Blnk-owned topic.
+// Blnk mints a subscriber principal by prefixing the subscriber's identifier with the
+// reserved namespace, and issuing credentials for it performs a SCRAM UPSERT: an
+// existing credential for that principal is REPLACED with a freshly generated password,
+// which is then returned to the caller in the response body.
 //
 // Two rules close it, and both are checked here:
 //
-//  1. NEITHER Blnk principal may sit inside the reserved subscriber namespace. The namespace is
-//     documented as Blnk's own and is derived, not chosen, so an identity inside it is
-//     reachable by an ordinary authorized API call.
-//  2. The administrative and producer principals must be DISTINCT from each other. They exist
-//     precisely to separate publishing from administration — one holds Write on the topics, the
-//     other can mint credentials and grant ACLs — and collapsing them onto one identity gives
-//     every process that only publishes the ability to provision. It also makes the excess
-//     privilege invisible, because each pair looks correctly configured on its own.
-//
-// # Severity follows whether Kafka is in use, matching validateKafkaSASLCredentials
-//
-// With brokers configured this is FATAL: the credential endpoint is reachable and the
-// escalation is live, so refusing to start is the only signal that cannot be overlooked. With
-// no brokers configured nothing reads these identities and no credential can be issued, so the
-// defect is a warning and start-up continues — the same posture the half-configured-pair check
-// takes, for the same reason.
-//
-// Comparison is case-SENSITIVE and on the trimmed value, because Kafka principals are
-// case-sensitive: "blnk-sub-x" and "BLNK-SUB-X" are two different identities at the broker, and
-// folding case here would refuse a configuration that is in fact safe while telling the
-// operator something untrue about why.
+//  1. NEITHER Blnk principal may sit inside the reserved subscriber namespace. The
+//     namespace is documented as Blnk's own and is derived, not chosen, so an identity
+//     inside it is reachable by an ordinary authorized API call.
+//  2. The administrative and producer principals must be DISTINCT from each other. They
+//     exist precisely to separate publishing from administration — one holds Write on
+//     the topics, the other can mint credentials and grant ACLs — and collapsing them
+//     onto one identity gives every process that only publishes the ability to
+//     provision.
 //
 // Returns:
-//   - error: non-nil only when a rule is broken on a deployment that has brokers configured.
-//     No message contains a secret — only usernames, which are not secrets.
+//   - error: non-nil only when a rule is broken on a deployment that has brokers
+//     configured. No message contains a secret — only usernames, which are not secrets.
 func (cnf *Configuration) validateKafkaPrincipalSeparation() error {
 	admin := strings.TrimSpace(cnf.Kafka.SASLAdminUser)
 	producer := strings.TrimSpace(cnf.Kafka.SASLUser)
@@ -2190,8 +1402,7 @@ func (cnf *Configuration) validateKafkaPrincipalSeparation() error {
 // There is exactly ONE input: WebhookDeprecationSunsetDate. The window is
 // WebhookDualDeliveryWindowDays long by definition, so the start is arithmetic rather
 // than configuration, and "exactly 30 days" cannot be got wrong because there is no
-// second value to disagree with. Requirement R-10 names the sunset and only the
-// sunset, which is also why the other end carries no environment variable.
+// second value to disagree with.
 //
 // The rules, in the order they are applied:
 //
@@ -2199,32 +1410,22 @@ func (cnf *Configuration) validateKafkaPrincipalSeparation() error {
 //     brokers. The date drives two security-relevant behaviours — whether the legacy
 //     HTTP transport still runs, and whether the deprecated webhook management routes
 //     still answer — and an operator who states a retirement instant and mis-types it
-//     must not have it silently reinterpreted. Refusing to start is the only signal
-//     that cannot be overlooked, and it happens before any traffic is served.
+//     must not have it silently reinterpreted.
 //
-//  2. A BLANK SUNSET WITH BROKERS CONFIGURED IS ALSO FATAL, and this is the rule the
-//     review's C-1 finding exists to install. It was previously a warning whose text
-//     promised that "legacy HTTP webhook delivery will run alongside Kafka
-//     INDEFINITELY" — and the runtime does the OPPOSITE. blnk.WebhookSunsetPassed
-//     treats "publishing configured, window unusable" as fail-closed: the sunset has
-//     ALREADY passed, so dual delivery stops and the deprecated webhook routes answer
-//     410 Gone. One of the two had to give, and the runtime's reading is the safe one
-//     — carrying on with a deprecated, less protected transport on the strength of an
-//     unset variable is worse than retiring it loudly. So configuration now REFUSES
-//     the combination outright, which is what event_sunset.go's own documentation
-//     already claimed it did, and the fail-closed arm becomes the second line of
-//     defence it is described as rather than a routine outcome.
+//  2. A BLANK SUNSET WITH BROKERS CONFIGURED IS ALSO FATAL. Configuration and the
+//     runtime once read a blank value differently; one of the two had to give, and the
+//     runtime's reading is the safe one — carrying on with a deprecated, less protected
+//     transport on the strength of an unset variable is worse than retiring it loudly.
+//     So configuration now REFUSES the combination outright, which is what
+//     event_sunset.go's own documentation already claimed it did, and the fail-closed
+//     arm becomes the second line of defence it is described as rather than a routine
+//     outcome.
 //
 //     Refusing costs nothing an operator cannot pay before serving traffic: the value
 //     is one RFC3339 instant, and the error below names the variable, the window
 //     length and how to compute it. What it buys is that "dual delivery is running"
 //     and "the webhook routes still answer" can no longer disagree with the
 //     configuration that described them.
-//
-//     This does NOT weaken AAP §0.7.2's graceful degradation, which is about
-//     KAFKA_BROKERS being UNSET: with no brokers the publisher is the no-op, there is
-//     no migration to describe, and case 3 below leaves the window empty without
-//     complaint.
 //
 //  3. A blank sunset with NO brokers is silently accepted and clears the window.
 //     Nothing has been mis-stated: there is no transport to migrate to, so there is no
@@ -2281,15 +1482,15 @@ func (cnf *Configuration) resolveWebhookDeprecationWindow() error {
 	return nil
 }
 
-// warnOnInsecureKafkaTransport reports a Kafka client that is configured to give up
-// a protection it would otherwise have.
+// warnOnInsecureKafkaTransport reports a Kafka client that is configured to give up a
+// protection it would otherwise have.
 //
 // Neither case is an error here, because both are reachable on purpose: the local
-// single-broker stack listens on SASL_PLAINTEXT, and a developer pointing at a
-// broker with a self-signed certificate may legitimately skip verification for an
-// afternoon. Both are refused at the point a client is actually built unless the
-// insecure flag is set, so this function's job is only to make the setting's
-// presence impossible to miss in a log an operator reads.
+// single-broker stack listens on SASL_PLAINTEXT, and a developer pointing at a broker
+// with a self-signed certificate may legitimately skip verification for an afternoon.
+// Both are refused at the point a client is actually built unless the insecure flag is
+// set, so this function's job is only to make the setting's presence impossible to miss
+// in a log an operator reads.
 func (cnf *Configuration) warnOnInsecureKafkaTransport() {
 	if len(cnf.Kafka.Brokers) == 0 {
 		return
@@ -2313,17 +1514,8 @@ func (cnf *Configuration) warnOnInsecureKafkaTransport() {
 	}
 }
 
-// warnOnUnusableSubscriberBrokers reports at STARTUP that credential issuance will refuse.
-//
-// KAFKA_SUBSCRIBER_BROKERS is REQUIRED for issuance and has no fallback — see
-// SubscriberFacingBrokers, which owns that policy. Only an operator knows the externally
-// advertised addresses a subscriber can dial, so the absence is not something Blnk can resolve;
-// what it must not be is a surprise discovered on the first credential request.
-//
-// It is a WARNING rather than a load failure because publishing is unaffected: the relay, the
-// dead-letter surface and every other endpoint work without it, and refusing to start would
-// take a working ledger offline over an endpoint the deployment may not use yet. It says
-// nothing when no broker is configured, because then there is no Kafka and no issuance.
+// warnOnUnusableSubscriberBrokers reports at STARTUP that credential issuance will
+// refuse.
 func (cnf *Configuration) warnOnUnusableSubscriberBrokers() {
 	if len(cnf.Kafka.Brokers) == 0 {
 		return
@@ -2341,17 +1533,9 @@ func (cnf *Configuration) warnOnUnusableSubscriberBrokers() {
 	)
 }
 
-// validateKafkaSASLCredentials refuses a half-configured administrative SASL
-// credential at configuration load, so the deployment contract fails where it is
-// described rather than at the first broker dial.
-//
-// The severity depends on whether Kafka is in use. With brokers configured the pair is
-// load-bearing and a half-configured one is fatal: an admin username with no secret
-// cannot complete a SCRAM exchange, and a secret with no username would connect
-// anonymously while the operator believed it was authenticating. With no brokers
-// configured nothing reads the pair, so the defect is reported as a warning and
-// start-up continues — a deployment that does not publish events must not be blocked
-// by a credential it never uses.
+// validateKafkaSASLCredentials refuses a half-configured administrative SASL credential
+// at configuration load, so the deployment contract fails where it is described rather
+// than at the first broker dial.
 //
 // Returns:
 //   - error: non-nil only for a half-configured pair on a deployment that has brokers
@@ -2375,25 +1559,15 @@ func (cnf *Configuration) validateKafkaSASLCredentials() error {
 }
 
 // validateRelayRetryWindow advises on a relay retry window that cannot behave as
-// intended. Every finding is a warning: relay tuning is an operational knob, and a
-// bad value must degrade event delivery rather than prevent the server from
-// starting. It runs after setDefaultValues, so it inspects effective values with
-// defaults already applied.
-//
-// IT NO LONGER REPORTS NEGATIVES OR AN OVER-CEILING BUDGET. setRelayDefaults has already
-// replaced each of those with the value that will actually be used, and named it, so a
-// second report here could only describe a state that no longer exists — which is what it
-// used to do: it warned that "retries will not be delayed" about a negative backoff whose
-// consumers then substituted a positive delay of their own, and it clamped an over-ceiling
-// budget setRelayDefaults had already clamped, producing two warnings for one value. What is
-// left is the one inconsistency normalisation cannot resolve, because both values are
-// individually valid.
+// intended. Every finding is a warning: relay tuning is an operational knob, and a bad
+// value must degrade event delivery rather than prevent the server from starting. It
+// runs after setDefaultValues, so it inspects effective values with defaults already
+// applied.
 func (cnf *Configuration) validateRelayRetryWindow() {
 	// An INVERTED window: a base delay above the cap. Both values are legitimate on their
-	// own, so neither can be corrected without discarding something the operator asked for.
-	// The relay applies the cap last, so every retry waits the capped maximum — the slower
-	// schedule, bounded as configured. Reported because the shape of the schedule is not what
-	// the two numbers read as.
+	// own, so neither can be corrected without discarding something the operator asked
+	// for. The relay applies the cap last, so every retry waits the capped maximum — the
+	// slower schedule, bounded as configured.
 	if cnf.Relay.RetryBaseBackoffMS > cnf.Relay.RetryMaxBackoffMS {
 		logrus.WithFields(logrus.Fields{
 			"retry_base_backoff_ms": cnf.Relay.RetryBaseBackoffMS,
@@ -2441,13 +1615,7 @@ func (cnf *Configuration) setDefaultValues() {
 		cnf.Server.UploadURLTimeoutSec = DEFAULT_UPLOAD_URL_TIMEOUT_SEC
 	}
 
-	// THE SEARCH CREDENTIAL IS DELIBERATELY NOT DEFAULTED HERE. SEC-07.
-	//
-	// It used to be, unconditionally, to the literal DEFAULT_TYPESENSE_KEY — and that
-	// substitution is what made the misconfiguration invisible. Once it had run, TypeSenseKey
-	// was non-empty, so no later check could tell a value the operator supplied from one this
-	// code invented. resolveSearchCredential makes the decision instead, from
-	// validateAndAddDefaults, where it can still see the difference and can refuse.
+	// THE SEARCH CREDENTIAL IS DELIBERATELY NOT DEFAULTED HERE.
 	//
 	// Set module defaults
 	cnf.setLogLevelDefaults()
@@ -2579,37 +1747,25 @@ func (cnf *Configuration) setQueueDefaults() {
 // setLogLevelDefaults resolves LogLevel onto the standard logger.
 //
 // It runs FIRST among the module default setters, so the level an operator asked for is
-// already in force for the warnings the other setters emit. Resolving it last would mean
-// the very lines that report a defaulted configuration were filtered by the previous
-// level.
+// already in force for the warnings the other setters emit. Resolving it last would
+// mean the very lines that report a defaulted configuration were filtered by the
+// previous level.
 //
-// # Three inputs, three outcomes
+//   - A PARSEABLE value is applied and normalised, so the field afterwards reads
+//     exactly what the logger is set to. logrus.ParseLevel accepts trace, debug, info,
+//     warn, warning, error, fatal and panic, case-insensitively, and it is the only
+//     parser used here: a second spelling of the level vocabulary would be a second
+//     thing to keep in step with the library.
 //
-//   - A PARSEABLE value is applied and normalised, so the field afterwards reads exactly
-//     what the logger is set to. logrus.ParseLevel accepts trace, debug, info, warn,
-//     warning, error, fatal and panic, case-insensitively, and it is the only parser used
-//     here: a second spelling of the level vocabulary would be a second thing to keep in
-//     step with the library.
+//   - An UNPARSEABLE value warns, names the accepted values, and leaves the logger as
+//     it is. The field is then set to the level actually in force rather than to the
+//     rejected text, because a configuration that reports a level the process is not
+//     running at is worse than one that reports the truth.
 //
-//   - An UNPARSEABLE value warns, names the accepted values, and leaves the logger as it
-//     is. The field is then set to the level actually in force rather than to the rejected
-//     text, because a configuration that reports a level the process is not running at is
-//     worse than one that reports the truth. Refusing to start would turn a typo in a
-//     diagnostic control into an outage; see the LogLevel field's documentation for why
-//     that is the opposite trade-off from the sunset date's.
-//
-//   - BLANK leaves the logger UNTOUCHED and fills the field with the default. Not calling
-//     SetLevel is the whole point rather than an optimisation: this function runs from
-//     validateAndAddDefaults, which MockConfig also calls, and several tests pin the level
-//     with logrus.SetLevel in order to capture a debug-only line. An unconditional
-//     SetLevel here would silently undo those pins from inside the configuration layer.
-//     logrus already defaults to info, so filling the field is a statement of fact.
-//
-// minimumVisibleLogLevel is MINIMUM_LOG_LEVEL as a logrus level.
-//
-// It is parsed from the constant rather than written as logrus.WarnLevel so that the
-// name an operator sets and the level the code enforces cannot drift apart. Parsing a
-// compile-time constant cannot fail; if it somehow did, warn is the answer anyway.
+//   - BLANK leaves the logger UNTOUCHED and fills the field with the default. Not
+//     calling SetLevel is the whole point rather than an optimisation: this function
+//     runs from validateAndAddDefaults, which MockConfig also calls, and several tests
+//     pin the level with logrus.SetLevel in order to capture a debug-only line.
 func minimumVisibleLogLevel() logrus.Level {
 	level, err := logrus.ParseLevel(MINIMUM_LOG_LEVEL)
 	if err != nil {
@@ -2621,13 +1777,6 @@ func minimumVisibleLogLevel() logrus.Level {
 
 // clampLogLevel raises a requested level to the floor that keeps mandatory records
 // visible, reporting whether it had to.
-//
-// logrus orders its levels from panic (0) to trace (6) and emits an entry only when the
-// logger's level is numerically at least the entry's, so "quieter" means a SMALLER
-// value and the floor is a minimum rather than a maximum. Getting that comparison
-// backwards would clamp away trace and debug — the exact diagnostics the LogLevel field
-// was added to make reachable — so the direction is asserted by
-// TestClampLogLevel_RaisesOnlyTheLevelsThatSuppressMandatoryRecords.
 //
 // Parameters:
 //   - requested: the level the deployment asked for.
@@ -2664,16 +1813,16 @@ func (cnf *Configuration) setLogLevelDefaults() {
 		return
 	}
 
-	// A level quieter than the floor is honoured as far as the floor and no further.
-	// The warning is emitted AFTER the level is applied, which is what guarantees it is
-	// itself visible: it is a warning, and the level it is announcing is the one that
-	// makes warnings emit. Announcing before applying could discard the announcement.
+	// A level quieter than the floor is honoured as far as the floor and no further. The
+	// warning is emitted AFTER the level is applied, which is what guarantees it is itself
+	// visible: it is a warning, and the level it is announcing is the one that makes
+	// warnings emit. Announcing before applying could discard the announcement.
 	effective, clamped := clampLogLevel(level)
 
-	// The field records the level the process is RUNNING at, not the one it was asked
-	// for. This follows the same rule as the unparseable branch above: a configuration
-	// that reports a level the logger is not set to is worse than one that reports the
-	// truth, and /metrics and support bundles read this field.
+	// The field records the level the process is RUNNING at, not the one it was asked for.
+	// This follows the same rule as the unparseable branch above: a configuration that
+	// reports a level the logger is not set to is worse than one that reports the truth,
+	// and /metrics and support bundles read this field.
 	cnf.LogLevel = effective.String()
 	logrus.SetLevel(effective)
 
@@ -2715,23 +1864,17 @@ func (cnf *Configuration) setDatabaseDefaults() {
 	}
 }
 
-// MaxMetricsSubscriberBudget is the supported ceiling on how many subscribers one metrics
-// collection tick may measure.
-//
-// The ceiling is real rather than cautious: each subscriber-topic pair is an exported gauge
-// series, and each subscriber costs two broker round trips per authorised topic, so an
-// unbounded budget makes a single tick unbounded in both duration and cardinality. A
-// configured value above it is clamped and logged rather than rejected, because a
-// misconfigured metrics budget must never stop the ledger from serving.
+// MaxMetricsSubscriberBudget is the supported ceiling on how many subscribers one
+// metrics collection tick may measure.
 const MaxMetricsSubscriberBudget = 5000
 
 // setKafkaDefaults fills only the unset Kafka topic-geometry values. Brokers,
-// SASLAdminUser and SASLAdminSecret are never defaulted: an empty broker list
-// selects the no-op event publisher, and the two SASL fields are credentials.
+// SASLAdminUser and SASLAdminSecret are never defaulted: an empty broker list selects
+// the no-op event publisher, and the two SASL fields are credentials.
 //
-// Because every assignment is guarded on the zero value, an explicitly configured
-// value always survives — in particular ReplicationFactor: 1, which a single-broker
-// cluster requires and which must not be overwritten by the production default of 3.
+// Because every assignment is guarded on the zero value, an explicitly configured value
+// always survives — in particular ReplicationFactor: 1, which a single-broker cluster
+// requires and which must not be overwritten by the production default of 3.
 func (cnf *Configuration) setKafkaDefaults() {
 	if cnf.Kafka.TopicPrefix == "" {
 		cnf.Kafka.TopicPrefix = defaultKafka.TopicPrefix
@@ -2743,13 +1886,6 @@ func (cnf *Configuration) setKafkaDefaults() {
 		cnf.Kafka.ReplicationFactor = defaultKafka.ReplicationFactor
 	}
 	// The lag-sweep budget: defaulted when unset or nonsensical, and CLAMPED above.
-	//
-	// Clamped rather than refused, matching how every other bad value in this file is
-	// handled — a misconfigured metrics budget must never stop the ledger from serving — and
-	// the correction is logged loudly so it cannot be mistaken for the value taking effect.
-	// The ceiling is real rather than cautious: each subscriber-topic pair is an exported
-	// gauge series and each subscriber costs two broker round trips per topic, so a budget of
-	// a million would make one collection tick unbounded in both time and cardinality.
 	if cnf.Kafka.MetricsSubscriberBudget <= 0 {
 		cnf.Kafka.MetricsSubscriberBudget = defaultKafka.MetricsSubscriberBudget
 	}
@@ -2769,17 +1905,18 @@ func (cnf *Configuration) setKafkaDefaults() {
 	// NOT DEFAULTED TO Brokers, deliberately. Falling back would hand every subscriber
 	// Blnk's internal broker addresses in a 200 response, which is the failure
 	// SubscriberBrokers exists to prevent; issuance refuses instead. Normalised the same
-	// way so that KAFKA_SUBSCRIBER_BROKERS="" and "," — both of which envconfig parses into
-	// a non-empty slice carrying nothing usable — read as "not configured" rather than as a
-	// list of blank endpoints.
+	// way so that KAFKA_SUBSCRIBER_BROKERS="" and "," — both of which envconfig parses
+	// into a non-empty slice carrying nothing usable — read as "not configured" rather
+	// than as a list of blank endpoints.
 	cnf.Kafka.SubscriberBrokers = normalizeBrokers(cnf.Kafka.SubscriberBrokers)
 
-	// THE ENFORCEMENT MODE FAILS CLOSED, and normalising it here rather than at each reader
-	// is what makes that single-valued. An unrecognised value — a typo, a mode borrowed from
-	// another product, a value a future release adds and this build does not understand — is
-	// forced to "none", because the only safe reading of "I do not know what enforcement this
-	// names" is "nothing is enforcing". Silence would let a misspelled mode read as
-	// enforcement by whichever reader happened to compare case-sensitively.
+	// THE ENFORCEMENT MODE FAILS CLOSED, and normalising it here rather than at each
+	// reader is what makes that single-valued. An unrecognised value — a typo, a mode
+	// borrowed from another product, a value a future release adds and this build does not
+	// understand — is forced to "none", because the only safe reading of "I do not know
+	// what enforcement this names" is "nothing is enforcing". Silence would let a
+	// misspelled mode read as enforcement by whichever reader happened to compare
+	// case-sensitively.
 	cnf.Kafka.KeyScopeEnforcement = strings.ToLower(strings.TrimSpace(cnf.Kafka.KeyScopeEnforcement))
 	switch cnf.Kafka.KeyScopeEnforcement {
 	case "":
@@ -2847,12 +1984,12 @@ func (cnf *Configuration) setKafkaDefaults() {
 		}
 	}
 
-	// Credentials are trimmed here rather than in trimWhitespace because a stray
-	// newline from an environment file turns a correct SASL username into one the
-	// broker has never heard of, and the resulting authentication failure reads
-	// exactly like a wrong password. trimWhitespace is a fixed list of long-standing
-	// fields; extending it would change behaviour for those, so the Kafka fields are
-	// normalised in their own domain setter instead.
+	// Credentials are trimmed here rather than in trimWhitespace because a stray newline
+	// from an environment file turns a correct SASL username into one the broker has never
+	// heard of, and the resulting authentication failure reads exactly like a wrong
+	// password. trimWhitespace is a fixed list of long-standing fields; extending it would
+	// change behaviour for those, so the Kafka fields are normalised in their own domain
+	// setter instead.
 	cnf.Kafka.SASLUser = strings.TrimSpace(cnf.Kafka.SASLUser)
 	cnf.Kafka.SASLSecret = strings.TrimSpace(cnf.Kafka.SASLSecret)
 	cnf.Kafka.SASLAdminUser = strings.TrimSpace(cnf.Kafka.SASLAdminUser)
@@ -2864,14 +2001,6 @@ func (cnf *Configuration) setKafkaDefaults() {
 
 	// A HALF-CONFIGURED pair is reported HERE, at load, and not only when a transport is
 	// eventually built.
-	//
-	// The construction paths already refuse it — kafkaTransportCredentials validates before
-	// it builds anything, so nothing half-authenticated can be dialled — but that failure
-	// arrives whenever the publisher or the admin client is first needed, which for a
-	// deployment with no Kafka work in flight can be long after start-up and a long way from
-	// the variable that caused it. Naming the missing variable while the configuration is
-	// being loaded is what turns "authentication failed" hours later into an actionable line
-	// in the boot log.
 	//
 	// It is a WARNING and not a fatal error, deliberately. validateRequiredFields requires
 	// only the two DSNs, and making a Kafka credential fatal would stop a server that does
@@ -2897,27 +2026,9 @@ func (cnf *Configuration) setKafkaDefaults() {
 // warnOnUnusableKafkaTopicGeometry reports a topic geometry that will be silently
 // corrected at the point of use.
 //
-// # Why a negative value needs its own line
-//
-// Zero means "unset" and is replaced by the default just above, which is correct and needs
-// no comment. A NEGATIVE value is different: it cannot have been intended, and the topic
-// assurance path raises it to the required six partitions anyway. Without this warning the
-// operator's stated number and the provisioned number differ with nothing anywhere saying
-// so — and the same value would then be reported back by a status endpoint as though it had
-// been honoured.
-//
-// A value below the six-partition floor but positive is warned about where it is applied,
-// because that is where the floor lives and where the correction is made; only the negative
-// case is invisible at that point, since a negative count reads as a paste error rather
-// than as a layout choice.
-//
-// A negative replication factor is warned about for the same reason and is more dangerous:
-// Kafka reads a negative replica count in a create request as "use the broker default", so
-// a topic would be created successfully with a durability the operator never chose.
-//
-// It is a WARNING and not a fatal error, matching every other Kafka diagnostic here:
-// validateRequiredFields requires only the two DSNs, and a deployment that does not use
-// Kafka must not be stopped from booting by a stray variable.
+// Zero means "unset" and is replaced by the default just above, which is correct and
+// needs no comment. A NEGATIVE value is different: it cannot have been intended, and
+// the topic assurance path raises it to the required six partitions anyway.
 func (cnf *Configuration) warnOnUnusableKafkaTopicGeometry() {
 	if cnf.Kafka.MinPartitions < 0 {
 		logrus.WithFields(logrus.Fields{
@@ -2958,8 +2069,8 @@ const MaxKafkaTopicNameLength = 249
 
 // maxComposedTopicSuffixLength is the length of the LONGEST suffix event_topics.go
 // appends to the prefix — ".transactions" plus the ".dlt" dead-letter sibling, 17
-// characters. Reserving it here is what makes the prefix budget below correct for
-// every name in the catalogue rather than only for the shortest one.
+// characters. Reserving it here is what makes the prefix budget below correct for every
+// name in the catalogue rather than only for the shortest one.
 //
 // Keep it in step with event_topics.go: a longer category name added there without a
 // matching change here would let a prefix through that composes an over-long topic.
@@ -2977,47 +2088,31 @@ const MaxKafkaTopicPrefixLength = MaxKafkaTopicNameLength - maxComposedTopicSuff
 
 // MaxHistoricalTopicPrefixes bounds KAFKA_HISTORICAL_TOPIC_PREFIXES.
 //
-// The bound is a resource bound, not a taste one. Each declared prefix has a Kafka writer
-// pre-created for every topic in its inventory — two per event category — on every process
-// start, and those writers exist for the sole purpose of draining rows captured before a
-// rename. Four is generous for what the list is for: a deployment that has renamed its
-// topic namespace four times without ever draining the previous generation has an
-// operational problem the allowlist cannot fix, and unbounded growth would let one stale
-// environment variable multiply the writer inventory indefinitely.
+// The bound is a resource bound, not a taste one. Each declared prefix has a Kafka
+// writer pre-created for every topic in its inventory — two per event category — on
+// every process start, and those writers exist for the sole purpose of draining rows
+// captured before a rename.
 const MaxHistoricalTopicPrefixes = 4
 
 // validateKafkaTopicPrefix REFUSES a topic prefix that cannot compose a legal Kafka
 // topic name.
 //
-// # Why this is fatal rather than a warning
-//
-// It used to warn and then use the value anyway. That is the worst of the three
-// available behaviours, and not a conservative middle ground:
+// That is the worst of the three available behaviours, and not a conservative middle
+// ground:
 //
 //   - EVENTS ARE LOST-IN-PLACE, not rejected. Producers keep capturing outbox rows
 //     whose `topic` column names a topic the broker will never create, so every one of
 //     them exhausts its retry budget and dead-letters — onto a dead-letter topic whose
 //     name is equally illegal, so the dead-letter write fails too and the row sits in
-//     `failed` forever. A ledger accepts mutations and silently stops notifying anyone.
-//   - THE PREFIX REACHES A LOG LINE UNSANITISED. The warning interpolated the configured
-//     value straight into a structured log message, so a prefix carrying newlines or
-//     ANSI control sequences could forge log records — the classic log-injection sink,
-//     reachable by anyone who can set an environment variable on the process.
+//     `failed` forever.
+//   - THE PREFIX REACHES A LOG LINE UNSANITISED. The warning interpolated the
+//     configured value straight into a structured log message, so a prefix carrying
+//     newlines or ANSI control sequences could forge log records — the classic
+//     log-injection sink, reachable by anyone who can set an environment variable on
+//     the process.
 //   - The broker's own refusal, which the warning deferred to, arrives at first Kafka
 //     use. For a deployment with no event traffic at boot that can be hours later and a
 //     long way from the variable that caused it.
-//
-// Refusing at load is therefore strictly better on every axis: nothing is captured that
-// cannot be delivered, no attacker-influenced value is logged, and the failure names the
-// variable at the moment it is read.
-//
-// # What is corrected and what is refused
-//
-// Leading and trailing whitespace and separators are stripped, and a blank prefix falls
-// back to the default, so the realistic accidents — a trailing newline in an environment
-// file, a lone dot — are accepted and normalised. That normalisation is applied to the
-// stored value here, so what this function validates is exactly what event_topics.go will
-// compose from.
 //
 // An INTERIOR character outside Kafka's set, or a prefix too long to leave room for the
 // longest composed suffix, is refused. The message names the offending characters as Go
@@ -3045,18 +2140,15 @@ func (cnf *Configuration) validateKafkaTopicPrefix() error {
 	return cnf.validateKafkaHistoricalTopicPrefixes()
 }
 
-// validateKafkaTopicPrefixValue applies the length and character rules a topic prefix must
-// satisfy, whatever variable it arrived in.
+// validateKafkaTopicPrefixValue applies the length and character rules a topic prefix
+// must satisfy, whatever variable it arrived in.
 //
-// It exists because KAFKA_TOPIC_PREFIX is no longer the only prefix a deployment declares:
-// KAFKA_HISTORICAL_TOPIC_PREFIXES names the namespaces it used to own and must still be
-// able to publish to, and a historical prefix composes topic names through exactly the same
-// composer. Validating the two with one function is what stops a value being accepted in
-// one variable and refused in the other.
+// Validating the two with one function is what stops a value being accepted in one
+// variable and refused in the other.
 //
 // Parameters:
-//   - variable string: the environment variable name to quote in any error, so the message
-//     names the value an operator has to change.
+//   - variable string: the environment variable name to quote in any error, so the
+//     message names the value an operator has to change.
 //   - prefix string: the already-trimmed, non-empty prefix to check.
 //
 // Returns:
@@ -3105,27 +2197,14 @@ func validateKafkaTopicPrefixValue(variable, prefix string) error {
 // validateKafkaHistoricalTopicPrefixes normalises and checks the historical-prefix
 // allowlist, and rewrites the field so every reader sees the normalised list.
 //
-// # Why it is validated rather than just trimmed
-//
-// Every prefix in this list is treated as OWNED: writers are pre-created for its whole
-// topic inventory, the publisher's ownership test admits it, and topic assurance keeps its
-// topics present. A malformed entry would therefore be a silent failure of exactly the
-// stranding this list exists to prevent — the operator declares the old namespace, the
-// value is unusable, and the old rows still never drain. Refusing it at load, by name, is
-// what makes the declaration mean something.
-//
-// # What is normalised away rather than refused
-//
-// Blank entries and duplicates, including a repeat of TopicPrefix. Both are ordinary in an
-// allowlist that is meant to be DRAINED: a trailing comma, or the current prefix left in
-// place after a rename completed, describes the same set of owned topics either way. The
-// current prefix is removed rather than kept so that every consumer can treat this list as
-// "the prefixes BESIDES the configured one", which is what makes a topic inventory
-// composed from current-plus-historical free of duplicates.
+// Blank entries and duplicates, including a repeat of TopicPrefix. Both are ordinary in
+// an allowlist that is meant to be DRAINED: a trailing comma, or the current prefix
+// left in place after a rename completed, describes the same set of owned topics either
+// way.
 //
 // Returns:
-//   - error: non-nil when an entry could not compose legal topic names, or when more than
-//     MaxHistoricalTopicPrefixes distinct prefixes are declared.
+//   - error: non-nil when an entry could not compose legal topic names, or when more
+//     than MaxHistoricalTopicPrefixes distinct prefixes are declared.
 func (cnf *Configuration) validateKafkaHistoricalTopicPrefixes() error {
 	if len(cnf.Kafka.HistoricalTopicPrefixes) == 0 {
 		cnf.Kafka.HistoricalTopicPrefixes = nil
@@ -3198,31 +2277,16 @@ var ErrProducerPrincipalRequired = errors.New(
 // ProducerSASL returns the SASL identity the steady-state event publisher must
 // authenticate as, and reports the one misconfiguration that has no safe answer.
 //
-// It exists so that "which credential does the producer use?" is answered in exactly
-// one place. The publisher and the administrative client used to reach into the
-// configuration separately, which is how the producer ended up authenticating as the
-// administrator: nothing in either call site was wrong on its own, and no single
-// place expressed the intent that they should differ.
-//
-// # There is NO fallback to the administrative principal (PRIV-01)
-//
-// This method used to return the administrative pair when no producer pair was set, so
-// that an existing deployment kept publishing across an upgrade. That compatibility
-// path was the vulnerability rather than a mitigation of it: the busiest process in the
-// deployment held cluster-administration authority permanently, a leaked producer
-// credential became a full compromise of the authorization model, and the broker's audit
-// trail could not tell routine publishing from administration. A warning does not change
-// any of that — it only records it — and a warning nobody reads is how a temporary
-// allowance becomes the permanent configuration.
-//
-// So the administrative pair is never returned here. When it is the only pair configured,
-// adminOnly is true and the caller must REFUSE to build a producer transport.
+// So the administrative pair is never returned here. When it is the only pair
+// configured, adminOnly is true and the caller must REFUSE to build a producer
+// transport.
 //
 // Returns:
 //   - user, secret string: the dedicated producer credentials. Both empty means no SASL
 //     at all, which is legitimate on a broker that requires none.
-//   - adminOnly bool: true when an administrative principal is configured and no producer
-//     principal is. The caller must treat this as fatal, not as a credential to use.
+//   - adminOnly bool: true when an administrative principal is configured and no
+//     producer principal is. The caller must treat this as fatal, not as a credential
+//     to use.
 func (cnf *Configuration) ProducerSASL() (user, secret string, adminOnly bool) {
 	if cnf.Kafka.SASLUser != "" || cnf.Kafka.SASLSecret != "" {
 		return cnf.Kafka.SASLUser, cnf.Kafka.SASLSecret, false
@@ -3235,11 +2299,9 @@ func (cnf *Configuration) ProducerSASL() (user, secret string, adminOnly bool) {
 	return "", "", true
 }
 
-// SASLAdminCredentials is THE one reading of the ADMINISTRATIVE SASL/SCRAM
-// credential, and every component that authenticates to a broker as the administrator
-// must resolve it through this method rather than inspecting the two fields itself.
-//
-// # The contract
+// SASLAdminCredentials is THE one reading of the ADMINISTRATIVE SASL/SCRAM credential,
+// and every component that authenticates to a broker as the administrator must resolve
+// it through this method rather than inspecting the two fields itself.
 //
 //	both empty         no SASL. The broker is reached over a PLAINTEXT (or plain TLS)
 //	                   listener. This is a supported deployment, not a degraded one:
@@ -3247,26 +2309,6 @@ func (cnf *Configuration) ProducerSASL() (user, secret string, adminOnly bool) {
 //	both set           SASL/SCRAM-SHA-512 as the named principal.
 //	exactly one set    a misconfiguration. enabled is false so no half-authenticated
 //	                   transport can be built, and ValidateSASLPair reports it by name.
-//
-// # Why this is a method rather than two field reads
-//
-// Before it existed, three components each invented their own reading of the same two
-// values. The publisher enabled SASL on a non-empty username and ignored an empty
-// secret. The admin client enabled it on a non-empty username, rejected a username
-// without a secret, and silently ignored a secret without a username — so a
-// deployment that set only KAFKA_SASL_ADMIN_SECRET connected as an anonymous
-// principal while its operator believed it was authenticating. The provisioning
-// scripts substituted the literal principal "admin" for an empty username, so the same
-// configuration meant "authenticate as admin" to a script and "authenticate as nobody"
-// to the service. One shared reading is what makes those three agree, and
-// scripts/kafka-provision.sh names this method as the contract it mirrors.
-//
-// Both values are trimmed here as well as at load, because a Configuration assembled
-// in a test or by a caller that bypassed validateAndAddDefaults must read the same way
-// as one that went through it: a trailing newline or space from a secret store, a
-// Kubernetes secret or a hand-edited .env would otherwise turn "unset" into a
-// credential made of whitespace, which fails SASL preparation or authenticates as a
-// principal nobody created.
 //
 // Returns:
 //   - user string: the trimmed principal, empty when SASL is not configured.
@@ -3287,24 +2329,10 @@ func (k KafkaConfig) SASLAdminCredentials() (user, secret string, enabled bool) 
 // OwnedTopicPrefixes returns every topic namespace this deployment owns: the configured
 // prefix first, then each historical prefix in declared order.
 //
-// # Why the order matters
-//
 // The configured prefix is where NEW events go, so it leads: a caller that composes a
 // topic inventory from this list builds the live generation's names first, which is the
 // order the provisioning script and the documentation both use, and a caller that is
 // resolving one topic name finds the common case on the first comparison.
-//
-// # What it guarantees
-//
-// Non-empty, distinct, and free of blanks. A configuration that has not been through the
-// validate-and-default path can still hold a blank prefix, and rather than return a list
-// with a hole in it this falls back to the default prefix — the same answer every other
-// prefix reader gives for an unconfigured deployment, and the STRICTEST one available,
-// since an unconfigured caller must not accidentally widen the owned namespace.
-//
-// The returned slice is freshly allocated. The configuration is shared through an
-// atomic.Value and read concurrently, so handing out the backing array would let a caller
-// that appends to its result mutate what every later reader sees.
 //
 // Returns:
 //   - []string: one or more distinct, non-blank prefixes, configured prefix first.
@@ -3333,48 +2361,19 @@ func (k KafkaConfig) OwnedTopicPrefixes() []string {
 	return prefixes
 }
 
-// SubscriberFacingBrokers returns the bootstrap list to HAND TO A SUBSCRIBER, and reports
-// whether an operator has advertised one at all.
+// SubscriberFacingBrokers returns the bootstrap list to HAND TO A SUBSCRIBER, and
+// reports whether an operator has advertised one at all.
 //
-// It exists so that the single question "what do I tell this subscriber to connect to?" has
-// one answer in one place. event_subscriber.go's subscriberFacingBrokers asks it and refuses
-// issuance when it reports false; nothing else decides this.
-//
-// # KAFKA_SUBSCRIBER_BROKERS IS MANDATORY FOR ISSUANCE, and there is no fallback
-//
-// An earlier revision fell back to KAFKA_BROKERS with a warning, on the argument that
-// requirement R-10 fixes the mandatory configuration surface at eight variables and a ninth
-// should not be able to make a documented endpoint unusable. That argument weighed the wrong
-// cost. KAFKA_BROKERS is what BLNK dials, and inside a deployment it is an internal address —
-// "kafka:9092" on a compose network, a ClusterIP or headless Service in Kubernetes — which
-// does not resolve for a subscriber outside it. Kafka compounds it rather than tolerating it:
-// a broker answers every client with the ADVERTISED address of the listener the connection
-// arrived on, so even an externally reachable bootstrap address hands back internal ones for
-// the partition leaders.
-//
-// A warning is not a control. The failure it warns about arrives days later as a connection
-// timeout at the subscriber, holding a secret that is shown exactly once and cannot be
-// recovered — so diagnosing it means reissuing the credential, which invalidates the one the
-// subscriber is holding. Refusing at issuance costs an operator one variable, once, with the
-// name in the error message; falling back costs a subscriber an unusable credential and a
-// forced rotation to find out why.
-//
-// R-10's eight variables are the surface that must exist for PUBLISHING. This one gates a
-// single endpoint, and the endpoint's whole output is an address a third party will dial:
-// there is no correct value for Blnk to infer, because only an operator knows what its
-// externally advertised listener is. So issuance answers the documented typed 503 when it is
-// unset, start-up warns that it will, and nothing internal is ever substituted.
-//
-// The returned slice is a COPY. The configuration is shared through an atomic.Value and read
-// concurrently, so handing out the backing array would let a caller that appends to its
-// result mutate what every later reader sees.
+// It exists so that the single question "what do I tell this subscriber to connect to?"
+// has one answer in one place. event_subscriber.go's subscriberFacingBrokers asks it
+// and refuses issuance when it reports false; nothing else decides this.
 //
 // Returns:
 //   - brokers []string: a copy of KAFKA_SUBSCRIBER_BROKERS, nil when it is unset.
-//   - advertised bool: true exactly when a non-empty list was configured. It is retained as a
-//     second return value rather than folded into the nil check so that callers written
-//     against the old fallback contract cannot silently reinterpret an empty list as a
-//     usable one.
+//   - advertised bool: true exactly when a non-empty list was configured. It is
+//     retained as a second return value rather than folded into the nil check so that
+//     callers written against the old fallback contract cannot silently reinterpret an
+//     empty list as a usable one.
 func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, advertised bool) {
 	normalized := normalizeBrokers(k.SubscriberBrokers)
 	if len(normalized) == 0 {
@@ -3390,48 +2389,29 @@ func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, advertised boo
 // KeyScopeEnforcementNone is the shipped default: NOTHING evaluates record keys.
 //
 // Under it a subscriber that records a partition_key_prefix is REFUSED a credential —
-// event_subscriber.go's requireProvisionableKeyScope and requireRecordableKeyScope — rather
-// than issued one whose declared boundary nothing keeps. Client-side filtering was the earlier
-// reading of this value and is not an authorization boundary: the party asked to apply the
-// filter is the party holding the credential, and any other Kafka client reads the whole topic.
+// event_subscriber.go's requireProvisionableKeyScope and requireRecordableKeyScope —
+// rather than issued one whose declared boundary nothing keeps. Client-side filtering
+// was the earlier reading of this value and is not an authorization boundary: the party
+// asked to apply the filter is the party holding the credential, and any other Kafka
+// client reads the whole topic.
 const KeyScopeEnforcementNone = "none"
 
-// KeyScopeEnforcementBrokerGateway declares that subscriber connections are terminated by a
-// gateway that authorises record keys against each principal's granted prefix.
+// KeyScopeEnforcementBrokerGateway declares that subscriber connections are terminated
+// by a gateway that authorises record keys against each principal's granted prefix.
 //
-// Blnk does not ship that gateway, and the reason is a property of Kafka rather than a gap
-// here: the authorizer interface authorises OPERATIONS ON RESOURCES — topics, groups, the
-// cluster, transactional ids — and a record key is not a resource. No ACL can express "read
-// only records whose key starts with X", so no arrangement of ACLs can enforce a key scope on
-// a shared topic. Enforcing one requires a component that reads the records, which is a
-// custom authorizer plugin or a protocol-aware proxy in front of the brokers.
-//
-// This value is how an operator who has deployed such a component tells Blnk about it. Setting
-// it changes two things and nothing else: issuance stops refusing key-scoped subscribers, and
-// the credential response reports the gateway's own bootstrap list and declares the key scope
-// ENFORCED at the gateway. Setting it without a gateway in front of the brokers is a false
-// declaration, which is why KeyScopeGateway refuses a gateway list that is empty or identical
-// to the broker list.
+// This value is how an operator who has deployed such a component tells Blnk about it.
+// Setting it changes two things and nothing else: issuance stops refusing key-scoped
+// subscribers, and the credential response reports the gateway's own bootstrap list and
+// declares the key scope ENFORCED at the gateway.
 const KeyScopeEnforcementBrokerGateway = "broker_gateway"
 
 // KeyScopeGateway resolves the key-scope enforcement point for subscriber credentials.
 //
-// It is the single decision behind two behaviours that must never disagree: whether issuance
-// may mint a credential for a subscriber carrying a partition_key_prefix, and what that
-// credential's response declares about where the prefix is enforced. Two separate reads would
-// permit a credential that declares enforcement it was not issued under.
-//
-// # Why an identical list is refused rather than accepted
-//
-// A gateway list equal to KAFKA_BROKERS means subscribers were pointed straight at the
-// brokers, where nothing evaluates keys. Accepting it would produce the exact failure this
-// whole mechanism exists to prevent — a credential declaring enforced key isolation while the
-// broker serves every record on the topic — so a configuration that cannot be enforcing is
-// treated as not enforcing, and never becomes the endpoint a credential names. Because that is
-// the SAME decision issuance reads, such a configuration also makes issuance refuse a
-// key-scoped subscriber, exactly as the default "none" does: a declaration that cannot be true
-// is worth less than no declaration, and the failure direction for an authorization control is
-// closed.
+// It is the single decision behind two behaviours that must never disagree: whether
+// issuance may mint a credential for a subscriber carrying a partition_key_prefix, and
+// what that credential's response declares about where the prefix is enforced. Two
+// separate reads would permit a credential that declares enforcement it was not issued
+// under.
 //
 // Returns:
 //   - brokers []string: a copy of the gateway bootstrap list, nil unless enforcement is
@@ -3452,15 +2432,12 @@ func (k KafkaConfig) KeyScopeGateway() (brokers []string, active bool) {
 		return nil, false
 	}
 
-	// THE CONTROL ENDPOINT IS PART OF THE DECLARATION, not an optional extra. Enforcement is
-	// "active" here only when Blnk can ASK the component to confirm the boundary, because
-	// everything active-ness unlocks is downstream of that confirmation: issuance stops
-	// refusing key-scoped rows, and the credential response declares the scope enforced. A mode
-	// and a bootstrap address are assertions a deployment makes about itself; an authenticated
-	// attestation is evidence. Treating an unattestable configuration as inactive means a
-	// deployment that has declared a gateway it cannot reach gets the same refusal as one that
-	// declared nothing — which is the fail-closed direction, and the only one that cannot mint a
-	// credential claiming an enforcement point nothing was asked about.
+	// THE CONTROL ENDPOINT IS PART OF THE DECLARATION, not an optional extra. Enforcement
+	// is "active" here only when Blnk can ASK the component to confirm the boundary,
+	// because everything active-ness unlocks is downstream of that confirmation: issuance
+	// stops refusing key-scoped rows, and the credential response declares the scope
+	// enforced. A mode and a bootstrap address are assertions a deployment makes about
+	// itself; an authenticated attestation is evidence.
 	if _, _, attestable := k.KeyScopeAttestation(); !attestable {
 		return nil, false
 	}
@@ -3474,29 +2451,17 @@ func (k KafkaConfig) KeyScopeGateway() (brokers []string, active bool) {
 // KeyScopeAttestation resolves the key-authorising component's CONTROL endpoint and the
 // credential Blnk presents to it.
 //
-// It answers one question — can Blnk ask the declared component to confirm a principal's key
-// scope? — and it is deliberately independent of the bootstrap list: the addresses a SUBSCRIBER
-// dials and the endpoint BLNK calls are different interfaces on the same component, and a
-// deployment may well expose them on different hosts and schemes.
-//
-// # What makes an endpoint usable
-//
 //  1. The mode is broker_gateway. Nothing else declares a component at all.
-//  2. The URL parses as an ABSOLUTE http or https URL with a host. A relative or schemeless
-//     value cannot be dialled, and treating it as usable would defer the failure to the middle
-//     of an issuance.
-//  3. The scheme is https, UNLESS the host is a loopback literal. The request carries the
-//     bearer token below, so plaintext to a remote host would put a long-lived credential on
-//     the wire; a loopback host is permitted because that is how a sidecar or a test double is
-//     reached, and its last hop never touches a network.
-//  4. The token is non-blank. An unauthenticated control endpoint is one any party that can
-//     reach it may rewrite bindings on, which would make the "boundary" writable by whoever
-//     found the URL.
-//
-// Anything else answers false, which KeyScopeGateway reads as "not enforcing" and issuance
-// reads as "refuse key-scoped subscribers". No warning is emitted here — this is a pure
-// accessor read on every issuance — validateKafkaKeyScopeGateway announces the misconfiguration
-// once at start-up instead.
+//  2. The URL parses as an ABSOLUTE http or https URL with a host. A relative or
+//     schemeless value cannot be dialled, and treating it as usable would defer the
+//     failure to the middle of an issuance.
+//  3. The scheme is https, UNLESS the host is a loopback literal. The request carries
+//     the bearer token below, so plaintext to a remote host would put a long-lived
+//     credential on the wire; a loopback host is permitted because that is how a
+//     sidecar or a test double is reached, and its last hop never touches a network.
+//  4. The token is non-blank. An unauthenticated control endpoint is one any party that
+//     can reach it may rewrite bindings on, which would make the "boundary" writable by
+//     whoever found the URL.
 //
 // Returns:
 //   - endpoint string: the trimmed URL, empty unless attestable.
@@ -3532,13 +2497,12 @@ func (k KafkaConfig) KeyScopeAttestation() (endpoint string, token string, attes
 	return endpoint, token, true
 }
 
-// KeyScopeAttestationTimeout is how long a single attestation or revocation call may take.
+// KeyScopeAttestationTimeout is how long a single attestation or revocation call may
+// take.
 //
-// It is bounded on BOTH sides. A non-positive configured value takes the default, because "no
-// timeout" inside a five-second issuance contract is not a configuration anybody means. A value
-// above MaxKeyScopeAttestationTimeout is capped rather than rejected: the call lives inside the
-// issuance budget, so a timeout longer than that budget cannot expire before the budget does,
-// and refusing to start over it would be worse than correcting it.
+// It is bounded on BOTH sides. A non-positive configured value takes the default,
+// because "no timeout" inside a five-second issuance contract is not a configuration
+// anybody means.
 //
 // Returns:
 //   - time.Duration: always positive, never above MaxKeyScopeAttestationTimeout.
@@ -3555,18 +2519,13 @@ func (k KafkaConfig) KeyScopeAttestationTimeout() time.Duration {
 	return timeout
 }
 
-// brokerListsEqual reports whether two bootstrap lists name the same endpoints in the same order.
+// brokerListsEqual reports whether two bootstrap lists name the same endpoints in the
+// same order.
 //
-// Both sides are normalised first, so a list differing only in whitespace, blank entries or
-// duplication is recognised as the same list. That matters because the ONE caller that compares
-// lists is asking a security question — is the declared gateway actually the brokers? — and a
-// deployment writing "kafka:9092, kafka:9092" for one and "kafka:9092" for the other must not
-// thereby be treated as having declared a distinct enforcement point.
-//
-// The comparison is ORDER-SENSITIVE after normalisation, which is the conservative direction for
-// its caller: two lists holding the same endpoints in a different order are reported as
-// DIFFERENT, so the caller treats them as a declared gateway and the attestation call then has
-// the final say. A false "identical" would be the dangerous answer, and cannot arise.
+// Both sides are normalised first, so a list differing only in whitespace, blank
+// entries or duplication is recognised as the same list. That matters because the ONE
+// caller that compares lists is asking a security question — is the declared gateway
+// actually the brokers?
 //
 // Parameters:
 //   - left, right []string: bootstrap lists, normalised internally.
@@ -3590,15 +2549,16 @@ func brokerListsEqual(left, right []string) bool {
 	return true
 }
 
-// isLoopbackHostname reports whether a URL host is a loopback address or the loopback name.
+// isLoopbackHostname reports whether a URL host is a loopback address or the loopback
+// name.
 //
-// The literal check is net.IP.IsLoopback, which covers 127.0.0.0/8 and ::1 without a string
-// comparison per form; "localhost" is accepted by name because that is what a compose file, a
-// sidecar annotation or an httptest URL writes, and it resolves to a loopback address on every
-// platform this runs on.
+// The literal check is net.IP.IsLoopback, which covers 127.0.0.0/8 and ::1 without a
+// string comparison per form; "localhost" is accepted by name because that is what a
+// compose file, a sidecar annotation or an httptest URL writes, and it resolves to a
+// loopback address on every platform this runs on.
 //
-// A name that merely CONTAINS "localhost" — "localhost.evil.example" — is not loopback and is
-// refused, which is why the comparison is an equality and not a suffix test.
+// A name that merely CONTAINS "localhost" — "localhost.evil.example" — is not loopback
+// and is refused, which is why the comparison is an equality and not a suffix test.
 //
 // Parameters:
 //   - hostname string: the host component of a URL, already stripped of any port.
@@ -3637,13 +2597,9 @@ func (k KafkaConfig) ValidateSASLAdminCredentials() error {
 
 // ValidateSASLPair rejects a half-configured SASL credential.
 //
-// One value without the other is always a mistake and never a mode: a username with
-// no secret cannot complete a SCRAM exchange, and a secret with no username has
-// nobody to present it as. Both used to be tolerated differently by the two Kafka
-// clients — one built a mechanism from whatever it had, the other skipped SASL
-// entirely — so the same misconfiguration produced an authentication failure in one
-// process and a silently unauthenticated connection in the other. Validating in one
-// exported place is what makes the two agree.
+// One value without the other is always a mistake and never a mode: a username with no
+// secret cannot complete a SCRAM exchange, and a secret with no username has nobody to
+// present it as. Validating in one exported place is what makes the two agree.
 //
 // Both empty is valid and means "no SASL".
 //
@@ -3664,9 +2620,9 @@ func ValidateSASLPair(role, user, secret string) error {
 	case user == "" && secret == "":
 		return nil
 	case user == "":
-		// The DANGEROUS half. Every component used to ignore a secret with no username and
-		// connect anonymously while looking configured, so this arm is the reason the
-		// function exists rather than an afterthought. The secret is never echoed.
+		// The DANGEROUS half. A component that ignored a secret with no username would connect
+		// anonymously while looking configured, so this arm is the reason the function exists
+		// rather than an afterthought. The secret is never echoed.
 		return fmt.Errorf(
 			"kafka %s SASL: %s is set but %s is empty; SASL/SCRAM needs both. Without a principal "+
 				"the secret cannot be used and the connection would be anonymous. Set the user, or "+
@@ -3685,11 +2641,11 @@ func ValidateSASLPair(role, user, secret string) error {
 
 // saslEnvNames maps a role onto the two environment variables that configure it.
 //
-// The error messages name the VARIABLE an operator has to change, not the struct field or
-// the role, because the variable is the only one of the three they can act on. An unknown
-// role still produces something useful rather than an empty name — the role is a literal at
-// every call site, so an unrecognised one is a programming slip and not an operator's
-// problem to decode.
+// The error messages name the VARIABLE an operator has to change, not the struct field
+// or the role, because the variable is the only one of the three they can act on. An
+// unknown role still produces something useful rather than an empty name — the role is
+// a literal at every call site, so an unrecognised one is a programming slip and not an
+// operator's problem to decode.
 //
 // Parameters:
 //   - role string: "producer" or "admin".
@@ -3707,9 +2663,9 @@ func saslEnvNames(role string) (userVar, secretVar string) {
 // normalizeBrokers trims surrounding whitespace from each broker address and drops
 // empty entries, preserving the configured order.
 //
-// Normalization is required rather than tidy: envconfig splits a comma-separated
-// value without trimming, so BLNK_KAFKA_BROKERS="a:9092, b:9092" yields the address
-// " b:9092", which cannot be dialled, and it preserves the empty entries produced by
+// Normalization is required rather than tidy: envconfig splits a comma-separated value
+// without trimming, so BLNK_KAFKA_BROKERS="a:9092, b:9092" yields the address "
+// b:9092", which cannot be dialled, and it preserves the empty entries produced by
 // consecutive or trailing commas, which this function discards.
 //
 // The function is idempotent — re-running it over its own output is a no-op, which
@@ -3735,45 +2691,18 @@ func normalizeBrokers(brokers []string) []string {
 // setRelayDefaults fills the unset relay retry values and BOUNDS the attempt count.
 //
 // The two backoff values are milliseconds and are stored verbatim; unlike the queue's
-// HotPairTTL they are never reinterpreted as another unit, so a configured 1000 stays 1000.
-//
-// The attempt count is treated differently from the two delays, because it is the only one
-// of the three that leaves the process as an exported metric label, so it is CLAMPED as
-// well as defaulted: anything above MaxRelayRetryAttempts is reduced to it, with a warning
-// naming both numbers so the operator sees what was asked for and what is in force. See
-// MaxRelayRetryAttempts for why the ceiling exists.
-//
-// Values below 1 are deliberately left alone here. They are not a label-domain problem —
-// the recording path normalises any attempt number below 1 to 1 — and
-// validateRelayRetryWindow already reports them as the operational warning they are, which
-// keeps "no retries before dead-lettering" a visible choice rather than one this function
-// silently overrides.
+// HotPairTTL they are never reinterpreted as another unit, so a configured 1000 stays
+// 1000.
 func (cnf *Configuration) setRelayDefaults() {
 	// THE THREE RETRY VALUES ARE NORMALISED HERE, AND ONLY HERE.
 	//
-	// Zero means "not set" and is filled in silently: requirement R-4 fixes the correct
-	// answer, so a deployment that never mentioned the setting needs no warning about it. A
-	// NEGATIVE is different — it is a value an operator typed, it cannot be honoured, and it
-	// used to be LEFT IN PLACE. Two things followed from that, and both are why normalising
-	// here rather than downstream is the fix:
-	//
-	//   - THE WARNING DESCRIBED THE OPPOSITE OF WHAT HAPPENED. validateRelayRetryWindow said a
-	//     negative base backoff meant "retries will not be delayed" and a negative budget meant
-	//     "events will not be retried before being dead-lettered". Neither was true: every
-	//     consumer substituted a positive value of its own, so the retries WERE delayed and the
-	//     events WERE retried, on a schedule no log line named. An operator reading that
-	//     warning would go looking for a delivery failure that was not occurring.
-	//   - THE CONFIGURATION KEPT A VALUE NOTHING HONOURED. The substitutions live in
-	//     event_relay.go's newRelayRetryPolicy and event_outbox.go's eventMaxAttempts, so
-	//     cnf.Relay still read -1 while the relay ran on 1s/30s/5. Anything that reports
-	//     configuration rather than re-deriving it — a log field, a support answer, a future
-	//     statistics endpoint — reported the value that was not in effect.
-	//
-	// Normalising at the single point where the configuration is settled makes every reader
-	// agree, and each warning names the value, its variable and the value actually applied, so
-	// the log states the outcome instead of predicting one. The downstream fallbacks stay as a
-	// second line of defence for a RelayConfig built directly, which is how the test suite
-	// constructs one.
+	// Zero means "not set" and is filled in silently, because the default IS the correct
+	// answer and a deployment that never mentioned the setting needs no warning. A NEGATIVE
+	// value is corrected here too, with a warning naming the substitution, so that
+	// cnf.Relay always holds the values the relay actually runs on: newRelayRetryPolicy in
+	// event_relay.go and eventMaxAttempts in event_outbox.go substitute positive values of
+	// their own, and a configuration left holding -1 would describe a schedule nothing
+	// honoured.
 	switch {
 	case cnf.Relay.MaxRetryAttempts < 0:
 		logrus.WithFields(logrus.Fields{
@@ -3833,12 +2762,10 @@ func (cnf *Configuration) setRelayDefaults() {
 	}
 
 	// RETENTION IS NOT DEFAULTED, and the asymmetry with the three values above is the
-	// point. Those three have a correct answer that requirement R-4 fixes, so an unset
-	// value is filled in. A retention period has no correct answer this code can know —
-	// it depends on jurisdiction, audit programme and any legal hold in force — and
-	// getting it wrong deletes ledger-adjacent evidence. So zero is left as zero and
-	// means "retention disabled", which is the only safe default for a destructive
-	// operation.
+	// point. Those three have a correct answer that the requirement fixes, so an unset
+	// value is filled in. A retention period has no correct answer this code can know — it
+	// depends on jurisdiction, audit programme and any legal hold in force — and getting
+	// it wrong deletes ledger-adjacent evidence.
 	//
 	// A NEGATIVE value is refused rather than honoured. Read literally it is a cutoff in
 	// the FUTURE, which would delete every terminal row including ones delivered seconds
@@ -3854,27 +2781,16 @@ func (cnf *Configuration) setRelayDefaults() {
 		cnf.Relay.EventRetentionDays = 0
 	}
 
-	// REPAIR CAPACITY (PERF-M06). All three are filled in when unset and normalised when
-	// nonsensical, because every one of them has a correct answer this code can supply and
-	// none of them means "off" at zero:
+	// REPAIR CAPACITY. All three are filled in when unset and normalised when nonsensical,
+	// because every one of them has a correct answer this code can supply and none of them
+	// means "off" at zero:
 	//
-	//   * a repair batch size of zero claims nothing, so the two repair passes would run every
-	//     tick and never repair anything — a silently disabled recovery path rather than a
-	//     disabled feature, and the rows it abandons are the only copies of events that
-	//     reached no topic at all;
+	//   * a repair batch size of zero claims nothing, so the two repair passes would run
+	//     every tick and never repair anything — a silently disabled recovery path rather
+	//     than a disabled feature, and the rows it abandons are the only copies of events
+	//     that reached no topic at all;
 	//   * a per-tick bound of zero chains no batches, which is the same silence; and
 	//   * a concurrency of zero would make the bounded semaphore unacquirable.
-	//
-	// A NEGATIVE value is normalised to the default rather than honoured, for all three. There
-	// is no meaningful reading of a negative batch, bound or width — unlike the retention
-	// sweep, where a negative per-sweep bound is the documented way to ask for no ceiling —
-	// and the repair passes deliberately have no unbounded mode: their bound is what keeps a
-	// recovery from starving the publish loop it shares a tick with.
-	//
-	// Switching repair off is not offered, and that is deliberate. A deployment that stopped
-	// repairing would silently keep events that reached no topic, and there is no operational
-	// reason to want that; a deployment that wants repair to cost almost nothing sets a small
-	// batch, which still makes progress.
 	if cnf.Relay.RepairBatchSize <= 0 {
 		cnf.Relay.RepairBatchSize = defaultRelay.RepairBatchSize
 	}
@@ -3885,21 +2801,22 @@ func (cnf *Configuration) setRelayDefaults() {
 		cnf.Relay.RepairConcurrency = defaultRelay.RepairConcurrency
 	}
 
-	// PURGE CAPACITY (PERF-P23). Unlike the retention PERIOD above, these two DO have a
-	// correct answer this code can supply, so an unset value is filled in rather than left to
-	// mean "off": a batch size of zero would delete nothing at all, which is a silently broken
+	// PURGE CAPACITY. Unlike the retention PERIOD above, these two DO have a correct
+	// answer this code can supply, so an unset value is filled in rather than left to mean
+	// "off": a batch size of zero would delete nothing at all, which is a silently broken
 	// sweeper rather than a disabled one. Retention is switched off by the period, in one
 	// place, and these only decide how fast it is enforced.
 	if cnf.Relay.EventRetentionBatchSize <= 0 {
 		cnf.Relay.EventRetentionBatchSize = defaultRelay.EventRetentionBatchSize
 	}
 
-	// The batch CEILING distinguishes unset from unbounded, because an unset int is zero and
-	// both readings of zero cannot be honoured. Zero DEFAULTS — the per-sweep bound is what
-	// protects a live relay from a single sweep attempting an entire historical backlog, and a
-	// deployment that never mentioned this setting must keep that protection. Asking for no
-	// ceiling is spelled EventRetentionUnboundedSweep, and any negative is normalised onto it
-	// so a reader downstream has one value to recognise rather than a sign to test.
+	// The batch CEILING distinguishes unset from unbounded, because an unset int is zero
+	// and both readings of zero cannot be honoured. Zero DEFAULTS — the per-sweep bound is
+	// what protects a live relay from a single sweep attempting an entire historical
+	// backlog, and a deployment that never mentioned this setting must keep that
+	// protection. Asking for no ceiling is spelled EventRetentionUnboundedSweep, and any
+	// negative is normalised onto it so a reader downstream has one value to recognise
+	// rather than a sign to test.
 	switch {
 	case cnf.Relay.EventRetentionMaxBatchesPerSweep == 0:
 		cnf.Relay.EventRetentionMaxBatchesPerSweep = defaultRelay.EventRetentionMaxBatchesPerSweep
@@ -3907,10 +2824,10 @@ func (cnf *Configuration) setRelayDefaults() {
 		cnf.Relay.EventRetentionMaxBatchesPerSweep = EventRetentionUnboundedSweep
 	}
 
-	// Reported when retention is ON, because capacity only matters if something is deleting,
-	// and reported as ROWS PER HOUR rather than as its two factors — that is the number an
-	// operator has to compare against their arrival rate, and making them multiply it
-	// themselves is how the previous default went eighteen times under peak unnoticed.
+	// Reported when retention is ON, because capacity only matters if something is
+	// deleting, and reported as ROWS PER HOUR rather than as its two factors: that is the
+	// number an operator compares against their arrival rate, and a capacity left as two
+	// factors to multiply is one nobody checks until the backlog grows.
 	if cnf.Relay.EventRetentionDays > 0 {
 		fields := logrus.Fields{
 			"batch_size":  cnf.Relay.EventRetentionBatchSize,
@@ -3941,8 +2858,8 @@ func (cnf *Configuration) setRelayDefaults() {
 	//
 	// A NEGATIVE value is refused rather than honoured. Read literally it would measure
 	// nothing at all, which would leave every subscriber's lag unmeasured — the exact
-	// condition the budget's own gauge exists to make visible, arrived at by
-	// configuration instead of by scale.
+	// condition the budget's own gauge exists to make visible, arrived at by configuration
+	// instead of by scale.
 	if cnf.Relay.SubscriberMetricsBudget < 0 {
 		logrus.WithFields(logrus.Fields{
 			"configured": cnf.Relay.SubscriberMetricsBudget,
@@ -4001,7 +2918,8 @@ func (cnf *Configuration) setRelayDefaults() {
 //
 // It exists so no caller multiplies days by hours itself. Two callers doing that
 // arithmetic separately is how one of them ends up an order of magnitude out, and the
-// consequence here is deleted ledger evidence rather than a wrong number on a dashboard.
+// consequence here is deleted ledger evidence rather than a wrong number on a
+// dashboard.
 //
 // Returns:
 //   - time.Duration: the retention period, or 0 when retention is disabled.
@@ -4067,13 +2985,7 @@ func (cnf *Configuration) UploadDomainWhitelistHosts() []string {
 // A NIL result means "trust nothing", and that is what an empty or unset value yields.
 // The distinction is load-bearing: the router hands this straight to gin's
 // SetTrustedProxies, where nil disables forwarded-header handling altogether and the
-// client address becomes the connection's own peer. Returning an empty non-nil slice
-// would not be the same thing to a future reader, so nil is returned deliberately.
-//
-// Entries are NOT validated here. gin parses them and reports a malformed entry, which
-// is the only place that can say authoritatively what it accepts; validating twice would
-// mean two definitions of a valid CIDR, and the stricter one would silently reject a
-// value the router would have taken.
+// client address becomes the connection's own peer.
 //
 // Returns:
 //   - []string: the proxy addresses, or nil to trust none.
@@ -4107,40 +3019,23 @@ func (cnf *Configuration) TrustedProxyCIDRs() []string {
 	return proxies
 }
 
-// ForwardedProtoTrustedPeers parses Server.TrustedProxies into the socket-peer matchers the
-// forwarded-HTTPS channel is believed on, and reports whether what remains is usable.
+// ForwardedProtoTrustedPeers parses Server.TrustedProxies into the socket-peer matchers
+// the forwarded-HTTPS channel is believed on, and reports whether what remains is
+// usable.
 //
-// # Why the forwarded-proto decision needs a peer at all (SEC-03)
-//
-// X-Forwarded-Proto is a request header. BLNK_SERVER_TRUST_FORWARDED_PROTO declares that a proxy
-// in front of Blnk sets it and overwrites whatever a client sent, which is a true statement about
-// the intended path and says nothing about the request in hand: a caller that reaches the process
-// by any other route — a pod IP inside the cluster, a port-forward, a second Service, a
-// misconfigured ingress that passes the header through — sends its own value and is believed.
-// That endpoint returns a one-time SASL password, so being believed is the whole of the exploit.
-//
-// The header is therefore believed only from a PEER the operator has named. This is not a new
-// list: BLNK_SERVER_TRUSTED_PROXIES already names the proxies whose forwarded headers may be
-// believed, which is exactly this question, and a second list would let a deployment trust a
-// proxy for the client address and not for the protocol, or the reverse.
-//
-// # What is rejected, and why silently rather than fatally
-//
-// A UNIVERSAL RANGE matches every peer, so it re-creates the behaviour this check exists to
-// remove: 0.0.0.0/0 and ::/0 — and any entry whose prefix length is zero — are skipped rather
-// than honoured. Skipped rather than fatal because the same list also configures gin's client-IP
-// resolution, where the operator's intent is a separate decision that this accessor has no
-// business failing; a list that consisted only of universal ranges reports usable=false, which
-// refuses. validateForwardedProtoTrust announces both cases at start-up.
-//
-// A malformed entry is skipped for the same reason and by the same rule as TrustedProxyCIDRs:
-// this accessor only ever grants confidence, so anything it cannot parse grants none.
+// A UNIVERSAL RANGE matches every peer, so it re-creates the behaviour this check
+// exists to remove: 0.0.0.0/0 and ::/0 — and any entry whose prefix length is zero —
+// are skipped rather than honoured. Skipped rather than fatal because the same list
+// also configures gin's client-IP resolution, where the operator's intent is a separate
+// decision that this accessor has no business failing; a list that consisted only of
+// universal ranges reports usable=false, which refuses. validateForwardedProtoTrust
+// announces both cases at start-up.
 //
 // Returns:
-//   - peers []*net.IPNet: the parsed matchers, bare IP literals widened to a single-address
-//     network. Nil when nothing usable was declared.
-//   - usable bool: whether at least one non-universal matcher was declared. False means the
-//     forwarded-HTTPS channel establishes nothing, whatever the header says.
+//   - peers []*net.IPNet: the parsed matchers, bare IP literals widened to a
+//     single-address network. Nil when nothing usable was declared.
+//   - usable bool: whether at least one non-universal matcher was declared. False means
+//     the forwarded-HTTPS channel establishes nothing, whatever the header says.
 func (cnf *Configuration) ForwardedProtoTrustedPeers() (peers []*net.IPNet, usable bool) {
 	declared := cnf.TrustedProxyCIDRs()
 	if len(declared) == 0 {
@@ -4165,8 +3060,8 @@ func (cnf *Configuration) ForwardedProtoTrustedPeers() (peers []*net.IPNet, usab
 // parseTrustedPeerEntry parses one trusted-proxy entry into a network matcher.
 //
 // It accepts a CIDR block or a bare IP literal, which are the two forms
-// BLNK_SERVER_TRUSTED_PROXIES documents, and rejects a universal range because a matcher that
-// matches everything is not an allowlist.
+// BLNK_SERVER_TRUSTED_PROXIES documents, and rejects a universal range because a
+// matcher that matches everything is not an allowlist.
 //
 // Parameters:
 //   - entry string: one already-trimmed entry from the declared list.
@@ -4199,21 +3094,17 @@ func parseTrustedPeerEntry(entry string) *net.IPNet {
 	return &net.IPNet{IP: address, Mask: net.CIDRMask(bits, bits)}
 }
 
-// TrustsForwardedProtoFrom reports whether X-Forwarded-Proto may be believed on a request whose
-// socket peer is remoteAddr.
-//
-// BOTH halves are required: the deployment must have declared that a proxy owns the header, and
-// the request must have arrived FROM one of the peers it named. Either alone is the defect —
-// the declaration alone believes any caller that reaches the process by another route, and a
-// peer match alone would believe a proxy the operator never said terminates TLS.
+// TrustsForwardedProtoFrom reports whether X-Forwarded-Proto may be believed on a
+// request whose socket peer is remoteAddr.
 //
 // Parameters:
-//   - remoteAddr string: the peer as http.Request.RemoteAddr gives it, "host:port" or a bare
-//     host. It must be the SOCKET peer: a value derived from X-Forwarded-For would let a caller
-//     nominate the peer that authorises it.
+//   - remoteAddr string: the peer as http.Request.RemoteAddr gives it, "host:port" or a
+//     bare host. It must be the SOCKET peer: a value derived from X-Forwarded-For would
+//     let a caller nominate the peer that authorises it.
 //
 // Returns:
-//   - bool: true only when the declaration, a usable allowlist and a matching peer all hold.
+//   - bool: true only when the declaration, a usable allowlist and a matching peer all
+//     hold.
 func (cnf *Configuration) TrustsForwardedProtoFrom(remoteAddr string) bool {
 	if !cnf.Server.TrustForwardedProto {
 		return false
@@ -4240,16 +3131,17 @@ func (cnf *Configuration) TrustsForwardedProtoFrom(remoteAddr string) bool {
 
 // peerAddressOf extracts the IP from a socket peer address.
 //
-// http.Request.RemoteAddr is "host:port" for TCP, and a bare host for the transports that have
-// no port, so both are accepted. An IPv6 zone is dropped: it identifies the interface a
-// link-local address was reached on and is not part of the address a CIDR describes.
+// http.Request.RemoteAddr is "host:port" for TCP, and a bare host for the transports
+// that have no port, so both are accepted. An IPv6 zone is dropped: it identifies the
+// interface a link-local address was reached on and is not part of the address a CIDR
+// describes.
 //
 // Parameters:
 //   - remoteAddr string: the peer address.
 //
 // Returns:
-//   - net.IP: the parsed address, or nil when there is nothing parseable — which every caller
-//     must read as "not trusted", since an unparseable peer establishes nothing.
+//   - net.IP: the parsed address, or nil when there is nothing parseable — which every
+//     caller must read as "not trusted", since an unparseable peer establishes nothing.
 func peerAddressOf(remoteAddr string) net.IP {
 	candidate := strings.TrimSpace(remoteAddr)
 	if candidate == "" {
@@ -4267,23 +3159,14 @@ func peerAddressOf(remoteAddr string) net.IP {
 	return net.ParseIP(strings.Trim(candidate, "[]"))
 }
 
-// validateForwardedProtoTrust refuses, in secure mode, a deployment that has declared the
-// forwarded-HTTPS channel without naming the proxies it may be believed from.
+// validateForwardedProtoTrust refuses, in secure mode, a deployment that has declared
+// the forwarded-HTTPS channel without naming the proxies it may be believed from.
 //
-// # Why this is fatal in secure mode rather than a warning
-//
-// The declaration's only effect is to permit a one-time SASL password onto a channel the process
-// cannot see, and without an allowlist it permits that for EVERY caller — including one that
-// reached the pod directly and set the header itself. A warning would leave that deployment
-// running in exactly the state the flag was introduced to avoid, and the remedy is one variable.
-//
-// Outside secure mode it is a warning, and that boundary is the same one resolveSearchCredential
-// draws: Server.Secure is this repository's production signal, the local stack and the test
-// suite run with it false, and a fatal check there would refuse configurations whose whole
-// purpose is to be permissive on a developer's machine.
-//
-// A deployment that terminates TLS in-process needs none of this: that channel is proven rather
-// than declared, so the flag is simply unnecessary and this check does not fire on it.
+// The declaration's only effect is to permit a one-time SASL password onto a channel
+// the process cannot see, and without an allowlist it permits that for EVERY caller —
+// including one that reached the pod directly and set the header itself. A warning
+// would leave that deployment running in exactly the state the flag was introduced to
+// avoid, and the remedy is one variable.
 //
 // Returns:
 //   - error: non-nil only for a secure deployment that declared the flag with no usable
@@ -4390,19 +3273,8 @@ func MockConfig(mockConfig *Configuration) {
 // logger configures the standard logger before any configuration has been read.
 //
 // The formatter is unconditional, as it always was. The LEVEL is read straight from the
-// environment here, ahead of the configuration file, because InitConfig calls this and then
-// loads the file — and loading the file logs. Without this, the warnings emitted while the
-// configuration is being validated would be filtered by the previous level rather than by
-// the one the operator asked for, which is exactly backwards for the run in which somebody
-// has just turned debug on to find out what is happening at start-up.
-//
-// Only the environment is consulted, because that is the only source available yet. The
-// value in blnk.json — and the environment again, since envconfig overlays it — is applied
-// by setLogLevelDefaults once the configuration exists, and that later application is
-// authoritative. An absent or unparseable variable is ignored in silence here: the
-// configuration layer reports the same condition properly, with the accepted values named,
-// and duplicating the warning at a point where nothing has been loaded would only make it
-// look like two separate faults.
+// environment here, ahead of the configuration file, because InitConfig calls this and
+// then loads the file — and loading the file logs.
 func logger() {
 	// Configure logrus defaults
 	logrus.SetFormatter(&logrus.TextFormatter{
@@ -4415,59 +3287,36 @@ func logger() {
 	}
 
 	if level, err := logrus.ParseLevel(strings.ToLower(strings.TrimSpace(raw))); err == nil {
-		// Clamped here as well as in setLogLevelDefaults, and for the same reason: this
-		// is the level in force for the whole of start-up, including the configuration
-		// load itself. Applying an unclamped quiet level here would discard start-up
-		// warnings that the later clamp can no longer bring back, since by then they
-		// have already been emitted and dropped.
-		//
-		// The clamp is silent at this point. Nothing has been loaded yet, and
-		// setLogLevelDefaults reports the same condition properly once it can name both
-		// the requested and the effective level; warning twice would read as two
-		// separate faults.
+		// Clamped here as well as in setLogLevelDefaults, and for the same reason: this is
+		// the level in force for the whole of start-up, including the configuration load
+		// itself. Applying an unclamped quiet level here would discard start-up warnings that
+		// the later clamp can no longer bring back, since by then they have already been
+		// emitted and dropped.
 		effective, _ := clampLogLevel(level)
 		logrus.SetLevel(effective)
 	}
 }
 
 // resolveSearchCredential decides what the TypeSense API key becomes when the operator
-// supplied none, and REFUSES the one case in which the historical answer was a hard-coded
-// credential in a production deployment. SEC-07.
+// supplied none, and REFUSES the one case in which the historical answer was a
+// hard-coded credential in a production deployment.
 //
-// # What was wrong
+// The posture is read from Server.Secure, which is this codebase's own production
+// signal — the same flag whose falsity already announces that API authentication is
+// disabled. The three arms are deliberately different, because a single rule gets one
+// of them wrong:
 //
-// setDefaultValues substituted the literal DEFAULT_TYPESENSE_KEY — "blnk-api-key" —
-// unconditionally, whenever no key was configured. That literal is not a secret by any
-// measure: it is the key in this repository's own compose files, it is in every clone, and it
-// is the value a local TypeSense is started with. So a production deployment that had simply
-// forgotten BLNK_TYPESENSE_KEY authenticated to its search index — which holds indexed
-// transaction, balance and identity records — with a credential anybody can read from GitHub.
-// That is CWE-798, and the substitution is also what made it UNDETECTABLE: once it had run,
-// the field was non-empty, so nothing downstream could distinguish a key the operator chose
-// from one this function invented.
-//
-// # The three outcomes, and why it is not simply "require it"
-//
-// The posture is read from Server.Secure, which is this codebase's own production signal —
-// the same flag whose falsity already announces that API authentication is disabled. The
-// three arms are deliberately different, because a single rule gets one of them wrong:
-//
-//  1. NOT SECURE — the historical default is applied, exactly as before. This is the posture
-//     of the compose stack, the makefile targets and the whole test suite, and a local
-//     TypeSense is started with that very key, so refusing here would break every local
-//     bring-up to protect a credential that is doing no work.
-//  2. SECURE, and no TypeSense host configured — the key is left EMPTY and the condition is
-//     reported. Search is optional in Blnk: an unset host means no indexing is in use, and
-//     failing to start over a credential for a subsystem the deployment does not run would be
-//     a worse defect than the one being fixed.
-//  3. SECURE, with a TypeSense host configured — REFUSED. Search is genuinely in use, the
-//     operator has supplied no key, and the only remaining options are to invent a public one
-//     or to stop. Stopping is correct: the alternative silently indexes ledger data behind a
-//     credential that grants anyone who knows it full access to the collection.
-//
-// Note what this does NOT do. It does not touch search behaviour, the TypeSense client or any
-// indexing code — the AAP excludes that feature (§0.6.2) and none of its files are modified.
-// It removes a hard-coded credential from the configuration layer, which §0.6.1 puts in scope.
+//  1. NOT SECURE — the historical default is applied, exactly as before. This is the
+//     posture of the compose stack, the makefile targets and the whole test suite, and
+//     a local TypeSense is started with that very key, so refusing here would break
+//     every local bring-up to protect a credential that is doing no work.
+//  2. SECURE, and no TypeSense host configured — the key is left EMPTY and the
+//     condition is reported. Search is optional in Blnk: an unset host means no
+//     indexing is in use, and failing to start over a credential for a subsystem the
+//     deployment does not run would be a worse defect than the one being fixed.
+//  3. SECURE, with a TypeSense host configured — REFUSED. Search is genuinely in use,
+//     the operator has supplied no key, and the only remaining options are to invent a
+//     public one or to stop.
 //
 // Returns:
 //   - error: non-nil only in case 3, carrying the variable to set and the reason.

@@ -18,31 +18,19 @@ package blnk
 
 // Tests for the service container's event-publisher wiring in blnk.go.
 //
-// Three properties are pinned here, and each of them is a thing that breaks quietly rather
-// than loudly if it regresses:
+// Three properties are pinned here, and each of them is a thing that breaks quietly
+// rather than loudly if it regresses:
 //
-//  1. GRACEFUL DEGRADATION. With no Kafka brokers configured, NewBlnk must succeed and must
-//     select the no-op publisher. This is the property that keeps every deployment which
-//     does not run Kafka — and the large part of this test suite that constructs
-//     NewBlnk(nil) with nothing but a Redis DSN — working unchanged. A constructor that
-//     returned an error, dialled a broker or blocked here would take all of them down at
-//     once.
+//  1. GRACEFUL DEGRADATION. With no Kafka brokers configured, NewBlnk must succeed and
+//     must select the no-op publisher.
 //  2. NO I/O AT CONSTRUCTION, on the configured path too. Brokers pointed at an
-//     unroutable address must still produce a publisher promptly, because writers connect
-//     lazily. If construction ever dialled, process startup would begin to depend on broker
-//     reachability.
-//  3. system.error IS DELIVERED, whichever transport the deployment has. blnk.go registers
-//     the notification package's WebhookSender, and that closure is the eighth and only
-//     indirect producer call site. If it is not routed onward, one of the thirteen event
-//     types silently disappears from the pipeline while every other one keeps flowing. Two
-//     tests cover it because there are two destinations: with a broker configured the event
-//     belongs in the outbox, and with no broker it belongs on the legacy queue, because no
-//     relay would ever drain a row written by a deployment that has no Kafka.
+//     unroutable address must still produce a publisher promptly, because writers
+//     connect lazily.
+//  3. system.error IS DELIVERED, whichever transport the deployment has. blnk.go
+//     registers the notification package's WebhookSender, and that closure is the
+//     eighth and only indirect producer call site.
 //
-// Nothing here performs network I/O. Redis is miniredis, no datasource is contacted, and every
-// broker address used is wiringBlackholeBroker — RFC 1918 private space, routed nowhere in a
-// default environment and never dialled. See that constant for why it is private space rather
-// than an RFC 5737 documentation address.
+// Nothing here performs network I/O.
 
 import (
 	"context"
@@ -69,41 +57,30 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// wiringBlackholeBroker is an RFC 1918 private address that is routed nowhere in a default
-// environment, so if any code path under test ever did dial a broker the failure would be an
-// unambiguous timeout rather than a connection to something real.
+// wiringBlackholeBroker is an RFC 1918 private address that is routed nowhere in a
+// default environment, so if any code path under test ever did dial a broker the
+// failure would be an unambiguous timeout rather than a connection to something real.
 //
-// It was 198.51.100.1, an RFC 5737 TEST-NET-2 address. That is a PUBLIC address, and
-// acknowledged plaintext no longer reaches a broker outside Blnk's own network:
-// KAFKA_INSECURE_LOCAL_DEV claims the broker is local, and requireLocalBrokersForPlaintext
-// now verifies the claim instead of merely warning about it. Private space keeps the
-// unroutability this constant exists for while satisfying that check.
+// It was 198.51.100.1, an RFC 5737 TEST-NET-2 address.
 const wiringBlackholeBroker = "10.255.255.1:9092"
 
 // wiringConstructionBudget bounds how long NewBlnk may take.
-//
-// It is deliberately well under eventTransportDialTimeout (5s): a single dial attempt
-// against wiringBlackholeBroker could not finish inside this budget, so exceeding it is
-// evidence that construction performed I/O rather than merely that the machine was busy.
 const wiringConstructionBudget = 2 * time.Second
 
 // wiringSpyDatasource records the event-outbox rows PublishEvent inserts.
 //
 // The embedded *mocks.MockDataSource supplies the remainder of database.IDataSource and
-// carries NO expectations, which is itself an assertion: any other datasource method this
-// path touched would panic rather than pass unnoticed.
-//
-// Rows are delivered over a buffered channel rather than accumulated behind a mutex because
-// the only writer is the goroutine notification.NotifyError spawns, and the reader needs to
-// block until it arrives. The channel is the synchronisation.
+// carries NO expectations, which is itself an assertion: any other datasource method
+// this path touched would panic rather than pass unnoticed.
 type wiringSpyDatasource struct {
 	*mocks.MockDataSource
 
 	rows chan *model.EventOutbox
 
-	// deadlines records, per recorded row, whether the insert's context carried a deadline and
-	// how far away it was. The sender registered in NewBlnk constructs that context itself —
-	// nothing upstream of it has one — so this is the only place the bound can be observed.
+	// deadlines records, per recorded row, whether the insert's context carried a deadline
+	// and how far away it was. The sender registered in NewBlnk constructs that context
+	// itself — nothing upstream of it has one — so this is the only place the bound can be
+	// observed.
 	deadlines chan time.Duration
 }
 
@@ -147,7 +124,8 @@ func (s *wiringSpyDatasource) InsertEventOutbox(ctx context.Context, e *model.Ev
 //   - t *testing.T: the test to fail if nothing was recorded.
 //
 // Returns:
-//   - time.Duration: time remaining on the insert's context, or zero when it had no deadline.
+//   - time.Duration: time remaining on the insert's context, or zero when it had no
+//     deadline.
 func (s *wiringSpyDatasource) awaitDeadline(t *testing.T) time.Duration {
 	t.Helper()
 
@@ -177,8 +155,9 @@ func (s *wiringSpyDatasource) await(t *testing.T) *model.EventOutbox {
 
 // assertRecordedNothing asserts no row was captured.
 //
-// It is called AFTER the legacy delivery has been observed, so the sender has demonstrably
-// already run: this is a check on where the event went, not a race against it arriving.
+// It is called AFTER the legacy delivery has been observed, so the sender has
+// demonstrably already run: this is a check on where the event went, not a race against
+// it arriving.
 //
 // Parameters:
 //   - t *testing.T: the test to fail.
@@ -193,40 +172,16 @@ func (s *wiringSpyDatasource) assertRecordedNothing(t *testing.T, reason string)
 	}
 }
 
-// wiringAssertSystemErrorEnvelope asserts raw is the FROZEN legacy body NotifyError produces
-// for system.error.
+// wiringAssertSystemErrorEnvelope asserts raw is the FROZEN legacy body NotifyError
+// produces for system.error.
 //
-// THE PAYLOAD GUARANTEE, asserted rather than described: the bytes are the marshaled two-key
-// legacy webhook body — {"event": ..., "data": ...} — carrying the payload object NotifyError
-// built, field for field. The closure in blnk.go forwards what it is handed and adds nothing.
-//
-// # Why the raw error text is asserted PRESENT rather than absent
-//
-// An earlier revision of the notification package replaced the two inner keys with a
-// classified reason and a correlation id, and this helper was written against that shape. The
-// substitution was reverted, and this helper follows it: requirement R-8 fixes a
-// LedgerEvent's payload as today's webhook body field-for-field, and the webhook body for
-// system.error has always been {"error": <text>, "time": <now>}. Replacing those keys under
-// the same event name is a breaking change to a published contract, delivered as a side
-// effect of a transport migration — every existing subscriber would read a key that is no
-// longer there with nothing having announced it.
-//
-// The disclosure concern that motivated the substitution is answered by AUDIENCE instead:
-// system.error routes to the internal blnk.system category, which model.SubscriberGrantableTopics
-// excludes, so no subscriber principal can be granted it. The bounded classification and the
-// correlation id are on the operator log record at the dispatch site, where narrowing costs
-// nothing. Asserting the text is present here is therefore asserting the contract, and it is
-// also what proves the wiring is a pass-through: a closure that re-derived or narrowed the
-// payload on its way onward would fail this.
-//
-// Both destinations are held to this same helper on purpose. The Kafka row and the legacy
-// task must carry identical bytes, and two separately-written sets of assertions could drift
-// apart while both kept passing.
+// Both destinations are held to this same helper on purpose.
 //
 // Parameters:
 //   - t *testing.T: the test to fail.
 //   - raw []byte: the captured body, from either transport.
-//   - rawErrorText string: the original error's text, which must appear in the body verbatim.
+//   - rawErrorText string: the original error's text, which must appear in the body
+//     verbatim.
 func wiringAssertSystemErrorEnvelope(t *testing.T, raw []byte, rawErrorText string) {
 	t.Helper()
 
@@ -286,14 +241,11 @@ func (p *wiringRecordingPublisher) closeCount() int {
 	return p.closes
 }
 
-// wiringStoreConfiguration publishes cnf for the duration of one test and restores whatever
-// was there before.
+// wiringStoreConfiguration publishes cnf for the duration of one test and restores
+// whatever was there before.
 //
-// config.ConfigStore is a process-global atomic.Value, so a configuration leaked out of one
-// test produces confusing failures in unrelated ones. It writes DIRECTLY rather than through
-// config.MockConfig because MockConfig runs validateAndAddDefaults, which refuses a
-// configuration lacking a data-source DSN — the value would be silently dropped — and which
-// would also supply the very Kafka defaults some cases here need to observe as absent.
+// config.ConfigStore is a process-global atomic.Value, so a configuration leaked out of
+// one test produces confusing failures in unrelated ones.
 func wiringStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 	t.Helper()
 
@@ -313,8 +265,7 @@ func wiringStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 // wiringRedisConfiguration returns a configuration whose only mandatory field is set.
 //
 // A Redis DSN is all NewBlnk genuinely requires, and miniredis provides one without a
-// server. This mirrors exactly what the legacy webhook tests construct, which is the input
-// the event-publisher wiring must not break.
+// server.
 func wiringRedisConfiguration(t *testing.T) *config.Configuration {
 	t.Helper()
 
@@ -325,13 +276,11 @@ func wiringRedisConfiguration(t *testing.T) *config.Configuration {
 	}
 }
 
-// wiringNewBlnkWithin constructs a Blnk instance and fails the test if it takes longer than
-// wiringConstructionBudget.
+// wiringNewBlnkWithin constructs a Blnk instance and fails the test if it takes longer
+// than wiringConstructionBudget.
 //
 // The bound is the assertion, not a convenience: "construction performs no I/O" is only
-// observable as "construction did not wait". Running the constructor on its own goroutine
-// means a genuinely blocking call fails the test with a clear message instead of hanging
-// until the package-level test timeout kills the whole run.
+// observable as "construction did not wait".
 func wiringNewBlnkWithin(t *testing.T, db *wiringSpyDatasource) (*Blnk, error) {
 	t.Helper()
 
@@ -342,8 +291,8 @@ func wiringNewBlnkWithin(t *testing.T, db *wiringSpyDatasource) (*Blnk, error) {
 
 	done := make(chan outcome, 1)
 	go func() {
-		// A nil *wiringSpyDatasource must be passed as a nil INTERFACE, not as a typed
-		// nil pointer: a typed nil would satisfy database.IDataSource and defeat the
+		// A nil *wiringSpyDatasource must be passed as a nil INTERFACE, not as a typed nil
+		// pointer: a typed nil would satisfy database.IDataSource and defeat the
 		// nil-datasource handling the legacy webhook tests rely on.
 		if db == nil {
 			instance, err := NewBlnk(nil)
@@ -375,16 +324,7 @@ func wiringNewBlnkWithin(t *testing.T, db *wiringSpyDatasource) (*Blnk, error) {
 // TestNewBlnk_SelectsTheNoopEventPublisherWhenNoBrokersAreConfigured is the
 // graceful-degradation acceptance criterion.
 //
-// An empty broker list is a legitimate steady state, not a misconfiguration: it reproduces
-// SendWebhook's own no-op-when-unconfigured contract, and it is the reason a Blnk deployment
-// has always been able to run with no notification sink at all. The three cases below are
-// the three ways "no brokers" actually reaches the constructor — the field never set, an
-// explicitly empty list, and a list holding nothing but blank separators left in an
-// environment file — and all three must resolve identically.
-//
-// A whitespace entry is the interesting one. Treated as a broker it would produce a
-// kafkaPublisher that can never connect, so every publish would fail against an address that
-// is not an address, and nothing in the configuration would look wrong.
+// A whitespace entry is the interesting one.
 func TestNewBlnk_SelectsTheNoopEventPublisherWhenNoBrokersAreConfigured(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string
@@ -422,14 +362,10 @@ func TestNewBlnk_SelectsTheNoopEventPublisherWhenNoBrokersAreConfigured(t *testi
 // TestNewBlnk_ConstructsTheKafkaPublisherWithoutDiallingABroker pins the constructor's
 // load-bearing property on the CONFIGURED path.
 //
-// The broker address is unroutable on purpose. If construction dialled, negotiated SASL or
-// fetched partition metadata, this test could not pass inside its budget — so passing is
-// evidence of the absence, which is the only way to test for it. That absence is what lets
-// a process start before its broker does, and what keeps startup independent of broker
-// reachability.
+// The broker address is unroutable on purpose.
 //
-// InsecureLocalDev is set because the transport refuses to dial a plaintext broker without
-// it; see the sibling case below, which asserts that refusal.
+// InsecureLocalDev is set because the transport refuses to dial a plaintext broker
+// without it; see the sibling case below, which asserts that refusal.
 func TestNewBlnk_ConstructsTheKafkaPublisherWithoutDiallingABroker(t *testing.T) {
 	cnf := wiringRedisConfiguration(t)
 	cnf.Kafka = config.KafkaConfig{
@@ -451,15 +387,11 @@ func TestNewBlnk_ConstructsTheKafkaPublisherWithoutDiallingABroker(t *testing.T)
 	assert.IsType(t, &kafkaPublisher{}, instance.events)
 }
 
-// TestNewBlnk_PropagatesAnEventPublisherConfigurationFailure covers the one case in which
-// the publisher legitimately fails construction.
+// TestNewBlnk_PropagatesAnEventPublisherConfigurationFailure covers the one case in
+// which the publisher legitimately fails construction.
 //
-// SASL/SCRAM authenticates the client to the broker; it does not encrypt the connection. So
-// a configured broker with TLS disabled and no explicit local-development acknowledgement
-// would put ledger amounts, identity records and the SCRAM handshake itself on the wire in
-// the clear. That is refused, and the refusal must reach the CALLER: silently degrading to
-// the no-op would leave a deployment that believes it is publishing events emitting nothing
-// at all, which is precisely the failure the loud error exists to prevent.
+// SASL/SCRAM authenticates the client to the broker; it does not encrypt the
+// connection.
 func TestNewBlnk_PropagatesAnEventPublisherConfigurationFailure(t *testing.T) {
 	cnf := wiringRedisConfiguration(t)
 	cnf.Kafka = config.KafkaConfig{
@@ -478,24 +410,9 @@ func TestNewBlnk_PropagatesAnEventPublisherConfigurationFailure(t *testing.T) {
 		"the error must name the acknowledgement an operator has to make, or it is not actionable")
 }
 
-// TestNewBlnk_ValidatesTheEventPublisherBeforeAcquiringAnyPooledResource is the LIFE-01
+// TestNewBlnk_ValidatesTheEventPublisherBeforeAcquiringAnyPooledResource is the lifecycle
 // guard: it proves the ORDER of construction, which is what makes a publisher failure
 // leak-free.
-//
-// The publisher is the one step in NewBlnk that fails for environmental reasons — an unusable
-// broker list, a SASL pair that does not validate, TLS material that will not load. It used
-// to be built LAST, after initializeRedisClients had already opened the Redis pool and the
-// asynq client's own pool. A publisher failure then returned without closing either, so every
-// failed construction leaked two pools for the lifetime of the process — and both cmd/server.go
-// and cmd/workers.go retry construction, so a deployment brought up before its broker is
-// reachable leaked a pair per attempt, in a loop.
-//
-// A leak is not directly observable from a test, but the ORDER that prevents it is: with BOTH
-// the Kafka configuration and the Redis DSN invalid, whichever error comes back names the step
-// that ran first. Asserting it is the KAFKA error is asserting that nothing was acquired when
-// the failure happened. If a future change moved the publisher back below Redis, the Redis
-// error would surface instead and this test would fail — which is the only way that regression
-// can be caught, because the leak itself is silent.
 func TestNewBlnk_ValidatesTheEventPublisherBeforeAcquiringAnyPooledResource(t *testing.T) {
 	cnf := &config.Configuration{
 		// A DSN that cannot resolve. If Redis were constructed first this is the error that
@@ -523,20 +440,11 @@ func TestNewBlnk_ValidatesTheEventPublisherBeforeAcquiringAnyPooledResource(t *t
 			"two connection pools on every failed construction")
 }
 
-// TestNewBlnk_RegistersTheSystemErrorSenderIntoTheEventOutbox proves the eighth producer
-// call site is covered on a deployment that runs Kafka.
+// TestNewBlnk_RegistersTheSystemErrorSenderIntoTheEventOutbox proves the eighth
+// producer call site is covered on a deployment that runs Kafka.
 //
-// system.error is the only event type emitted indirectly: internal/notification cannot
-// import this package, so it holds a registered WebhookSender and NotifyError calls through
-// it. NewBlnk registering that closure is what captures the event, and routing the closure
-// at PublishEvent is what puts it in the outbox alongside the other twelve — earning it the
-// same durable retry, dead-lettering and replay.
-//
-// The Kafka-only configuration is the one that used to be unreachable: NotifyError guards the
-// call on EITHER transport being configured, and a guard that tested the webhook URL alone
-// would drop system.error on every post-migration deployment with nothing failing to say so.
-// The webhook-only half of that guard is covered by the sibling test below, which asserts the
-// destination such a deployment actually has.
+// The webhook-only half of that guard is covered by the sibling test below, which
+// asserts the destination such a deployment actually has.
 func TestNewBlnk_RegistersTheSystemErrorSenderIntoTheEventOutbox(t *testing.T) {
 	cnf := wiringRedisConfiguration(t)
 	cnf.Kafka = config.KafkaConfig{
@@ -571,23 +479,8 @@ func TestNewBlnk_RegistersTheSystemErrorSenderIntoTheEventOutbox(t *testing.T) {
 	wiringAssertSystemErrorEnvelope(t, row.Payload, systemError.Error())
 }
 
-// TestNewBlnk_BoundsTheSystemErrorSendersOwnContext pins the deadline the closure constructs.
-//
-// # Why the closure has to construct one at all
-//
-// notification.WebhookSender carries no context and must not grow one — the notification
-// package's signature is frozen — and NotifyError runs the sender on a goroutine detached from
-// any request. So nothing upstream can supply a deadline, and the closure registered in NewBlnk
-// is the only place one can come from.
-//
-// It used to pass context.Background(). That reads as harmless and is not: system.error is the
-// event type raised BY failures, so it arrives in bursts during exactly the outage that makes a
-// database stop answering, and an insert with no deadline pinned each notifier goroutine
-// indefinitely. The capture is a single attempt with no retry budget, so the bound is the whole
-// operation's.
-//
-// The assertion is on the context the DATASOURCE received, which is the only observation that
-// proves the bound reached the operation rather than being created and discarded.
+// TestNewBlnk_BoundsTheSystemErrorSendersOwnContext pins the deadline the closure
+// constructs.
 func TestNewBlnk_BoundsTheSystemErrorSendersOwnContext(t *testing.T) {
 	cnf := wiringRedisConfiguration(t)
 	cnf.Kafka = config.KafkaConfig{
@@ -619,18 +512,15 @@ func TestNewBlnk_BoundsTheSystemErrorSendersOwnContext(t *testing.T) {
 			"stated by systemErrorCaptureBudget is the bound the operation actually gets")
 }
 
-// TestNewBlnk_RegistersTheSystemErrorSenderIntoTheLegacyTransportWhenKafkaIsAbsent is the
-// other half of the same guarantee, for the configuration nearly every deployment is in.
+// TestNewBlnk_RegistersTheSystemErrorSenderIntoTheLegacyTransportWhenKafkaIsAbsent is
+// the other half of the same guarantee, for the configuration nearly every deployment
+// is in.
 //
 // NotifyError calls the registered sender when EITHER transport is configured, so on a
-// deployment with a webhook URL and no broker the closure runs — and for a while it captured
-// an outbox row that nothing would ever claim, because the relay refuses to run without
-// Kafka. system.error stopped being delivered at all, silently, on exactly the deployments
-// that had never opted into Kafka.
-//
-// The assertion is therefore on the LEGACY QUEUE, and on the datasource having stayed
-// untouched. Both halves matter: delivering the event is the requirement, and not writing an
-// undrainable row is what stops the outbox filling up with events nobody will ever send.
+// deployment with a webhook URL and no broker the closure runs — and for a while it
+// captured an outbox row that nothing would ever claim, because the relay refuses to
+// run without Kafka. system.error stopped being delivered at all, silently, on exactly
+// the deployments that had never opted into Kafka.
 func TestNewBlnk_RegistersTheSystemErrorSenderIntoTheLegacyTransportWhenKafkaIsAbsent(t *testing.T) {
 	const legacyQueue = "webhook_queue"
 
@@ -683,13 +573,10 @@ func TestNewBlnk_RegistersTheSystemErrorSenderIntoTheLegacyTransportWhenKafkaIsA
 
 // TestBlnkClose_ReleasesTheEventPublisherAndStaysNilSafe covers shutdown.
 //
-// A publisher's writers hold pooled broker connections and a SASL session per broker, and
-// closing a writer flushes what it has batched. Leaving them open leaks the connections and
-// loses events that were accepted but not yet produced, and neither is visible at the time.
+// A publisher's writers hold pooled broker connections and a SASL session per broker,
+// and closing a writer flushes what it has batched.
 //
-// The nil case matters just as much. A Blnk built as a struct literal — which many tests do
-// — has no publisher and no asynq client, and Close must stay silent rather than panic on
-// the nil interface.
+// The nil case matters just as much.
 func TestBlnkClose_ReleasesTheEventPublisherAndStaysNilSafe(t *testing.T) {
 	t.Run("the publisher is closed exactly once", func(t *testing.T) {
 		publisher := &wiringRecordingPublisher{NoopEventPublisher: NewNoopEventPublisher()}
@@ -725,11 +612,11 @@ func TestBlnkClose_ReleasesTheEventPublisherAndStaysNilSafe(t *testing.T) {
 	})
 
 	t.Run("the release is announced, and a failed release is announced differently", func(t *testing.T) {
-		// PERF-P17 was that NOTHING invoked this method: every shutdown left the publisher's
-		// writer goroutines and broker connections to the process's death. Now that the server
-		// and worker commands do invoke it, an operator has to be able to CONFIRM that from the
-		// log — the absence of the step is not observable from outside the process, and neither
-		// is its presence unless it says so.
+		// A shutdown that never invokes this method leaves the publisher's
+		// writer goroutines and broker connections to the process's death. Now that the
+		// server and worker commands do invoke it, an operator has to be able to CONFIRM that
+		// from the log — the absence of the step is not observable from outside the process,
+		// and neither is its presence unless it says so.
 		t.Run("success", func(t *testing.T) {
 			hook := logtest.NewGlobal()
 			defer hook.Reset()
@@ -780,10 +667,8 @@ func TestBlnkClose_ReleasesTheEventPublisherAndStaysNilSafe(t *testing.T) {
 // TestInitializeEventPublisher_NeverReturnsANilPublisher pins the field invariant the
 // wiring site establishes.
 //
-// Close and, once it exists, the relay both read b.events without a nil check, and they can
-// only do that because this constructor guarantees a value. A nil configuration is included
-// because it is genuinely reachable: a process whose configuration has not been loaded yet
-// resolves one.
+// Close and, once it exists, the relay both read b.events without a nil check, and they
+// can only do that because this constructor guarantees a value.
 func TestInitializeEventPublisher_NeverReturnsANilPublisher(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
@@ -802,23 +687,18 @@ func TestInitializeEventPublisher_NeverReturnsANilPublisher(t *testing.T) {
 	}
 }
 
-// TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer pins the least-privilege
-// boundary between the process roles.
+// TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer pins the
+// least-privilege boundary between the process roles.
 //
-// It is the assertion that stops the worker holding write authority over every ledger topic.
-// The configuration below IS fully publishable — brokers, an insecure-local-dev
-// acknowledgement, everything a producer needs — so the ONLY thing that can make the result a
-// no-op is the role. A regression that dropped the role check would build a real producer here
-// and fail, which is the point: the check is invisible in behaviour otherwise, because a
-// producer nothing calls looks exactly like no producer at all until the credential leaks.
+// It is the assertion that stops the worker holding write authority over every ledger
+// topic.
 func TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer(t *testing.T) {
-	// THE SHARED BLACKHOLE CONSTANT, not a literal. This fixture held 198.51.100.1 — a PUBLIC
-	// documentation address — and it has to be private space now, for the reason the constant's
-	// own comment gives: KAFKA_INSECURE_LOCAL_DEV asserts the broker is local, and
-	// requireLocalBrokersForPlaintext verifies the assertion instead of merely warning about it,
-	// so an acknowledged-plaintext configuration pointing at a public address is one the
-	// transport must REFUSE. A refusal here would fail this test for a reason that has nothing
-	// to do with the role boundary it exists to pin.
+	// THE SHARED BLACKHOLE CONSTANT, not a literal. This fixture held 198.51.100.1 — a
+	// PUBLIC documentation address — and it has to be private space now, for the reason
+	// the constant's own comment gives: KAFKA_INSECURE_LOCAL_DEV asserts the broker is
+	// local, and requireLocalBrokersForPlaintext verifies the assertion instead of merely
+	// warning about it, so an acknowledged-plaintext configuration pointing at a public
+	// address is one the transport must REFUSE.
 	publishable := &config.Configuration{
 		Kafka: config.KafkaConfig{
 			Brokers:          []string{wiringBlackholeBroker},
@@ -851,8 +731,8 @@ func TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer(t *testin
 		})
 	}
 
-	// The role check must precede the configuration read, or a non-publishing role would still
-	// fail to start on a credential it would never present. Plaintext without the
+	// The role check must precede the configuration read, or a non-publishing role would
+	// still fail to start on a credential it would never present. Plaintext without the
 	// local-development acknowledgement is the cheapest configuration NewEventPublisher
 	// refuses outright.
 	t.Run("a non-publishing role is unaffected by a producer misconfiguration", func(t *testing.T) {
@@ -875,12 +755,10 @@ func TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer(t *testin
 	})
 }
 
-// TestProcessRole_PublishesEventsIsAnAllowlist pins the direction the role test fails in.
+// TestProcessRole_PublishesEventsIsAnAllowlist pins the direction the role test fails
+// in.
 //
-// Only the server publishes. A role added later without a decision recorded in
-// PublishesEvents must come out non-publishing, because the alternative failure — a new role
-// silently acquiring write authority over every ledger topic — is the one that cannot be
-// noticed by watching the system behave.
+// Only the server publishes.
 func TestProcessRole_PublishesEventsIsAnAllowlist(t *testing.T) {
 	assert.True(t, ProcessRoleServer.PublishesEvents(),
 		"the server hosts the relay and is the only producer of Kafka messages")
@@ -897,10 +775,7 @@ func TestProcessRole_PublishesEventsIsAnAllowlist(t *testing.T) {
 
 // wiringOpenDescriptors counts this process's open file descriptors.
 //
-// It is how a POOLED CLIENT LEAK is observed. Both the redis client and the asynq client open
-// sockets eagerly — the pool is configured with MinIdleConns of 20 — so a construction that
-// returns without closing them leaves those sockets behind, and the count is the only direct
-// evidence of it. Goroutine counts would be a proxy and a noisier one.
+// It is how a POOLED CLIENT LEAK is observed.
 //
 // Returns:
 //   - int: the number of entries in /proc/self/fd, or -1 where that is unavailable.
@@ -915,29 +790,9 @@ func wiringOpenDescriptors(t *testing.T) int {
 	return len(entries)
 }
 
-// TestNewBlnk_ClosesEveryAcquiredClientWhenThePublisherFailsToConstruct is the RES-01 guard.
+// TestNewBlnk_ClosesEveryAcquiredClientWhenThePublisherFailsToConstruct is the guard.
 //
-// # The defect
-//
-// initializeRedisClients runs BEFORE initializeEventPublisher, and both clients it returns own
-// sockets and background goroutines from the moment they are built — the pool is configured with
-// twenty minimum idle connections, so the sockets are opened eagerly rather than on first use.
-// The publisher-construction error path returned without closing either.
-//
-// That is not a theoretical path. It is reached by a malformed CA bundle, a SASL credential
-// SASLprep rejects, and TLS disabled without the local-development acknowledgement — all
-// CONFIGURATION MISTAKES, which is exactly the class of failure a supervised process retries in a
-// loop. Each retry leaked another pair, so a misconfigured deployment exhausted its descriptor
-// limit instead of failing cleanly on the first attempt, and the eventual symptom ("too many open
-// files", somewhere else entirely) named nothing to do with Kafka configuration.
-//
-// # How the fix is observed
-//
-// The construction is repeated enough times that a per-attempt leak of twenty-odd descriptors
-// would be unmistakable, and the descriptor count is required not to grow with the attempts. The
-// tolerance is deliberately generous: the test asserts the ABSENCE OF GROWTH PROPORTIONAL TO THE
-// ATTEMPTS, not an exact figure, because the Go runtime and the miniredis server in the fixture
-// both legitimately hold descriptors of their own.
+// That is not a theoretical path.
 func TestNewBlnk_ClosesEveryAcquiredClientWhenThePublisherFailsToConstruct(t *testing.T) {
 	const attempts = 12
 
@@ -976,9 +831,9 @@ func TestNewBlnk_ClosesEveryAcquiredClientWhenThePublisherFailsToConstruct(t *te
 	final := wiringOpenDescriptors(t)
 	growth := final - baseline
 
-	// Each leaked pair would hold at least the eight minimum idle redis connections plus the
-	// asynq client's own, so twelve attempts would grow the count by roughly a hundred. A
-	// tolerance of one per attempt is far below that and far above the noise.
+	// Each leaked pair would hold at least the eight minimum idle redis connections plus
+	// the asynq client's own, so twelve attempts would grow the count by roughly a
+	// hundred. A tolerance of one per attempt is far below that and far above the noise.
 	assert.LessOrEqual(t, growth, attempts,
 		"THE DESCRIPTOR COUNT GREW BY %d ACROSS %d FAILED CONSTRUCTIONS (%d -> %d): the redis and "+
 			"asynq clients acquired before the publisher are not being closed on its error path, so "+

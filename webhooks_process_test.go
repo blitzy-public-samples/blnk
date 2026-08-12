@@ -16,35 +16,16 @@ limitations under the License.
 
 // THIS FILE IS LIVE COVERAGE, NOT LEGACY DEBRIS — AND IT IS DELETED WITH webhooks.go.
 //
-// It is the specification of the legacy HTTP webhook transport: the signed wire contract,
-// the no-op-when-unconfigured semantic, the retry-on-non-2xx semantic, the task identity on
-// the shared webhook queue, and the byte fidelity that makes the dual-delivery
-// payload-equivalence guarantee measurable. Every one of those behaviours is a behaviour the
-// Kafka pipeline either reproduces or is compared against, so the coverage below must stay
-// green for the whole 30-day dual-delivery window rather than being retired early with the
-// call sites that used to drive it.
+// It is the specification of the legacy HTTP webhook transport: the signed wire
+// contract, the no-op-when-unconfigured semantic, the retry-on-non-2xx semantic, the
+// task identity on the shared webhook queue, and the byte fidelity that makes the
+// dual-delivery payload-equivalence guarantee measurable.
 //
-// WHEN IT GOES. This file is deleted TOGETHER WITH webhooks.go, at step 2 of the SUNSET block
-// at the foot of that file, and only once WebhookSunsetPassed (event_sunset.go) answers true
-// for the deployed WEBHOOK_DEPRECATION_SUNSET_DATE. It has no subject after that: every
-// function it exercises — processHTTP, processHTTPRaw, SendWebhook,
-// EnqueueLegacyWebhookDelivery, legacyWebhookTaskID and ProcessWebhook — is deleted in the
-// same change. Deleting it EARLIER removes the second transport the equivalence guarantee is
-// measured against; deleting it LATER leaves a test file with nothing to compile against.
+// WHEN IT GOES.
 //
-// WHAT MUST NOT GO WITH IT. Two behaviours asserted here outlive this file because the
-// symbols that own them do — and both symbols have ALREADY MOVED: the NewWebhook envelope,
-// which IS the payload every LedgerEvent carries, now lives in event_outbox.go, and the
-// getEventFromStatus vocabulary now lives in event_topics.go. Their coverage lives where they
-// landed — TestEventOutboxSource_HoldsTheRelocatedPayloadContract and
-// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary each guard the declaration and
-// the invariant in both directions — so the sunset deletion loses no assertion about either.
-// The getEventFromStatus tests at the foot of this file are deliberate duplicates of that
-// vocabulary from the transport's side, and they go with this file.
+// WHAT MUST NOT GO WITH IT.
 //
-// Nothing in this file may assert /hooks behaviour. The webhook asynq QUEUE is shared with
-// transaction hooks and TypeSense indexing and survives the sunset untouched; only the
-// ProcessWebhook handler mapping is removed. See SUNSET step 4 in webhooks.go.
+// Nothing in this file may assert /hooks behaviour.
 
 package blnk
 
@@ -76,16 +57,14 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Test infrastructure: the Redis these tests use, the queues they own, and how a
-// queue listing is allowed to fail
+// Test infrastructure: the Redis these tests use, the queues they own, and how a queue
+// listing is allowed to fail
 // ---------------------------------------------------------------------------
 
 // legacyWebhookRedisAddrEnv overrides the Redis address these tests use.
 //
-// The tests below are integration tests by nature: asynq's enqueue path and its Inspector are
-// the subject, not a stand-in for them, so they need a real Redis. The address was hard-coded
-// at every one of a dozen call sites, which made "run this suite against a different Redis"
-// impossible and gave a wrong address a dozen separate ways to fail.
+// The tests below are integration tests by nature: asynq's enqueue path and its
+// Inspector are the subject, not a stand-in for them, so they need a real Redis.
 const legacyWebhookRedisAddrEnv = "BLNK_TEST_REDIS_ADDR"
 
 // legacyWebhookDefaultRedisAddr is the address the local stack publishes.
@@ -94,23 +73,8 @@ const legacyWebhookDefaultRedisAddr = "localhost:6379"
 // legacyWebhookRedisDialBudget bounds the reachability probe below.
 const legacyWebhookRedisDialBudget = 2 * time.Second
 
-// legacyWebhookRedisAddr resolves the Redis address and proves something is listening on it.
-//
-// # Why it SKIPS rather than fails
-//
-// An unreachable Redis is a statement about the environment, not about the legacy webhook
-// transport, and it is indistinguishable from it in the failure output: asynq reports a dial
-// error from inside Enqueue, so a dozen tests fail at once with a message that names neither
-// Redis nor the fact that one is required. The probe converts that into one legible skip per
-// test, with the address it tried and the command that provides one.
-//
-// # Why it is a skip and not miniredis
-//
-// asynq's Inspector reads its own Redis data structures through Lua, and several of these
-// tests assert on task IDENTITY and RETENTION — behaviour that lives in those scripts. A
-// stand-in that implements Redis approximately would make those assertions statements about
-// the stand-in. The real broker is the subject here, and the tests that do NOT need one
-// (the whole of webhooks_test.go, and every relay test) already use miniredis or fakes.
+// legacyWebhookRedisAddr resolves the Redis address and proves something is listening
+// on it.
 //
 // Parameters:
 //   - t *testing.T: the test to skip when nothing is listening.
@@ -139,13 +103,8 @@ func legacyWebhookRedisAddr(t *testing.T) string {
 	return addr
 }
 
-// legacyWebhookUniqueQueueName returns a queue name no other test, and no other clone, can produce.
-//
-// The names were built from time.Now().UnixNano(), which is unique only by luck: two processes
-// that start in the same nanosecond collide, and — more to the point — CLONE_INDEX-separated
-// clones sharing one Redis would silently observe each other's tasks, so a test asserting "the
-// queue is empty" could fail because a sibling clone had just filled it. A UUID plus the clone
-// index removes both, and the prefix keeps the names greppable in Redis.
+// legacyWebhookUniqueQueueName returns a queue name no other test, and no other clone,
+// can produce.
 //
 // Parameters:
 //   - t *testing.T: the test the queue belongs to; its name is carried for legibility.
@@ -166,26 +125,9 @@ func legacyWebhookUniqueQueueName(t *testing.T, prefix string) string {
 
 // newLegacyWebhookInspector builds an Inspector for queueName and closes it on cleanup.
 //
-// An Inspector holds its own Redis client. Every one of these tests used to create one and
-// leave it open, so a package run leaked one connection per test — enough, on a Redis with a
-// modest maxclients, to make a LATER test fail on connection exhaustion for a reason nothing
-// in its output would explain. The cleanup also empties and removes the queue, so a failed
-// assertion does not leave tasks behind for the next run to trip over.
+// An Inspector holds its own Redis client.
 //
-// # Why the cleanup's own errors are asserted
-//
-// The three cleanup calls used to discard their errors to `_`. That made the cleanup a
-// statement of intent rather than a fact: a Redis that had gone away, an authentication
-// failure, or a queue asynq declined to delete all left tasks and the queue itself behind
-// while reporting nothing. The cost lands on a LATER test — this package shares one Redis
-// with every other clone on the host, and a leftover queue is exactly the contamination the
-// unique per-clone queue names exist to prevent. A cleanup that cannot fail cannot be relied
-// on, so each call is now asserted with the same discipline listLegacyPendingTasks applies to
-// listing: ErrQueueNotFound is legitimate, because asynq creates a queue lazily on first
-// enqueue and several of these tests deliberately enqueue nothing; every other error fails.
-//
-// assert rather than require, because a cleanup that stops at its first problem hides the
-// rest, and all three of these are worth knowing about together.
+// The three cleanup calls report their errors rather than discarding them.
 //
 // Parameters:
 //   - t *testing.T: the test owning the inspector.
@@ -218,21 +160,8 @@ func newLegacyWebhookInspector(t *testing.T, addr, queueName string) *asynq.Insp
 
 // legacyQueueMissing reports whether err is asynq saying the queue does not exist.
 //
-// # Why one of the two shapes is matched on its message
-//
 // asynq v0.25.1 reports the same condition two different ways, and only one of them is
-// reachable through a sentinel. DeleteQueue and the List*Tasks family translate it to the
-// exported asynq.ErrQueueNotFound (inspector.go:228,244), so errors.Is answers for them. The
-// DeleteAll*Tasks family returns what its RDB layer produced untranslated (inspector.go:532),
-// and that is errors.E(errors.Internal, &errors.QueueNotFoundError{…}) from asynq's INTERNAL
-// errors package (internal/rdb/inspect.go:451) — a type this module cannot import and one that
-// does not wrap the exported sentinel. There is no exported discriminator for that call path.
-//
-// The message match is therefore the only observation available, and it is made as narrow as
-// possible: the rendered error must name THIS queue as not existing, so an internal error about
-// anything else — a Redis command failure, a permission problem — still fails the cleanup. The
-// asynq version is named above so that an upgrade which adds a sentinel is a prompt to delete
-// this half rather than a silent inheritance.
+// reachable through a sentinel.
 //
 // Parameters:
 //   - err error: the error to classify; must not be nil.
@@ -248,11 +177,8 @@ func legacyQueueMissing(err error, queueName string) bool {
 	return strings.Contains(err.Error(), fmt.Sprintf("queue %q does not exist", queueName))
 }
 
-// assertLegacyQueueCleanupSucceeded fails the test unless err is nil or the queue simply
-// never existed.
-//
-// A missing queue is legitimate here and expected often: asynq creates a queue lazily on first
-// enqueue, and several of these tests exist precisely to prove that NOTHING was enqueued.
+// assertLegacyQueueCleanupSucceeded fails the test unless err is nil or the queue
+// simply never existed.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and failure reporting.
@@ -273,22 +199,8 @@ func assertLegacyQueueCleanupSucceeded(t *testing.T, err error, action, queueNam
 		action, queueName, err)
 }
 
-// listLegacyPendingTasks lists a queue's pending tasks, accepting ONLY "the queue does not
-// exist" as a reason for there to be none.
-//
-// # The assertion this replaces could not fail
-//
-// Every "nothing was enqueued" test used to read `tasks, err := ListPendingTasks(q)` and then
-// assert emptiness only `if err == nil`. Under that shape a Redis that was down, a wrong
-// address, a permission error or an asynq API change all satisfied the test silently — the
-// assertion was simply never reached. The tests that mattered most were exactly the ones that
-// could not fail: "no URL configured enqueues nothing" and "past the sunset the relay enqueues
-// nothing" are both proofs of an ABSENCE, and an absence is only evidence when the observation
-// that looked for it is known to have worked.
-//
-// asynq wraps ErrQueueNotFound for a queue that has never held a task, which is a legitimate
-// and expected shape of "empty" here since asynq creates a queue lazily on first enqueue. That
-// one error is translated to an empty slice; every other error fails the test.
+// listLegacyPendingTasks lists a queue's pending tasks, accepting ONLY "the queue does
+// not exist" as a reason for there to be none.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and failure reporting.
@@ -357,14 +269,9 @@ func newWebhookReceiver(status int) (*httptest.Server, func() []receivedWebhook)
 	return server, get
 }
 
-// storeWebhookTestConfig stores a configuration pointing the webhook notification at url, with
-// a unique webhook queue per test so that no two tests — and no two clones — can observe each
-// other's tasks.
-//
-// It RESTORES whatever was published before, when the test finishes. config.ConfigStore is a
-// process-global atomic.Value: a webhook URL, a signing secret or a queue name left installed
-// here is read by every later test in the package that calls config.Fetch, and the failure
-// then appears in a test that never mentioned webhooks at all.
+// storeWebhookTestConfig stores a configuration pointing the webhook notification at
+// url, with a unique webhook queue per test so that no two tests — and no two clones —
+// can observe each other's tasks.
 //
 // Parameters:
 //   - t *testing.T: the test whose lifetime the configuration is scoped to.
@@ -611,10 +518,9 @@ func TestSendWebhook_UnmarshalablePayloadReturnsError(t *testing.T) {
 }
 
 func TestProcessWebhook_NoSignatureHeadersWithEmptySecret(t *testing.T) {
-	// Regression: an empty Server.SecretKey used to produce an HMAC over the
-	// empty key — computable (and forgeable) by anyone. The delivery is now
-	// sent unsigned so receivers cannot mistake a forgeable header for
-	// authentication.
+	// Regression: an empty Server.SecretKey used to produce an HMAC over the empty key —
+	// computable (and forgeable) by anyone. The delivery is now sent unsigned so receivers
+	// cannot mistake a forgeable header for authentication.
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
 	storeWebhookTestConfig(t, server.URL, "", nil)
@@ -635,46 +541,30 @@ func TestProcessWebhook_NoSignatureHeadersWithEmptySecret(t *testing.T) {
 
 // ===== DUAL-DELIVERY BYTE FIDELITY AND TASK IDENTITY =====
 //
-// The tests above cover the legacy transport as it always behaved. The ones below cover the
-// two properties the Kafka dual-delivery window adds to it, both of which are about the
-// relay handing this transport bytes it already holds rather than a struct to re-serialise.
+// The tests above cover the legacy transport as it always behaved.
 
-// nonCanonicalLegacyBody returns a legacy webhook body whose bytes CANNOT survive a round
-// trip through NewWebhook.Payload interface{}.
+// nonCanonicalLegacyBody returns a legacy webhook body whose bytes CANNOT survive a
+// round trip through NewWebhook.Payload interface{}.
 //
-// Every element of it is chosen to break under re-marshalling, because a body that survives
-// proves nothing:
+// Every element of it is chosen to break under re-marshalling, because a body that
+// survives proves nothing:
 //
-//   - The data object's keys are in deliberately non-alphabetical order. Decoding makes them
-//     a map[string]interface{}, and Go marshals map keys SORTED, so re-marshalling
-//     alphabetises them.
-//   - The identifier is a large integer. Decoding makes it a float64, and re-marshalling a
-//     float64 of that magnitude produces scientific notation.
-//   - The amount carries a trailing zero and high precision. float64 re-rendering drops the
-//     trailing zero and can perturb the last digits.
-//
-// A ledger event's payload is a marshaled domain struct, whose fields serialise in
-// declaration order rather than alphabetically, so this is the realistic shape rather than a
-// contrived one.
+//   - The data object's keys are in deliberately non-alphabetical order.
+//   - The identifier is a large integer. Decoding makes it a float64, and
+//     re-marshalling a float64 of that magnitude produces scientific notation.
+//   - The amount carries a trailing zero and high precision. float64 re-rendering drops
+//     the trailing zero and can perturb the last digits.
 func nonCanonicalLegacyBody() []byte {
 	return []byte(`{"event":"transaction.applied","data":{"transaction_id":"txn_fidelity",` +
 		`"amount":150.250,"reference":"ref_1","source":"bal_src","precise_amount":9007199254740993,` +
 		`"currency":"USD"}}`)
 }
 
-// TestEnqueueLegacyWebhookDelivery_CarriesTheStoredBytesVerbatim is the executable half of
-// the dual-delivery payload-equivalence guarantee (V-8).
+// TestEnqueueLegacyWebhookDelivery_CarriesTheStoredBytesVerbatim is the executable half
+// of the dual-delivery payload-equivalence guarantee.
 //
-// The guarantee is that the legacy webhook and the Kafka message carry the SAME payload for
-// the same event, asserted byte for byte. The relay holds the authoritative bytes — the exact
-// blnk.event_outbox payload it published to Kafka — so the only way this transport can honour
-// the guarantee is to carry them unchanged.
-//
-// SendWebhook cannot: it takes a struct, so a caller holding bytes must decode into
-// NewWebhook.Payload interface{} and marshal again, and that round trip re-orders object keys
-// and re-renders numbers. The failure is invisible to anything but a byte comparison, because
-// the two bodies stay semantically equal — which is exactly why this test asserts bytes and
-// then separately demonstrates that the round trip really would have changed them.
+// The guarantee is that the legacy webhook and the Kafka message carry the SAME payload
+// for the same event, asserted byte for byte.
 func TestEnqueueLegacyWebhookDelivery_CarriesTheStoredBytesVerbatim(t *testing.T) {
 	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
@@ -714,13 +604,11 @@ func TestEnqueueLegacyWebhookDelivery_CarriesTheStoredBytesVerbatim(t *testing.T
 			"would pass even if the raw path did not exist")
 }
 
-// TestProcessWebhook_DeliversTheEnqueuedBytesWithoutReserialising closes the second half of
-// the path.
+// TestProcessWebhook_DeliversTheEnqueuedBytesWithoutReserialising closes the second
+// half of the path.
 //
-// Preserving bytes into the queue is worthless if the handler re-serialises them on the way
-// out. This asserts the body the receiver is handed is byte-identical to the body that was
-// enqueued, and — because a receiver verifies HMAC over the bytes it received — that the
-// signature covers those same bytes.
+// Preserving bytes into the queue is worthless if the handler re-serialises them on the
+// way out.
 func TestProcessWebhook_DeliversTheEnqueuedBytesWithoutReserialising(t *testing.T) {
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
@@ -758,15 +646,12 @@ func TestProcessWebhook_DeliversTheEnqueuedBytesWithoutReserialising(t *testing.
 // identity (F27).
 //
 // Enqueuing the delivery and recording that the webhook leg was dispatched are two
-// operations against two systems with no transaction spanning them. A crash in between
-// leaves the row unmarked, so the next claim enqueues the delivery again — a duplicate
-// webhook for one event, which for a payment notification is a real consequence and not a
-// tidiness concern.
+// operations against two systems with no transaction spanning them.
 //
-// The event ID is the task's identity, so the second enqueue is refused by asynq rather than
-// accepted. The refusal is reported as SUCCESS, because the post-condition the caller needs
-// — this event's webhook leg is queued exactly once — already holds, and failing would stall
-// the row behind a condition that is already satisfied.
+// The event ID is the task's identity, so the second enqueue is refused by asynq rather
+// than accepted. The refusal is reported as SUCCESS, because the post-condition the
+// caller needs — this event's webhook leg is queued exactly once — already holds, and
+// failing would stall the row behind a condition that is already satisfied.
 func TestEnqueueLegacyWebhookDelivery_SuppressesADuplicateForTheSameEvent(t *testing.T) {
 	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
@@ -796,13 +681,13 @@ func TestEnqueueLegacyWebhookDelivery_SuppressesADuplicateForTheSameEvent(t *tes
 	assert.Len(t, tasks, 2, "a distinct event must not be suppressed by another event's identity")
 }
 
-// TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest covers the three inputs that
-// cannot produce a correct delivery.
+// TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest covers the three inputs
+// that cannot produce a correct delivery.
 //
-// The missing event ID matters most and is the least obvious: asynq SILENTLY IGNORES an empty
-// task ID rather than rejecting it, so a caller that omitted it would get at-least-once
-// delivery with nothing anywhere indicating that the duplicate suppression it was relying on
-// was not in effect.
+// The missing event ID matters most and is the least obvious: asynq SILENTLY IGNORES an
+// empty task ID rather than rejecting it, so a caller that omitted it would get
+// at-least-once delivery with nothing anywhere indicating that the duplicate
+// suppression it was relying on was not in effect.
 func TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest(t *testing.T) {
 	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
@@ -831,10 +716,6 @@ func TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest(t *testing.T) {
 
 // TestEnqueueLegacyWebhookDelivery_NoURLConfiguredSkipsEnqueue pins the same
 // no-op-when-unconfigured contract SendWebhook has.
-//
-// It is load-bearing rather than defensive: a deployment with no webhook URL runs the Kafka
-// leg alone, and an error here would fail the relay's dual-delivery branch on every event for
-// a transport the operator deliberately did not configure.
 func TestEnqueueLegacyWebhookDelivery_NoURLConfiguredSkipsEnqueue(t *testing.T) {
 	cnf, queueName := storeWebhookTestConfig(t, "", "secret", nil)
 
@@ -852,12 +733,11 @@ func TestEnqueueLegacyWebhookDelivery_NoURLConfiguredSkipsEnqueue(t *testing.T) 
 		"nothing may be enqueued when no webhook URL is configured")
 }
 
-// TestLegacyWebhookTaskID_NamespacesTheEventID guards against a cross-feature collision.
+// TestLegacyWebhookTaskID_NamespacesTheEventID guards against a cross-feature
+// collision.
 //
-// The webhook queue is SHARED with transaction hooks and TypeSense indexing, and asynq task
-// IDs are unique per QUEUE rather than per task type. A bare event ID as the identity would be
-// one accidental identifier collision away from silently dropping another feature's task as a
-// duplicate — or having one of ours dropped.
+// The webhook queue is SHARED with transaction hooks and TypeSense indexing, and asynq
+// task IDs are unique per QUEUE rather than per task type.
 func TestLegacyWebhookTaskID_NamespacesTheEventID(t *testing.T) {
 	id := legacyWebhookTaskID("evt_123")
 
@@ -870,58 +750,28 @@ func TestLegacyWebhookTaskID_NamespacesTheEventID(t *testing.T) {
 
 // ===== THE DUAL-DELIVERY BRANCH IS THE ONLY THING THAT DRIVES THIS TRANSPORT =====
 //
-// Everything above exercises the legacy transport through its own entry points, which is what
-// pins the wire contract. What it cannot show is WHO CALLS IT, and that is the part the Kafka
-// migration changed.
-//
-// Before: eight domain post-actions called SendWebhook directly. After: none of them do. A
-// ledger mutation records an event into blnk.event_outbox inside the very transaction that
-// performed it, and the relay in event_relay.go claims that row, publishes it to Kafka and —
-// for as long as the dual-delivery window is open — enqueues the legacy delivery from THAT SAME
-// CLAIMED ROW. The relay's dual-delivery branch is the one and only caller.
-//
-// The tests below are therefore the only ones in this file that start from an outbox row rather
-// than from a webhook envelope, and they are deliberately the REAL transport end to end: the
-// relay's legacy seam is the real *Blnk, the enqueue is a real asynq enqueue onto the real
-// Redis queue, the handler is the real ProcessWebhook, and the receiver is a real HTTP server.
-// event_relay_test.go covers the same branch against a fake legacy transport, which is where
-// the relay's decisions belong; what only this file can show is that the decision actually
-// reaches a socket.
-//
-// The sunset decision is likewise NOT stubbed here. processor.sunsetPassed is left as
-// NewEventRelayProcessor assigned it — event_sunset.go's WebhookSunsetPassed — so the branch is
-// driven by the configured WEBHOOK_DEPRECATION_SUNSET_DATE through the single decision point,
-// which is the only arrangement that can show the real predicate wired to the real queue.
+// Before: eight domain post-actions called SendWebhook directly.
 
-// storeDualDeliveryWebhookConfig publishes a configuration describing a deployment inside — or
-// past the end of — the 30-day dual-delivery window.
+// storeDualDeliveryWebhookConfig publishes a configuration describing a deployment
+// inside — or past the end of — the 30-day dual-delivery window.
 //
 // It differs from storeWebhookTestConfig in exactly two ways, and both are deliberate:
 //
-//   - It carries WebhookDeprecationSunsetDate, which is the sole input to the sunset decision
-//     the relay's dual-delivery branch consults. Kafka.Brokers is left empty on purpose: with a
-//     window that parses, the verdict is a straight comparison against it, so configuring a
-//     broker would add nothing here except a dependency on one being reachable.
-//   - It RESTORES whatever configuration was published before, when the test finishes. A sunset
-//     date left behind in the global store would be read by every later test in this package
-//     that asks WebhookSunsetPassed — including the ones asserting the unconfigured default —
-//     and the failure would appear in a test that never mentioned a sunset.
-//
-// The field set is otherwise storeWebhookTestConfig's. This ADDS a field to a configuration
-// literal local to this file; it changes no field's name, type or meaning, so the configuration
-// shape the rest of the suite constructs is untouched.
+//   - It carries WebhookDeprecationSunsetDate, which is the sole input to the sunset
+//     decision the relay's dual-delivery branch consults.
+//   - It RESTORES whatever configuration was published before, when the test finishes.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and Cleanup registration.
 //   - url string: the webhook receiver URL, or "" for the unconfigured no-op contract.
 //   - secret string: the signing secret, or "" for unsigned delivery.
-//   - sunset time.Time: the sunset instant. Whole seconds only — time.RFC3339 carries no
-//     fractional part, so a sub-second offset would be silently lost in formatting.
+//   - sunset time.Time: the sunset instant. Whole seconds only — time.RFC3339 carries
+//     no fractional part, so a sub-second offset would be silently lost in formatting.
 //
 // Returns:
 //   - *config.Configuration: the published configuration.
-//   - string: the unique webhook queue name, so concurrent runs cannot collide on the shared
-//     Redis instance.
+//   - string: the unique webhook queue name, so concurrent runs cannot collide on the
+//     shared Redis instance.
 func storeDualDeliveryWebhookConfig(
 	t *testing.T,
 	url, secret string,
@@ -954,11 +804,11 @@ func storeDualDeliveryWebhookConfig(
 		Notification: config.Notification{
 			Webhook: config.WebhookConfig{
 				Url: url,
-				// The dual-delivery fixtures deliver to an httptest server on loopback over
-				// http, which is exactly the assertion this flag makes: the destination is on
-				// a network the operator owns. It opens loopback and http and nothing else —
-				// the redirect refusal stays unconditional and link-local, metadata,
-				// multicast, unspecified and NAT64-wrapped addresses stay refused with it set.
+				// The dual-delivery fixtures deliver to an httptest server on loopback over http,
+				// which is exactly the assertion this flag makes: the destination is on a network
+				// the operator owns. It opens loopback and http and nothing else — the redirect
+				// refusal stays unconditional and link-local, metadata, multicast, unspecified and
+				// NAT64-wrapped addresses stay refused with it set.
 				AllowPrivateDestination: true,
 			},
 		},
@@ -969,49 +819,41 @@ func storeDualDeliveryWebhookConfig(
 	return cnf, queueName
 }
 
-// dualDeliveryRelay is a relay whose Kafka and database seams are substituted while its LEGACY
-// seam is the real thing.
-//
-// The row's own fields are carried alongside the fakes so an assertion can name the claimed
-// row's event id, topic, payload and id without re-deriving any of them — the point of every
-// test below is that both transports came from ONE row, and re-deriving a value would let an
-// assertion pass against a row the relay never saw.
+// dualDeliveryRelay is a relay whose Kafka and database seams are substituted while its
+// LEGACY seam is the real thing.
 type dualDeliveryRelay struct {
 	processor *EventRelayProcessor
 	store     *relayFakeStore
 	publisher *relayFakePublisher
 
-	// The claimed row, unpacked. rowID is the outbox primary key the two markers are recorded
-	// against; payload is the stored legacy body; topic is the destination the row itself
-	// recorded.
+	// The claimed row, unpacked. rowID is the outbox primary key the two markers are
+	// recorded against; payload is the stored legacy body; topic is the destination the
+	// row itself recorded.
 	eventID string
 	topic   string
 	payload []byte
 	rowID   int64
 }
 
-// newDualDeliveryRelay builds a relay holding exactly one claimable outbox row, wired to
-// publish through a fake Kafka publisher and to deliver through the real legacy transport.
+// newDualDeliveryRelay builds a relay holding exactly one claimable outbox row, wired
+// to publish through a fake Kafka publisher and to deliver through the real legacy
+// transport.
 //
-// WHAT IS SUBSTITUTED, AND WHAT IS EMPHATICALLY NOT. The store and the publisher are fakes
-// because the alternative is a database and a broker for a test about an HTTP transport, and
-// event_relay_test.go already owns the relay's behaviour against them. Two things are left
-// exactly as NewEventRelayProcessor assigned them, and they are the reason these tests exist:
+// WHAT IS SUBSTITUTED, AND WHAT IS EMPHATICALLY NOT. The store and the publisher are
+// fakes because the alternative is a database and a broker for a test about an HTTP
+// transport, and event_relay_test.go already owns the relay's behaviour against them.
 //
-//   - processor.legacy is the real *Blnk, so EnqueueLegacyWebhookDelivery, the asynq client,
-//     the task identity, the retention and the queue routing are all production code.
-//   - processor.sunsetPassed is event_sunset.go's WebhookSunsetPassed, so the dual-delivery
-//     branch is decided by the configured date through the single decision point rather than by
-//     a stub that could disagree with it.
-//
-// The clock is pinned to relayFixedNow — the package's fixed test instant, which the fake store
-// also uses — so the sunset verdict is a deterministic comparison against the configured date
-// rather than a race with the wall clock.
+//   - processor.legacy is the real *Blnk, so EnqueueLegacyWebhookDelivery, the asynq
+//     client, the task identity, the retention and the queue routing are all production
+//     code.
+//   - processor.sunsetPassed is event_sunset.go's WebhookSunsetPassed, so the
+//     dual-delivery branch is decided by the configured date through the single
+//     decision point rather than by a stub that could disagree with it.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and assertions about the wiring.
-//   - b *Blnk: the real instance, built AFTER the configuration was published so that its
-//     cached configuration carries the test's webhook URL and queue.
+//   - b *Blnk: the real instance, built AFTER the configuration was published so that
+//     its cached configuration carries the test's webhook URL and queue.
 //   - eventID string: the outbox event id, which becomes the legacy task's identity.
 //
 // Returns:
@@ -1019,17 +861,16 @@ type dualDeliveryRelay struct {
 func newDualDeliveryRelay(t *testing.T, b *Blnk, eventID string) *dualDeliveryRelay {
 	t.Helper()
 
-	// A transaction event on one ledger: the common case, and the one whose ordering guarantee
-	// the partition key carries. relayRow's payload is a marshaled NewWebhook, so the row holds
-	// the bytes a real ledger mutation would have recorded.
+	// A transaction event on one ledger: the common case, and the one whose ordering
+	// guarantee the partition key carries. relayRow's payload is a marshaled NewWebhook,
+	// so the row holds the bytes a real ledger mutation would have recorded.
 	row := relayRow(1, eventID, "transaction.applied", "ldg_dual_delivery", relayFixedNow)
 
-	// The stored payload is deliberately one that CANNOT survive a decode/re-marshal round trip
-	// — non-alphabetical keys, a large integer identifier, a trailing-zero decimal. See
-	// nonCanonicalLegacyBody. relayRow's own payload is canonical, so a chain that re-serialised
-	// the body somewhere between the outbox row and the socket would carry it unchanged and this
-	// harness would prove nothing about byte fidelity. With this body, any re-serialisation
-	// anywhere along claim → enqueue → handler → socket shows up as a byte difference.
+	// The stored payload is deliberately one that CANNOT survive a decode/re-marshal round
+	// trip — non-alphabetical keys, a large integer identifier, a trailing-zero decimal.
+	// See nonCanonicalLegacyBody. relayRow's own payload is canonical, so a chain that
+	// re-serialised the body somewhere between the outbox row and the socket would carry
+	// it unchanged and this harness would prove nothing about byte fidelity.
 	row.Payload = nonCanonicalLegacyBody()
 
 	store := newRelayFakeStore(row)
@@ -1041,9 +882,10 @@ func newDualDeliveryRelay(t *testing.T, b *Blnk, eventID string) *dualDeliveryRe
 	processor.deadLetters = &relayFakeDeadLetterer{}
 	processor.now = func() time.Time { return relayFixedNow }
 
-	// The wiring these tests depend on is asserted rather than assumed. If a future change to
-	// NewEventRelayProcessor stopped adopting the instance as the legacy transport, every test
-	// below would still pass — against nothing — because a nil legacy seam is a silent no-op.
+	// The wiring these tests depend on is asserted rather than assumed. If a future change
+	// to NewEventRelayProcessor stopped adopting the instance as the legacy transport,
+	// every test below would still pass — against nothing — because a nil legacy seam is a
+	// silent no-op.
 	legacy, ok := processor.legacy.(*Blnk)
 	require.True(t, ok,
 		"the relay's legacy transport must be the *Blnk instance; these tests assert the real "+
@@ -1064,13 +906,8 @@ func newDualDeliveryRelay(t *testing.T, b *Blnk, eventID string) *dualDeliveryRe
 
 // pendingLegacyDeliveries lists the tasks waiting on queueName.
 //
-// It is the dual-delivery tests' name for listLegacyPendingTasks, kept because those tests read
-// better with it. It USED to swallow any listing error as "the queue is empty", on the argument
-// that asynq creates a queue lazily so a missing queue and an empty one are the same
-// observation. That argument is right about a missing queue and wrong about everything else: a
-// Redis that was down, a wrong address or a permission error read as "nothing was enqueued"
-// too, which is the exact conclusion the post-sunset case draws. Only ErrQueueNotFound is
-// accepted now, and every other failure is reported.
+// It is the dual-delivery tests' name for listLegacyPendingTasks, kept because those
+// tests read better with it.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and diagnostics.
@@ -1085,24 +922,11 @@ func pendingLegacyDeliveries(t *testing.T, inspector *asynq.Inspector, queueName
 	return listLegacyPendingTasks(t, inspector, queueName)
 }
 
-// TestProcessWebhook_DeliversFromDualDeliveryBranch is the end-to-end proof that the legacy
-// transport is now driven by the relay off a claimed outbox row.
+// TestProcessWebhook_DeliversFromDualDeliveryBranch is the end-to-end proof that the
+// legacy transport is now driven by the relay off a claimed outbox row.
 //
 // It starts where production starts — one row in blnk.event_outbox — and finishes where
-// production finishes: a signed HTTP request at a subscriber. Nothing in between is fabricated
-// by the test. Nothing calls SendWebhook, nothing calls EnqueueLegacyWebhookDelivery directly,
-// and no domain post-action is involved, because none of those is how a webhook is produced any
-// more.
-//
-// The chain it closes, link by link:
-//
-//	claimed row → relay's dual-delivery branch → EnqueueLegacyWebhookDelivery → real asynq
-//	queue → the task the relay actually produced → ProcessWebhook → signed POST at the receiver
-//
-// The handler is driven with the task READ BACK FROM THE QUEUE rather than one the test builds,
-// which is what makes this an end-to-end assertion rather than two half-tested halves: a body
-// mangled by the enqueue, a task type the worker mux could not route, or an identity the queue
-// rejected would all surface here.
+// production finishes: a signed HTTP request at a subscriber.
 func TestProcessWebhook_DeliversFromDualDeliveryBranch(t *testing.T) {
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
@@ -1120,18 +944,17 @@ func TestProcessWebhook_DeliversFromDualDeliveryBranch(t *testing.T) {
 	defer func() { _ = b.Close() }()
 
 	// The HANDLER's clock, pinned to the relay's. ProcessWebhook enforces the sunset at
-	// execution time (Q4-09), and this fixture expresses its window relative to relayFixedNow
-	// — so leaving the handler on the wall clock would have it judge the window closed while
-	// the relay judged it open, and the delivery this test exists to observe would never be
-	// attempted. Both legs reading one instant is also what makes "the handler and the relay
-	// agree" a property of the test rather than an accident of when the suite runs.
+	// execution time (Q4-09), and this fixture expresses its window relative to
+	// relayFixedNow — so leaving the handler on the wall clock would have it judge the
+	// window closed while the relay judged it open, and the delivery this test exists to
+	// observe would never be attempted.
 	b.legacyWebhookNow = func() time.Time { return relayFixedNow }
 
 	relay := newDualDeliveryRelay(t, b, gofakeit.UUID())
 
-	// The fixture must describe the window it claims to. Asserting the real predicate here means
-	// a mis-typed date cannot turn this into an accidental post-sunset test that passes because
-	// nothing was delivered at all.
+	// The fixture must describe the window it claims to. Asserting the real predicate here
+	// means a mis-typed date cannot turn this into an accidental post-sunset test that
+	// passes because nothing was delivered at all.
 	require.False(t, WebhookSunsetPassed(relayFixedNow),
 		"the pinned clock must fall inside the dual-delivery window for this test to have a legacy leg to assert")
 
@@ -1161,9 +984,9 @@ func TestProcessWebhook_DeliversFromDualDeliveryBranch(t *testing.T) {
 	assert.Equal(t, http.MethodPost, req.method)
 	assert.Equal(t, "application/json", req.headers.Get("Content-Type"))
 
-	// The body a subscriber receives is the payload stored in the outbox row, unchanged. This is
-	// an assertion about ONE transport carrying the row's bytes to the socket; the comparison
-	// BETWEEN the two transports is criterion V-8 and belongs to event_dual_delivery_test.go.
+	// The body a subscriber receives is the payload stored in the outbox row, unchanged.
+	// This is an assertion about ONE transport carrying the row's bytes to the socket; the
+	// comparison BETWEEN the two transports belongs to event_dual_delivery_test.go.
 	assert.Equal(t, string(relay.payload), string(req.body),
 		"the delivered body must be the stored outbox payload verbatim, with no key reordering and no number re-rendering")
 
@@ -1186,20 +1009,10 @@ func TestProcessWebhook_DeliversFromDualDeliveryBranch(t *testing.T) {
 		"a relay-driven delivery must be signed over timestamp.body exactly as a directly enqueued one is")
 }
 
-// TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports asserts the SHARED PROVENANCE that
-// makes payload equivalence structural rather than procedural.
+// TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports asserts the SHARED PROVENANCE
+// that makes payload equivalence structural rather than procedural.
 //
-// The dual-delivery guarantee is not upheld by two code paths being careful to agree. It is
-// upheld because there is only one source: a single claimed row, read once, feeding both legs.
-// Two transports reading one row cannot describe two different events, and no amount of drift in
-// either path can make them.
-//
-// So what is asserted here is the JOIN, not the bytes: one claim, one Kafka publish carrying that
-// row's event id and the topic the row itself recorded, one legacy task whose identity is that
-// same event id, and both legs recorded against the same outbox row under the same claim token.
-// Deep byte-for-byte equality between the two transports is criterion V-8 and is owned by
-// event_dual_delivery_test.go; duplicating it here would assert the same fact twice and leave
-// the provenance — the reason it holds — asserted nowhere.
+// The dual-delivery guarantee is not upheld by two code paths being careful to agree.
 func TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports(t *testing.T) {
 	// No receiver is needed: this test is about what the relay produces, not about delivery. The
 	// URL only has to be non-empty, because an empty one is the no-op contract.
@@ -1238,9 +1051,10 @@ func TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports(t *testing.T) {
 	assert.Equal(t, legacyWebhookTaskID(publishes[0].Event.EventID), tasks[0].ID,
 		"the legacy task's identity must be derived from the very event id that was published to Kafka")
 
-	// Both legs are recorded against the SAME ROW under the SAME CLAIM TOKEN. The token is what
-	// makes this a property of the schema: a leg recorded under a stale token is refused by the
-	// repository, so two legs sharing one token cannot have come from two different claims.
+	// Both legs are recorded against the SAME ROW under the SAME CLAIM TOKEN. The token is
+	// what makes this a property of the schema: a leg recorded under a stale token is
+	// refused by the repository, so two legs sharing one token cannot have come from two
+	// different claims.
 	marks := relay.store.snapshotWebhookMarks()
 	require.Len(t, marks, 1, "the legacy leg must be recorded exactly once")
 	assert.Equal(t, relay.rowID, marks[0].id, "the legacy marker must name the claimed row")
@@ -1253,24 +1067,11 @@ func TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports(t *testing.T) {
 		"both legs must be recorded under one claim token, which is what proves they came from one claimed row")
 }
 
-// TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed asserts the enqueue side of the
-// sunset: after the window closes, no legacy task is produced at all.
+// TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed asserts the enqueue side
+// of the sunset: after the window closes, no legacy task is produced at all.
 //
-// The three cases differ in ONE INPUT — the configured RFC3339 sunset date — and in nothing else.
-// Same row, same relay wiring, same clock, same queue mechanics. That is what makes this a test
-// of the sunset rather than a test of a relay that happened to stop working: the Kafka leg is
-// asserted to run in every case, so the only thing the date changes is whether the deprecated
-// transport is fed.
-//
-// The verdict is never recomputed here. Each case states what event_sunset.go's WebhookSunsetPassed
-// must answer for the pinned clock and asserts it, so a fixture that has drifted from the case it
-// is named for fails as a fixture rather than silently asserting the wrong behaviour. The boundary
-// case — a sunset instant equal to the clock — pins the documented half-open window: the instant
-// itself is the first moment of the post-sunset era, so dual delivery has already stopped there.
-//
-// Scope: this file owns the ENQUEUE side of the sunset. The HTTP 410 Gone answer on the deprecated
-// webhook management routes is the other consumer of the same decision and is owned by
-// api/webhook_sunset_test.go.
+// The three cases differ in ONE INPUT — the configured RFC3339 sunset date — and in
+// nothing else.
 func TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed(t *testing.T) {
 	for _, testCase := range []struct {
 		name         string
@@ -1339,29 +1140,12 @@ func TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed(t *testing.T) 
 	}
 }
 
-// ===== THE TRANSACTION EVENT VOCABULARY (AND ONE DEFECT PRESERVED ON PURPOSE) =====
-//
-// getEventFromStatus is declared in webhooks.go, and seven of the thirteen event names Blnk emits
-// originate there. Those names are not internal labels: each one is the value of the "event" key
-// in the body every subscriber parses, each is duplicated into the LedgerEvent envelope's
-// event_type, and each decides which Kafka topic the event is published to. Change one and a
-// subscriber's routing changes with it.
-//
-// The names are asserted here because this file is the home of the payload contract until the
-// sunset relocates it. event_topics_test.go asserts the same mapping from the ROUTING side — that
-// every name reaches the transactions topic — and model/event.go owns the table itself. The
-// overlap is deliberate: this is the vocabulary the whole feature is built on, and the value it
-// most needs is that no single edit can change it without something failing.
+// ===== THE TRANSACTION EVENT VOCABULARY =====
 
-// TestGetEventFromStatus_PinsTheTransactionEventVocabulary pins every transaction event name
-// value by value, and pins them through the wire envelope that carries them.
+// TestGetEventFromStatus_PinsTheTransactionEventVocabulary pins every transaction event
+// name value by value, and pins them through the wire envelope that carries them.
 //
-// Exact values rather than a shape. "Something starting with transaction." is not the contract: a
-// separator change, a tense change or a dropped prefix all produce a plausible-looking name, all
-// pass a loose assertion, and all silently stop matching what a subscriber filters on.
-//
-// The statuses come from the constants rather than being re-spelled, so a change to a status value
-// is carried into this test instead of being hidden behind a stale literal.
+// Exact values rather than a shape.
 func TestGetEventFromStatus_PinsTheTransactionEventVocabulary(t *testing.T) {
 	for _, testCase := range []struct {
 		status    string
@@ -1393,40 +1177,25 @@ func TestGetEventFromStatus_PinsTheTransactionEventVocabulary(t *testing.T) {
 		})
 	}
 
-	// The mapping is case-insensitive, so the lower-cased spelling of a status must produce the
-	// same name. Tying the two calls together rather than asserting a literal means this keeps
-	// holding if a status value changes.
+	// The mapping is case-insensitive, so the lower-cased spelling of a status must
+	// produce the same name. Tying the two calls together rather than asserting a literal
+	// means this keeps holding if a status value changes.
 	assert.Equal(t, getEventFromStatus(StatusApplied), getEventFromStatus("applied"),
 		"the status comparison is case-insensitive, so both spellings must produce one event name")
 
-	// An unrecognised status still yields a real, routable transaction event rather than an empty
-	// string. An empty event name would be published to a topic with a body no subscriber filter
-	// matches, silently.
+	// An unrecognised status still yields a real, routable transaction event rather than
+	// an empty string. An empty event name would be published to a topic with a body no
+	// subscriber filter matches, silently.
 	assert.Equal(t, "transaction.unknown", getEventFromStatus("NO_SUCH_STATUS"),
 		"an unrecognised status must fall through to transaction.unknown")
 	assert.Equal(t, "transaction.unknown", getEventFromStatus(""),
 		"an empty status must fall through to transaction.unknown rather than producing an empty event name")
 }
 
-// TestGetEventFromStatus_CommitFallsThroughToUnknown pins a DEFECT THAT IS PRESERVED ON PURPOSE.
-// Do not "correct" the mapping to make this test read differently.
+// TestGetEventFromStatus_CommitFallsThroughToUnknown pins a DEFECT THAT IS PRESERVED ON
+// PURPOSE. Do not "correct" the mapping to make this test read differently.
 //
-// StatusCommit ("COMMIT", declared in transaction_inflight.go and reached when an inflight
-// transaction is committed) has no case in the mapping, so it falls through to the default and its
-// event is named transaction.unknown.
-//
-// THIS IS PRE-EXISTING BEHAVIOUR, NOT A REGRESSION. It predates the Kafka event pipeline by a long
-// way, and it is kept exactly as it is for one reason: the dual-delivery guarantee is measured by
-// comparing the Kafka message and the legacy webhook BYTE FOR BYTE (criterion V-8), and adding a
-// transaction.commit case would change one side of that comparison and fail it for a reason that
-// has nothing whatever to do with the transport.
-//
-// It is documented in docs/event-streaming.md so that it can be corrected LATER as a separate,
-// deliberately reviewed change — one that renames an event subscribers route on, and so belongs to
-// nobody's incidental refactor.
-//
-// Without this test the trap is wide open: adding the missing case looks exactly like a bug fix,
-// passes every other test in the repository, and silently breaks the dual-delivery comparison.
+// THIS IS PRE-EXISTING BEHAVIOUR, NOT A REGRESSION.
 func TestGetEventFromStatus_CommitFallsThroughToUnknown(t *testing.T) {
 	assert.Equal(t, "transaction.unknown", getEventFromStatus(StatusCommit),
 		"COMMIT has no case in the mapping and must keep falling through to transaction.unknown; "+
@@ -1440,9 +1209,9 @@ func TestGetEventFromStatus_CommitFallsThroughToUnknown(t *testing.T) {
 	assert.Equal(t, getEventFromStatus(StatusCommit), getEventFromStatus("COMMIT"),
 		"the constant and its literal spelling must resolve identically")
 
-	// transaction.unknown is therefore a REAL event name reached by a REAL status, not a defensive
-	// default nothing produces — which is exactly why it must be treated as part of the vocabulary
-	// rather than as an error case.
+	// transaction.unknown is therefore a REAL event name reached by a REAL status, not a
+	// defensive default nothing produces — which is exactly why it must be treated as part
+	// of the vocabulary rather than as an error case.
 	assert.Equal(t, getEventFromStatus("NO_SUCH_STATUS"), getEventFromStatus(StatusCommit),
 		"a committed transaction and an unrecognised status are indistinguishable on the wire today")
 

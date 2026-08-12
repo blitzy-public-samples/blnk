@@ -23,16 +23,9 @@ import (
 	"testing"
 )
 
-// This file covers the error codes of the Kafka event-streaming pipeline: EVENT_*
-// for dead-letter triage and replay, SUBSCRIBER_* for the registry and credential
+// This file covers the error codes of the Kafka event-streaming pipeline: EVENT_* for
+// dead-letter triage and replay, SUBSCRIBER_* for the registry and credential
 // provisioning, and GEN_GONE for a deprecated webhook route past its sunset.
-//
-// A missing statusByCode entry is invisible — no compile error, no panic, no log
-// line — because StatusForCode falls through to its documented 500 default for
-// unknown codes. Telling "mapped" apart from "silently defaulted to 500" therefore
-// takes two assertions: the resolved status per code, and, where the intended status
-// is itself 500, a direct lookup of the key in the map. The second is why this file
-// is in-package rather than in package apierror_test.
 
 // eventStreamingCodeCases is the single inventory of the new codes — identifier,
 // the status statusByCode must resolve it to, and the exact string on the wire.
@@ -49,74 +42,69 @@ var eventStreamingCodeCases = []struct {
 	// The second code in this family deliberately mapped to 500, and the ONE reason it is
 	// inventoried here despite sharing the unknown-code default: an unkeyable event is a
 	// producer defect inside this service rather than anything a caller did, so 500 is the
-	// judgement and not the absence of one. TestStatusForCode_EventCodesAreMappedNotDefaulted
-	// is what tells the two apart, because it does a two-value lookup instead of comparing
-	// StatusForCode against 500.
+	// judgement and not the absence of one.
+	// TestStatusForCode_EventCodesAreMappedNotDefaulted is what tells the two apart,
+	// because it does a two-value lookup instead of comparing StatusForCode against 500.
 	{ErrEventKeyUnresolvable, http.StatusInternalServerError, "EVENT_KEY_UNRESOLVABLE"},
-	// The identifier says Kafka but the string carries the EVENT_ family prefix, and
-	// that asymmetry is deliberate. So is the 503: an unreachable broker is a
-	// retryable upstream condition, not a defect here, so it must not resolve to 500.
+	// The identifier says Kafka but the string carries the EVENT_ family prefix, and that
+	// asymmetry is deliberate. So is the 503: an unreachable broker is a retryable
+	// upstream condition, not a defect here, so it must not resolve to 500.
 	{ErrKafkaUnavailable, http.StatusServiceUnavailable, "EVENT_KAFKA_UNAVAILABLE"},
-	// NO TIMEOUT CODE FOLLOWS IT, and that is the contract rather than a gap in this table.
-	// A replay abandoned by a cancelled caller or a spent deadline answers
-	// EVENT_REPLAY_FAILED and says so in its message; an EVENT_REPLAY_TIMEOUT mapped to 504
-	// was added here once and withdrawn, because widening this family's public surface is a
-	// contract change and not an implementation detail.
+	// NO TIMEOUT CODE FOLLOWS IT, and that is the contract rather than a gap in this
+	// table. A replay abandoned by a cancelled caller or a spent deadline answers
+	// EVENT_REPLAY_FAILED and says so in its message; an EVENT_REPLAY_TIMEOUT mapped to
+	// 504 was added here once and withdrawn, because widening this family's public surface
+	// is a contract change and not an implementation detail.
 	{ErrSubscriberNotFound, http.StatusNotFound, "SUBSCRIBER_NOT_FOUND"},
 	{ErrSubscriberProvisioningFailed, http.StatusServiceUnavailable, "SUBSCRIBER_PROVISIONING_FAILED"},
 	// A dependency of issuance being unconfigured is not a malformed request, so 503
 	// and never 400: only an operator can supply the externally advertised list.
 	{ErrSubscriberBrokersNotConfigured, http.StatusServiceUnavailable, "SUBSCRIBER_BROKERS_NOT_CONFIGURED"},
-	// The THREE STATE refusals. All 409, because the request is well formed and it is
-	// the registry row — or the deployment's configuration — that has to change before the
+	// The THREE STATE refusals. All 409, because the request is well formed and it is the
+	// registry row — or the deployment's configuration — that has to change before the
 	// identical request can succeed.
 	//
-	// SUBSCRIBER_KEY_SCOPE_UNENFORCED is the fail-closed one, and it is the ONLY code for its
-	// judgement in either order: issuing for a row that already records a partition-key
-	// prefix, and recording a prefix on a row that already holds a credential. A second code
-	// for one judgement (SUBSCRIBER_ISOLATION_UNENFORCEABLE) existed and is gone, because two
-	// codes for one refusal is how a client comes to handle one and not the other.
+	// SUBSCRIBER_KEY_SCOPE_UNENFORCED is the fail-closed one, and it is the ONLY code for
+	// its judgement in either order: issuing for a row that already records a
+	// partition-key prefix, and recording a prefix on a row that already holds a
+	// credential. A second code for one judgement (SUBSCRIBER_ISOLATION_UNENFORCEABLE)
+	// existed and is gone, because two codes for one refusal is how a client comes to
+	// handle one and not the other.
 	{ErrSubscriberKeyScopeUnenforced, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_UNENFORCED"},
-	// Its MIRROR, and a separate code because the remedy is the opposite edit. UNENFORCED means
-	// "this row records a key scope and nothing keeps it"; REQUIRED means "this deployment
-	// declared a key-scoped model and this row records no scope", which is the one credential
-	// that would escape the model with whole-topic Read. One code for both would tell an
-	// operator to change a prefix without saying in which direction.
+	// Its MIRROR, and a separate code because the remedy is the opposite edit. UNENFORCED
+	// means "this row records a key scope and nothing keeps it"; REQUIRED means "this
+	// deployment declared a key-scoped model and this row records no scope", which is the
+	// one credential that would escape the model with whole-topic Read. One code for both
+	// would tell an operator to change a prefix without saying in which direction.
 	{ErrSubscriberKeyScopeRequired, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_REQUIRED"},
-	// The declaration refusal: a secure-mode deployment that has said nothing about whether its
-	// subscribers read whole topics. 409 because the CONFIGURATION is the state that changes,
-	// and not 403, which would blame the caller holding the master key.
+	// The declaration refusal: a secure-mode deployment that has said nothing about
+	// whether its subscribers read whole topics. 409 because the CONFIGURATION is the
+	// state that changes, and not 403, which would blame the caller holding the master
+	// key.
 	{ErrSubscriberSharedTopicAccessUnacknowledged, http.StatusConflict, "SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED"},
 	// The verification refusal. 409 even when the attestation call timed out, because the
-	// declared enforcement point is the deployment's state rather than a Blnk dependency: a 503
-	// would send an operator to a Kafka that never stopped answering. The detail's retryable
-	// flag is what separates "unreachable, try again" from "it attested a different prefix".
+	// declared enforcement point is the deployment's state rather than a Blnk dependency:
+	// a 503 would send an operator to a Kafka that never stopped answering. The detail's
+	// retryable flag is what separates "unreachable, try again" from "it attested a
+	// different prefix".
 	{ErrSubscriberKeyScopeUnattested, http.StatusConflict, "SUBSCRIBER_KEY_SCOPE_UNATTESTED"},
 	{ErrSubscriberDeprovisioning, http.StatusConflict, "SUBSCRIBER_DEPROVISIONING"},
 	{ErrSubscriberGrantEmpty, http.StatusConflict, "SUBSCRIBER_GRANT_EMPTY"},
-	// A fourth state refusal, and the one whose state lives at the BROKER rather than in the
-	// registry row. 409 for the same reason and never the 503 of the *_FAILED codes: the
-	// broker answered, so there is no upstream condition for a retry to outlast.
+	// A fourth state refusal, and the one whose state lives at the BROKER rather than in
+	// the registry row. 409 for the same reason and never the 503 of the *_FAILED codes:
+	// the broker answered, so there is no upstream condition for a retry to outlast.
 	{ErrSubscriberAccessExceedsAuthorization, http.StatusConflict, "SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION"},
-	// 403, and the only one here that is about the CHANNEL rather than about state: the request
-	// is well formed and the caller is authorised, and the server is refusing to put a one-time
-	// secret on a transport it cannot establish as confidential. A retry over the same transport
-	// cannot succeed, which is why it is not a 503.
+	// 403, and the only one here that is about the CHANNEL rather than about state: the
+	// request is well formed and the caller is authorised, and the server is refusing to
+	// put a one-time secret on a transport it cannot establish as confidential. A retry
+	// over the same transport cannot succeed, which is why it is not a 503.
 	{ErrSubscriberInsecureTransport, http.StatusForbidden, "SUBSCRIBER_INSECURE_TRANSPORT"},
-	// AND NO TIMEOUT CODE HERE EITHER, for the same reason as in the EVENT_ family above: a
-	// spent issuance budget or a caller that went away answers the retryable
-	// SUBSCRIBER_PROVISIONING_FAILED (503) inventoried above, at every layer of the issuance
-	// path, with the spent budget named in the message and the broker residue in the detail.
-	// THERE ARE NO DATA-PLANE CODES IN THIS FAMILY, and their absence is the access model
-	// rather than an omission. Every code above is provoked by an OPERATOR calling a
-	// management route with the master key. Blnk serves no subscriber records — there is no
-	// read path under /subscribers — so no request a subscriber makes reaches this catalogue
-	// at all: a subscriber authenticates to the broker with SASL/SCRAM and is refused by the
-	// broker's own authorizer, in Kafka's protocol, with Kafka's error codes.
-	//
-	// SUBSCRIBER_CREDENTIAL_INVALID (401) and SUBSCRIBER_TOPIC_NOT_GRANTED (403) were declared
-	// for a Blnk-hosted record read and are removed with it. Reintroducing either would mean
-	// Blnk had grown a second data plane, which is the thing the access model exists to avoid.
+	// AND NO TIMEOUT CODE HERE EITHER, for the same reason as in the EVENT_ family above:
+	// a spent issuance budget or a caller that went away answers the retryable
+	// SUBSCRIBER_PROVISIONING_FAILED (503) inventoried above, at every layer of the
+	// issuance path, with the spent budget named in the message and the broker residue in
+	// the detail. THERE ARE NO DATA-PLANE CODES IN THIS FAMILY, and their absence is the
+	// access model rather than an omission.
 }
 
 // TestStatusForCode_EventStreamingCodes states the mapping positively;
@@ -125,34 +113,6 @@ var eventStreamingCodeCases = []struct {
 func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	// Guard the inventory itself: a table that no longer holds one row per code in
 	// codes.go means a code was added or removed without its assertions.
-	//
-	// The count is stated literally rather than derived, because deriving it from the
-	// catalog is what the guard exists to prevent: a code that arrives with neither a
-	// status entry nor a row here would then satisfy a self-referential comparison and
-	// resolve to the unknown-code 500 in production. Adding a code is a deliberate edit
-	// of this number — as is REMOVING one, and the arithmetic that produced 18 is worth
-	// recording because every step of it was a separate edit:
-	//
-	//   12 — the original event-streaming family, SUBSCRIBER_ISOLATION_UNENFORCEABLE included.
-	//   +3 — EVENT_ALREADY_RESOLVED, SUBSCRIBER_INSECURE_TRANSPORT and
-	//        SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION added.
-	//   −1 — EVENT_ALREADY_RESOLVED retired again with the dead-letter resolve endpoint. That
-	//        endpoint's write could leave a row from which a broker-acknowledged replay could
-	//        not be recorded, and retention needs no second write to be safe: a dead-lettered
-	//        row is never purged by age, and a replay is what turns one into a receipt.
-	//   +1 — EVENT_REPLAY_TIMEOUT added, because a replay abandoned by a cancelled caller or a
-	//        spent deadline was resolving to EVENT_KAFKA_UNAVAILABLE and telling an operator to
-	//        wait for a broker that had never stopped answering.
-	//   −1 — EVENT_REPLAY_TIMEOUT WITHDRAWN AGAIN. The distinction it drew is real and is kept,
-	//        but it is drawn in the MESSAGE and the log line rather than in a public code and a
-	//        504 that a client's retry logic branches on: this family's approved public surface
-	//        is the codes the plan froze, and widening it is a contract change that belongs to
-	//        its own approved plan. An abandoned replay answers EVENT_REPLAY_FAILED.
-	//   +2 — SUBSCRIBER_CREDENTIAL_INVALID and SUBSCRIBER_TOPIC_NOT_GRANTED added for a
-	//        Blnk-hosted subscriber record read, then BOTH REMOVED with it. Blnk serves no
-	//        records, so no request a subscriber makes reaches this catalogue and neither code
-	//        can be provoked. Net zero, and recorded rather than netted out because a future
-	//        reader finding the names in git history should find the reason here.
 	//
 	//   +1 — EVENT_KEY_UNRESOLVABLE added with the producer-side capture guard: an event that
 	//        can be assigned no Kafka message key cannot preserve per-aggregate ordering, so it
@@ -185,9 +145,6 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	//        either name in git history should find the reason here.
 	//
 	//   = 17.
-	//
-	// One of those edits caught a genuine omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_
-	// AUTHORIZATION had no statusByCode entry at all, so a deliberate 409 was resolving to 500.
 	if len(eventStreamingCodeCases) != 17 {
 		t.Fatalf("eventStreamingCodeCases has %d rows, want 17 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
@@ -203,20 +160,9 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 // TestStatusForCode_EventStreamingInventoryIsComplete makes the literal count above
 // FALSIFIABLE rather than a number a reader has to trust.
 //
-// The count guard one function up catches a row being deleted. It cannot catch the
-// opposite and more dangerous drift: a code declared and mapped in codes.go that never
-// acquired a row here. SUBSCRIBER_KEY_SCOPE_UNENFORCED was exactly that — declared,
-// mapped to 409, and absent from the inventory — and the literal count was satisfied the
-// whole time, because deleting a stale row and never adding the new one nets to zero.
+// The count guard one function up catches a row being deleted.
 //
-// So this derives the population from statusByCode instead of restating it: every mapped
-// code whose string carries the EVENT_ or SUBSCRIBER_ prefix must appear above. It reads
-// the same map production resolves against, so a code cannot be mapped-but-uninventoried
-// in any build where this passes.
-//
-// GEN_GONE is deliberately outside the derived set. It is a GEN_ code that this family
-// merely depends on, so it is asserted by name in the two tests around this one rather
-// than swept in by a prefix match that would then also sweep in every other GEN_ code.
+// GEN_GONE is deliberately outside the derived set.
 func TestStatusForCode_EventStreamingInventoryIsComplete(t *testing.T) {
 	inventoried := make(map[ErrorCode]bool, len(eventStreamingCodeCases))
 	for _, tt := range eventStreamingCodeCases {
@@ -243,9 +189,10 @@ func TestStatusForCode_EventStreamingInventoryIsComplete(t *testing.T) {
 	}
 
 	// AND THE REVERSE DIRECTION, which is what keeps a retired code from lingering as an
-	// assertion about a symbol nothing produces. A row for an unmapped code would resolve to
-	// the 500 default and the status assertion would fail — but only if the row's expected
-	// status happened to differ from 500, and EVENT_REPLAY_FAILED legitimately expects 500.
+	// assertion about a symbol nothing produces. A row for an unmapped code would resolve
+	// to the 500 default and the status assertion would fail — but only if the row's
+	// expected status happened to differ from 500, and EVENT_REPLAY_FAILED legitimately
+	// expects 500.
 	for _, tt := range eventStreamingCodeCases {
 		if _, mapped := statusByCode[tt.code]; !mapped {
 			t.Errorf(
@@ -275,10 +222,10 @@ func TestStatusForCode_GenGoneIsGone(t *testing.T) {
 func TestStatusForCode_EventCodesAreMappedNotDefaulted(t *testing.T) {
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {
-			// A two-value lookup rather than a StatusForCode comparison, because
-			// StatusForCode returns 500 both for a code deliberately mapped to 500
-			// and for one not mapped at all. For ErrEventReplayFailed, whose
-			// intended status is 500, only this lookup tells the two apart.
+			// A two-value lookup rather than a StatusForCode comparison, because StatusForCode
+			// returns 500 both for a code deliberately mapped to 500 and for one not mapped at
+			// all. For ErrEventReplayFailed, whose intended status is 500, only this lookup
+			// tells the two apart.
 			status, ok := statusByCode[tt.code]
 			if !ok {
 				t.Fatalf("statusByCode has no entry for %s: StatusForCode would silently default it to %d", tt.code, http.StatusInternalServerError)
@@ -365,23 +312,7 @@ func TestMapErrorToHTTPStatus_GenGone(t *testing.T) {
 // TestMapErrorToHTTPStatus_PointerShapedAPIError covers the *APIError branch of
 // MapErrorToHTTPStatus, which nothing else in this package reached.
 //
-// # Why the branch exists at all
-//
-// APIError declares Error() on its VALUE receiver, so both APIError and *APIError
-// satisfy the error interface, and errors.As only matches a target whose element
-// type the concrete type is assignable to. A handler returning &APIError{...} —
-// or any layer that took an address along the way — therefore misses the value
-// target entirely and is resolved by the second lookup. Without it such an error
-// would fall through to 500, and a deprecated surface past its sunset would answer
-// 500 instead of the 410 acceptance criterion V-10 requires.
-//
-// # Why this test was written
-//
-// The mutation gate found it. `internal/apierror` scores one viable mutant, the
-// `apiErrPtr != nil` guard on this branch, and it LIVED: the branch was covered but
-// no assertion depended on its answer, so negating the guard — which sends every
-// pointer-shaped API error to 500 — changed nothing any test could see. Both halves
-// of the guard are now asserted, so a mutation of either is caught.
+// The mutation gate found it.
 func TestMapErrorToHTTPStatus_PointerShapedAPIError(t *testing.T) {
 	// A pointer-shaped error must resolve to its mapped status, not to 500. This is
 	// the half that fails if the nil guard is negated.
@@ -406,11 +337,11 @@ func TestMapErrorToHTTPStatus_PointerShapedAPIError(t *testing.T) {
 		})
 	}
 
-	// A TYPED NIL is the half that fails if the guard is removed rather than
-	// negated. errors.As succeeds against a nil *APIError — the type matches — so
-	// without the guard the next line would dereference nil and take down the
-	// process that was merely trying to choose a status code. 500 is the right
-	// answer: an error carrying no code is exactly the unclassified case.
+	// A TYPED NIL is the half that fails if the guard is removed rather than negated.
+	// errors.As succeeds against a nil *APIError — the type matches — so without the guard
+	// the next line would dereference nil and take down the process that was merely trying
+	// to choose a status code. 500 is the right answer: an error carrying no code is
+	// exactly the unclassified case.
 	var absent *APIError
 	var carried error = absent
 	if got := MapErrorToHTTPStatus(carried); got != http.StatusInternalServerError {

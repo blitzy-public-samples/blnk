@@ -18,13 +18,11 @@
 -- could not be completed and the endpoint that wrote them was never part of the agreed
 -- API surface.
 --
--- # The defect this closes
---
--- sql/1781249007.sql added resolved_at, resolution_note and two CHECK constraints so that
--- an operator could record "this dead-lettered event has been dealt with" and retention
--- could then delete the row. One of those constraints,
+-- sql/1781249007.sql added resolved_at, resolution_note and two CHECK constraints so
+-- that an operator could record "this dead-lettered event has been dealt with" and
+-- retention could then delete the row. One of those constraints,
 -- event_outbox_resolution_state_chk, confined a resolution to the dead_lettered and
--- replaying states. That is a correct-looking rule with an impossible consequence:
+-- replaying states.
 --
 --   1. An operator resolves a dead-lettered event. resolved_at is set.
 --   2. The broker recovers and the same event is REPLAYED. The replay claims the row
@@ -33,38 +31,23 @@
 --   3. MarkEventDispatched then moves the row to dispatched — and dispatched is not one
 --      of the two states the constraint permits a resolution in, so PostgreSQL REJECTS
 --      the only write that records the successful publish.
---   4. The API answers EVENT_REPLAY_FAILED for a publish that in fact succeeded, and the
---      row is released still dead_lettered — that is, still replayable. Every retry
---      publishes the event to the topic again.
+--   4. The API answers EVENT_REPLAY_FAILED for a publish that in fact succeeded, and
+--      the row is released still dead_lettered — that is, still replayable.
 --
--- The reverse order was refused outright: once a replay had made the row dispatched, a
--- resolution could no longer be recorded at all, because the write required the
--- dead_lettered state. So the two operations composed in neither direction, and one of
--- the orderings manufactured duplicate ledger events on a topic subscribers consume.
---
--- # Why the columns go rather than the constraint
---
--- Dropping the constraint alone would make the schema permissive enough for the sequence
--- above to commit, and would leave the feature in place. The feature itself is the
--- problem: POST /events/dead-letter/:event_id/resolve was a fourteenth management route
--- on a surface the plan fixes at thirteen, and its purpose — telling retention which
--- dead-letter rows are safe to delete — is served correctly and with no extra state by
--- the workflow that was already approved:
+-- Dropping the constraint alone would make the schema permissive enough for the
+-- sequence above to commit, and would leave the feature in place. The feature itself is
+-- the problem: POST /events/dead-letter/:event_id/resolve was a fourteenth management
+-- route on a surface the plan fixes at thirteen, and its purpose — telling retention
+-- which dead-letter rows are safe to delete — is served correctly and with no extra
+-- state by the workflow that was already approved:
 --
 --   * A DEAD-LETTERED row is now NEVER deleted by age. It is the only record that a
---     ledger event went undelivered, the only inventory triage reads, and the only place
---     the bytes a replay is driven from and the failure metadata explaining the loss
---     exist. Nothing may remove it on a timer.
+--     ledger event went undelivered, the only inventory triage reads, and the only
+--     place the bytes a replay is driven from and the failure metadata explaining the
+--     loss exist.
 --   * REPLAY is what ends its life. A re-publish the broker acknowledges makes the row
 --     dispatched — a receipt for an event a subscriber has now had — and a receipt is
 --     exactly what the retention sweep is for.
---
--- The dead-letter age gauge and the DeadLetterMessageStuck alert therefore keep counting
--- an entry until it has actually reached a subscriber, which is stronger pressure than a
--- resolution that could be recorded without anything being delivered.
---
--- No data is lost that anything reads: nothing in the shipped code writes these columns
--- any more, and the endpoint that used to is gone in the same change.
 
 -- The state constraint that made a broker-acknowledged replay uncommittable. Dropped
 -- FIRST, before the columns it references, so the drop order is legible rather than

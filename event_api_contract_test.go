@@ -34,50 +34,10 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// event_api_contract_test.go pins the CLIENT-FACING contract of the Kafka event-streaming
-// surface: the request and response shapes in api/model/event.go, and the two authorization
-// resource values in api/middleware/scope.go that the new routes resolve to.
-//
-// # Why this file exists
-//
-// Every type it covers is, at this point in the work, declared but not yet referenced by a
-// handler. That combination — a published contract with no caller — is the one place a
-// rename, a dropped omitempty or a pointer quietly demoted to a value passes every check
-// the toolchain performs: the package compiles, go vet is silent, and no test notices,
-// because nothing yet reads the shape. The first thing to notice would be a subscriber's
-// parser failing against a deployed release. So each contract is asserted here directly:
-// the exact JSON key of every field, in declaration order (encoding/json emits keys in that
-// order, so the order is observable too), which keys disappear at their zero value, which
-// fields are pointers because "absent" and "empty" mean different things, and which request
-// fields are mandatory.
-//
-// The same reasoning covers ResourceEvents and ResourceSubscribers. Each value plays two
-// roles at once — the first path segment of the new routes, and the resource half of an
-// API-key scope string — and a typo in either would compile perfectly and simply reject
-// every caller.
-//
-// # Why it lives in the repository root, in package blnk_test
-//
-// The two folders that hold the subjects are closed to new test files by the plan: api/model
-// is covered from package api by the handler tests, and api/middleware likewise. This file
-// respects both boundaries while still pinning the contracts now rather than a checkpoint
-// later, and it sits with the rest of the event work under the root's event_*_test.go
-// pattern.
-//
-// It is an EXTERNAL test package, and that is a requirement rather than a preference:
-// api/middleware imports the root blnk package, so an in-package blnk test that imported the
-// middleware would be an import cycle. The repository already uses external test packages
-// where the same problem arises (internal/request, internal/apierror). Being external also
-// means every assertion below is made through exactly the surface a real client of these
-// packages sees.
-//
-// # What it deliberately does not assert
-//
-// Nothing here touches pathToResource in api/middleware/auth.go or the route registration in
-// api/api.go. Both are later work, and getResourceFromPath fails closed for an unregistered
-// prefix, so those are end-to-end concerns for the handler tests. This file pins the
-// vocabulary half only: that the two values exist, that they are spelled exactly as the URL
-// segments are, and that the scope machinery treats them like every other resource.
+// event_api_contract_test.go pins the CLIENT-FACING contract of the Kafka
+// event-streaming surface: the request and response shapes in api/model/event.go, and
+// the two authorization resource values in api/middleware/scope.go that the new routes
+// resolve to.
 
 // fieldContract is one struct field's client-facing contract: the Go name, the JSON key it
 // serialises under, whether the key vanishes at its zero value, and the binding tag that
@@ -92,8 +52,8 @@ type fieldContract struct {
 // assertWireContract asserts a struct's full field contract, in declaration order.
 //
 // The field COUNT is asserted alongside the per-field expectations so that neither a
-// dropped field nor an undocumented addition can pass: an added field with a plausible tag
-// is exactly the change that reaches a client unannounced.
+// dropped field nor an undocumented addition can pass: an added field with a plausible
+// tag is exactly the change that reaches a client unannounced.
 func assertWireContract(t *testing.T, subject interface{}, contract []fieldContract) {
 	t.Helper()
 
@@ -177,15 +137,7 @@ const legacyWebhookPayload = `{"event":"transaction.applied","data":{"transactio
 
 // TestDeadLetterEvent_WireContract pins the item shape of GET /events/dead-letter.
 //
-// The projection is deliberately MINIMAL. It carries no payload, no raw failure text and no
-// nested failure record, because a triage listing is read far more widely than the ledger
-// itself and every one of those three carries either customer data or a broker's own error
-// string straight out of the service. What replaces them is what triage actually needs: a
-// CLASSIFIED failure reason, the two attempt instants, and the payload SIZE — enough to
-// decide whether to replay without reproducing the event.
-//
-// The two attempt instants are pointers so a row that never failed omits them rather than
-// emitting a zero time, which a client would otherwise have to recognise as "not applicable".
+// The projection is deliberately MINIMAL.
 func TestDeadLetterEvent_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.DeadLetterEvent{}, []fieldContract{
 		{name: "EventID", jsonKey: "event_id"},
@@ -204,11 +156,12 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 		{name: "LastAttemptedAt", jsonKey: "last_attempted_at", omitEmpty: true},
 		{name: "PayloadBytes", jsonKey: "payload_bytes"},
 		// AND NOTHING ELSE. resolved_at and resolution_note were declared here and have been
-		// withdrawn with the endpoint that wrote them: an operator's resolution used to exempt
-		// an entry from the retention purge and from the dead-letter age gauge, and it left the
-		// row in a state from which a broker-acknowledged replay could not be recorded. Every
-		// entry in this inventory is now outstanding by construction — a replay is what takes
-		// one out of it — so there is nothing for the pair to distinguish.
+		// withdrawn with the endpoint that wrote them: an operator's resolution used to
+		// exempt an entry from the retention purge and from the dead-letter age gauge, and it
+		// left the row in a state from which a broker-acknowledged replay could not be
+		// recorded. Every entry in this inventory is now outstanding by construction — a
+		// replay is what takes one out of it — so there is nothing for the pair to
+		// distinguish.
 	})
 
 	t.Run("a bare entry omits every optional key and keeps the mandatory ones", func(t *testing.T) {
@@ -232,13 +185,11 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 	})
 
 	t.Run("the partition key and the ledger id are separate facts", func(t *testing.T) {
-		// The Kafka message key IS the ordering mechanism: every event sharing a key lands
-		// in one partition and is therefore consumed in publish order. This projection used
-		// to carry only ledger_id and to DOCUMENT it as the key, which is wrong in the case
-		// that matters most — a ledger-less event, where the key falls back to the aggregate
-		// so the key is present while the ledger is not. An operator answering "why were
-		// these two events consumed out of order?" from ledger_id would reach the wrong
-		// conclusion for exactly the events whose routing is least obvious.
+		// The Kafka message key IS the ordering mechanism: every event sharing a key lands in
+		// one partition and is therefore consumed in publish order. This projection used to
+		// carry only ledger_id and to DOCUMENT it as the key, which is wrong in the case that
+		// matters most — a ledger-less event, where the key falls back to the aggregate so
+		// the key is present while the ledger is not.
 		decoded := marshalToKeys(t, apimodel.DeadLetterEvent{
 			EventID:      "8f14e45f-ea8f-4b3a-9c2d-0a7b6c5d4e3f",
 			EventType:    "identity.created",
@@ -256,8 +207,8 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 			"a ledger-less event has no ledger to report, and reporting the key in its place is "+
 				"the conflation this field exists to end")
 
-		// The other direction: a ledgered event reports both, and they are not required to
-		// be equal — the stored key is the key the event was ACTUALLY written with, not one
+		// The other direction: a ledgered event reports both, and they are not required to be
+		// equal — the stored key is the key the event was ACTUALLY written with, not one
 		// recomputed from the row today.
 		both := marshalToKeys(t, apimodel.DeadLetterEvent{
 			EventID:      "9a25f56g-fb9g-5c4b-ad3e-1b8c7d6e5f4a",
@@ -275,8 +226,8 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 
 	t.Run("no key can carry a payload or a raw broker error", func(t *testing.T) {
 		// The guarantee is STRUCTURAL: there is nowhere on the type to put either, so a
-		// handler cannot leak one by mistake. Asserted over the field set rather than over one
-		// marshalled instance, because an instance only proves what that instance held.
+		// handler cannot leak one by mistake. Asserted over the field set rather than over
+		// one marshalled instance, because an instance only proves what that instance held.
 		shape := reflect.TypeOf(apimodel.DeadLetterEvent{})
 		for _, forbidden := range []string{"Payload", "LastError", "FailureMetadata"} {
 			_, present := shape.FieldByName(forbidden)
@@ -356,15 +307,9 @@ func TestReplayEventResponse_WireContract(t *testing.T) {
 	})
 }
 
-// TestEventOutboxStatsResponse_WireContract pins GET /events/stats, including the validity
-// caveats without which its numbers cannot be trusted.
-// dispatchedCount is the pointer form the dispatched count now takes on the wire.
-//
-// It is a pointer because dispatched is the ONE status count that is not always measured
-// (PERF-M05): counting the single unbounded population is the deliberate on-demand reading, and
-// emitting a zero for "nobody counted" would tell a reconciliation that nothing was published.
-// A helper rather than a local variable at each site keeps these contract cases reading as the
-// literals they are about.
+// TestEventOutboxStatsResponse_WireContract pins GET /events/stats, including the
+// validity caveats without which its numbers cannot be trusted. dispatchedCount is the
+// pointer form the dispatched count now takes on the wire.
 func dispatchedCount(v int64) *int64 { return &v }
 
 func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
@@ -372,11 +317,11 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		{name: "Pending", jsonKey: "pending"},
 		{name: "Processing", jsonKey: "processing"},
 		{name: "WebhookPending", jsonKey: "webhook_pending"},
-		// PERF-M05: dispatched is the ONE count that is not always taken, so it is the one
-		// count that omits. It is a count of the single unbounded population — 43.2 million
-		// rows a day at the target rate — and is read only for a request that asked for the
-		// broker side, so an emitted zero would say "nothing was dispatched today" when the
-		// truth is "nobody counted". DispatchedHistoryCounted beside it is always emitted.
+		// Dispatched is the ONE count that is not always taken, so it is the one count that
+		// omits. It is a count of the single unbounded population — 43.2 million rows a day
+		// at the target rate — and is read only for a request that asked for the broker side,
+		// so an emitted zero would say "nothing was dispatched today" when the truth is
+		// "nobody counted".
 		{name: "Dispatched", jsonKey: "dispatched", omitEmpty: true},
 		{name: "DispatchedHistoryCounted", jsonKey: "dispatched_history_counted"},
 		{name: "Failed", jsonKey: "failed"},
@@ -394,9 +339,9 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		// present itself as conclusive.
 		{name: "MeasuredWindows", jsonKey: "measured_windows", omitEmpty: true},
 		{name: "OffsetsMeasuredAt", jsonKey: "offsets_measured_at", omitEmpty: true},
-		// PERF-P04/PERF-P05: the window the two unbounded figures were measured over. It is
-		// part of the published contract because the dispatched count and the reconciliation
-		// mean different things over different windows, and a caller that could not read the
+		// The window the two unbounded figures were measured over. It is part of the
+		// published contract because the dispatched count and the reconciliation mean
+		// different things over different windows, and a caller that could not read the
 		// window would be comparing yesterday's figure against today's.
 		{name: "WindowStart", jsonKey: "window_start", omitEmpty: true},
 		{name: "WindowSeconds", jsonKey: "window_seconds", omitEmpty: true},
@@ -404,12 +349,12 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		{name: "Reconciliation", jsonKey: "reconciliation", omitEmpty: true},
 	})
 
-	// Driven from the model's OWN vocabulary rather than from a list written out here, which
-	// is what makes it a completeness check instead of a restatement. A status added to the
-	// model and not added to this response would otherwise vanish from the reconciliation
-	// silently — and a status that is counted in the table but absent from the response makes
-	// the reported counts sum to less than the row count, so a zero-loss check cannot tell a
-	// short total from a lost event.
+	// Driven from the model's OWN vocabulary rather than from a list written out here,
+	// which is what makes it a completeness check instead of a restatement. A status added
+	// to the model and not added to this response would otherwise vanish from the
+	// reconciliation silently — and a status that is counted in the table but absent from
+	// the response makes the reported counts sum to less than the row count, so a
+	// zero-loss check cannot tell a short total from a lost event.
 	t.Run("every outbox status in the model is reported as an explicit count", func(t *testing.T) {
 		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{})
 
@@ -418,9 +363,9 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 
 		for _, status := range statuses {
 			// DISPATCHED IS THE ONE EXCEPTION, and it is exercised in its own subtest below
-			// (PERF-M05). Counting it is the deliberate on-demand reading rather than part of
-			// every response, so an emitted zero would carry the one meaning a zero-loss check
-			// cannot survive: "nothing was published" in place of "nobody counted".
+			// Counting it is the deliberate on-demand reading rather than part of every
+			// response, so an emitted zero would carry the one meaning a zero-loss check cannot
+			// survive: "nothing was published" in place of "nobody counted".
 			if status == model.EventOutboxStatusDispatched {
 				continue
 			}
@@ -601,15 +546,11 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 	})
 }
 
-// TestProducerAtomicityStats_WireContract pins the owed-event projection reported inside
-// GET /events/stats.
+// TestProducerAtomicityStats_WireContract pins the owed-event projection reported
+// inside GET /events/stats.
 //
 // It is contracted separately from the response that carries it because it answers a
-// different question. The per-status counts are a census of rows that EXIST; this object
-// counts intents recorded atomically with a mutation from which an event has not been
-// captured yet — events that are owed and are in no status at all. A reconciliation that
-// read only the census would find it internally consistent while alerts and batch summaries
-// were still pending, which is precisely the blind spot requirement R-2 closes.
+// different question.
 func TestProducerAtomicityStats_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.ProducerAtomicityStats{}, []fieldContract{
 		{name: "MonitorHandoffPending", jsonKey: "monitor_handoff_pending"},
@@ -620,11 +561,11 @@ func TestProducerAtomicityStats_WireContract(t *testing.T) {
 		{name: "OldestUnfinalizedBatchAt", jsonKey: "oldest_unfinalized_batch_at", omitEmpty: true},
 	})
 
-	// Driven from the handoff's OWN status vocabulary rather than from a list restated here,
-	// for the same reason the per-status census is: the handoff reuses the lineage outbox
-	// statuses, and one of them left uncounted would make the reported handoff totals sum to
-	// less than the table's row count — a shortfall a zero-loss check cannot tell apart from
-	// an evaluation that was silently dropped.
+	// Driven from the handoff's OWN status vocabulary rather than from a list restated
+	// here, for the same reason the per-status census is: the handoff reuses the lineage
+	// outbox statuses, and one of them left uncounted would make the reported handoff
+	// totals sum to less than the table's row count — a shortfall a zero-loss check cannot
+	// tell apart from an evaluation that was silently dropped.
 	t.Run("every handoff status is reported as an explicit count", func(t *testing.T) {
 		decoded := marshalToKeys(t, apimodel.ProducerAtomicityStats{})
 
@@ -657,17 +598,11 @@ func TestProducerAtomicityStats_WireContract(t *testing.T) {
 	})
 }
 
-// TestOutboxReconciliationResult_WireContract pins the verdict acceptance criterion V-2 is
-// scored on, and it exists because the response used to carry the two SIDES of the
-// comparison and no verdict at all.
+// TestOutboxReconciliationResult_WireContract pins the VERDICT field beside the two
+// sides of the comparison it is drawn from.
 //
-// Leaving the verdict to the caller meant every caller re-implemented the comparison, and each
-// got its own chance to get it wrong in a way that reads as success. The comparison itself was
-// then rebuilt, because the only one available from two totals was unsound: whole-topic
-// cumulative end offsets and currently-retained outbox rows share no baseline, no readability
-// guarantee, no topic incarnation and no producer. So the wire shape carries a BOUNDED MAPPING
-// — how many claims were placed inside a measured offset window, and one count per reason the
-// rest could not be — plus the window the verdict covers.
+// Leaving the verdict to the caller means every caller re-implements the comparison, and
+// each gets its own chance to get it wrong in a way that reads as success.
 func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.OutboxReconciliationResult{}, []fieldContract{
 		{name: "TerminalEvents", jsonKey: "terminal_events"},
@@ -682,34 +617,23 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 		{name: "BeyondEndEvents", jsonKey: "beyond_end_events"},
 		{name: "DuplicatedRecords", jsonKey: "duplicated_records"},
 		{name: "MessagesWritten", jsonKey: "messages_written"},
-		// records_retained and blnk_record_share are the SHARED-TOPIC correction, and they are
-		// on the wire because without them a shared log cannot be reconciled at all. An end
-		// offset counts every record the topic ever accepted from every producer; retention
-		// then deletes an arbitrary prefix of them. Measuring Blnk's surplus against the whole
-		// retained log therefore compares Blnk's events against somebody else's traffic, and
-		// the answer moves whenever that traffic does. blnk_record_share is the part of the
-		// retained log this reconciliation actually attributed to Blnk's own published events,
-		// which is the only denominator the surplus means anything against. Neither is the
-		// verdict — that is what conclusive and loss_detected are for — and both are reported
-		// so an operator reading a surplus can see which log it was drawn from.
+		// records_retained and blnk_record_share are the SHARED-TOPIC correction, and they
+		// are on the wire because without them a shared log cannot be reconciled at all. An
+		// end offset counts every record the topic ever accepted from every producer;
+		// retention then deletes an arbitrary prefix of them.
 		{name: "RecordsRetained", jsonKey: "records_retained"},
 		{name: "BlnkRecordShare", jsonKey: "blnk_record_share"},
-		// FIVE FIELDS WERE RETIRED FROM BETWEEN THESE TWO, and their absence is the point.
-		// purged_events, all_time_terminal_events, verified_records, unverifiable_records and
-		// missing_records belonged to a whole-history reconciliation that corrected for retention
-		// with a purge log and checked each claimed coordinate against the broker in Go. Both
-		// mechanisms were replaced by drawing the comparison INSIDE the per-partition windows the
-		// offsets were measured in and classifying every claim in SQL over those same windows,
-		// which is what corroborated / aged_out / beyond_end / unmeasured above report. Their
-		// service-layer counterparts went with the rewrite; leaving the wire half behind meant
-		// five documented fields that could only ever be zero, and a reconciliation script
-		// reading verified_records: 0 beside a green verdict concludes nothing was verified.
+		// THE WIRE CARRIES NO WHOLE-HISTORY FIELDS, and their absence is the point: the
+		// verdict is drawn INSIDE the per-partition windows the offsets were measured in and
+		// every claim is classified in SQL over those same windows, which is what
+		// corroborated / aged_out / beyond_end /
+		// unmeasured above report.
 		{name: "Overhead", jsonKey: "overhead"},
 		{name: "LossDetected", jsonKey: "loss_detected"},
 		{name: "Conclusive", jsonKey: "conclusive"},
-		// PERF-P05: the population the verdict compared. Windowed is NOT omitempty — a
-		// diagnostic-only verdict must say so explicitly, and an omitted false would read as
-		// a field the server forgot rather than as a comparison it declined to conclude from.
+		// The population the verdict compared. Windowed is NOT omitempty — a diagnostic-only
+		// verdict must say so explicitly, and an omitted false would read as a field the
+		// server forgot rather than as a comparison it declined to conclude from.
 		{name: "WindowStart", jsonKey: "window_start", omitEmpty: true},
 		{name: "Windowed", jsonKey: "windowed"},
 		{name: "Caveats", jsonKey: "caveats", omitEmpty: true},
@@ -724,9 +648,9 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 		// The API shape and the computed verdict must not drift: a field added to the
 		// service-layer OutboxReconciliation and not surfaced here is a finding the daily
 		// check produces and the API silently withholds. Compared as SETS of names, because
-		// the two types legitimately differ in wire tags, in Summary's form — a method on one,
-		// a field on the other — and in the time fields' nullability, which the wire needs and
-		// the computation does not.
+		// the two types legitimately differ in wire tags, in Summary's form — a method on
+		// one, a field on the other — and in the time fields' nullability, which the wire
+		// needs and the computation does not.
 		wire := reflect.TypeOf(apimodel.OutboxReconciliationResult{})
 		service := reflect.TypeOf(blnk.OutboxReconciliation{})
 
@@ -864,12 +788,11 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 	})
 }
 
-// TestMeasuredOffsetWindow_WireContract pins the windows the verdict is computed against.
+// TestMeasuredOffsetWindow_WireContract pins the windows the verdict is computed
+// against.
 //
-// They are on the response because the verdict is a statement ABOUT them: each outbox row's
-// stored coordinate is checked for membership in the window of its own partition. A verdict
-// reported without its windows cannot be audited by the reader — which is exactly how the
-// unbounded comparison this replaced came to present itself as conclusive.
+// They are on the response because the verdict is a statement ABOUT them: each outbox
+// row's stored coordinate is checked for membership in the window of its own partition.
 func TestMeasuredOffsetWindow_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.MeasuredOffsetWindow{}, []fieldContract{
 		{name: "Topic", jsonKey: "topic"},
@@ -922,28 +845,26 @@ func TestMeasuredOffsetWindow_WireContract(t *testing.T) {
 func TestCreateSubscriber_RequestContract(t *testing.T) {
 	assertWireContract(t, apimodel.CreateSubscriber{}, []fieldContract{
 		{name: "SubscriberID", jsonKey: "subscriber_id"},
-		// NO binding:"required" on Name. The requirement is real and is enforced by
-		// Validate; the tag made a missing name a BINDER failure, answering
-		// GEN_MALFORMED_REQUEST where the endpoint's contract and every other rule this
-		// DTO applies answer GEN_VALIDATION_ERROR. It also split one rule across two
-		// mechanisms, so an omitted name and a whitespace-only one produced different
-		// codes for the same broken rule.
+		// NO binding:"required" on Name. The requirement is real and is enforced by Validate;
+		// the tag made a missing name a BINDER failure, answering GEN_MALFORMED_REQUEST where
+		// the endpoint's contract and every other rule this DTO applies answer
+		// GEN_VALIDATION_ERROR.
 		{name: "Name", jsonKey: "name"},
 		{name: "AuthorizedTopics", jsonKey: "authorized_topics", binding: "max=16,dive,max=249"},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
-		// NO WebhookURL. C-01: this route is not deprecated and is not fronted by the
-		// sunset guard, so accepting legacy webhook state here left a write path open
-		// after the four guarded routes had begun answering 410 Gone.
+		// NO WebhookURL: this route is not deprecated and is not fronted by the sunset
+		// guard, so accepting legacy webhook state here left a write path open after the four
+		// guarded routes had begun answering 410 Gone.
 	})
 
 	t.Run("the principal and the consumer group are not accepted from a client", func(t *testing.T) {
-		// Both are DERIVED from the subscriber identifier, and the derivation is enforced
-		// by CHECK constraints on blnk.event_subscribers rather than by this shape alone.
-		// Accepting either here would let a caller name a principal that does not belong
-		// to its own identifier — the principal is the join key to every ACL binding, so a
-		// caller choosing it is a caller choosing which subscriber's grants it inherits —
-		// and it would let a row be written that the schema then rejects, which surfaces
-		// as a server fault for what is really a rejected request.
+		// Both are DERIVED from the subscriber identifier, and the derivation is enforced by
+		// CHECK constraints on blnk.event_subscribers rather than by this shape alone.
+		// Accepting either here would let a caller name a principal that does not belong to
+		// its own identifier — the principal is the join key to every ACL binding, so a
+		// caller choosing it is a caller choosing which subscriber's grants it inherits — and
+		// it would let a row be written that the schema then rejects, which surfaces as a
+		// server fault for what is really a rejected request.
 		subjectType := reflect.TypeOf(apimodel.CreateSubscriber{})
 
 		for _, derived := range []string{"KafkaPrincipal", "ConsumerGroupID"} {
@@ -954,11 +875,10 @@ func TestCreateSubscriber_RequestContract(t *testing.T) {
 	})
 
 	t.Run("no field is mandatory at the BINDER, name included", func(t *testing.T) {
-		// C-24. name IS required, and the requirement now lives in Validate rather than in
-		// a binding tag, so a missing one answers GEN_VALIDATION_ERROR like every other
-		// broken rule this DTO applies instead of the binder's GEN_MALFORMED_REQUEST. The
-		// binder keeps only what it is the right layer for: TYPE errors, and the bounds
-		// below.
+		// Name IS required, and the requirement now lives in Validate rather than in a
+		// binding tag, so a missing one answers GEN_VALIDATION_ERROR like every other broken
+		// rule this DTO applies instead of the binder's GEN_MALFORMED_REQUEST. The binder
+		// keeps only what it is the right layer for: TYPE errors, and the bounds below.
 		subjectType := reflect.TypeOf(apimodel.CreateSubscriber{})
 
 		for index := 0; index < subjectType.NumField(); index++ {
@@ -1004,8 +924,8 @@ func TestUpdateSubscriber_RequestContract(t *testing.T) {
 		},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
 		// NO WebhookURL, for the reason given on CreateSubscriber. PUT
-		// /subscribers/:subscriber_id/webhook-subscription is the guarded write path, and
-		// the destination policy it applies is unchanged.
+		// /subscribers/:subscriber_id/webhook-subscription is the guarded write path, and the
+		// destination policy it applies is unchanged.
 	})
 
 	t.Run("every scalar is a pointer so absent and empty stay distinguishable", func(t *testing.T) {
@@ -1079,39 +999,30 @@ func TestSubscriberResponse_WireContract(t *testing.T) {
 		{name: "AuthorizedTopics", jsonKey: "authorized_topics"},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
 		{name: "EnforcedAccess", jsonKey: "enforced_access"},
-		// Present unconditionally, and both of them deliberately. A client that had to infer
-		// "no credential will be issued for this row" from the ABSENCE of a field would infer
-		// it wrong, and the state was previously discoverable only by triggering the refusal on
-		// a later call.
+		// Present unconditionally, and both of them deliberately.
 		{name: "CredentialIssuanceBlocked", jsonKey: "credential_issuance_blocked"},
 		{name: "CredentialIssuanceBlockedReason", jsonKey: "credential_issuance_blocked_reason", omitEmpty: true},
 		{name: "CredentialFingerprint", jsonKey: "credential_fingerprint", omitEmpty: true},
 		{name: "CredentialIssuedAt", jsonKey: "credential_issued_at", omitEmpty: true},
-		// NO WebhookURL. C-01: the recorded endpoint is disclosed by GET
+		// NO WebhookURL: the recorded endpoint is disclosed by GET
 		// /subscribers/:subscriber_id/webhook-subscription alone, which the sunset guard
-		// fronts, so it stops being readable at the retirement instant. Echoing it here
-		// as well kept it readable through an unguarded route afterwards, and the two
-		// reads then disagreed about whether the legacy surface still existed.
-		//
-		// MigratedAt STAYS: it is migration progress about this deployment rather than
-		// legacy state — no endpoint and no third-party data — and a progress report
-		// needs it on both sides of the sunset.
+		// fronts, so it stops being readable at the retirement instant.
 		{name: "MigratedAt", jsonKey: "migrated_at", omitEmpty: true},
-		// ORPHAN-01: the three unsettled-state markers. They are PROJECTED rather than
-		// database-only because both alerts that fire on them tell an operator to find the
-		// affected rows through this API, and before this the answer was "read the table" — a
-		// marker an operator cannot see through the registry is a marker they cannot triage.
-		// All three are omitempty: present always means something needs attention.
+		// the three unsettled-state markers. They are PROJECTED rather than database-only
+		// because both alerts that fire on them tell an operator to find the affected rows
+		// through this API, and before this the answer was "read the table" — a marker an
+		// operator cannot see through the registry is a marker they cannot triage.
 		{name: "RevocationPendingAt", jsonKey: "revocation_pending_at", omitEmpty: true},
 		{name: "RevocationFailedAt", jsonKey: "revocation_failed_at", omitEmpty: true},
 		{name: "CredentialOrphanedAt", jsonKey: "credential_orphaned_at", omitEmpty: true},
 		{name: "CreatedAt", jsonKey: "created_at"},
 		{name: "UpdatedAt", jsonKey: "updated_at"},
 		// The revocation pair, at the end because it was added last. The boolean is present
-		// unconditionally for the same reason CredentialIssuanceBlocked is — a client inferring
-		// it from an absent field would infer it wrong — and the reason accompanies it because
-		// docs/metrics.md answers the revocation alert with "find the affected subscribers with
-		// GET /subscribers", so the response has to carry the remedy and not only the state.
+		// unconditionally for the same reason CredentialIssuanceBlocked is — a client
+		// inferring it from an absent field would infer it wrong — and the reason accompanies
+		// it because docs/metrics.md answers the revocation alert with "find the affected
+		// subscribers with GET /subscribers", so the response has to carry the remedy and not
+		// only the state.
 		{name: "RevocationPending", jsonKey: "revocation_pending"},
 		{name: "RevocationPendingReason", jsonKey: "revocation_pending_reason", omitEmpty: true},
 	})
@@ -1135,12 +1046,11 @@ func TestSubscriberResponse_WireContract(t *testing.T) {
 	})
 
 	t.Run("the stored credential reference is never published, only a fingerprint", func(t *testing.T) {
-		// The read shape carries a SHORT DIGEST FRAGMENT of the reference, not the
-		// reference. The reference is not a secret — it is non-reversible and nobody can
-		// authenticate with it — but it is internal correlation state, and publishing it
-		// invites a client to send it back or compare against it, which makes it part of
-		// the API contract by accident. The fingerprint answers the only legitimate
-		// question ("is this the same issuance I saw last time?") and nothing else.
+		// The read shape carries a SHORT DIGEST FRAGMENT of the reference, not the reference.
+		// The reference is not a secret — it is non-reversible and nobody can authenticate
+		// with it — but it is internal correlation state, and publishing it invites a client
+		// to send it back or compare against it, which makes it part of the API contract by
+		// accident.
 		subjectType := reflect.TypeOf(apimodel.SubscriberResponse{})
 
 		_, present := subjectType.FieldByName("CredentialReference")
@@ -1199,19 +1109,20 @@ func TestKafkaCredentialsResponse_WireContract(t *testing.T) {
 		{name: "Password", jsonKey: "password"},
 		{name: "Mechanism", jsonKey: "mechanism"},
 		{name: "IssuedAt", jsonKey: "issued_at"},
-		// The two the service established and the response used to drop. Neither is omitempty:
-		// an empty fingerprint and a false Replaced are both meaningful readings, and omitting
-		// them would make "not replaced" indistinguishable from "the field is not returned".
+		// The two the service establishes and the response must carry. Neither is
+		// omitempty: an empty fingerprint and a false Replaced are both meaningful readings,
+		// and omitting them would make "not replaced" indistinguishable from "the field is
+		// not returned".
 		{name: "CredentialFingerprint", jsonKey: "credential_fingerprint"},
 		{name: "Replaced", jsonKey: "replaced"},
 	})
 
 	t.Run("the fingerprint and the replacement flag reach the caller", func(t *testing.T) {
-		// The password is returned once and nothing persists it, so the FINGERPRINT is the only
-		// handle a client has on an issuance afterwards — and it is the same value a subscriber
-		// read reports, which is what makes the two comparable. REPLACED is the destructive-action
-		// confirmation: Kafka stores one credential per principal, so true means a live consumer's
-		// password has just stopped working.
+		// The password is returned once and nothing persists it, so the FINGERPRINT is the
+		// only handle a client has on an issuance afterwards — and it is the same value a
+		// subscriber read reports, which is what makes the two comparable. REPLACED is the
+		// destructive-action confirmation: Kafka stores one credential per principal, so true
+		// means a live consumer's password has just stopped working.
 		decoded := marshalToKeys(t, apimodel.KafkaCredentialsResponse{
 			CredentialFingerprint: "9f1c8a72",
 			Replaced:              true,
@@ -1261,19 +1172,10 @@ func TestKafkaCredentialsResponse_WireContract(t *testing.T) {
 	})
 }
 
-// TestEventAPIShapes_CarryNoSecretOutsideTheIssuanceResponse is the falsifiable form of the
-// secret-handling posture.
+// TestEventAPIShapes_CarryNoSecretOutsideTheIssuanceResponse is the falsifiable form of
+// the secret-handling posture.
 //
-// One type may carry a password, and exactly one does. The guarantee is structurally backed
-// — blnk.event_subscribers has no column capable of holding a plaintext or reversibly
-// encrypted secret, so a field on any read shape could never be populated from persistence
-// and could only ever leak one — but "structurally backed" is not the same as "checked", and
-// a field added later would compile silently. This checks it.
-//
-// The scan covers the deprecated webhook-subscription shapes too, and must: they are live
-// until the sunset date, and the legacy transport's signing secret and configured headers are
-// exactly the sort of deployment-wide value somebody might be tempted to surface per
-// subscriber. Naming them is what lets them be checked, hence the local suppression.
+// One type may carry a password, and exactly one does.
 //
 //nolint:staticcheck // SA1019: the deprecated shapes ship until sunset and must be scanned too.
 func TestEventAPIShapes_CarryNoSecretOutsideTheIssuanceResponse(t *testing.T) {
@@ -1324,14 +1226,9 @@ func TestEventAPIShapes_CarryNoSecretOutsideTheIssuanceResponse(t *testing.T) {
 // Deprecated legacy webhook-subscription shapes
 // ---------------------------------------------------------------------------
 
-// TestWebhookSubscriptionShapes_WireContract pins the transitional surface that exists only
-// for the dual-delivery window, and on which the 410 Gone sunset becomes observable.
-//
-// The three types it names are marked Deprecated, which is correct and deliberate: they are
-// scheduled for deletion once the sunset date passes. Until then they ship, and a shape that
-// ships is a shape a client parses, so it is pinned here like any other. Naming a deprecated
-// type is precisely what a test of its contract has to do, which is why the deprecation
-// warning is suppressed for this function and nowhere else.
+// TestWebhookSubscriptionShapes_WireContract pins the transitional surface that exists
+// only for the dual-delivery window, and on which the 410 Gone sunset becomes
+// observable.
 //
 //nolint:staticcheck // SA1019: pinning a deprecated-but-shipping contract requires naming it.
 func TestWebhookSubscriptionShapes_WireContract(t *testing.T) {
@@ -1380,20 +1277,10 @@ func TestWebhookSubscriptionShapes_WireContract(t *testing.T) {
 // Authorization vocabulary for the new route prefixes
 // ---------------------------------------------------------------------------
 
-// TestScopeResources_CoverTheEventAndSubscriberSurfaces pins the two resource values the new
-// routes authorize against.
+// TestScopeResources_CoverTheEventAndSubscriberSurfaces pins the two resource values
+// the new routes authorize against.
 //
-// Each value does two jobs, and a typo in it would compile cleanly and break both. It is the
-// first path segment the auth middleware resolves a request by — /events/dead-letter,
-// /events/stats, /subscribers, /subscribers/:id/kafka-credentials,
-// /subscribers/:id/webhook-subscription — and it is the resource half of an API-key scope
-// string such as "events:read". A hyphenated variant, a singular slip or a stray capital
-// would silently deny every caller, with no compile error and no failing test anywhere else.
-//
-// Registration in api/middleware/auth.go's pathToResource map is the other half of making
-// these routes reachable, and it is deliberately NOT asserted here: it is later work, and
-// the end-to-end proof belongs to the handler tests. What this test fixes is the vocabulary,
-// so that when the map is written it is written against values that cannot have drifted.
+// Each value does two jobs, and a typo in it would compile cleanly and break both.
 func TestScopeResources_CoverTheEventAndSubscriberSurfaces(t *testing.T) {
 	assert.Equal(t, middleware.Resource("events"), middleware.ResourceEvents,
 		"ResourceEvents must be exactly \"events\": it is the first segment of /events/dead-letter, "+
@@ -1477,24 +1364,18 @@ func TestScopeResources_CoverTheEventAndSubscriberSurfaces(t *testing.T) {
 	})
 }
 
-// TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforcesIt is the API half
-// of the partition-key-prefix hazard.
+// TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforcesIt is the
+// API half of the partition-key-prefix hazard.
 //
-// # The hazard
+// A subscriber's record carries three access-shaped values — authorized_topics, a
+// consumer group, and partition_key_prefix — and only the first two are ACL bindings.
 //
-// A subscriber's record carries three access-shaped values — authorized_topics, a consumer
-// group, and partition_key_prefix — and only the first two are ACL bindings. Kafka's authorizer
-// has no message-key dimension, so no ACL confines a consumer to a slice of a topic by key.
+// A security review rejected it: cooperation is not an access boundary, and a
+// subscriber that ignored the request — or used any other Kafka client — read every
+// record on the shared topic, including records written for other ledgers.
 //
-// The response used to answer that by declaring the key dimension UNENFORCED and asking the
-// subscriber to filter for itself. A security review rejected it: cooperation is not an access
-// boundary, and a subscriber that ignored the request — or used any other Kafka client — read
-// every record on the shared topic, including records written for other ledgers.
-//
-// So the dimension is enforced now, by a component of Blnk's rather than by the broker, and this
-// body is where the response says which component enforces what. That is the property these
-// assertions protect, in both directions: a response must not claim the prefix is a broker
-// boundary, and it must not report it as nobody's boundary either.
+// So the dimension is enforced now, by a component of Blnk's rather than by the broker,
+// and this body is where the response says which component enforces what.
 func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforcesIt(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions", "blnk.balances"}
@@ -1518,9 +1399,9 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 	})
 
 	t.Run("the key scope is reported together with where it IS enforced", func(t *testing.T) {
-		// Both fields or neither. The prefix alone reads as a limit the CREDENTIAL carries, which
-		// is what made the previous contract dangerous — the prefix was echoed with nothing in
-		// the body saying that no component applied it.
+		// Both fields or neither. The prefix alone reads as a limit the CREDENTIAL carries,
+		// which is what made the previous contract dangerous — the prefix was echoed with
+		// nothing in the body saying that no component applied it.
 		assert.Equal(t, keyScope, enforced.PartitionKeyPrefix,
 			"the recorded scope must reach the client whose records it selects")
 		assert.Equal(t, model.KeyScopeEnforcementGateway, enforced.PartitionKeyPrefixEnforcedBy,
@@ -1548,9 +1429,9 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 
 	t.Run("a whitespace-only key scope is reported as absent", func(t *testing.T) {
 		// It agrees with model.EventSubscriber.DeclaresKeyScope, which reads whitespace as
-		// absent for the same reason: a scope on nothing is not an intent anybody has. It must
-		// not produce an ENFORCED declaration either, or a body would claim a filter that
-		// matches every key is a boundary.
+		// absent for the same reason: a scope on nothing is not an intent anybody has. It
+		// must not produce an ENFORCED declaration either, or a body would claim a filter
+		// that matches every key is a boundary.
 		blank := declaredEnforcedAccess(subscriberID, topics, "   \t ")
 		assert.Empty(t, blank.PartitionKeyPrefix)
 		assert.Equal(t, model.KeyScopeEnforcementNone, blank.PartitionKeyPrefixEnforcedBy)
@@ -1578,11 +1459,9 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 		assert.Equal(t, topics, enforced.Topics, "the topic set must be reported exactly")
 	})
 
-	// M-1 kept, inverted. The negative claim used to be the load-bearing statement in this
-	// object: partition_key sat in not_enforced_by, and a client had to read it to learn that
-	// the prefix was its own problem. The boundary is enforced now, so the list is EMPTY — and
-	// the key stays in the body, because an absent key would be indistinguishable from a
-	// response that simply forgot to state it.
+	// The boundary is enforced, so the list is EMPTY — and the key
+	// stays in the body, because an absent key would be indistinguishable from a response
+	// that simply forgot to state it.
 	t.Run("nothing is reported as unenforced, on any path", func(t *testing.T) {
 		assert.Empty(t, enforced.NotEnforcedBy,
 			"a key-scoped subscriber has no unenforced dimension: the prefix is applied by the "+
@@ -1627,10 +1506,10 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 				"the report describes a boundary the subscriber's own group falls outside")
 	})
 
-	// MAJ-1: the state scale, on the wire and in every state. Before it, every enforcement field
-	// in this object derived from one fact — whether the prefix column was non-empty — so a
-	// registry read on the shipped default announced a verified key boundary that the next
-	// credential call refused for want of the very component it had named.
+	// the state scale, on the wire and in every state. Before it, every enforcement field
+	// in this object derived from one fact — whether the prefix column was non-empty — so
+	// a registry read on the shipped default announced a verified key boundary that the
+	// next credential call refused for want of the very component it had named.
 	t.Run("the key scope state distinguishes requested from enforceable", func(t *testing.T) {
 		keys := marshalToKeys(t, enforced)
 		require.Contains(t, keys, "partition_key_scope_state",
@@ -1673,11 +1552,11 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 				"force every client to special-case it")
 	})
 
-	// AUTH-03: the declaration used to describe what Blnk ASKED FOR and nothing else, so a
-	// principal carrying a hand-made ALLOW binding was issued a credential whose response
-	// declared this exact boundary while the broker enforced a wider one. Issuance now reads
-	// the principal's complete grant and refuses a broader one, and the response says so — but
-	// only on the path where the reading actually happened.
+	// a declaration describing what Blnk ASKED FOR and nothing else would issue a principal
+	// carrying a hand-made ALLOW binding a credential whose response declared this exact
+	// boundary while the broker enforced a wider one. Issuance reads the principal's
+	// complete grant and refuses a broader one, and the response says so — but only on the
+	// path where the reading actually happened.
 	t.Run("the exclusivity claim is only made where it was verified", func(t *testing.T) {
 		assert.False(t, enforced.ExclusiveGrantVerified,
 			"a projection built from a registry row makes no broker round trip, so it must not "+
@@ -1688,8 +1567,9 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 				"keep this boundary, and no round trip has confirmed that it does for this principal")
 
 		// THE SAME key scope the unverified fixture was built with. The two constructors are
-		// compared field by field below, so passing a different scope here would make them differ
-		// in more fields than the comparison expects and it would pass for the wrong reason.
+		// compared field by field below, so passing a different scope here would make them
+		// differ in more fields than the comparison expects and it would pass for the wrong
+		// reason.
 		verified := declaredVerifiedEnforcedAccess(subscriberID, topics, keyScope)
 		assert.True(t, verified.ExclusiveGrantVerified,
 			"issuance reads the principal's complete ACL grant and refuses a broader one, so the "+
@@ -1698,11 +1578,12 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 			"AND it reports the key scope ATTESTED, because issuance also required the declared "+
 				"component to confirm this principal and this prefix before a secret existed")
 
-		// IDENTICAL IN EVERY OTHER RESPECT, and the two fields that do differ are exactly the two
-		// that describe what Blnk OBSERVED rather than what it asked for: the broker's complete
-		// grant, and the component's confirmation. Neither is knowable from a registry row, and no
-		// other field may drift between the two constructors — that is what stops a subscriber
-		// read and a credential response describing different boundaries.
+		// IDENTICAL IN EVERY OTHER RESPECT, and the two fields that do differ are exactly the
+		// two that describe what Blnk OBSERVED rather than what it asked for: the broker's
+		// complete grant, and the component's confirmation. Neither is knowable from a
+		// registry row, and no other field may drift between the two constructors — that is
+		// what stops a subscriber read and a credential response describing different
+		// boundaries.
 		verified.ExclusiveGrantVerified = false
 		verified.PartitionKeyScopeState = enforced.PartitionKeyScopeState
 		assert.Equal(t, enforced, verified,
@@ -1754,33 +1635,12 @@ func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforces
 	})
 }
 
-// TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs is C-02's API half.
+// TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs is the stated-scope contract's API
+// half.
 //
-// # Why this field exists rather than a refusal
-//
-// Credential issuance used to REFUSE any subscriber recording a partition key prefix, with the
-// typed code SUBSCRIBER_ISOLATION_UNENFORCEABLE and a 409, permanently. That withdrew a mandatory
-// capability for a state the registry is designed to hold: a subscriber registered with a prefix
-// could never obtain credentials at all, and a database CHECK constraint made the combination
-// unrepresentable as well.
-//
-// What replaced it was DISCLOSURE — issue whole-topic Read, echo the prefix, and declare that
-// applying it was the consumer's own obligation. That was accurate prose about an absent boundary.
-// A subscriber that ignored the obligation, or used any other Kafka client, read every record on
-// the shared category topic, including records written for other ledgers and other subscribers,
-// and nothing in the platform could prevent or detect it. A security review named exactly that:
-// disclosure and client cooperation are not an authorization boundary.
-//
-// So the boundary is ENFORCED now, and this is where the contract says so. A subscriber recording
-// a prefix is granted Describe but NOT Read on its topics — the broker refuses every direct fetch —
-// and its records are delivered by the key-authorising component the DEPLOYMENT declares in
-// KAFKA_KEY_SCOPE_ENFORCEMENT, which applies the prefix to each record's key. Blnk does not ship
-// that component and serves no records itself, so where none is declared issuance refuses the row
-// with SUBSCRIBER_KEY_SCOPE_UNENFORCED rather than emitting this object at all — which is what
-// keeps every response carrying it a statement about a live enforcement point.
-//
-// The fields below are the whole of that statement, and they are asserted as a group because their
-// VALUE is in their agreement: any one of them alone is either ambiguous or ignorable.
+// What replaced it was DISCLOSURE — issue whole-topic Read, echo the prefix, and
+// declare that applying it was the consumer's own obligation. That was accurate prose
+// about an absent boundary.
 func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions"}
@@ -1833,8 +1693,8 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 
 	t.Run("every flag is DERIVED from the prefix, so they cannot disagree", func(t *testing.T) {
 		// Passing the flags alongside the value would allow a caller to send a prefix with no
-		// enforcement point attached, or gateway delivery with no prefix to filter on. Either is
-		// worse than neither, so the constructor computes all of them from one fact.
+		// enforcement point attached, or gateway delivery with no prefix to filter on. Either
+		// is worse than neither, so the constructor computes all of them from one fact.
 		for name, prefix := range map[string]string{
 			"padded":     "  ldg_9f2c  ",
 			"whitespace": "   ",
@@ -1898,27 +1758,10 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 	})
 }
 
-// TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation is SEC-01's API half.
+// TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation is the attestation rule's API
+// half.
 //
-// # The gap this closes
-//
-// The declaration's negative facts were complete: partition_key_prefix_enforced false,
-// not_enforced_by naming the key dimension, client_side_key_filtering_required saying whose job
-// the narrowing is. What none of them said is what to do INSTEAD, and the answer existed only
-// outside the response — in docs/kafka-operations.md, in a WARNING in Blnk's own log, and in the
-// SubscriberKeyScopeGuidance constant, which was declared and referenced by nothing at all.
-//
-// A runtime security review reproduced the consequence: a subscriber granted blnk.transactions
-// read tens of thousands of records whose keys fell outside its recorded prefix, exactly as this
-// declaration says it would, while a reader of the requirement that promised key-prefix scoping
-// had no way to learn from any response how to obtain a boundary that is actually kept. The two
-// readings could not be reconciled from the API alone.
-//
-// So the remedy now travels in the same object as the limitation. This asserts it is there, that
-// it is the shared constant rather than a per-handler paraphrase, and that it is present for
-// every subscriber rather than only for the key-scoped ones — a remedy that appeared only beside
-// a prefix would let a reader of any other subscriber conclude the key dimension is enforced for
-// them.
+// So the remedy now travels in the same object as the limitation.
 func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions"}
@@ -2000,9 +1843,10 @@ func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing
 	})
 
 	t.Run("verifying exclusivity does not change the remedy", func(t *testing.T) {
-		// The verified constructor differs from the unverified one in the two OBSERVED fields, and
-		// this keeps the remedy out of that difference: advice that changed depending on whether a
-		// broker round trip happened would be advice about the wrong thing.
+		// The verified constructor differs from the unverified one in the two OBSERVED
+		// fields, and this keeps the remedy out of that difference: advice that changed
+		// depending on whether a broker round trip happened would be advice about the wrong
+		// thing.
 		unverified := declaredEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 		verified := declaredVerifiedEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 
@@ -2015,16 +1859,9 @@ func TestSubscriberEnforcedAccess_CarriesTheRemedyBesideTheLimitation(t *testing
 	})
 }
 
-// declaredKeyScopeDeployment is the resolved deployment state these contract assertions are made
-// under: one that DECLARES a key-authorising component, with subscriber-facing brokers advertised
-// and whole-topic access acknowledged.
-//
-// It is stated rather than defaulted because the projection is now truthful about deployment
-// state, and the enforced shape these tests pin — partition_key_prefix_enforced true,
-// broker_gateway named, gateway delivery required — is the shape of a deployment that has such a
-// component. Passing the zero value would assert against a deployment that has none, where the
-// honest projection reports the scope requested-but-unenforced; that case is covered by
-// TestNewSubscriberResponse_StatesWhatTheNextCallWillDo in api/model.
+// declaredKeyScopeDeployment is the resolved deployment state these contract assertions
+// are made under: one that DECLARES a key-authorising component, with subscriber-facing
+// brokers advertised and whole-topic access acknowledged.
 func declaredKeyScopeDeployment() model.SubscriberAccessDeployment {
 	return model.SubscriberAccessDeployment{
 		KeyScopeEnforcement:         model.KeyScopeEnforcementGateway,
@@ -2033,13 +1870,8 @@ func declaredKeyScopeDeployment() model.SubscriberAccessDeployment {
 	}
 }
 
-// declaredEnforcedAccess builds a registry-read declaration under declaredKeyScopeDeployment.
-//
-// A thin wrapper so the wire-shape assertions below read as they did while still going through
-// the constructor that takes the deployment. api/model.NewSubscriberEnforcedAccess — the overload
-// with no deployment argument — deliberately claims NO enforcement point, which is the right
-// answer for a caller that does not know and the wrong fixture for a test asserting the enforced
-// shape.
+// declaredEnforcedAccess builds a registry-read declaration under
+// declaredKeyScopeDeployment.
 func declaredEnforcedAccess(
 	subscriberID string, topics []string, partitionKeyPrefix string,
 ) apimodel.SubscriberEnforcedAccess {

@@ -16,67 +16,20 @@ limitations under the License.
 
 // event_retention.go holds the production caller of the event outbox's retention purge.
 //
-// # Why the mechanism alone was not enough
+// database.PurgeTerminalEventsBefore existed, was documented, was tested — and nothing
+// in a running process ever called it. That is not a smaller version of the same
+// problem; it is the whole problem, because what the table accumulates in the meantime
+// is the ledger's most sensitive data.
 //
-// database.PurgeTerminalEventsBefore existed, was documented, was tested — and nothing in a
-// running process ever called it. That is not a smaller version of the same problem; it is
-// the whole problem, because what the table accumulates in the meantime is the ledger's most
-// sensitive data.
-//
-// EVERY ROW'S PAYLOAD IS THE WEBHOOK BODY VERBATIM. A transaction event carries amounts and
-// balance identifiers. An identity event carries names, email addresses, phone numbers,
-// postal addresses and dates of birth. last_error and failure_metadata carry broker and
-// driver text. None of it has any operational value once the event has been delivered, so
-// retaining it forever converts a delivery buffer into an unbounded SECOND COPY of that data
-// — without the access controls the primary tables have around them, growing without limit,
-// and with a blast radius that grows with it. It is also a storage-exhaustion path: at the
-// designed 500 events per second the table gains 43 million rows a day and never gives one
-// back.
-//
-// # Shape
-//
-// Modelled on LineageOutboxProcessor [lineage_worker.go:31-193] and on
-// EventMetricsCollector, which follows the same precedent: a mutex-guarded running flag, a
-// stop channel, a wait group, fluent With* configurators, a double-start-guarded
-// Start(ctx), a Stop() that closes and waits, IsRunning(), and a ticker/select loop over
-// context cancellation, the stop channel and the tick. Following it means the server role
-// gets the same two lines every other background worker gets, and an operator reasons about
-// one lifecycle rather than several.
+// EVERY ROW'S PAYLOAD IS THE WEBHOOK BODY VERBATIM. A transaction event carries amounts
+// and balance identifiers.
 //
 // The cadence differs from a relay's on purpose. A relay polls every second because a
-// claimable row is work waiting to be done. Retention is housekeeping over rows that are
-// already terminal: sweeping hourly is far more often than any plausible retention period
-// needs, and sweeping faster would only add load to a table the relay is concurrently
-// claiming from.
+// claimable row is work waiting to be done.
 //
-// # Three safety properties, each deliberate
-//
-// DISABLED BY DEFAULT. Deleting ledger-adjacent records is a decision only an operator can
-// take — a jurisdiction, an audit programme or a legal hold may require a longer period than
-// any default could guess — so RELAY_EVENT_RETENTION_DAYS ships unset and this worker
-// declines to start until it is configured. A default that silently deleted evidence would
-// be worse than one that keeps too much.
-//
-// ONE ELIGIBLE STATE, enforced in SQL rather than here, and it is narrower than "terminal".
-// The repository deletes a DISPATCHED row on age alone — it is a receipt for an event a
-// subscriber has already had. A DEAD-LETTERED row is NEVER deleted, however old it is: it is
-// the record of an event nobody received, so it is the only inventory triage reads, the only
-// thing a replay can be driven from, and the only place the failure metadata explaining the
-// loss exists. Deleting it on an age timer destroyed all of that unrecoverably, and destroyed
-// the oldest failure first — the one most likely to have been forgotten rather than handled.
-// Such a row leaves the inventory by being REPLAYED: a re-publish the broker acknowledges
-// makes it dispatched, and this sweep then treats it as the receipt it has become.
-//
-// A pending, processing, replaying or failed row is never eligible either — failed most of
-// all, because its dead-letter write is still owed, which makes the outbox the only copy of
-// that event in existence. model.EventOutbox.IsPurgeableByRetention states the same rule in Go
-// for a caller that needs to evaluate it without a database.
-//
-// BOUNDED IN EVERY DIRECTION. Each delete is limited to a batch, each sweep is limited to a
-// number of batches, and each sweep runs under its own deadline. An unbounded DELETE over a
-// large backlog would hold locks on a table the relay is claiming from for the duration and
-// bloat the WAL in a single transaction; the bound turns a dangerous one-shot into a
-// resumable trickle that catches up over successive sweeps.
+// ONE ELIGIBLE STATE, enforced in SQL rather than here, and it is narrower than
+// "terminal". The repository deletes a DISPATCHED row on age alone — it is a receipt
+// for an event a subscriber has already had.
 package blnk
 
 import (
@@ -92,47 +45,27 @@ import (
 
 const (
 	// defaultEventRetentionInterval is how often the sweep runs. Hourly: retention periods
-	// are measured in days, so this is already far more frequent than the shortest sensible
-	// period, and running it faster would add load to a table the relay is claiming from
-	// for no benefit.
+	// are measured in days, so this is already far more frequent than the shortest
+	// sensible period, and running it faster would add load to a table the relay is
+	// claiming from for no benefit.
 	defaultEventRetentionInterval = time.Hour
 
-	// defaultEventRetentionBatchSize is how many rows one DELETE removes: the fallback for a
-	// sweeper built before configuration could be read. It keeps each statement's lock
+	// defaultEventRetentionBatchSize is how many rows one DELETE removes: the fallback for
+	// a sweeper built before configuration could be read. It keeps each statement's lock
 	// footprint and WAL contribution small on a table under concurrent claim.
-	//
-	// DERIVED rather than restated, so this and the configured default cannot diverge. Two
-	// copies of one default are two numbers that can disagree, and which one a deployment ran
-	// at would then depend on start-up ordering.
 	defaultEventRetentionBatchSize = config.DefaultEventRetentionBatchSize
 
-	// defaultEventRetentionMaxBatchesPerSweep bounds ONE sweep by default, and the bound is
-	// what makes the operation safe to run beside a live relay: without it, the first sweep
-	// after retention is enabled on a long-running deployment would try to delete the entire
-	// historical backlog in a single pass, holding locks and generating WAL for as long as
-	// that took. With it, the backlog drains over successive sweeps.
-	//
-	// IT IS A DEFAULT AND NO LONGER A CEILING (PERF-P23). It used to be a compile-time
-	// constant of 100, giving 100,000 rows an hour, and its own comment claimed that
-	// "overtakes any realistic arrival rate" — which is false for the rate this system is
-	// specified for: 500 events a second arrive at 1,800,000 rows an hour, eighteen times
-	// faster than the sweeper could delete. Capacity below arrivals does not slow growth, it
-	// permits it, and the retention period is then never actually enforced.
-	//
-	// So the value is now configurable through RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP and
-	// its default is set ABOVE peak ingestion. See config.RelayConfig for the arithmetic, and
-	// config.EventRetentionUnboundedSweep for how a deployment asks for no ceiling at all.
-	//
-	// DERIVED from the configured default for the same reason the batch size above is.
+	// defaultEventRetentionMaxBatchesPerSweep bounds ONE sweep by default, and the bound
+	// is what makes the operation safe to run beside a live relay: without it, the first
+	// sweep after retention is enabled on a long-running deployment would try to delete
+	// the entire historical backlog in a single pass, holding locks and generating WAL for
+	// as long as that took. With it, the backlog drains over successive sweeps.
 	defaultEventRetentionMaxBatchesPerSweep = config.DefaultEventRetentionMaxBatchesPerSweep
 
-	// eventRetentionSweepTimeout bounds one sweep. Generous, because it may issue thousands of
-	// bounded deletes; bounded all the same, so a sweep against a struggling database ends
-	// and is retried on the next tick rather than overlapping the one after it.
-	//
-	// IT IS THE OUTER BOUND, and it is what makes an unbounded batch ceiling safe: a sweep
-	// configured with no ceiling still cannot run past this, so "no ceiling" means "drain what
-	// you can inside ten minutes" rather than "run until the backlog is gone, however long".
+	// eventRetentionSweepTimeout bounds one sweep. Generous, because it may issue
+	// thousands of bounded deletes; bounded all the same, so a sweep against a struggling
+	// database ends and is retried on the next tick rather than overlapping the one after
+	// it.
 	eventRetentionSweepTimeout = 10 * time.Minute
 )
 
@@ -162,7 +95,7 @@ type EventRetentionSweeper struct {
 
 	// maxBatches bounds one sweep. Non-positive means no ceiling, which the sweep loop reads
 	// directly; the unset-versus-unbounded distinction is resolved before it reaches here, by
-	// applyPurgeCapacity and WithMaxBatches. PERF-P23.
+	// applyPurgeCapacity and WithMaxBatches.
 	maxBatches int
 
 	// now is the clock, replaceable in-package so a test can assert the cutoff exactly.
@@ -179,8 +112,8 @@ type EventRetentionSweeper struct {
 // configuration.
 //
 // Parameters:
-//   - b *Blnk: the service container. A nil instance, or one with no datasource, yields a
-//     sweeper that declines to start rather than a nil pointer the caller must guard.
+//   - b *Blnk: the service container. A nil instance, or one with no datasource, yields
+//     a sweeper that declines to start rather than a nil pointer the caller must guard.
 //
 // Returns:
 //   - *EventRetentionSweeper: ready to Start. Never nil.
@@ -206,17 +139,12 @@ func NewEventRetentionSweeper(b *Blnk) *EventRetentionSweeper {
 	return sweeper
 }
 
-// applyPurgeCapacity reads the configured purge capacity onto the sweeper. PERF-P23.
+// applyPurgeCapacity reads the configured purge capacity onto the sweeper.
 //
-// Falls back to the process configuration for the same reason retentionPeriodFor does: a Blnk
-// built before configuration was published would otherwise silently run on the built-in
-// defaults, so an operator who had deliberately raised the capacity to match their arrival rate
-// would get the shipped one and a table that kept growing anyway.
-//
-// A configuration that cannot be read leaves the constructor's defaults in place, which are
-// already above the specified peak arrival rate. Nothing here can turn retention OFF — that is
-// the period's decision, taken in one place — so the worst case for an unreadable
-// configuration is deleting at the default rate rather than not deleting.
+// Falls back to the process configuration for the same reason retentionPeriodFor does:
+// a Blnk built before configuration was published would otherwise silently run on the
+// built-in defaults, so an operator who had deliberately raised the capacity to match
+// their arrival rate would get the shipped one and a table that kept growing anyway.
 //
 // Parameters:
 //   - cnf *config.Configuration: the instance's configuration, possibly nil.
@@ -235,11 +163,11 @@ func (s *EventRetentionSweeper) applyPurgeCapacity(cnf *config.Configuration) {
 	}
 
 	// Zero is UNSET and leaves the constructor's bound in place; a negative is
-	// config.EventRetentionUnboundedSweep, the explicit request for no ceiling. The distinction
-	// is made in config.setRelayDefaults and repeated here rather than assumed, because this
-	// method also runs against configurations that never passed through it — a hand-built
-	// Configuration, or one published before the defaults were applied — and in those the zero
-	// value must not silently remove the bound.
+	// config.EventRetentionUnboundedSweep, the explicit request for no ceiling. The
+	// distinction is made in config.setRelayDefaults and repeated here rather than
+	// assumed, because this method also runs against configurations that never passed
+	// through it — a hand-built Configuration, or one published before the defaults were
+	// applied — and in those the zero value must not silently remove the bound.
 	switch {
 	case cnf.Relay.EventRetentionMaxBatchesPerSweep > 0:
 		s.maxBatches = cnf.Relay.EventRetentionMaxBatchesPerSweep
@@ -252,14 +180,15 @@ func (s *EventRetentionSweeper) applyPurgeCapacity(cnf *config.Configuration) {
 // configuration when the instance carries none.
 //
 // The fallback exists because a Blnk built before configuration was published would
-// otherwise report retention as disabled and silently never sweep — a failure mode with no
-// symptom other than a table that keeps growing.
+// otherwise report retention as disabled and silently never sweep — a failure mode with
+// no symptom other than a table that keeps growing.
 //
 // Parameters:
 //   - cnf *config.Configuration: the instance's configuration, possibly nil.
 //
 // Returns:
-//   - time.Duration: the retention period, or 0 when retention is disabled or unreadable.
+//   - time.Duration: the retention period, or 0 when retention is disabled or
+//     unreadable.
 func retentionPeriodFor(cnf *config.Configuration) time.Duration {
 	if cnf != nil {
 		return cnf.EventRetentionPeriod()
@@ -275,9 +204,9 @@ func retentionPeriodFor(cnf *config.Configuration) time.Duration {
 
 // WithInterval sets how often the sweep runs.
 //
-// A non-positive interval falls back to the default rather than being rejected, matching
-// every other worker here: a misconfigured cadence must not be able to stop retention
-// running, because the failure mode is silent growth.
+// A non-positive interval falls back to the default rather than being rejected,
+// matching every other worker here: a misconfigured cadence must not be able to stop
+// retention running, because the failure mode is silent growth.
 //
 // Parameters:
 //   - interval time.Duration: the sweep interval.
@@ -317,20 +246,13 @@ func (s *EventRetentionSweeper) WithBatchSize(size int) *EventRetentionSweeper {
 	return s
 }
 
-// WithMaxBatches sets how many batches one sweep may issue. PERF-P23.
-//
-// It follows the same contract as the configuration variable, deliberately, so the two cannot
-// disagree: a POSITIVE value is the ceiling, a NEGATIVE value is
-// config.EventRetentionUnboundedSweep and removes it, and ZERO is unset and leaves the default
-// in place. Zero is the one worth stating — it is what a caller passes by accident, from an
-// unpopulated variable, and reading it as "no ceiling" would quietly remove the bound that
-// keeps one sweep from attempting an entire backlog beside a live relay.
+// WithMaxBatches sets how many batches one sweep may issue.
 //
 // A sweep with no ceiling is still bounded by eventRetentionSweepTimeout.
 //
 // Parameters:
-//   - batches int: the per-sweep batch ceiling. Negative means unbounded; zero keeps the
-//     default.
+//   - batches int: the per-sweep batch ceiling. Negative means unbounded; zero keeps
+//     the default.
 //
 // Returns:
 //   - *EventRetentionSweeper: the receiver, for chaining.
@@ -354,11 +276,11 @@ func (s *EventRetentionSweeper) WithMaxBatches(batches int) *EventRetentionSweep
 
 // StartupObstacle reports why the sweeper must not run, or nil when it may.
 //
-// The DISABLED case is a legitimate steady state rather than a fault, and it is reported as
-// a distinct error so the caller can log it at the right level: retention shipping switched
-// off is the default and an operator has not necessarily done anything wrong, while a
-// missing datasource on a deployment that HAS configured retention means the control they
-// asked for is not running.
+// The DISABLED case is a legitimate steady state rather than a fault, and it is
+// reported as a distinct error so the caller can log it at the right level: retention
+// shipping switched off is the default and an operator has not necessarily done
+// anything wrong, while a missing datasource on a deployment that HAS configured
+// retention means the control they asked for is not running.
 //
 // Returns:
 //   - error: the reason the sweeper must not run, or nil.
@@ -460,16 +382,16 @@ func (s *EventRetentionSweeper) IsRunning() bool {
 
 // run is the ticker loop.
 //
-// The FIRST sweep is deliberately on the first tick rather than immediately at start-up. A
-// sweep at start-up would run during the busiest moment of a deployment — every instance
-// starting at once, caches cold, the relay draining whatever accumulated during the
-// rollout — and it is housekeeping over rows that have already been terminal for days.
-// Waiting one interval costs nothing and keeps deletes away from a restart.
+// The FIRST sweep is deliberately on the first tick rather than immediately at
+// start-up. A sweep at start-up would run during the busiest moment of a deployment —
+// every instance starting at once, caches cold, the relay draining whatever accumulated
+// during the rollout — and it is housekeeping over rows that have already been terminal
+// for days.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it ends the loop.
-//   - stop <-chan struct{}: the stop channel, captured by Start rather than read from the
-//     field. See Start for why that distinction is load-bearing.
+//   - stop <-chan struct{}: the stop channel, captured by Start rather than read from
+//     the field.
 func (s *EventRetentionSweeper) run(ctx context.Context, stop <-chan struct{}) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -492,14 +414,9 @@ func (s *EventRetentionSweeper) run(ctx context.Context, stop <-chan struct{}) {
 
 // Sweep performs ONE bounded retention sweep and returns how many rows it deleted.
 //
-// It is exported so an operator-facing path can run retention on demand — the same code,
-// the same bounds, the same cutoff arithmetic — rather than a second implementation that
-// could disagree with this one about what is eligible.
-//
-// The loop stops on the first short batch, which means the eligible set is drained, and on
-// the batch bound, which means there is more to do and the next sweep will continue. It also
-// stops on cancellation, leaving the rows for next time: an interrupted retention sweep has
-// no partial state to repair, because each delete is its own committed statement.
+// It is exported so an operator-facing path can run retention on demand — the same
+// code, the same bounds, the same cutoff arithmetic — rather than a second
+// implementation that could disagree with this one about what is eligible.
 //
 // Parameters:
 //   - ctx context.Context: cancels the sweep. A deadline of its own is applied on top.
@@ -522,7 +439,7 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 		// drained records WHY the loop ended, which is the difference between a sweep that
 		// finished its work and one that ran out of the capacity it was given. Only the
 		// second is worth an operator's attention, and without this the two are
-		// indistinguishable in the logs. PERF-P23.
+		// indistinguishable in the logs.
 		drained bool
 	)
 
@@ -554,12 +471,12 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 		}
 	}
 
-	// The condition PERF-P23 exists to make visible. A sweep that deleted a full batch on its
-	// last permitted iteration left eligible rows behind, which means this deployment's purge
-	// capacity is at or below its arrival rate and the retention period is consequently NOT
-	// being enforced however it is configured. It is reported at warning level naming the
-	// setting to raise, because the alternative — the previous behaviour — was a table that
-	// grew without anything ever saying so.
+	// The condition the capacity ceiling exists to make visible. A sweep that deleted a full batch on
+	// its last permitted iteration left eligible rows behind, which means this
+	// deployment's purge capacity is at or below its arrival rate and the retention period
+	// is consequently NOT being enforced however it is configured. It is reported at
+	// warning level naming the setting to raise, because the alternative — the previous
+	// behaviour — was a table that grew without anything ever saying so.
 	if !drained && s.maxBatches > 0 && deleted >= int64(s.maxBatches)*int64(s.batchSize) {
 		logrus.WithFields(logrus.Fields{
 			"deleted":                     deleted,
@@ -585,10 +502,10 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 		return 0
 	}
 
-	// RECORDED HERE, on the code path that performs the deletion, because this is a COUNTER
-	// and not a gauge: it only accumulates, so incrementing it where the thing it counts
-	// happens is exactly right. The gauges in event_metrics.go are the opposite case and
-	// have their own single owner for that reason.
+	// RECORDED HERE, on the code path that performs the deletion, because this is a
+	// COUNTER and not a gauge: it only accumulates, so incrementing it where the thing it
+	// counts happens is exactly right. The gauges in event_metrics.go are the opposite
+	// case and have their own single owner for that reason.
 	if metrics.EventsPurgedTotal != nil {
 		metrics.EventsPurgedTotal.Add(ctx, deleted)
 	}
@@ -605,10 +522,10 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 // The three obstacles, as values rather than freshly-built errors.
 //
 // ErrEventRetentionDisabled is EXPORTED and the other two are not, and the split is the
-// point: a caller must be able to recognise "retention is switched off" and log it as the
-// unremarkable default it is, while the other two are wiring defects there is nothing
-// useful to branch on. Matching on message text instead would break the moment the wording
-// improved.
+// point: a caller must be able to recognise "retention is switched off" and log it as
+// the unremarkable default it is, while the other two are wiring defects there is
+// nothing useful to branch on. Matching on message text instead would break the moment
+// the wording improved.
 var (
 	// ErrEventRetentionDisabled means RELAY_EVENT_RETENTION_DAYS is unset or zero. Not a
 	// fault: retention ships switched off because deleting ledger-adjacent records is an

@@ -162,20 +162,8 @@ func TestCreateBalance(t *testing.T) {
 
 	// Convert metadata to JSON for mocking
 	metaDataJSON, _ := json.Marshal(balance.MetaData)
-	// NO TRANSACTION IS SCRIPTED, and that is the graceful-degradation criterion rather than
-	// an omission.
-	//
-	// The entity writers open a transaction only when they are HANDED AN EVENT PREPARER, which
-	// the service layer supplies only when event publishing is configured. This instance has no
-	// KAFKA_BROKERS, so no preparer is passed, the writer takes its single-statement path, and
-	// the behaviour is exactly what it was before this feature existed — which is what
-	// §0.7.2's "with KAFKA_BROKERS unset, the service must process transactions exactly as
-	// before" asks for, and what keeps every deployment that never adopts Kafka from paying for
-	// a transaction it has no second statement to put in.
-	//
-	// The transactional path is covered where it can actually be observed: with a preparer
-	// supplied, by event_producer_atomicity_test.go here and by
-	// database/{ledger,identity,balance}_test.go at the repository layer.
+	// NO TRANSACTION IS SCRIPTED, and that is the graceful-degradation criterion rather
+	// than an omission.
 	mock.ExpectExec("INSERT INTO blnk.balances").
 		WithArgs(sqlmock.AnyArg(), balance.Balance.String(), balance.CreditBalance.String(), balance.DebitBalance.String(), balance.Currency, balance.LedgerID, balance.IdentityID, sqlmock.AnyArg(), sqlmock.AnyArg(), metaDataJSON, false, "FIFO").
 		WillReturnResult(sqlmock.NewResult(1, 1))

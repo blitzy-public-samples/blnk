@@ -14,52 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// PROVENANCE CONTRACT ASSERTIONS for the V-1 verdict in tests/loadtest/events.js.
+// PROVENANCE CONTRACT ASSERTIONS for the throughput-and-latency verdict in
+// tests/loadtest/events.js.
 //
-// # Why a Go test asserts on JavaScript
+// 500 events per second sustained, with a p99 capture-to-dispatch latency under two
+// seconds — is met.
 //
-// events.js is the artefact that decides whether acceptance criterion V-1 — 500 events per
-// second sustained, with a p99 capture-to-dispatch latency under two seconds — is met. Nothing
-// else in the repository makes that judgement, and nothing checks the judgement itself: no CI
-// job runs k6, so the script's decision logic has no compiler, no type system and no test
-// harness of its own. A defect in it is not a failing build; it is a PASS that was never
-// earned, which is strictly worse than a failure because it is acted upon.
-//
-// The specific defect these tests exist to prevent had exactly that shape. The p99 selection
-// accepted blnk_events_publish_duration_seconds as a FALLBACK when the capture-to-dispatch
-// histogram had no observations:
+// The specific defect these tests exist to prevent had exactly that shape. The p99
+// selection accepted blnk_events_publish_duration_seconds as a FALLBACK when the
+// capture-to-dispatch histogram had no observations:
 //
 //	if (capture.quantile.value !== null) { ... } else if (brokerWrite.quantile.value !== null) {
 //	  latencySource = P99_SOURCE_PUBLISH_DURATION;
 //	  chosen = brokerWrite;                       // <- a different interval entirely
 //	}
-//
-// The two instruments do not time the same thing. V-1 is stated over the interval a subscriber
-// waits — from the outbox row being committed to the broker acknowledging the write — while
-// publish_duration's clock starts at the relay's CLAIM, and therefore excludes the row waiting
-// for the next poll tick, the poll interval and the claim query. That excluded segment is
-// precisely the component that grows when the relay falls behind, so the fallback reported its
-// smallest figures in the exact circumstance the target exists to catch, and the threshold row
-// read PASS. Recording the substitution in a provenance field did not help: a CI gate and an
-// operator both read the verdict, not the provenance.
-//
-// # What is asserted, and why it is asserted structurally
-//
-// The behaviour was verified by extracting the script's own decision text and running it over
-// synthetic histogram readings, which is how the defect was confirmed present before the fix
-// and absent after it. That exercise is not repeatable in CI, so what remains here are the
-// STRUCTURAL properties the behaviour rests on, each phrased so that restoring the fallback in
-// any of its available forms fails a Go test:
-//
-//	the selection may read only the capture histogram,
-//	the availability flag must key on that histogram rather than on the chosen source,
-//	no threshold may be attached to either diagnostic figure, and
-//	the thresholded metric must be documented against the capture series.
-//
-// The regions are located by their own anchor statements rather than by line number, and
-// comments are removed before absence is asserted, so that prose which merely NAMES the
-// removed fallback — as the rationale comments deliberately do — cannot satisfy or defeat an
-// assertion about code.
 package blnk
 
 import (
@@ -84,14 +52,8 @@ func loadTestScript(t *testing.T) string {
 	return readRepoFile(t, loadTestScriptPath)
 }
 
-// scriptRegion returns the text of events.js between two anchor statements, exclusive of the
-// closing anchor.
-//
-// Anchors are used in preference to line numbers because the surrounding rationale comments are
-// long and expected to be edited; an anchored region survives that, while a line range would
-// drift silently and start asserting about the wrong code. Both anchors are required to appear
-// exactly once, so a region that has been duplicated or renamed fails loudly here rather than
-// quietly narrowing what the test looks at.
+// scriptRegion returns the text of events.js between two anchor statements, exclusive
+// of the closing anchor.
 func scriptRegion(t *testing.T, source, openAnchor, closeAnchor string) string {
 	t.Helper()
 
@@ -111,10 +73,9 @@ func scriptRegion(t *testing.T, source, openAnchor, closeAnchor string) string {
 
 // scriptFunctionBody returns the text of a named top-level function in events.js.
 //
-// It exists because some function bodies end on a statement that is not unique in the file —
-// `return o;` closes two of them — so an anchored region cannot address them unambiguously. The
-// body is taken from the declaration to the first line consisting of a single closing brace,
-// which is where Prettier puts the end of every top-level function in this script.
+// It exists because some function bodies end on a statement that is not unique in the
+// file — `return o;` closes two of them — so an anchored region cannot address them
+// unambiguously.
 func scriptFunctionBody(t *testing.T, source, declaration string) string {
 	t.Helper()
 
@@ -129,14 +90,6 @@ func scriptFunctionBody(t *testing.T, source, declaration string) string {
 }
 
 // stripLineComments removes whole-line JavaScript comments from a region.
-//
-// It is deliberately line-wise rather than a general lexer: it drops only lines whose trimmed
-// form OPENS a comment, so it can never truncate a string literal that happens to contain "//",
-// of which this script has several (metric help text, PromQL, URLs). events.js is formatted by
-// Prettier, which puts comments in the regions asserted on below on their own lines, so nothing
-// is missed in practice. Absence assertions run over the stripped text because the rationale
-// comments name the removed fallback on purpose — a test that grepped the raw region would
-// report the explanation as the defect.
 func stripLineComments(region string) string {
 	lines := strings.Split(region, "\n")
 	kept := make([]string, 0, len(lines))
@@ -157,29 +110,18 @@ func stripLineComments(region string) string {
 }
 
 // collapseWhitespace reduces every run of whitespace in a region to a single space.
-//
-// It exists so that an assertion about WHICH TOKENS a decision is made of survives reformatting.
-// events.js is formatted by Prettier at an 80-column print width, so a condition long enough to
-// wrap is written across several lines and a shorter one is not — a difference that says nothing
-// about behaviour. An assertion written against the wrapped form would fail the moment the
-// expression is edited into or out of that width, which trains a reader to "fix" the test rather
-// than to read it.
 func collapseWhitespace(region string) string {
 	return strings.Join(strings.Fields(region), " ")
 }
 
 // ---------------------------------------------------------------------------
-// V-1 may be certified from one series and one series only
+// The latency verdict may be certified from one series and one series only
 // ---------------------------------------------------------------------------
 
 // TestLoadTestP99_IsCertifiedFromCaptureToDispatchAlone pins the selection.
 //
-// The assertion is about what the block may READ, not about which constant it happens to
-// assign. That framing matters: a re-introduced fallback could name a new source code, or
-// reuse P99_SOURCE_CAPTURE_TO_DISPATCH and quietly point `chosen` at the wrong histogram, and
-// an assertion phrased against the constant would miss both. Requiring that the block mention
-// no series other than `capture` closes every variant at once, because a figure that is never
-// read cannot be certified.
+// The assertion is about what the block may READ, not about which constant it happens
+// to assign.
 func TestLoadTestP99_IsCertifiedFromCaptureToDispatchAlone(t *testing.T) {
 	source := loadTestScript(t)
 	selection := stripLineComments(scriptRegion(t,
@@ -196,7 +138,7 @@ func TestLoadTestP99_IsCertifiedFromCaptureToDispatchAlone(t *testing.T) {
 
 	// The whole defect, in one assertion: publish_duration must not be reachable from the
 	// selection at all. It is a strictly shorter interval, so any path that lets it become
-	// `chosen` certifies V-1 against a measurement V-1 is not stated over.
+	// `chosen` would certify the verdict against a measurement it is not stated over.
 	assert.NotContainsf(t, selection, "brokerWrite",
 		"%s: the p99 selection must not read publish_duration. Its clock starts at the relay "+
 			"claim, so it excludes the queue wait and reports its smallest figures for the "+
@@ -206,12 +148,10 @@ func TestLoadTestP99_IsCertifiedFromCaptureToDispatchAlone(t *testing.T) {
 		"%s: no branch of the p99 selection may resolve to the publish-duration source",
 		loadTestScriptPath)
 
-	// Exactly one source is assignable, so the "else if" shape cannot have returned in another
-	// guise. Enumerated rather than counted, because the initialiser `chosen = null` is itself an
-	// assignment and a bare count would be satisfied by any second branch that replaced it.
-	// The selection is a conditional expression rather than a chain of assignments, so the
-	// provenance is enumerated from the operands of that expression: whatever `chosen` can hold
-	// appears here, and a second source could only be added by extending it.
+	// Exactly one source is assignable, so the "else if" shape cannot have returned in
+	// another guise. Enumerated rather than counted, because the initialiser `chosen =
+	// null` is itself an assignment and a bare count would be satisfied by any second
+	// branch that replaced it.
 	assignments := regexp.MustCompile(`chosen\s*=\s*[^;]*?\?\s*([A-Za-z][A-Za-z0-9_]*)\s*:\s*([A-Za-z][A-Za-z0-9_]*)`).
 		FindAllStringSubmatch(selection, -1)
 
@@ -225,15 +165,9 @@ func TestLoadTestP99_IsCertifiedFromCaptureToDispatchAlone(t *testing.T) {
 
 // TestLoadTestVerdictAvailability_KeysOnTheCaptureHistogram pins the fail-closed flag.
 //
-// event_publish_verdicts_available is the gate that makes the other three verdicts meaningful:
-// a run that measured nothing reports zeroes, two of which satisfy their `<` thresholds. Before
-// the fix this reason keyed on `latencySource === P99_SOURCE_NONE`, which the fallback had
-// already moved off zero — so the run was declared certifiable on the strength of a series V-1
-// is not stated over, and the flag that exists to fail closed failed open instead.
-//
-// Keying on the capture histogram directly makes the flag independent of how many sources the
-// selection grows later: without first-attempt capture observations V-1 has no population,
-// whatever else was scraped.
+// event_publish_verdicts_available is the gate that makes the other three verdicts
+// meaningful: a run that measured nothing reports zeroes, two of which satisfy their
+// `<` thresholds.
 func TestLoadTestVerdictAvailability_KeysOnTheCaptureHistogram(t *testing.T) {
 	source := loadTestScript(t)
 	reason := stripLineComments(scriptRegion(t,
@@ -256,16 +190,6 @@ func TestLoadTestVerdictAvailability_KeysOnTheCaptureHistogram(t *testing.T) {
 }
 
 // TestLoadTestDiagnostics_CarryNoThreshold pins the demotion.
-//
-// Removing the fallback keeps publish_duration in the report on purpose: read beside
-// capture-to-dispatch, the DIFFERENCE of the two is a diagnostic-only supporting figure — an
-// order-of-magnitude indication of whether a slow end-to-end reading is the broker or a relay
-// backlog, and NOT a queue-wait percentile, because the difference of two independently ranked
-// p99 values is not the p99 of the difference. That is only safe while neither figure can decide
-// anything. A threshold
-// on either one would re-create the original defect through the k6 threshold table instead of
-// through the selection — same false PASS, different mechanism — so the absence is asserted
-// here rather than left to reviewer attention.
 func TestLoadTestDiagnostics_CarryNoThreshold(t *testing.T) {
 	source := loadTestScript(t)
 	thresholds := stripLineComments(
@@ -284,10 +208,9 @@ func TestLoadTestDiagnostics_CarryNoThreshold(t *testing.T) {
 			"%s: %s must carry a threshold", loadTestScriptPath, metric)
 	}
 
-	// M_QUEUE_WAIT_P99 is named among the forbidden entries although no such constant exists any
-	// more: the figure was renamed to a DIFFERENCE precisely because it is not a queue-wait
-	// percentile, and keeping the old name in this list means re-introducing it under that
-	// misleading spelling fails here too.
+	// M_QUEUE_WAIT_P99 is named among the forbidden entries although no such constant
+	// exists: the figure is a DIFFERENCE and not a queue-wait percentile, and naming the
+	// misleading spelling here means re-introducing it under that name fails too.
 	for _, diagnostic := range []string{
 		"M_BROKER_WRITE_P99",
 		"M_P99_DIFFERENCE",
@@ -299,7 +222,7 @@ func TestLoadTestDiagnostics_CarryNoThreshold(t *testing.T) {
 			loadTestScriptPath, diagnostic)
 	}
 
-	// The p99 threshold must be the V-1 bound rather than an unrelated literal.
+	// The p99 threshold must be the published two-second bound rather than an unrelated literal.
 	assert.Containsf(t, thresholds, `o[M_P99_SECONDS] = ["value<" + MAX_P99_PUBLISH_SECONDS];`,
 		"%s: the p99 verdict must be gated on MAX_P99_PUBLISH_SECONDS", loadTestScriptPath)
 }
@@ -307,11 +230,7 @@ func TestLoadTestDiagnostics_CarryNoThreshold(t *testing.T) {
 // TestLoadTestP99_IsDocumentedAgainstTheCaptureSeries pins the reported provenance.
 //
 // The summary publishes an `equivalent_promql` beside each verdict so the figure can be
-// reproduced in Prometheus. If that query names publish_duration while the verdict is computed
-// from capture-to-dispatch — or the reverse — then anyone who checks the number gets a
-// different one and has no way to tell which of the two is the criterion. The two are asserted
-// together for that reason: the thresholded metric's query must name the capture series, and
-// the diagnostic's must name publish_duration.
+// reproduced in Prometheus.
 func TestLoadTestP99_IsDocumentedAgainstTheCaptureSeries(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -326,9 +245,9 @@ func TestLoadTestP99_IsDocumentedAgainstTheCaptureSeries(t *testing.T) {
 		"%s: the diagnostic's published query must name publish_duration, narrowed to "+
 			"successful writes", loadTestScriptPath)
 
-	// The DIFFERENCE of the two, which is the only reason keeping the shorter interval in the
-	// report is worth anything — and it is a diagnostic-only supporting figure rather than a
-	// queue-wait percentile.
+	// The DIFFERENCE of the two, which is the only reason keeping the shorter interval in
+	// the report is worth anything — and it is a diagnostic-only supporting figure rather
+	// than a queue-wait percentile.
 	assert.Containsf(t, source, "const PROMQL_P99_DIFFERENCE = PROMQL_P99 + \" - \" + PROMQL_BROKER_WRITE;",
 		"%s: the diagnostic must be derived as capture-to-dispatch minus the broker write, and it "+
 			"is named as the DIFFERENCE it is: the difference of two p99 figures is not the p99 of "+
@@ -338,14 +257,10 @@ func TestLoadTestP99_IsDocumentedAgainstTheCaptureSeries(t *testing.T) {
 
 // TestLoadTestP99SourceCodes_StayStableForOldArtefacts pins the numbering.
 //
-// P99_SOURCE_PUBLISH_DURATION is kept at 2 although it can no longer be emitted. Deleting it
-// would renumber any code added afterwards, and summaries are compared across runs — including
-// runs produced before the fallback was removed, which really did emit a 2. A reader diffing
-// two artefacts must not have one integer mean two different things.
+// P99_SOURCE_PUBLISH_DURATION is kept at 2 although it can no longer be emitted.
 //
-// What the test enforces is the pair: the code exists with its original value, AND it is only
-// ever DECODED, never produced. `p99SourceCode.add(...)` is the single emission point, and the
-// preceding test already fixes what may reach it.
+// What the test enforces is the pair: the code exists with its original value, AND it
+// is only ever DECODED, never produced.
 func TestLoadTestP99SourceCodes_StayStableForOldArtefacts(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -394,28 +309,19 @@ const (
 	eventStreamingNDJSONArtefact  = "run-event-streaming.ndjson"
 )
 
-// TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames pins the case identifier and the two
-// output filenames the acceptance record is filed under.
+// TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames pins the case identifier
+// and the two output filenames the acceptance record is filed under.
 //
-// # Why a filename is worth a test
-//
-// These three strings are an interface between parties that never see each other's source. The
-// acceptance record cites the case name; CI collects the two files by name; the dashboard reads
-// them; events.js names them in the provenance block it writes INTO one of them. Renaming any of
-// them does not fail a build and does not fail a run — the run still produces correct numbers, in
-// a file nothing else looks for. That failure is silent in both directions, which is exactly the
-// class of defect a structural test is for.
+// These three strings are an interface between parties that never see each other's
+// source.
 //
 // It happened: the runner was changed to make `events` the canonical name and to emit
-// `summary-events.json` and `run-events.ndjson`, the guide was updated to document the renamed
-// pair, and events.js went on naming the frozen pair in its own report. Nothing failed.
+// `summary-events.json` and `run-events.ndjson`, the guide was updated to document the
+// renamed pair, and events.js went on naming the frozen pair in its own report.
 //
-// # What is asserted
-//
-// The canonical dispatch, the alias NORMALISING ONTO it rather than dispatching separately, both
-// frozen defaults in the runner, the same default in the scenario for a direct `k6 run`, and the
-// absence of the renamed pair anywhere in the three files. The last assertion is what makes this
-// test fail on the rename rather than merely on the removal of the frozen names.
+// The canonical dispatch, the alias NORMALISING ONTO it rather than dispatching
+// separately, both frozen defaults in the runner, the same default in the scenario for
+// a direct `k6 run`, and the absence of the renamed pair anywhere in the three files.
 func TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 	scenario := loadTestScript(t)
@@ -425,9 +331,9 @@ func TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames(t *testing.T) {
 		"%s: `event-streaming` is the frozen case identifier and must be the name the runner "+
 			"dispatches on", loadTestRunnerPath)
 
-	// The alias points AT the canonical name. The reverse — normalising `event-streaming` onto
-	// `events` — is what renamed the artefacts, because the filenames are derived from the name
-	// the branch runs under.
+	// The alias points AT the canonical name. The reverse — normalising `event-streaming`
+	// onto `events` — is what renamed the artefacts, because the filenames are derived
+	// from the name the branch runs under.
 	assert.Truef(t,
 		strings.Contains(runner, `if [[ "${CASE_NAME}" == "events" ]]; then`+"\n"+`  CASE_NAME="event-streaming"`),
 		"%s: `events` must normalise ONTO `event-streaming`, so both spellings run one branch "+
@@ -463,33 +369,18 @@ func TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames(t *testing.T) {
 	}
 }
 
-// TestLoadTestRunner_KeepsCredentialsOutOfArgvAndOutOfOutput pins the two ways the runner used to
-// disclose privileged material.
+// TestLoadTestRunner_KeepsCredentialsOutOfArgvAndOutOfOutput pins the two ways a runner
+// can disclose privileged material.
 //
-// # argv is not private
-//
-// The metrics bearer token, the FULL-PRIVILEGE master key and an API key were each passed to k6 as
-// `-e NAME=value`. A process's arguments are world-readable through /proc/<pid>/cmdline for as long
-// as it runs, and they are what `ps`, a container runtime's process view and many CI log
-// collectors display. The runner's own comment said not to `echo` the array and not to `set -x`
-// around it, which is true and insufficient: nothing was echoing them, and they were readable
-// anyway. They now travel in the child ENVIRONMENT, which /proc exposes only to the same user and
-// root, and k6 reads them from there because --include-system-env-vars defaults to true.
-//
-// # And a URL is printed by design
+// Passing the metrics bearer token, the FULL-PRIVILEGE master key or an API key to k6 as
+// `-e NAME=value` puts it in argv. A process's arguments are world-readable through
+// /proc/<pid>/cmdline for as long as it runs, and they are what `ps`, a container
+// runtime's process view and many CI log collectors display.
 //
 // The runner prints the transaction and metrics endpoints, and events.js refuses a
-// credential-bearing URL during init — one step too late, because the printing happened first. So
-// userinfo or a query token reached the terminal, the CI log and the scrollback before the refusal.
-// The refusal is now the runner's, before the first print, and every print goes through the
-// redaction helper.
-//
-// # What is asserted
-//
-// Absence of the three credentials from the k6 argument array in any spelling, presence of the
-// exports that replaced them, and the ORDERING of the refusal before the first echo of an
-// endpoint — the last being the property that actually failed, since the refusal existed and ran
-// too late.
+// credential-bearing URL during init — one step too late on its own, because the printing
+// comes first, so userinfo or a query token would reach the terminal, the CI log and the
+// scrollback before the refusal.
 func TestLoadTestRunner_KeepsCredentialsOutOfArgvAndOutOfOutput(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 
@@ -500,10 +391,11 @@ func TestLoadTestRunner_KeepsCredentialsOutOfArgvAndOutOfOutput(t *testing.T) {
 	require.Greaterf(t, branchEnd, 0,
 		"%s: the event-streaming branch must terminate with `exit 0` inside its own `fi`",
 		loadTestRunnerPath)
-	// Comments are stripped before anything is asserted, and every assertion below is phrased so
-	// that a failure reports its own message rather than echoing the whole branch. The runner's
-	// rationale prose deliberately quotes the constructs that were removed, so an unstripped
-	// search for `-e MASTER_KEY=` matches the comment explaining why it is gone.
+	// Comments are stripped before anything is asserted, and every assertion below is
+	// phrased so that a failure reports its own message rather than echoing the whole
+	// branch. The runner's rationale prose deliberately quotes the constructs that were
+	// removed, so an unstripped search for `-e MASTER_KEY=` matches the comment explaining
+	// why it is gone.
 	code := stripShellComments(runner[dispatch : dispatch+branchEnd])
 
 	// No credential may reach the argument array, under either the normalised name or the BLNK_
@@ -574,22 +466,15 @@ func TestLoadTestRunner_KeepsCredentialsOutOfArgvAndOutOfOutput(t *testing.T) {
 	}
 }
 
-// TestLoadTestRunner_LeavesTheEventLoadShapeToTheScenario pins the second place the V-1
-// verdict could be quietly detached from what V-1 says.
+// TestLoadTestRunner_LeavesTheEventLoadShapeToTheScenario pins the second place the
+// latency verdict could be quietly detached from what it is stated over.
 //
-// run_case.sh exists for the four transaction topology cases and defaults them to RATE=300 for
-// DURATION=30s, which are sensible figures for comparing queue shapes. V-1 is stated at 500
-// events per second sustained for thirty minutes, and V-3's dead-letter rate is stated over
-// that same window. An events case that reached the scenario through those defaults would emit
-// a summary reporting PASS on all three verdicts after thirty seconds at 300/s: not a wrong
-// number, but a right number for a load nobody claimed anything about — the same substitution
-// the p99 fallback made, one layer out.
+// run_case.sh exists for the four transaction topology cases and defaults them to
+// RATE=300 for DURATION=30s, which are sensible figures for comparing queue shapes.
 //
-// The runner therefore forwards RATE, DURATION, VUS and MAX_VUS only when the CALLER set them,
-// leaving events.js to apply its own defaults, which are the criterion's figures. That is
-// asserted here in two halves, because either alone can be defeated: the events case must be
-// dispatched before the transaction defaults are assigned, and the forwarding must be
-// conditional.
+// The runner therefore forwards RATE, DURATION, VUS and MAX_VUS only when the CALLER
+// set them, leaving events.js to apply its own defaults, which are the criterion's
+// figures.
 func TestLoadTestRunner_LeavesTheEventLoadShapeToTheScenario(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 
@@ -615,9 +500,10 @@ func TestLoadTestRunner_LeavesTheEventLoadShapeToTheScenario(t *testing.T) {
 			loadTestRunnerPath, transactionDefault)
 	}
 
-	// The events branch ALONE, bounded at its own terminator. Slicing to the end of the file
-	// would drag the transaction path in and make every absence assertion below vacuous — the
-	// transaction invocation legitimately passes an unconditional -e RATE= and drives script.js.
+	// The events branch ALONE, bounded at its own terminator. Slicing to the end of the
+	// file would drag the transaction path in and make every absence assertion below
+	// vacuous — the transaction invocation legitimately passes an unconditional -e RATE=
+	// and drives script.js.
 	branchEnd := strings.Index(runner[eventsDispatch:], "\n  exit 0\nfi\n")
 	require.Greaterf(t, branchEnd, 0,
 		"%s: the events branch must terminate with `exit 0` inside its own `fi`, so it cannot "+
@@ -661,34 +547,10 @@ func TestLoadTestRunner_LeavesTheEventLoadShapeToTheScenario(t *testing.T) {
 // The measured window must contain the WHOLE unsettled population
 // ---------------------------------------------------------------------------
 
-// TestLoadTestSettlingGate_CoversEveryUnsettledOutboxState pins the settling population.
+// TestLoadTestSettlingGate_CoversEveryUnsettledOutboxState pins the settling
+// population.
 //
-// # The defect this closes
-//
-// The gates at both ends of the measured window waited for the `pending` count alone. Three
-// other states are un-settled Kafka work and every one of them read as quiet:
-//
-//	processing   claimed by a relay under a lease, unacknowledged
-//	failed       retry budget spent, DEAD-LETTER WRITE STILL OWED
-//	replaying    a dead-lettered row whose republish is in flight
-//
-// A row in any of them has reached no terminal counter — it is absent from
-// blnk_events_published_total and absent from blnk_events_dead_lettered_total — so closing the
-// window over it removes it from both sides of V-3's ratio and from the latency histogram. The
-// direction is what makes this critical rather than merely imprecise: the excluded rows are
-// ENRICHED in dead letters, most of all the ones whose retries are already exhausted, so the
-// exclusion lowers the reported dead-letter rate and lowers the p99 at the same time. A run
-// could report 0% dead letters over a window that ended one poll before the dead letters were
-// written.
-//
-// # Why the states are asserted by name
-//
-// A count would pass for a gate that summed four fields of which one was the wrong one, and an
-// assertion on the total alone would pass for a gate that read a total the server computes over
-// a narrower population. Each state is therefore named where it is summed, and
-// `webhook_pending` is asserted ABSENT: its Kafka leg is acknowledged and already counted, so
-// waiting for it would make the acceptance window's length depend on the deprecated HTTP
-// transport's health.
+// The gates at both ends of the measured window waited for the `pending` count alone.
 func TestLoadTestSettlingGate_CoversEveryUnsettledOutboxState(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -742,18 +604,15 @@ func TestLoadTestSettlingGate_CoversEveryUnsettledOutboxState(t *testing.T) {
 			"alone is not the population", loadTestScriptPath)
 }
 
-// TestLoadTestSettlingGate_FailsClosedOnAnIncompletePopulation pins the fail-closed half.
+// TestLoadTestSettlingGate_FailsClosedOnAnIncompletePopulation pins the fail-closed
+// half.
 //
-// The live census is master-key gated. Without a key the only available source is
-// blnk_outbox_pending, which the server publishes as `pending + processing` and which therefore
-// CANNOT see a failed row awaiting its dead-letter write or a replay in flight. Such a reading
-// is a real number over a narrower population, so treating it as quiescence would reinstate the
-// exclusion this fix removes while looking like a measurement.
+// The live census is master-key gated.
 //
 // So a reading counts only when it is complete, an incomplete gate reports
-// `state_unavailable`, and teardown turns that into its own degraded reason rather than into
-// "the relay is behind" — because the two remedies are different: a master key versus a bigger
-// budget or a faster relay.
+// `state_unavailable`, and teardown turns that into its own degraded reason rather than
+// into "the relay is behind" — because the two remedies are different: a master key
+// versus a bigger budget or a faster relay.
 func TestLoadTestSettlingGate_FailsClosedOnAnIncompletePopulation(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -789,27 +648,11 @@ func TestLoadTestSettlingGate_FailsClosedOnAnIncompletePopulation(t *testing.T) 
 			"sent for a master key rather than for a bigger budget", loadTestScriptPath)
 }
 
-// TestLoadTestDeadLetterNumerator_IsASameWindowDelta pins V-3's arithmetic.
+// TestLoadTestDeadLetterNumerator_IsASameWindowDelta pins the dead-letter rate's arithmetic.
 //
-// # The defect this closes
-//
-// V-3's numerator came from the exported counter's delta and from nowhere else, while its
-// PROVENANCE could be set to the stats endpoint on the strength of any non-null cumulative
-// census value. The two decisions were eighty lines apart, so when
-// blnk_events_dead_lettered_total was absent from the exposition the run selected
-// "the /events/stats reading" as its source and then divided a numerator of ZERO — the absent
-// series' coerced value — by a real denominator. A deployment with real dead letters could
-// certify a 0% dead-letter rate, and the summary asserted a provenance for a value that
-// provenance had never supplied.
-//
-// # What is pinned
-//
-// The source is resolved BEFORE the arithmetic and the numerator is taken from whichever source
-// it selected, so the label and the number are one decision. The census fallback is a delta
-// between a baseline reading taken in setup and the final reading taken in teardown: the count
-// is a whole-table total, so a cumulative value is a lifetime figure and not a window one. A
-// negative delta is refused rather than clamped, because rows leaving the state (a replay, an
-// operator resolving them) do not make a count of what this window produced.
+// The numerator comes from the exported counter's delta and from nowhere else, while
+// its PROVENANCE could be set to the stats endpoint on the strength of any non-null
+// cumulative census value.
 func TestLoadTestDeadLetterNumerator_IsASameWindowDelta(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -824,7 +667,7 @@ func TestLoadTestDeadLetterNumerator_IsASameWindowDelta(t *testing.T) {
 
 	numerator := stripLineComments(scriptRegion(t,
 		source,
-		"  // --- V-3's numerator and its provenance, resolved BEFORE the arithmetic",
+		"  // --- The dead-letter numerator and its provenance, resolved BEFORE the arithmetic",
 		"  // THE DIVISOR IS THE LOAD INTERVAL",
 	))
 
@@ -864,20 +707,8 @@ func TestLoadTestDeadLetterNumerator_IsASameWindowDelta(t *testing.T) {
 
 // TestLoadTestAcceptance_RequiresAnIsolatedInstance pins the attribution contract.
 //
-// # Why it exists
-//
-// Every verdict is a delta of PROCESS-GLOBAL counters and a quantile over a process-global
-// histogram. There is no run or workload dimension in the production instruments and there must
-// not be one — a per-run label on a counter is unbounded cardinality in the server, paid for
-// permanently to serve a benchmark — so a Blnk instance serving other traffic during the run
-// contributes its events to the same counters. The distortion is not neutral: foreign events
-// inflate throughput and enlarge the dead-letter denominator, which is the passing direction for
-// two of the three verdicts, and they mix the latency population for the third.
-//
-// The runner used to impose nothing, so a run against a shared stack produced numbers presented
-// as belonging to the invocation. Two enforcement halves are pinned here, because neither is
-// sufficient: an explicit acknowledgement (nothing observable distinguishes an idle foreign
-// client from an absent one) and an empirical idle probe (an acknowledgement can be wrong).
+// Every verdict is a delta of PROCESS-GLOBAL counters and a quantile over a
+// process-global histogram.
 func TestLoadTestAcceptance_RequiresAnIsolatedInstance(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -946,12 +777,8 @@ func TestLoadTestAcceptance_RequiresAnIsolatedInstance(t *testing.T) {
 		loadTestScriptPath)
 }
 
-// eventsRunnerBranch returns the text of run_case.sh's `events` case, bounded at its own
-// terminator.
-//
-// Bounded rather than read whole, for the reason TestLoadTestRunner_LeavesTheEventLoadShapeToThe
-// Scenario gives: the transaction path below legitimately does things this case must not, so an
-// absence assertion over the whole file would be vacuous.
+// eventsRunnerBranch returns the text of run_case.sh's `events` case, bounded at its
+// own terminator.
 func eventsRunnerBranch(t *testing.T, runner string) string {
 	t.Helper()
 
@@ -968,21 +795,11 @@ func eventsRunnerBranch(t *testing.T, runner string) string {
 
 // TestLoadTestRunner_KeepsCredentialsOutOfArgv pins the secret transport.
 //
-// # What was wrong
-//
-// The metrics bearer token, the master key and an API key were each passed to k6 as
-// `-e NAME=value`, which makes them ARGV ELEMENTS of the k6 process. Argv is not private: any
-// account on the host can read /proc/<pid>/cmdline, and process-audit daemons, container runtimes
-// and CI diagnostics collect it verbatim into logs this script does not control. The master key
-// alone authorises every management endpoint in Blnk.
-//
-// # Why the environment is the fix rather than a mitigation
-//
-// k6 runs with --include-system-env-vars enabled by default, so an exported variable arrives in
-// __ENV exactly as an -e one does — the scenario needs no change at all. What changes is
-// visibility: /proc/<pid>/environ is readable only by the process owner. The empty-value guard is
-// preserved on the way, because exporting an empty METRICS_BEARER_TOKEN would override the
-// scenario's own resolution with nothing.
+// The metrics bearer token, the master key and an API key were each passed to k6 as `-e
+// NAME=value`, which makes them ARGV ELEMENTS of the k6 process. Argv is not private:
+// any account on the host can read /proc/<pid>/cmdline, and process-audit daemons,
+// container runtimes and CI diagnostics collect it verbatim into logs this script does
+// not control. The master key alone authorises every management endpoint in Blnk.
 func TestLoadTestRunner_KeepsCredentialsOutOfArgv(t *testing.T) {
 	branch := eventsRunnerBranch(t, readRepoFile(t, loadTestRunnerPath))
 
@@ -1022,16 +839,13 @@ func TestLoadTestRunner_KeepsCredentialsOutOfArgv(t *testing.T) {
 			"overrides the scenario's own resolution with nothing", loadTestRunnerPath)
 }
 
-// TestLoadTestRunner_RefusesAndRedactsCredentialBearingURLs pins the shell-side URL hygiene.
+// TestLoadTestRunner_RefusesAndRedactsCredentialBearingURLs pins the shell-side URL
+// hygiene.
 //
-// events.js refuses a credential-bearing URL during init and redacts every URL it writes into the
-// summary. Neither protects THIS script's output: the runner echoes the endpoints it is about to
-// use, and the METRICS_URL-derivation failure echoed the raw URL in its error message — both
-// before k6 exists. A token in a `?token=` query string or in `https://user:pass@host` was
-// therefore printed verbatim into the terminal and into whatever CI log captured it.
-//
-// The helpers are asserted to exist AND to be used at every diagnostic, because either half alone
-// is decorative.
+// events.js refuses a credential-bearing URL during init and redacts every URL it
+// writes into the summary. Neither protects THIS script's output: the runner echoes the
+// endpoints it is about to use, and the METRICS_URL-derivation failure echoed the raw
+// URL in its error message — both before k6 exists.
 func TestLoadTestRunner_RefusesAndRedactsCredentialBearingURLs(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 	branch := eventsRunnerBranch(t, runner)
@@ -1080,13 +894,11 @@ func TestLoadTestRunner_RefusesAndRedactsCredentialBearingURLs(t *testing.T) {
 // TestLoadTestRunner_RefusesAnUnattributableAcceptanceRun pins the runner's half of the
 // attribution contract.
 //
-// The scenario checks isolation empirically and refuses a minute into the run. The runner refuses
-// at the point the operator reads the command, which is where the requirement belongs: the run's
-// figures are process-global, so a shared deployment produces numbers that are not attributable
-// to the invocation however carefully the rest of the harness measures them.
-//
-// Both explicit opt-outs are pinned too. A gate with no documented way past it gets deleted by
-// the next person who needs to run a shakeout.
+// The scenario checks isolation empirically and refuses a minute into the run. The
+// runner refuses at the point the operator reads the command, which is where the
+// requirement belongs: the run's figures are process-global, so a shared deployment
+// produces numbers that are not attributable to the invocation however carefully the
+// rest of the harness measures them.
 func TestLoadTestRunner_RefusesAnUnattributableAcceptanceRun(t *testing.T) {
 	branch := eventsRunnerBranch(t, readRepoFile(t, loadTestRunnerPath))
 
@@ -1115,17 +927,14 @@ func TestLoadTestRunner_RefusesAnUnattributableAcceptanceRun(t *testing.T) {
 		loadTestRunnerPath)
 }
 
-// TestLoadTestRunner_ForwardsTheFixtureAndSettlingContract pins the variables the documented
-// commands depend on.
+// TestLoadTestRunner_ForwardsTheFixtureAndSettlingContract pins the variables the
+// documented commands depend on.
 //
 // events.js REFUSES to provision fixtures unless LEDGER_PAIRS names existing ones or
-// ALLOW_FIXTURE_CREATION=1 acknowledges that the run permanently adds ledgers and balances to a
-// database with no delete endpoint for either. A runner that dropped them silently turned a
-// documented command into an abort before load generation, and the guide's own examples were
-// written against the abort.
-//
-// Forwarding is CONDITIONAL for every one of them, which the load-shape test already asserts as a
-// property of the loop; here the membership is what matters.
+// ALLOW_FIXTURE_CREATION=1 acknowledges that the run permanently adds ledgers and
+// balances to a database with no delete endpoint for either. A runner that dropped them
+// silently turned a documented command into an abort before load generation, and the
+// guide's own examples were written against the abort.
 func TestLoadTestRunner_ForwardsTheFixtureAndSettlingContract(t *testing.T) {
 	branch := eventsRunnerBranch(t, readRepoFile(t, loadTestRunnerPath))
 
@@ -1169,16 +978,8 @@ func TestLoadTestRunner_ForwardsTheFixtureAndSettlingContract(t *testing.T) {
 
 // loadTestGuidePath is the runbook an operator reads before quoting a verdict.
 
-// guideEventCommands returns every `run_case.sh events` invocation the guide advertises, one
-// logical command per element, taken only from its fenced shell blocks.
-//
-// Physical lines are joined across backslash continuations because every documented acceptance
-// command is written that way — the prerequisites sit on the first line and the invocation on the
-// last, so a per-line reading would see an invocation with no prerequisites and an assertion built
-// on it would be vacuous. Comment-only lines are dropped so that prose inside a block cannot
-// satisfy an assertion about a command, and prose OUTSIDE a fenced block is not considered at all:
-// the surrounding text names variables in order to explain them, and a command is what a reader
-// copies.
+// guideEventCommands returns every `run_case.sh events` invocation the guide
+// advertises, one logical command per element, taken only from its fenced shell blocks.
 func guideEventCommands(t *testing.T, guide string) []string {
 	t.Helper()
 
@@ -1220,13 +1021,10 @@ func guideEventCommands(t *testing.T, guide string) []string {
 	return commands
 }
 
-// guideSection returns the text of one Markdown section of the guide, from its heading to the next
-// heading at the same or a higher level.
+// guideSection returns the text of one Markdown section of the guide, from its heading
+// to the next heading at the same or a higher level.
 //
-// Assertions are scoped to a section rather than to the whole document for two reasons. A claim
-// belongs where a reader meets it — a settling rule stated only in a section about credentials is
-// not stated — and a failed assertion over a thirty-kilobyte document prints the document, which
-// buries the one line that matters.
+// Assertions are scoped to a section rather than to the whole document for two reasons.
 func guideSection(t *testing.T, guide, heading string) string {
 	t.Helper()
 
@@ -1245,11 +1043,11 @@ func guideSection(t *testing.T, guide, heading string) string {
 	return rest
 }
 
-// guideLinesContaining returns every `line N: text` in the guide that contains a needle.
+// guideLinesContaining returns every `line N: text` in the guide that contains a
+// needle.
 //
-// Used for the absence assertions, which have to run over the WHOLE document — a wrong reading of a
-// figure does its damage wherever it is written. Returning the offending lines rather than a bare
-// bool keeps the failure output to the lines at fault instead of the entire guide.
+// Used for the absence assertions, which have to run over the WHOLE document — a wrong
+// reading of a figure does its damage wherever it is written.
 func guideLinesContaining(guide, needle string) []string {
 	var hits []string
 
@@ -1262,28 +1060,16 @@ func guideLinesContaining(guide, needle string) []string {
 	return hits
 }
 
-// TestLoadTestGuide_DocumentsOnlyRunnableEventCommands pins every advertised command to the two
-// prerequisites the scenario actually enforces.
-//
-// # What was wrong
+// TestLoadTestGuide_DocumentsOnlyRunnableEventCommands pins every advertised command to
+// the two prerequisites the scenario actually enforces.
 //
 // events.js refuses to provision fixtures unless LEDGER_PAIRS names existing ones or
-// ALLOW_FIXTURE_CREATION=1 acknowledges that the run permanently adds ledgers and balances to a
-// database with no delete endpoint for either, and — since the attribution fix — both the runner
-// and the scenario refuse an acceptance run that has not been declared to own its instance. Every
-// command the guide advertised predated both refusals, so the documented way to run the acceptance
-// case aborted before load generation. A runbook whose commands do not run is worse than no
-// runbook: the reader concludes the harness is broken and reaches for SMOKE=1, which relaxes every
-// other acceptance guard at the same time.
-//
-// # Why it is asserted per command rather than per document
-//
-// It would be easy to satisfy a document-wide assertion by mentioning the variables once in prose
-// and leaving the copyable commands as they were — which is exactly the state this test exists to
-// forbid. So each invocation is checked on its own, and each must satisfy the two contracts in one
-// of the forms the code accepts, including the deliberate opt-outs: SMOKE=1 relaxes both,
-// LEDGER_SPREAD=0 is the deliberate single-aggregate measurement, and REQUIRE_ISOLATION=0 is the
-// declared shared-stack run.
+// ALLOW_FIXTURE_CREATION=1 acknowledges that the run permanently adds ledgers and
+// balances to a database with no delete endpoint for either, and — since the
+// attribution fix — both the runner and the scenario refuse an acceptance run that has
+// not been declared to own its instance. Every command the guide advertised predated
+// both refusals, so the documented way to run the acceptance case aborted before load
+// generation.
 func TestLoadTestGuide_DocumentsOnlyRunnableEventCommands(t *testing.T) {
 	commands := guideEventCommands(t, readRepoFile(t, loadTestGuidePath))
 
@@ -1309,9 +1095,9 @@ func TestLoadTestGuide_DocumentsOnlyRunnableEventCommands(t *testing.T) {
 			loadTestGuidePath, command)
 	}
 
-	// Both fixture paths must be DEMONSTRATED, not merely named: an operator on a shared database
-	// cannot use the disposable form, and one on a disposable database should not be pushed into
-	// maintaining a pairs file.
+	// Both fixture paths must be DEMONSTRATED, not merely named: an operator on a shared
+	// database cannot use the disposable form, and one on a disposable database should not
+	// be pushed into maintaining a pairs file.
 	joined := strings.Join(commands, "\n")
 	assert.Containsf(t, joined, "ALLOW_FIXTURE_CREATION=1",
 		"%s: the disposable-database path must appear as a runnable command", loadTestGuidePath)
@@ -1319,27 +1105,19 @@ func TestLoadTestGuide_DocumentsOnlyRunnableEventCommands(t *testing.T) {
 		"%s: the reusable-fixtures path must appear as a runnable command", loadTestGuidePath)
 }
 
-// TestLoadTestGuide_StatesTheSettlingPopulationAndItsFailClosedRule pins the guide to the gate
-// that was actually built.
+// TestLoadTestGuide_StatesTheSettlingPopulationAndItsFailClosedRule pins the guide to
+// the gate that was actually built.
 //
-// # What was wrong
+// The guide described the settling gates as waiting for the outbox's PENDING depth to
+// reach zero, which is what the gates once did and is not what settlement means.
 //
-// The guide described the settling gates as waiting for the outbox's PENDING depth to reach zero,
-// which is what the gates once did and is not what settlement means. A row in `processing` is
-// claimed and unacknowledged, a row in `failed` has spent its retry budget and still owes its
-// dead-letter write, and a row in `replaying` is a republish in flight — none has reached a
-// terminal counter, so a window closed over `pending` alone excludes exactly the rows that are
-// enriched in the outcome V-3 measures, and reports a flatteringly low rate beside a flatteringly
-// low p99.
-//
-// # What the guide has to carry
-//
-// The four states by name, `webhook_pending`'s exclusion and the reason for it — otherwise the
-// next reader "completes" the population with it and ties the acceptance window's length to the
-// transport being retired — and the fail-closed rule, because a run without a master key reads the
-// population from blnk_outbox_pending, which is pending plus processing only. That run withholds
-// its verdicts, and an operator who does not know it will read the withheld rows as a stack
-// problem rather than as a missing credential.
+// The four states by name, `webhook_pending`'s exclusion and the reason for it —
+// otherwise the next reader "completes" the population with it and ties the acceptance
+// window's length to the transport being retired — and the fail-closed rule, because a
+// run without a master key reads the population from blnk_outbox_pending, which is
+// pending plus processing only. That run withholds its verdicts, and an operator who
+// does not know it will read the withheld rows as a stack problem rather than as a
+// missing credential.
 func TestLoadTestGuide_StatesTheSettlingPopulationAndItsFailClosedRule(t *testing.T) {
 	guide := guideSection(t, readRepoFile(t, loadTestGuidePath),
 		`### The settling gates: what "settled" covers`)
@@ -1369,21 +1147,8 @@ func TestLoadTestGuide_StatesTheSettlingPopulationAndItsFailClosedRule(t *testin
 			"rather than reporting the partial figures as a result", loadTestGuidePath)
 }
 
-// TestLoadTestGuide_StatesTheSameWindowDeadLetterNumerator pins V-3's arithmetic as documented.
-//
-// # What was wrong
-//
-// The guide said the dead-letter rate came from the counter, and named the census as a fallback
-// source, at a time when the fallback contributed a PROVENANCE STRING and no number: the numerator
-// stayed at the counter's zero. A deployment that had never exported the counter therefore
-// certified 0% while its outbox held dead letters. The fix takes a baseline census reading in
-// setup() and subtracts it from the final one, and withholds the verdict when neither source
-// yields a window delta.
-//
-// The guide has to carry three specifics, because each is a way the reader could otherwise be
-// misled: that the census numerator is a DELTA across the window, that the cumulative census value
-// is never used on its own (it is a lifetime total — dead-lettered rows are not purged by
-// retention), and that an absent counter withholds the verdict instead of reading as zero.
+// TestLoadTestGuide_StatesTheSameWindowDeadLetterNumerator pins that arithmetic as
+// documented.
 func TestLoadTestGuide_StatesTheSameWindowDeadLetterNumerator(t *testing.T) {
 	guide := guideSection(t, readRepoFile(t, loadTestGuidePath), "### Where each verdict comes from")
 
@@ -1403,14 +1168,8 @@ func TestLoadTestGuide_StatesTheSameWindowDeadLetterNumerator(t *testing.T) {
 			"named, or the arithmetic cannot be redone by hand", loadTestGuidePath)
 }
 
-// TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait pins the diagnostic's description.
-//
-// The guide once introduced `event_publish_p99_difference_seconds` as "the queue wait" and then,
-// four sections later, correctly said that the difference of two independently ranked p99 values
-// is not a queue-wait percentile. Both statements cannot be acted on: the first invites a reader
-// to quote the figure as a latency component of the pipeline, which is the reading the second
-// forbids. Only the corrective phrasing may remain, and it must remain — a diagnostic with no
-// stated limit is quoted as a measurement.
+// TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait pins the diagnostic's
+// description.
 func TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait(t *testing.T) {
 	guide := readRepoFile(t, loadTestGuidePath)
 
@@ -1440,19 +1199,11 @@ func TestLoadTestGuide_DoesNotReadTheP99DifferenceAsAQueueWait(t *testing.T) {
 // The verdict must be decided by what was measured, and by what was registered
 // ---------------------------------------------------------------------------
 
-// TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed pins the eight defects that together
-// made the V-1 and V-3 verdicts untrustworthy, whichever way they came out.
+// TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed pins the eight defects that
+// together would make the latency and dead-letter verdicts untrustworthy, whichever way
+// they came out.
 //
-// # Why they belong in one test
-//
-// Every one of them is the same shape: a figure that LOOKS measured and is not. A gate that
-// counts one of five states; a freshness check reading a gauge nobody collected; a numerator
-// taken from an absent series; a threshold registered against a metric no scenario feeds; a row
-// showing one metric's value beside another's verdict; a headline that cannot say PASS; a cadence
-// named twice with two values; a tolerance of one that permits none. None is visible in a run's
-// output, and several of them bias the result towards certifying a pipeline that was failing.
-//
-// Each subtest asserts the mechanism rather than a value, because the values are configuration.
+// Every one of them is the same shape: a figure that LOOKS measured and is not.
 func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 	source := loadTestScript(t)
 
@@ -1496,8 +1247,9 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 
 		// Every metric only the sampler scenario feeds. Registering any of these outside the
 		// block means an unsampled run is judged on a metric that received no samples: the
-		// Counter is evaluated at zero and FAILS, the Rate passes VACUOUSLY, and the run fails
-		// naming a subwindow count on a configuration that deliberately has no subwindows.
+		// Counter is evaluated at zero and FAILS, the Rate passes VACUOUSLY, and the run
+		// fails naming a subwindow count on a configuration that deliberately has no
+		// subwindows.
 		for _, metric := range []string{
 			"M_WINDOW_EVENTS_PER_SEC",
 			"M_RATE_WINDOWS_COUNTED",
@@ -1514,7 +1266,7 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 		}
 
 		// And the unconditional ones must NOT be inside it: gating the latency or dead-letter
-		// threshold on the sampler would silently withdraw V-1's p99 and V-3 entirely.
+		// threshold on the sampler would silently withdraw the p99 and the dead-letter rate entirely.
 		for _, metric := range []string{"M_P99_SECONDS", "M_DEAD_LETTER_RATIO", "M_VERDICTS_AVAILABLE"} {
 			assert.NotContainsf(t, samplerBlock, "o["+metric+"]",
 				"%s: %s must be registered unconditionally — it does not come from the sampler, and "+
@@ -1549,13 +1301,11 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 				"threshold was measured and reported but not asserted on; printing FAIL beside a "+
 				"healthy figure states the opposite of the truth", loadTestScriptPath)
 
-		// EVERY CERTIFYING ROW MUST BE ABLE TO HOLD. verdictHolds requires a non-null `value`,
-		// which is right — an unrecorded Gauge reads as 0 and 0 satisfies both `< ceiling`
-		// verdicts, so an absent figure must not count as a passing one. But the subwindow row is
-		// a FRACTION rather than a measurement against a bound and carried no `value` at all, so
-		// it reported FAIL with both of its thresholds green. That was a third structural reason
-		// the aggregate could never be true, and it was observed live at
-		// `rate>=0.95: true, count>=3: true` beside a FAIL.
+		// EVERY CERTIFYING ROW MUST BE ABLE TO HOLD. verdictHolds requires a non-null
+		// `value`, which is right — an unrecorded Gauge reads as 0 and 0 satisfies both `<
+		// ceiling` verdicts, so an absent figure must not count as a passing one. But the
+		// subwindow row is a FRACTION rather than a measurement against a bound and carried
+		// no `value` at all, so it reported FAIL with both of its thresholds green.
 		assert.Containsf(t, source, "value: subwindowFraction,",
 			"%s: the sustained-subwindow row must publish the figure its verdict is read from. The "+
 				"fraction is the right one: null exactly when NO subwindow was judged, which is the "+
@@ -1568,9 +1318,9 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 	})
 
 	t.Run("PERF-C01 the drain gate counts every unsettled state", func(t *testing.T) {
-		// readUnsettledDepth, not readPendingDepth: the function was renamed when it stopped
-		// reading `pending`, and that rename IS this finding's remedy rather than an unrelated
-		// tidy-up, so the name asserted here is the one the fixed code carries.
+		// readUnsettledDepth, not readPendingDepth: the name states that the gate does not
+		// read `pending` alone, so the name asserted here is the one the correct
+		// implementation carries.
 		body := scriptFunctionBody(t, source, "function readUnsettledDepth() {")
 
 		assert.Containsf(t, body, "stats.unsettled !== null",
@@ -1587,11 +1337,7 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 
 		// Each state the gate waits on must actually be read.
 		//
-		// FOUR, not five. `webhook_pending` is deliberately outside the population, for the
-		// reason TestLoadTestSettlingGate_CoversEveryUnsettledOutboxState sets out: such a row's
-		// Kafka leg is acknowledged and already counted in blnk_events_published_total, so only
-		// the deprecated HTTP leg is still owed, and waiting for it would tie the length of the
-		// acceptance window to the health of the transport being retired.
+		// FOUR, not five.
 		probe := scriptFunctionBody(t, source, "function probeEventStats() {")
 		for _, status := range []string{"pending", "processing", "failed", "replaying"} {
 			assert.Containsf(t, probe, `readOptionalNumber(body, "`+status+`")`,
@@ -1599,10 +1345,10 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 					"gate treats as empty", loadTestScriptPath, status)
 		}
 		// INCOMPLETE MEANS NULL, NOT ZERO. The census propagates unreadability into the total
-		// instead of tracking it in a separate flag, so there is no way to hold a summed total
-		// and a "not really complete" marker that disagree with each other: an absent key makes
-		// `unsettled` null, the gate reports that it could not read the population, and the run
-		// withholds. A missing key contributing 0 is the whole finding.
+		// instead of tracking it in a separate flag, so there is no way to hold a summed
+		// total and a "not really complete" marker that disagree with each other: an absent
+		// key makes `unsettled` null, the gate reports that it could not read the population,
+		// and the run withholds.
 		assert.Containsf(t, collapseWhitespace(probe),
 			"? null : pending + processing + failed + replaying;",
 			"%s: a MISSING status key must mark the count incomplete rather than contribute zero. "+
@@ -1669,22 +1415,15 @@ func TestLoadTestHarness_VerdictInputsAreMeasuredNotAssumed(t *testing.T) {
 }
 
 // loadTestGuidePath is the guide an operator runs the acceptance case from.
-// TestLoadTestGuide_PublishesARunnableRecipe pins DOC-M11 and DOC-m03.
+// TestLoadTestGuide_PublishesARunnableRecipe pins the runnable recipe the guide owes.
 //
-// # Why a test guards prose
-//
-// This guide is the only instruction for producing the V-1 and V-3 evidence, and its commands were
-// not runnable: `events.js` refuses to create ledgers and balances implicitly — Blnk has no DELETE
-// endpoint for either, so anything provisioned is permanent — and it aborts inside `setup()` until
-// one of three fixture choices is stated. The documented commands stated none, so the canonical
-// path ended in a stack trace. A second layer sat behind that: `./.env` ships the master key and no
-// API key, so even with a fixture choice every provisioning request is refused with 401, and the
-// abort then blames the partition-key spread rather than the authentication.
-//
-// A command that cannot run is worse than an absent one, because the reader assumes their
-// environment is at fault. The assertions below are deliberately about MECHANISM — that no bash
-// block invoking the case omits a fixture choice, and that the required variables are named — so
-// they keep holding as the numbers and prose change.
+// This guide is the only instruction for producing the throughput, latency and
+// dead-letter evidence, and its
+// commands were not runnable: `events.js` refuses to create ledgers and balances
+// implicitly — Blnk has no DELETE endpoint for either, so anything provisioned is
+// permanent — and it aborts inside `setup()` until one of three fixture choices is
+// stated. The documented commands stated none, so the canonical path ended in a stack
+// trace.
 func TestLoadTestGuide_PublishesARunnableRecipe(t *testing.T) {
 	guide := readRepoFile(t, loadTestGuidePath)
 
@@ -1741,10 +1480,9 @@ func TestLoadTestGuide_PublishesARunnableRecipe(t *testing.T) {
 	})
 
 	t.Run("DOC-m03 the p99 difference is never called a queue wait", func(t *testing.T) {
-		// The phrase may appear only in a sentence that DENIES it. Quantiles are not subtractive:
-		// the difference of two independently ranked p99 values is not any event's latency, and can
-		// be negative. One paragraph asserted it was the queue wait while another correctly said it
-		// was not, so a reader had to guess which to believe.
+		// The phrase may appear only in a sentence that DENIES it. Quantiles are not
+		// subtractive: the difference of two independently ranked p99 values is not any
+		// event's latency, and can be negative.
 		for _, line := range strings.Split(guide, "\n") {
 			if !strings.Contains(line, "queue wait") {
 				continue
@@ -1772,11 +1510,9 @@ func TestLoadTestGuide_PublishesARunnableRecipe(t *testing.T) {
 
 // stripShellComments removes whole-line shell comments from a region.
 //
-// The shell counterpart of stripLineComments, and needed for the same reason: the runner's
-// rationale comments deliberately NAME the argv form that was removed, so an absence assertion
-// over the raw text would report the explanation as the defect. Line-wise rather than lexical,
-// so a `#` inside a quoted string — the runner has several in URLs and prose — can never
-// truncate a line that is really code. The shebang goes with them, which is harmless.
+// The shell counterpart of stripLineComments, and needed for the same reason: the
+// runner's rationale comments deliberately NAME the argv form that was removed, so an
+// absence assertion over the raw text would report the explanation as the defect.
 func stripShellComments(region string) string {
 	lines := strings.Split(region, "\n")
 	kept := make([]string, 0, len(lines))
@@ -1792,11 +1528,8 @@ func stripShellComments(region string) string {
 	return strings.Join(kept, "\n")
 }
 
-// eventsRunnerBranchStripped returns the runner's events case alone, with comments stripped.
-//
-// Bounded at its own `exit 0` for the reason the load-shape test gives: slicing to the end of
-// the file would drag in the transaction invocation, which legitimately spells things the
-// events branch must not.
+// eventsRunnerBranchStripped returns the runner's events case alone, with comments
+// stripped.
 func eventsRunnerBranchStripped(t *testing.T) string {
 	t.Helper()
 
@@ -1813,35 +1546,14 @@ func eventsRunnerBranchStripped(t *testing.T) string {
 	return stripShellComments(runner[start : start+length])
 }
 
-// eventCredentialEnvNames are the three credentials the events case supplies to the scenario,
-// under the names events.js actually reads them by.
-//
-// The names are the scenario's, not the environment's: events.js reads METRICS_BEARER_TOKEN and
-// MASTER_KEY, never BLNK_METRICS_BEARER_TOKEN or BLNK_SERVER_SECRET_KEY, so the runner has to
-// re-export the BLNK_* spellings that ./.env ships under these. That translation is why the
-// runner cannot simply leave the caller's environment alone.
+// eventCredentialEnvNames are the three credentials the events case supplies to the
+// scenario, under the names events.js actually reads them by.
 var eventCredentialEnvNames = []string{"METRICS_BEARER_TOKEN", "MASTER_KEY", "API_KEY"}
 
-// TestLoadTestRunner_KeepsCredentialsOutOfProcessArgv pins SEC-M13.
+// TestLoadTestRunner_KeepsCredentialsOutOfProcessArgv keeps secrets out of argv.
 //
-// # Why argv and environment are not interchangeable
-//
-// The three values are secrets: the metrics bearer token reads /metrics, the master key reads
-// GET /events/stats, and the API key posts the load. They used to be appended to the k6
-// command line as `-e NAME=value`, and on Linux that is a materially weaker channel than the
-// environment — measured on the host this suite runs on:
-//
-//	/proc/<pid>/cmdline   -r--r--r--   readable by ANY user for as long as k6 runs
-//	/proc/<pid>/environ   -r--------   readable only by the process owner
-//
-// Beyond the local read, argv is what `ps` prints, what a CI runner echoes when it reports the
-// command it spawned, and what a shell history or crash trace keeps after the run. None of
-// those leaks has to be noticed to have happened, and none of them is undone by rotating
-// afterwards if nobody knows to rotate.
-//
-// So this asserts the CHANNEL rather than any particular spelling: no credential name may
-// appear on an argv-forming `-e` in the events branch, each must be exported, and the k6
-// invocation must pin the inheritance flag that makes the environment channel work.
+// The three values are secrets: the metrics bearer token reads /metrics, the master key
+// reads GET /events/stats, and the API key posts the load.
 func TestLoadTestRunner_KeepsCredentialsOutOfProcessArgv(t *testing.T) {
 	eventsCase := eventsRunnerBranchStripped(t)
 
@@ -1880,9 +1592,10 @@ func TestLoadTestRunner_KeepsCredentialsOutOfProcessArgv(t *testing.T) {
 	}
 
 	// The environment channel is only reliable if it is pinned. --include-system-env-vars
-	// defaults to true, but K6_INCLUDE_SYSTEM_ENV_VARS=false in the caller's shell overrides
-	// that default and silently empties every exported value — verified against the pinned k6.
-	// The resulting failure is the quiet kind: the run completes and reports withheld verdicts.
+	// defaults to true, but K6_INCLUDE_SYSTEM_ENV_VARS=false in the caller's shell
+	// overrides that default and silently empties every exported value — verified against
+	// the pinned k6. The resulting failure is the quiet kind: the run completes and
+	// reports withheld verdicts.
 	assert.Containsf(t, eventsCase, "--include-system-env-vars",
 		"%s: the events case must pass --include-system-env-vars explicitly. It defaults to "+
 			"true, but an ambient K6_INCLUDE_SYSTEM_ENV_VARS=false turns the credential channel "+
@@ -1891,24 +1604,17 @@ func TestLoadTestRunner_KeepsCredentialsOutOfProcessArgv(t *testing.T) {
 		loadTestRunnerPath)
 }
 
-// TestLoadTestRunner_MakesTheRawStreamOptIn pins PERF-M12.
+// TestLoadTestRunner_MakesTheRawStreamOptIn keeps the raw stream opt-in.
 //
-// The raw k6 NDJSON stream was written on every run. At the criterion's own load — 500 events
-// per second for thirty minutes — that is tens of millions of records and gigabytes written by
-// the load generator while it is measuring sub-second latency, so the mandatory artifact
-// contends for the disk and CPU of the very measurement it accompanies and shows up as dropped
-// iterations and inflated percentiles. The verdicts are not computed from it: every V-1, V-3
-// and p99 figure is produced inside the scenario and written to the summary.
+// The raw k6 NDJSON stream was written on every run.
 //
-// The summary therefore stays unconditional and the raw stream becomes opt-in. Both halves are
-// asserted, because dropping the summary would be the mirror-image defect: a cheap run that
-// evidences nothing.
+// The summary therefore stays unconditional and the raw stream becomes opt-in.
 func TestLoadTestRunner_MakesTheRawStreamOptIn(t *testing.T) {
 	eventsCase := eventsRunnerBranchStripped(t)
 
-	// The k6 invocation itself, from the command to the scenario it runs. --out must not appear
-	// here as a literal: an unconditional flag is the defect regardless of how the path is
-	// built.
+	// The k6 invocation itself, from the command to the scenario it runs. --out must not
+	// appear here as a literal: an unconditional flag is the defect regardless of how the
+	// path is built.
 	invocationStart := strings.Index(eventsCase, "k6 run")
 	require.Greaterf(t, invocationStart, 0, "%s: the events case must invoke k6", loadTestRunnerPath)
 	invocationEnd := strings.Index(eventsCase[invocationStart:], "tests/loadtest/events.js")
@@ -1943,21 +1649,9 @@ func TestLoadTestRunner_MakesTheRawStreamOptIn(t *testing.T) {
 
 // TestLoadTestRunner_NamesArtefactsAsTheScenarioDoes pins CONTRACT-m01.
 //
-// # One stem, and it is derived rather than declared here
-//
-// events.js writes its summary to __ENV.SUMMARY_OUT or, absent that, to its OWN default — which
-// is what a bare `k6 run tests/loadtest/events.js` produces with no runner involved. If the
-// runner defaults to a different path, the same run yields different filenames depending on how
-// it was started, and the README can only document one of them.
-//
-// So the expected stem is READ OUT OF events.js rather than written here. That is what makes
-// the property self-enforcing: change the scenario's default and this test demands the runner
-// follow, in either direction, without anybody having to remember a literal in a third place.
-//
-// The alias is asserted too. `event-streaming` normalising onto `events` is correct — two
-// separate branches once forwarded different variables and spelled the master key differently,
-// so both names appeared to work while doing different things — but the substitution has to be
-// VISIBLE, or an operator who typed one name cannot tell which case ran or which files to open.
+// events.js writes its summary to __ENV.SUMMARY_OUT or, absent that, to its OWN default
+// — which is what a bare `k6 run tests/loadtest/events.js` produces with no runner
+// involved.
 func TestLoadTestRunner_NamesArtefactsAsTheScenarioDoes(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 
@@ -2001,12 +1695,6 @@ func TestLoadTestRunner_NamesArtefactsAsTheScenarioDoes(t *testing.T) {
 }
 
 // TestLoadTestRunner_IsExecutable pins the file mode in the index.
-//
-// The runner is documented as `bash tests/loadtest/run_case.sh events`, which works whatever the
-// mode is, but every other script in the repository that is meant to be run — scripts/kafka-
-// bootstrap.sh and scripts/kafka-provision.sh — is committed 100755, and README examples and
-// makefile targets invoke scripts directly elsewhere. A 100644 runner is an inconsistency that
-// surfaces only as "permission denied" for whoever first tries ./run_case.sh.
 func TestLoadTestRunner_IsExecutable(t *testing.T) {
 	info, err := os.Stat(loadTestRunnerPath)
 	require.NoErrorf(t, err, "%s must exist", loadTestRunnerPath)
@@ -2018,19 +1706,14 @@ func TestLoadTestRunner_IsExecutable(t *testing.T) {
 
 // TestLoadTestRunner_ValidatesAndSanitisesEveryURLItReports pins two separate mistakes.
 //
-// FIRST, it reported before it validated. The runner echoed URL and METRICS_URL and only then let
-// k6 or events.js discover that one was unusable, so the operator's first sight of a malformed
-// value was as the endpoint under test, and the actual complaint arrived later from a different
-// program in a different vocabulary.
+// FIRST, it reported before it validated.
 //
-// SECOND, it reported the value verbatim. A URL is somewhere a credential hides in plain sight —
-// http://user:token@host/, or ?api_key=... — and this runner's whole reason for keeping secrets
-// out of argv is that argv is readable by other accounts. Echoing userinfo into stdout is worse
-// than argv, because stdout becomes a CI log that is retained, searchable and often public.
+// SECOND, it reported the value verbatim. A URL is somewhere a credential hides in
+// plain sight — http://user:token@host/, or ?api_key=...
 //
-// So: require_http_url refuses a non-http(s) value without echoing it, and display_url renders
-// scheme, host, port and path only. The value k6 receives is unchanged; only what reaches the
-// terminal is narrowed.
+// So: require_http_url refuses a non-http(s) value without echoing it, and display_url
+// renders scheme, host, port and path only. The value k6 receives is unchanged; only
+// what reaches the terminal is narrowed.
 func TestLoadTestRunner_ValidatesAndSanitisesEveryURLItReports(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 
@@ -2046,9 +1729,8 @@ func TestLoadTestRunner_ValidatesAndSanitisesEveryURLItReports(t *testing.T) {
 	require.Greater(t, validatorEnd, 0, "require_http_url must be a closed function")
 	validator := runner[validatorStart : validatorStart+validatorEnd]
 
-	// Scoped to the lines that PRINT. The function must of course reference ${value} to test it;
-	// what it must not do is put it on the terminal. Asserted line by line so a future `echo
-	// "got: ${value}"` added for debugging is caught, which is exactly how this leak would return.
+	// Scoped to the lines that PRINT. The function must of course reference ${value} to
+	// test it; what it must not do is put it on the terminal.
 	for _, line := range strings.Split(validator, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "echo ") && !strings.HasPrefix(trimmed, "printf ") {
@@ -2108,31 +1790,17 @@ func TestLoadTestRunner_ValidatesAndSanitisesEveryURLItReports(t *testing.T) {
 			"containing '@' does not leave its tail behind as part of the host", loadTestRunnerPath)
 }
 
-// TestLoadTestRunner_RefusesAnUnacknowledgedFixtureSpreadBeforeStartingK6 is the M-16 guard.
+// TestLoadTestRunner_RefusesAnUnacknowledgedFixtureSpreadBeforeStartingK6 is the guard.
 //
-// # What was wrong
+// # The README documented the certifying run as
 //
-// The README documented the certifying V-1/V-3 run as
+// set -a;. ./.env; set +a bash tests/loadtest/run_case.sh events
 //
-//	set -a; . ./.env; set +a
-//	bash tests/loadtest/run_case.sh events
-//
-// and that command could not complete. events.js refuses to provision fixtures without one of
-// LEDGER_PAIRS, ALLOW_FIXTURE_CREATION=1 or SMOKE=1, because provisioning permanently adds
-// LEDGER_SPREAD (128) ledgers and twice that many balances to a database it cannot clean up —
-// Blnk exposes no DELETE for a ledger or a balance. The refusal is correct. The documented
-// command simply omitted the decision, so the one run the README called certifying was the one
-// run that always aborted.
-//
-// # Why the check has to be in the runner and not only in the scenario
-//
-// The scenario's refusal lives in setup(), which k6 reaches only after initialising the
-// scenario, starting the sampler scenario and evaluating every threshold. So the operator saw a
-// complete verdict table — six criteria, all FAIL, ending in "ALL CRITERIA FAIL — NOT certified
-// by this run" — and the single line explaining that no fixture mode had been chosen scrolled
-// past underneath it. A missing acknowledgement is, at a glance, indistinguishable from a
-// pipeline that measured badly, and the second reading costs an investigation. Refusing in the
-// runner puts the message where nothing can bury it.
+// and that command could not complete. events.js refuses to provision fixtures without
+// one of LEDGER_PAIRS, ALLOW_FIXTURE_CREATION=1 or SMOKE=1, because provisioning
+// permanently adds LEDGER_SPREAD (128) ledgers and twice that many balances to a
+// database it cannot clean up — Blnk exposes no DELETE for a ledger or a balance. The
+// refusal is correct.
 func TestLoadTestRunner_RefusesAnUnacknowledgedFixtureSpreadBeforeStartingK6(t *testing.T) {
 	runner := readRepoFile(t, loadTestRunnerPath)
 
@@ -2142,10 +1810,11 @@ func TestLoadTestRunner_RefusesAnUnacknowledgedFixtureSpreadBeforeStartingK6(t *
 		"%s must refuse an unacknowledged fixture spread itself, rather than letting the "+
 			"scenario's setup() do it after a full verdict table has printed", loadTestRunnerPath)
 
-	// Anchored on the INVOCATION rather than on `--include-system-env-vars`, because the flag
-	// is named in four rationale comments before it is ever passed, and the first of those sits
-	// above the gate — so matching the flag would compare the gate against a comment and pass
-	// or fail for the wrong reason. `k6 run` inside the events branch is the real thing.
+	// Anchored on the INVOCATION rather than on `--include-system-env-vars`, because the
+	// flag is named in four rationale comments before it is ever passed, and the first of
+	// those sits above the gate — so matching the flag would compare the gate against a
+	// comment and pass or fail for the wrong reason. `k6 run` inside the events branch is
+	// the real thing.
 	invocation := strings.Index(runner, "\n    k6 run \\")
 	require.Greaterf(t, invocation, 0,
 		"%s: the events branch must invoke `k6 run` inside its subshell", loadTestRunnerPath)
@@ -2154,10 +1823,10 @@ func TestLoadTestRunner_RefusesAnUnacknowledgedFixtureSpreadBeforeStartingK6(t *
 			"has already paid for an initialised scenario and a screen of FAIL verdicts",
 		loadTestRunnerPath)
 
-	// Every escape the scenario honours must be honoured here too. A runner stricter than the
-	// scenario would block a legitimate run — LEDGER_SPREAD=0 is a deliberate single-aggregate
-	// measurement, not an oversight — and one looser than the scenario would let the buried
-	// failure back in.
+	// Every escape the scenario honours must be honoured here too. A runner stricter than
+	// the scenario would block a legitimate run — LEDGER_SPREAD=0 is a deliberate
+	// single-aggregate measurement, not an oversight — and one looser than the scenario
+	// would let the buried failure back in.
 	for _, escape := range []string{
 		"LEDGER_PAIRS",
 		"ALLOW_FIXTURE_CREATION",
@@ -2197,27 +1866,12 @@ func TestLoadTestRunner_RefusesAnUnacknowledgedFixtureSpreadBeforeStartingK6(t *
 	}
 }
 
-// TestLoadTestOfferedRate_IsReportedAsOfferedRatherThanAsTheTarget is the N-02 guard.
+// TestLoadTestOfferedRate_IsReportedAsOfferedRatherThanAsTheTarget is the guard.
 //
-// # What was wrong
+// events.js offers 550 events/sec, not 500: RATE defaults to ceil(TARGET_EVENTS_PER_SEC
+// * LOAD_HEADROOM_RATIO) = ceil(500 * 1.1).
 //
-// events.js offers 550 events/sec, not 500: RATE defaults to
-// ceil(TARGET_EVENTS_PER_SEC * LOAD_HEADROOM_RATIO) = ceil(500 * 1.1). The headroom is
-// deliberate and events.js explains it — an arrival the executor cannot start is a dropped
-// iteration, a rejected transaction produces no event, and the measured window is never shorter
-// than the load, so every real effect pushes the measured rate DOWN and none pushes it up.
-//
-// The defect was in what the runner and the README then SAID. Both described the default shape
-// as "500/s for 30 minutes", which is the target rather than the offer. Read literally it claims
-// the run offers exactly the bar it is judged against, which would mean any loss at all fails
-// V-1; read as a description of the load it understates the offer by 10%. Either way the number
-// a reader would quote is not the number the run drives.
-//
-// # What this asserts, and what it deliberately does not
-//
-// The criterion is still 500 and must keep saying so — the verdict table row "V-1 — 500
-// events/sec sustained" is correct and is not what this is about. What must be distinguishable
-// is the OFFERED rate from the JUDGED rate, wherever the default shape is described.
+// What the runner and the README SAY about that rate is the part that has to match it.
 func TestLoadTestOfferedRate_IsReportedAsOfferedRatherThanAsTheTarget(t *testing.T) {
 	// The derivation itself must remain target x headroom, so the two numbers stay linked
 	// rather than both being hardcoded and drifting apart.
@@ -2258,32 +1912,27 @@ func TestLoadTestOfferedRate_IsReportedAsOfferedRatherThanAsTheTarget(t *testing
 	}
 
 	// The absence checks above are necessary but evadable: any rephrasing that drops the
-	// offered rate without reproducing one of those two exact strings would slip through. So
-	// the offered rate is also asserted POSITIVELY. A reader must be able to find 550
-	// somewhere in this document, because it is the load the default run actually drives.
+	// offered rate without reproducing one of those two exact strings would slip through.
+	// So the offered rate is also asserted POSITIVELY.
 	assert.Containsf(t, readme, "550",
 		"tests/loadtest/README.md must state the OFFERED rate (550/s) somewhere. Describing "+
 			"only the 500/s target leaves a reader quoting a load the run never drove")
 }
 
-// TestLoadTestReadmeCertifyingRun_IsRunnableAsDocumented is the second half of the M-16 guard.
+// TestLoadTestReadmeCertifyingRun_IsRunnableAsDocumented is the second half of the
+// guard.
 //
-// The runner refusing early is only half a fix: if the README still prints a command that the
-// runner now refuses, the documentation is still wrong and the refusal simply arrives sooner.
-// The certifying invocation must carry a fixture decision that permits quoting the result.
+// The runner refusing early is only half a fix: if the README still prints a command
+// that the runner now refuses, the documentation is still wrong and the refusal simply
+// arrives sooner. The certifying invocation must carry a fixture decision that permits
+// quoting the result.
 func TestLoadTestReadmeCertifyingRun_IsRunnableAsDocumented(t *testing.T) {
 	readme := readRepoFile(t, "tests/loadtest/README.md")
 
-	// Scoped to the acceptance-run section rather than searched file-wide. An invocation of the
-	// runner appears many times in this README — general usage examples, the certifying run, the
-	// fixture-reuse form and two shortened runs — and only one of them is the command that claims
-	// to certify V-1 and V-3. A file-wide search finds the general example first and asserts about
-	// the wrong line.
-	//
-	// Either spelling of the case name counts, because both dispatch the one branch: the guide
-	// writes the canonical `event-streaming`, and `events` normalises onto it in the runner. This
-	// test is about the command being RUNNABLE as printed, not about which of the two names it
-	// uses — TestLoadTestRunner_KeepsTheFrozenEventCaseAndArtefactNames owns the naming.
+	// Scoped to the acceptance-run section rather than searched file-wide. An invocation
+	// of the runner appears many times in this README — general usage examples, the
+	// certifying run, the fixture-reuse form and two shortened runs — and only one of them
+	// is the command that claims to certify the latency and dead-letter verdicts.
 	section := strings.Index(readme, "## The event-streaming acceptance run")
 	require.Greaterf(t, section, 0,
 		"tests/loadtest/README.md must carry an acceptance-run section")

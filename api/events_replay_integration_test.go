@@ -15,39 +15,16 @@ limitations under the License.
 */
 
 // events_replay_integration_test.go holds the ONE assertion about the event management
-// surface that cannot be made without a broker: that a 200 from
-// POST /events/dead-letter/:event_id/replay actually put the record back on the topic it
+// surface that cannot be made without a broker: that a 200 from POST
+// /events/dead-letter/:event_id/replay actually put the record back on the topic it
 // came from, keyed as the original was and carrying the original bytes.
-//
-// # Why it is its own file
 //
 // events_api_test.go covers the request-side contract of this surface — the master-key
 // gate, the closed query-parameter set, parsing, validation and the response envelope —
 // and it does so with NO broker configured, which is both the cheaper posture and the
-// deployment posture that has to keep working. Its own preamble states that no test in it
-// imports a Kafka client, and while the broker-backed success path lived there that
-// statement was false: the file imported github.com/segmentio/kafka-go and the SCRAM
-// mechanism, so every reader and every tool saw an HTTP contract suite carrying a
-// transport dependency it says it does not have.
+// deployment posture that has to keep working.
 //
-// Splitting it is the smaller correction of the two available. The proof itself is worth
-// keeping exactly as it was — a handler that returned the dead-letter topic, an empty
-// event id or a re-marshalled payload would pass every mock-backed test in the package —
-// so it moves rather than shrinks, and the file it moves into declares the broker
-// dependency in its name.
-//
-// # What it shares with the rest of the package
-//
-// Everything except the Kafka client: subscribersKafkaEnvironment resolves and reports the
-// broker environment, newEventsAPIOverMockDatasource builds the router over a mock
-// registry, and eventsKeyedRequest issues the master-keyed request. One harness, one
-// implementation, in the same package.
-//
-// # Skipping
-//
-// It SKIPS with a reason when no broker is configured, exactly as the credential issuance
-// test does, and its name is inside the ^TestEventsAPI_ family the Kafka acceptance job
-// runs with a fail-on-skip gate: absent locally, required in CI.
+// Splitting it is the smaller correction of the two available.
 package api
 
 import (
@@ -71,25 +48,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// eventsReplayKafkaClient builds an authenticated Kafka client for reading a replayed record
-// back off its topic.
+// eventsReplayKafkaClient builds an authenticated Kafka client for reading a replayed
+// record back off its topic.
 //
-// The local stack speaks SASL/SCRAM-SHA-512, so an unauthenticated client cannot read anything
-// and a test built on one would report every assertion as a broker problem.
-//
-// THE ADMINISTRATIVE PRINCIPAL IS USED, NOT THE PRODUCER, and the reason is a property worth
-// stating: Blnk's producer principal is granted Write and NOT Read, so it cannot read back what
-// it publishes — least privilege applied to the publisher itself. A read-back verifier therefore
-// needs a different identity, and the administrator is the one this environment already supplies
-// for administrative reads. It is a verification identity belonging to the test, never a
-// production consumer.
+// The local stack speaks SASL/SCRAM-SHA-512, so an unauthenticated client cannot read
+// anything and a test built on one would report every assertion as a broker problem.
 //
 // Parameters:
 //   - t *testing.T: the test, failed when the mechanism cannot be built.
 //   - kafkaConfig config.KafkaConfig: the resolved broker environment.
 //
 // Returns:
-//   - *kafka.Client: a client addressed at the first broker, with its transport closed on cleanup.
+//   - *kafka.Client: a client addressed at the first broker, with its transport closed
+//     on cleanup.
 func eventsReplayKafkaClient(t *testing.T, kafkaConfig config.KafkaConfig) *kafka.Client {
 	t.Helper()
 
@@ -119,43 +90,12 @@ func eventsReplayKafkaClient(t *testing.T, kafkaConfig config.KafkaConfig) *kafk
 // rather than hanging it.
 const eventsReplayBrokerTimeout = 15 * time.Second
 
-// TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic is the SUCCESS path of
-// POST /events/dead-letter/:event_id/replay, executed rather than described.
+// TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic is the SUCCESS
+// path of POST /events/dead-letter/:event_id/replay, executed rather than described.
 //
-// # What was untested
+// A 200 cannot be forged from this package.
 //
-// Every other test of this route asserts a refusal — no broker, not dead-lettered, not found,
-// unauthorised — and the success body was covered only by a test that MARSHALLED
-// model.ReplayEventResponse itself and inspected the JSON. That pins the DTO's tags and can pin
-// nothing about the handler: which outcome fields it copies into which response fields, that it
-// answers 200 rather than 201 or 204, that it reports the ORIGINAL topic rather than the
-// dead-letter topic it was listed from, and that the event id it returns is the one that was
-// replayed. Every one of those is a line of handler code that a self-marshalled DTO never
-// executes. A handler that returned the dlt topic, or an empty event id, or someone else's
-// timestamp would have passed the whole file.
-//
-// # Why it is broker-backed and what that costs
-//
-// A 200 cannot be forged from this package. The handler calls blnk.ReplayDeadLetteredEvent on
-// the concrete service, which resolves the real publisher and refuses with
-// EVENT_KAFKA_UNAVAILABLE when it is the no-op — so a success requires a real publish to a real
-// broker. It therefore SKIPS with a reason when none is configured, exactly as the credential
-// issuance test in the sibling file does, and its name puts it inside the ^TestEventsAPI_ family
-// the Kafka acceptance job runs with a fail-on-skip gate: absent locally, required in CI.
-//
-// The registry stays a MOCK, which is what makes the assertions exact. The claim returns a known
-// dead-lettered row, so the event id, the topic and the payload bytes on the wire are all
-// fixture values the response can be compared against — and the coordinate the broker assigned
-// is captured from the MarkEventDispatched argument, which is the same value the service read
-// out of the publish acknowledgement.
-//
-// # The record is read back at the coordinate the broker named
-//
-// Not scanned for. The acknowledged partition and offset are used to fetch exactly one record,
-// so a value that arrived at a different coordinate, or not at all, fails rather than being
-// missed by a search that gave up. Its key and its bytes are then compared with the stored row:
-// a replay must republish the ORIGINAL bytes, which is the property the byte-fidelity criterion
-// rests on and the reason PublishRequestFromOutbox reads EventRaw instead of re-marshalling.
+// The registry stays a MOCK, which is what makes the assertions exact.
 func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *testing.T) {
 	kafkaConfig, reason, configured := subscribersKafkaEnvironment(t)
 	if !configured {
@@ -174,11 +114,11 @@ func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *t
 	})
 	router := apiInstance.Router()
 
-	// RESOLVED THROUGH PRODUCTION, and only after the configuration is published: TopicForEvent
-	// reads the prefix from the store, and the topic the fixture names must be one Blnk OWNS
-	// under that prefix or the publisher refuses the request for a reason that has nothing to do
-	// with this test. Spelling it out here instead would hard-code a prefix the environment is
-	// free to change.
+	// RESOLVED THROUGH PRODUCTION, and only after the configuration is published:
+	// TopicForEvent reads the prefix from the store, and the topic the fixture names must
+	// be one Blnk OWNS under that prefix or the publisher refuses the request for a reason
+	// that has nothing to do with this test. Spelling it out here instead would hard-code
+	// a prefix the environment is free to change.
 	row.Topic = blnk.TopicForEvent(row.EventType)
 	row.DLTTopic = blnk.DLTFor(row.Topic)
 	require.NotEmpty(t, row.Topic, "the fixture's event type must route to a topic")
@@ -196,9 +136,9 @@ func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *t
 			require.True(t, isRecord, "the dispatch transition must be given a broker record")
 			acknowledged = record
 		})
-	// Not expected to be reached: a successful replay marks the row dispatched and releases
-	// nothing. Programmed so that a release would be RECORDED rather than panicking the mock,
-	// which is what lets the assertion below name it.
+	// Not expected to be reached: a successful replay marks the row dispatched and
+	// releases nothing. Programmed so that a release would be RECORDED rather than
+	// panicking the mock, which is what lets the assertion below name it.
 	datasource.On("ReleaseEventReplay", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
 		Return(nil).Maybe()
 

@@ -132,28 +132,16 @@ func getWebhookSender() WebhookSender {
 	return webhookSender
 }
 
-// notifyErrorCompleted is called, if set, when NotifyError's goroutine has finished — on every
-// path, including the ones that dispatch nothing.
-//
-// # Why a production file carries a test seam
+// notifyErrorCompleted is called, if set, when NotifyError's goroutine has finished —
+// on every path, including the ones that dispatch nothing.
 //
 // NotifyError returns as soon as it has SPAWNED its work, so from the outside there is no
-// moment at which "the dispatch decision has been made" is observable. That leaves a test two
-// options: wait on a channel the sender writes to, which works only when a dispatch is
-// expected, or sleep and hope — and the assertions that matter most here are NEGATIVE ones.
-// "An unconfigured deployment stays silent" and "both transports configured dispatch exactly
-// once" are both statements about something NOT happening, and a sleep-based version of either
-// passes on a machine that was merely slow: the goroutine had not reached the gate yet.
-//
-// So the goroutine announces its own completion instead. Unset in production, where it costs
-// one nil comparison per notified error, and set by a test that then knows the decision is
-// behind it before asserting anything. The alternative considered and rejected was exporting
-// the gate as a pure function and testing that instead: it would test the CONDITION while
-// leaving the wiring — that the condition is what the goroutine consults, and that the sender
-// is called at most once — exactly as unobservable as before.
-//
-// Guarded by its own mutex because the notifier runs on another goroutine, and the race
-// detector is part of this suite.
+// moment at which "the dispatch decision has been made" is observable — and the
+// assertions that matter most here are NEGATIVE ones ("an unconfigured deployment stays
+// silent", "both transports configured dispatch exactly once"), which a sleep-based test
+// would pass on a merely slow machine. So the goroutine announces its own completion.
+// Unset in production, where it costs one nil comparison per notified error, and set by a
+// test that then knows the decision is behind it before asserting anything.
 var (
 	notifyErrorCompletedMu sync.RWMutex
 	notifyErrorCompleted   func()
@@ -198,17 +186,13 @@ func NotifyError(systemError error) {
 		// ONE OPERATOR RECORD PER OCCURRENCE, and it is emitted here — before anything can
 		// fail or be skipped — so an error is never swallowed.
 		//
-		// There used to be two, and both carried the raw error: a bare logrus.Error(systemError)
-		// followed by a structured line. That doubled the disclosure of whatever an error
-		// happens to render — a PostgreSQL error names schema, table, column and routine; a
-		// broker error names internal addresses — left the first record uncorrelated with the
-		// system.error event a subscriber receives, and printed the text verbatim, so a newline
-		// inside it forged a second entry in a line-oriented aggregator.
-		//
-		// The single record is correlated, classified, and its error text is bounded and
-		// stripped of control characters. The full text still reaches an operator, because a
-		// system error nobody can read is an undiagnosable outage rather than a security
-		// improvement; what the SUBSCRIBER receives is the frozen legacy body and nothing more.
+		// One record rather than two, because whatever an error renders is disclosed once per
+		// record: a PostgreSQL error names schema, table, column and routine, and a broker
+		// error names internal addresses. This record is correlated, classified, bounded and
+		// stripped of control characters — a raw text printed verbatim lets a newline inside
+		// it forge a second entry in a line-oriented aggregator. The full text still reaches
+		// the operator, because a system error nobody can read is an undiagnosable outage;
+		// what the SUBSCRIBER receives is the frozen legacy body and nothing more.
 		correlationID := newCorrelationID()
 		operatorRecord := logrus.WithFields(logrus.Fields{
 			"correlation_id": correlationID,
@@ -237,45 +221,19 @@ func NotifyError(systemError error) {
 		}
 
 		// THE DURABLE RECORD IS ATTEMPTED FIRST, and the optional side channel second.
-		//
-		// The order is load-bearing rather than stylistic. SlackNotification is a synchronous
-		// HTTP POST to a third party whose client allows 30 seconds per call, and it is exactly
-		// the call most likely to be slow during the incident this goroutine is reporting. With
-		// Slack first, every system.error spent that budget BEFORE its outbox row was attempted:
-		// a burst of errors accumulated goroutines each holding an uncaptured event, and a
-		// process that went down inside that window lost the events entirely, because the row
-		// that would have made them replayable had not been written. Nothing about the Slack
-		// message needs to precede it.
-		//
-		// Dispatch system.error whenever EITHER event transport is configured: Kafka
-		// brokers or the legacy webhook URL. This sender is system.error's only route
-		// into the event pipeline — it is the one event type with no direct producer
-		// call site — so gating on the webhook URL alone would drop it entirely on a
-		// Kafka-only deployment, which is the intended end state once webhooks are
-		// retired. With neither configured nothing is attempted, preserving the
-		// no-op-when-unconfigured behaviour. A non-empty broker list means at least one
-		// nonblank configured address, since setKafkaDefaults normalizes blank entries
-		// away; whether that address is reachable is not established here.
 		sender := getWebhookSender()
 		if sender != nil && (len(conf.Kafka.Brokers) > 0 || conf.Notification.Webhook.Url != "") {
-			// THE PAYLOAD IS THE FROZEN LEGACY CONTRACT: {"error": <text>, "time": <now>},
-			// and nothing else. See systemErrorPayload for why it must not be reshaped — the
+			// THE PAYLOAD IS THE FROZEN LEGACY CONTRACT: {"error": <text>, "time": <now>}, and
+			// nothing else. See systemErrorPayload for why it must not be reshaped — the
 			// requirement is that a subscriber's existing parser keeps working when only the
 			// transport changes, so neither a new key nor a substituted error value belongs
-			// here. The bounded, classified diagnosis and the correlation id are on the
-			// operator record above instead, which is where narrowing costs nothing.
+			// here. The bounded, classified diagnosis and the correlation id are on the operator
+			// record above instead, which is where narrowing costs nothing.
 			payload := systemErrorPayload(systemError)
 			if err := sender(systemErrorEventType, payload); err != nil {
-				// A DISTINCT FAILURE, so it gets its own record rather than being folded into
-				// the one above — the system error happened, and separately the attempt to
-				// report it did not. Both carry the correlation id, so the pair reads as one
-				// story.
-				//
-				// The sender's error is BOUNDED rather than interpolated with %v. It comes from
-				// the event pipeline or an HTTP client, so it can carry broker addresses, a
-				// topic name or a response body, at any length and with any control characters
-				// in it; Errorf put that straight into the message text, where a newline forges
-				// an entry and no length limit applied at all.
+				// A DISTINCT FAILURE, so it gets its own record rather than being folded into the
+				// one above — the system error happened, and separately the attempt to report it
+				// did not. Both carry the correlation id, so the pair reads as one story.
 				operatorRecord.WithField("sender_error", boundedErrorText(err)).Error(
 					"the system.error event could not be published; the system error above " +
 						"went unreported to subscribers",
@@ -339,10 +297,7 @@ const (
 //
 // Order is load-bearing. Authorization is checked before transport because a broker or
 // database can report both in one message and the authorization failure is the
-// actionable half — it will not clear on its own. Timeout is checked before transport
-// for the same reason in reverse: "i/o timeout" is a timeout that happens to be on a
-// connection, and calling it a transport failure would send an operator looking at the
-// wrong thing.
+// actionable half — it will not clear on its own.
 var systemErrorSignatures = []struct {
 	signature string
 	reason    string
@@ -381,11 +336,6 @@ var systemErrorSignatures = []struct {
 // the error, a payload value: no error, however constructed, can produce output that
 // describes the deployment.
 //
-// A typed apierror is classified from its CODE first, because the code is an explicit
-// classification the raising site already made and is strictly better than inferring one
-// from prose. Text matching is the fallback for the many errors in this codebase that
-// are plain fmt.Errorf values.
-//
 // Parameters:
 //   - systemError error: the error being notified. Nil yields the unclassified reason.
 //
@@ -415,10 +365,10 @@ func classifySystemError(systemError error) string {
 
 // reasonForErrorCode classifies a typed apierror code.
 //
-// It reads the code's HTTP status rather than enumerating every code, so a code added to
-// apierror later is classified without an edit here. Enumerating them would mean this
-// function silently returning "" for every new code — the failure mode where a growing
-// vocabulary quietly degrades into unclassified.
+// It reads the code's HTTP status rather than enumerating every code, so a code added
+// to apierror later is classified without an edit here. Enumerating them would mean
+// this function silently returning "" for every new code — the failure mode where a
+// growing vocabulary quietly degrades into unclassified.
 //
 // Parameters:
 //   - code apierror.ErrorCode: the typed code.
@@ -475,34 +425,17 @@ const maxLoggedErrorLength = 512
 // error from a genuinely short one and does not diagnose the truncation as the error.
 const logTruncationSuffix = "…[truncated]"
 
-// boundedErrorText renders an error for a log FIELD: control characters neutralised and the
-// length capped.
+// boundedErrorText renders an error for a log FIELD: control characters neutralised and
+// the length capped.
 //
-// # Why an error is untrusted input here
+// Two independent problems, and neither is hypothetical for the errors this package
+// receives.
 //
-// Two independent problems, and neither is hypothetical for the errors this package receives.
-//
-// LOG INJECTION. A newline inside an error message forges a log entry in any line-oriented
-// aggregator, so an error whose text is influenced by a request body — a validation failure
-// quoting the offending input, a broker returning a response body — can write whatever it
-// likes into the log as though Blnk had written it. Carriage returns and tabs are neutralised
-// for the same reason, and every other control character is dropped rather than replaced,
-// since none of them carries meaning a reader needs.
-//
-// UNBOUNDED LENGTH. There is no limit on how long an error's text may be. A driver error can
-// embed a multi-kilobyte statement; a Kafka error can embed a response. Interpolating one into
-// a log message, which is what %v did, put it there at whatever length it happened to be.
-//
-// Truncation happens on a RUNE boundary, so a multi-byte character is never split into invalid
-// UTF-8 — which would corrupt the log line rather than shorten it.
-//
-// This deliberately mirrors the root package's sanitizeLogValue. It is reimplemented rather
-// than shared because the root package imports this one, so importing it back would be a
-// cycle; the semantics are stated here in full so the two cannot silently diverge in meaning.
+// UNBOUNDED LENGTH. There is no limit on how long an error's text may be.
 //
 // Parameters:
-//   - err error: the error to render. A nil error yields the empty string, which is how an
-//     absent error reads in a log field.
+//   - err error: the error to render. A nil error yields the empty string, which is how
+//     an absent error reads in a log field.
 //
 // Returns:
 //   - string: a single-line, length-capped rendering.
@@ -536,8 +469,8 @@ func boundedErrorText(err error) string {
 	return string(rendered[:maxLoggedErrorLength]) + logTruncationSuffix
 }
 
-// newCorrelationID returns the identifier that ties a system.error event to the log line
-// carrying the full error.
+// newCorrelationID returns the identifier that ties a system.error event to the log
+// line carrying the full error.
 //
 // uuid.NewString cannot fail in the way a caller must handle — it panics only if the
 // system entropy source is unavailable, which is not a condition an error notification
@@ -551,47 +484,29 @@ func newCorrelationID() string {
 
 // systemErrorPayload builds the system.error event body.
 //
-// # THIS PAYLOAD IS A FROZEN CONTRACT: {"error": <text>, "time": <now>}
-//
-// Requirement R-8 states that a LedgerEvent's payload must match today's webhook body
-// FIELD-FOR-FIELD, and the webhook body for system.error has always been these two keys.
-// Every subscriber's parser is written against them. The transport moved from an HTTP POST
-// to a Kafka topic; the body did not, and that is the entire point of the migration — a
-// subscriber re-points its consumer and its body handling keeps working.
-//
-// An earlier revision of this function replaced the two keys with a classified reason, a
-// correlation id and an optional error code, on the reasoning that Blnk's error text can
-// describe the inside of the deployment. That reasoning is sound and the change was not:
-// substituting one payload for another under the same event name is a BREAKING CHANGE to a
-// published contract delivered as a side effect of a transport migration, which leaves every
-// existing subscriber reading a key that is no longer there, with nothing having announced
-// it. Narrowing what system.error discloses is a legitimate thing to want and it is a
-// deliberate, versioned change to the contract — schema_version exists on the envelope for
-// exactly that — not something to fold into this one.
+// A LedgerEvent's payload must match the legacy webhook body
+// FIELD-FOR-FIELD, and the webhook body for system.error has always been these two
+// keys. Every subscriber's parser is written against them.
 //
 // What the concern DOES justify, and what is done instead:
 //
-//   - system.error routes to the blnk.system category, which NO SUBSCRIBER IS GRANTED BY
-//     DEFAULT — model.SubscriberGrantableEventCategories withholds it, for this payload's
-//     sake among others — so the audience for this body is the operator unless a deployment
-//     deliberately widens it. Widening takes two declarations that are hard to make by
-//     accident: the deployment sets KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true, and the
-//     subscriber's own grant then has to name the topic. That is the containment: an audience
-//     that cannot widen itself, rather than a rule an operator is asked to follow. See
-//     model.EventCategorySystem.
+//   - system.error routes to the blnk.system category, which NO SUBSCRIBER IS GRANTED
+//     BY DEFAULT — model.SubscriberGrantableEventCategories withholds it, for this
+//     payload's sake among others — so the audience for this body is the operator
+//     unless a deployment deliberately widens it. Widening takes two declarations that
+//     are hard to make by accident: the deployment sets
+//     KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true, and the subscriber's own grant then
+//     has to name the topic.
+//
 //   - The bounded classification — classifySystemError and systemErrorCode, both fixed
 //     vocabularies — is logged at the dispatch site alongside a correlation id, so an
 //     operator gets the diagnosis without the raw text being repeated across log sinks.
 //
-// # The two keys, exactly
-//
 //   - error: systemError.Error(), verbatim. This is the value subscribers parse.
-//   - time: time.Now(), as the original payload carried it. A time.Time rather than a
-//     formatted string, because that is what the legacy payload put in the map and what the
-//     JSON encoder therefore rendered.
 //
-// Nothing else. A third key here is a change to a published contract and would break the
-// field-for-field guarantee; the payload-shape test asserts the count for that reason.
+//   - time: time.Now(), as the original payload carried it. A time.Time rather than a
+//     formatted string, because that is what the legacy payload put in the map and what
+//     the JSON encoder therefore rendered.
 //
 // Parameters:
 //   - systemError error: the error being notified.
