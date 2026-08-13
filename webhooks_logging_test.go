@@ -206,6 +206,43 @@ func TestProcessWebhook_MalformedPayloadRecordNamesTheTaskAndWithholdsWhatItCann
 		"nothing was decoded, so naming an event here would be a fabrication that misdirects the investigation")
 }
 
+// settleLegacyWebhookPrivateDestinationWarning consumes the process-level once-guard at
+// webhooks.go:52 so that a capture window opened afterwards holds only the records the
+// delivery under test produced.
+//
+// # Why a test has to do this at all
+//
+// Every receiver in this file is an httptest server, so every delivery here dials a
+// loopback address, and storeWebhookTestConfig sets allow_private_destination — which is
+// the combination guardLegacyWebhookDial warns about. That warning is deliberately
+// emitted through a sync.Once, because it describes the CONFIGURATION rather than the
+// delivery and one record per delivery would be five hundred a second on the shipped
+// target. A once-guard is process state, so whichever test in the binary delivers first
+// receives the warning in its own capture window and every later one does not.
+//
+// An assertion on the total size of a capture window is therefore only meaningful once
+// the guard is known to be spent, and a test that INHERITS that condition from whatever
+// ran before it reports a different verdict alone than in a suite. Spending it here makes
+// the precondition the test's own, so `-run` a single name, `-shuffle=on`, and the whole
+// package agree.
+//
+// The guard is spent through the real dial hook rather than through a second delivery: it
+// is the code that owns the warning, it needs no receiver, and it cannot disturb the
+// request count the caller then asserts on.
+//
+// Parameters:
+//   - t *testing.T: the test, for the helper marker and the hook's verdict.
+func settleLegacyWebhookPrivateDestinationWarning(t *testing.T) {
+	t.Helper()
+
+	// Port 1 is never connected to: the hook runs before connect and judges the address
+	// alone. nil is the RawConn net.Dialer.Control is called with in tests elsewhere in this
+	// package.
+	require.NoError(t, guardLegacyWebhookDial("tcp4", "127.0.0.1:1", nil),
+		"the loopback destination must be permitted here, or the configuration this helper "+
+			"relies on to spend the warning is not the one under test")
+}
+
 // TestProcessWebhook_DeliveryFailureProducesOneRecordCarryingTheStatus covers the
 // failure mode where the event IS known.
 //
@@ -219,6 +256,10 @@ func TestProcessWebhook_DeliveryFailureProducesOneRecordCarryingTheStatus(t *tes
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
 	defer func() { _ = b.Close() }()
+
+	// BEFORE the window opens, and the reason the assertion below can be about the total
+	// number of records rather than about the number that match a string.
+	settleLegacyWebhookPrivateDestinationWarning(t)
 
 	var handlerErr error
 	captured := captureLogs(t, logrus.DebugLevel, func() {
@@ -235,7 +276,9 @@ func TestProcessWebhook_DeliveryFailureProducesOneRecordCarryingTheStatus(t *tes
 	require.Equal(t, 1, captured.count(message),
 		"one failed delivery must produce one record")
 	require.Len(t, captured.entries, 1,
-		"and NOTHING else may be logged for it: the status line processHTTPRaw used to write is the duplicate this consolidates")
+		"and NOTHING else may be logged for it: the status line processHTTPRaw used to write is the duplicate this consolidates. "+
+			"A private-destination warning here instead means the once-guard settled above has become per-delivery, which is the "+
+			"same log-flooding defect from the other direction. Captured: %s", captured.raw)
 
 	assert.Equal(t, "legacy_webhook", captured.field(message, "transport"))
 	assert.Equal(t, "transaction.applied", captured.field(message, "event_type"),
@@ -284,6 +327,74 @@ func TestProcessWebhook_FailureRecordCapsACauseTheReceiverControlsTheLengthOf(t 
 		"the cause must be capped so no single receiver can decide how much of the log a failure occupies")
 	assert.Contains(t, reported, logTruncationSuffix,
 		"a shortened cause must SAY it was shortened, or it reads as the whole of the failure")
+}
+
+// TestLegacyWebhookPrivateDestinationAdvisory_IsEmittedOncePerProcess owns the one-shot
+// notice that every other test in this package relies on having already fired.
+//
+// The notice exists because allow_private_destination is an operator ASSERTION that a
+// private network is theirs, and an assertion that silently widens where webhooks may be
+// delivered has to appear in the log at least once. It is deliberately once per process:
+// repeated per delivery it would be noise at webhook volume, and the operator learns
+// nothing from the thousandth copy.
+//
+// That "once per process" is precisely what makes it untestable by accident — whichever
+// test delivers first consumes it — so this test takes the Once over for its duration and
+// hands it back settled. Nothing else in the package may assert on it, and nothing else
+// has to.
+func TestLegacyWebhookPrivateDestinationAdvisory_IsEmittedOncePerProcess(t *testing.T) {
+	server, received := newWebhookReceiver(http.StatusOK)
+	defer server.Close()
+	storeWebhookTestConfig(t, server.URL, "secret", nil)
+
+	// Taken AFTER storeWebhookTestConfig, which settles it: from here the notice is unfired
+	// and this test is the only thing that can observe it. It is settled again on the way
+	// out so the ownership cannot leak into whatever runs next.
+	legacyWebhookPrivateDestinationWarning = sync.Once{}
+	t.Cleanup(func() {
+		legacyWebhookPrivateDestinationWarning = sync.Once{}
+		settleLegacyWebhookPrivateDestinationAdvisory()
+	})
+
+	b, err := NewBlnk(nil)
+	require.NoError(t, err)
+	defer func() { _ = b.Close() }()
+
+	const notice = "notification.webhook.allow_private_destination is set"
+
+	deliver := func() capturedLog {
+		return captureLogs(t, logrus.DebugLevel, func() {
+			require.NoError(t, b.ProcessWebhook(
+				context.Background(),
+				asynq.NewTask("webhook_delivery", legacyWebhookEnvelope(t, "transaction.applied")),
+			), "the receiver answers 200, so the delivery itself must succeed: this test is about "+
+				"the advisory, and a failed delivery would prove nothing about it")
+		})
+	}
+
+	first := deliver()
+	require.Len(t, received(), 1, "exactly one attempt per call")
+	require.Equal(t, 1, first.count(notice),
+		"the operator's assertion must be reported the first time it is acted on; a widened "+
+			"destination policy that never appears in the log is indistinguishable from the safe default")
+	assert.Equal(t, "it is a loopback address", first.field(notice, "reason"),
+		"and the record must name WHICH internal address class was permitted, because that is the "+
+			"part of the assertion an operator can check against the network they meant to allow")
+
+	// THE ONCE-NESS IS ASSERTED AGAINST THE GUARD, NOT AGAINST A SECOND DELIVERY. A second
+	// ProcessWebhook reuses the pooled keep-alive connection, so it never dials, so the
+	// guard never runs — a "no notice the second time" assertion written that way passes
+	// even against a guard that has had its Once removed entirely, which is no assertion at
+	// all. Calling the hook directly is the only way to make the second occasion real.
+	second := captureLogs(t, logrus.DebugLevel, func() {
+		require.NoError(t, guardLegacyWebhookDial("tcp4", "127.0.0.1:9999", nil),
+			"a loopback address must still be PERMITTED while the operator's assertion stands; "+
+				"this test is about the notice, not about the policy")
+	})
+	assert.Equal(t, 0, second.count(notice),
+		"once per process means once: emitted per dial this notice becomes the log at webhook "+
+			"volume, and it is also what made every strict record-count assertion in this package "+
+			"depend on which test ran first")
 }
 
 // TestLegacyWebhookFailureRecord_StripsWhatWouldForgeALogLine asserts the

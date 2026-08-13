@@ -273,6 +273,9 @@ type outboxEventFixture struct {
 	// column from ledger_id, which records the authoritative ledger and takes no part in
 	// partitioning; several shapes below have a partition key and no ledger at all.
 	partitionKey string
+	// partitionKeyIsEventID replaces partitionKey for an event with NO aggregate of any
+	// kind, whose key is its own id and therefore cannot be a literal.
+	partitionKeyIsEventID bool
 }
 
 // outboxEventCatalogueSize is the number of event types Blnk emits: thirteen.
@@ -464,16 +467,22 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxLedgerID,
 		},
 		{
-			// system.error has no aggregate of any kind, so both the aggregate id and the
-			// partition key fall back to the event type. That gives the error stream one
-			// partition and therefore a total order, which is what an error consumer wants, and
-			// it keeps the key non-empty.
-			name:         "system.error (no aggregate)",
-			eventType:    "system.error",
-			payload:      outboxSampleSystemErrorPayload(),
-			topic:        "blnk.system",
-			aggregateID:  "system.error",
-			partitionKey: "system.error",
+			// system.error has no aggregate of any kind, so the two columns diverge: aggregate_id
+			// falls back to the event TYPE, which is the only grouping these rows have, while the
+			// partition key falls back to the event's OWN id so the events spread across the
+			// category's partitions.
+			//
+			// BOTH used to be the event type. That gave the error stream one partition and a
+			// total order, and with it a ceiling of one message at a time for the whole
+			// category — measured at 1.00 event per second while errors arrived far faster, until
+			// the backlog was 59% of the outbox. No pair of unrelated internal errors has a
+			// causal order, so the order that bought was never one a consumer could use.
+			name:                  "system.error (no aggregate)",
+			eventType:             "system.error",
+			payload:               outboxSampleSystemErrorPayload(),
+			topic:                 "blnk.system",
+			aggregateID:           "system.error",
+			partitionKeyIsEventID: true,
 		},
 	}
 }
@@ -1560,8 +1569,16 @@ func TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation(t *testing.T) 
 			})
 			require.NotNil(t, row)
 
-			assert.Equal(t, fixture.partitionKey, row.PartitionKey,
-				"%s must be keyed on %s", fixture.eventType, fixture.partitionKey)
+			if fixture.partitionKeyIsEventID {
+				assert.Equal(t, row.EventID, row.PartitionKey,
+					"%s has no aggregate, so it must be keyed on its OWN id: one key per event, so "+
+						"the stream spreads across the category's partitions rather than being pinned "+
+						"to the single partition its event type would have given it",
+					fixture.eventType)
+			} else {
+				assert.Equal(t, fixture.partitionKey, row.PartitionKey,
+					"%s must be keyed on %s", fixture.eventType, fixture.partitionKey)
+			}
 			assert.NotEmpty(t, row.PartitionKey,
 				"an empty key lets Kafka scatter the event round-robin and destroys ordering silently")
 		})
@@ -1611,11 +1628,15 @@ func TestPrepareEventOutbox_AggregateIDIsTheEventSubject(t *testing.T) {
 // deterministic.
 func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 	fallbacks := []struct {
-		name        string
-		eventType   string
-		payload     interface{}
-		key         string
-		aggregateID string
+		name      string
+		eventType string
+		payload   interface{}
+		key       string
+		// keyIsEventID replaces key wherever the expected value is the row's OWN id, which
+		// cannot be written as a literal. It marks every case that reaches the LAST resort —
+		// no ledger, no aggregate, only a type — where the key used to be the type itself.
+		keyIsEventID bool
+		aggregateID  string
 	}{
 		{
 			// Step 1 of the transaction preference: the source balance, which is what the
@@ -1699,25 +1720,29 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 		},
 		{
 			// system.error has neither an aggregate nor a ledger, so the key falls back to the
-			// event type. That gives the error stream a single partition and therefore a total
-			// order, which is what an error consumer wants.
-			name:        "system.error falls back to its event type",
-			eventType:   "system.error",
-			payload:     outboxSampleSystemErrorPayload(),
-			key:         "system.error",
-			aggregateID: "system.error",
+			// event's OWN id and these events SPREAD across the category's partitions. It used to
+			// fall back to the event type, which gave the stream a total order and, with it, a
+			// ceiling of one message at a time for the whole category. aggregate_id still records
+			// the type, which is the only grouping these rows have.
+			name:         "system.error falls back to its own event id",
+			eventType:    "system.error",
+			payload:      outboxSampleSystemErrorPayload(),
+			keyIsEventID: true,
+			aggregateID:  "system.error",
 		},
 		{
-			// A bulk event whose batch id is missing: the map arm finds nothing, so the
-			// event type carries it.
-			name:      "a bulk event with no batch_id falls back to its event type",
+			// A bulk event whose batch id is missing: the map arm finds nothing, so the event's
+			// own id carries it. Its SIBLINGS in the same batch are keyed on the batch, so only
+			// the ones that lost their batch id spread — which is the honest outcome, since a
+			// batch id is exactly what would have ordered them.
+			name:      "a bulk event with no batch_id falls back to its own event id",
 			eventType: "bulk_transaction.failed",
 			payload: map[string]interface{}{
 				"status":    "failed",
 				"timestamp": outboxFixedInstant,
 			},
-			key:         "bulk_transaction.failed",
-			aggregateID: "bulk_transaction.failed",
+			keyIsEventID: true,
+			aggregateID:  "bulk_transaction.failed",
 		},
 		{
 			// A batch id of the wrong type is not stringified into nonsense such as
@@ -1729,54 +1754,54 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 				"status":    "applied",
 				"timestamp": outboxFixedInstant,
 			},
-			key:         "bulk_transaction.applied",
-			aggregateID: "bulk_transaction.applied",
+			keyIsEventID: true,
+			aggregateID:  "bulk_transaction.applied",
 		},
 		{
 			// A typed nil pointer marshals to "null", so there is nothing to derive
 			// from. It must not panic, and the event must still be keyed.
-			name:        "a nil transaction pointer falls back to its event type",
-			eventType:   "transaction.void",
-			payload:     (*model.Transaction)(nil),
-			key:         "transaction.void",
-			aggregateID: "transaction.void",
+			name:         "a nil transaction pointer falls back to its own event id",
+			eventType:    "transaction.void",
+			payload:      (*model.Transaction)(nil),
+			keyIsEventID: true,
+			aggregateID:  "transaction.void",
 		},
 		{
-			name:        "a nil balance pointer falls back to its event type",
-			eventType:   "balance.created",
-			payload:     (*model.Balance)(nil),
-			key:         "balance.created",
-			aggregateID: "balance.created",
+			name:         "a nil balance pointer falls back to its own event id",
+			eventType:    "balance.created",
+			payload:      (*model.Balance)(nil),
+			keyIsEventID: true,
+			aggregateID:  "balance.created",
 		},
 		{
-			name:        "a nil ledger pointer falls back to its event type",
-			eventType:   "ledger.created",
-			payload:     (*model.Ledger)(nil),
-			key:         "ledger.created",
-			aggregateID: "ledger.created",
+			name:         "a nil ledger pointer falls back to its own event id",
+			eventType:    "ledger.created",
+			payload:      (*model.Ledger)(nil),
+			keyIsEventID: true,
+			aggregateID:  "ledger.created",
 		},
 		{
-			name:        "a nil identity pointer falls back to its event type",
-			eventType:   "identity.created",
-			payload:     (*model.Identity)(nil),
-			key:         "identity.created",
-			aggregateID: "identity.created",
+			name:         "a nil identity pointer falls back to its own event id",
+			eventType:    "identity.created",
+			payload:      (*model.Identity)(nil),
+			keyIsEventID: true,
+			aggregateID:  "identity.created",
 		},
 		{
-			name:        "a nil monitor pointer falls back to its event type",
-			eventType:   "balance.monitor",
-			payload:     (*model.BalanceMonitor)(nil),
-			key:         "balance.monitor",
-			aggregateID: "balance.monitor",
+			name:         "a nil monitor pointer falls back to its own event id",
+			eventType:    "balance.monitor",
+			payload:      (*model.BalanceMonitor)(nil),
+			keyIsEventID: true,
+			aggregateID:  "balance.monitor",
 		},
 		{
-			// An absent payload of any other shape. The event type is still a
-			// deterministic key, so these events stay ordered amongst themselves.
-			name:        "an unrecognised payload falls back to its event type",
-			eventType:   "ledger.created",
-			payload:     nil,
-			key:         "ledger.created",
-			aggregateID: "ledger.created",
+			// An absent payload of any other shape. There is nothing to order it against, so it
+			// is keyed on itself: no false ordering promise, and no partition it can monopolise.
+			name:         "an unrecognised payload falls back to its own event id",
+			eventType:    "ledger.created",
+			payload:      nil,
+			keyIsEventID: true,
+			aggregateID:  "ledger.created",
 		},
 	}
 
@@ -1795,7 +1820,14 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 			require.NoError(t, prepareErr)
 			require.NotNil(t, row)
 
-			assert.Equal(t, fallback.key, row.PartitionKey)
+			if fallback.keyIsEventID {
+				assert.Equal(t, row.EventID, row.PartitionKey,
+					"with no ledger and no aggregate the key is the event's OWN id, so events of "+
+						"this shape spread across partitions instead of collapsing onto the one "+
+						"partition their event type would have pinned them to")
+			} else {
+				assert.Equal(t, fallback.key, row.PartitionKey)
+			}
 			assert.Equal(t, fallback.aggregateID, row.AggregateID)
 			assert.NotEmpty(t, row.PartitionKey, "the key must never be empty")
 			assert.NotEmpty(t, row.AggregateID, "aggregate_id is NOT NULL in the schema")
@@ -1864,13 +1896,16 @@ func TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension(t *testi
 	ledgerID := "ldg_dimension"
 
 	cases := []struct {
-		name        string
-		eventType   string
-		payload     interface{}
-		options     []EventOption
-		wantKey     string
-		wantLedger  string
-		wantDeclare model.EventKeyDimension
+		name      string
+		eventType string
+		payload   interface{}
+		options   []EventOption
+		wantKey   string
+		// wantKeyIsEventID replaces wantKey for the event dimension, where the expected key
+		// is the row's OWN id and so cannot be written as a literal.
+		wantKeyIsEventID bool
+		wantLedger       string
+		wantDeclare      model.EventKeyDimension
 	}{
 		{
 			name:        "a transaction event supplied with its ledger reaches the ledger dimension",
@@ -1925,12 +1960,19 @@ func TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension(t *testi
 			wantDeclare: model.EventKeyDimensionAggregate,
 		},
 		{
-			name:        "system.error has no aggregate at all and keys on its type",
-			eventType:   "system.error",
-			payload:     map[string]interface{}{"error": "boom"},
-			wantKey:     "system.error",
-			wantLedger:  "",
-			wantDeclare: model.EventKeyDimensionEventType,
+			// KEYED ON ITSELF, so these events SPREAD across the category's partitions
+			// instead of collapsing onto one. Keying them on the event type gave the stream a
+			// total order and, with it, a per-category ceiling of one message at a time —
+			// measured at 1.00 event per second while errors arrived far faster, until the
+			// backlog was 59% of the outbox. Two unrelated internal errors have no causal
+			// order, so the order that ceiling bought was never meaningful; occurred_at is
+			// where a consumer reads time order.
+			name:             "system.error has no aggregate at all, so it keys on its own event id",
+			eventType:        "system.error",
+			payload:          map[string]interface{}{"error": "boom"},
+			wantKeyIsEventID: true,
+			wantLedger:       "",
+			wantDeclare:      model.EventKeyDimensionEvent,
 		},
 		{
 			name:        "THE MISS: a rejected transaction has no balances, so its key falls to the source",
@@ -1950,7 +1992,13 @@ func TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension(t *testi
 			}, testCase.options...)
 			require.NotNil(t, row)
 
-			assert.Equal(t, testCase.wantKey, row.PartitionKey, "the Kafka message key")
+			if testCase.wantKeyIsEventID {
+				assert.Equal(t, row.EventID, row.PartitionKey,
+					"an event with no aggregate must be keyed on its OWN id, so that events of this "+
+						"type spread across the category's partitions rather than serialising onto one")
+			} else {
+				assert.Equal(t, testCase.wantKey, row.PartitionKey, "the Kafka message key")
+			}
 			assert.Equal(t, testCase.wantLedger, row.LedgerID,
 				"ledger_id records the AUTHORITATIVE ledger and stays NULL when the event has none; "+
 					"a fabricated ledger is worse than an absent one")

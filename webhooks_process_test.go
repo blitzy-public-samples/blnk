@@ -315,7 +315,31 @@ func storeWebhookTestConfig(t *testing.T, url, secret string, headers map[string
 		},
 	}
 	config.ConfigStore.Store(cnf)
+
+	// EVERY configuration this helper publishes sets AllowPrivateDestination, and every
+	// receiver in this package is an httptest server on 127.0.0.1 — so every delivery here
+	// is capable of emitting the once-per-process private-destination advisory. Whichever
+	// test happened to run first absorbed it, which meant a test asserting on the EXACT set
+	// of records ITS delivery produced was passing on test order alone: selected on its own
+	// it saw the advisory land inside its captured window as a second entry. Settling the
+	// notice here, before any delivery can trigger it, gives every test the same known
+	// state whether it runs alone, in the file, or in the package.
+	settleLegacyWebhookPrivateDestinationAdvisory()
+
 	return cnf, queueName
+}
+
+// settleLegacyWebhookPrivateDestinationAdvisory brings the process-wide
+// private-destination advisory to its already-emitted state, so that no test observes it
+// as a side effect of being the first one to deliver.
+//
+// It does not hide a regression:
+// TestLegacyWebhookPrivateDestinationAdvisory_IsEmittedOncePerProcess takes ownership of
+// the Once and asserts both halves of the contract — that the notice IS emitted when the
+// operator's assertion is relied on, and that it is emitted only once — which is the
+// coverage this settling would otherwise silently remove.
+func settleLegacyWebhookPrivateDestinationAdvisory() {
+	legacyWebhookPrivateDestinationWarning.Do(func() {})
 }
 
 func TestProcessWebhook_DeliversSignedPayload(t *testing.T) {
@@ -1055,14 +1079,17 @@ func TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports(t *testing.T) {
 	// what makes this a property of the schema: a leg recorded under a stale token is
 	// refused by the repository, so two legs sharing one token cannot have come from two
 	// different claims.
-	marks := relay.store.snapshotWebhookMarks()
-	require.Len(t, marks, 1, "the legacy leg must be recorded exactly once")
-	assert.Equal(t, relay.rowID, marks[0].id, "the legacy marker must name the claimed row")
-	assert.NotEmpty(t, marks[0].claimToken, "the legacy marker must carry the claim token; an empty one would be unconditional")
+	assert.Empty(t, relay.store.snapshotWebhookMarks(),
+		"the legacy leg must not cost a marker statement of its own; it is recorded by the terminal write")
 
 	dispatched := relay.store.snapshotDispatched()
 	require.Len(t, dispatched, 1, "the Kafka leg must be recorded exactly once")
 	assert.Equal(t, relay.rowID, dispatched[0].id, "the dispatch marker must name the same row")
+	assert.True(t, dispatched[0].settleLegacyLeg,
+		"and that one write must record BOTH legs, which is what keeps them under one claim token")
+	assert.NotEmpty(t, dispatched[0].claimToken,
+		"the transition must carry the claim token; an empty one would be unconditional")
+	marks := dispatched
 	assert.Equal(t, marks[0].claimToken, dispatched[0].claimToken,
 		"both legs must be recorded under one claim token, which is what proves they came from one claimed row")
 }
@@ -1124,10 +1151,13 @@ func TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed(t *testing.T) 
 			assert.Len(t, pendingLegacyDeliveries(t, inspector, queueName), testCase.wantEnqueued,
 				"the legacy webhook leg must be enqueued only while the sunset is in the future")
 
-			// The row must not be marked as webhook-dispatched for a delivery that never happened:
-			// a marker without a task would make the migration look further along than it is.
-			assert.Len(t, relay.store.snapshotWebhookMarks(), testCase.wantEnqueued,
-				"the legacy marker must be recorded exactly when a legacy task was enqueued, and never otherwise")
+			// NO SEPARATE MARKER STATEMENT IS WRITTEN in either case. The relay folds the
+			// dual-delivery marker into the terminal transition instead of spending a second
+			// update and a second commit on it per event, so this asserts the statement is gone
+			// rather than that it ran: a reappearing marker write is the regression that would
+			// put the per-event cost back.
+			assert.Empty(t, relay.store.snapshotWebhookMarks(),
+				"the ordinary path must not write a standalone legacy marker; it rides on the terminal transition")
 
 			// The KAFKA leg runs in every case. Without this, a relay that had simply stopped
 			// publishing would satisfy the assertions above.
@@ -1136,6 +1166,14 @@ func TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed(t *testing.T) 
 			dispatched := relay.store.snapshotDispatched()
 			require.Len(t, dispatched, 1, "the row must reach its dispatched terminal state in every case")
 			assert.Equal(t, relay.rowID, dispatched[0].id)
+
+			// AND THE MARKER IS RECORDED THERE, in the same write, whether or not a task was
+			// enqueued. Inside the window it records a webhook that is on the queue; after the
+			// sunset it records that none is owed — which is what stops the repair leg claiming
+			// the row forever looking for a delivery the window no longer permits.
+			assert.True(t, dispatched[0].settleLegacyLeg,
+				"the terminal transition must carry the legacy marker, so a re-claim neither repeats "+
+					"the webhook nor leaves the row owing one")
 		})
 	}
 }

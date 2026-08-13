@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/config"
@@ -77,14 +78,77 @@ func loadInstance(app *blnkInstance, configFile string, role blnk.ProcessRole) e
 	return nil
 }
 
+// defaultConfigFile is the path --config falls back to, and the only path whose ABSENCE is
+// tolerated: an environment-only deployment is a first-class configuration mode, and the
+// compose stack, the Kubernetes manifests and the whole test suite all run that way.
+const defaultConfigFile = "./blnk.json"
+
 // preRun sets up the configuration and initializes the Blnk instance before running any command.
-func preRun(app *blnkInstance) func(cmd *cobra.Command, args []string) error {
+//
+// THE FLAG IS READ THROUGH A POINTER, and it has to be. --config is a persistent flag bound
+// to a variable in NewCLI, and this hook is built before Cobra has parsed anything; taking the
+// value now would capture the default. Dereferencing here reads what the operator actually
+// passed. The literal that used to sit in its place made the flag dead: `blnk start --config
+// /somewhere/else.json` loaded ./blnk.json and reported nothing, so `make run_relay
+// CONFIG_FILE=<path>` could gate on one file and launch a process reading another.
+//
+// AN EXPLICIT PATH THAT IS NOT THERE IS AN ERROR; the default path's absence is not. Naming a
+// file is a statement that the file holds the configuration, and silently continuing from the
+// environment is how a typo becomes a deployment with defaults nobody chose. The default path
+// keeps its existing behaviour, so nothing that runs without a blnk.json changes.
+//
+// Parameters:
+//   - app *blnkInstance: the instance the loaded configuration is attached to.
+//   - configFile *string: the variable --config is bound to. May be nil, in which case the
+//     default path is used.
+func preRun(app *blnkInstance, configFile *string) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
-		if err := loadInstance(app, "blnk.json", processRoleFor(cmd)); err != nil {
+		path := defaultConfigFile
+		if configFile != nil && strings.TrimSpace(*configFile) != "" {
+			path = strings.TrimSpace(*configFile)
+		}
+
+		if configFileWasNamed(cmd) {
+			if _, err := os.Stat(path); err != nil {
+				log.Fatalf(
+					"--config names %q, which cannot be read: %v. A configuration file that was "+
+						"asked for by name is required to exist; remove the flag to configure this "+
+						"process from its environment instead",
+					path, err,
+				)
+			}
+		}
+
+		if err := loadInstance(app, path, processRoleFor(cmd)); err != nil {
 			log.Fatal(err)
 		}
 		return nil
 	}
+}
+
+// configFileWasNamed reports whether --config was given on the command line, as opposed to
+// resolving to its default.
+//
+// Cobra records the flag as changed on the FlagSet that parsed it. For a persistent flag on
+// the root command that is the executing subcommand's own complete set, but the root's
+// persistent set is checked as well so the answer does not depend on which set Cobra chose to
+// merge the flag into.
+func configFileWasNamed(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+
+	if flag := cmd.Flags().Lookup("config"); flag != nil && flag.Changed {
+		return true
+	}
+
+	if root := cmd.Root(); root != nil {
+		if flag := root.PersistentFlags().Lookup("config"); flag != nil && flag.Changed {
+			return true
+		}
+	}
+
+	return false
 }
 
 // processRoleFor maps the subcommand being executed to the process role its service container
@@ -148,10 +212,14 @@ func NewCLI() *Blnk {
 	}
 
 	// Add a persistent flag to the root command for specifying the config file.
-	rootCmd.PersistentFlags().StringVar(&configFile, "config", "./blnk.json", "Configuration file for wallet lite")
+	rootCmd.PersistentFlags().StringVar(&configFile, "config", defaultConfigFile,
+		"Configuration file to load. Absent by default, in which case configuration comes "+
+			"from the environment; a path given here must exist")
 
-	// Set the persistent pre-run hook to initialize the app and config before executing any command.
-	rootCmd.PersistentPreRunE = preRun(b)
+	// Set the persistent pre-run hook to initialize the app and config before executing any
+	// command. The flag's variable is passed by ADDRESS because this runs before Cobra has
+	// parsed the command line.
+	rootCmd.PersistentPreRunE = preRun(b, &configFile)
 
 	// Add various subcommands to the root command.
 	rootCmd.AddCommand(serverCommands(b))      // Command for starting the server

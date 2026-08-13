@@ -82,6 +82,10 @@ type orderingContractCase struct {
 	// wantKey is the partition key the document promises.
 	wantKey string
 
+	// wantKeyIsEventID replaces wantKey for the one documented row whose key is the event's
+	// OWN id and therefore cannot be transcribed as a literal.
+	wantKeyIsEventID bool
+
 	// wantLedgerColumn is what ledger_id must hold: the ledger for a ledger-scoped event,
 	// and the empty string — stored as SQL NULL — for one that belongs to no ledger. A
 	// fabricated ledger would corrupt both the daily reconciliation and any consumer
@@ -162,15 +166,20 @@ func orderingContractCases() []orderingContractCase {
 			wantLedgerColumn: orderingContractLedgerID,
 		},
 		{
-			documentedAs: "`system.error` | The **event type**, so the whole stream is one partition | `null`",
-			eventType:    "system.error",
+			documentedAs: "`system.error` | The **event id** — its own — so the stream spreads across " +
+				"every partition and no two error events are mutually ordered | `null`",
+			eventType: "system.error",
 			payload: map[string]interface{}{
 				"error": "ordering contract fixture",
 				"time":  "2026-03-01T12:00:00Z",
 			},
 			ledgerOption: "",
-			// No aggregate of any kind, so the documented chain reaches the event type.
-			wantKey:          "system.error",
+			// No aggregate of any kind, so the documented chain reaches the event's own id. It
+			// used to reach the event TYPE, which pinned the whole category to one partition and
+			// one publisher — a ceiling measured at 1.00 event per second while errors arrived
+			// far faster. Unrelated errors have no causal order, so nothing a consumer could use
+			// was given up; occurred_at carries time order.
+			wantKeyIsEventID: true,
 			wantLedgerColumn: "",
 		},
 	}
@@ -197,11 +206,21 @@ func TestPartitionKeyContract_MatchesTheDocumentedTable(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, row, "publishing is configured, so a row must be prepared")
 
-			assert.Equal(t, testCase.wantKey, row.PartitionKey,
-				"docs/event-streaming.md's partition-key table promises a subscriber that %q keys on "+
-					"%q. A key the document does not name silently changes which events a subscriber "+
-					"may assume are mutually ordered",
-				testCase.documentedAs, testCase.wantKey)
+			if testCase.wantKeyIsEventID {
+				assert.Equal(t, row.EventID, row.PartitionKey,
+					"docs/event-streaming.md's partition-key table promises a subscriber that %q keys "+
+						"on the event's own id, so that these events SPREAD across the category's "+
+						"partitions. A key the document does not name silently changes which events a "+
+						"subscriber may assume are mutually ordered — and keying them on anything "+
+						"shared would put the whole category behind one publisher again",
+					testCase.documentedAs)
+			} else {
+				assert.Equal(t, testCase.wantKey, row.PartitionKey,
+					"docs/event-streaming.md's partition-key table promises a subscriber that %q keys on "+
+						"%q. A key the document does not name silently changes which events a subscriber "+
+						"may assume are mutually ordered",
+					testCase.documentedAs, testCase.wantKey)
+			}
 
 			assert.Equal(t, testCase.wantLedgerColumn, row.LedgerID,
 				"and the same table's ledger_id column for %q. An empty value is stored as SQL NULL "+

@@ -57,7 +57,7 @@
 # /etc/prometheus/alerts/*.yml against the bind-mounted ./alerts directory, and a
 # unit-test file is not a rule file: `promtool check rules` rejects it outright ("field
 # tests not found in type rulefmt.RuleGroups"), so Prometheus would refuse the whole
-# configuration and every one of the thirteen rules would fail to load. The glob does not
+# configuration and every one of the fifteen rules would fail to load. The glob does not
 # recurse, so ./alerts/tests is inside the same mount and out of its reach.
 # TestPrometheusAlertsDirectory_HoldsOnlyRuleFiles keeps it that way.
 rule_files:
@@ -110,6 +110,113 @@ tests:
                 EVENT_NOT_DEAD_LETTERED; restore broker reachability so the dead-letter write
                 completes, then replay. GET /events/stats reports how many are in each state.
               runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#deadlettermessagestuck
+
+  # ------------------------------------------------------------------------
+  # THE COUNT BESIDE THE AGE. This rule is what makes a repair leg that cannot clear
+  # itself alertable at all: the legacy webhook leg's rows are webhook_pending, which
+  # neither the dead-letter inventory nor blnk_outbox_pending includes, so before it
+  # existed a leg that never drained had no series any rule could read. Both directions
+  # matter here for a different reason than on a threshold rule: zero must NOT fire,
+  # because zero is the reading every healthy deployment publishes on every tick, and a
+  # rule that fired on it would page every operator for ever.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the repair backlog alert fires on work owed for fifteen minutes and never on zero
+    input_series:
+      # Drained for the first two and a half minutes, then three rows owed and never
+      # cleared. The dwell therefore starts at t=150s and completes at t=1050s.
+      - series: 'blnk_events_repair_backlog{job="blnk-server",instance="blnk-server:5001",leg="dead_letter"}'
+        values: '0+0x4 3+0x60'
+    alert_rule_test:
+      # An explicit zero is the healthy reading, published every tick. It must be silent.
+      - eval_time: 2m
+        alertname: EventRepairBacklogStuck
+        exp_alerts: []
+      # Owed for seven and a half minutes: breaching, inside the dwell, so pending.
+      - eval_time: 10m
+        alertname: EventRepairBacklogStuck
+        exp_alerts: []
+      # Owed for fifteen minutes.
+      - eval_time: 18m
+        alertname: EventRepairBacklogStuck
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              leg: 'dead_letter'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                A relay repair leg has been unable to clear its backlog for 15 minutes
+              description: >-
+                The dead_letter repair leg on blnk-server:5001 has owed 3 row(s) for 15 minutes, and
+                its pass runs every second — so it is failing, not queued. This value is a COUNT of
+                rows, not an age. leg="dead_letter" is the urgent one: those rows spent their retry
+                budget AND their <topic>.dlt write also failed, so each is the only copy of an event
+                that reached no Kafka topic at all, and GET /events/dead-letter reports them as
+                'failed' rather than 'dead_lettered' — replay refuses them with
+                EVENT_NOT_DEAD_LETTERED until the dead-letter write lands. Restore write access to
+                the .dlt sibling (broker reachability, then the topic's existence and the producer's
+                WRITE ACL on it) and the pass clears them itself. leg="legacy_webhook" is rows whose
+                Kafka leg is finished and whose legacy webhook enqueue keeps failing during the
+                migration window: check Redis and the asynq queue; those rows are abandoned once they
+                spend their enqueue budget, so a backlog that clears itself with events undelivered
+                to webhook subscribers is the failure mode to look for. blnk_events_repair_saturated
+                tells you whether the pass is merely configured too slowly to catch up.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventrepairbacklogstuck
+
+  # ------------------------------------------------------------------------
+  # A CLAIM THAT DOES NOT COMPLETE. The healthy value is exactly zero, so this asserts
+  # the boundary that matters — no timeouts at all is silent, one is not — and the dwell,
+  # because a single cancelled claim during an autovacuum pass must not page while a plan
+  # that has regressed must. A counter rate rather than a gauge: the condition is an
+  # EVENT, and a gauge of "the last claim timed out" would clear itself on the next tick
+  # and be missed by every scrape in between.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the relay claim timeout alert fires on the first timeout, after its dwell
+    input_series:
+      # No timeouts for the first ten minutes, then one, and the counter stays there:
+      # a claim that timed out once and recovered is still a claim that published nothing.
+      - series: 'blnk_events_relay_claims_total{job="blnk-server",instance="blnk-server:5001",outcome="timeout"}'
+        values: '0+0x20 1+0x40'
+    alert_rule_test:
+      # A relay whose claims all complete: the rate is zero, and zero is not MORE than zero.
+      - eval_time: 2m
+        alertname: EventRelayClaimTimingOut
+        exp_alerts: []
+      # The timeout is now inside the rate window, but the dwell has not been served.
+      - eval_time: 11m
+        alertname: EventRelayClaimTimingOut
+        exp_alerts: []
+      # Past the two-minute dwell.
+      - eval_time: 13m
+        alertname: EventRelayClaimTimingOut
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              outcome: 'timeout'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                The event relay's outbox claim is timing out, so nothing is being published
+              description: >-
+                One or more event outbox claims on blnk-server:5001 were cancelled at their 15
+                second budget in the last 10 minutes. A cancelled claim returns NO rows, so the
+                relay published nothing for that tick — and because the events are still sitting in
+                the outbox, no dead-letter or lag rule can see it; watch blnk_outbox_pending rising
+                against a flat blnk_events_published_total for the effect. Read the p99 of
+                blnk_events_relay_claim_duration_seconds and the rows-per-claim ratio
+                (blnk_events_relay_claimed_rows_total over
+                blnk_events_relay_claims_total{outcome="rows"}) to see how far the claim has drifted
+                from its normal single-digit milliseconds. The usual causes are a table whose
+                dead-tuple population has outgrown autovacuum, or a very large claimable backlog
+                concentrated on very few partition keys; ANALYZE blnk.event_outbox and confirm the
+                claim is still index-driven before changing anything else.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventrelayclaimtimingout
 
   # ------------------------------------------------------------------------
   # THE SECOND ACCEPTANCE THRESHOLD: subscriber consumer lag above 10,000 messages.
@@ -419,7 +526,11 @@ tests:
                 or ACL fault; 'registry_failed' means the registry query itself is failing;
                 'topic_missing' means a row authorises a topic that does not exist, so provision the
                 topic or correct the row; 'unprovisioned' means the row has no topics to measure and
-                is the row's own problem. The event-metrics log line carries registry_size,
+                is the row's own problem; 'broker_unconfigured' means this deployment has no
+                KAFKA_BROKERS at all, so nothing about these rows can be measured — configure the
+                brokers or delete registry rows the deployment is not using, and note that a
+                deployment with no brokers AND no subscriber rows reports complete coverage and
+                never reaches this rule. The event-metrics log line carries registry_size,
                 resume_from and the topic names.
               runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscriberlagcoverageincomplete
 
@@ -443,6 +554,58 @@ tests:
       # and it stays quiet
       - eval_time: 45m
         alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # THE NO-KAFKA STEADY STATE, which is a SUPPORTED configuration and not a fault: a
+  # deployment with KAFKA_BROKERS unset and no subscriber rows. It used to publish
+  # inventory_complete = 0 — there was no sweep, so nothing set the boolean — and this rule
+  # then fired thirty minutes after start-up and stayed firing for ever, on a deployment
+  # where every reason on blnk_kafka_subscribers_unmeasured read zero. The instruction the
+  # notification carried ("act on the reason") had no reason to act on, and no action could
+  # clear it.
+  #
+  # The whole registry is published, zeros included, so the case asserts the reasons too:
+  # nothing unmeasured, nothing registered, coverage complete, and — for two hours, four
+  # times the dwell — nothing fires.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a deployment running without Kafka and without subscribers never reaches the coverage rule
+    input_series:
+      - series: 'blnk_kafka_consumer_lag_inventory_complete{job="blnk-server",instance="blnk-server:5001"}'
+        values: '1+0x240'
+      - series: 'blnk_subscribers_registered{job="blnk-server",instance="blnk-server:5001"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="budget"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="broker_unconfigured"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="unprovisioned"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="measure_failed"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="registry_failed"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="topic_missing"}'
+        values: '0+0x240'
+    alert_rule_test:
+      # past the dwell
+      - eval_time: 31m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # and four times past it, because the defect this replaces was permanent rather than
+      # transient: a rule that only failed to fire early would have looked identical.
+      - eval_time: 120m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # NOR ANY OTHER RULE. Every subscriber and coverage series this deployment publishes is
+      # in the input above, so this is also the assertion that the no-Kafka steady state pages
+      # nobody at all.
+      - eval_time: 120m
+        alertname: ConsumerLagMeasurementDegraded
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: SubscriberConsumerLagHigh
         exp_alerts: []
 
   # ------------------------------------------------------------------------

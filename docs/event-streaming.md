@@ -196,7 +196,7 @@ The `data` object above is abridged for readability. It is whatever the domain o
 | `balance.monitor` | The id of the monitor that fired |
 | `identity.created` | The identity id |
 | `ledger.created` | The ledger id |
-| `system.error` | No aggregate exists, so the field falls back to the message key, which for this event type is the event name itself |
+| `system.error` | No aggregate exists, so the field falls back to the event NAME. Note that this is the one event type where `aggregate_id` and the message key deliberately differ: the key is the event's own id, so that these events spread across partitions, while `aggregate_id` stays the type because a type is the only grouping they have |
 
 ### Parsing `occurred_at`
 
@@ -232,7 +232,7 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 | `transaction.void` | `blnk.transactions` | An inflight transaction is voided and its hold released. |
 | `transaction.rejected` | `blnk.transactions` | A transaction is refused — insufficient funds, an overdraft limit, or a terminal processing error. |
 | `transaction.unknown` | `blnk.transactions` | A transaction reaches a status the event mapping has no name for. Not produced by any current code path — see [the note below](#three-names-in-the-vocabulary-are-not-currently-reachable) and [The `COMMIT` Status](#the-commit-status). |
-| `bulk_transaction.<status>` | `blnk.transactions` | A bulk batch reaches an outcome. The suffix is the batch status, so this is a **family** of names, not one — see below. |
+| `bulk_transaction.<status>` | `blnk.transactions` | A bulk batch reaches an outcome, **and only for a batch submitted with `"run_async": true`** — a synchronous submission returns its outcome in its own response and emits nothing. The suffix is the batch status, so this is a **family** of names, not one — see below. |
 | `balance.created` | `blnk.balances` | A balance is created. |
 | `balance.monitor` | `blnk.balances` | A balance monitor's condition is met. Fires on every occurrence, so the same monitor produces many of these. |
 | `identity.created` | `blnk.identities` | An identity is created. |
@@ -274,6 +274,10 @@ It is the only event string with a variable suffix. The name is composed at runt
 A filter written as `event_type == "bulk_transaction.applied"` will silently miss every other batch outcome, and will miss any status added later. Match `event_type` against the `bulk_transaction.` prefix instead.
 
 The statuses emitted today are `applied`, `inflight` and `failed`, giving `bulk_transaction.applied`, `bulk_transaction.inflight` and `bulk_transaction.failed`. Treat that as the current set rather than the contract; a new batch status routes correctly with no change on Blnk's side and no notice to you.
+
+**A batch produces this event only when it was submitted asynchronously, and that is a property of the request rather than of the batch.** `POST /transactions/bulk` with `"run_async": true` answers `202 Accepted` immediately with `{"batch_id": …, "status": "processing"}` and hands the work to a background goroutine — and it is that goroutine which captures the summary when the batch reaches its outcome. Omit `run_async`, or send it false, and the request instead blocks until the batch finishes and returns the outcome **in its own response body**: `201 Created` with `batch_id`, `status` and `transaction_count` when it succeeds, or an error status carrying `batch_id`, the reason in `error` and a typed `error_detail` when it does not. No `bulk_transaction.*` event is captured for that batch, then or later — and that holds for a failed synchronous batch as much as for a successful one, so `bulk_transaction.failed` is not the way to learn that a synchronous batch failed either.
+
+Nothing is *lost* on the synchronous path — every member transaction still publishes its own `transaction.*` event, because the members are processed identically either way. Only the batch-level summary is absent, and a synchronous caller already has its equivalent in the response it blocked for. The consequence is for the consumer rather than the ledger: **a subscriber waiting on `bulk_transaction.*` sees nothing at all from a synchronous submission, and waits forever rather than briefly.** If a batch-level signal is part of your design, the producers have to submit with `run_async`. The member events cannot substitute for one: each carries the batch under `parent_transaction` and its own position under `meta_data.sequence`, which is enough to group them and to order them, but none of them carries the batch's total — so a consumer can see that members are arriving and never learn that they have stopped.
 
 ### An unrecognised event type is published, not dropped
 
@@ -432,7 +436,7 @@ Do not infer a batch outcome from the absence of a summary, and do not treat a m
 
 Every message carries a **partition key**, and it is always set. The key is hashed by a stable balancer to select a partition, so all messages sharing a key land on one partition, and Kafka preserves order within a partition.
 
-Blnk partitions by **ledger id**. That is the one dimension the ordering guarantee is built on: every event that belongs to a ledger is keyed on that ledger, so a ledger's events are pinned to a single partition and arrive in the order the mutations happened. The events that belong to no ledger reach a documented fallback chain instead: `identity.created`, because an identity is not ledger-scoped; `bulk_transaction.*`, because a batch is a runtime grouping that can span ledgers; and `system.error`, because it describes no ledger object at all. `transaction.rejected` is keyed on its ledger like every other transaction event — the ledger is resolved from the balance the transaction names — and reaches the fallback only when that balance cannot be read, which is itself one of the ordinary reasons a transaction is rejected.
+Blnk partitions by **ledger id**. That is the one dimension the ordering guarantee is built on: every event that belongs to a ledger is keyed on that ledger, so a ledger's events are pinned to a single partition and arrive in the order the mutations happened. The events that belong to no ledger reach a documented fallback chain instead: `identity.created`, because an identity is not ledger-scoped; `bulk_transaction.*`, because a batch is a runtime grouping that can span ledgers; and `system.error`, because it describes no ledger object at all and is therefore keyed on the event itself. `transaction.rejected` is keyed on its ledger like every other transaction event — the ledger is resolved from the balance the transaction names — and reaches the fallback only when that balance cannot be read, which is itself one of the ordinary reasons a transaction is rejected.
 
 **Ordering is guaranteed per partition key. It is not guaranteed across a topic.** Two events with different keys carry no ordering relationship at all, even on the same topic and even if one was committed to the ledger before the other. Design your consumer around that: order within a key is something you can rely on, order between keys is something you must not.
 
@@ -457,7 +461,7 @@ describes. That is not a degraded fallback — it is the only ordering domain th
 | `balance.monitor` | The ledger of the balance whose update met the condition | The same ledger |
 | `identity.created` | The **identity id** | `null` |
 | `ledger.created` | The ledger id | The same ledger |
-| `system.error` | The **event type**, so the whole stream is one partition | `null` |
+| `system.error` | The **event id** — its own — so the stream spreads across every partition and no two error events are mutually ordered | `null` |
 
 Why those three carry no ledger:
 
@@ -468,16 +472,26 @@ Why those three carry no ledger:
 - **An identity is not a ledger-scoped entity.** The same party may hold balances in many ledgers or
   in none, so there is no authoritative ledger to record. Keying on the identity gives one identity's
   events a total order among themselves.
-- **`system.error` has no aggregate at all.** Keying on the event type puts the whole error stream on
-  one partition and therefore in total order, which is what an error stream wants.
+- **`system.error` has no aggregate at all**, so it is keyed on its own event id and its events are
+  spread across the category's partitions. **This changed, and if you built a consumer on the previous
+  behaviour, read on.** It used to be keyed on the event TYPE, which put the whole error stream on one
+  partition and therefore in total order. That total order was not worth what it cost and was not
+  meaningful in the first place. It cost a hard ceiling on the whole category: one key is claimed by one
+  relay instance and published one message at a time, measured at 1.00 event per second against an
+  arrival rate far above it, until unpublished error events were 59% of Blnk's entire event outbox and
+  the oldest population every other key had to be claimed around. And it was not meaningful because
+  two unrelated internal errors have no causal relationship — nothing about their relative position on
+  a partition told you anything you could act on. **If you need these events in time order, sort by
+  `occurred_at`**, which is on the envelope and is the only ordering that was ever real.
 
 #### The dimension is declared, and a departure from it is reported
 
 Each event type declares which of those three dimensions its key is *supposed* to come from —
-`ledger`, `aggregate` or `event_type` — and the capture path compares the dimension it actually
+`ledger`, `aggregate` or `event` — and the capture path compares the dimension it actually
 achieved against that declaration. The table above is that declaration: every `transaction.*`,
 `balance.*` and `ledger.created` is ledger-dimensioned, `identity.created` and
-`bulk_transaction.<status>` are aggregate-dimensioned, and `system.error` is type-dimensioned.
+`bulk_transaction.<status>` are aggregate-dimensioned, and `system.error` is event-dimensioned —
+keyed on the event itself, which is what an event with no aggregate has.
 
 This matters because a key taken from a balance and a key taken from a ledger look identical in
 the row. Without the declaration, an event that *should* have been keyed on its ledger and was
@@ -522,11 +536,14 @@ A message with no key would be spread across partitions rather than pinned to on
 
 Keying is necessary but not sufficient. Blnk's relay claims outbox rows in **occurrence order** and publishes them in that order, so the sequence reaching a partition is the sequence in which the mutations happened. Ordering is therefore a property of the key *and* the claim, not the key alone.
 
-The claim additionally returns **at most one row per message key**, across all concurrent relay
+The claim additionally admits **at most one claimant per message key**, across all concurrent relay
 instances rather than merely within one — and it resolves that key exactly as the publisher does,
-ledger first, so the value the database serialises on is the value Kafka partitions on. Two events
-sharing a key can therefore never be in flight simultaneously, which is what makes ordering hold
-when the relay is scaled out. One consequence is
+ledger first, so the value the database serialises on is the value Kafka partitions on. A claim may
+take **several rows of one key**, but only that key's oldest rows, only as a contiguous run, and one
+relay goroutine then publishes them in order and abandons the rest of the run at the first row that
+does not settle. Two claimants can therefore never hold one key at the same time, and no row is ever
+published ahead of an older sibling of its own key — which is what makes ordering hold when the
+relay is scaled out. One consequence is
 worth planning for: while an event is still being retried, later events sharing its partition key
 wait behind it even when they belong to another category. That is a deliberate
 correctness-over-throughput trade, and it is bounded by the retry budget.
@@ -539,12 +556,13 @@ are delivered in order relative to each other, with the failed one missing until
 it, and a replay lands after everything published in the meantime. Design for a gap you may have to
 reconcile, not for a queue that stops.
 
-**One consequence is a throughput limit, and it is worth planning capacity around.** Because at most
-one row per key is ever in flight, a single key's events are published **strictly serially** — one
-publish round trip at a time, however the relay is tuned or scaled. Throughput is therefore
-**key-diversity-bound**: the ceiling is the number of distinct keys with work pending, multiplied by
-the round-trip rate on one key, and `RELAY_*` batch and poll settings cannot raise it because they
-govern how many rows are claimed rather than how many may be in flight per key.
+**One consequence is a throughput limit, and it is worth planning capacity around.** Because only one
+publish is ever in flight for a given key, a single key's events are published **strictly serially** —
+one publish round trip at a time, however the relay is tuned or scaled, and however many rows of that
+key one claim took. Throughput is therefore **key-diversity-bound**: the ceiling is the number of
+distinct keys with work pending — capped by the relay's publish concurrency — multiplied by the
+round-trip rate on one key. `RELAY_*` batch and poll settings cannot raise it, because they govern
+how many rows are claimed and how often rather than how many publishes may be in flight for one key.
 
 Since the key is the ledger id wherever a ledger exists, that means a workload concentrated on **one
 ledger** cannot exceed roughly one publish round trip at a time on that ledger — a few hundred

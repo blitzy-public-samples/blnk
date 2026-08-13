@@ -701,6 +701,11 @@ type legacyWebhookRelayMark struct {
 	id         int64
 	claimToken string
 
+	// settleLegacyLeg is whether this terminal write also recorded the legacy leg. During
+	// the window the relay folds the marker in here rather than writing it separately, so a
+	// test asserting the dual-delivery bookkeeping reads it from this field.
+	settleLegacyLeg bool
+
 	// record is the broker coordinate the transition was given. Recorded so a test can
 	// assert that dual delivery persists the SAME coordinate the Kafka leg reported, which
 	// is what keeps the zero-loss reconciliation able to account for a dual-delivered row.
@@ -745,6 +750,7 @@ func (s *legacyWebhookRelayStore) ClaimPendingEventOutbox(
 	_ context.Context,
 	_ int,
 	lockDuration time.Duration,
+	_ string,
 ) ([]model.EventOutbox, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -777,12 +783,13 @@ func (s *legacyWebhookRelayStore) MarkEventDispatched(
 	id int64,
 	claimToken string,
 	record model.BrokerRecord,
+	settleLegacyLeg bool,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.dispatched = append(s.dispatched, legacyWebhookRelayMark{
-		id: id, claimToken: claimToken, record: record,
+		id: id, claimToken: claimToken, record: record, settleLegacyLeg: settleLegacyLeg,
 	})
 
 	return nil
@@ -1186,12 +1193,22 @@ func TestSendWebhook_InvokedFromRelayDualDeliveryBranch(t *testing.T) {
 		"the legacy leg must carry the row's STORED BYTES, not a re-serialisation of them; that is "+
 			"what makes the row the single source both transports read")
 
-	webhookMarks := store.snapshotWebhookMarks()
-	require.Len(t, webhookMarks, 1, "the legacy leg must be recorded so a re-claim does not repeat it")
-	assert.Equal(t, row.ID, webhookMarks[0].id)
-	assert.Equal(t, legacyWebhookRelayClaimToken, webhookMarks[0].claimToken,
-		"the marker is conditional on the claim token, so it must be presented before "+
-			"MarkEventDispatched clears it")
+	// THE LEG IS RECORDED BY THE TERMINAL TRANSITION, not by a statement of its own. The
+	// relay folds the marker into MarkEventDispatched so that publishing an event costs one
+	// row update rather than two; what matters to dual delivery is unchanged — the leg is
+	// durably recorded, under the claim token, before the claim is released — and that is
+	// what is asserted here.
+	assert.Empty(t, store.snapshotWebhookMarks(),
+		"the ordinary path must not write a standalone legacy marker; a reappearing one is the "+
+			"per-event cost this fold removed")
+
+	dispatchMarks := store.snapshotDispatched()
+	require.Len(t, dispatchMarks, 1, "the legacy leg must be recorded so a re-claim does not repeat it")
+	assert.Equal(t, row.ID, dispatchMarks[0].id)
+	assert.True(t, dispatchMarks[0].settleLegacyLeg,
+		"the terminal transition must carry the legacy marker for a row whose webhook is on the queue")
+	assert.Equal(t, legacyWebhookRelayClaimToken, dispatchMarks[0].claimToken,
+		"the transition is conditional on the claim token the claim issued")
 
 	published := publisher.snapshotRequests()
 	require.Len(t, published, 1,

@@ -50,11 +50,58 @@ MUTATION_THRESHOLD=80
 #   filter=all   score every file gremlins finds from that directory down
 #   filter=event score only that directory's OWN event/outbox files
 MUTATION_FAST_SCOPES=model:all internal/filter:all internal/apierror:all
-MUTATION_EVENT_SCOPES=.:event database:event
+
+# ./api IS IN THIS LIST, and it is the master-key-gated surface: api/events.go serves the
+# dead-letter inventory and the replay, api/subscribers.go mints Kafka credentials. Leaving
+# it out — which it was — meant the two endpoints that can replay a ledger event or hand out
+# a broker principal were the only new event code no mutation scope ever reached. See
+# MUTATION_EVENT_FILE_PREFIXES for how the filter finds them under their own names.
+MUTATION_EVENT_SCOPES=.:event database:event api:event
 
 # Per-mutant test timeout, as a multiple of the measured baseline. 8 for every scope,
 # and raising it for the event scopes was TRIED AND REJECTED on evidence.
 MUTATION_TIMEOUT_COEFFICIENT=8
+
+# WHICH FILE NAMES THE `event` FILTER KEEPS.
+#
+# The root package and ./database name their event surface event_*.go; ./api names the same
+# surface events.go and subscribers.go, because api/ files are named after the ROUTE they
+# serve. A filter that matched `event_` alone therefore scored nothing in ./api — and worse,
+# would have scored nothing SILENTLY if the fail-closed guard below had used a different
+# pattern from the exclude list. Both read this one variable.
+MUTATION_EVENT_FILE_PREFIXES=event subscriber
+
+# THE COVERAGE STEP IS NOT THE MUTATION STEP, and this is the list that keeps the two from
+# being confused for each other.
+#
+# gremlins measures coverage before it mutates anything, and it does that by running the
+# module's own test suite: `go test -cover -coverprofile <f> ./...` when invoked from the
+# repository root. So a single red test ANYWHERE in the module — in a package this gate does
+# not score, testing code this gate does not mutate — ends the run with "failed to gather
+# coverage" and NO SCORE AT ALL. That is what happened: `make mutate_events` could not report
+# a number for the event scopes because two pre-existing api tests are load-fragile, and the
+# AAP's mutation gate on the new event code went unverified for a reason that had nothing to
+# do with the event code.
+#
+# The named tests poll a live asynq pipeline against a wall clock — 10s for an inflight
+# transaction to be applied, 2 minutes for a TypeSense reindex — so on a host running several
+# suites at once they fail on the budget rather than on the behaviour. They are excluded HERE,
+# in the gate, rather than weakened where they live: they are pre-existing, they belong to
+# features this change does not touch, and the coverage they contribute is coverage of code
+# this gate excludes from mutation anyway.
+#
+# THE EXCLUSION IS NOT A WEAKENING OF THE SCORE. It reaches `go test` through GOFLAGS, which
+# the go command applies only to commands that know the flag, so it lands on the coverage run
+# and on the per-mutant runs — and a per-mutant run only ever executes the MUTATED package's
+# tests, so for the root and database scopes it matches nothing at all. Where it does match
+# (the api scope) removing a load-fragile test is a correctness gain: gremlins runs each
+# mutant with -failfast, so a test that fails on a timeout would KILL a mutant it never
+# detected and inflate the efficacy.
+#
+# Override it to score with everything running: `make mutate_events MUTATION_COVERAGE_SKIP=`.
+# Every name in it is asserted to still exist by TestMutationGate_SkipsOnlyTestsThatExist, so
+# a rename cannot quietly turn this back into a blocked gate.
+MUTATION_COVERAGE_SKIP=^(TestInflightTransaction_Commit_API|TestInflightTransaction_Commit_WithAmount_API|TestSearchWithTypesense)$$
 
 mutate: SCOPES=${MUTATION_FAST_SCOPES}
 mutate: mutation_gate
@@ -70,42 +117,83 @@ mutate_all: mutation_gate
 
 # THE MUTATION TOOL IS PINNED TO AN EXACT VERSION, and the pin is a supply-chain control
 # rather than a reproducibility nicety.
+#
+# THE PIN IS VERIFIED AGAINST THE BINARY, NOT ASSUMED FROM ITS ABSENCE. The check used to be
+# `command -v gremlins || go install ...@${GREMLINS_VERSION}`, which installs the pin only when
+# NO gremlins is on PATH — so any gremlins already there, of any version, silently became the
+# tool the gate scored with, and two machines could report different efficacy for one commit
+# with nothing to show for it.
+#
+# `gremlins --version` cannot answer this: the version string is an ldflags stamp applied by
+# the project's release build, so a binary correctly installed from the v0.6.0 tag by
+# `go install` still reports "dev". `go version -m <binary>` reports the MODULE version it was
+# built from, which is the fact the pin is about, and a locally built one reports "(devel)".
 GREMLINS_VERSION=v0.6.0
+GREMLINS_MODULE=github.com/go-gremlins/gremlins
+
+# Prints the module version a Go binary was built from, or nothing when it was not built from
+# a tagged module. A make variable rather than recipe lines, following BROKER_ARRAY_DECLARED.
+GREMLINS_INSTALLED_VERSION = go version -m "$$candidate" 2>/dev/null | awk '$$1 == "mod" && $$2 == "${GREMLINS_MODULE}" { print $$3; exit }'
 
 mutation_gate:
-	@command -v gremlins >/dev/null 2>&1 || go install github.com/go-gremlins/gremlins/cmd/gremlins@${GREMLINS_VERSION}
 	@set -e; \
 	if [ -z "${SCOPES}" ]; then \
 		echo "mutation_gate is not a target to invoke directly: it scores whatever SCOPES names,"; \
 		echo "and nothing named any. Use 'make mutate', 'make mutate_events' or 'make mutate_all'."; \
 		exit 1; \
 	fi; \
-	gremlins_bin=$$(command -v gremlins 2>/dev/null || true); \
-	if [ -z "$$gremlins_bin" ]; then gremlins_bin="$$(go env GOPATH)/bin/gremlins"; fi; \
+	gremlins_bin=""; \
+	for candidate in "$$(command -v gremlins 2>/dev/null || true)" "$$(go env GOPATH)/bin/gremlins"; do \
+		[ -n "$$candidate" ] && [ -x "$$candidate" ] || continue; \
+		installed=$$(${GREMLINS_INSTALLED_VERSION}); \
+		if [ "$$installed" = "${GREMLINS_VERSION}" ]; then gremlins_bin="$$candidate"; break; fi; \
+		echo "ignoring $$candidate: built from ${GREMLINS_MODULE} $${installed:-an untagged local build}, and this gate scores with ${GREMLINS_VERSION}"; \
+	done; \
+	if [ -z "$$gremlins_bin" ]; then \
+		echo "installing ${GREMLINS_MODULE}@${GREMLINS_VERSION}"; \
+		go install ${GREMLINS_MODULE}/cmd/gremlins@${GREMLINS_VERSION}; \
+		gremlins_bin="$$(go env GOPATH)/bin/gremlins"; \
+	fi; \
 	if [ ! -x "$$gremlins_bin" ]; then \
 		echo "MUTATION GATE FAILED: gremlins is not executable at $$gremlins_bin. It was just"; \
-		echo "installed into \$$(go env GOPATH)/bin, which is not on this shell's PATH — add it"; \
-		echo "(export PATH=\"\$$(go env GOPATH)/bin:\$$PATH\") and re-run."; \
+		echo "installed into \$$(go env GOPATH)/bin — check that directory exists and is writable,"; \
+		echo "then re-run."; \
 		exit 1; \
 	fi; \
-	echo "using gremlins at $$gremlins_bin"; \
+	candidate="$$gremlins_bin"; \
+	scoring_with=$$(${GREMLINS_INSTALLED_VERSION}); \
+	if [ "$$scoring_with" != "${GREMLINS_VERSION}" ]; then \
+		echo "MUTATION GATE FAILED: $$gremlins_bin is built from ${GREMLINS_MODULE}"; \
+		echo "$${scoring_with:-an untagged local build}, and this gate scores with ${GREMLINS_VERSION}."; \
+		echo "A score from another version is not comparable with the threshold this gate enforces."; \
+		echo "Install the pin: go install ${GREMLINS_MODULE}/cmd/gremlins@${GREMLINS_VERSION}"; \
+		exit 1; \
+	fi; \
+	echo "using gremlins at $$gremlins_bin ($$scoring_with)"; \
 	export GOFLAGS="-p=1 $$GOFLAGS"; \
+	if [ -n "${MUTATION_COVERAGE_SKIP}" ]; then \
+		export GOFLAGS="-skip=${MUTATION_COVERAGE_SKIP} $$GOFLAGS"; \
+		echo "coverage-gathering skip: ${MUTATION_COVERAGE_SKIP}"; \
+	fi; \
 	for scope in ${SCOPES}; do \
 		pkg=$${scope%%:*}; \
 		filter=$${scope##*:}; \
 		excludes=""; \
 		coefficient=${MUTATION_TIMEOUT_COEFFICIENT}; \
 		if [ "$$filter" = "event" ]; then \
+			kept='^('$$(echo ${MUTATION_EVENT_FILE_PREFIXES} | tr ' ' '|')')'; \
 			excludes="-E /"; \
-			for f in $$(cd $$pkg && ls *.go | grep -v '_test\.go$$' | grep -v '^event_'); do \
+			for f in $$(cd $$pkg && ls *.go | grep -v '_test\.go$$' | grep -vE "$$kept"); do \
 				excludes="$$excludes -E $$f"; \
 			done; \
-			if [ -z "$$(cd $$pkg && ls event_*.go 2>/dev/null | grep -v '_test\.go$$')" ]; then \
-				echo "MUTATION GATE FAILED: scope $$scope asks for event files in $$pkg and there"; \
-				echo "are none. A renamed or relocated event file would otherwise make this scope"; \
-				echo "score nothing and report success."; \
+			scored=$$(cd $$pkg && ls *.go 2>/dev/null | grep -v '_test\.go$$' | grep -cE "$$kept" || true); \
+			if [ "$${scored:-0}" -eq 0 ]; then \
+				echo "MUTATION GATE FAILED: scope $$scope asks for files matching $$kept in $$pkg and"; \
+				echo "there are none. A renamed or relocated event file would otherwise make this"; \
+				echo "scope score nothing and report success."; \
 				exit 1; \
 			fi; \
+			echo "scoring $$scored file(s) in $$pkg matching $$kept"; \
 		fi; \
 		echo "==> mutation testing $$pkg [$$filter] (threshold ${MUTATION_THRESHOLD}%, timeout x$$coefficient)"; \
 		log=/tmp/gremlins-$$(echo $$pkg-$$filter | tr '/.' '_').log; \
@@ -351,6 +439,23 @@ PROJECTION_TESTS=.configmap-projection_test.yml
 # above, so the recipe stays one tab-indented statement per step.
 EXTRACT_PROJECTED_RULES = python3 -c "import sys, yaml; data = (yaml.safe_load(open('$(PROMETHEUS_CONFIGMAP)')) or {}).get('data') or {}; text = data.get('$(ALERT_RULES)'); sys.exit('$(PROMETHEUS_CONFIGMAP) projects no $(ALERT_RULES) key, so Kubernetes would load no rules at all') if text is None else open('alerts/tests/$(PROJECTION)', 'w').write(text)"
 
+# THE SECOND RULE KEY IS GATED TOO, and it was not. `blnk-infra-alerts.yml` exists only in
+# the Kubernetes projection — one rule, KafkaBrokerVolumeFilling, reading kubelet series
+# this repository does not publish — so it has no root-file counterpart and was outside
+# every check here. That is how it kept a repository-relative, fragmentless runbook_url
+# after the other key's were corrected: nothing extracted it, and the Go guard
+# over the fragments read only the other key. Both now cover it.
+#
+# `check rules` only, and deliberately: `test rules` needs a unit-test file, and a rule
+# whose inputs come from the kubelet can only be exercised against series invented here,
+# which would prove the expression parses twice over rather than prove anything about
+# Blnk. What this catches is the failure that takes every rule with it — a rule file
+# Prometheus refuses to load.
+INFRA_ALERT_RULES=blnk-infra-alerts.yml
+INFRA_PROJECTION=.configmap-infra-projection.yml
+
+EXTRACT_PROJECTED_INFRA_RULES = python3 -c "import sys, yaml; data = (yaml.safe_load(open('$(PROMETHEUS_CONFIGMAP)')) or {}).get('data') or {}; text = data.get('$(INFRA_ALERT_RULES)'); sys.exit('$(PROMETHEUS_CONFIGMAP) projects no $(INFRA_ALERT_RULES) key, so the broker-volume rule Kubernetes is meant to mount would be silently absent') if text is None else open('alerts/tests/$(INFRA_PROJECTION)', 'w').write(text)"
+
 alerts_configmap:
 	@set -e; \
 	$(RESOLVE_PROMTOOL); \
@@ -360,11 +465,13 @@ alerts_configmap:
 		echo "repository copy alone."; \
 		exit 1; \
 	}; \
-	trap 'rm -f alerts/tests/$(PROJECTION) alerts/tests/$(PROJECTION_TESTS)' EXIT; \
+	trap 'rm -f alerts/tests/$(PROJECTION) alerts/tests/$(PROJECTION_TESTS) alerts/tests/$(INFRA_PROJECTION)' EXIT; \
 	$(EXTRACT_PROJECTED_RULES); \
 	sed 's|\.\./$(ALERT_RULES)|$(PROJECTION)|' alerts/tests/$(ALERT_RULE_TESTS) > alerts/tests/$(PROJECTION_TESTS); \
 	eval "( $$promtool_prefix $$promtool_cmd check rules $(PROJECTION) )"; \
-	eval "( $$promtool_prefix $$promtool_cmd test rules $(PROJECTION_TESTS) )"
+	eval "( $$promtool_prefix $$promtool_cmd test rules $(PROJECTION_TESTS) )"; \
+	$(EXTRACT_PROJECTED_INFRA_RULES); \
+	eval "( $$promtool_prefix $$promtool_cmd check rules $(INFRA_PROJECTION) )"
 
 # Everything the alert rules are gated on, in one run.
 alerts: alerts_test alerts_configmap

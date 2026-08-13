@@ -330,13 +330,13 @@ func (f *zeroLossFixture) publishAndRecord(ctx context.Context, index int) model
 	}
 	require.NoErrorf(f.t, f.ds.InsertEventOutbox(ctx, entry), "storing fixture %d", index)
 
-	claimed, err := f.ds.ClaimPendingEventOutbox(ctx, 1, time.Minute)
+	claimed, err := f.ds.ClaimPendingEventOutbox(ctx, 1, time.Minute, "")
 	require.NoErrorf(f.t, err, "claiming fixture %d", index)
 	require.Lenf(f.t, claimed, 1, "fixture %d must be claimable", index)
 	require.Equal(f.t, entry.EventID, claimed[0].EventID)
 
 	require.NoErrorf(f.t,
-		f.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, result.Record),
+		f.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, result.Record, true),
 		"recording the broker coordinate for fixture %d", index)
 
 	return result.Record
@@ -494,12 +494,12 @@ func TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords(t *
 		}
 		require.NoError(t, fixture.ds.InsertEventOutbox(ctx, entry))
 
-		claimed, err := fixture.ds.ClaimPendingEventOutbox(ctx, 1, time.Minute)
+		claimed, err := fixture.ds.ClaimPendingEventOutbox(ctx, 1, time.Minute, "")
 		require.NoError(t, err)
 		require.Len(t, claimed, 1)
 		require.Equal(t, entry.EventID, claimed[0].EventID)
 		require.NoError(t,
-			fixture.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, phantom),
+			fixture.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, phantom, true),
 			"the row must be recordable: the repository stores the coordinate it is given, and "+
 				"detecting that it cannot exist is the reconciliation's job rather than the write's")
 
@@ -650,7 +650,7 @@ func TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka
 		}
 		require.NoError(t, fixture.ds.InsertEventOutbox(ctx, entry))
 
-		claimed, err := fixture.ds.ClaimPendingEventOutbox(ctx, 1, time.Minute)
+		claimed, err := fixture.ds.ClaimPendingEventOutbox(ctx, 1, time.Minute, "")
 		require.NoError(t, err)
 		require.Len(t, claimed, 1)
 		require.Equal(t, entry.EventID, claimed[0].EventID)
@@ -659,7 +659,7 @@ func TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka
 		// it because a publish whose acknowledgement was lost is a real outcome; classifying
 		// it is the reconciliation's job, not the write's.
 		require.NoError(t,
-			fixture.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, model.BrokerRecord{}),
+			fixture.ds.MarkEventDispatched(ctx, claimed[0].ID, claimed[0].ClaimToken, model.BrokerRecord{}, true),
 			"a dispatched row with no coordinate must be recordable, or this state could not arise")
 
 		statistics, err := eventOutboxStatistics(

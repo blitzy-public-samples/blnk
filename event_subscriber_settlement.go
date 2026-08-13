@@ -361,6 +361,52 @@ func (s *EventSubscriberService) schedule(task func()) {
 	deferWork(task)
 }
 
+// scheduleSettlement hands the post-response settlement of one operation to the
+// scheduler, on the context that work is entitled to.
+//
+// THE ONE PLACE THAT DECIDES WHICH CLOCK A SETTLEMENT RUNS ON, because the answer
+// depends on something only this function knows: whether the settlement is going to run
+// after the response or inside it.
+//
+//   - A scheduler is installed, so the settlement runs after the response has been
+//     written and nobody is waiting on it. It is rebased onto a wall clock of its own —
+//     see rebaseSubscriberSettlementClock for why that is not an extension of the
+//     caller's promise but a recognition that the promise was already kept.
+//   - No scheduler, so the settlement runs INLINE and the caller is still waiting. It
+//     stays a slice of the caller's promise, which is what keeps the endpoint answering
+//     inside its budget rather than inside its budget plus a fresh one per level of
+//     cleanup.
+//
+// Either way the window is opened ONCE, by subscriberCleanupContext, so a phase derived
+// inside the task shares this instant instead of carving a second slice out of it.
+//
+// Parameters:
+//   - ctx context.Context: the operation's context, whose wall clock may be spent.
+//   - task func(context.Context): the settlement, run with the context it is entitled
+//     to. Not called when nil.
+func (s *EventSubscriberService) scheduleSettlement(ctx context.Context, task func(context.Context)) {
+	if task == nil {
+		return
+	}
+
+	// Read BEFORE the task is handed over: the decision must describe the arm this
+	// settlement is actually taking, and a scheduler installed moments later must not
+	// retroactively change the clock an inline run already used.
+	deferred := s.defersWork()
+
+	s.schedule(func() {
+		base := ctx
+		if deferred {
+			base = rebaseSubscriberSettlementClock(ctx)
+		}
+
+		settle, done := subscriberCleanupContext(base)
+		defer done()
+
+		task(settle)
+	})
+}
+
 // defersWork reports whether a scheduler is installed, so a caller can ask the broker
 // to defer work only when there is somewhere for it to be deferred TO.
 func (s *EventSubscriberService) defersWork() bool {

@@ -45,6 +45,7 @@ import (
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/embedded"
 
+	apimodel "github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/metrics"
@@ -288,6 +289,11 @@ type dltFakeStore struct {
 type dltDispatchRecord struct {
 	id         int64
 	claimToken string
+
+	// settleLegacyLeg is whether the transition was told to settle the legacy webhook leg.
+	// A replay must never say it did: the row may still owe a webhook the repair leg
+	// finishes, so this is asserted false rather than merely recorded.
+	settleLegacyLeg bool
 
 	// record is the broker coordinate of the REPLAY write, so a replayed row names the new
 	// record rather than the dead-letter one it was read from.
@@ -545,12 +551,13 @@ func (s *dltFakeStore) MarkEventDispatched(
 	id int64,
 	claimToken string,
 	record model.BrokerRecord,
+	settleLegacyLeg bool,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.dispatched = append(s.dispatched, dltDispatchRecord{
-		id: id, claimToken: claimToken, record: record,
+		id: id, claimToken: claimToken, record: record, settleLegacyLeg: settleLegacyLeg,
 	})
 
 	if s.markDispatchedErr != nil {
@@ -1514,8 +1521,18 @@ func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *test
 
 	assert.Contains(t, claimSQL, "status IN ('pending', 'processing')",
 		"the claim must restrict to the two claimable statuses, which excludes dead_lettered")
-	assert.Contains(t, claimSQL, "candidate.attempts < candidate.max_attempts",
-		"the claim must exclude a row that has spent its retry budget")
+
+	// The retry-budget condition is applied through the SHARED claimable predicate rather
+	// than written out at each of the claim's four uses of it, so it is asserted where it is
+	// defined. Asserting it in the claim's own text would pass only for as long as the
+	// predicate stays duplicated, which is the arrangement that let the four copies drift.
+	assert.Contains(t, claimSQL, "eventOutboxClaimableSQL(\"candidate\")",
+		"every stage of the claim must apply the shared claimable predicate")
+	assert.Regexp(t,
+		"(?s)func eventOutboxClaimableSQL.*attempts.*<.*max_attempts",
+		source,
+		"the shared claimable predicate must exclude a row that has spent its retry budget, or a "+
+			"dead-lettered row could be claimed, republished, fail and be dead-lettered again for ever")
 	assert.NotContains(t, claimSQL, model.EventOutboxStatusDeadLettered,
 		"the claim query must never name the dead-lettered status")
 	assert.NotContains(t, claimSQL, model.EventOutboxStatusReplaying,
@@ -4336,6 +4353,50 @@ func TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes(t *te
 		assert.Empty(t, store.snapshotCountQueries())
 	})
 
+	t.Run("a free-text filter carrying a NUL byte is refused before the repository is touched",
+		func(t *testing.T) {
+			// A PostgreSQL text value cannot hold a NUL byte in any encoding, so a filter
+			// carrying one aborts the query with SQLSTATE 22021 — a driver failure, which the
+			// repository reports as an internal error. That is the wrong class of answer for a
+			// value the caller chose, and it is refused HERE rather than only at the HTTP
+			// boundary because this validator is the seam the page, the page-and-count and the
+			// bare count all share: a caller that is not an HTTP request must get the same
+			// answer.
+			store := newDltFakeStore().withRow(dltAgedRow(t, "evt_nul_guard", "transaction.applied",
+				"blnk.transactions", model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute))
+			service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+			for name, options := range map[string]DeadLetterListOptions{
+				"event_type": {EventType: "transaction.\x00applied"},
+				"topic":      {Topic: "blnk.\x00transactions"},
+			} {
+				t.Run(name, func(t *testing.T) {
+					_, listErr := service.ListDeadLetterEvents(context.Background(), options)
+					dltAssertCodeAndStatus(t, listErr, apierror.ErrGenValidation, http.StatusBadRequest)
+					assert.Contains(t, listErr.Error(), name,
+						"the refusal must name the filter it rejected")
+
+					_, total, pageErr := service.ListAndCountDeadLetterEvents(context.Background(), options)
+					dltAssertCodeAndStatus(t, pageErr, apierror.ErrGenValidation, http.StatusBadRequest)
+					assert.Zero(t, total, "a refused page must not also report a number")
+
+					counted, countErr := service.CountDeadLetterEvents(context.Background(), options)
+					dltAssertCodeAndStatus(t, countErr, apierror.ErrGenValidation, http.StatusBadRequest)
+					assert.Zero(t, counted, "a refused count must not also report a number")
+
+					// THE MESSAGE MUST NOT CARRY THE VALUE. It is unvalidated caller input around a
+					// control byte, and this message reaches a response body and a log line.
+					assert.NotContains(t, listErr.Error(), "\x00",
+						"the refusal must not repeat the NUL byte")
+				})
+			}
+
+			assert.Empty(t, store.snapshotInventoryQueries(),
+				"a rejected filter must never reach the database")
+			assert.Empty(t, store.snapshotInventoryCountQueries())
+			assert.Empty(t, store.snapshotDeadLetterCounts())
+		})
+
 	t.Run("the repository's own failure is propagated, not reported as zero", func(t *testing.T) {
 		failing := newDltFakeStore()
 		failing.countDeadLetterErr = apierror.NewAPIError(
@@ -6071,6 +6132,125 @@ func TestDeadLetterOutcomeLogFields_RedactsBrokerTopologyFromTheFailureReason(t 
 			// agrees with the reason, which is what makes the pair readable together.
 			assert.Equal(t, "broker_unavailable", fields["failure_class"],
 				"the class is derived from the reason and must survive the redaction of its addresses")
+		})
+	}
+}
+
+// TestClassifyDeadLetterFailure_ATopicTheProducerCannotSeeIsNeitherADefectNorACrashedCluster
+// pins the classification of the one failure text that arrives genuinely ambiguous, and
+// the agreement between the log's class and the API's reason for the same text.
+//
+// A principal holding no Describe on a topic is never TOLD it was denied: the broker
+// answers UNKNOWN_TOPIC_OR_PARTITION — word for word the sentence a genuinely absent
+// topic produces. kafka-go renders it as "[3] Unknown Topic Or Partition: the request is
+// for a topic or partition that does not exist on this broker", which is a trap twice
+// over: classified as `serialization` it reads as "a defect, not a transient condition"
+// and sends the reader into the publisher code, and because the sentence contains the
+// word "broker" the broker signatures would otherwise blame a cluster that is perfectly
+// healthy. Either reading costs an operator the incident. The class must name the two
+// things actually worth checking — provisioning, and the grant — and an explicit
+// TOPIC_AUTHORIZATION_FAILED must still be claimed by the auth class, because that one
+// the broker was willing to state.
+func TestClassifyDeadLetterFailure_ATopicTheProducerCannotSeeIsNeitherADefectNorACrashedCluster(t *testing.T) {
+	for name, expectation := range map[string]struct {
+		reason    string
+		class     string
+		apiReason string
+		because   string
+	}{
+		"the ACL-masked unknown topic names both possibilities": {
+			reason: "[3] Unknown Topic Or Partition: the request is for a topic or partition " +
+				"that does not exist on this broker",
+			class:     deadLetterFailureClassTopicUnavailable,
+			apiReason: apimodel.FailureReasonTopicMissing,
+			because: "this is the sentence an ACL gap and a missing topic SHARE; calling it a " +
+				"serialisation defect sends the operator to read publisher code, and letting the " +
+				"word \"broker\" in it win sends them to a healthy cluster",
+		},
+		"a topic reported absent in the broker's other wording is the same class": {
+			reason:    "kafka server: topic does not exist",
+			class:     deadLetterFailureClassTopicUnavailable,
+			apiReason: apimodel.FailureReasonTopicMissing,
+			because:   "the classification must follow the condition, not one broker's phrasing of it",
+		},
+		"an explicit topic denial stays a denial": {
+			reason: "[29] Topic Authorization Failed: the client is not authorized to access " +
+				"the requested topic",
+			class:     deadLetterFailureClassAuth,
+			apiReason: apimodel.FailureReasonAuthorizationDenied,
+			because: "when the broker is willing to say \"denied\" it must be reported as a denial: " +
+				"that is a narrower, more actionable answer than \"missing or unauthorized\"",
+		},
+		"an illegal topic name is still a defect": {
+			reason: "[17] Invalid Topic: a request which attempted to access an invalid topic " +
+				"(e.g. one which has an illegal name)",
+			class:     deadLetterFailureClassSerialization,
+			apiReason: apimodel.FailureReasonUnclassified,
+			because: "a name Kafka refuses as illegal is something Blnk composed wrongly, which is a " +
+				"defect in the same sense a payload that will not encode is — retrying cannot help",
+		},
+		"a payload that will not encode is still a defect": {
+			reason:    "json: unsupported type: chan int",
+			class:     deadLetterFailureClassSerialization,
+			apiReason: apimodel.FailureReasonUnclassified,
+			because:   "the serialisation class must keep the failures it was created for",
+		},
+		"a refused connection is still the cluster": {
+			reason:    "dial tcp 127.0.0.1:9092: connect: connection refused",
+			class:     deadLetterFailureClassBroker,
+			apiReason: apimodel.FailureReasonBrokerUnavailable,
+			because:   "the topic signatures must not have widened into transport failures",
+		},
+		"a publish through a closed writer is a shutdown": {
+			reason:    "event publisher is closed",
+			class:     deadLetterFailureClassClosed,
+			apiReason: apimodel.FailureReasonUnclassified,
+			because: "a shutdown must be distinguishable from a fault, or a rolling restart reads as " +
+				"an incident",
+		},
+		"no recorded reason says so rather than guessing": {
+			reason:    "",
+			class:     deadLetterFailureClassNone,
+			apiReason: "",
+			because: "an absent reason is a bookkeeping gap in Blnk, not an answer from the broker, " +
+				"and both vocabularies have to say so rather than picking a plausible cause",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fields := DeadLetterOutcome{
+				EventID:         "evt_topic_visibility",
+				EventType:       "transaction.applied",
+				OriginalTopic:   "blnk.transactions",
+				DeadLetterTopic: "blnk.transactions.dlt",
+				PartitionKey:    "bln_7d3ac6f1",
+				Status:          model.PublishStatusDeadLettered,
+				Metadata: model.FailureMetadata{
+					OriginalTopic: "blnk.transactions",
+					ErrorReason:   expectation.reason,
+					AttemptCount:  5,
+				},
+			}.LogFields()
+
+			assert.Equal(t, expectation.class, fields["failure_class"], expectation.because)
+
+			// THE SAME TEXT THROUGH THE OTHER VOCABULARY. The log's failure_class and the
+			// API's failure_reason are independent classifications of one stored string, and
+			// docs/kafka-operations.md publishes the mapping between them so a script can move
+			// from one to the other. A mapping nobody asserts is a mapping that drifts.
+			listed := apimodel.NewDeadLetterEvent(model.DeadLetterInventoryEntry{
+				EventID:   "evt_topic_visibility",
+				EventType: "transaction.applied",
+				Topic:     "blnk.transactions",
+				DLTTopic:  "blnk.transactions.dlt",
+				Status:    model.EventOutboxStatusDeadLettered,
+				Attempts:  5,
+				LastError: expectation.reason,
+			})
+
+			assert.Equal(t, expectation.apiReason, listed.FailureReason,
+				"the documented mapping from failure_class %q to failure_reason must hold: an "+
+					"operator who triages from the log and an operator who triages from the API "+
+					"have to reach the same conclusion about the same event", expectation.class)
 		})
 	}
 }

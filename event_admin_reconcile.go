@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -437,6 +438,78 @@ type eventStatisticsStore interface {
 	) (int64, *time.Time, error)
 }
 
+// eventCensusStamper is implemented by a statistics store whose per-status census may be
+// a moment old, so the statistics can report WHEN the numbers were taken rather than when
+// the response was assembled.
+//
+// Optional on purpose: a store that always reads live implements nothing and the
+// statistics fall back to the wall clock, which is what every test double and every
+// direct Datasource caller does.
+type eventCensusStamper interface {
+	// LastCensusAt is the instant the counts most recently returned were read at, or the
+	// zero time when no census has been served yet.
+	LastCensusAt() time.Time
+}
+
+// eventStatusCensusTTL is how long a per-status census may be reused.
+//
+// ONE SECOND, and the number is chosen against the consumers rather than picked for
+// roundness. The census is O(non-dispatched rows) by nature — counting open work means
+// visiting it — so the only way its cost stops tracking the backlog is to stop repeating
+// it per request. Measured on a 400,000-row open backlog, one census is ~34ms and takes
+// two parallel workers with it, so sixteen concurrent readers were costing 48 backend
+// processes to answer one question that has one answer.
+//
+// The consumers set the ceiling. The load harness's settling gate polls this endpoint
+// every 5 seconds by default and needs to see monotonic progress and then stability; the
+// metrics collector reads the same census every 15 seconds. A one-second reuse window is
+// invisible to both, and it is REPORTED rather than hidden: GeneratedAt becomes the
+// instant the counts were read, which is what its documentation already says it is.
+const eventStatusCensusTTL = time.Second
+
+// eventStatusCensus memoises the per-status census behind a TTL and collapses concurrent
+// readers onto one query.
+//
+// The two mechanisms do different jobs and both are needed. SINGLE FLIGHT is what stops
+// concurrency multiplying the work: sixteen readers arriving together share the one census
+// already in progress, so the database does the work once. The TTL is what stops a high
+// request RATE doing the same thing sequentially. Neither makes the census cheaper; both
+// make its cost independent of how often it is asked for, which is the property that was
+// missing.
+type eventStatusCensus struct {
+	mu sync.Mutex
+
+	// ttl is how long an entry may be reused. Zero selects eventStatusCensusTTL; a
+	// negative value disables reuse entirely, which is what a test asserting on raw query
+	// counts wants.
+	ttl time.Duration
+
+	// entries holds one memo per census variant: the unresolved census, and one per
+	// truncated window start. The windowed key carries an instant, so it necessarily moves
+	// on — pruneExpiredLocked is what keeps that from being a slow leak.
+	entries map[string]*eventCensusEntry
+
+	// takenAt is the instant of the census most recently SERVED, memo or fresh, which is
+	// what LastCensusAt reports.
+	takenAt time.Time
+
+	// now is the clock, injectable so expiry is testable without sleeping.
+	now func() time.Time
+}
+
+// eventCensusEntry is one variant's memo, and while loading is also the rendezvous the
+// concurrent readers of that variant wait on.
+type eventCensusEntry struct {
+	// done is closed when the load finishes. A nil channel means the entry is settled.
+	done chan struct{}
+
+	// counts, takenAt and err are the load's outcome, written before done is closed and
+	// only read afterwards.
+	counts  map[string]int64
+	takenAt time.Time
+	err     error
+}
+
 // ProducerAtomicityCensus is how much of the two pre-recorded intents is outstanding.
 type ProducerAtomicityCensus struct {
 	// MonitorHandoffPending, MonitorHandoffProcessing, MonitorHandoffCompleted and
@@ -545,7 +618,10 @@ func eventOutboxStatistics(
 	}
 
 	statistics := EventOutboxStatistics{
-		GeneratedAt:              time.Now().UTC(),
+		// THE INSTANT THE COUNTS WERE READ, which is what this field's documentation says it
+		// is and what a store serving a memoised census reports. A store that always reads
+		// live implements nothing and this is the wall clock, unchanged.
+		GeneratedAt:              eventCensusInstant(store),
 		CountsByStatus:           counts,
 		UnreportedStatuses:       unreportedEventOutboxStatuses(counts),
 		WindowStart:              windowStart,
@@ -649,6 +725,27 @@ func eventOutboxStatistics(
 	return statistics, nil
 }
 
+// eventCensusInstant reports when the counts a store just served were read.
+//
+// Returns the wall clock for a store that reads live, and never a future instant: a memo's
+// stamp can only be older than now, and a clock skewed the other way would make the
+// statistics claim to describe a moment that has not happened.
+func eventCensusInstant(store eventStatisticsStore) time.Time {
+	now := time.Now().UTC()
+
+	stamper, ok := store.(eventCensusStamper)
+	if !ok {
+		return now
+	}
+
+	taken := stamper.LastCensusAt()
+	if taken.IsZero() || taken.After(now) {
+		return now
+	}
+
+	return taken.UTC()
+}
+
 // readEventStatusCounts reads whichever per-status aggregate the posture calls for.
 func readEventStatusCounts(
 	ctx context.Context,
@@ -747,7 +844,235 @@ func (b *Blnk) eventStatisticsStore() (eventStatisticsStore, error) {
 		return nil, unavailable()
 	}
 
-	return datasource, nil
+	return &censusMemoStore{eventStatisticsStore: datasource, census: b.statusCensus()}, nil
+}
+
+// statusCensus returns the process-wide census memo, building it on first use.
+//
+// Lazily rather than in NewBlnk because a Blnk assembled as a struct literal — which is
+// what several tests and the CLI paths do — must be as bounded as one the constructor
+// returned.
+func (b *Blnk) statusCensus() *eventStatusCensus {
+	b.censusOnce.Do(func() {
+		b.eventCensus = &eventStatusCensus{entries: map[string]*eventCensusEntry{}}
+	})
+
+	return b.eventCensus
+}
+
+// clock reads the census's clock, defaulting to time.Now.
+func (c *eventStatusCensus) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+
+	return time.Now()
+}
+
+// reuseWindow reports how long an entry may be reused for.
+func (c *eventStatusCensus) reuseWindow() time.Duration {
+	if c.ttl == 0 {
+		return eventStatusCensusTTL
+	}
+
+	return c.ttl
+}
+
+// LastCensusAt reports the instant of the census most recently served.
+func (c *eventStatusCensus) LastCensusAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.takenAt
+}
+
+// read serves one census variant, reusing a fresh memo, joining a load already in flight,
+// or performing the load itself.
+//
+// Parameters:
+//   - ctx context.Context: bounds this reader. A reader that JOINS a load in flight
+//     abandons the wait when its own context ends, so one slow census cannot hold a
+//     request past its deadline — the load itself continues for whoever is still waiting.
+//   - variant string: the memo key. Must be derived from a normalised input, because it
+//     is what bounds the memo's size.
+//   - load func(context.Context) (map[string]int64, error): performs the census.
+//
+// Returns:
+//   - map[string]int64: the counts. Copied on the way out, so a caller cannot mutate a
+//     memo that other readers are still going to be served.
+//   - time.Time: the instant the counts were read.
+//   - error: the load's error, shared by every reader that joined it.
+func (c *eventStatusCensus) read(
+	ctx context.Context,
+	variant string,
+	load func(context.Context) (map[string]int64, error),
+) (map[string]int64, time.Time, error) {
+	if c == nil {
+		counts, err := load(ctx)
+
+		return counts, time.Now(), err
+	}
+
+	for {
+		c.mu.Lock()
+
+		entry := c.entries[variant]
+
+		switch {
+		case entry != nil && entry.done != nil:
+			// A load is in flight for this variant. Wait for it rather than starting a second.
+			//
+			// THE CHANNEL IS COPIED OUT WHILE THE MUTEX IS STILL HELD, and the wait below is on
+			// that copy rather than on the entry's field. The owning reader nils the field when
+			// its load settles, so reading entry.done after the unlock would be an
+			// unsynchronised read of a field another goroutine writes — and not a harmless one:
+			// a reader that observed the nil would select on a nil channel, which never becomes
+			// ready, so it would wait out its whole context instead of being woken by the load
+			// it was waiting for. The race detector caught this before a request ever did.
+			waiting := entry.done
+			c.mu.Unlock()
+
+			select {
+			case <-waiting:
+			case <-ctx.Done():
+				return nil, time.Time{}, ctx.Err()
+			}
+
+			continue
+
+		case entry != nil && c.clock().Sub(entry.takenAt) < c.reuseWindow():
+			// Fresh enough. Errors are never memoised — an entry that failed is left settled
+			// with a zero takenAt, so this arm cannot serve one.
+			counts, takenAt := copyEventStatusCounts(entry.counts), entry.takenAt
+			c.takenAt = takenAt
+			c.mu.Unlock()
+
+			return counts, takenAt, nil
+		}
+
+		// This reader owns the load. The entry is published BEFORE the query starts so that
+		// every reader arriving during it finds the rendezvous rather than starting its own.
+		pending := &eventCensusEntry{done: make(chan struct{})}
+		c.entries[variant] = pending
+		c.mu.Unlock()
+
+		counts, err := load(ctx)
+		takenAt := c.clock()
+
+		c.mu.Lock()
+		pending.counts = counts
+		pending.err = err
+
+		if err == nil {
+			pending.takenAt = takenAt
+			c.takenAt = takenAt
+		} else {
+			// A failed census leaves no memo to serve and no memo to expire: the entry is
+			// removed so the next reader loads afresh instead of waiting out a TTL on an answer
+			// that does not exist.
+			delete(c.entries, variant)
+		}
+
+		done := pending.done
+		pending.done = nil
+
+		// The windowed variant's key moves forward with the clock, so the map would otherwise
+		// gain an entry a second and keep every one of them. Pruned here rather than on a timer
+		// because this is the only place entries are added.
+		c.pruneExpiredLocked(takenAt)
+
+		c.mu.Unlock()
+
+		close(done)
+
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+
+		return copyEventStatusCounts(counts), takenAt, nil
+	}
+}
+
+// pruneExpiredLocked drops every settled entry that can no longer be reused. The caller
+// must hold the mutex.
+func (c *eventStatusCensus) pruneExpiredLocked(now time.Time) {
+	window := c.reuseWindow()
+
+	for variant, entry := range c.entries {
+		// A load in flight is never pruned: readers are waiting on its channel.
+		if entry.done != nil {
+			continue
+		}
+
+		if now.Sub(entry.takenAt) >= window {
+			delete(c.entries, variant)
+		}
+	}
+}
+
+// copyEventStatusCounts copies a census so a memo cannot be mutated by a caller.
+func copyEventStatusCounts(counts map[string]int64) map[string]int64 {
+	if counts == nil {
+		return nil
+	}
+
+	copied := make(map[string]int64, len(counts))
+	for status, count := range counts {
+		copied[status] = count
+	}
+
+	return copied
+}
+
+// censusMemoStore is an eventStatisticsStore whose two per-status censuses are served
+// through the memo, leaving every other read live.
+//
+// A decorator rather than a change to Datasource, because the memo's lifetime is the
+// PROCESS and Datasource is a value type constructed per call. It is also why the memo is
+// held on Blnk: one memo per service instance, shared by every request that reaches it.
+type censusMemoStore struct {
+	eventStatisticsStore
+
+	census *eventStatusCensus
+}
+
+// Compile-time proof the decorator can stamp the statistics with the census instant.
+var _ eventCensusStamper = (*censusMemoStore)(nil)
+
+// LastCensusAt reports the instant of the census most recently served.
+func (s *censusMemoStore) LastCensusAt() time.Time {
+	return s.census.LastCensusAt()
+}
+
+// CountUnresolvedEventOutbox serves the unresolved census through the memo.
+func (s *censusMemoStore) CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error) {
+	counts, _, err := s.census.read(ctx, "unresolved", s.eventStatisticsStore.CountUnresolvedEventOutbox)
+
+	return counts, err
+}
+
+// CountEventOutboxByStatus serves the windowed census through the memo.
+//
+// The memo is keyed on the window's LENGTH rather than on the instant derived from it,
+// because the instant moves every millisecond and would make every request a miss. The
+// counts a reader gets are therefore measured from an instant up to one TTL earlier than
+// its own window start — a second's difference in a window measured in hours, and the
+// reader is told when the census was taken.
+func (s *censusMemoStore) CountEventOutboxByStatus(
+	ctx context.Context,
+	since time.Time,
+) (map[string]int64, error) {
+	variant := "history:" + since.Truncate(s.census.reuseWindow()).UTC().Format(time.RFC3339)
+
+	counts, _, err := s.census.read(ctx, variant, func(call context.Context) (map[string]int64, error) {
+		return s.eventStatisticsStore.CountEventOutboxByStatus(call, since)
+	})
+
+	return counts, err
 }
 
 // unreportedEventOutboxStatuses names the statuses present in the aggregate that the

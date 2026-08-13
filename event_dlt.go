@@ -183,8 +183,24 @@ const (
 	// deadLetterFailureClassTooLarge is a message the broker or Blnk refused on size.
 	deadLetterFailureClassTooLarge = "message_too_large"
 
-	// deadLetterFailureClassSerialization is a payload that would not serialise, or a
-	// topic that could not be resolved. A defect, not a transient condition.
+	// deadLetterFailureClassTopicUnavailable is "the topic Blnk asked for was not there
+	// as far as this principal is concerned". The name states BOTH possibilities on
+	// purpose, because the broker does not distinguish them for us: a principal that
+	// holds no Describe on a topic is answered UNKNOWN_TOPIC_OR_PARTITION rather than a
+	// denial, so an ACL gap and a genuinely missing topic arrive as the same sentence.
+	// Classifying that sentence as a defect would send an operator to read the publisher
+	// code when the remedy is `make kafka_provision` or an ACL grant; classifying it as
+	// broker_unavailable would send them to a cluster that is perfectly healthy. This
+	// class exists so the log names the two things worth checking and nothing else.
+	// An explicit TOPIC_AUTHORIZATION_FAILED is NOT this class — it is a denial the
+	// broker was willing to state, and the auth signatures above claim it first.
+	deadLetterFailureClassTopicUnavailable = "topic_missing_or_unauthorized"
+
+	// deadLetterFailureClassSerialization is something BLNK produced that could not be
+	// encoded or that Kafka rejected as malformed: a payload that would not serialise, or
+	// a topic name that violates Kafka's naming rules. A defect, not a transient
+	// condition — retrying it unchanged cannot help. A topic that is merely absent or
+	// invisible to the principal is deadLetterFailureClassTopicUnavailable instead.
 	deadLetterFailureClassSerialization = "serialization"
 
 	// deadLetterFailureClassClosed is a publish attempted through a closed transport,
@@ -218,6 +234,15 @@ var deadLetterFailureSignatures = []struct {
 	{"message size", deadLetterFailureClassTooLarge},
 	{"record too large", deadLetterFailureClassTooLarge},
 
+	// The topic signatures are claimed BEFORE the serialisation and broker blocks below,
+	// and that ordering is the whole point of them. kafka-go renders error 3 as
+	// "[3] Unknown Topic Or Partition: the request is for a topic or partition that does
+	// not exist on this broker" — a sentence that contains the word "broker", so the
+	// broker block would otherwise swallow it and blame a healthy cluster.
+	{"unknown topic", deadLetterFailureClassTopicUnavailable},
+	{"partition that does not exist", deadLetterFailureClassTopicUnavailable},
+	{"topic does not exist", deadLetterFailureClassTopicUnavailable},
+
 	{"marshal", deadLetterFailureClassSerialization},
 	{"unmarshal", deadLetterFailureClassSerialization},
 	{"serial", deadLetterFailureClassSerialization},
@@ -227,8 +252,10 @@ var deadLetterFailureSignatures = []struct {
 	// "marshal" — "json: unsupported type: chan int" being the one that made this obvious.
 	{"json:", deadLetterFailureClassSerialization},
 	{"unsupported type", deadLetterFailureClassSerialization},
+	// An INVALID topic name stays here: error 17 is Kafka refusing a name as illegal, or
+	// refusing a write to an internal topic. Both are things Blnk composed wrongly, which
+	// is a defect in the same sense a payload that will not encode is.
 	{"invalid topic", deadLetterFailureClassSerialization},
-	{"unknown topic", deadLetterFailureClassSerialization},
 
 	{"publisher is closed", deadLetterFailureClassClosed},
 	{"closed", deadLetterFailureClassClosed},
@@ -262,6 +289,25 @@ func errorText(err error) string {
 
 // classifyDeadLetterFailure reduces a recorded failure reason to one value from the
 // fixed vocabulary above.
+//
+// It feeds TWO log fields that describe TWO DIFFERENT ERRORS, and reading them as one is
+// the mistake this comment exists to prevent:
+//
+//   - `failure_class` classifies Metadata.ErrorReason — why the ORIGINAL publish to the
+//     category topic failed, i.e. the reason the event is being dead-lettered at all.
+//   - `failure_detail_class` classifies the error of the step being logged — why the
+//     dead-letter WRITE failed, why the row could not be marked, or on a replay why the
+//     re-publish or its bookkeeping failed.
+//
+// So one record can legitimately read failure_class=authorization_denied with
+// failure_detail_class=broker_unavailable: the event was refused a topic it may not
+// write, and the attempt to preserve it then hit a cluster that had gone away. The two
+// are classified through the same vocabulary precisely so they are comparable.
+//
+// The API's failure_reason (api/model.classifyFailureReason) is a THIRD, independent
+// classification of the same stored text, deliberately narrower: it splits `timeout` and
+// `persistence_failure` out and has no serialisation value. docs/kafka-operations.md
+// carries the full mapping between the two so a script can move between them.
 func classifyDeadLetterFailure(reason string) string {
 	if strings.TrimSpace(reason) == "" {
 		return deadLetterFailureClassNone
@@ -497,7 +543,10 @@ type eventDeadLetterStore interface {
 	// becomes dispatched, which removes it from the dead-letter inventory and makes a
 	// second replay attempt fail closed. It too is conditional on the claim token — here,
 	// the one ClaimEventForReplay issued.
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error
+	// settleLegacyLeg is always FALSE here, and that is the point: a replay says nothing
+	// about the legacy webhook leg, which may still be owed on a row that was dead-lettered
+	// before its enqueue succeeded. Folding a marker in on a replay would strand that leg.
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord, settleLegacyLeg bool) error
 
 	// ClaimEventForReplay atomically moves a dead-lettered row to replaying and returns it
 	// with a fresh claim token, so a replay is a CLAIM rather than a read followed by a

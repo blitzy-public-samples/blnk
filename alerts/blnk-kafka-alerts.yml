@@ -18,14 +18,22 @@
 # nothing evaluates is never alerted on, and a rule whose series is never recorded can
 # never fire, so both halves have to be in place.
 #
-# THIRTEEN rules, in one group, and they divide in two. SEVEN are CONDITION rules —
+# FIFTEEN rules, in one group, and they divide in two. NINE are CONDITION rules —
 # something in the pipeline is wrong — of which two are the thresholds the requirement
 # names: DeadLetterMessageStuck on dead-letter age and SubscriberConsumerLagHigh on
 # consumer lag.
 #
-# Four of them carry the reasoning that is least obvious from the expression alone:
+# Six of them carry the reasoning that is least obvious from the expression alone:
 #
 #   * ConsumerLagMeasurementDegraded covers the gap the lag threshold leaves.
+#   * EventRepairBacklogStuck covers the work a repair leg still OWES, which is not the
+#     same question as how old the oldest dead letter is: the legacy webhook leg's rows
+#     appear in no other series at all, and a dead-letter backlog that is filling fast is
+#     visible here before anything in it is fifteen minutes old.
+#   * EventRelayClaimTimingOut covers the relay's claim failing to complete, which no
+#     other rule here can see: the outbox stops draining while every gauge describing the
+#     outbox stays healthy, so the only symptom is pending rising against a flat
+#     published count.
 #   * SubscriberRevocationOutstanding covers broker-side credential revocation Blnk
 #     still owes.
 #   * SubscriberCredentialOrphaned covers the SAME exposure arriving by a different
@@ -35,9 +43,9 @@
 #     by retrying the deregistration, and issuance is refused for a pending row.
 #
 # The count is stated because it is checkable: `promtool check rules` prints it —
-# "SUCCESS: 13 rules found" — /rules shows thirteen under blnk-kafka-alerts, and the
+# "SUCCESS: 15 rules found" — /rules shows fifteen under blnk-kafka-alerts, and the
 # prometheus-config ConfigMap in infrastructure/k8s-manifests carries a verbatim copy of
-# this group that has to agree. It states thirteen too, in its own blnk-kafka-alerts
+# this group that has to agree. It states fifteen too, in its own blnk-kafka-alerts
 # group, alongside a separate blnk-infra-alerts group holding the one rule that only
 # exists on Kubernetes.
 
@@ -99,6 +107,74 @@ groups:
           summary: "Dead-lettered events unresolved for more than 15 minutes"
           description: "The oldest unresolved dead-letter entry destined for {{ $labels.topic }} (instance {{ $labels.instance }}) has been waiting {{ $value | humanizeDuration }}. This value is an age, not a count: one entry this old is enough to fire. REMEDIATION IS STATUS-DEPENDENT, so read the status first with GET /events/dead-letter. A 'dead_lettered' entry is on its topic and is replayable: triage it and replay it with POST /events/dead-letter/:event_id/replay. A 'failed' entry is NOT replayable yet — its retry budget is spent but the dead-letter write itself has not completed, so there may be no message on the topic at all and replay is refused with EVENT_NOT_DEAD_LETTERED; restore broker reachability so the dead-letter write completes, then replay. GET /events/stats reports how many are in each state."
           runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#deadlettermessagestuck"
+
+      # Work a REPAIR leg still owes, left owed. This is the COUNT beside the age above,
+      # and it is a separate rule because the two do not cover the same ground.
+      #
+      # blnk_events_repair_backlog is the only series either leg's outstanding work
+      # appears on. The age rule above reads the dead-letter inventory, which covers the
+      # dead_letter leg's rows and NOT the legacy_webhook leg's — those rows are
+      # webhook_pending, a state that inventory does not include and blnk_outbox_pending
+      # does not count either, so before this rule a webhook leg that never drained had no
+      # alertable series at all. It also fires on a dead-letter leg that is filling
+      # quickly but has not yet aged past fifteen minutes, which is the earliest an
+      # operator can be told that events are reaching no topic.
+      #
+      # NORMALLY ZERO, ON EVERY SUPPORTED CONFIGURATION, which is what makes `> 0`
+      # legitimate rather than noisy: the dead_letter leg holds rows only while a
+      # `<topic>.dlt` write is failing, and the legacy_webhook leg holds rows only while an
+      # asynq enqueue is failing inside the migration window — a deployment with no
+      # webhook configured, and every deployment after the sunset, settles that leg
+      # without ever entering the state. Both legs are also self-limiting: the webhook leg
+      # abandons a row once it spends its enqueue budget, and the relay settles rows left
+      # webhook_pending when the window closes.
+      - alert: EventRepairBacklogStuck
+        # Bare, so the leg label reaches the notification: the two legs mean different
+        # things and need different actions, and an aggregate would hide which one is
+        # stuck. No dwell shortcut either — a repair pass runs on every one-second poll
+        # tick, so anything still owed fifteen minutes later is failing rather than queued.
+        expr: blnk_events_repair_backlog > 0
+        # Fifteen minutes of the pass being unable to clear it, matching the dead-letter
+        # triage threshold above so the two rules agree about how long "stuck" is.
+        for: 15m
+        labels:
+          severity: warning
+          component: event-streaming
+        annotations:
+          summary: "A relay repair leg has been unable to clear its backlog for 15 minutes"
+          description: "The {{ $labels.leg }} repair leg on {{ $labels.instance }} has owed {{ $value }} row(s) for 15 minutes, and its pass runs every second — so it is failing, not queued. This value is a COUNT of rows, not an age. leg=\"dead_letter\" is the urgent one: those rows spent their retry budget AND their <topic>.dlt write also failed, so each is the only copy of an event that reached no Kafka topic at all, and GET /events/dead-letter reports them as 'failed' rather than 'dead_lettered' — replay refuses them with EVENT_NOT_DEAD_LETTERED until the dead-letter write lands. Restore write access to the .dlt sibling (broker reachability, then the topic's existence and the producer's WRITE ACL on it) and the pass clears them itself. leg=\"legacy_webhook\" is rows whose Kafka leg is finished and whose legacy webhook enqueue keeps failing during the migration window: check Redis and the asynq queue; those rows are abandoned once they spend their enqueue budget, so a backlog that clears itself with events undelivered to webhook subscribers is the failure mode to look for. blnk_events_repair_saturated tells you whether the pass is merely configured too slowly to catch up."
+          runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#eventrepairbacklogstuck"
+
+      # The relay's own claim failing to complete. Nothing is lost and nothing is
+      # dead-lettered, so no other rule in this file can see it: the outbox simply
+      # stops draining while every gauge that describes the outbox stays healthy.
+      - alert: EventRelayClaimTimingOut
+        # A COUNTER RATE, and > 0 rather than a threshold, because the healthy value is
+        # exactly zero. A claim is a bounded, indexed statement whose measured cost is
+        # single-digit milliseconds; one that runs for its whole 15 second budget and is
+        # cancelled has a plan that has gone wrong, and there is no number of those per
+        # ten minutes that is acceptable. The 10 minute window is long enough that one
+        # timeout is still visible after the tick that produced it, which matters because
+        # a claim that times out claims nothing at all — a relay in this state publishes
+        # NOTHING for as long as it holds, and it recovers by claiming again rather than
+        # by anyone noticing.
+        #
+        # Deliberately not written as a ratio against the total claim rate: a relay whose
+        # every claim times out has no successful claims to divide by, so a ratio would be
+        # undefined in exactly the worst case.
+        expr: rate(blnk_events_relay_claims_total{outcome="timeout"}[10m]) > 0
+        # Two minutes, so a single transient — an autovacuum pass on the outbox table, a
+        # bulk import competing for I/O — does not page, while a plan that has genuinely
+        # regressed does. The rate window already spans ten minutes, so this dwell adds
+        # confirmation rather than delay.
+        for: 2m
+        labels:
+          severity: warning
+          component: event-streaming
+        annotations:
+          summary: "The event relay's outbox claim is timing out, so nothing is being published"
+          description: "One or more event outbox claims on {{ $labels.instance }} were cancelled at their 15 second budget in the last 10 minutes. A cancelled claim returns NO rows, so the relay published nothing for that tick — and because the events are still sitting in the outbox, no dead-letter or lag rule can see it; watch blnk_outbox_pending rising against a flat blnk_events_published_total for the effect. Read the p99 of blnk_events_relay_claim_duration_seconds and the rows-per-claim ratio (blnk_events_relay_claimed_rows_total over blnk_events_relay_claims_total{outcome=\"rows\"}) to see how far the claim has drifted from its normal single-digit milliseconds. The usual causes are a table whose dead-tuple population has outgrown autovacuum, or a very large claimable backlog concentrated on very few partition keys; ANALYZE blnk.event_outbox and confirm the claim is still index-driven before changing anything else."
+          runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#eventrelayclaimtimingout"
 
       # A subscriber falling behind. The events are durably in Kafka and the
       # consumer catches up on its own, so this is degradation, not loss.
@@ -273,7 +349,7 @@ groups:
           component: event-streaming
         annotations:
           summary: "Consumer lag is not being measured for every registered subscriber"
-          description: "The last {{ $labels.job }} lag sweep on {{ $labels.instance }} did not produce a complete reading for every registered subscriber, and has not for 30 minutes. Those subscribers have NO lag series, so SubscriberConsumerLagHigh cannot fire for them however far behind they are. Read blnk_kafka_subscribers_unmeasured to see how many and why, then act on the reason: 'budget' means the registry is larger than one tick can measure, so raise RELAY_SUBSCRIBER_METRICS_BUDGET; 'measure_failed' is a broker or ACL fault; 'registry_failed' means the registry query itself is failing; 'topic_missing' means a row authorises a topic that does not exist, so provision the topic or correct the row; 'unprovisioned' means the row has no topics to measure and is the row's own problem. The event-metrics log line carries registry_size, resume_from and the topic names."
+          description: "The last {{ $labels.job }} lag sweep on {{ $labels.instance }} did not produce a complete reading for every registered subscriber, and has not for 30 minutes. Those subscribers have NO lag series, so SubscriberConsumerLagHigh cannot fire for them however far behind they are. Read blnk_kafka_subscribers_unmeasured to see how many and why, then act on the reason: 'budget' means the registry is larger than one tick can measure, so raise RELAY_SUBSCRIBER_METRICS_BUDGET; 'measure_failed' is a broker or ACL fault; 'registry_failed' means the registry query itself is failing; 'topic_missing' means a row authorises a topic that does not exist, so provision the topic or correct the row; 'unprovisioned' means the row has no topics to measure and is the row's own problem; 'broker_unconfigured' means this deployment has no KAFKA_BROKERS at all, so nothing about these rows can be measured — configure the brokers or delete registry rows the deployment is not using, and note that a deployment with no brokers AND no subscriber rows reports complete coverage and never reaches this rule. The event-metrics log line carries registry_size, resume_from and the topic names."
           runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#subscriberlagcoverageincomplete"
 
       # The settlement pass itself has stopped.

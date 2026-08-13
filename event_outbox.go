@@ -200,7 +200,7 @@ func eventAggregateID(payload interface{}) string {
 // resolveEventPartitionKey picks the Kafka message key and reports WHICH dimension it
 // came from.
 func resolveEventPartitionKey(
-	derived, aggregateID, eventType, ledgerID string,
+	derived, aggregateID, eventType, ledgerID, eventID string,
 ) (string, model.EventKeyDimension) {
 	if derived != "" {
 		if ledgerID != "" && derived == ledgerID {
@@ -214,11 +214,27 @@ func resolveEventPartitionKey(
 		return aggregateID, model.EventKeyDimensionAggregate
 	}
 
-	if eventType != "" {
-		return eventType, model.EventKeyDimensionEventType
+	// THE EVENT TYPE IS THE GATE, NOT THE KEY. An event with no type at all is a producer
+	// defect — it cannot be routed to a category and it describes nothing — so it is
+	// refused by the caller on the empty key returned here. An event that HAS a type but no
+	// aggregate is a different thing entirely and is keyed on itself below.
+	if eventType == "" {
+		return "", model.EventKeyDimensionEvent
 	}
 
-	return "", model.EventKeyDimensionEventType
+	// THE EVENT'S OWN ID, so events with no aggregate SPREAD instead of collapsing onto one
+	// partition. Keying them on the event type instead gave the type a total order at the
+	// cost of a hard per-category throughput ceiling — one key is claimed by one relay
+	// instance and published one message at a time — and that ceiling was measured at 1.00
+	// event per second against an arrival rate far above it, until the backlog was 59% of
+	// the outbox. The order it bought was never meaningful: these events share no
+	// aggregate, so no pair of them has a causal order for a partition to preserve, and a
+	// consumer that wants time order reads occurred_at off the envelope.
+	//
+	// The event id, not a random value: it is already on the row, so a replay of this event
+	// re-publishes under the SAME key and lands on the same partition, and the key stays
+	// reproducible from the stored row rather than being minted twice.
+	return eventID, model.EventKeyDimensionEvent
 }
 
 // eventPartitionKey derives the KAFKA MESSAGE KEY for an event FROM ITS PAYLOAD ALONE.
@@ -418,9 +434,22 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		partitionKey = supplied
 	}
 
+	// THE EVENT ID IS RESOLVED BEFORE THE KEY, because it is the key's last resort. It is
+	// DERIVED when the event has a stable identity and random when it does not, and neither
+	// derivation reads the partition key or the aggregate, so computing it here changes
+	// nothing about its value — only about what is available to the resolution below.
+	eventID := model.NewEventID()
+	if attributes.identity != "" {
+		eventID = model.DeriveEventID(attributes.identity, eventType, model.SchemaVersionV1)
+	} else if identity, derivable := model.EventIdentityFor(eventType, event.Payload); derivable {
+		eventID = model.DeriveEventID(identity, eventType, model.SchemaVersionV1)
+	}
+
 	// THE KEY IS RESOLVED AGAINST A DECLARED DIMENSION, not through an untyped chain.
 	declared := model.KeyDimensionForEventType(eventType)
-	partitionKey, achieved := resolveEventPartitionKey(partitionKey, aggregateID, eventType, ledgerID)
+	partitionKey, achieved := resolveEventPartitionKey(
+		partitionKey, aggregateID, eventType, ledgerID, eventID,
+	)
 	if partitionKey == "" {
 		err := fmt.Errorf(
 			"blnk: event %q carries no ledger, no aggregate and no event type, so no Kafka "+
@@ -464,19 +493,16 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		)
 	}
 
-	// aggregate_id is NOT NULL in the schema and is what consumers group by, so it
-	// inherits the partition key once every payload-derived candidate is exhausted.
+	// aggregate_id is NOT NULL in the schema and is what consumers GROUP BY, so it falls
+	// back to the event TYPE once every payload-derived candidate is exhausted.
+	//
+	// THE TYPE AND NOT THE PARTITION KEY, and the two used to be the same value here. The
+	// key's last resort is now the event's own id, which is unique per row and would make
+	// this column unique per row with it — turning the one field a consumer can group an
+	// unkeyed event stream by into a second copy of its identifier. The type is what these
+	// rows have always recorded, and it is the only grouping they have.
 	if aggregateID == "" {
-		aggregateID = partitionKey
-	}
-
-	// The event id is DERIVED when the event has a stable identity, and random when it
-	// does not.
-	eventID := model.NewEventID()
-	if attributes.identity != "" {
-		eventID = model.DeriveEventID(attributes.identity, eventType, model.SchemaVersionV1)
-	} else if identity, derivable := model.EventIdentityFor(eventType, event.Payload); derivable {
-		eventID = model.DeriveEventID(identity, eventType, model.SchemaVersionV1)
+		aggregateID = eventType
 	}
 
 	outbox := &model.EventOutbox{

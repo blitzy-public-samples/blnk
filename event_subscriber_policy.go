@@ -243,7 +243,15 @@ func requireActiveSubscriber(subscriber *model.EventSubscriber, refusal string) 
 	}
 
 	return apierror.NewAPIError(
-		apierror.ErrConflict,
+		// SUBSCRIBER_DEPROVISIONING, not the generic conflict. Both carry 409 — the request is
+		// well formed and it is the row's state that has to change — but the STATUS is not the
+		// discriminator: registering a duplicate subscriber id answers 409 as well, and the
+		// two call for opposite actions. A duplicate id means pick another one and never
+		// retry; a revocation tombstone means this id is on its way out, so finish or reverse
+		// the deregistration and then retry unchanged. Reported as one code, the two were
+		// distinguishable only by reading the English prose, which is the one thing a client's
+		// error handling cannot do.
+		apierror.ErrSubscriberDeprovisioning,
 		refusal,
 		fmt.Errorf(
 			"event subscriber: subscriber %q carries a revocation tombstone from %s; complete or "+

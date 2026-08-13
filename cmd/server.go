@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"sync"
@@ -276,7 +277,96 @@ func initializeRouter(b *blnkInstance) *gin.Engine {
 		}
 		router.GET("/metrics", middleware.MetricsAuth(secure, token), gin.WrapH(h))
 	}
+
+	registerProfilingRoutes(router)
+
 	return router
+}
+
+// profilingRoutes is the runtime-profiling surface, and the reason it exists is that a
+// counter can say a relay has stopped delivering while only a stack dump can say WHY.
+//
+// A relay that stops draining is the pipeline's worst failure and its least diagnosable
+// one: the process is healthy, the queues are healthy, the database is idle, and the
+// question an operator needs answered — what is this goroutine blocked on — has no answer
+// anywhere in a metric. Measured during testing, a relay spent 504.8 seconds inside one
+// claim with no log line, no error and no counter, and the only way to learn anything
+// about it was to kill the process, which destroys the evidence.
+//
+// Each route maps to one of the runtime's profiles, and the two that answer the questions
+// above are goroutine — every stack, so a blocked one is visible by name — and heap, which
+// is what turns "memory grows" into "these allocation sites".
+var profilingRoutes = []struct {
+	// path is the route, matching the layout net/http/pprof publishes under /debug/pprof so
+	// that `go tool pprof` and every runbook written against it work unchanged.
+	path string
+
+	// handler serves it.
+	handler http.HandlerFunc
+
+	// why states what this profile answers, for the log line that lists the surface.
+	why string
+}{
+	{"/debug/pprof/", pprof.Index, "the index, and the named profiles not listed below"},
+	{"/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP, "every goroutine's stack: what a wedged relay is blocked on"},
+	{"/debug/pprof/heap", pprof.Handler("heap").ServeHTTP, "live allocations by site: what unbounded memory is holding"},
+	{"/debug/pprof/allocs", pprof.Handler("allocs").ServeHTTP, "all allocations since start: what churns"},
+	{"/debug/pprof/block", pprof.Handler("block").ServeHTTP, "blocking profile, empty unless SetBlockProfileRate was raised"},
+	{"/debug/pprof/mutex", pprof.Handler("mutex").ServeHTTP, "mutex contention, empty unless SetMutexProfileFraction was raised"},
+	{"/debug/pprof/threadcreate", pprof.Handler("threadcreate").ServeHTTP, "OS thread creation sites"},
+	{"/debug/pprof/cmdline", pprof.Cmdline, "the process's own command line"},
+	{"/debug/pprof/symbol", pprof.Symbol, "symbol resolution, which go tool pprof requires"},
+	{"/debug/pprof/trace", pprof.Trace, "an execution trace over ?seconds="},
+	{"/debug/pprof/profile", pprof.Profile, "a CPU profile over ?seconds="},
+}
+
+// registerProfilingRoutes publishes the profiling surface behind the metrics credential.
+//
+// GATED EXACTLY LIKE /metrics, and deliberately by the same middleware rather than by one
+// written for this surface: a profile is more sensitive than a counter — a heap dump can
+// carry payload bytes and a command line can carry a DSN — so the surface that discloses
+// more must never be reachable where the surface that discloses less is not. Sharing
+// MetricsAuth means that cannot drift. In secure mode with no token configured, both
+// refuse; outside secure mode with no token, both are open, which is the local-development
+// posture the metrics endpoint already establishes.
+//
+// Parameters:
+//   - router *gin.Engine: the router to register on. Nil is ignored, so a caller that
+//     failed to build one does not panic here.
+func registerProfilingRoutes(router *gin.Engine) {
+	if router == nil {
+		return
+	}
+
+	cfg, _ := config.Fetch()
+
+	var (
+		secure bool
+		token  string
+	)
+
+	if cfg != nil {
+		secure = cfg.Server.Secure
+		token = cfg.Server.MetricsBearerToken
+	}
+
+	guard := middleware.MetricsAuth(secure, token)
+
+	for _, route := range profilingRoutes {
+		// POST as well as GET: `go tool pprof` issues GET, but the trace and profile routes are
+		// commonly driven by tooling that posts, and a 404 on the wrong verb during an incident
+		// is the least useful possible answer.
+		router.GET(route.path, guard, gin.WrapF(route.handler))
+		router.POST(route.path, guard, gin.WrapF(route.handler))
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"routes":        len(profilingRoutes),
+		"authenticated": token != "",
+	}).Info(
+		"runtime profiling is available under /debug/pprof, behind the same credential as /metrics; " +
+			"use /debug/pprof/goroutine?debug=2 for a wedged worker and /debug/pprof/heap for growth",
+	)
 }
 
 func initializeOpenTelemetry(ctx context.Context, monitoringDSN string) (func(context.Context) error, error) {

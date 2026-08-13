@@ -26,6 +26,7 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/model"
@@ -85,6 +86,63 @@ const kafkaAdminDialTimeout = 3 * time.Second
 
 // kafkaAdminIdleTimeout is how long an unused administrative connection is kept open.
 const kafkaAdminIdleTimeout = 30 * time.Second
+
+// kafkaProvisioningPermits bounds how many subscriber-mutating administrative
+// conversations this process has open at once.
+//
+// A KafkaAdminClient is shared, and every mutating subscriber operation is a
+// CONVERSATION rather than a request: an authorizer probe, a credential describe, a
+// credential alter, an ACL describe and an ACL create, each a round trip to the same
+// controller. Left unbounded, the endpoint that starts those conversations inherits the
+// broker's congestion curve, and that curve collapses. Measured on the local
+// single-broker stack, issuing credentials through POST
+// /subscribers/{id}/kafka-credentials:
+//
+//	concurrency   1 -> 11.7 issuances/s, p99 0.098s, 0 failures
+//	concurrency  16 -> 19.1 issuances/s, p99 0.843s, 0 failures
+//	concurrency 120 -> 37.4 issuances/s, p99 2.780s, 0 failures
+//	concurrency 300 ->  5.2 issuances/s, 274 of 300 refused at the budget
+//
+// The broker's administrative service rate tops out below 40/s whatever is offered to
+// it, so past that point extra concurrency buys latency and nothing else — and once the
+// latency passes the five-second requirement budget the requests do not merely fail,
+// they fail HALF-PROVISIONED, each leaving a SCRAM credential at the broker that the
+// registry does not know about. A bound is therefore not a throttle bolted onto a
+// working path; it is what keeps the path working, because a request that waits its turn
+// and then succeeds is strictly better than one that overruns having already written a
+// credential.
+//
+// SIXTEEN IS MEASURED RATHER THAN CHOSEN. The pool size was swept on the same stack,
+// offering 120 issuances at concurrency 16 and then 300 at concurrency 300, and counting
+// what each setting left behind at the broker afterwards:
+//
+//	permits	120 @ c16	300 @ c300	unrevoked credentials / grants / fences
+//	     16	120 ok, p99 1.1s	 82 ok	  0 /   0 /   0
+//	     64	120 ok, p99 0.9s	 84 ok	184 / 180 / 432
+//	    128	120 ok, p99 0.9s	 29 ok	218 / 218 / 542
+//
+// Two things in that table decide the value. Raising the pool buys two more successes out
+// of three hundred, because the ceiling is the broker's administrative service rate and
+// not this process's willingness to wait. And raising it destroys the compensation
+// guarantee outright: with sixty-four forward conversations open the broker is saturated
+// again, so the round trips that UNDO a failed provisioning expire too, and the residue
+// the bound exists to prevent comes straight back. At 128 the collapse itself returns —
+// 29 successes, fewer than the 26 an unbounded client managed.
+//
+// It also matches lagMeasurementConcurrency, the other place in this codebase that
+// decides how many administrative conversations one broker answers promptly, which is
+// some comfort that the number describes the broker rather than this one endpoint.
+const kafkaProvisioningPermits = 16
+
+// kafkaCompensationPermits is the SEPARATE reserve that undoing work draws on.
+//
+// Compensation exists precisely for the moments when provisioning is failing, which are
+// exactly the moments when the forward queue is full. Drawing both from one pool would
+// make the revocation of a credential queue behind the attempts to mint more of them —
+// so the orphan that compensation exists to prevent would be created by the mechanism
+// meant to prevent it. The reserve is small because a compensation is two round trips
+// rather than five, and it is never shared with the forward path.
+const kafkaCompensationPermits = 4
 
 // ErrKafkaAdminNotConfigured is returned by every administrative operation when no
 // brokers are configured.
@@ -222,6 +280,130 @@ type KafkaAdminClient struct {
 	// now is the clock, injectable so cache expiry is testable without sleeping. Nil
 	// means time.Now.
 	now func() time.Time
+
+	// permitOnce builds the two permit pools on first use rather than in NewKafkaAdmin,
+	// because a client assembled as a struct literal — which is how the tests build one —
+	// must be as bounded as one the constructor returned.
+	permitOnce sync.Once
+
+	// provisionPermits bounds forward, subscriber-mutating conversations.
+	provisionPermits *semaphore.Weighted
+
+	// compensationPermits is the separate reserve undoing work draws on, so a compensation
+	// can never queue behind the attempts it is compensating for.
+	compensationPermits *semaphore.Weighted
+}
+
+// kafkaAdminPermitClass names which of the two pools an operation draws from.
+type kafkaAdminPermitClass int
+
+const (
+	// kafkaAdminForward is a conversation that mints or widens access.
+	kafkaAdminForward kafkaAdminPermitClass = iota
+
+	// kafkaAdminCompensating is a conversation that removes or narrows it.
+	kafkaAdminCompensating
+)
+
+// kafkaAdminPermitKey marks a context whose goroutine already holds a permit.
+type kafkaAdminPermitKey struct{}
+
+// admitAdminConversation admits one administrative conversation, waiting for a permit
+// when the pool is full.
+//
+// The permit is REENTRANT through the returned context: a gated operation that calls
+// another gated operation runs inside the permit it already holds rather than waiting
+// for a second one. Without that, a single call chain could wait for a permit it is
+// itself holding, and the deadlock would appear only under load.
+//
+// Parameters:
+//   - ctx context.Context: the caller's context. Its deadline is what bounds the wait,
+//     so a request whose budget expires in the queue is refused having written nothing.
+//   - class kafkaAdminPermitClass: which pool to draw from.
+//
+// Returns:
+//   - context.Context: the context to run the conversation on, marked as holding a
+//     permit.
+//   - func(): releases the permit. Always non-nil, always safe to call once.
+//   - error: the reason no permit could be had, already wrapped. Nothing has been sent to
+//     the broker when this is non-nil.
+func (a *KafkaAdminClient) admitAdminConversation(
+	ctx context.Context,
+	class kafkaAdminPermitClass,
+) (context.Context, func(), error) {
+	if a == nil {
+		return ctx, func() {}, nil
+	}
+
+	// Already inside a permitted conversation, so this is a nested step of it.
+	if held, ok := ctx.Value(kafkaAdminPermitKey{}).(bool); ok && held {
+		return ctx, func() {}, nil
+	}
+
+	pool := a.permits(class)
+
+	waited := time.Now()
+	if err := pool.Acquire(ctx, 1); err != nil {
+		// The queue is where a deployment discovers it is asking for more provisioning than
+		// its broker can serve inside the budget. Logged with what was waited so that the
+		// answer is diagnosable from one line, and returned as an error so the caller refuses
+		// BEFORE its first write rather than after it.
+		logrus.WithFields(logrus.Fields{
+			"admin_permit_class": class.String(),
+			"waited_ms":          time.Since(waited).Milliseconds(),
+			"permits":            permitsForClass(class),
+			"error_class":        kafkaErrorClassField("admin_permit", err),
+		}).Warn(
+			"kafka admin: no administrative permit became available inside the caller's budget, so the " +
+				"operation was refused before anything was written; retry, or provision fewer principals " +
+				"concurrently",
+		)
+
+		return ctx, func() {}, fmt.Errorf(
+			"kafka admin: %s administrative capacity is saturated (%d concurrent conversations); "+
+				"nothing was written: %w", class, permitsForClass(class), err,
+		)
+	}
+
+	var once sync.Once
+
+	release := func() {
+		once.Do(func() { pool.Release(1) })
+	}
+
+	return context.WithValue(ctx, kafkaAdminPermitKey{}, true), release, nil
+}
+
+// permits returns the pool for one class, building both on first use.
+func (a *KafkaAdminClient) permits(class kafkaAdminPermitClass) *semaphore.Weighted {
+	a.permitOnce.Do(func() {
+		a.provisionPermits = semaphore.NewWeighted(kafkaProvisioningPermits)
+		a.compensationPermits = semaphore.NewWeighted(kafkaCompensationPermits)
+	})
+
+	if class == kafkaAdminCompensating {
+		return a.compensationPermits
+	}
+
+	return a.provisionPermits
+}
+
+// permitsForClass reports the size of a class's pool, for the log line and the error.
+func permitsForClass(class kafkaAdminPermitClass) int64 {
+	if class == kafkaAdminCompensating {
+		return kafkaCompensationPermits
+	}
+
+	return kafkaProvisioningPermits
+}
+
+// String names a permit class in a log field and an error message.
+func (c kafkaAdminPermitClass) String() string {
+	if c == kafkaAdminCompensating {
+		return "compensating"
+	}
+
+	return "provisioning"
 }
 
 // cachedAuthorizerProbe is a memoised answer to "does this broker enforce ACLs".

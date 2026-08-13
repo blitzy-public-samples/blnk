@@ -849,8 +849,14 @@ func TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey(t *testing.T) {
 				Payload: fixture.payload,
 			})
 
-			require.Equal(t, fixture.partitionKey, row.PartitionKey,
-				"the fixture's expected partition key must be what the producer stored")
+			if fixture.partitionKeyIsEventID {
+				require.Equal(t, row.EventID, row.PartitionKey,
+					"the fixture expects an event with no aggregate to be keyed on its OWN id, which "+
+						"is what spreads these events across the category's partitions")
+			} else {
+				require.Equal(t, fixture.partitionKey, row.PartitionKey,
+					"the fixture's expected partition key must be what the producer stored")
+			}
 			require.NotEmpty(t, row.PartitionKey,
 				"a blank key would be scattered across partitions with nothing in the data to show it")
 
@@ -873,7 +879,9 @@ func TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey(t *testing.T) {
 				"the bytes handed to kafka.Message.Key must be the resolved key verbatim")
 		})
 
-		if fixture.partitionKey != fixture.aggregateID {
+		// An event keyed on its own id is discriminating BY CONSTRUCTION: its aggregate_id is
+		// the event type and its key is a per-row identifier, so the two can never agree.
+		if fixture.partitionKeyIsEventID || fixture.partitionKey != fixture.aggregateID {
 			discriminating++
 		}
 	}

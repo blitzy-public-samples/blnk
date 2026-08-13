@@ -1332,7 +1332,9 @@ func (s *eventIsolationStore) fencedWriteGuardLocked(
 
 	if requireActive && row.RevocationPendingAt != nil {
 		return apierror.NewAPIError(
-			apierror.ErrConflict,
+			// The code the real datasource answers with for this miss; see the same branch in
+			// database.fencedWriteMissError.
+			apierror.ErrSubscriberDeprovisioning,
 			"This subscriber is being deregistered, so its access model can no longer be changed",
 			fmt.Errorf("event isolation store: subscriber %q carries a revocation tombstone", subscriberID),
 		)

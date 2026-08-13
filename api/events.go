@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/blnkfinance/blnk"
+	authz "github.com/blnkfinance/blnk/api/middleware"
 	"github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	coremodel "github.com/blnkfinance/blnk/model"
@@ -109,8 +110,18 @@ var errEventsRequireMasterKey = errors.New("event management requires master key
 // ensureEventManagementAuthorized enforces the master key on the event management
 // surface. It returns false once it has written the refusal, so a caller must return
 // immediately without touching the response.
+//
+// THE GATE RESOLVES THE CREDENTIAL RATHER THAN READING A FLAG, which is what makes these
+// endpoints reachable with the credential the runbooks name. With secure mode off the auth
+// middleware returns before setting "isMasterKey", so a flag read refused every caller
+// including the master key — and the dead-letter triage and daily reconciliation
+// procedures, which are operated entirely through this surface, could not be run on the
+// shipped local stack at all. authz.MasterKeyRequest keeps the middleware's decision
+// authoritative wherever it made one and falls back to the same constant-time comparison
+// where it made none, so the refusal below still holds for every caller that does not
+// present the key.
 func ensureEventManagementAuthorized(c *gin.Context) bool {
-	if isMasterKeyRequest(c) {
+	if authz.MasterKeyRequest(c) {
 		return true
 	}
 
@@ -277,6 +288,45 @@ type DeadLetterPageResponse struct {
 	TotalCount *int64 `json:"total_count,omitempty"`
 }
 
+// eventFilterTextFromQuery reads one free-text filter value, refusing a value the
+// database cannot be asked to compare.
+//
+// A PostgreSQL text value cannot contain a NUL byte in any encoding, so a filter
+// carrying one aborts the query with SQLSTATE 22021 (data_exception) — which the
+// repository reports, correctly for a driver-origin failure, as an internal error. The
+// refusal therefore has to happen HERE, before the value becomes a query parameter: the
+// value came from the client, so it is a client error, and this endpoint already answers
+// one for an unusable limit, cursor, status and occurrence bound. Answering 500 for the
+// three free-text filters and 400 for everything else made the same class of mistake
+// look like two different kinds of failure, and sent an operator triaging a dead-letter
+// backlog to look for a fault in Blnk.
+//
+// Parameters:
+//   - c *gin.Context: the request, for reading the value and writing the refusal.
+//   - parameter string: the query-parameter name, which the refusal names.
+//
+// Returns:
+//   - string: the trimmed value. Empty when the parameter was absent.
+//   - bool: false once the refusal has been written, in which case the caller must
+//     return immediately without touching the response.
+func eventFilterTextFromQuery(c *gin.Context, parameter string) (string, bool) {
+	value := strings.TrimSpace(c.Query(parameter))
+	if !strings.ContainsRune(value, 0) {
+		return value, true
+	}
+
+	// The value is NOT echoed. It carries a NUL byte, and a log-forging or
+	// terminal-corrupting sequence around it would be echoed with it; naming the
+	// parameter and the byte is what the caller needs to fix it.
+	respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
+		"Invalid %s value: it carries a NUL byte (0x00), which no stored value can contain, so "+
+			"nothing could ever match it. Remove the NUL byte and repeat the request",
+		parameter,
+	), nil)
+
+	return "", false
+}
+
 // deadLetterListOptionsFromQuery reads the page and the filters from the query string,
 // writing the refusal itself when a value is unusable.
 func deadLetterListOptionsFromQuery(c *gin.Context) (blnk.DeadLetterListOptions, bool) {
@@ -305,10 +355,19 @@ func deadLetterListOptionsFromQuery(c *gin.Context) (blnk.DeadLetterListOptions,
 		return blnk.DeadLetterListOptions{}, false
 	}
 
+	eventType, ok := eventFilterTextFromQuery(c, eventQueryParamEventType)
+	if !ok {
+		return blnk.DeadLetterListOptions{}, false
+	}
+
 	return blnk.DeadLetterListOptions{
-		Limit:        limit,
-		Cursor:       cursor,
-		EventType:    strings.TrimSpace(c.Query(eventQueryParamEventType)),
+		Limit:  limit,
+		Cursor: cursor,
+		// event_type and topic are read through eventFilterTextFromQuery; status is not,
+		// because it is checked against a closed set of two values downstream and anything
+		// outside that set — a NUL byte included — is already refused there with the same
+		// code this file would use.
+		EventType:    eventType,
 		Topic:        topic,
 		Status:       strings.TrimSpace(c.Query(eventQueryParamStatus)),
 		OccurredFrom: occurredFrom,
@@ -376,10 +435,21 @@ func deadLetterCursorFromQuery(c *gin.Context) (*coremodel.DeadLetterCursor, boo
 // deadLetterTopicFilterFromQuery resolves the topic filter to an ORIGINAL category
 // topic, which is what the service filters on.
 func deadLetterTopicFilterFromQuery(c *gin.Context) (string, bool) {
-	topic := strings.TrimSuffix(
-		strings.TrimSpace(c.Query(eventQueryParamTopic)), blnk.DeadLetterTopicSuffix)
-	deadLetterTopic := strings.TrimSuffix(
-		strings.TrimSpace(c.Query(eventQueryParamDLTTopic)), blnk.DeadLetterTopicSuffix)
+	// BOTH SPELLINGS ARE READ THROUGH THE SAME GUARD, and each names ITSELF in its
+	// refusal: the two collapse into one filter below, so a message naming "topic" for a
+	// value supplied as dlt_topic would send the caller to a parameter they never sent.
+	rawTopic, ok := eventFilterTextFromQuery(c, eventQueryParamTopic)
+	if !ok {
+		return "", false
+	}
+
+	rawDeadLetterTopic, ok := eventFilterTextFromQuery(c, eventQueryParamDLTTopic)
+	if !ok {
+		return "", false
+	}
+
+	topic := strings.TrimSuffix(rawTopic, blnk.DeadLetterTopicSuffix)
+	deadLetterTopic := strings.TrimSuffix(rawDeadLetterTopic, blnk.DeadLetterTopicSuffix)
 
 	if topic != "" && deadLetterTopic != "" && topic != deadLetterTopic {
 		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(

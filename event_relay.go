@@ -38,9 +38,28 @@ const (
 	defaultEventRelayBatchSize = 100
 
 	// defaultEventRelayPollInterval is how often the relay looks for work when it has
-	// none, matching LineageOutboxProcessor. It is NOT the throughput limit — see
-	// maxEventRelayBatchesPerTick, which lets one tick drain a backlog.
-	defaultEventRelayPollInterval = 1 * time.Second
+	// none. It is NOT the throughput limit — see maxEventRelayBatchesPerTick, which lets one
+	// tick drain a backlog — it is the LATENCY FLOOR, and that is why it does not match
+	// LineageOutboxProcessor's one second while the batch size and the lease do.
+	//
+	// A row captured just after a tick waits until the next one before any work begins, so
+	// the wait is uniform on [0, interval) and contributes interval/2 to the median and very
+	// nearly the whole interval to the tail. Measured end to end at 550 events a second with
+	// a one-second interval, on 165,000 events: capture-to-dispatch p50 0.548s against a
+	// claim-to-acknowledgement p50 of 0.014s — the median event spent 97% of its life waiting
+	// for a tick — and p99 1.484s against the 2-second ceiling V-1 states, with p99.9 already
+	// past it at 2.247s. Nothing was behind: the relay published all 165,000 and finished with
+	// an empty outbox. The ceiling was being consumed by the interval rather than by work.
+	//
+	// At 250ms the same profile leaves a margin of four rather than a fifth, and the cost is
+	// three more claims a second against an empty table. That is affordable precisely because
+	// the claim is bounded — an empty claim is a few index probes, 1ms to 2ms, so the idle
+	// cost of this interval is under 1% of one core. It would NOT have been affordable before
+	// the claim was bounded, which is the reason the two changes belong together.
+	//
+	// Deployments that would rather have the idle quiet than the latency margin can still ask
+	// for it through WithPollInterval; this is the default, not a constraint.
+	defaultEventRelayPollInterval = 250 * time.Millisecond
 
 	// defaultEventRelayLockDuration is the lease a claim takes on its rows, matching
 	// LineageOutboxProcessor. It is the recovery latency after a crash: rows a dead relay
@@ -61,6 +80,19 @@ const (
 	// eventRelayRowPublishBudget is the WORST-CASE wall time ONE row's publish attempt may
 	// take, and it is the only thing that bounds a publish by arithmetic.
 	eventRelayRowPublishBudget = eventWriterWriteTimeout
+
+	// eventRelayClaimBudget bounds ONE claim, and it exists because an unbounded claim is
+	// indistinguishable from a stopped relay. A claim that outgrew its indexes was measured
+	// holding a single statement open for 504 seconds while the relay published nothing,
+	// logged nothing and moved no counter: there was no error to report because nothing had
+	// failed yet.
+	//
+	// It is deliberately many times the poll interval. A claim is a bounded, indexed
+	// statement whose measured cost is single-digit milliseconds, so this is not a
+	// performance knob to tune — it is the wall a pathological plan hits, after which the
+	// relay reports a timeout, counts it, and claims again on the next tick rather than
+	// waiting for the query planner to change its mind.
+	eventRelayClaimBudget = 15 * time.Second
 
 	// eventRelayBackoffMultiplier is the factor the retry delay grows by on each attempt.
 	eventRelayBackoffMultiplier = 2
@@ -156,15 +188,26 @@ func (p relayRetryPolicy) backoffFor(attempt int) time.Duration {
 // of it.
 type eventRelayStore interface {
 	// ClaimPendingEventOutbox claims a batch, oldest occurrence first, taking a lease and
-	// stamping every row with a claim token. It returns at most one row per EFFECTIVE key
-	// — the same key the publisher hashes — across all concurrent relay instances, which
-	// is half of the ordering guarantee.
-	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)
+	// stamping every row with a claim token. Rows sharing an EFFECTIVE key — the same key
+	// the publisher hashes — arrive as a CONTIGUOUS RUN starting at that key's head, and no
+	// other claim, in this process or another, can hold a row of that key at the same time.
+	// That is half of the ordering guarantee; the other half is that the caller publishes a
+	// run sequentially and stops at the first row that does not settle.
+	//
+	// keyCursor rotates which keys a claim offers when the backlog is larger than one
+	// batch. It is a fairness input, not a correctness one: any value returns a correct
+	// claim.
+	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration, keyCursor string) ([]model.EventOutbox, error)
 
 	// MarkEventDispatched moves a claimed row to its success terminal state. It is
 	// conditional on the claim token and CLEARS it, so it must be the last transition the
 	// relay performs on a row.
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error
+	//
+	// settleLegacyLeg records the dual-delivery marker in the SAME update, which is why the
+	// relay no longer spends a statement of its own on it: the marker and the terminal state
+	// are one write. See the implementation for the measured cost of the statement it
+	// replaces and for the crash window it moves.
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord, settleLegacyLeg bool) error
 
 	// MarkEventFailed records one failed attempt, schedules the row's next due instant
 	// from retryAfter, and reports — decided in SQL, so two instances cannot both conclude
@@ -190,8 +233,11 @@ type eventRelayStore interface {
 	// of them can change.
 	MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string, deadLetterLease time.Duration) (model.EventFailureOutcome, error)
 
-	// MarkWebhookDispatched records the legacy leg of the dual-delivery window. It is
-	// conditional on the claim token, so it must run BEFORE MarkEventDispatched clears it.
+	// MarkWebhookDispatched records the legacy leg of the dual-delivery window for a row
+	// that reaches NO terminal transition in the same pass — the repair leg, which finishes
+	// the webhook of a row whose Kafka leg settled on an earlier claim. It is conditional on
+	// the claim token, so it must run before a transition that clears it. The ordinary path
+	// does not use it: there, MarkEventDispatched folds the marker into the terminal write.
 	MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error
 
 	// MarkEventWebhookPending records a Kafka leg that is DONE alongside a legacy webhook
@@ -269,6 +315,21 @@ type EventRelayProcessor struct {
 	running bool
 	mu      sync.Mutex
 
+	// keyCursor is where the claim's rotation walk resumes, and it is guarded by mu because
+	// the loop goroutine advances it while Start and Stop read the fields beside it.
+	//
+	// It exists so that a backlog larger than one batch cannot leave a key unserved. The
+	// claim's age-ordered key sources see the oldest and the newest claimable rows; a key
+	// between the two would be offered by neither until the backlog ahead of it had drained.
+	// Advancing this cursor past the keys each claim returned, and resetting it once a claim
+	// comes back short, sweeps the key space in rotation.
+	//
+	// It is a FAIRNESS input only. A stale, duplicated or reset cursor still produces a
+	// correct claim, which is why it is kept in memory and not persisted: two relay
+	// instances holding different cursors is not a conflict, it is the point — they cover
+	// different regions of the key space instead of contending for the same rows.
+	keyCursor string
+
 	// store is the outbox repository, narrowed to the four methods the relay drives.
 	store eventRelayStore
 
@@ -330,7 +391,10 @@ type eventRelayCatalogueGate interface {
 //
 // Returns:
 //   - *EventRelayProcessor: the configured processor, with the house defaults — batch
-//     size 100, poll interval 1 second, lock duration 30 seconds.
+//     size 100 and lock duration 30 seconds as LineageOutboxProcessor has them, and a
+//     250ms poll interval, which is deliberately shorter than the lineage relay's second
+//     because it is this relay's latency floor and V-1 states a 2-second ceiling. See
+//     defaultEventRelayPollInterval.
 func NewEventRelayProcessor(blnk *Blnk) *EventRelayProcessor {
 	processor := &EventRelayProcessor{
 		blnk:         blnk,
@@ -709,12 +773,76 @@ func (p *EventRelayProcessor) processTick(ctx context.Context) {
 		}
 
 		claimed := p.processBatch(ctx)
-		if claimed < p.batchSize {
-			// A short batch means the claimable set is drained — or that the rows left are
-			// not due yet, which is the same thing for this tick.
+		if claimed == 0 {
+			// NOTHING WAS CLAIMABLE, which is the only condition that ends a tick early.
+			//
+			// It used to end on a SHORT batch — `claimed < p.batchSize` — and that made the
+			// number of distinct claimable keys the throughput ceiling rather than the broker.
+			// A claim offers at most one run per key, so a backlog spread over 25 keys returned
+			// 25 rows, the tick ended, and the relay waited a full poll interval before asking
+			// again: measured at exactly 25 events per second with 25 keys, 80 with 80, and
+			// 1.00 with one. The batch was short because the KEYS were few, not because the
+			// work was done, and the two are not the same thing.
+			//
+			// Chaining on any non-empty claim costs one extra claim per drained backlog — the
+			// one that comes back empty — and that claim is bounded and indexed.
 			return
 		}
 	}
+}
+
+// advanceKeyCursor moves the claim's rotation walk on, from the rows a claim returned.
+//
+// The next claim resumes after the highest effective key this one saw, so the walk sweeps
+// the key space instead of re-offering the same region. A claim that came back SHORT has
+// reached the end of what is claimable, so the cursor resets and the next sweep starts
+// from the beginning of the key space.
+//
+// Parameters:
+//   - rows []model.EventOutbox: the rows the claim returned.
+func (p *EventRelayProcessor) advanceKeyCursor(rows []model.EventOutbox) {
+	highest := ""
+
+	for _, row := range rows {
+		if key := row.EffectiveKey(); key > highest {
+			highest = key
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(rows) == 0 {
+		// NOTHING WAS CLAIMABLE, so the sweep is over. Reset, or the keys BEFORE the cursor
+		// would be stranded until the process restarted.
+		p.keyCursor = ""
+
+		return
+	}
+
+	// Any non-empty claim advances the sweep, and only FORWARD. Taking a lower key would
+	// re-offer a region the walk has already passed, and taking the highest key of a batch
+	// whose oldest rows belong to a lexicographically late key would otherwise do exactly
+	// that.
+	//
+	// A SHORT batch advances too, deliberately. A short claim does not mean the work is
+	// done — it can equally mean another relay instance holds the rows this one was offered,
+	// and in that case advancing is what moves this instance off the region the other is
+	// working and onto keys it can actually claim.
+	if highest > p.keyCursor {
+		p.keyCursor = highest
+	}
+}
+
+// currentKeyCursor reads where the next claim's rotation walk should resume.
+//
+// Returns:
+//   - string: the cursor, or "" to start the sweep from the beginning of the key space.
+func (p *EventRelayProcessor) currentKeyCursor() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.keyCursor
 }
 
 // --------------------------------------------------------------------------- A NOTE ON

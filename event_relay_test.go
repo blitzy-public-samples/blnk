@@ -66,12 +66,22 @@ var errRelayTransient = errors.New("relay test: broker unavailable")
 type relayClaimRecord struct {
 	batchSize    int
 	lockDuration time.Duration
+	// keyCursor is where the relay asked the claim's rotation walk to resume. It is
+	// recorded so a test can assert the relay sweeps the key space instead of re-offering
+	// the same region while a backlog drains.
+	keyCursor string
 }
 
 // relayMarkRecord is one recorded transition: which row, under which claim token.
 type relayMarkRecord struct {
 	id         int64
 	claimToken string
+
+	// settleLegacyLeg is whether the transition was told to fold the dual-delivery marker
+	// into the same UPDATE. Recorded so a test can assert the relay no longer spends a
+	// second statement on the marker, which is the property that removed one row update and
+	// one commit from every published event.
+	settleLegacyLeg bool
 
 	// record is the broker coordinate the transition was given. Recorded so a test can
 	// assert that the relay PERSISTS where the broker put the message — the mapping the
@@ -187,11 +197,15 @@ func newRelayFakeStore(rows ...model.EventOutbox) *relayFakeStore {
 }
 
 // ClaimPendingEventOutbox hands out up to batchSize due rows, stamping one fresh token for
-// the batch exactly as the repository does.
+// the batch exactly as the repository does. keyCursor is recorded rather than applied: the
+// repository uses it to rotate WHICH keys a claim offers, which is a property of the SQL and
+// is asserted against the real database, while the tests here assert what the relay does
+// with the cursor it is handed back.
 func (s *relayFakeStore) ClaimPendingEventOutbox(
 	ctx context.Context,
 	batchSize int,
 	lockDuration time.Duration,
+	keyCursor string,
 ) ([]model.EventOutbox, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -210,7 +224,11 @@ func (s *relayFakeStore) ClaimPendingEventOutbox(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.claims = append(s.claims, relayClaimRecord{batchSize: batchSize, lockDuration: lockDuration})
+	s.claims = append(s.claims, relayClaimRecord{
+		batchSize:    batchSize,
+		lockDuration: lockDuration,
+		keyCursor:    keyCursor,
+	})
 
 	if s.claimErr != nil {
 		return nil, s.claimErr
@@ -266,6 +284,7 @@ func (s *relayFakeStore) MarkEventDispatched(
 	id int64,
 	claimToken string,
 	record model.BrokerRecord,
+	settleLegacyLeg bool,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -275,7 +294,7 @@ func (s *relayFakeStore) MarkEventDispatched(
 	defer s.mu.Unlock()
 
 	s.dispatched = append(s.dispatched, relayMarkRecord{
-		id: id, claimToken: claimToken, record: record,
+		id: id, claimToken: claimToken, record: record, settleLegacyLeg: settleLegacyLeg,
 	})
 
 	if s.dispatchErr != nil {
@@ -805,6 +824,8 @@ func (s *relayFakeStore) expireLeases() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	expired := make([]model.EventOutbox, 0, len(s.inflight))
+
 	for id, row := range s.inflight {
 		if _, done := s.terminal[id]; done {
 			continue
@@ -814,9 +835,26 @@ func (s *relayFakeStore) expireLeases() {
 		row.ClaimToken = ""
 		row.LockedUntil = nil
 		row.NextAttemptAt = time.Time{}
-		s.pending = append(s.pending, row)
+		expired = append(expired, row)
 		delete(s.inflight, id)
 	}
+
+	// SORTED BEFORE THEY GO BACK, because s.inflight is a MAP and its iteration order is
+	// randomised. The real claim returns rows ORDER BY occurred_at ASC, id ASC — that
+	// ordering is what makes a partition key's run contiguous and in sequence — so a fake
+	// that returned recovered rows in map order would hand the relay a batch the database
+	// could never produce, and every ordering assertion made through it would be asserting
+	// against an arbitrary permutation. It made the crash-recovery ordering assertion fail
+	// roughly one run in three, on a relay that was behaving correctly.
+	sort.Slice(expired, func(i, j int) bool {
+		if expired[i].OccurredAt.Equal(expired[j].OccurredAt) {
+			return expired[i].ID < expired[j].ID
+		}
+
+		return expired[i].OccurredAt.Before(expired[j].OccurredAt)
+	})
+
+	s.pending = append(s.pending, expired...)
 }
 
 // retireInflight drops every claimed row's token, which is what a FINISHED batch looks
@@ -1263,12 +1301,29 @@ type relayFakeLegacy struct {
 
 var _ eventRelayLegacyTransport = (*relayFakeLegacy)(nil)
 
+// EnqueueLegacyWebhookDelivery records the enqueue and SUPPRESSES A DUPLICATE FOR THE SAME
+// EVENT, because that is what the real transport does and the difference decides what the
+// dual-delivery tests are able to prove.
+//
+// EnqueueLegacyWebhookDelivery gives asynq a task id derived from the event id and treats
+// ErrTaskIDConflict as success, so a second enqueue of one event is refused by the queue
+// rather than delivered twice. A fake that appended unconditionally would report a duplicate
+// where production has none — and it would do so exactly on the re-claim path a restart takes,
+// which is the path the no-double-delivery guarantee is about.
 func (l *relayFakeLegacy) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.err != nil {
 		return l.err
+	}
+
+	for _, existing := range l.enqueued {
+		if existing.eventID == eventID {
+			// The queue refuses the duplicate and reports success, which is the post-condition
+			// the caller needs: this event's webhook is queued exactly once.
+			return nil
+		}
 	}
 
 	l.enqueued = append(l.enqueued, relayLegacyEnqueue{
@@ -1559,7 +1614,11 @@ func TestNewEventRelayProcessor_UsesTheHouseDefaults(t *testing.T) {
 
 	require.NotNil(t, processor)
 	assert.Equal(t, 100, processor.batchSize, "batch size matches the house relay")
-	assert.Equal(t, 1*time.Second, processor.pollInterval, "poll interval matches the house relay")
+	assert.Equal(t, 250*time.Millisecond, processor.pollInterval,
+		"the poll interval is deliberately SHORTER than the house relay's second: it is this "+
+			"relay's latency floor, and a one-second interval put 0.548s of pure waiting into the "+
+			"median event and left p99.9 past the 2-second ceiling V-1 states with nothing behind. "+
+			"See defaultEventRelayPollInterval for the measurements")
 	assert.Equal(t, 30*time.Second, processor.lockDuration, "lock duration matches the house relay")
 	assert.Equal(t, defaultEventRelayConcurrency, processor.concurrency)
 	assert.NotNil(t, processor.stopCh, "stopCh must exist before Start")
@@ -2299,9 +2358,17 @@ func TestProcessBatch_LogsAClaimFailureAndReportsNoWork(t *testing.T) {
 	assert.Equal(t, logrus.ErrorLevel, entries[0].Level)
 }
 
-// TestProcessTick_ChainsFullBatchesAndStopsOnAShortOne asserts the throughput mechanism: one
-// tick drains the backlog instead of publishing one batch per poll interval.
-func TestProcessTick_ChainsFullBatchesAndStopsOnAShortOne(t *testing.T) {
+// TestProcessTick_ChainsUntilAClaimComesBackEmpty asserts the throughput mechanism: one tick
+// drains the backlog instead of publishing one batch per poll interval.
+//
+// The terminator is an EMPTY claim, not a short one. A short batch does not mean the backlog
+// is drained: the claim is bounded by its key budget and by the claimable prefix of each key,
+// so a backlog of a hundred thousand rows spread over three keys returns a handful of rows per
+// claim while remaining enormous. Ending the tick on the first short batch capped a
+// low-key-spread backlog at one batch per poll interval — the throughput ceiling this test
+// exists to keep closed. The cost of the correct terminator is exactly one additional,
+// empty claim per drained tick.
+func TestProcessTick_ChainsUntilAClaimComesBackEmpty(t *testing.T) {
 	rows := make([]model.EventOutbox, 0, 5)
 	for id := int64(1); id <= 5; id++ {
 		rows = append(rows, relayTransactionRow(id, fmt.Sprintf("evt-%d", id)))
@@ -2316,8 +2383,10 @@ func TestProcessTick_ChainsFullBatchesAndStopsOnAShortOne(t *testing.T) {
 		"one tick must drain the backlog rather than stopping after one batch")
 
 	claims := harness.store.snapshotClaims()
-	assert.Len(t, claims, 3,
-		"two full batches must chain and the short third must end the tick")
+	assert.Len(t, claims, 4,
+		"the tick must chain through the two full batches AND the short third — which under a "+
+			"key-bounded claim carries no information about the remaining backlog — and end only "+
+			"on the fourth, empty claim")
 }
 
 // TestProcessTick_HonoursTheStopSignalBetweenBatches asserts a shutdown is not delayed by up
@@ -3220,14 +3289,17 @@ func TestDualDelivery_EnqueuesTheStoredBytesAndRecordsTheMarker(t *testing.T) {
 	assert.Equal(t, enqueued[0].body, []byte(requests[0].Event.Payload),
 		"both transports must carry identical bytes — they read the same row")
 
-	marks := harness.store.snapshotWebhookMarks()
-	require.Len(t, marks, 1, "the dual-delivery outcome must be recorded on the row")
-	assert.Equal(t, int64(1), marks[0].id)
-	assert.Equal(t, "token-1", marks[0].claimToken,
-		"the marker must be written while the claim is still held")
+	assert.Empty(t, harness.store.snapshotWebhookMarks(),
+		"the marker must ride on the terminal write rather than costing a statement of its own")
 
 	dispatched := harness.store.snapshotDispatched()
 	require.Len(t, dispatched, 1, "the Kafka leg must still reach its terminal state")
+	assert.Equal(t, int64(1), dispatched[0].id)
+	assert.Equal(t, "token-1", dispatched[0].claimToken,
+		"the transition must be written while the claim is still held")
+	assert.True(t, dispatched[0].settleLegacyLeg,
+		"and it must carry the dual-delivery outcome, which is what a re-claim reads to know the "+
+			"webhook is already queued")
 }
 
 // TestDualDelivery_StopsAfterTheSunset asserts the post-sunset state: Kafka is the only
@@ -3305,8 +3377,15 @@ func TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset(t *testin
 			require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 
 			assert.Len(t, harness.legacy.snapshot(), testCase.wantLegacy, testCase.wantExplain)
-			assert.Len(t, harness.store.snapshotWebhookMarks(), testCase.wantMarkings,
-				"the marker must be written exactly when the legacy leg ran")
+			assert.Empty(t, harness.store.snapshotWebhookMarks(),
+				"no standalone marker statement is written on either side of the boundary")
+			dispatchedRows := harness.store.snapshotDispatched()
+			require.Len(t, dispatchedRows, 1)
+			assert.True(t, dispatchedRows[0].settleLegacyLeg,
+				"the terminal write carries the marker on BOTH sides of the sunset: inside the window "+
+					"it records a webhook that is queued, and after it records that none is owed — which "+
+					"is what stops the repair leg hunting for a delivery the window no longer permits")
+			_ = testCase.wantMarkings
 
 			assert.Len(t, harness.publisher.snapshotRequests(), 1,
 				"the Kafka publish happens on both sides of the boundary")
@@ -3331,7 +3410,14 @@ func TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook(t *testing.T)
 
 	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 	require.Len(t, harness.legacy.snapshot(), 1, "the legacy leg ran before the crash")
-	require.Len(t, harness.store.snapshotWebhookMarks(), 1, "and was recorded on the row")
+	firstAttempt := harness.store.snapshotDispatched()
+	require.Len(t, firstAttempt, 1, "the terminal write was attempted")
+	require.True(t, firstAttempt[0].settleLegacyLeg,
+		"carrying the legacy marker, which is where the marker now lives")
+	_, crashTerminal := harness.store.terminalState(1)
+	require.False(t, crashTerminal,
+		"but it FAILED, so nothing durable records either leg — which is exactly the state a "+
+			"restart has to be safe in")
 
 	// The restart: the database is healthy again and the lease has run out.
 	harness.store.mu.Lock()
@@ -3343,10 +3429,12 @@ func TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook(t *testing.T)
 		"a row that never reached a terminal state must be claimable again after its lease")
 
 	assert.Len(t, harness.legacy.snapshot(), 1,
-		"the legacy webhook must NOT be enqueued a second time — webhook_dispatched is the "+
-			"marker that survives the re-claim and prevents it")
-	assert.Len(t, harness.store.snapshotWebhookMarks(), 1,
-		"and a row whose legacy leg is already done must not be re-marked")
+		"the legacy webhook must NOT be delivered a second time. The re-claim DOES re-attempt the "+
+			"enqueue — the crash took the terminal write, so nothing had recorded the leg — and the "+
+			"task identity derived from the event id is what the queue refuses it on. That identity, "+
+			"not the marker, is the guarantee; the marker is only what makes the common case cheap")
+	assert.Empty(t, harness.store.snapshotWebhookMarks(),
+		"and no pass writes a standalone marker statement")
 
 	assert.Len(t, harness.publisher.snapshotRequests(), 2,
 		"the Kafka leg IS republished, and that is the documented at-least-once duplicate; it "+
@@ -3479,22 +3567,31 @@ func TestDualDelivery_LegacyFailuresNeverAffectTheKafkaPath(t *testing.T) {
 			"a deprecated transport failing is a warning, not an error on the new one")
 	})
 
-	t.Run("the marker fails", func(t *testing.T) {
+	t.Run("the standalone marker statement is gone from this path", func(t *testing.T) {
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
 
 		harness := newRelayHarness(t, relayTransactionRow(1, "evt-legacy-mark-failed"))
+		// A marker statement that CANNOT SUCCEED. It used to run here, immediately after the
+		// enqueue, and its failure was reported. The ordinary path no longer writes it — the
+		// terminal transition carries the marker instead — so injecting a failure into it must
+		// change nothing at all. That makes this the regression guard for the per-event cost:
+		// reintroduce the statement and this test fails on the log line it would emit.
 		harness.store.webhookErr = errors.New("relay test: database unavailable")
 
 		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 
 		assert.Len(t, harness.legacy.snapshot(), 1, "the task is enqueued and will be delivered")
-		assert.Len(t, harness.store.snapshotDispatched(), 1, "the Kafka leg still completes")
+		assert.Empty(t, harness.store.snapshotWebhookMarks(),
+			"and no standalone marker was attempted, which is why its injected failure is inert")
 
-		entries := relayEntriesWithMessage(hook, "could not be marked")
-		require.NotEmpty(t, entries)
-		assert.Contains(t, entries[0].Message, "suppressed by the task identity",
-			"the log must state why the missing marker is not a delivery defect")
+		dispatched := harness.store.snapshotDispatched()
+		require.Len(t, dispatched, 1, "the Kafka leg still completes")
+		assert.True(t, dispatched[0].settleLegacyLeg,
+			"and it carries the marker, so the row records the leg in ONE write rather than two")
+
+		assert.Empty(t, relayEntriesWithMessage(hook, "could not be marked"),
+			"nothing may be logged about a marker this path no longer writes")
 	})
 }
 
@@ -3544,12 +3641,14 @@ func TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka(t *testi
 		"THE KAFKA LEG MUST NOT BE REPUBLISHED: its acknowledgement is recorded on the row, so "+
 			"retrying the webhook costs the topic nothing")
 
-	marks := harness.store.snapshotWebhookMarks()
-	require.Len(t, marks, 1, "the legacy leg must be recorded once it is enqueued")
-	assert.Equal(t, int64(1), marks[0].id)
+	assert.Empty(t, harness.store.snapshotWebhookMarks(),
+		"this pass reaches a terminal transition of its own, so the marker rides on it")
 
 	dispatched := harness.store.snapshotDispatched()
 	require.Len(t, dispatched, 1, "and NOW the row is terminal, with both legs done")
+	assert.Equal(t, int64(1), dispatched[0].id)
+	assert.True(t, dispatched[0].settleLegacyLeg,
+		"the terminal write records the legacy leg this pass finally enqueued")
 
 	state, terminal := harness.store.terminalState(1)
 	assert.True(t, terminal)
@@ -3609,8 +3708,9 @@ func TestDualDelivery_RunsEvenWhenTheKafkaPublishFails(t *testing.T) {
 
 	assert.Len(t, harness.legacy.snapshot(), 1,
 		"a Kafka outage must not suppress delivery to subscribers who have not migrated")
-	assert.Len(t, harness.store.snapshotWebhookMarks(), 1,
-		"and the legacy leg must be recorded so the retry does not re-enqueue it")
+	assert.Empty(t, harness.store.snapshotWebhookMarks(),
+		"the marker is not written on this path: the row reaches no success transition to carry it, "+
+			"so the retry re-attempts the enqueue and the task identity refuses the duplicate")
 	assert.Len(t, harness.store.snapshotFailures(), 1, "the Kafka leg still records its failure")
 }
 
@@ -4110,10 +4210,26 @@ func TestEventRelay_CountsEachEventOnceWhenItReachesDispatched(t *testing.T) {
 // the lease the way the database does, restarts, and asserts the honest guarantee: nothing is
 // lost, and the only duplicate is the row that was published but not marked — suppressed at the
 // subscriber on event_id.
+//
+// The four rows share ONE partition key, so they are one run and are published one after
+// another. That makes this test the behavioural proof of the ordering half of the crash
+// guarantee as well: the row whose transition failed is republished later, so the rows BEHIND
+// it must not be published now — otherwise the partition would hold 1, 3, 4 and then 2.
 func TestCrashRecovery_RepublishesOnlyWhatTheCrashLeftUnmarked(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
 	rows := make([]model.EventOutbox, 0, 4)
 	for id := int64(1); id <= 4; id++ {
 		rows = append(rows, relayTransactionRow(id, fmt.Sprintf("evt-%d", id)))
+	}
+
+	// The premise this test's conclusion rests on, asserted rather than assumed: one
+	// partition key across all four rows, so they form one run and one ordering sequence.
+	for _, row := range rows {
+		require.Equal(t, rows[0].EffectiveKey(), row.EffectiveKey(),
+			"the fixture must put every row on ONE partition key, or the run this test is about "+
+				"does not exist and the ordering conclusion below does not follow")
 	}
 
 	harness := newRelayHarness(t, rows...)
@@ -4134,7 +4250,19 @@ func TestCrashRecovery_RepublishesOnlyWhatTheCrashLeftUnmarked(t *testing.T) {
 	harness.processor.processBatch(context.Background())
 
 	firstRun := harness.publisher.publishedIDs()
-	require.Len(t, firstRun, 4, "the batch was claimed, so every row was attempted")
+	require.Equal(t, []string{"evt-1", "evt-2"}, firstRun,
+		"evt-2 was published and its transition failed, so it WILL be published again — and the "+
+			"rest of its run must therefore be left alone. Publishing evt-3 and evt-4 now would "+
+			"put them on the partition ahead of the redelivery of evt-2, which is the "+
+			"per-aggregate ordering this pipeline promises")
+
+	// The abandonment is not silent: an operator reading the log must be able to see that a
+	// run was cut short and how much of it was left.
+	abandoned := relayEntriesWithMessage(hook, "a row of a partition-key run did not settle")
+	require.NotEmpty(t, abandoned, "cutting a run short must be logged")
+	assert.Equal(t, 2, abandoned[0].Data["abandoned_rows"],
+		"the log must name how many rows of the run were left for a later claim")
+	assert.Equal(t, rows[0].EffectiveKey(), abandoned[0].Data["partition_key"])
 
 	// The restart. Rows that never reached a terminal state come back when the lease expires,
 	// which is the mechanism that makes a crashed relay's work recoverable rather than lost.
@@ -4167,6 +4295,19 @@ func TestCrashRecovery_RepublishesOnlyWhatTheCrashLeftUnmarked(t *testing.T) {
 		"a row marked before the crash must not be republished")
 	assert.Equal(t, 2, delivered["evt-2"],
 		"the row published but not marked is exactly the documented at-least-once duplicate")
+
+	// The rows the abandonment protected were delivered exactly once each, AFTER the
+	// redelivery of the row they follow: recovered in full and still in order.
+	assert.Equal(t, 1, delivered["evt-3"],
+		"a row the abandonment held back was never published before the restart, so it must be "+
+			"delivered exactly once by it")
+	assert.Equal(t, 1, delivered["evt-4"],
+		"a row the abandonment held back was never published before the restart, so it must be "+
+			"delivered exactly once by it")
+	assert.Equal(t, []string{"evt-1", "evt-2", "evt-2", "evt-3", "evt-4"},
+		harness.publisher.publishedIDs(),
+		"the partition must hold the run in occurrence order across the crash, with the "+
+			"unmarked row's redelivery as the only repetition")
 
 	assert.Empty(t, harness.deadLetters.snapshotRows(),
 		"a crash must not consume a retry attempt or dead-letter anything")

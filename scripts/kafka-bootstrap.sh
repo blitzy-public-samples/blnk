@@ -74,7 +74,12 @@
 #       conventional container-entrypoint form and lets a compose service declare its
 #       entrypoint once. The command runs only after a successful bootstrap.
 #
-# There are no options to parse - only an optional trailing command. Configuration comes
+#   scripts/kafka-bootstrap.sh --help
+#       Print the above, every variable this script reads, and exit 0. Answered before the
+#       Kafka CLI is looked for, so the question can be asked anywhere.
+#
+# Apart from -h/--help there are no options - only an optional trailing command, and an
+# argument that LOOKS like an option is refused rather than run as one. Configuration comes
 # from the environment; see the configuration block below.
 #
 # REQUIRED CONFIGURATION
@@ -1025,7 +1030,81 @@ bootstrap_storage() {
 # Entry point
 # ---------------------------------------------------------------------------------------
 
+# usage prints what this script does, how it is invoked and every variable it reads.
+#
+# IT EXISTS BECAUSE ASKING WAS ANSWERED WITH THE WRONG FAILURE. `--help` used to fall
+# through into detect_storage_cli and exit 1 with "neither 'kafka-storage' nor
+# 'kafka-storage.sh' could be found" - true of the host asking the question, and no answer to
+# it. A script whose entire interface is an environment contract has to be able to state that
+# contract, and the state of the host's PATH must not decide whether it can.
+usage() {
+    printf '%s\n' "Usage: scripts/kafka-bootstrap.sh [-h|--help] [command [argument ...]]"
+    printf '%s\n' ""
+    printf '%s\n' "Formats Kafka KRaft storage and seeds the administrative SCRAM credential into the"
+    printf '%s\n' "cluster metadata log in the SAME operation, which is the only way the first"
+    printf '%s\n' "credential can exist: a KRaft broker cannot authenticate a SASL client until one is"
+    printf '%s\n' "already in the log, and the runtime command that would add one needs an"
+    printf '%s\n' "authenticated connection. Run it BEFORE the broker's first start."
+    printf '%s\n' ""
+    printf '%s\n' "Idempotent: already-formatted storage is detected and skipped, never treated as an"
+    printf '%s\n' "error, so it is safe on every bring-up."
+    printf '%s\n' ""
+    printf '%s\n' "With no arguments it formats, reports and exits 0, and the caller starts the broker."
+    printf '%s\n' "With a trailing command it replaces itself with that command after a successful"
+    printf '%s\n' "bootstrap - the conventional container-entrypoint form, and it takes that step on the"
+    printf '%s\n' "already-formatted path too:"
+    printf '%s\n' ""
+    printf '%s\n' "  scripts/kafka-bootstrap.sh kafka-server-start.sh /etc/kafka/server.properties"
+    printf '%s\n' ""
+    printf '%s\n' "There are no options beyond -h/--help. Everything else is configured through the"
+    printf '%s\n' "environment, and the header of this file documents each variable at its point of use:"
+    printf '%s\n' ""
+    printf '  %-27s %s\n' "KAFKA_SASL_ADMIN_USER" "(required, no default) the principal to seed"
+    printf '  %-27s %s\n' "KAFKA_SASL_ADMIN_SECRET" "(required, no default) its password"
+    printf '  %-27s %s\n' "KAFKA_SCRAM_ITERATIONS" "4096, which is also the minimum"
+    printf '  %-27s %s\n' "KAFKA_CLUSTER_ID" "(unset) generated when absent; pin to reproduce"
+    printf '  %-27s %s\n' "KAFKA_KRAFT_CONFIG" "(unset) auto-detected from known image layouts"
+    printf '  %-27s %s\n' "KAFKA_LOG_DIRS" "(unset) falls back to log.dirs, then a default"
+    printf '%s\n' ""
+    printf '%s\n' "Both credential values must be drawn from the safe alphabet described in this file's"
+    printf '%s\n' "header: Kafka's --add-scram grammar has no escape sequence, so a value carrying a"
+    printf '%s\n' "comma or a bracket is refused rather than silently truncated."
+    printf '%s\n' ""
+    printf '%s\n' "Runtime per-subscriber principals are NOT created here. They are added once the"
+    printf '%s\n' "broker is up, by scripts/kafka-provision.sh locally and by the Go admin client in"
+    printf '%s\n' "production. The order is: bootstrap, then broker, then provisioning."
+}
+
+# parse_arguments answers -h/--help/help and refuses an unrecognised OPTION, leaving anything
+# else alone: a trailing command is this script's documented second form, and it is passed
+# through untouched. Only the FIRST argument is inspected, because everything after it belongs
+# to that command rather than to this script.
+#
+# An unrecognised option is refused rather than exec'd. `scripts/kafka-bootstrap.sh --dry-run`
+# would otherwise be handed to the shell as a command name and fail as "not found", which
+# reads like a broken image rather than a flag this script does not have.
+parse_arguments() {
+    case "${1:-}" in
+        -h | --help | help )
+            usage
+            exit 0
+            ;;
+        -* )
+            usage >&2
+            die "unrecognised option '${1}'." \
+                "This script takes -h/--help and an optional trailing COMMAND to run after a" \
+                "successful bootstrap; it has no other options, and everything else is" \
+                "configured through the environment as the usage above lists." \
+                "No storage has been touched."
+            ;;
+    esac
+}
+
 main() {
+    # BEFORE ANYTHING ELSE, including CLI detection: asking what this script does must not
+    # depend on whether the host it is asked on has a Kafka distribution installed.
+    parse_arguments "$@"
+
     log "bootstrapping Kafka KRaft storage for Blnk event streaming"
 
     detect_storage_cli

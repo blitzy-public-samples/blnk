@@ -333,6 +333,44 @@ generate_kafka_secret() {
     exit 1
 }
 
+# Generate the PostgreSQL password.
+#
+# ALPHANUMERIC, AND THAT IS A REQUIREMENT RATHER THAN A PREFERENCE. This value reaches
+# PostgreSQL two ways: the postgres service reads POSTGRES_PASSWORD directly, and both
+# Compose files interpolate it into the USERINFO of the DSN they hand the application when
+# BLNK_DATA_SOURCE_DNS is empty - which is the shipped state. A URL's userinfo cannot
+# carry "/", "@", "?" or "#" un-encoded, and net/url rejects the result, so the previous
+# `openssl rand -base64 15` produced a password the derived DSN could not express roughly
+# one run in four: the database came up with it, and the ledger could not parse its way to
+# the database. Dropping to 62 characters from base64's 64 costs about a tenth of a bit
+# per character and the length below more than covers it.
+#
+# 24 characters of A-Za-z0-9 is a little over 142 bits, above the 120 bits the previous
+# 20-character base64 value carried.
+postgres_password_characters=24
+
+generate_postgres_password() {
+    local secret="" attempt=0
+
+    while [ "${attempt}" -lt 100 ]
+    do
+        attempt=$((attempt + 1))
+        # Twice the bytes asked for, because the filter discards everything outside the
+        # alphabet and a short draw would otherwise silently shorten the password.
+        secret="$(openssl rand -base64 $((postgres_password_characters * 2)) | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c "${postgres_password_characters}" || true)"
+
+        if [ "${#secret}" -eq "${postgres_password_characters}" ]
+        then
+            printf '%s' "${secret}"
+            return 0
+        fi
+    done
+
+    printf "Could not generate a %s-character alphanumeric PostgreSQL password after %s attempts.\n" "${postgres_password_characters}" "${attempt}" >&2
+    printf "This means 'openssl rand' is not producing usable entropy on this host. Nothing has been written.\n" >&2
+    exit 1
+}
+
 # It is deleted rather than wired up, and its one genuine advantage was carried across
 # first: it tried BSD's `stat -f '%Lp'` as well as GNU's `stat -c '%a'`, so
 # enforce_env_permissions now tries both. Nothing was lost with it.
@@ -1345,7 +1383,12 @@ main() {
                 # password into sed's world-readable argv and depended on GNU sed's
                 # in-place extension. One writer for every credential means one place
                 # where that is fixed, and it already is - see write_env_substitution.
-                POSTGRES_PASSWORD=$(openssl rand -base64 15)
+                #
+                # GENERATED FROM THE URL-SAFE ALPHABET, through the helper that explains
+                # why: both Compose files derive the application's DSN from this value
+                # when BLNK_DATA_SOURCE_DNS is empty, and a base64 password carrying "/"
+                # cannot be expressed in a URL's userinfo.
+                POSTGRES_PASSWORD=$(generate_postgres_password)
                 set_env_value "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD" >/dev/null
                 # The Kafka administrative principal and its password, generated the
                 # same way and for the same reason: one credential per stack, created

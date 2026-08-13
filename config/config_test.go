@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -5160,4 +5161,197 @@ func TestResolveWebhookDeprecationWindow_AcceptsTheRetiredSentinel(t *testing.T)
 				cnf.WebhookDeprecationSunsetDate)
 		}
 	})
+}
+
+// envExampleAssignment is one uncommented `KEY=value` line of the repository's
+// .env.example, with the line number so a failure names the line to edit.
+type envExampleAssignment struct {
+	Key   string
+	Value string
+	Line  int
+}
+
+// readEnvExampleAssignments parses the repository's .env.example the way a shell does
+// when the documented `set -a; . ./.env; set +a` sources it: comment lines and blank
+// lines are skipped, everything else is a KEY=value assignment, and a blank value is an
+// assignment to the empty string rather than an absent variable.
+//
+// Parameters:
+//   - t *testing.T: the test. A template that cannot be read fails it, because every
+//     host-run command in the documentation starts by copying this file.
+//
+// Returns:
+//   - []envExampleAssignment: every assignment, in file order.
+func readEnvExampleAssignments(t *testing.T) []envExampleAssignment {
+	t.Helper()
+
+	// The config package lives one level below the repository root, which is where the
+	// template is.
+	contents, err := os.ReadFile(filepath.Join("..", ".env.example"))
+	require.NoError(t, err, ".env.example must be readable: it is the documented starting point "+
+		"for every host-run command in docs/ and tests/loadtest/")
+
+	assignments := make([]envExampleAssignment, 0, 96)
+	for number, raw := range strings.Split(string(contents), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+
+		assignments = append(assignments, envExampleAssignment{
+			Key:   strings.TrimSpace(key),
+			Value: strings.TrimSpace(value),
+			Line:  number + 1,
+		})
+	}
+
+	require.NotEmpty(t, assignments, ".env.example must declare assignments")
+
+	return assignments
+}
+
+// configurationEnvFieldKinds maps every envconfig key the Configuration tree declares to
+// the reflect.Kind envconfig will parse a value into, following pointers and resolving
+// time.Duration to its own name rather than to Int64.
+//
+// Returns:
+//   - map[string]string: envconfig key -> the type envconfig has to parse, as a word a
+//     failure message can use.
+func configurationEnvFieldKinds() map[string]string {
+	kinds := make(map[string]string, 128)
+
+	var walk func(reflect.Type)
+	walk = func(typ reflect.Type) {
+		if typ.Kind() != reflect.Struct {
+			return
+		}
+
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			fieldType := field.Type
+			for fieldType.Kind() == reflect.Ptr {
+				fieldType = fieldType.Elem()
+			}
+
+			if tag := field.Tag.Get("envconfig"); tag != "" {
+				switch {
+				case fieldType == reflect.TypeOf(time.Duration(0)):
+					kinds[tag] = "duration"
+				case fieldType.Kind() == reflect.Bool:
+					kinds[tag] = "bool"
+				case fieldType.Kind() >= reflect.Int && fieldType.Kind() <= reflect.Uint64:
+					kinds[tag] = "integer"
+				case fieldType.Kind() == reflect.Float32 || fieldType.Kind() == reflect.Float64:
+					kinds[tag] = "number"
+				default:
+					kinds[tag] = "string"
+				}
+			}
+
+			// Nested configuration blocks carry their own tagged fields.
+			if fieldType.Kind() == reflect.Struct && fieldType != reflect.TypeOf(time.Time{}) {
+				walk(fieldType)
+			}
+		}
+	}
+
+	walk(reflect.TypeOf(Configuration{}))
+
+	return kinds
+}
+
+// TestEnvExampleTemplate_ShipsNoBlankTypedAssignment is the structural half of the guard:
+// no boolean, numeric or duration key may be shipped as a BLANK assignment.
+//
+// The template is the documented starting point for every host-run command in this
+// repository, and the documented way to load it is `set -a; . ./.env; set +a`. A blank
+// assignment is therefore an assignment to the EMPTY STRING, not an absent variable — and
+// an empty string is not a valid bool, int, float or duration, so envconfig refuses it
+// instead of falling back to the default. It happened: BLNK_SERVER_SSL,
+// BLNK_RATE_LIMIT_RPS, BLNK_RATE_LIMIT_BURST and BLNK_RATE_LIMIT_CLEANUP_INTERVAL_SEC all
+// shipped blank under comments promising that blank meant "accept the default", and every
+// documented host-run command died on the first of them with
+// the empty-string parse failure envconfig reports. Container deployments never saw it,
+// because a Compose
+// environment block forwards only the keys it names and supplies its own defaults — which
+// is exactly why nothing in CI caught it.
+//
+// The remedy the file now uses is to ship such a key COMMENTED OUT with its default named,
+// and this test is what keeps the next one from being added blank instead.
+func TestEnvExampleTemplate_ShipsNoBlankTypedAssignment(t *testing.T) {
+	kinds := configurationEnvFieldKinds()
+
+	for _, assignment := range readEnvExampleAssignments(t) {
+		if assignment.Value != "" {
+			continue
+		}
+
+		kind, declared := kinds[assignment.Key]
+		if !declared || kind == "string" {
+			// Not read by the typed configuration tree, or read as a string, for which the
+			// empty value is a legitimate "unset".
+			continue
+		}
+
+		t.Errorf(".env.example:%d ships %s as a BLANK assignment, but the configuration reads it "+
+			"as a %s. Sourcing the file then sets it to the empty string, which is not a valid %s, "+
+			"and the process refuses to start instead of taking the default. Ship it commented out "+
+			"with its default named instead: #%s=<default>",
+			assignment.Line, assignment.Key, kind, kind, assignment.Key)
+	}
+}
+
+// TestEnvExampleTemplate_LoadsIntoAHostProcess is the behavioural half: the template,
+// sourced whole into the environment, must produce a configuration that LOADS.
+//
+// This is the assertion the four blank typed assignments failed. It goes through the real
+// loader — envconfig, the prefixed aliases, the event-streaming overlay and every default
+// setter — so it fails for any future template value the runtime would reject, not only
+// for the empty-string class the test above covers structurally.
+//
+// The two DSNs are supplied here rather than read from the template because the template
+// ships them empty ON PURPOSE: they are the deployment's own addresses, and the loader
+// requires them. Everything else comes from the file exactly as a shell would set it.
+func TestEnvExampleTemplate_LoadsIntoAHostProcess(t *testing.T) {
+	clearEventStreamingEnv(t)
+	clearBlnkPrefixedEnv(t)
+	restoreConfigStore(t)
+
+	for _, assignment := range readEnvExampleAssignments(t) {
+		// A quoted value is unquoted by the shell before the process sees it.
+		value := strings.Trim(assignment.Value, `"'`)
+		t.Setenv(assignment.Key, value)
+	}
+
+	// What a host run must always supply, and what the template deliberately leaves empty.
+	t.Setenv("BLNK_DATA_SOURCE_DNS", "postgres://blnk.invalid:5432/blnk?sslmode=disable")
+	t.Setenv("BLNK_REDIS_DNS", "blnk.invalid:6379")
+
+	// A path that does not exist, so the loader takes the environment-only route a host
+	// process without blnk.json takes.
+	require.NoError(t, InitConfig(filepath.Join(t.TempDir(), "no-such-config.json")),
+		"the shipped .env.example must produce a loadable configuration when it is sourced into "+
+			"a shell, which is how every host-run command in the documentation reads it")
+
+	cnf, err := Fetch()
+	require.NoError(t, err)
+
+	// The defaults the template's own comments promise for the keys that used to ship blank.
+	assert.False(t, cnf.Server.SSL,
+		"the template must leave in-process TLS off by default")
+	require.NotNil(t, cnf.RateLimit.RequestsPerSecond,
+		"the rate limit must resolve to the shipped default rather than staying unset")
+	assert.InDelta(t, 2000.0, *cnf.RateLimit.RequestsPerSecond, 0.001,
+		"and it must be the 2000 rps the template documents")
+	require.NotNil(t, cnf.RateLimit.Burst)
+	assert.Equal(t, 4000, *cnf.RateLimit.Burst,
+		"with the burst of 4000 the template documents")
+	require.NotNil(t, cnf.RateLimit.CleanupIntervalSec)
+	assert.Equal(t, 10800, *cnf.RateLimit.CleanupIntervalSec,
+		"and the 10800-second sweep interval the template documents")
 }

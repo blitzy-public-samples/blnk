@@ -63,7 +63,25 @@ func (cnf *Configuration) setKafkaDefaults() {
 		)
 		cnf.Kafka.MetricsSubscriberBudget = MaxMetricsSubscriberBudget
 	}
+	// ANNOUNCED WHEN IT CHANGES THE LIST, once and here rather than inside the helper, which
+	// several readers call. A repeat is almost always a copy-and-paste in a broker list or two
+	// sources of the same address concatenated, and the operator's evidence that it happened is
+	// otherwise a broker count that quietly disagrees with the value they set.
+	declaredBrokers := len(cnf.Kafka.Brokers)
 	cnf.Kafka.Brokers = normalizeBrokers(cnf.Kafka.Brokers)
+	if dropped := declaredBrokers - len(cnf.Kafka.Brokers); dropped > 0 {
+		logrus.WithFields(logrus.Fields{
+			"declared": declaredBrokers,
+			"applied":  len(cnf.Kafka.Brokers),
+			"dropped":  dropped,
+			"variable": "KAFKA_BROKERS",
+		}).Warn(
+			"KAFKA_BROKERS declared entries that are blank or repeat an address already in the " +
+				"list; the duplicates and blanks have been dropped. A bootstrap list is a set of " +
+				"seeds for discovering the cluster, so a repeated address adds no broker — and a " +
+				"count that includes repeats makes a single-broker deployment read like a quorum",
+		)
+	}
 	// NOT DEFAULTED TO Brokers, deliberately. Falling back would hand every subscriber
 	// Blnk's internal broker addresses in a 200 response, which is the failure
 	// SubscriberBrokers exists to prevent; issuance refuses instead. Normalised the same
@@ -650,19 +668,33 @@ func saslEnvNames(role string) (userVar, secretVar string) {
 	return "KAFKA_SASL_USER", "KAFKA_SASL_SECRET"
 }
 
-// normalizeBrokers trims surrounding whitespace from each broker address and drops
-// empty entries, preserving the configured order.
+// normalizeBrokers trims surrounding whitespace from each broker address, drops empty
+// entries, and drops REPEATS, preserving the order of first appearance.
+//
+// DE-DUPLICATION IS NOT TIDINESS HERE. A bootstrap list is a set of seeds a client dials
+// to discover the cluster, so "localhost:9092,localhost:9092,localhost:9092" describes one
+// broker three times. Left as three entries it was reported as three - `broker_count=3` in
+// the publisher's start-up line, on a single-broker stack - which is the one number an
+// operator reads to confirm the cluster they think they configured, and it is also the
+// figure that makes a one-broker deployment look like a quorum in a log. The same reading
+// applies to brokerListsEqual: two lists naming the same endpoints are the same list
+// whatever their repeats, which is what the key-scope gateway comparison means to ask.
 func normalizeBrokers(brokers []string) []string {
 	if len(brokers) == 0 {
 		return brokers
 	}
 
+	seen := make(map[string]struct{}, len(brokers))
 	normalized := make([]string, 0, len(brokers))
 	for _, broker := range brokers {
 		broker = strings.TrimSpace(broker)
 		if broker == "" {
 			continue
 		}
+		if _, already := seen[broker]; already {
+			continue
+		}
+		seen[broker] = struct{}{}
 		normalized = append(normalized, broker)
 	}
 	return normalized

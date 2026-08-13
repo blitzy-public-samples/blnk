@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/blnkfinance/blnk"
+	authz "github.com/blnkfinance/blnk/api/middleware"
 	"github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/logsafe"
@@ -150,8 +151,13 @@ var errSubscribersRequireMasterKey = errors.New("subscriber management requires 
 
 // ensureSubscriberManagementAuthorized enforces the master key on the subscriber
 // management surface, writing the refusal itself when the caller does not hold it.
+//
+// It resolves the credential through authz.MasterKeyRequest rather than reading the
+// context flag directly, for the reason ensureEventManagementAuthorized sets out: with
+// secure mode off nothing sets that flag, so the whole surface refused the very credential
+// its documentation names. The refusal is unchanged for a caller that does not present it.
 func ensureSubscriberManagementAuthorized(c *gin.Context) bool {
-	if isMasterKeyRequest(c) {
+	if authz.MasterKeyRequest(c) {
 		return true
 	}
 

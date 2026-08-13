@@ -769,7 +769,13 @@ func TestDualDelivery_EveryEventTypeCarriesIdenticalBytesOnBothTransports(t *tes
 			assert.Equal(t, fixture.topic, observation.row.Topic,
 				"%q must route to %s", fixture.eventType, fixture.topic)
 			assert.Equal(t, fixture.aggregateID, observation.row.AggregateID)
-			assert.Equal(t, fixture.partitionKey, observation.row.PartitionKey)
+			if fixture.partitionKeyIsEventID {
+				assert.Equal(t, observation.row.EventID, observation.row.PartitionKey,
+					"an event with no aggregate is keyed on its OWN id, and BOTH transports read that "+
+						"one row — so the key cannot differ between them however it was derived")
+			} else {
+				assert.Equal(t, fixture.partitionKey, observation.row.PartitionKey)
+			}
 
 			// The two-key envelope, asserted as a byte PREFIX rather than through a decode:
 			// the outer object is {"event": ..., "data": ...} in that order, which is what an
@@ -943,8 +949,16 @@ func TestDualDelivery_BothLegsAreDrivenFromTheSameClaimedRow(t *testing.T) {
 	assert.Equal(t, 1, harness.queuedTaskCount(),
 		"one row must produce exactly one queued legacy delivery")
 
-	marks := harness.store.snapshotWebhookMarks()
+	// THE LEG IS RECORDED BY THE TERMINAL WRITE, not by a marker statement of its own: the
+	// relay folds webhook_dispatched into MarkEventDispatched so a published event costs one
+	// row update instead of two. What the row must end up saying is unchanged.
+	assert.Empty(t, harness.store.snapshotWebhookMarks(),
+		"the ordinary path must not spend a second statement on the marker")
+
+	marks := harness.store.snapshotDispatched()
 	require.Len(t, marks, 1, "the legacy leg must be recorded on the row, or a re-claim re-enqueues it")
+	assert.True(t, marks[0].settleLegacyLeg,
+		"the terminal write must carry the legacy marker for a row whose webhook is on the queue")
 	assert.Equal(t, dualDeliveryOutboxRowID, marks[0].id, "recorded on the row that was claimed")
 	assert.Equal(t, dualDeliveryFirstClaimToken, marks[0].claimToken,
 		"recorded under the claim still held; MarkEventDispatched clears the token, so the marker "+
@@ -1126,7 +1140,12 @@ func TestDualDelivery_SunsetVerdictComesFromConfiguration(t *testing.T) {
 		assertTransportsCarryIdenticalBytes(t, observation, event)
 		assert.Equal(t, 1, httpmock.GetTotalCallCount(),
 			"the legacy transport is still live while the sunset is in the future")
-		assert.Len(t, harness.store.snapshotWebhookMarks(), 1)
+		assert.Empty(t, harness.store.snapshotWebhookMarks(),
+			"the marker rides on the terminal write; a standalone one is the per-event cost this fold removed")
+		insideWindowDispatch := harness.store.snapshotDispatched()
+		require.Len(t, insideWindowDispatch, 1)
+		assert.True(t, insideWindowDispatch[0].settleLegacyLeg,
+			"and the terminal write must record the leg, or a re-claim would look for a webhook that is queued")
 	})
 
 	// The four cases below are all POST-SUNSET, reached four different ways, and all must behave

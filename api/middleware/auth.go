@@ -194,6 +194,19 @@ func (m *AuthMiddleware) Authenticate() gin.HandlerFunc {
 			return
 		}
 
+		// AND FOR THE PROFILING SURFACE, for the same reason and behind the same credential.
+		// Skipping X-Blnk-Key here is not opening the surface: /debug/pprof is registered with
+		// MetricsAuth, which is the one that actually admits or refuses, and it is deliberately
+		// the SAME middleware the metrics endpoint uses. Without this branch the profiles would
+		// answer 401 AUTH_MISSING_API_KEY to a caller holding the metrics bearer token, which is
+		// the credential the runbook tells an operator to use — so the surface would exist and
+		// be unreachable exactly when it is needed.
+		if c.Request != nil && c.Request.URL != nil &&
+			strings.HasPrefix(c.Request.URL.Path, "/debug/pprof") {
+			c.Next()
+			return
+		}
+
 		// Check if secure mode is enabled
 		conf, err := config.Fetch()
 		if err == nil && conf != nil && !conf.Server.Secure {
@@ -284,4 +297,70 @@ func (m *AuthMiddleware) Authenticate() gin.HandlerFunc {
 // extractKey retrieves the authentication key from the X-Blnk-Key header.
 func extractKey(c *gin.Context) string {
 	return c.GetHeader(KeyHeader)
+}
+
+// MasterKeyRequest reports whether this request is authenticated as the deployment's
+// MASTER KEY — the credential the privileged management surfaces are gated on.
+//
+// Authenticate sets the "isMasterKey" context value when it recognises the master key, so
+// that value is authoritative WHENEVER IT IS PRESENT: a middleware that has already
+// decided must not be second-guessed, and a test that sets it deliberately must keep
+// deciding.
+//
+// THE FALLBACK EXISTS BECAUSE THERE IS A PATH ON WHICH NOTHING DECIDES. With secure mode
+// off, Authenticate returns before comparing anything — authentication is disabled, so
+// every route is open — and the context value is therefore never set. The management
+// handlers read it and refused, which made the entire /events and /subscribers surface
+// answer 403 AUTH_MASTER_KEY_REQUIRED on the shipped Compose default, with the correct
+// master key presented, and left the dead-letter triage and daily reconciliation runbooks
+// unexecutable on a local stack. That is a reachability defect rather than a security
+// property: the response was the same for the master key and for no key at all.
+//
+// So when nothing has decided, the presented key is compared against the configured
+// master key with the SAME constant-time comparison Authenticate uses. This cannot widen
+// access anywhere:
+//
+//   - It only ever returns true for a caller that presents the configured master key, so
+//     it can only agree with the comparison Authenticate would have made.
+//   - It stays FAIL-CLOSED when no key is presented, when no master key is configured, or
+//     when the key does not match — a caller without the credential is refused in insecure
+//     mode exactly as it is in secure mode.
+//
+// Parameters:
+//   - c *gin.Context: the request. A nil context, or one with no request, is not a master
+//     key request.
+//
+// Returns:
+//   - bool: true only for a request carrying the deployment's master key.
+func MasterKeyRequest(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+
+	if value, decided := c.Get("isMasterKey"); decided {
+		isMaster, _ := value.(bool)
+
+		return isMaster
+	}
+
+	if c.Request == nil {
+		return false
+	}
+
+	// Read through the same accessor Authenticate uses, so the header this compares is the
+	// header the middleware would have compared.
+	presented := extractKey(c)
+	if presented == "" {
+		return false
+	}
+
+	conf, err := config.Fetch()
+	if err != nil || conf == nil || conf.Server.SecretKey == "" {
+		// No configured master key means no request can be one. A deployment that has not set
+		// BLNK_SERVER_SECRET_KEY has no master credential to present, and treating an
+		// unconfigured secret as a match would open the surface to any caller at all.
+		return false
+	}
+
+	return subtle.ConstantTimeCompare([]byte(conf.Server.SecretKey), []byte(presented)) == 1
 }

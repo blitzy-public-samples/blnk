@@ -12,6 +12,16 @@ CLAUDE.md
 __pycache__
 tests/loadtest/*.json
 tests/loadtest/*.ndjson
+# Compressed raw streams. `NDJSON_OUT=...gz` is the documented way to keep a long run's
+# per-request detail, because k6 gzips a destination whose name asks for it — so the same
+# artifact the two globs above already ignore arrives under a third extension. Without this
+# the recommended form is the only one that leaves the tree dirty, which reads as the
+# recommendation being wrong.
+tests/loadtest/*.gz
+# In-flight artifacts. run_case.sh writes k6's output to a `.partial.<pid>-<epoch>.` marked
+# name and promotes it only after a clean exit, removing it on EXIT, INT and TERM. A SIGKILL
+# outruns those traps, and a surviving temporary must not be stageable as a result.
+tests/loadtest/.partial.*
 
 # Rendered Kubernetes manifests, produced by `make k8s_render` / scripts/k8s-preflight.sh
 # --render. These are COPIES of infrastructure/k8s-manifests with the application image
@@ -26,3 +36,4 @@ tests/loadtest/*.ndjson
 # see them even mid-run; they are listed here so an interrupted run cannot leave one staged.
 /alerts/tests/.configmap-projection.yml
 /alerts/tests/.configmap-projection_test.yml
+/alerts/tests/.configmap-infra-projection.yml

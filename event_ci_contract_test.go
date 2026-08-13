@@ -661,3 +661,258 @@ func TestDependencies_YAMLParsingStaysTestOnly(t *testing.T) {
 			"in production is a dependency contract nobody can read off the manifest",
 		strings.Join(offending, ", "))
 }
+
+// makeVariable reads one simple `NAME=value` assignment out of a makefile.
+//
+// Deliberately not a make invocation: `make -p` would also expand and evaluate, and what
+// these tests need is the DECLARED text, so that an assertion fails on the declaration a
+// reader will edit rather than on something make computed from it.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when the variable is not declared.
+//   - makefile string: the makefile source.
+//   - name string: the variable name.
+//
+// Returns:
+//   - string: the declared value, trimmed.
+func makeVariable(t *testing.T, makefile, name string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(makefile, "\n") {
+		if !strings.HasPrefix(line, name+"=") && !strings.HasPrefix(line, name+" =") {
+			continue
+		}
+
+		_, value, _ := strings.Cut(line, "=")
+
+		return strings.TrimSpace(value)
+	}
+
+	require.Failf(t, "missing make variable", "the makefile must declare %s", name)
+
+	return ""
+}
+
+// expandMakeVariables substitutes one level of ${NAME} references from the makefile's own
+// simple assignments.
+//
+// It exists because this makefile deliberately holds its longer commands in variables — the
+// note above BROKER_ARRAY_DECLARED explains why — so a recipe assertion that read the raw
+// text would report a command as absent purely because it was declared one line higher up.
+// One level is enough for that convention and stops short of reimplementing make.
+//
+// Parameters:
+//   - t *testing.T: the test, for the helper marker.
+//   - makefile string: the makefile source.
+//   - text string: the text to expand.
+//
+// Returns:
+//   - string: text with every resolvable ${NAME} replaced; unresolved names are left alone.
+func expandMakeVariables(t *testing.T, makefile, text string) string {
+	t.Helper()
+
+	reference := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+	return reference.ReplaceAllStringFunc(text, func(match string) string {
+		name := reference.FindStringSubmatch(match)[1]
+
+		for _, line := range strings.Split(makefile, "\n") {
+			if !strings.HasPrefix(line, name+"=") && !strings.HasPrefix(line, name+" =") {
+				continue
+			}
+
+			_, value, _ := strings.Cut(line, "=")
+
+			return strings.TrimSpace(value)
+		}
+
+		return match
+	})
+}
+
+// TestMutationGate_ScoresWithThePinnedToolRatherThanWhateverIsOnPath guards the pin the
+// mutation threshold is only meaningful against.
+//
+// The gate used to install ${GREMLINS_VERSION} only when NO gremlins was on PATH, so any
+// gremlins already installed — any version, including an untagged local build — silently
+// became the tool that decided whether the repository met its own threshold. Two machines
+// could then report different efficacy for one commit with nothing in any diff to show for
+// it, which is the whole failure a pin exists to prevent.
+//
+// The check has to read the binary's MODULE version rather than its --version output:
+// gremlins stamps that string at release time, so a binary installed correctly from the
+// v0.6.0 tag by `go install` still says "dev". That is why this test asserts on
+// `go version -m` specifically, and why it fails if the recipe reverts to the presence test.
+func TestMutationGate_ScoresWithThePinnedToolRatherThanWhateverIsOnPath(t *testing.T) {
+	makefile := readRepoFile(t, "makefile")
+	declared := makeTargetRecipe(t, makefile, "mutation_gate")
+	recipe := expandMakeVariables(t, makefile, declared)
+
+	require.NotEmpty(t, makeVariable(t, makefile, "GREMLINS_VERSION"),
+		"the makefile must pin an exact gremlins version")
+
+	assert.Contains(t, recipe, "go version -m",
+		"the gate must verify the module version of the binary it is about to score with; "+
+			"`gremlins --version` cannot answer this, because that string is an ldflags stamp "+
+			"applied by the release build and a correctly installed pin still reports \"dev\"")
+	assert.Contains(t, declared, "${GREMLINS_VERSION}",
+		"the verification must compare against the pin rather than against a literal")
+
+	assert.NotContains(t, declared, "command -v gremlins >/dev/null 2>&1 || go install",
+		"a presence test is not a version check: it installs the pin only when nothing is "+
+			"there, so any gremlins already on PATH becomes the tool this gate scores with")
+
+	// And the outcome of a mismatch must be a refusal, not a warning: a score from another
+	// version compared against this threshold is a number with no meaning.
+	assert.Contains(t, recipe, "MUTATION GATE FAILED",
+		"a version mismatch the gate cannot repair must fail the gate")
+}
+
+// TestMutationGate_ScoresTheEventSurfaceOfEveryPackageThatHasOne guards the two ways this
+// gate could report success while scoring nothing.
+//
+// The first is a missing SCOPE: MUTATION_EVENT_SCOPES covered the root package and
+// ./database and not ./api, so api/events.go — the master-key-gated dead-letter inventory
+// and replay — and api/subscribers.go — which mints Kafka credentials — were the only new
+// event code no scope reached.
+//
+// The second is the FILTER. api/ files are named after the route they serve, so the event
+// surface there is events.go and subscribers.go rather than event_*.go. A filter matching
+// `event_` alone would have added the api scope and scored nothing in it.
+func TestMutationGate_ScoresTheEventSurfaceOfEveryPackageThatHasOne(t *testing.T) {
+	root := moduleRootDir(t)
+	makefile := readRepoFile(t, "makefile")
+
+	scopes := strings.Fields(makeVariable(t, makefile, "MUTATION_EVENT_SCOPES"))
+	require.NotEmpty(t, scopes, "the makefile must declare at least one event mutation scope")
+
+	prefixes := strings.Fields(makeVariable(t, makefile, "MUTATION_EVENT_FILE_PREFIXES"))
+	require.NotEmpty(t, prefixes, "the makefile must declare which file names the event filter keeps")
+
+	// Every package holding the pipeline's own code must be scored. Named here rather than
+	// discovered, because "which packages own event code" is the question the scope list is
+	// answering and a test that derived it from the same rule could not disagree.
+	for _, pkg := range []string{".", "database", "api"} {
+		assert.Containsf(t, scopes, pkg+":event",
+			"MUTATION_EVENT_SCOPES must score %s: its event files are otherwise mutated by no "+
+				"scope at all, and an unscored file is indistinguishable from a fully killed one "+
+				"in the gate's output. Scopes: %v", pkg, scopes)
+	}
+
+	// And the filter must actually select files in each of them.
+	for _, scope := range scopes {
+		directory, filter, _ := strings.Cut(scope, ":")
+		if filter != "event" {
+			continue
+		}
+
+		entries, err := os.ReadDir(filepath.Join(root, directory))
+		require.NoErrorf(t, err, "scope %s names a directory that must be readable", scope)
+
+		matched := make([]string, 0, 8)
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(name, prefix) {
+					matched = append(matched, name)
+
+					break
+				}
+			}
+		}
+
+		assert.NotEmptyf(t, matched,
+			"scope %s selects no file: the event filter keeps names beginning with %v, and %s/ "+
+				"holds none of them. The gate refuses this at runtime rather than scoring nothing, "+
+				"so this is a declaration to fix rather than a failure to work around",
+			scope, prefixes, directory)
+	}
+}
+
+// TestMutationGate_SkipsOnlyTestsThatExist is the rot guard on the coverage-gathering skip.
+//
+// gremlins gathers coverage by running the whole module's suite, so one red test anywhere
+// ends the run with "failed to gather coverage" and no score — which is how the AAP's
+// mutation gate on the new event code came to be unverified while two pre-existing,
+// load-fragile api tests were failing on their wall-clock budgets. The gate now excludes
+// those tests by name from the coverage run.
+//
+// A list of names is a thing that rots. A rename would leave the skip matching nothing,
+// the gate blocked again, and the only symptom a coverage error that names none of this —
+// so the names are checked against the tree here, where the failure says what to edit.
+func TestMutationGate_SkipsOnlyTestsThatExist(t *testing.T) {
+	root := moduleRootDir(t)
+	makefile := readRepoFile(t, "makefile")
+
+	skip := makeVariable(t, makefile, "MUTATION_COVERAGE_SKIP")
+	require.NotEmpty(t, skip,
+		"the makefile must declare MUTATION_COVERAGE_SKIP; an empty declaration is a legitimate "+
+			"OVERRIDE at the command line but not a legitimate default, because the default is what "+
+			"CI and a new contributor get")
+
+	// The regex is an anchored alternation of exact test names — `^(A|B|C)$` with make's `$$`
+	// escaping — so the names are recoverable without evaluating it.
+	names := strings.Split(strings.Trim(strings.TrimSuffix(strings.TrimPrefix(skip, "^("), "$$"), ")"), "|")
+	require.NotEmpty(t, names, "MUTATION_COVERAGE_SKIP must name the tests it excludes: %q", skip)
+
+	declarations := map[string]string{}
+
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return fs.SkipDir
+			}
+
+			return nil
+		}
+
+		if !strings.HasSuffix(entry.Name(), "_test.go") {
+			return nil
+		}
+
+		source, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+
+		relative, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			relative = path
+		}
+
+		for _, name := range names {
+			if strings.Contains(string(source), "func "+name+"(t *testing.T)") {
+				declarations[name] = relative
+			}
+		}
+
+		return nil
+	})
+	require.NoError(t, err, "walking the module's tests")
+
+	for _, name := range names {
+		assert.Containsf(t, declarations, name,
+			"MUTATION_COVERAGE_SKIP excludes %q from the coverage run and no test by that name "+
+				"exists any more. The skip then matches nothing, the load-fragile test it was "+
+				"excluding runs again, and the gate goes back to reporting \"failed to gather "+
+				"coverage\" with nothing in the message about this list. Update the makefile", name)
+	}
+
+	// The excluded tests must belong to packages this gate does not mutate. Excluding a test
+	// that covers scored code would remove coverage the score is computed from, which is a
+	// weakening rather than a repair.
+	for name, file := range declarations {
+		assert.Truef(t, strings.HasPrefix(file, "api/"),
+			"%s is excluded from the coverage run but lives in %s. The exclusion is only safe for "+
+				"tests of code no event scope mutates; a test of scored code must be repaired or "+
+				"made load-tolerant instead of skipped", name, file)
+	}
+}

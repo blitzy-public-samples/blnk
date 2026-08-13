@@ -316,11 +316,11 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	defer func() {
 		compensate := owedCompensation
 
-		s.schedule(func() {
-			// THE RELEASE'S WINDOW IS RESOLVED HERE, not when the issuance started.
-			releaseCtx, endRelease := subscriberCleanupContext(ctx)
-			defer endRelease()
-
+		// THE RELEASE'S WINDOW IS RESOLVED WHEN THE SETTLEMENT RUNS, not when the issuance
+		// started — and against the settlement's own clock when it runs after the response.
+		// scheduleSettlement owns that distinction; see its comment for why the two arms
+		// differ.
+		s.scheduleSettlement(ctx, func(releaseCtx context.Context) {
 			if compensate != nil {
 				compensate(releaseCtx)
 			}
@@ -823,10 +823,30 @@ func (s *EventSubscriberService) provisioningFailure(
 				"kafka-acls — the bindings are named in the error above — and retry",
 		)
 
-		message = "The subscriber's Kafka principal carries ACL grants Blnk did not provision, " +
-			"so its effective access is broader than its authorization records and credentials " +
-			"cannot be issued; remove the foreign ACL bindings from the principal and retry"
-		reason = "The Kafka principal carries foreign ALLOW ACL bindings, so no access boundary can be stated"
+		// RETURNED HERE rather than through the terminal 503 below, and with the same code the
+		// ErrForeignACLGrantsAccess branch above returns: this is that branch's judgement
+		// reached one step earlier — the surplus grant was found while reconciling the
+		// principal's bindings instead of after them — and the finding is identical. The broker
+		// answered; what it holds is what the refusal is about. Falling through gave the SAME
+		// condition two status classes depending only on WHEN it was noticed, and the one it
+		// fell into is 503, the class reserved for a transient dependency failure. A caller
+		// obeying that 503 retries with backoff against a state only a human can change, which
+		// burns broker round trips and hides the remedy this message already names. See the
+		// refusal table in docs/kafka-operations.md, which publishes 409 for it.
+		return apierror.NewAPIError(
+			apierror.ErrSubscriberAccessExceedsAuthorization,
+			"The subscriber's Kafka principal carries ACL grants Blnk did not provision, so its "+
+				"effective access is broader than its authorization records and credentials cannot "+
+				"be issued; remove the foreign ACL bindings from the principal and retry",
+			// NOT retryable, for the reason above. The state flags travel as they do on every
+			// other branch, because whether a credential reached the broker is the one fact the
+			// caller cannot learn any other way.
+			s.provisioningDetail(
+				"The Kafka principal carries foreign ALLOW ACL bindings, so no access boundary "+
+					"can be stated",
+				subscriber, result, false,
+			),
+		)
 	}
 
 	return apierror.NewAPIError(

@@ -48,12 +48,34 @@ func (p *EventRelayProcessor) leaseDeadline(claimedAt time.Time) time.Time {
 
 // processBatch claims one batch of due outbox rows and publishes every one of them.
 func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
-	rows, err := p.store.ClaimPendingEventOutbox(ctx, p.batchSize, p.lockDuration)
+	// THE CLAIM IS BOUNDED, and the bound is the only thing that distinguishes a relay that
+	// is working slowly from one that has stopped. A claim whose cost outgrows its indexes
+	// held a single statement open for 504 seconds in testing while this loop published
+	// nothing and reported nothing — the goroutine was inside the driver, so there was no
+	// tick to observe and no error to log. With a deadline the condition becomes a timeout
+	// the repository names, this counter records and the next tick retries.
+	claiming, cancelClaim := context.WithTimeout(ctx, eventRelayClaimBudget)
+	claimStartedAt := p.now()
+	rows, err := p.store.ClaimPendingEventOutbox(claiming, p.batchSize, p.lockDuration, p.currentKeyCursor())
+	claimElapsed := p.now().Sub(claimStartedAt)
+	cancelClaim()
+
+	// Recorded on EVERY path, including the failures, because the reading that matters most
+	// is the one taken while claims are going wrong: a duration that has climbed into
+	// seconds is the leading indicator of the stall, and it is visible here before any
+	// throughput counter moves.
+	recordEventClaim(ctx, claimElapsed, len(rows), err, claiming.Err() != nil)
+
 	if err != nil {
-		withLoggableCause(nil, err).Error("failed to claim event outbox entries")
+		withLoggableCause(logrus.WithFields(logrus.Fields{
+			"claim_duration_ms": claimElapsed.Milliseconds(),
+			"batch_size":        p.batchSize,
+		}), err).Error("failed to claim event outbox entries")
 
 		return 0
 	}
+
+	p.advanceKeyCursor(rows)
 
 	if len(rows) == 0 {
 		return 0
@@ -121,16 +143,45 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 
 			// SEQUENTIALLY WITHIN THE GROUP. Every row here shares one partition key, so
 			// this loop is the per-partition-key ordering guarantee in code.
-			for _, row := range rows {
-				// Cancellation is honoured BETWEEN rows as well as between groups. A group is
-				// normally one row — the claim returns at most one per partition key — but it is
-				// not bounded to one, and a group that kept publishing through an abort would be
-				// the one place cancellation did not reach.
+			for position, row := range rows {
+				// Cancellation is honoured BETWEEN rows as well as between groups. A claim returns
+				// a CONTIGUOUS RUN per partition key, so a group routinely holds several rows, and
+				// a group that kept publishing through an abort would be the one place
+				// cancellation did not reach.
 				if !publishingMayProceed(publishing) {
 					return
 				}
 
-				p.processRow(publishing, row, claimedAt)
+				if p.processRow(publishing, row, claimedAt) {
+					continue
+				}
+
+				// THE REST OF THE RUN IS ABANDONED, and this is the second half of the ordering
+				// guarantee — the half SQL cannot express.
+				//
+				// This row's Kafka leg did not reach a recorded, durable state: the publish failed,
+				// or it succeeded and the transition that records it did not. Either way the row
+				// will be published again on a later claim. Publishing the rows BEHIND it now would
+				// put event N+1 on the topic before event N, for the same partition key, which is
+				// precisely the per-aggregate ordering this pipeline promises.
+				//
+				// The abandoned rows keep the lease this claim took and re-enter the claimable set
+				// when it expires. The claim cannot hand them to anyone else in the meantime,
+				// because a key's run is only ever taken from its head forward and this row is now
+				// that head — so the next claim gets this row first, and its successors only once it
+				// has settled.
+				if remaining := len(rows) - position - 1; remaining > 0 {
+					logrus.WithFields(logrus.Fields{
+						"event_id":       row.EventID,
+						"partition_key":  row.EffectiveKey(),
+						"abandoned_rows": remaining,
+					}).Warn(
+						"event relay: a row of a partition-key run did not settle, so the rest of the run " +
+							"is left for a later claim; publishing behind it would break this aggregate's order",
+					)
+				}
+
+				return
 			}
 		}(group)
 	}
@@ -275,11 +326,24 @@ func groupEventRowsByPartitionKey(rows []model.EventOutbox) [][]model.EventOutbo
 }
 
 // processRow performs ONE publish attempt for one claimed row and records the outcome.
+//
+// Parameters:
+//   - ctx context.Context: cancels the publish; bookkeeping writes are detached from it.
+//   - row model.EventOutbox: the claimed row.
+//   - claimedAt time.Time: when the batch was claimed, for the publish-duration histogram.
+//
+// Returns:
+//   - bool: whether this row's KAFKA leg reached a recorded, durable state — either
+//     published and transitioned now, or already published on an earlier pass. False means
+//     the row will be published again later, and the caller MUST NOT publish anything
+//     behind it that shares its partition key. The legacy webhook leg deliberately does
+//     not affect this answer: it carries no ordering promise, and a row whose Kafka leg is
+//     recorded is never republished on its account.
 func (p *EventRelayProcessor) processRow(
 	ctx context.Context,
 	row model.EventOutbox,
 	claimedAt time.Time,
-) {
+) bool {
 	// THE RELAY'S OWN SPAN over everything one claimed row costs: the legacy leg, the
 	// Kafka publish, the retry decision, the dead-letter hand-off and the durable
 	// transition. The publisher's producer span nests inside it, so a trace shows the
@@ -318,9 +382,7 @@ func (p *EventRelayProcessor) processRow(
 		// coordinate of the record its earlier successful publish produced. Both marking
 		// transitions COALESCE the coordinate for exactly this case, so passing the zero
 		// value leaves the stored one intact rather than erasing it.
-		p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, model.BrokerRecord{}, false)
-
-		return
+		return p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, model.BrokerRecord{}, false)
 	}
 
 	// The publish is bounded so it cannot complete on a claim this relay no longer holds,
@@ -356,14 +418,19 @@ func (p *EventRelayProcessor) processRow(
 		// the legacy budget on a Kafka outage.
 		p.recordFailedAttempt(ctx, row, attempt, result, err)
 
-		return
+		return false
 	}
 
-	p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, result.Record, true)
+	return p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, result.Record, true)
 }
 
 // settleAfterKafkaSuccess drives a row whose KAFKA leg is complete to the right state,
 // which depends entirely on what the legacy leg did.
+//
+// Returns:
+//   - bool: whether the Kafka leg is now RECORDED as well as complete. False when the
+//     transition that records it failed, which leaves the row to be published again — and
+//     therefore stops the caller publishing its partition-key successors.
 func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 	ctx context.Context,
 	row model.EventOutbox,
@@ -372,17 +439,23 @@ func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 	legacyErr error,
 	record model.BrokerRecord,
 	published bool,
-) {
+) bool {
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
 	defer cancel()
 
 	if legacyLeg == legacyLegOwed {
-		p.deferLegacyLeg(bookkeeping, row, attempt, legacyErr, record, published)
-
-		return
+		return p.deferLegacyLeg(bookkeeping, row, attempt, legacyErr, record, published)
 	}
 
-	if markErr := p.store.MarkEventDispatched(bookkeeping, row.ID, row.ClaimToken, record); markErr != nil {
+	// THE LEGACY MARKER RIDES ALONG, rather than costing a statement of its own. legacyLeg is
+	// settled here by construction — the owed arm returned above — so this row owes no
+	// webhook, whether because one was just enqueued, because one was already recorded,
+	// because the window has closed, or because no legacy sink is configured at all. Folding
+	// the marker into this write is what removes one row update and one commit per published
+	// event; see MarkEventDispatched for the measurement and for the crash window it moves.
+	if markErr := p.store.MarkEventDispatched(
+		bookkeeping, row.ID, row.ClaimToken, record, true,
+	); markErr != nil {
 		withLoggableCause(logrus.WithFields(p.rowFields(row, attempt)), markErr).Error(
 			"event relay: the event was published but its outbox row could not be marked dispatched; " +
 				"it will be republished when its lease expires and must be suppressed on event_id",
@@ -391,7 +464,7 @@ func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 		// NOT COUNTED. The broker has the event but nothing durable says so, and this row is
 		// going to be published again when its lease expires — counting here and again after
 		// that republish would report one event twice. See recordDurableEventDelivery.
-		return
+		return false
 	}
 
 	// THE DURABLE TRANSITION HAS COMMITTED, which is the moment the delivery is recorded
@@ -402,6 +475,8 @@ func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 
 	// THE ONE PER-EVENT DELIVERY COUNT, recorded here and only here for this arm.
 	recordEventDispatched(bookkeeping, row)
+
+	return true
 }
 
 // recordEventDispatched increments the per-event delivery count for a row that has just
@@ -415,6 +490,10 @@ func recordEventDispatched(ctx context.Context, row model.EventOutbox) {
 
 // deferLegacyLeg records a Kafka leg that is done alongside a legacy webhook leg that
 // is still owed, and reports the arm the datasource chose.
+// Returns:
+//   - bool: whether the Kafka leg is now recorded. The webhook leg's own fate — owed,
+//     retried or abandoned — does not change the answer; only a failure to RECORD the
+//     Kafka leg does, because that is the only outcome that republishes the event.
 func (p *EventRelayProcessor) deferLegacyLeg(
 	ctx context.Context,
 	row model.EventOutbox,
@@ -422,7 +501,7 @@ func (p *EventRelayProcessor) deferLegacyLeg(
 	cause error,
 	record model.BrokerRecord,
 	published bool,
-) {
+) bool {
 	reason := "the legacy webhook enqueue failed"
 	if cause != nil {
 		reason = relayFailureReason(cause)
@@ -447,7 +526,7 @@ func (p *EventRelayProcessor) deferLegacyLeg(
 
 		// NOT COUNTED: nothing durable records this delivery yet, and the row will be
 		// re-settled on a later claim which is where the increment belongs.
-		return
+		return false
 	}
 
 	// THE DURABLE TRANSITION HAS COMMITTED. kafka_dispatched_at now names this delivery,
@@ -476,7 +555,7 @@ func (p *EventRelayProcessor) deferLegacyLeg(
 				"delivered. Any subscriber still consuming webhooks has missed this event",
 		)
 
-		return
+		return true
 	}
 
 	fields["retry_after"] = retryAfter.String()
@@ -484,6 +563,8 @@ func (p *EventRelayProcessor) deferLegacyLeg(
 		"event relay: the event is published to Kafka and its legacy webhook leg is still owed; " +
 			"the row stays claimable for the webhook alone and will not be republished",
 	)
+
+	return true
 }
 
 // legacyLegDue reports whether the legacy webhook leg must run for an event being

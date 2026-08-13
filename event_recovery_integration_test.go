@@ -113,10 +113,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -136,8 +139,9 @@ import (
 
 // testSettlementLease held the production hand-off window of thirty seconds. It is RETIRED,
 // because this file deliberately does not use that period: recoveryDeadLetterHandoffLease is the
-// hand-off lease these tests pass, shortened to two seconds so that waiting for it to lapse is an
-// assertion rather than a stall, and recoveryHandOffRaceLease is the ninety-second one used where
+// hand-off lease these tests pass, shortened to two seconds — widened only by
+// recoveryTimingScale — so that waiting for it to lapse is an assertion rather than a stall, and
+// recoveryHandOffRaceLease is the ninety-second one used where
 // the window must NOT lapse mid-assertion. Both say so in full below. Wiring a thirty-second
 // constant in here would have quietly reversed those two decisions.
 
@@ -165,25 +169,29 @@ const (
 	// for missing infrastructure must be instant, not a wait.
 	recoveryProbeTimeout = 750 * time.Millisecond
 
-	// recoveryLease is the claim lease these tests give the relay, and it is deliberately
-	// far shorter than the production default of 30 seconds.
+	// recoveryBaseLease is the claim lease these tests give the relay on an idle,
+	// uninstrumented host, and it is deliberately far shorter than the production default of
+	// 30 seconds.
 	//
 	// The lease IS the recovery latency: rows a dead relay was holding become claimable
 	// again this long after it stopped. Thirty seconds is right for production and would
 	// make every restart assertion here a thirty-second wait, so it is shortened rather
 	// than worked around — the mechanism under test is unchanged, only its period.
-	recoveryLease = 2 * time.Second
+	//
+	// It is a BASE rather than the value used: recoveryLease widens it by
+	// recoveryTimingScale. See that variable for why.
+	recoveryBaseLease = 2 * time.Second
 
-	// recoveryDeadLetterHandoffLease is the lease a terminal transition holds the row under
-	// while its dead-letter write is owed. It is the same short period as recoveryLease and for
-	// the same reason: it is the delay before the dead-letter repair pass may adopt a row whose
-	// owner died mid-hand-off, so the production default of 30 seconds would turn an assertion
-	// into a wait.
+	// recoveryBaseDeadLetterHandoffLease is the lease a terminal transition holds the row under
+	// while its dead-letter write is owed. It is the same short period as recoveryBaseLease and
+	// for the same reason: it is the delay before the dead-letter repair pass may adopt a row
+	// whose owner died mid-hand-off, so the production default of 30 seconds would turn an
+	// assertion into a wait.
 	//
 	// It is DELIBERATELY NON-ZERO. A zero lease resolves to an instant that has already passed,
 	// which would make the retained claim token advisory rather than exclusive and would let a
 	// second worker dead-letter the same event.
-	recoveryDeadLetterHandoffLease = 2 * time.Second
+	recoveryBaseDeadLetterHandoffLease = 2 * time.Second
 
 	// recoveryHandOffRaceLease is the hand-off lease used by the test that races the repair
 	// pass against a dead-letter write in flight, and it is deliberately LONG.
@@ -195,26 +203,53 @@ const (
 	// host cannot turn a correct build into a failure.
 	recoveryHandOffRaceLease = 90 * time.Second
 
-	// recoveryHeldLease is the lease taken by tests that must OBSERVE a row while it is still
-	// held — the "not re-claimable while the lease is live" side of the contract, and the
-	// crash reproduced by publishing without marking. It is longer than recoveryLease so the
+	// recoveryBaseHeldLease is the lease taken by tests that must OBSERVE a row while it is
+	// still held — the "not re-claimable while the lease is live" side of the contract, and the
+	// crash reproduced by publishing without marking. It is longer than recoveryBaseLease so the
 	// observation cannot race the expiry on a loaded machine, and it is the wait those tests
-	// then pay to see the row come back.
-	recoveryHeldLease = 5 * time.Second
+	// then pay to see the row come back. recoveryHeldLease widens it by recoveryTimingScale.
+	recoveryBaseHeldLease = 5 * time.Second
 
 	// recoveryNoExpiryLease is the production default, used by the two-relay test so that
 	// nothing can expire while it runs. That is what makes "no row was processed by both" a
 	// statement about FOR UPDATE SKIP LOCKED rather than about how fast the machine is.
 	recoveryNoExpiryLease = 30 * time.Second
 
-	// recoveryLeaseOverrun is how long a batch is deliberately held PAST its lease by the
-	// renewal test, and it is a multiple of the lease rather than a duration in its own right
-	// so the two cannot drift apart.
+	// recoveryLeaseMultiplesOfOverrun is how many leases a batch is deliberately held past
+	// its own by the renewal test.
 	//
-	// Three leases is what makes the assertion unambiguous: a lease taken once and never
-	// renewed would have expired twice over by the time it is read back, so a lease still
-	// live at the end of the overrun was renewed. Nothing about the number is tuning.
-	recoveryLeaseOverrun = 3 * recoveryLease
+	// Three is what makes the assertion unambiguous: a lease taken once and never renewed
+	// would have expired twice over by the time it is read back, so a lease still live at the
+	// end of the overrun was renewed. Nothing about the number is tuning, which is why it is
+	// expressed as a multiple of the lease rather than as a duration that could drift from it.
+	recoveryLeaseMultiplesOfOverrun = 3
+
+	// recoveryMaxTimingScale caps how far recoveryTimingScale may widen the leases.
+	//
+	// A cap is needed because the load reading is unbounded: a host at loadavg 200 would
+	// otherwise turn a six-second hold into minutes, and a test that cannot finish is no more
+	// useful than one that fails. Four keeps the renewal assertion meaningful — an
+	// eight-second lease renewed every 2.7 seconds — while bounding the worst case.
+	recoveryMaxTimingScale = 4
+
+	// recoveryMaxSlowPublish caps how long ONE deliberately slow publish may take, and the
+	// number it is defending is eventRelayRowPublishBudget: the relay gives every row's
+	// publish attempt a fixed wall-clock budget and abandons it after that, failing the
+	// attempt and releasing the row.
+	//
+	// That budget is what a batch held past this cap would collide with, and the collision is
+	// indistinguishable at the assertion from the defect under test — the row loses its claim
+	// either way, and only one of the two reasons is a bug. A slow publish therefore stays
+	// well inside the budget; recoveryAssertPublishFitsItsBudget pins the relationship so it
+	// cannot be broken by editing either number alone.
+	recoveryMaxSlowPublish = 2 * time.Second
+
+	// recoveryRaceTimingScale is the floor applied under the race detector, and
+	// recoveryCoverageTimingScale the floor applied under coverage instrumentation. Both
+	// serialise or interpose on work the relay does per row, so the renewal round trip they
+	// slow down is exactly the one the lease is racing.
+	recoveryRaceTimingScale     = 3
+	recoveryCoverageTimingScale = 2
 
 	// recoveryOversizedBatch is a claim limit larger than any backlog seeded here.
 	//
@@ -246,13 +281,15 @@ const (
 	// in every batch these tests seed.
 	recoveryPublishesInFlight = 4
 
-	// recoveryDrainTimeout bounds the wait for the backlog to reach terminal states. It is
+	// recoveryBaseDrainTimeout bounds the wait for the backlog to reach terminal states. It is
 	// generous because a shared development database may be serving other work, and a
-	// timeout here reports the exact outbox state rather than hanging.
-	recoveryDrainTimeout = 90 * time.Second
+	// timeout here reports the exact outbox state rather than hanging. recoveryDrainTimeout
+	// widens it by recoveryTimingScale, because the leases it is waiting behind widen too.
+	recoveryBaseDrainTimeout = 90 * time.Second
 
-	// recoveryGateTimeout bounds the wait for the relay to reach the interruption point.
-	recoveryGateTimeout = 45 * time.Second
+	// recoveryBaseGateTimeout bounds the wait for the relay to reach the interruption point.
+	// recoveryGateTimeout widens it by recoveryTimingScale for the same reason.
+	recoveryBaseGateTimeout = 45 * time.Second
 
 	// recoveryConsumeTimeout bounds a single read from the topic. Generous, because the first
 	// read of a partition also dials the broker and negotiates SASL — but bounded, so a broker
@@ -277,6 +314,195 @@ const (
 	// worker over many batches, so it is orders of magnitude larger than this.
 	recoveryGoroutineTolerance = 8
 )
+
+// The leases these tests grant, widened from their bases by recoveryTimingScale.
+//
+// # Why these are variables
+//
+// A lease is the only value in this file that a SLOW HOST can invalidate rather than merely
+// delay. Everything else here is a timeout: it bounds a wait, and a machine that needs
+// longer simply takes longer. A lease is the opposite — it is a deadline the relay must
+// keep MEETING while it works, by renewing at a third of the period, and the assertions
+// built on it ("the row is still held", "the token can still move the row") turn false when
+// the renewal or its database round trip is descheduled past the expiry. The mechanism is
+// correct in that moment; only the wall clock disagrees.
+//
+// That is not hypothetical. The renewal assertion holds a batch for three of its own
+// two-second leases and reads the lease back: on a host at loadavg 64-83 with GOMAXPROCS 4
+// — roughly sixteen times oversubscribed, which is what several test suites sharing one
+// four-CPU machine produces — the heartbeat slipped and the row was released, so a
+// six-second wall-clock reading, not the heartbeat, decided the verdict.
+//
+// So the period scales with the conditions and the multiples do not. Every relationship the
+// assertions rest on is preserved: the overrun stays three leases, the renewal interval
+// stays a third of the lease, and the held lease stays longer than the claim lease. On an
+// idle uninstrumented host the scale is 1 and every duration is exactly what it was.
+var (
+	// recoveryLease is the claim lease these tests give the relay.
+	recoveryLease = recoveryScaled(recoveryBaseLease)
+
+	// recoveryDeadLetterHandoffLease is the hand-off lease a terminal transition takes.
+	recoveryDeadLetterHandoffLease = recoveryScaled(recoveryBaseDeadLetterHandoffLease)
+
+	// recoveryHeldLease is the longer lease used where a row must be OBSERVED while held.
+	recoveryHeldLease = recoveryScaled(recoveryBaseHeldLease)
+
+	// recoveryLeaseOverrun is how long the renewal test holds a batch past its own lease.
+	recoveryLeaseOverrun = recoveryLeaseMultiplesOfOverrun * recoveryLease
+
+	// recoverySlowPublish is how long one deliberately slow publish takes in the renewal
+	// test. Half a lease, so a batch of the size that test seeds keeps publishing for longer
+	// than the overrun, and never more than recoveryMaxSlowPublish, so a single attempt stays
+	// far inside the relay's own per-row publish budget.
+	recoverySlowPublish = min(recoveryLease/2, recoveryMaxSlowPublish)
+
+	// recoveryDrainTimeout bounds the wait for a backlog to reach terminal states.
+	recoveryDrainTimeout = recoveryScaled(recoveryBaseDrainTimeout)
+
+	// recoveryGateTimeout bounds the wait for a relay to reach an interruption point.
+	recoveryGateTimeout = recoveryScaled(recoveryBaseGateTimeout)
+)
+
+// recoveryTimingScale is how much longer than its base every lease above is, and
+// recoveryTimingScaleReason says why. Both are resolved once, at package initialisation.
+var recoveryTimingScale, recoveryTimingScaleReason = resolveRecoveryTimingScale()
+
+// resolveRecoveryTimingScale reads the three conditions that starve a heartbeat and returns
+// the largest widening any of them asks for.
+//
+// The race detector and coverage instrumentation are read from the binary itself rather than
+// from an environment variable a runner has to remember: `go test -race` records `-race` in
+// the build info, and a coverage-instrumented binary reports a non-empty
+// testing.CoverMode(). Host load is read from /proc/loadavg against GOMAXPROCS, because a
+// heartbeat competes for a scheduler slot rather than for a CPU count — a run at four times
+// oversubscription is four times as likely to be descheduled past its deadline. A platform
+// without /proc/loadavg contributes nothing, which is the conservative direction: the scale
+// only ever grows from 1.
+//
+// Returns:
+//   - int: the scale, at least 1 and at most recoveryMaxTimingScale.
+//   - string: the reason, for the log line and for every lease failure message, so a failure
+//     under load says which conditions were read and what they produced.
+func resolveRecoveryTimingScale() (int, string) {
+	scale := 1
+	reasons := make([]string, 0, 3)
+
+	if recoveryRaceDetectorEnabled() {
+		scale = max(scale, recoveryRaceTimingScale)
+		reasons = append(reasons, fmt.Sprintf("race detector (x%d)", recoveryRaceTimingScale))
+	}
+
+	if mode := testing.CoverMode(); mode != "" {
+		scale = max(scale, recoveryCoverageTimingScale)
+		reasons = append(reasons, fmt.Sprintf("coverage mode %q (x%d)", mode, recoveryCoverageTimingScale))
+	}
+
+	procs := runtime.GOMAXPROCS(0)
+	if load, ok := recoveryHostLoadAverage(); ok {
+		// Rounded UP, so a host at 1.2 times oversubscription is treated as oversubscribed
+		// rather than as idle. int() truncation would report the busiest interesting case — just
+		// over the line — as no load at all.
+		oversubscription := int(math.Ceil(load / float64(procs)))
+		if oversubscription > scale {
+			scale = oversubscription
+			reasons = append(reasons, fmt.Sprintf("loadavg %.2f over GOMAXPROCS %d (x%d)",
+				load, procs, oversubscription))
+		}
+	}
+
+	if scale > recoveryMaxTimingScale {
+		scale = recoveryMaxTimingScale
+		reasons = append(reasons, fmt.Sprintf("capped at x%d", recoveryMaxTimingScale))
+	}
+
+	if len(reasons) == 0 {
+		return scale, "idle uninstrumented host"
+	}
+
+	return scale, strings.Join(reasons, ", ")
+}
+
+// recoveryAssertPublishFitsItsBudget pins the relationship between a deliberately slow
+// publish and the relay's own per-row publish budget.
+//
+// The relationship is invisible at both ends: recoverySlowPublish is composed from the lease
+// and a cap here, and eventRelayRowPublishBudget is a production constant in another file.
+// Widening either one alone reintroduces the collision that made the renewal assertion
+// load-dependent — the relay abandons an over-budget attempt and releases the row, which is
+// correct behaviour that reads exactly like the defect under test. Asserted rather than
+// commented, so the next edit to either number fails here with the reason.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when the margin has been lost.
+func recoveryAssertPublishFitsItsBudget(t *testing.T) {
+	t.Helper()
+
+	// Half the budget, so the margin absorbs a loaded host's scheduling delay rather than
+	// merely satisfying an inequality.
+	require.Lessf(t, recoverySlowPublish, eventRelayRowPublishBudget/2,
+		"a deliberately slow publish of %s must stay far inside the relay's %s per-row publish "+
+			"budget: the relay abandons an attempt that exceeds it and releases the row, and that "+
+			"release is indistinguishable here from the lease defect under test",
+		recoverySlowPublish, eventRelayRowPublishBudget)
+}
+
+// recoveryScaled widens one base duration by recoveryTimingScale.
+//
+// Parameters:
+//   - base time.Duration: the duration used on an idle uninstrumented host.
+//
+// Returns:
+//   - time.Duration: base multiplied by the resolved scale.
+func recoveryScaled(base time.Duration) time.Duration {
+	return time.Duration(recoveryTimingScale) * base
+}
+
+// recoveryRaceDetectorEnabled reports whether this test binary was built with -race.
+//
+// Read from the build settings rather than from a build-tagged constant, so the file that
+// needs the answer is the file that asks for it and no second source of truth exists.
+//
+// Returns:
+//   - bool: true when the race detector is compiled in.
+func recoveryRaceDetectorEnabled() bool {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+
+	for _, setting := range info.Settings {
+		if setting.Key == "-race" {
+			return setting.Value == "true"
+		}
+	}
+
+	return false
+}
+
+// recoveryHostLoadAverage reads the one-minute load average.
+//
+// Returns:
+//   - float64: the one-minute load average.
+//   - bool: false when it cannot be read, which every caller must treat as "no load
+//     information" rather than as zero load.
+func recoveryHostLoadAverage() (float64, bool) {
+	raw, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0, false
+	}
+
+	fields := strings.Fields(string(raw))
+	if len(fields) == 0 {
+		return 0, false
+	}
+
+	load, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || load < 0 {
+		return 0, false
+	}
+
+	return load, true
+}
 
 // The two transport refusals these tests inject. They are sentinels rather than fmt.Errorf
 // calls so that an assertion can name the exact failure it expects to see travel all the way
@@ -1350,7 +1576,7 @@ func (f *recoveryFixture) claimMine(ctx context.Context, want int, lease time.Du
 	deadline := time.Now().Add(30 * time.Second)
 
 	for len(claimedMine) < want {
-		batch, err := f.ds.ClaimPendingEventOutbox(ctx, 100, lease)
+		batch, err := f.ds.ClaimPendingEventOutbox(ctx, 100, lease, "")
 		require.NoError(f.t, err, "claiming a batch of outbox rows")
 
 		claimedMine = append(claimedMine, f.mine(batch)...)
@@ -1488,6 +1714,9 @@ type recoveryPublisher struct {
 	parked     int
 	peakParked int
 	hold       chan struct{}
+	// parkFor bounds each park. Zero parks indefinitely, which is the crash shape; a
+	// duration makes the publisher merely SLOW. See parkEachPublishFor.
+	parkFor time.Duration
 
 	gate      chan struct{}
 	gateOnce  sync.Once
@@ -1534,6 +1763,42 @@ func (p *recoveryPublisher) freezeAfter(deliveries, inFlight int) *recoveryPubli
 	p.gateAt = deliveries
 	p.gateParked = inFlight
 	p.hold = make(chan struct{})
+
+	return p
+}
+
+// parkEachPublishFor bounds the freeze: each parked publish leaves the gate on its own after
+// hold, instead of waiting for release.
+//
+// # Why a bounded park exists at all
+//
+// An indefinite park is the right shape for staging a CRASH — the test cancels the context
+// and the parked publishes fail as in-flight work. It is the wrong shape for staging a batch
+// that legitimately takes a long time, because the relay bounds every row's publish attempt
+// by eventRelayRowPublishBudget and abandons it after that, failing the attempt and RELEASING
+// the row. A test that parks one publish and then observes leases for longer than that budget
+// therefore reads a release the relay performed correctly as the lease defect it was looking
+// for. Measured on a loaded host, the whole observation sat within about two seconds of that
+// budget, which is exactly how a passing assertion becomes an intermittent failure.
+//
+// A bounded park removes the collision instead of racing it: no single attempt approaches its
+// budget, the batch stays in flight for as long as the number of rows multiplied by hold, and
+// the lease has to be renewed throughout. It is also the more faithful reproduction — the
+// defect being guarded is a batch of many SLOW waves, not one publish that never returns.
+//
+// Call it before the relay starts, together with freezeAfter: the gate still reports when a
+// publish has parked, which is what tells the test the batch is in flight.
+//
+// Parameters:
+//   - hold time.Duration: how long each publish parks. Zero restores the indefinite park.
+//
+// Returns:
+//   - *recoveryPublisher: the receiver, for chaining.
+func (p *recoveryPublisher) parkEachPublishFor(hold time.Duration) *recoveryPublisher {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.parkFor = hold
 
 	return p
 }
@@ -1672,6 +1937,7 @@ func (p *recoveryPublisher) awaitRelease(ctx context.Context) error {
 	p.mu.Lock()
 	frozen := p.gateAt > 0 && len(p.published) >= p.gateAt
 	hold := p.hold
+	parkFor := p.parkFor
 
 	reached := false
 	if frozen && hold != nil {
@@ -1703,8 +1969,26 @@ func (p *recoveryPublisher) awaitRelease(ctx context.Context) error {
 		p.mu.Unlock()
 	}()
 
+	if parkFor <= 0 {
+		select {
+		case <-hold:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// A bounded park. The timer is stopped rather than left to fire, so a long-running batch
+	// does not accumulate one live timer per publish.
+	timer := time.NewTimer(parkFor)
+	defer timer.Stop()
+
 	select {
 	case <-hold:
+		return nil
+	case <-timer.C:
+		// The park expired, so this publish proceeds and the next row's begins. Nothing about
+		// this is a failure: it is what makes the publisher SLOW rather than stuck.
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -2417,7 +2701,7 @@ func TestEventRecovery_ClaimedRowIsReclaimableOnlyAfterItsLeaseExpires(t *testin
 	}
 
 	// SIDE ONE: not claimable while the lease is live.
-	blocked, err := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease)
+	blocked, err := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease, "")
 	require.NoError(t, err, "a claim must not fail merely because everything of ours is held")
 	assert.Empty(t, fixture.mine(blocked),
 		"a row whose lease is still live must NOT be claimable; two relay instances publishing one event "+
@@ -2454,14 +2738,14 @@ func TestEventRecovery_ClaimedRowIsReclaimableOnlyAfterItsLeaseExpires(t *testin
 	// must. Without this, a worker whose lease expired could mark an event dispatched that the
 	// instance which took over had not yet published.
 	stale := secondClaim[0]
-	staleErr := fixture.ds.MarkEventDispatched(ctx, stale.ID, firstTokens[stale.EventID], model.BrokerRecord{})
+	staleErr := fixture.ds.MarkEventDispatched(ctx, stale.ID, firstTokens[stale.EventID], model.BrokerRecord{}, true)
 	require.Error(t, staleErr,
 		"the token of a lost claim must be refused: a stale worker must not be able to mark a row the new owner holds")
 	assert.Contains(t, strings.ToLower(staleErr.Error()), "claim",
 		"the refusal must say the claim was lost rather than fail opaquely: %v", staleErr)
 
 	for _, row := range secondClaim {
-		require.NoErrorf(t, fixture.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}),
+		require.NoErrorf(t, fixture.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}, true),
 			"the CURRENT claim token must be able to finish event %s", row.EventID)
 	}
 
@@ -2497,27 +2781,46 @@ func TestEventRecovery_ClaimedRowIsReclaimableOnlyAfterItsLeaseExpires(t *testin
 //
 // # The shape
 //
-// Alpha claims the whole backlog in one batch under one token and then cannot finish it: its
-// publisher parks, and its concurrency of one means the rest of the batch waits behind the
-// parked publish. The batch is then held for three times its own lease — long enough that a
-// lease taken once and never renewed would have expired twice over — while beta polls
-// throughout. The assertions are that alpha's lease is still live under the SAME token with a
-// LATER expiry, that beta delivered nothing of this run's, and that once alpha is released every
-// event was published exactly once between them.
+// Alpha claims the whole backlog in one batch under one token and then takes far longer than its
+// lease to finish it: every publish is deliberately SLOW and its concurrency of one means the
+// rest of the batch waits behind each one. The batch is then held for three times its own lease
+// — long enough that a lease taken once and never renewed would have expired twice over — while
+// beta polls throughout. The assertions are that alpha's rows are still its own at the end of
+// the overrun, under the SAME token and with a LATER expiry where they are still in flight, that
+// beta delivered nothing of this run's, and that every event was published exactly once.
+//
+// # Why the publishes are slow rather than stopped
+//
+// An earlier shape parked ONE publish indefinitely, which reads as the simpler reproduction and
+// silently bounded the whole observation at eventRelayRowPublishBudget: the relay abandons an
+// attempt that exceeds it and releases the row, correctly, and that release is indistinguishable
+// at the assertion from the lease defect. On a loaded host the observation ran within about two
+// seconds of that budget. Slow-but-returning publishes hold the batch for rows × slowness
+// instead, with no single attempt anywhere near its budget, so the only thing that can release a
+// row here is the heartbeat failing — which is the subject.
 func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *testing.T) {
 	fixture := newRecoveryFixture(t, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), recoveryScaled(3*time.Minute))
 	defer cancel()
 
-	const seededEvents = 12
+	recoveryAssertPublishFitsItsBudget(t)
+
+	// Enough rows that alpha is still publishing when the overrun ends, with a lease of slack
+	// on top: the assertion needs rows STILL IN FLIGHT at the end, and a batch that finished
+	// early would make it vacuous. Derived rather than fixed, because both the overrun and the
+	// slowness move with recoveryTimingScale — at scale 1 this is the twelve rows the test was
+	// written with.
+	seededEvents := int((recoveryLeaseOverrun+recoveryLease)/recoverySlowPublish) + 2
 
 	seeded := fixture.seed(ctx, seededEvents)
 
-	// Frozen after one delivery with one publish parked, which is all a concurrency of one can
-	// have in flight — and enough, because what the lease is protecting is the rows QUEUED
-	// BEHIND that publish, not the publish itself.
-	alphaPublisher := newRecoveryPublisher("relay-alpha", nil, seeded).freezeAfter(1, 1)
+	// Slow after one delivery, with the gate reporting once one publish has parked — which is
+	// all a concurrency of one can have in flight, and enough, because what the lease is
+	// protecting is the rows QUEUED BEHIND that publish, not the publish itself.
+	alphaPublisher := newRecoveryPublisher("relay-alpha", nil, seeded).
+		freezeAfter(1, 1).
+		parkEachPublishFor(recoverySlowPublish)
 	betaPublisher := newRecoveryPublisher("relay-beta", nil, seeded)
 
 	baseline := runtime.NumGoroutine()
@@ -2565,19 +2868,59 @@ func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *t
 	// lease alpha is renewing, and every one of them must come back with nothing of ours.
 	require.NoError(t, beta.Start(ctx), "beta refused to start; the returned obstacle names why")
 
-	t.Logf("holding alpha's batch of %d rows for %s, which is %.0f times its own %s lease",
-		len(held), recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease), recoveryLease)
+	t.Logf("holding alpha's batch of %d rows for %s, which is %.0f times its own %s lease, "+
+		"at %s per publish (timing scale x%d: %s)",
+		len(held), recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease), recoveryLease,
+		recoverySlowPublish, recoveryTimingScale, recoveryTimingScaleReason)
 	time.Sleep(recoveryLeaseOverrun)
 
 	renewed := fixture.heldLeases(ctx)
 
+	// Keyed by event id, because the two readings are compared row by row: a row missing from
+	// renewed is either one alpha finished — legitimate — or one it lost, and only the state
+	// tells the two apart.
+	midflight := make(map[string]recoveryRowState, seededEvents)
+	for _, state := range fixture.snapshot(ctx) {
+		midflight[state.eventID] = state
+	}
+
+	// A row alpha FINISHED during the overrun is no longer held, and must not be: its lease was
+	// released by the dispatch that ended it. The lease contract applies to the rows still in
+	// flight, so the two groups are separated rather than asserted together — and the still-held
+	// group is required to be non-empty, because an empty one would make every assertion below
+	// pass by having nothing to check.
+	stillHeld := 0
+	settled := 0
+
 	for eventID, before := range held {
-		after, stillHeld := renewed[eventID]
-		require.Truef(t, stillHeld,
-			"event %s lost its claim while alpha was still holding it: after %s — %.0f leases — the "+
+		state, known := midflight[eventID]
+		require.Truef(t, known, "event %s must still be in the outbox", eventID)
+
+		if state.terminal() {
+			settled++
+
+			assert.Truef(t, state.dispatched,
+				"event %s finished during the overrun, so it must have finished by being DISPATCHED "+
+					"rather than by failing; status %q, last error %q",
+				eventID, state.status, state.lastError)
+			assert.Containsf(t, alphaPublisher.deliveries(), eventID,
+				"event %s finished during the overrun, so ALPHA must be the instance that published "+
+					"it: it held the claim throughout", eventID)
+
+			continue
+		}
+
+		after, keptIt := renewed[eventID]
+		require.Truef(t, keptIt,
+			"event %s lost its claim while alpha was still holding it: after %s — %.0f leases of %s — the "+
 				"heartbeat must have kept it. A row released here is republished by another instance "+
-				"while this one is still publishing it",
-			eventID, recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease))
+				"while this one is still publishing it. Its status is %q and no publish of it had "+
+				"completed. Timing scale x%d (%s), so if the heartbeat was merely descheduled rather "+
+				"than broken, that scale is what did not widen far enough",
+			eventID, recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease), recoveryLease,
+			state.status, recoveryTimingScale, recoveryTimingScaleReason)
+
+		stillHeld++
 
 		assert.Equalf(t, before.claimToken, after.claimToken,
 			"event %s must still be held by the SAME claim: a different token means the row was "+
@@ -2594,6 +2937,14 @@ func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *t
 			after.expiry.UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano))
 	}
 
+	t.Logf("after the overrun %d of alpha's rows are still in flight under the renewed lease and "+
+		"%d had already been dispatched by it", stillHeld, settled)
+	require.Positivef(t, stillHeld,
+		"alpha must still be holding rows at the end of the overrun, or the renewal assertions above "+
+			"checked nothing: %d rows were seeded, %d were claimed and %d had finished. Each publish "+
+			"takes %s, so the batch is meant to outlast the %s overrun",
+		seededEvents, len(held), settled, recoverySlowPublish, recoveryLeaseOverrun)
+
 	betaDelivered, betaStrangers, betaFailures := betaPublisher.counts()
 	t.Logf("beta polled throughout the overrun and delivered %d of this run's events "+
 		"(%d other runs', %d failures)", betaDelivered, betaStrangers, betaFailures)
@@ -2601,6 +2952,9 @@ func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *t
 		"beta must not publish a single row alpha is still holding: %d of this run's events were "+
 			"published by a second instance while the first had them in flight", betaDelivered)
 
+	// Alpha finishes the rest at its own pace. release() lets the publish parked at this instant
+	// return immediately instead of serving out its slowness, which shortens the drain without
+	// changing anything the assertions below rest on.
 	alphaPublisher.release()
 
 	states := fixture.waitForTerminalStates(ctx, seededEvents, recoveryDrainTimeout)
@@ -2691,7 +3045,7 @@ func TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget(t *testing.T
 			// it is not due yet. Without this the configured schedule — four waits of 1s, 2s, 4s
 			// and 8s between the five attempts — collapses into consecutive attempts against a
 			// broker that has barely begun to fail.
-			early, claimErr := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease)
+			early, claimErr := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease, "")
 			require.NoError(t, claimErr)
 			assert.Emptyf(t, fixture.mine(early),
 				"the persisted next_attempt_at must keep the row out of the claimable set until it is due (attempt %d)",
@@ -2712,7 +3066,7 @@ func TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget(t *testing.T
 	}
 
 	// A spent budget must END the retry loop.
-	exhausted, err := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease)
+	exhausted, err := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease, "")
 	require.NoError(t, err)
 	assert.Empty(t, fixture.mine(exhausted),
 		"a row whose retry budget is spent must not be claimable again; the claim predicate admits only "+

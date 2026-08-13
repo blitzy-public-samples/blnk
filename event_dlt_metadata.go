@@ -309,6 +309,21 @@ func normalizeDeadLetterListOptions(opts DeadLetterListOptions) (DeadLetterListO
 	opts.Topic = strings.TrimSpace(opts.Topic)
 	opts.Status = strings.TrimSpace(opts.Status)
 
+	// THE FREE-TEXT FILTERS ARE REFUSED HERE TOO, and not only at the HTTP boundary. A
+	// PostgreSQL text value cannot hold a NUL byte in any encoding, so one reaching the
+	// query aborts it with SQLSTATE 22021 and the repository reports a driver failure —
+	// an internal error, which is the wrong answer for a value the caller chose. This
+	// validator is the one seam every listing path shares (the page, the page-and-count
+	// and the bare count all normalise through it), so refusing here is what makes the
+	// answer the same for a caller that is not an HTTP request.
+	if err := requireComparableDeadLetterFilter("event_type", opts.EventType); err != nil {
+		return opts, err
+	}
+
+	if err := requireComparableDeadLetterFilter("topic", opts.Topic); err != nil {
+		return opts, err
+	}
+
 	switch opts.Status {
 	case "",
 		model.EventOutboxStatusDeadLettered,
@@ -339,6 +354,36 @@ func normalizeDeadLetterListOptions(opts DeadLetterListOptions) (DeadLetterListO
 	}
 
 	return opts, nil
+}
+
+// requireComparableDeadLetterFilter refuses a filter value the database cannot be asked
+// to compare.
+//
+// Parameters:
+//   - name string: the filter's name, which the refusal names so the caller knows which
+//     of several filters was rejected.
+//   - value string: the trimmed filter value. An empty value is no filter and passes.
+//
+// Returns:
+//   - error: a typed validation error when the value carries a NUL byte, nil otherwise.
+func requireComparableDeadLetterFilter(name, value string) error {
+	if !strings.ContainsRune(value, 0) {
+		return nil
+	}
+
+	// The value is deliberately absent from both the message and the cause: it carries a
+	// NUL byte, so whatever surrounds it is unvalidated caller input, and the cause is a
+	// log line. The filter's NAME is what identifies the problem.
+	return apierror.NewAPIError(
+		apierror.ErrGenValidation,
+		fmt.Sprintf(
+			"Invalid %s filter: it carries a NUL byte (0x00), which no stored value can contain, "+
+				"so nothing could ever match it. Remove the NUL byte and repeat the request",
+			name,
+		),
+		fmt.Errorf("blnk: the dead-letter %s filter carries a NUL byte, which no PostgreSQL text "+
+			"value can hold", name),
+	)
 }
 
 // replayAttemptNumber returns the attempt label a replay is recorded under.

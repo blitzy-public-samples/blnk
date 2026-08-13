@@ -483,7 +483,10 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 
 		_, err := source.UpdateEventSubscriber(
 			context.Background(), canonicalSubscriber(t), "claim-token")
-		requireAPIError(t, err, apierror.ErrConflict)
+		// SUBSCRIBER_DEPROVISIONING and not the generic conflict, which is what distinguishes
+		// this miss from the lost claim above by more than its wording: both are 409, and a
+		// client's error handling reads the code.
+		requireAPIError(t, err, apierror.ErrSubscriberDeprovisioning)
 		assert.Contains(t, err.Error(), "being deregistered")
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})

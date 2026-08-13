@@ -633,6 +633,44 @@ const EVENTS_STATS_COUNTS_URL = withQueryParam(
 );
 const LEDGERS_URL =
   __ENV.LEDGERS_URL || siblingURL(URL, "/transactions", "/ledgers");
+
+// WHICH LEDGER MUTATION THE LOAD OFFERS, and it exists because of a measured ceiling that
+// has nothing to do with the event pipeline.
+//
+//   - "transactions" (the default) posts POST /transactions. This is the faithful
+//     end-to-end path and it is what a deployment actually does, but the transaction is
+//     APPLIED ASYNCHRONOUSLY by the asynq worker, and the outbox row is written at apply
+//     time. So the rate offered to the OUTBOX is the worker's apply rate, not the API's
+//     accept rate. Measured: the API accepted 487.4 requests/sec while transaction.* outbox
+//     rows grew at 66.1/sec and the asynq backlog reached 567,644 — the relay was never
+//     offered more than 66 events/sec, so a 500-events/sec target could not be presented to
+//     it however hard the API was driven.
+//   - "ledgers" posts POST /ledgers. One ledger.created event per request, CAPTURED
+//     SYNCHRONOUSLY IN THE REQUEST PATH, so the rate offered to the outbox is the rate k6
+//     achieves and the target becomes presentable.
+//
+// The worker's concurrency is out of scope for this change, so this is the harness-side
+// remedy rather than a fix to the ceiling. What each mode can and cannot certify:
+// "ledgers" measures the OUTBOX AND THE RELAY at the target rate — the capture, the claim,
+// the publish, the ordering and the dead-letter rate — and it is the mode V-1 and V-3 are
+// demonstrable in. It does NOT measure the transaction pipeline, and no run in this mode
+// says anything about it. "transactions" measures the whole path and is bounded by the
+// worker. Neither replaces the other.
+const OFFER_MODE = (__ENV.OFFER_MODE || "transactions").toLowerCase();
+
+(function refuseUnknownOfferMode() {
+  if (OFFER_MODE === "transactions" || OFFER_MODE === "ledgers") {
+    return;
+  }
+
+  throw new Error(
+    "OFFER_MODE must be 'transactions' (the faithful end-to-end path, bounded by the" +
+      " asynq worker's apply rate) or 'ledgers' (one synchronous ledger.created per" +
+      " request, which is the mode the 500-events/sec target is presentable in); got '" +
+      OFFER_MODE +
+      "'",
+  );
+})();
 const BALANCES_URL =
   __ENV.BALANCES_URL || siblingURL(URL, "/transactions", "/balances");
 
@@ -1262,6 +1300,10 @@ const STATUS_UNREACHABLE = 0;
 
 // The three verdicts, plus the guard that says whether they mean anything.
 const M_EVENTS_PER_SEC = "event_publish_events_per_second";
+// The same delta over the OFFERED interval rather than the measured one. Reported beside
+// the achieved rate, never instead of it, and never as a verdict: it is the reading that
+// overstates when the pipeline lags, which is exactly why it needs a name of its own.
+const M_OFFERED_EVENTS_PER_SEC = "event_publish_offered_events_per_second";
 // The INTERVAL-AWARE throughput series, and the one the sustained-rate claim is read
 // from. See intervalEventsPerSecond for why a two-point average over the whole run is not
 // evidence of a sustained rate.
@@ -1426,6 +1468,7 @@ const finalSettleSeconds = new Gauge(M_FINAL_SETTLE_SECONDS);
 const backlogPendingAtSettle = new Gauge(M_BACKLOG_PENDING_AT_SETTLE);
 
 const eventsPerSecond = new Gauge(M_EVENTS_PER_SEC);
+const offeredEventsPerSecond = new Gauge(M_OFFERED_EVENTS_PER_SEC);
 
 // A TREND rather than a Gauge, because it holds one observation per sampling interval and the
 // verdict is a QUANTILE over them. Every other custom metric here is a Gauge precisely because it
@@ -3510,6 +3553,13 @@ function provisionAggregates() {
     return supplied;
   }
 
+  // LEDGERS MODE USES NO PAIRS AT ALL, so provisioning a pool would create ledgers and
+  // balances this run never touches — permanently, in a database with no delete endpoint
+  // for either. The key spread in that mode is one key per event by construction.
+  if (OFFER_MODE === "ledgers") {
+    return pairs;
+  }
+
   if (!(LEDGER_SPREAD > 0) || !LEDGERS_URL || !BALANCES_URL) {
     return pairs;
   }
@@ -3585,8 +3635,35 @@ function provisionAggregates() {
  * only the counter this did not read. The published counter is enough on a healthy stack and is
  * not enough on the stack whose isolation is most worth checking.
  *
+ * # An exposition that omits both counters is ZERO, not unreadable
+ *
+ * A counter instrument is exported only once it has been incremented, so a blnk process that
+ * has not yet published or dead-lettered a single event exposes NEITHER family — and that is
+ * the state of a freshly started instance, which is the most dedicated instance an acceptance
+ * run can be given. Reading that as "unreadable" refused the run the recipe asks for: bring up
+ * a stack nobody else is using, point the case at it, and it aborts in setup because the
+ * counters it intends to difference do not exist yet.
+ *
+ * The distinction that matters is therefore between the ENDPOINT and the SERIES:
+ *
+ *   - the endpoint could not be read at all — unreachable, refused, or not parseable — which is
+ *     null, because nothing is known about what the process has published;
+ *   - the endpoint answered and exports no terminal family yet, which is 0, because an
+ *     exposition that was read and contains no terminal counter says the process has produced
+ *     no terminal event;
+ *   - a family IS exported but its value could not be read, which is null again: something is
+ *     there and this cannot say what.
+ *
+ * Reading an empty exposition as zero cannot mask a stack whose publisher is a no-op either.
+ * The verdicts are gated separately on the series being present at measurement time — an absent
+ * published counter withholds every verdict rather than reporting a vacuous pass — so the only
+ * thing this decides is whether the probe can establish that no OTHER client is producing
+ * events, and on a process that has published nothing at either end of the probe, none is.
+ *
  * @param {object} scrape a scrapeMetrics result.
- * @returns {number|null} the sum, or null when neither counter could be read.
+ * @returns {number|null} the sum; 0 when the exposition was read and exports no terminal
+ *   counter yet; null when the exposition could not be read, or when a counter it does export
+ *   could not be.
  */
 function terminalEventTotal(scrape) {
   if (!scrape || !scrape.available || !scrape.snapshot) {
@@ -3595,6 +3672,9 @@ function terminalEventTotal(scrape) {
 
   var counters = scrape.snapshot.counters || {};
   var total = null;
+  // Set only when a family IS exported and its value still could not be read, which is the one
+  // case an available exposition still cannot be summed from.
+  var exportedButUnreadable = false;
   var families = [SERIES_PUBLISHED, SERIES_DEAD_LETTERED];
 
   for (var f = 0; f < families.length; f++) {
@@ -3605,10 +3685,17 @@ function terminalEventTotal(scrape) {
 
     var value = readNumber(counters, resolved.name);
     if (value === null) {
+      exportedButUnreadable = true;
       continue;
     }
 
     total = (total === null ? 0 : total) + value;
+  }
+
+  if (total === null) {
+    // The exposition was read and yielded no terminal counter. Zero unless something was there
+    // and could not be parsed; see the note above on the endpoint/series distinction.
+    return exportedButUnreadable ? null : 0;
   }
 
   return total;
@@ -3691,8 +3778,11 @@ function verifyInstanceIsolation() {
 
   if (before === null || after === null) {
     // THE CONTRACT COULD NOT BE ESTABLISHED, which is not the same as being violated and is
-    // reported as its own reason. It happens on a stack whose observability is off or whose
-    // publisher is a no-op, and on such a stack no verdict is computable anyway.
+    // reported as its own reason. It happens on a stack whose /metrics could not be read at
+    // all — unreachable, refused, or observability disabled — and on such a stack no verdict is
+    // computable anyway. It does NOT happen merely because the counters do not exist yet: an
+    // exposition that was read and exports no terminal counter is zero terminal events, which
+    // is exactly what a freshly started dedicated instance has produced. See terminalEventTotal.
     outcome.reason =
       "the idle probe could not read the terminal event counters at both ends, so foreign" +
       " traffic can be neither observed nor ruled out. Check that /metrics is reachable and" +
@@ -3758,20 +3848,52 @@ export function setup() {
   }
 
   var pairs = provisionAggregates();
-  console.log(
-    "[event_publish] provisioned " +
-      pairs.length +
-      " of " +
-      LEDGER_SPREAD +
-      " requested ledger/balance pairs" +
-      (pairs.length === 0
-        ? " — falling back to the @uuid shorthand, which shares ONE partition key, so the relay will publish that key strictly one event at a time regardless of the offered load"
-        : ""),
-  );
+  // THE LINE IS MODE-AWARE, because the same zero means opposite things in the two modes.
+  //
+  // In transactions mode a pair count of zero is the worst case there is: the payload falls
+  // back to the @uuid shorthand, every transaction names the same aggregate, and the relay
+  // publishes that one key strictly one event at a time — so the line has to say so.
+  //
+  // In ledgers mode provisionAggregates deliberately provisions nothing: the pairs are the
+  // TRANSACTION path's spread mechanism and no request in this mode carries one. Printing
+  // the transactions-mode sentence here would state the exact opposite of what the run
+  // does, and it is the first line an operator reads — a run whose key spread is one key
+  // per event would appear to be a run with a single key.
+  if (OFFER_MODE === "ledgers") {
+    console.log(
+      "[event_publish] provisioned no ledger/balance pairs, and none are used: OFFER_MODE=" +
+        "ledgers keys every event by the id of the ledger its own request created, so the " +
+        "spread is one partition key per event by construction",
+    );
+  } else {
+    console.log(
+      "[event_publish] provisioned " +
+        pairs.length +
+        " of " +
+        LEDGER_SPREAD +
+        " requested ledger/balance pairs" +
+        (pairs.length === 0
+          ? " — falling back to the @uuid shorthand, which shares ONE partition key, so the relay will publish that key strictly one event at a time regardless of the offered load"
+          : ""),
+    );
+  }
 
   // Acceptance mode refuses to spend thirty minutes measuring something it cannot
   // certify.
-  if (!SMOKE && LEDGER_SPREAD > 0 && pairs.length < requiredSpread()) {
+  //
+  // NOT IN LEDGERS MODE, and the exemption is not a relaxation. The gate exists because the
+  // transaction path takes its partition key from the balance pair it was given, so too few
+  // pairs means too few keys and the run would measure one aggregate's serialisation
+  // ceiling. In ledgers mode every event's key is the id of the ledger the request just
+  // created, so the spread is one key per event by construction and the pairs play no part
+  // in it — requiring them would refuse a run whose key spread is strictly better than the
+  // one being demanded.
+  if (
+    !SMOKE &&
+    OFFER_MODE !== "ledgers" &&
+    LEDGER_SPREAD > 0 &&
+    pairs.length < requiredSpread()
+  ) {
     throw new Error(
       "acceptance mode needs at least " +
         requiredSpread() +
@@ -3900,6 +4022,16 @@ export function setup() {
       events_stats_url: redactURL(EVENTS_STATS_URL),
       scenario: SCENARIO,
       rate: RATE,
+      // WHICH LEDGER MUTATION WAS OFFERED, recorded because it decides what the run's
+      // numbers are ABOUT. "transactions" measures the whole path and is bounded by the
+      // asynq worker's apply rate; "ledgers" offers one synchronous ledger.created per
+      // request and measures the outbox and the relay at the rate k6 achieved. A summary
+      // that did not say which was used could have either reading attributed to it.
+      offer_mode: OFFER_MODE,
+      offer_mode_note:
+        OFFER_MODE === "ledgers"
+          ? "ledger.created is captured inside the request, so the rate offered to the outbox is the rate k6 achieved. This run measures the OUTBOX AND RELAY — capture, claim, publish, ordering and dead-letter rate — and says nothing about the transaction pipeline. Every event's partition key is the id of the ledger the request created, so the key spread is one key per event, which is the favourable end of the range"
+          : "POST /transactions is applied asynchronously by the asynq worker and the outbox row is written at apply time, so the rate offered to the outbox is the worker's APPLY rate rather than the API's accept rate. Measured on this path: 487.4 requests/sec accepted against 66.1 transaction events/sec reaching the outbox. Use OFFER_MODE=ledgers to present a higher rate to the relay",
       duration: DURATION,
       pre_allocated_vus: VUS,
       max_vus: MAX_VUS,
@@ -4006,6 +4138,61 @@ function postTxn(source, destination) {
 }
 
 /**
+ * postLedger offers one ledger.created event, captured synchronously in the request path.
+ *
+ * ONE REQUEST, ONE EVENT, AND NO WORKER BETWEEN THEM. That is the whole reason this exists:
+ * the transaction path's outbox row is written when the asynq worker APPLIES the
+ * transaction, so the rate the relay is offered is the worker's apply rate and not the
+ * API's accept rate. A ledger is created inside the request, and its event is captured in
+ * the same database transaction, so the offered rate is whatever k6 achieves.
+ *
+ * The partition key is the new ledger's own id, so every event lands on a distinct key.
+ * That is the FAVOURABLE end of the key-spread range and it is stated here rather than
+ * left to be discovered: this mode measures how fast the outbox and the relay can go, and
+ * a deployment whose events concentrate on few keys is bounded by the per-key ordering
+ * guarantee instead. The key-spread sweep is the measurement for that, not this.
+ */
+function postLedger() {
+  var payload = JSON.stringify({
+    name: "loadtest-offer-" + uuidv4(),
+    meta_data: { source: "event-streaming load test", mode: "ledgers" },
+  });
+
+  var headers = { "Content-Type": "application/json" };
+  if (API_KEY) {
+    headers["X-Blnk-Key"] = API_KEY;
+  }
+
+  var res = http.post(LEDGERS_URL, payload, {
+    headers: headers,
+    timeout: "30s",
+    tags: { endpoint: "ledgers" },
+  });
+
+  var body = null;
+  try {
+    body = res.json();
+  } catch (err) {
+    body = null;
+  }
+
+  // The same two-part check the transaction producer makes, and for the same reason: a
+  // status alone does not establish that an event will follow it.
+  check(res, {
+    "is status 201": function (r) {
+      return r.status === 201;
+    },
+    "carries a ledger id": function () {
+      return (
+        body !== null &&
+        typeof body.ledger_id === "string" &&
+        body.ledger_id !== ""
+      );
+    },
+  });
+}
+
+/**
  * publishEvents is the scenario body: one attempted ledger mutation per iteration.
  *
  * The pair is picked at random from the aggregates setup() provisioned, so the load is spread
@@ -4022,6 +4209,15 @@ function postTxn(source, destination) {
  * @param {object} data the value setup returned.
  */
 export function publishEvents(data) {
+  // THE OFFERED-RATE MODE, and the branch is first because the two modes share nothing
+  // below it: a ledger mutation needs no balance pair, and the pairs the fixture built are
+  // the transaction path's spread mechanism rather than the pipeline's.
+  if (OFFER_MODE === "ledgers") {
+    postLedger();
+
+    return;
+  }
+
   var pairs = data && data.pairs ? data.pairs : null;
   if (pairs && pairs.length > 0) {
     var pair = pairs[Math.floor(Math.random() * pairs.length)];
@@ -4413,10 +4609,10 @@ export function teardown(data) {
   // exists to include them — so dividing by the offered window credits drain-period
   // publishing to load-period seconds.
   //
-  // THE RATE IS NEVERTHELESS DIVIDED BY NEITHER OF THEM. It is divided by LOAD_SECONDS,
-  // the CONFIGURED load interval, which is what "500 events/sec sustained for 30
-  // minutes" is a statement about; see the divisor comment at the throughput
-  // computation for why.
+  // THE SETTLED WINDOW IS WHAT THE RATE IS DIVIDED BY, so the numerator and the
+  // denominator describe the same interval. The offered window is recorded beside it and
+  // is what the separately-named offered-load reading uses; see the divisor comment at the
+  // throughput computation for why the two are kept apart rather than reconciled.
   var settledMillis = scrape.at - startedAt;
   var measuredWindow =
     startedAt > 0 && settledMillis > 0 ? settledMillis / 1000 : 0;
@@ -4609,8 +4805,27 @@ export function teardown(data) {
   // dead-lettered, never both — so their sum is the population the rate is stated over.
   var terminalEvents = publishedEvents + deadLetteredEvents;
 
-  // THE DIVISOR IS THE LOAD INTERVAL, not the measured window.
-  var throughput = LOAD_SECONDS > 0 ? publishedEvents / LOAD_SECONDS : 0;
+  // THE DIVISOR IS THE MEASURED WINDOW, because the numerator is measured over it.
+  //
+  // This used to divide by LOAD_SECONDS, the CONFIGURED load interval, on the reasoning
+  // that "500 events/sec sustained for 30 minutes" is a statement about that interval. The
+  // reasoning is fine and the arithmetic was not: the numerator is a settling-to-settling
+  // delta, so on a pipeline that lags it accrues over the load interval PLUS the whole
+  // drain, and dividing it by the load interval alone credits drain-period publishing to
+  // load-period seconds. Verified numerically at 6,330 events accrued over ~330 s and
+  // reported as 6,330/150 = 42.2 ev/s against a real 19.2 — a 2.2x overstatement, in the
+  // direction that flatters the run.
+  //
+  // The offered-load reading is still available, under a name that says what it is: see
+  // offeredThroughput below. Two numbers with honest names beat one number with a
+  // footnote, and this is the one a threshold can be attached to.
+  var throughput = measuredWindow > 0 ? publishedEvents / measuredWindow : 0;
+
+  // THE SAME NUMERATOR OVER THE OFFERED INTERVAL, kept because it answers a real question
+  // — how much of the load the run offered actually became events — and named so it cannot
+  // be read as an achieved rate. It is deliberately NOT a verdict: no threshold is
+  // registered against it, precisely because it is the figure that can overstate.
+  var offeredThroughput = LOAD_SECONDS > 0 ? publishedEvents / LOAD_SECONDS : 0;
   var ratio = terminalEvents > 0 ? deadLetteredEvents / terminalEvents : 0;
   // Published over dispatched, and it is NOT a redelivery factor. Both counters now
   // move ONCE PER EVENT: published at the transition that made the Kafka leg durable,
@@ -4781,6 +4996,7 @@ export function teardown(data) {
     reason = REASON_LOAD_INTERVAL_UNKNOWN;
   } else if (
     !SMOKE &&
+    OFFER_MODE !== "ledgers" &&
     LEDGER_SPREAD > 0 &&
     (baseline.pairs ? baseline.pairs.length : 0) < requiredSpread()
   ) {
@@ -4800,8 +5016,13 @@ export function teardown(data) {
   var measurementSound =
     scrapesUsable && !resetSeen && drainHeld && isolationHeld;
 
-  if (measurementSound && published.code !== SERIES_CODE_ABSENT && LOAD_SECONDS > 0) {
+  if (measurementSound && published.code !== SERIES_CODE_ABSENT && measuredWindow > 0) {
     eventsPerSecond.add(throughput);
+  }
+  // The offered-load figure is recorded under the same soundness gate and its own name, so
+  // the summary carries both and the arithmetic behind either can be re-done by hand.
+  if (measurementSound && published.code !== SERIES_CODE_ABSENT && LOAD_SECONDS > 0) {
+    offeredEventsPerSecond.add(offeredThroughput);
   }
   if (
     measurementSound &&
@@ -5829,8 +6050,8 @@ function buildProvenance(metrics) {
         target: TARGET_EVENTS_PER_SEC,
         comparison: ">=",
         // SERIES_PUBLISHED, because that is the counter the value beside it was
-        // differenced from: M_EVENTS_PER_SEC is publishedEvents / LOAD_SECONDS and is
-        // recorded only when the PUBLISHED series resolved. The dispatched counter's
+        // differenced from: M_EVENTS_PER_SEC is publishedEvents / the measured window and
+        // is recorded only when the PUBLISHED series resolved. The dispatched counter's
         // own resolution is still auditable, on the
         // event_publish_dispatched_series_code gauge and the dispatched_delta row under
         // raw_inputs.
@@ -5844,8 +6065,12 @@ function buildProvenance(metrics) {
           gaugeValue(metrics, M_PUBLISHED_SERIES_CODE),
         ),
         method:
-          "the counter's delta over the measured window, summed over every topic and event_type label, divided by the LOAD INTERVAL rather than by the window. The window is necessarily longer than the load — it opens at the baseline scrape after provisioning and closes after the tail drain — so dividing by it would charge the load for seconds during which none was offered, and would do so in the failing direction",
-        divisor_seconds: gaugeValue(metrics, M_LOAD_SECONDS),
+          "the counter's delta over the measured window, summed over every topic and event_type label, divided by THAT WINDOW so the numerator and the denominator describe the same interval. The window opens at the baseline scrape after provisioning and closes after the tail drain, so on a pipeline that lags it is longer than the load interval — which is the point: the delta accrues over the drain too, and dividing it by the load interval alone credited drain-period publishing to load-period seconds and overstated the rate by up to 2.2x. The offered-load reading is reported separately as offered_events_per_second",
+        divisor_seconds: gaugeValue(metrics, M_WINDOW_SECONDS),
+        offered_events_per_second: gaugeValue(metrics, M_OFFERED_EVENTS_PER_SEC),
+        offered_divisor_seconds: gaugeValue(metrics, M_LOAD_SECONDS),
+        offered_events_note:
+          "the same delta divided by the CONFIGURED load interval, which answers 'how much of the load offered became events' and is NOT an achieved rate. It carries no threshold and certifies nothing, because it is the reading that overstates when the relay lags behind the load",
         offered_arrival_rate: gaugeValue(metrics, M_OFFERED_RATE),
         offered_headroom_note:
           "the offered rate carries headroom over the target on purpose: at exactly the target a flawless run lands ON the >= boundary and every real effect — a dropped iteration, a rejected transaction, a window longer than the load — pushes below it, with nothing pushing the other way. The verdict is still judged at the target",
@@ -5864,7 +6089,7 @@ function buildProvenance(metrics) {
         certified_by: [M_EVENTS_PER_SEC],
         role: RATE_SAMPLER_ENABLED
           ? "DIAGNOSTIC. A whole-run mean cannot distinguish sustained load from a burst followed by a stall, so the sustained verdict below decides V-1's throughput and this figure carries no threshold"
-          : "VERDICT, by default of the sampler being disabled. This is a whole-run MEAN: a run that managed twice the target for half its duration and nothing for the other half reports the target here. Set RATE_WINDOW_SECONDS to enable the windowed verdict",
+          : "VERDICT, by default of the sampler being disabled. This is a whole-run MEAN over the measured window: a run that managed twice the target for half its duration and nothing for the other half reports the target here. Set RATE_WINDOW_SECONDS to enable the windowed verdict",
       },
       sustained_throughput_events_per_second: {
         metric: M_WINDOW_EVENTS_PER_SEC,
@@ -6058,11 +6283,18 @@ function buildProvenance(metrics) {
         : ALLOW_FIXTURE_CREATION
           ? "created by this run and PERMANENT: Blnk has no delete endpoint for a ledger or a balance, so ALLOW_FIXTURE_CREATION=1 was required to acknowledge it"
           : "none created",
-      note: "the number of independent aggregates the offered load was spread over. The relay's claim returns at most ONE row per partition key per poll, so this is the ceiling on concurrent publishing: throughput comes from distinct keys, not from a larger batch. Zero means the @uuid shorthand fallback was used, whose balances all share one default ledger — such a run measures one aggregate's serialisation ceiling and cannot certify a throughput target",
+      note:
+        OFFER_MODE === "ledgers"
+          ? "NOT APPLICABLE IN THIS MODE, and the zero beside it does not mean what it means for a transaction run. OFFER_MODE=ledgers creates a ledger per request and keys each event by that ledger's own id, so the spread is one partition key PER EVENT — the favourable end of the range — and no balance-pair pool is provisioned. The figure here counts that pool, which this run does not use"
+          : "the number of independent aggregates the offered load was spread over. The relay's claim returns at most ONE row per partition key per poll, so this is the ceiling on concurrent publishing: throughput comes from distinct keys, not from a larger batch. Zero means the @uuid shorthand fallback was used, whose balances all share one default ledger — such a run measures one aggregate's serialisation ceiling and cannot certify a throughput target",
     },
     raw_inputs: {
       load_seconds: gaugeValue(metrics, M_LOAD_SECONDS),
       offered_rate: gaugeValue(metrics, M_OFFERED_RATE),
+      // The measured window is now the throughput divisor, so it belongs beside the load
+      // interval it replaced rather than only in the verdict's own provenance.
+      measured_window_seconds: gaugeValue(metrics, M_WINDOW_SECONDS),
+      offered_window_seconds: gaugeValue(metrics, M_OFFERED_WINDOW_SECONDS),
       backlog_drained: gaugeValue(metrics, M_BACKLOG_DRAINED),
       drain_seconds: gaugeValue(metrics, M_DRAIN_SECONDS),
       settlement_population_complete: gaugeValue(

@@ -728,7 +728,7 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 
 	mock.ExpectQuery("").WillReturnRows(newEventOutboxRows())
 
-	_, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
+	_, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second, "")
 	require.NoError(t, err)
 	require.Len(t, *captured, 1, "the claim must be a single statement, not a multi-round-trip read")
 
@@ -741,25 +741,26 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	assert.NotContains(t, issued, "ORDER BY created_at",
 		"ordering by created_at would silently break per-aggregate ordering while leaving every other test green")
 
-	// THE PER-KEY EXCLUSION PREDICATE. Kafka preserves append order rather than occurred_at, so that
-	// reordering reaches subscribers with nothing anywhere to show it.
-	assert.Contains(t, issued, "NOT EXISTS",
-		"the claim must exclude a row whose message key already has an earlier row in flight; SKIP LOCKED alone permits same-key reordering")
-
-	// SCOPED BY THE EFFECTIVE KEY, which is the key the publisher hashes — the ledger
-	// wherever a row has one, the stored partition key only where it does not. Scoping it
-	// wider would serialise unrelated aggregates and destroy throughput; scoping it to the
-	// partition_key COLUMN was the previous shape and was NARROWER than the Kafka
-	// partition, which is worse than either: two same-ledger rows with divergent stored
-	// keys went unserialised while both hashed to one partition.
-	assert.Contains(t, issued, eventOutboxEffectiveKeySQL("earlier")+" = "+eventOutboxEffectiveKeySQL("candidate"),
-		"the exclusion must compare the EFFECTIVE key on both sides, so the value the database serialises on is the value Kafka partitions on")
-	assert.NotContains(t, issued, "earlier.partition_key = candidate.partition_key",
-		"the superseded column comparison must not return")
-	assert.Contains(t, issued, "(earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)",
-		"the exclusion must compare occurrence THEN id, matching the claim ordering exactly, or two rows sharing an instant could both be claimed")
-	assert.Contains(t, issued, "earlier.status IN ('pending', 'processing')",
-		"only pending and processing rows may block their key: a permanently failed or dead-lettered row must not stall its aggregate forever")
+	// THE PER-KEY SERIALISATION. Kafka preserves append order rather than occurred_at, so a
+	// reordering here reaches subscribers with nothing anywhere to show it.
+	//
+	// It is carried by per-key RUNS rather than by a correlated anti-join. The anti-join was
+	// correct and unaffordable: it re-tested the whole blocked population on every claim, so
+	// one key carrying 150,000 rows cost 1.5 seconds to return one row.
+	assert.Contains(t, issued, eventOutboxEffectiveKeySQL("candidate")+" = key_heads.effective_key",
+		"a key's run must be gathered through the EFFECTIVE key expression — the key the publisher hashes — so the value the database serialises on is the value Kafka partitions on")
+	assert.NotContains(t, issued, "candidate.partition_key = keys.effective_key", //nolint:testifylint // superseded shape
+		"the superseded column comparison must not return: two same-ledger rows with divergent stored keys would go unserialised while both hashed to one partition")
+	assert.Contains(t, issued, "blnk.event_outbox_key_head(keys.effective_key)",
+		"and a key's HEAD must be resolved either from the age-ordered window that already read it "+
+			"or through the pinned lookup — never through an inline lateral, which the planner "+
+			"answers with an age-ordered scan filtered on the key")
+	assert.Contains(t, issued, "BOOL_AND(following.claimable) OVER (",
+		"a run must be cut at the first row that is not claimable, so no row is ever claimed over an older sibling of its own key")
+	assert.Contains(t, issued, "candidate.id = ANY (ARRAY(SELECT id FROM key_heads))",
+		"a claimant must enter a key through its HEAD and lock it, which is what stops a second claimant taking any other row of that key")
+	assert.Contains(t, issued, "candidate.status IN ('pending', 'processing')",
+		"only pending and processing rows take part in a key's run: a permanently failed or dead-lettered row must not stall its aggregate forever")
 
 	// The remaining predicates the relay's correctness rests on.
 	assert.Contains(t, issued, "candidate.attempts < candidate.max_attempts",
@@ -776,7 +777,9 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	// UPDATE ... RETURNING does not preserve the inner ORDER BY, so the outer sort over
 	// the CTE is what guarantees FIFO WITHIN a batch.
 	assert.Contains(t, issued, "ORDER BY candidate.occurred_at ASC, candidate.id ASC",
-		"the inner selection must order by occurrence then id, so rows sharing an instant are still claimed in the order they were recorded")
+		"the inner selections must order by occurrence then id, so rows sharing an instant are still claimed in the order they were recorded")
+	assert.Contains(t, issued, "ORDER BY offered.occurred_at ASC, offered.id ASC",
+		"the batch must be composed oldest first across keys, so the oldest work is never displaced by a newer key's run, and so cutting it back to the batch can only ever drop a run's tail")
 	assert.Contains(t, issued, "SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC",
 		"the outer re-sort over the CTE is what guarantees FIFO WITHIN a batch; UPDATE ... RETURNING does not preserve the inner ORDER BY, so it is not redundant and must not be collapsed")
 
@@ -794,13 +797,15 @@ func TestClaimPendingEventOutbox_BindsProcessingStatusLockIntervalAndBatchSize(t
 
 	var claimToken driver.Value
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
-		WithArgs(model.EventOutboxStatusProcessing, "30s", captureArg(&claimToken), 100).
+		WithArgs(model.EventOutboxStatusProcessing, "30s", captureArg(&claimToken), 100,
+			eventClaimKeyBudget(100), eventClaimKeyScanWindow, "rotate-from-here", eventClaimKeyWalkDepth).
 		WillReturnRows(newEventOutboxRows())
 
-	_, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
+	_, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second, "rotate-from-here")
 	require.NoError(t, err)
 	assert.NoError(t, mock.ExpectationsWereMet(),
-		"the claim must bind exactly (processing, lock interval string, claim token, batch size) in that order")
+		"the claim must bind exactly (processing, lock interval string, claim token, batch size, "+
+			"key budget, key scan window, key cursor, key walk depth) in that order")
 
 	token, ok := claimToken.(string)
 	require.True(t, ok, "the claim token must be bound as text")
@@ -819,7 +824,7 @@ func TestClaimPendingEventOutbox_NonPositiveBatchSizeIsRejected(t *testing.T) {
 			db, mock := newSQLMock(t)
 			ds := Datasource{Conn: db}
 
-			entries, err := ds.ClaimPendingEventOutbox(context.Background(), batchSize, 30*time.Second)
+			entries, err := ds.ClaimPendingEventOutbox(context.Background(), batchSize, 30*time.Second, "")
 
 			assert.Nil(t, entries)
 			requireAPIError(t, err, apierror.ErrBadRequest)
@@ -842,10 +847,11 @@ func TestClaimPendingEventOutbox_NonPositiveLockDurationFallsBackToDefault(t *te
 
 			mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 				WithArgs(model.EventOutboxStatusProcessing, defaultEventClaimLease.String(),
-					sqlmock.AnyArg(), 25).
+					sqlmock.AnyArg(), 25, eventClaimKeyBudget(25), eventClaimKeyScanWindow,
+					"", eventClaimKeyWalkDepth).
 				WillReturnRows(newEventOutboxRows())
 
-			_, err := ds.ClaimPendingEventOutbox(context.Background(), 25, lockDuration)
+			_, err := ds.ClaimPendingEventOutbox(context.Background(), 25, lockDuration, "")
 			require.NoError(t, err, "a non-positive lease must be normalised, not rejected: failing the poll would stop the relay")
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
@@ -874,7 +880,7 @@ func TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnRows(newEventOutboxRows(newest, middle, oldest))
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 10, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 10, 30*time.Second, "")
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{newest.EventID, middle.EventID, oldest.EventID}, eventIDsOf(entries),
@@ -929,7 +935,7 @@ func TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(newEventOutboxRows(want))
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second, "")
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	got := entries[0]
@@ -1002,7 +1008,7 @@ func TestClaimPendingEventOutbox_NullableColumnsScanCleanly(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(newEventOutboxRows(bare))
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second, "")
 	require.NoError(t, err, "NULL nullable columns must scan cleanly")
 	require.Len(t, entries, 1)
 	got := entries[0]
@@ -1057,7 +1063,7 @@ func TestClaimPendingEventOutbox_APartialBrokerCoordinateScansAsAbsent(t *testin
 			rows := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(values...)
 			mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(rows)
 
-			entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second)
+			entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second, "")
 			require.NoError(t, err, "a partial coordinate must scan cleanly, not error")
 			require.Len(t, entries, 1)
 
@@ -1083,7 +1089,7 @@ func TestClaimPendingEventOutbox_EmptyBacklogReturnsNoError(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(newEventOutboxRows())
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second, "")
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -1098,7 +1104,7 @@ func TestClaimPendingEventOutbox_QueryErrorIsWrapped(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second, "")
 
 	assert.Nil(t, entries)
 	requireAPIError(t, err, apierror.ErrInternalServer)
@@ -1130,7 +1136,7 @@ func TestClaimPendingEventOutbox_ScanErrorIsWrapped(t *testing.T) {
 	broken := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(cells...)
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(broken)
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second, "")
 
 	assert.Nil(t, entries, "a scan failure must abandon the batch, never return a partial one")
 	requireAPIError(t, err, apierror.ErrInternalServer)
@@ -1153,7 +1159,7 @@ func TestClaimPendingEventOutbox_RowIterationErrorIsWrapped(t *testing.T) {
 	rows := newEventOutboxRows(entry).RowError(0, sql.ErrConnDone)
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(rows)
 
-	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
+	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second, "")
 
 	assert.Nil(t, entries)
 	requireAPIError(t, err, apierror.ErrInternalServer)
@@ -1184,10 +1190,14 @@ func TestMarkEventDispatched_SetsDispatchedStatusStampsTimestampAndClearsLease(t
 			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
 			// $6-$8: the broker coordinate, NULL here because this case has none.
 			// TestMarkEventDispatched_PersistsTheBrokerCoordinate covers the populated form.
-			nil, nil, nil).
+			nil, nil, nil,
+			// $9: the dual-delivery marker, folded into this statement rather than written by a
+			// second one. Bound as a parameter so a pass that settles no legacy leg cannot
+			// un-mark a row whose leg was already recorded.
+			true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42", model.BrokerRecord{}))
+	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42", model.BrokerRecord{}, true))
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
@@ -1374,7 +1384,7 @@ func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) 
 func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 	transitions := map[string]func(ctx context.Context, ds Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDispatched(ctx, 1, "   ", model.BrokerRecord{})
+			return ds.MarkEventDispatched(ctx, 1, "   ", model.BrokerRecord{}, true)
 		},
 		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
 			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0, false, testDeadLetterHandoffLease)
@@ -2080,7 +2090,7 @@ func TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped(t *testing.T) {
 func eventTransitionTable() map[string]func(context.Context, Datasource) error {
 	return map[string]func(context.Context, Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDispatched(ctx, 1, "tok", model.BrokerRecord{})
+			return ds.MarkEventDispatched(ctx, 1, "tok", model.BrokerRecord{}, true)
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
 			return ds.MarkEventDeadLettered(ctx, 1, "tok", "blnk.transactions.dlt", json.RawMessage(`{}`), model.BrokerRecord{})
@@ -2148,7 +2158,7 @@ func TestMarkEventTransitions_UndeterminableRowsAffectedIsNotAnError(t *testing.
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnResult(sqlmock.NewErrorResult(errors.New("rows affected not supported")))
 
-	assert.NoError(t, ds.MarkEventDispatched(context.Background(), 5, "tok", model.BrokerRecord{}),
+	assert.NoError(t, ds.MarkEventDispatched(context.Background(), 5, "tok", model.BrokerRecord{}, true),
 		"a driver that cannot report RowsAffected must not fail an UPDATE that already succeeded")
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -4627,7 +4637,7 @@ func TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr(t *testing.T)
 		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 			WillReturnRows(newEventOutboxRows(claimed).CloseError(closeErr))
 
-		entries, err := ds.ClaimPendingEventOutbox(context.Background(), 10, 30*time.Second)
+		entries, err := ds.ClaimPendingEventOutbox(context.Background(), 10, 30*time.Second, "")
 
 		assert.Nil(t, entries,
 			"a batch the driver could not vouch for must not be handed back as though it were complete")
@@ -5027,8 +5037,28 @@ func isMarkedEventOutbox(entry model.EventOutbox, markerPrefix string) bool {
 func claimEventOutboxToken(t *testing.T, ds Datasource, entry *model.EventOutbox) string {
 	t.Helper()
 
-	claimed, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 5*time.Minute, "")
 	require.NoError(t, err)
+
+	// EVERY OTHER ROW THE CLAIM RETURNED IS PUT BACK, because a claim now hands out a
+	// contiguous RUN per partition key rather than a single row. This helper's callers want
+	// one row leased — the one whose token they are about to use — and a sibling of the same
+	// key left leased for five minutes would be missing from the claim they assert on next,
+	// which reads as the claim refusing to hand it over rather than as this helper holding it.
+	defer func() {
+		for _, row := range claimed {
+			if row.EventID == entry.EventID {
+				continue
+			}
+
+			_, releaseErr := ds.Conn.Exec(`
+				UPDATE blnk.event_outbox
+				SET status = 'pending', locked_until = NULL, claim_token = NULL
+				WHERE id = $1
+			`, row.ID)
+			require.NoError(t, releaseErr, "failed to release a row this helper claimed but does not want")
+		}
+	}()
 
 	for _, row := range claimed {
 		if row.EventID == entry.EventID {
@@ -5040,6 +5070,22 @@ func claimEventOutboxToken(t *testing.T, ds Datasource, entry *model.EventOutbox
 	require.FailNowf(t, "row was not claimed",
 		"event %q was expected in the claimed batch; without its token no transition can be authorised", entry.EventID)
 	return ""
+}
+
+// releaseEventOutboxLease returns one row to the claimable set without settling it, which
+// is what the relay's own abandonment leaves behind: a leased row whose lease lapses.
+//
+// It exists because a claim now hands out a RUN, so a test that wants to observe a single row
+// of a key being re-claimed has to give up the siblings the same claim leased.
+func releaseEventOutboxLease(t *testing.T, ds Datasource, id int64) {
+	t.Helper()
+
+	_, err := ds.Conn.Exec(`
+		UPDATE blnk.event_outbox
+		SET status = 'pending', locked_until = NULL, claim_token = NULL
+		WHERE id = $1
+	`, id)
+	require.NoError(t, err, "failed to release the lease on event outbox row %d", id)
 }
 
 // TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB is the baseline: a row
@@ -5245,50 +5291,61 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 		insertionOrder = append(insertionOrder, entry.EventID)
 	}
 
-	// ONE AT A TIME, and that is the guarantee rather than a limitation of the test. So
-	// the batch is drained by claiming, retiring, and claiming again, and the sequence
-	// that comes out is the sequence a consumer sees.
+	// A KEY'S ROWS COME OUT AS ONE ORDERED RUN, to one claimant, and the sequence they come
+	// out in is the sequence a consumer sees.
+	//
+	// They used to come out ONE PER CLAIM, and that is what made the drain rate equal the
+	// number of distinct aggregates — 1.00 event/second for a single key. The exclusivity
+	// that mattered was never "one row at a time"; it was "one CLAIMANT at a time, taking
+	// rows from the key's head forward, publishing them sequentially". This test therefore
+	// drains the key over as many claims as it takes and asserts the ORDER, which is the
+	// property per-aggregate ordering actually rests on.
 	drained := make([]string, 0, len(inserted))
 	for len(drained) < len(inserted) {
-		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 
-		mine := make([]model.EventOutbox, 0, 1)
+		mine := make([]model.EventOutbox, 0, len(inserted))
 		for _, entry := range claimed {
 			if isMarkedEventOutbox(entry, marker) {
 				mine = append(mine, entry)
 			}
 		}
-		require.Len(t, mine, 1,
-			"at most ONE row per partition key may be claimable at a time; more than one in flight is how same-aggregate events get appended out of order")
+		require.NotEmpty(t, mine, "the key must be claimable; a stalled key is an undrainable aggregate")
 
-		entry := mine[0]
-		assert.Equal(t, model.EventOutboxStatusProcessing, entry.Status,
-			"a claimed row must be moved to processing and leased")
-		require.NotNil(t, entry.LockedUntil, "a claimed row must carry a lease")
-		require.NotNil(t, entry.FirstAttemptedAt, "the claim must stamp first_attempted_at")
-		require.NotNil(t, entry.LastAttemptedAt, "the claim must stamp last_attempted_at")
-		require.NotEmpty(t, entry.ClaimToken, "a claimed row must carry the token the claim issued")
+		for _, entry := range mine {
+			assert.Equal(t, model.EventOutboxStatusProcessing, entry.Status,
+				"a claimed row must be moved to processing and leased")
+			require.NotNil(t, entry.LockedUntil, "a claimed row must carry a lease")
+			require.NotNil(t, entry.FirstAttemptedAt, "the claim must stamp first_attempted_at")
+			require.NotNil(t, entry.LastAttemptedAt, "the claim must stamp last_attempted_at")
+			require.NotEmpty(t, entry.ClaimToken, "a claimed row must carry the token the claim issued")
 
-		drained = append(drained, entry.EventID)
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken, model.BrokerRecord{}))
+			drained = append(drained, entry.EventID)
+			require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken, model.BrokerRecord{}, true))
+		}
 	}
 
 	wantOccurrenceOrder := []string{
 		byLabel["first"], byLabel["second"], byLabel["third"], byLabel["fourth"],
 	}
 	assert.Equal(t, wantOccurrenceOrder, drained,
-		"the claim must release rows in occurred_at order; ordering by created_at or id would return insertion order instead and silently break per-aggregate ordering")
+		"the claim must release rows in occurred_at order, WITHIN a run as well as across claims; ordering by created_at or id would return insertion order instead and silently break per-aggregate ordering")
 	assert.NotEqual(t, insertionOrder, drained,
 		"the fixtures were built so occurrence order disagrees with insertion order; if these matched, the test could not distinguish occurred_at from created_at")
 }
 
-// TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB is the
-// direct proof of the per-key exclusion predicate, and it is the test SKIP LOCKED alone cannot
-// pass.
+// TestClaimPendingEventOutbox_OnlyOneClaimantPerPartitionKeyIsEverInFlight_RealDB is the
+// direct proof of the per-key exclusion, and it is the test SKIP LOCKED alone cannot pass.
 //
-// FOR UPDATE SKIP LOCKED makes it impossible for two relays to claim the SAME row.
-func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(t *testing.T) {
+// FOR UPDATE SKIP LOCKED makes it impossible for two relays to claim the SAME row. It says
+// nothing about two relays holding two DIFFERENT rows of one partition key at once, which is
+// what would let event N+1 reach the topic before event N.
+//
+// The exclusion is stated per CLAIMANT rather than per row: one claim takes a contiguous run
+// from a key's head, and while it holds any of that key's rows no other claim may take any
+// other. A retrying row still holds its key. A terminal row releases it.
+func TestClaimPendingEventOutbox_OnlyOneClaimantPerPartitionKeyIsEverInFlight_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("onekey")
@@ -5311,22 +5368,34 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 	independent.OccurredAt = base.Add(2 * time.Minute)
 	insertRealEventOutbox(t, ds, independent)
 
-	first, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	first, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 	assert.True(t, containsEventID(first, earlier.EventID),
 		"the earliest row of a key must be claimable")
-	assert.False(t, containsEventID(first, later.EventID),
-		"a LATER row of the same partition key must not be claimable while an earlier one is in flight; this is exactly what SKIP LOCKED alone permits")
 	assert.True(t, containsEventID(first, independent.EventID),
 		"the exclusion must be scoped to the partition key: serialising unrelated keys would destroy throughput")
 
-	// A second poll, with the earlier row still held, must still refuse its successor —
-	// which is the multi-relay case, since a second relay's poll is indistinguishable from
-	// a second poll here.
-	second, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	// THE RUN, and its ORDER. Both rows of the shared key belong to this claimant, and the
+	// earlier one comes first — which is what lets the relay publish them sequentially in
+	// order rather than paying a whole claim for each.
+	sharedRun := make([]string, 0, 2)
+	for _, row := range first {
+		if row.EffectiveKey() == sharedKey {
+			sharedRun = append(sharedRun, row.EventID)
+		}
+	}
+	assert.Equal(t, []string{earlier.EventID, later.EventID}, sharedRun,
+		"a key's rows must arrive as ONE contiguous run, head first, to one claimant")
+
+	// A second poll, with that run still held, must refuse EVERY row of the key — which is
+	// the multi-relay case, since a second relay's poll is indistinguishable from a second
+	// poll here.
+	second, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
+	assert.False(t, containsEventID(second, earlier.EventID),
+		"a second relay instance must not be able to claim a row another claimant holds")
 	assert.False(t, containsEventID(second, later.EventID),
-		"a second relay instance must not be able to claim the successor either")
+		"nor any other row of that key: two claimants publishing one key concurrently is how same-aggregate events get appended out of order")
 
 	// A FAILURE within budget returns the earlier row to pending, where it still blocks
 	// its key — retries preserve order.
@@ -5341,27 +5410,46 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 	require.NoError(t, err)
 	require.False(t, outcome.Exhausted)
 
-	retry, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
-	require.NoError(t, err)
-	assert.True(t, containsEventID(retry, earlier.EventID),
-		"a retryable row must be re-claimed")
-	assert.False(t, containsEventID(retry, later.EventID),
-		"a retrying row must still block its key, or a retry would be appended after its own successor")
+	// The successor is returned to the claimable set the way the relay returns a run it
+	// abandoned: by letting the lease go. That is what the relay does when a row of a run does
+	// not settle — it stops publishing the run and leaves the rest leased until it expires.
+	releaseEventOutboxLease(t, ds, later.ID)
 
-	// Retiring the earlier row finally releases the key.
-	var retryToken string
+	retry, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
+	require.NoError(t, err)
+	require.True(t, containsEventID(retry, earlier.EventID),
+		"a retryable row must be re-claimed")
+
+	// THE RETRY COMES BACK AT THE HEAD OF ITS RUN, and that is the ordering guarantee in this
+	// state: the successor may travel WITH its predecessor, to the same claimant, behind it —
+	// never ahead of it, and never to a different claimant.
+	retryRun := make([]string, 0, 2)
 	for _, row := range retry {
-		if row.EventID == earlier.EventID {
-			retryToken = row.ClaimToken
+		if row.EffectiveKey() == sharedKey {
+			retryRun = append(retryRun, row.EventID)
 		}
 	}
-	require.NotEmpty(t, retryToken)
-	require.NoError(t, ds.MarkEventDispatched(ctx, earlier.ID, retryToken, model.BrokerRecord{}))
+	require.NotEmpty(t, retryRun)
+	assert.Equal(t, earlier.EventID, retryRun[0],
+		"a retrying row must lead its key's run, or a retry would be appended after its own successor")
 
-	released, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	concurrent, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
-	assert.True(t, containsEventID(released, later.EventID),
-		"once its predecessor reaches a terminal state the successor must become claimable, or the key stalls forever")
+	assert.False(t, containsEventID(concurrent, later.EventID),
+		"and no second claimant may take the successor while the retrying predecessor is held")
+
+	// Retiring the run's rows finally releases the key.
+	for _, row := range retry {
+		if row.EffectiveKey() == sharedKey {
+			require.NoError(t, ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}, true))
+		}
+	}
+
+	stored, err := ds.GetEventByID(ctx, later.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.NotNil(t, stored.DispatchedAt,
+		"once its predecessor reaches a terminal state the successor must be delivered too, or the key stalls forever")
 }
 
 // TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB pins the
@@ -5393,7 +5481,7 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 	require.NoError(t, err)
 	require.True(t, outcome.Exhausted, "a one-attempt budget is spent by its first failure")
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 	assert.False(t, containsEventID(claimed, doomed.EventID),
 		"a failed row is out of the claimable set: it belongs to the dead-letter path")
@@ -5441,7 +5529,7 @@ func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_Real
 	assert.Equal(t, 1, stored.WebhookAttempts)
 	assert.Equal(t, 0, stored.Attempts, "no Kafka attempt may have been spent")
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 
 	assert.True(t, containsEventID(claimed, published.EventID),
@@ -5503,7 +5591,7 @@ func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t
 		inFlight = append(inFlight, insertRealEventOutbox(t, ds, row))
 	}
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, originalLease)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, originalLease, "")
 	require.NoError(t, err)
 
 	mine := make(map[string]model.EventOutbox, 3)
@@ -5523,7 +5611,7 @@ func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t
 	}
 
 	// One row finishes, exactly as the first wave of a real batch does.
-	require.NoError(t, ds.MarkEventDispatched(ctx, finished.ID, token, model.BrokerRecord{}))
+	require.NoError(t, ds.MarkEventDispatched(ctx, finished.ID, token, model.BrokerRecord{}, true))
 
 	renewed, err := ds.RenewEventOutboxLease(ctx, token, 10*time.Minute)
 	require.NoError(t, err)
@@ -5535,7 +5623,7 @@ func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t
 	// Past the ORIGINAL lease. Without the renewal every one of these rows would be claimable now.
 	time.Sleep(originalLease + 200*time.Millisecond)
 
-	afterExpiry, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute)
+	afterExpiry, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute, "")
 	require.NoError(t, err)
 
 	for _, row := range inFlight {
@@ -5615,7 +5703,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 	// Both rows fail their only attempt. They are claimed in ONE batch — their partition
 	// keys differ, so nothing serialises them — and the tokens are captured together,
 	// because a second claim would find them already leased under the first one.
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 
 	tokens := make(map[string]string, 2)
@@ -5646,7 +5734,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 		"blnk.transactions.dlt", json.RawMessage(`{"original_topic":"blnk.transactions"}`), model.BrokerRecord{}))
 
 	// THE LIMBO. The ordinary claim will never take the stranded row again.
-	ordinary, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute)
+	ordinary, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute, "")
 	require.NoError(t, err)
 	require.False(t, containsEventID(ordinary, stranded.EventID),
 		"a row whose retry budget is spent must be outside the ordinary claim: if it were not, this "+
@@ -5772,7 +5860,7 @@ func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T
 		go func(w int) {
 			defer done.Done()
 			start.Wait() // line every worker up for maximum contention
-			results[w], errs[w] = ds.ClaimPendingEventOutbox(ctx, total/workers, 5*time.Minute)
+			results[w], errs[w] = ds.ClaimPendingEventOutbox(ctx, total/workers, 5*time.Minute, "")
 		}(w)
 	}
 	start.Done()
@@ -5873,7 +5961,7 @@ func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t 
 	defer cancelClaim()
 
 	started := time.Now()
-	claimed, claimErr := ds.ClaimPendingEventOutbox(claimCtx, 1, testSettlementLease)
+	claimed, claimErr := ds.ClaimPendingEventOutbox(claimCtx, 1, testSettlementLease, "")
 	elapsed := time.Since(started)
 
 	require.NoErrorf(t, claimErr,
@@ -5909,7 +5997,7 @@ func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t 
 	// drain.
 	release()
 
-	reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 5, testSettlementLease)
+	reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 5, testSettlementLease, "")
 	require.NoError(t, err)
 	assert.Truef(t, containsEventID(reclaimed, parked.EventID),
 		"once the lock is released the passed-over row must be claimable again. SKIP LOCKED defers "+
@@ -5930,12 +6018,12 @@ func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
 	entry := newEventOutboxFixture(marker)
 	insertRealEventOutbox(t, ds, entry)
 
-	firstClaim, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	firstClaim, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 	require.True(t, containsEventID(firstClaim, entry.EventID), "the fixture must be claimed first time")
 
 	// While the lease holds, the row must not be claimable again.
-	secondClaim, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	secondClaim, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 	assert.False(t, containsEventID(secondClaim, entry.EventID),
 		"a leased row must not be claimable again; otherwise two relays publish the same event")
@@ -5955,7 +6043,7 @@ func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
 		"the crashed-relay scenario requires the row to still be in processing")
 	require.True(t, lockExpired, "the lease must already be expired on the database clock")
 
-	reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 	assert.True(t, containsEventID(reclaimed, entry.EventID),
 		"an expired lease on a processing row must make it claimable again; this is what stops a relay crash from stranding in-flight events forever")
@@ -5990,7 +6078,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 
 	// Everything relay A now attempts must be refused.
 	t.Run("stale dispatch is refused", func(t *testing.T) {
-		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken, model.BrokerRecord{}), apierror.ErrConflict)
+		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken, model.BrokerRecord{}, true), apierror.ErrConflict)
 	})
 	t.Run("stale failure is refused and does not spend the budget", func(t *testing.T) {
 		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0, false, testDeadLetterHandoffLease)
@@ -6017,7 +6105,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 	})
 
 	// And the LIVE holder is unaffected throughout.
-	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, liveToken, model.BrokerRecord{}),
+	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, liveToken, model.BrokerRecord{}, true),
 		"the live claim holder must still be able to complete its work")
 
 	final, err := ds.GetEventByID(ctx, entry.EventID)
@@ -6055,7 +6143,7 @@ func TestClaimPendingEventOutbox_SkipsRowsAtMaxAttempts_RealDB(t *testing.T) {
 		"UPDATE blnk.event_outbox SET attempts = max_attempts - 1 WHERE id = $1", withinBudget.ID)
 	require.NoError(t, err)
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 
 	assert.False(t, containsEventID(claimed, exhausted.EventID),
@@ -6084,7 +6172,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		entry := newEventOutboxFixture(marker)
 		insertRealEventOutbox(t, ds, entry)
 
-		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 		require.True(t, containsEventID(claimed, entry.EventID))
 
@@ -6096,7 +6184,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		}
 		require.NotEmpty(t, token, "the claim must issue a token, or no transition can be authorised")
 
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}, true))
 
 		got, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -6105,10 +6193,10 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.Nil(t, got.LockedUntil, "the lease must be released")
 		assert.Empty(t, got.ClaimToken, "a terminal state releases the claim token")
 
-		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}),
+		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}, true),
 			"replaying the same transition with the same token must be refused: the row is terminal and the token has been released")
 
-		again, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		again, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 		assert.False(t, containsEventID(again, entry.EventID),
 			"dispatched is terminal: the claim predicate admits only pending and processing rows")
@@ -6139,7 +6227,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		require.NotNil(t, got.FirstAttemptedAt)
 		require.NotNil(t, got.LastAttemptedAt)
 
-		reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 		assert.True(t, containsEventID(reclaimed, entry.EventID), "a retryable row must be reclaimable")
 	})
@@ -6168,7 +6256,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.True(t, got.NextAttemptAt.After(time.Now().Add(30*time.Minute)),
 			"the due instant must be advanced by the caller's delay, got %s", got.NextAttemptAt)
 
-		notDue, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		notDue, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 		assert.False(t, containsEventID(notDue, entry.EventID),
 			"a pending, unleased row that is not yet DUE must not be claimed — that is the whole backoff")
@@ -6181,7 +6269,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 			entry.ID)
 		require.NoError(t, err)
 
-		due, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		due, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 		assert.True(t, containsEventID(due, entry.EventID),
 			"once the due instant passes the row must be claimed again")
@@ -6231,7 +6319,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		secondToken := claimEventOutboxToken(t, ds, entry)
 		require.NotEqual(t, firstToken, secondToken,
 			"each claim must issue its own token, or a stale worker's token would still authorise a write")
-		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken, model.BrokerRecord{}),
+		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken, model.BrokerRecord{}, true),
 			"the stale token from the previous claim must no longer authorise anything")
 
 		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0, false, testDeadLetterHandoffLease)
@@ -6276,7 +6364,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		// A failed row is out of the claimable set even though it is not yet
 		// dead-lettered, so it cannot be retried past its budget.
-		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 		require.NoError(t, err)
 		assert.False(t, containsEventID(claimed, entry.EventID))
 
@@ -6338,7 +6426,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		// A replaying row is also out of the relay's reach, so the relay cannot publish
 		// it underneath the replay.
-		relayBatch, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute)
+		relayBatch, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute, "")
 		require.NoError(t, err)
 		assert.False(t, containsEventID(relayBatch, entry.EventID),
 			"a replaying row must be outside the relay's claimable set")
@@ -6356,7 +6444,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		reclaimed, err := ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
 		require.NoError(t, err)
 		require.NotNil(t, reclaimed)
-		require.NoError(t, ds.MarkEventDispatched(ctx, reclaimed.ID, reclaimed.ClaimToken, model.BrokerRecord{}))
+		require.NoError(t, ds.MarkEventDispatched(ctx, reclaimed.ID, reclaimed.ClaimToken, model.BrokerRecord{}, true))
 
 		done, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -6557,13 +6645,13 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 
 	for range wantDispatched {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}, true))
 	}
 	// Dispatched THREE HOURS AGO: inside the wide window, outside the narrow one. These are
 	// the rows whose disappearance from the narrow reading is the fix.
 	for range wantAgedDispatched {
 		entry := insertRealEventOutbox(t, ds, aged())
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}, true))
 	}
 	for range wantDeadLettered {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
@@ -6770,7 +6858,8 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// no leases and mutates nothing — which matters here, because executing this
 	// particular statement would move rows into processing as a side effect.
 	rows, err := ds.Conn.QueryContext(ctx, "EXPLAIN "+claimPendingEventOutboxQuery,
-		model.EventOutboxStatusProcessing, (5 * time.Minute).String(), uuid.NewString(), 100)
+		model.EventOutboxStatusProcessing, (5 * time.Minute).String(), uuid.NewString(), 100,
+		eventClaimKeyBudget(100), eventClaimKeyScanWindow, "", eventClaimKeyWalkDepth)
 	require.NoError(t, err, "EXPLAIN of the claim query must succeed")
 	defer func() { _ = rows.Close() }()
 
@@ -6802,37 +6891,67 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	requireColdHistoryExcludingIndex(t, ds, candidateScan, planText,
 		"the claim's candidate selection", marker)
 
-	// The earlier-same-key exclusion must be INDEX-DRIVEN and confined to the blocking
-	// states. What it must never be is a scan of each key's entire history, which would
-	// buy the ordering guarantee at a price that grows with the table — correct, and
-	// progressively unable to keep up.
+	// THE PER-KEY SERIALISATION MUST BE INDEX-DRIVEN AND BOUNDED, which is where the
+	// previous shape failed. It expressed the serialisation as a correlated anti-join
+	// evaluated once per candidate row, so a key carrying 150,000 blocked rows cost 1.5
+	// seconds and 605,415 buffer accesses to return ONE row: correct, and progressively
+	// unable to keep up. It is now three bounded index operations, and this is what each
+	// must remain.
 	//
-	// That property is asserted rather than the name of one specific index, because
-	// PostgreSQL has TWO correct ways to satisfy it and picks between them on cost:
-	//
-	//   - a NESTED LOOP anti-join that probes idx_event_outbox_effective_key_inflight once
-	//     per candidate row, which wins when there are many candidates; and
-	//   - a HASH anti-join whose build side is read from idx_event_outbox_claim in ONE
-	//     index scan, which wins when the claimable working set is small — the steady
-	//     state the relay actually lives in, and what it chooses on a compacted heap.
-	assert.Contains(t, planText, "Anti Join",
-		"the earlier-same-key exclusion must survive as an anti-join. Without the NOT EXISTS predicate a relay can skip an earlier locked row and claim a LATER row with the same partition key, and because Kafka preserves append order rather than occurred_at a subscriber then sees one aggregate's events out of order — with no error, no log line and no row state to show it.\nPlan was:\n"+planText)
-
+	// The key sources and the head lookup are asserted through the partition key expression
+	// rather than through an index NAME, because the name is a plan detail and the
+	// expression is the guarantee.
 	assert.Contains(t, planText, "partition_key",
-		"the anti-join must be keyed on partition_key, which is what makes it per-aggregate.\nPlan was:\n"+planText)
+		"the claim must resolve keys through the effective partition key, which is what makes the serialisation per-aggregate.\nPlan was:\n"+planText)
 
-	// Asserted on the ONE plan line that reaches the earlier-same-key relation rather than
-	// on the whole plan text: "the plan contains an index scan somewhere" is nearly
-	// vacuous — every plan here contains several — whereas "the line reaching
-	// `event_outbox earlier` is an index scan through a blocking-state partial index" says
-	// exactly what it means, and it says it for either of the two plan shapes above.
-	earlierScan := planAccessPathFor(planText, "event_outbox earlier")
-	require.NotEmpty(t, earlierScan,
-		"the plan must reach the earlier-same-key relation explicitly.\nPlan was:\n"+planText)
-	assert.Contains(t, earlierScan, "Index",
-		"the earlier-same-key exclusion must be index-driven. Read through a scan instead, the ordering guarantee is bought at the price of reading the table's entire history on every poll — correct, and progressively unable to keep up.\nPlan line was: "+earlierScan)
-	requireColdHistoryExcludingIndex(t, ds, earlierScan, planText,
-		"the earlier-same-key exclusion", marker)
+	// (1) THE HEADS: carried out of the age-ordered window, with the per-key lookup present but
+	// reached only when the window cannot fill a batch.
+	//
+	// This assertion changed shape when the lookup did, and the reason is worth stating where
+	// the plan is being read. A head USED to be resolved by a lateral probe per key, and the
+	// assertion here was that the probe was index-driven. It was — when the planner chose the
+	// effective-key index. The planner chooses it on an estimate of how many rows are claimable,
+	// that estimate comes from statistics gathered when almost always nothing was, and at "one
+	// row" an age-ordered scan filtered on the key is costed lower than the seek. Measured on a
+	// 600,000-row table with 25,000 rows pending, that choice cost 2,215ms and 1.8 million
+	// buffer accesses for one claim of 100 rows, against 9.4ms and 4,571 for the shape below.
+	//
+	// So the plan is now asserted on the two properties that survive the planner's choice: the
+	// window is index-driven, and the lookup that remains is the PINNED one, whose own plan is
+	// fixed by its definition rather than chosen per statement.
+	assert.Contains(t, planText, "Function Scan on event_outbox_key_head",
+		"the per-key head lookup must go through blnk.event_outbox_key_head, whose plan is pinned "+
+			"to the effective-key index by its definition. An inline lateral is planned per "+
+			"statement, and the planner gets it wrong in exactly the state that matters.\n"+
+			"Plan was:\n"+planText)
+
+	// And the carried path must be in the plan beside it: key_heads reads the key list for the
+	// heads the window already resolved, rather than probing the table for every key. The window
+	// itself is the candidate scan asserted index-driven above — it is the first node of the
+	// statement to reach the relation, which is why there is no second access-path check here.
+	assert.Contains(t, planText, "CTE Scan on keys",
+		"the heads the age-ordered window carried must be read back from the key list. Probed per "+
+			"key instead, the claim pays a lookup for every key it considers — 400 of them per "+
+			"claim, and each one costed on an estimate the planner takes from statistics gathered "+
+			"when nothing was claimable.\nPlan was:\n"+planText)
+
+	// (2) THE RUN TAIL: a RANGE scan from the head forward, so a key's successors are reached
+	// without reading the rows in front of them. It is asserted on the INDEX CONDITION rather
+	// than on a named plan node because the tail CTE is read once and PostgreSQL inlines it,
+	// which leaves its scan under whichever node consumed it.
+	assert.Contains(t, planText, "ROW(occurred_at, id) > ROW(",
+		"a key's successors must be reached by an index RANGE scan starting at the head this claim "+
+			"locked. Filtered instead of ranged, the claim reads every row of the key ahead of the "+
+			"tail on every poll, which is the cost that made the previous claim unusable at scale.\n"+
+			"Plan was:\n"+planText)
+
+	// (3) THE LOCK, which is what makes the serialisation hold across relay instances: a
+	// claimant enters a key by locking its head, so no other claimant can take any row of
+	// that key. Without a LockRows node the claim takes no row locks at all, and two
+	// instances would publish one aggregate concurrently — with no error, no log line and no
+	// row state to show it, because Kafka preserves append order rather than occurred_at.
+	assert.Contains(t, planText, "LockRows",
+		"the claim must take row locks: locking a key's head is what excludes every other claimant from that key.\nPlan was:\n"+planText)
 
 	assert.NotContains(t, planText, "Seq Scan on event_outbox",
 		"the claim must not sequentially scan blnk.event_outbox.\nPlan was:\n"+planText)
@@ -7120,11 +7239,18 @@ func planIndexesUsed(planText string) []string {
 }
 
 // eventOutboxClaimQueries are the three statements that lease rows, named so the
-// invariant below covers all of them rather than whichever one a reader remembers.
-var eventOutboxClaimQueries = map[string]string{
-	"pending claim":            claimPendingEventOutboxQuery,
-	"failed dead-letter claim": claimFailedEventOutboxForDeadLetterQuery,
-	"webhook delivery claim":   claimPendingWebhookDeliveriesQuery,
+// invariant below covers all of them rather than whichever one a reader remembers. Each
+// carries the name of the CTE its UPDATE draws its rows from, because the three do not
+// agree on one name and must not be made to: the publish claim composes its row set from
+// per-key runs and then filters it by which locks were actually taken, so its final set is
+// `claimable_prefix`, while the two single-population claims select `candidates` directly.
+var eventOutboxClaimQueries = map[string]struct {
+	query  string
+	rowSet string
+}{
+	"pending claim":            {query: claimPendingEventOutboxQuery, rowSet: "claim_set"},
+	"failed dead-letter claim": {query: claimFailedEventOutboxForDeadLetterQuery, rowSet: "candidates"},
+	"webhook delivery claim":   {query: claimPendingWebhookDeliveriesQuery, rowSet: "candidates"},
 }
 
 // TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet is a
@@ -7133,27 +7259,27 @@ var eventOutboxClaimQueries = map[string]string{
 // Every one of these statements leases rows and every one bounds the lease with a
 // LIMIT.
 func TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet(t *testing.T) {
-	for name, query := range eventOutboxClaimQueries {
+	for name, claim := range eventOutboxClaimQueries {
 		t.Run(name, func(t *testing.T) {
-			require.Contains(t, query, "AS MATERIALIZED",
+			require.Contains(t, claim.query, "AS MATERIALIZED",
 				"the candidate selection must be a MATERIALIZED CTE so it is evaluated exactly "+
 					"once; without it the planner may re-execute the LIMIT per outer row and the "+
 					"claim leases more rows than the caller asked for")
 
-			require.Contains(t, query, "WHERE id IN (SELECT id FROM candidates)",
+			require.Contains(t, claim.query, claim.rowSet,
 				"the UPDATE must select its rows from the materialised candidate set rather than "+
 					"from an inline subquery, which is the form that can be re-executed")
 
 			// The precautions the CTE must not have quietly cost: skip-locked concurrency
 			// between relay instances, and the LIMIT itself.
-			require.Contains(t, query, "FOR UPDATE SKIP LOCKED",
+			require.Contains(t, claim.query, "FOR UPDATE SKIP LOCKED",
 				"several relay instances must still be able to claim disjoint subsets")
-			require.Contains(t, query, "LIMIT $",
+			require.Contains(t, claim.query, "LIMIT $",
 				"the batch size must still be bound rather than inlined or dropped")
 
 			// And the inline shape must be gone rather than merely joined by a CTE: leaving
 			// both would mean the bound holds only for whichever the planner used.
-			assert.NotContains(t, query, "WHERE id IN (\n",
+			assert.NotContains(t, claim.query, "WHERE id IN (\n",
 				"no inline multi-line IN subquery may remain in a claim")
 		})
 	}
@@ -7181,7 +7307,7 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 	const batchSize = 2
 	drained := make([]string, 0, total)
 	for len(drained) < total {
-		claimed, err := ds.ClaimPendingEventOutbox(ctx, batchSize, 5*time.Minute)
+		claimed, err := ds.ClaimPendingEventOutbox(ctx, batchSize, 5*time.Minute, "")
 		require.NoError(t, err)
 
 		mine := make([]string, 0, batchSize)
@@ -7199,7 +7325,7 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 		// does once the broker acknowledges.
 		for _, entry := range claimed {
 			if isMarkedEventOutbox(entry, marker) {
-				require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken, model.BrokerRecord{}))
+				require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken, model.BrokerRecord{}, true))
 			}
 		}
 	}
@@ -8432,11 +8558,11 @@ func TestMarkEventDispatched_PersistsTheBrokerCoordinate(t *testing.T) {
 	mock.ExpectExec("").
 		WithArgs(model.EventOutboxStatusDispatched, int64(42), "tok-42",
 			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
-			captureArg(&topic), captureArg(&partition), captureArg(&offset)).
+			captureArg(&topic), captureArg(&partition), captureArg(&offset), true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	record := model.BrokerRecord{Topic: "blnk.transactions", Partition: 3, Offset: 148_291}
-	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42", record))
+	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42", record, true))
 
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
@@ -8446,6 +8572,9 @@ func TestMarkEventDispatched_PersistsTheBrokerCoordinate(t *testing.T) {
 	assert.Contains(t, issued, "kafka_offset = COALESCE($8, kafka_offset)",
 		"COALESCE, not assignment: a webhook-only pass carries no coordinate and must not erase "+
 			"the one the successful publish recorded")
+	assert.Contains(t, issued, "webhook_dispatched = webhook_dispatched OR $9",
+		"OR, not assignment: the marker is folded into this statement to save a second one, and a "+
+			"pass that settles no legacy leg must not un-mark a row whose leg was already recorded")
 
 	assert.Equal(t, "blnk.transactions", topic)
 	assert.EqualValues(t, 3, partition)
@@ -8463,11 +8592,11 @@ func TestMarkEventDispatched_BindsNullForAnUnconfirmedCoordinate(t *testing.T) {
 	mock.ExpectExec("UPDATE blnk.event_outbox").
 		WithArgs(model.EventOutboxStatusDispatched, int64(42), "tok-42",
 			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
-			captureArg(&topic), captureArg(&partition), captureArg(&offset)).
+			captureArg(&topic), captureArg(&partition), captureArg(&offset), true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	require.NoError(t, ds.MarkEventDispatched(
-		context.Background(), 42, "tok-42", model.BrokerRecord{},
+		context.Background(), 42, "tok-42", model.BrokerRecord{}, true,
 	))
 
 	assert.Nil(t, topic, "an absent coordinate must bind NULL, never a zero")
@@ -8723,7 +8852,7 @@ func TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB(t *testing.T) {
 	token := claimEventOutboxToken(t, ds, entry)
 
 	record := eventOutboxBrokerRecord(marker, 4, 9_182)
-	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, record))
+	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, record, true))
 
 	stored, err := ds.GetEventByID(ctx, entry.EventID)
 	require.NoError(t, err)
@@ -8748,7 +8877,7 @@ func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
 	first := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 	second := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 
 	tokens := make(map[string]string, 2)
@@ -8760,10 +8889,10 @@ func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
 	require.Len(t, tokens, 2, "both fixture rows must be claimed in one pass")
 
 	record := eventOutboxBrokerRecord(marker, 2, 555)
-	require.NoError(t, ds.MarkEventDispatched(ctx, first.ID, tokens[first.EventID], record))
+	require.NoError(t, ds.MarkEventDispatched(ctx, first.ID, tokens[first.EventID], record, true))
 
 	// The SAME coordinate for a different row. The database must refuse it.
-	err = ds.MarkEventDispatched(ctx, second.ID, tokens[second.EventID], record)
+	err = ds.MarkEventDispatched(ctx, second.ID, tokens[second.EventID], record, true)
 	require.Error(t, err,
 		"THE UNIQUE INDEX IS THE GUARANTEE: two rows sharing one record's corroboration would let "+
 			"the audit count one record twice, which is the double-counting the mapping removes")
@@ -8800,7 +8929,7 @@ func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *t
 	// A row that has NOT been published at all, which must not be counted by any bucket.
 	untouched := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 
 	tokens := make(map[string]string, 7)
@@ -8817,7 +8946,7 @@ func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *t
 
 	// Inside the window.
 	require.NoError(t, ds.MarkEventDispatched(ctx, inside.ID, tokens[inside.EventID],
-		at(kafkaTopic, 0, 450)))
+		at(kafkaTopic, 0, 450), true))
 
 	// Kafka leg done, HTTP leg outstanding. Not terminal, but on the topic and inside the
 	// window — so it corroborates.
@@ -8827,20 +8956,20 @@ func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *t
 
 	// Published, acknowledged, but the library reported no coordinate.
 	require.NoError(t, ds.MarkEventDispatched(ctx, noCoordinate.ID, tokens[noCoordinate.EventID],
-		model.BrokerRecord{}))
+		model.BrokerRecord{}, true))
 
 	// Below the window: written, then deleted by retention.
 	require.NoError(t, ds.MarkEventDispatched(ctx, agedOut.ID, tokens[agedOut.EventID],
-		at(kafkaTopic, 0, 99)))
+		at(kafkaTopic, 0, 99), true))
 
 	// AT the end offset. The boundary is exclusive, so this is beyond the log — the reading
 	// that means the partition was truncated or the topic recreated.
 	require.NoError(t, ds.MarkEventDispatched(ctx, beyondEnd.ID, tokens[beyondEnd.EventID],
-		at(kafkaTopic, 0, 900)))
+		at(kafkaTopic, 0, 900), true))
 
 	// A topic no window covers.
 	require.NoError(t, ds.MarkEventDispatched(ctx, unmeasured.ID, tokens[unmeasured.EventID],
-		at(otherTopic, 0, 450)))
+		at(otherTopic, 0, 450), true))
 
 	after, err := ds.AuditEventRecordsInIntervals(ctx, windows)
 	require.NoError(t, err)
@@ -9910,7 +10039,7 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 
 		switch spec.status {
 		case model.EventOutboxStatusDispatched:
-			require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, record))
+			require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, record, true))
 		case model.EventOutboxStatusFailed:
 			outcome, failErr := ds.MarkEventFailed(ctx, entry.ID, token, "spent", 0, true, testDeadLetterHandoffLease)
 			require.NoError(t, failErr)
@@ -9944,7 +10073,7 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 	insertRealEventOutbox(t, ds, survivor)
 	require.NoError(t, ds.MarkEventDispatched(ctx, survivor.ID,
 		claimEventOutboxToken(t, ds, survivor),
-		model.BrokerRecord{Topic: survivor.Topic, Partition: 1, Offset: 9500}))
+		model.BrokerRecord{Topic: survivor.Topic, Partition: 1, Offset: 9500}, true))
 
 	purged, err := ds.PurgeTerminalEventsBefore(ctx, cutoff, 100)
 	require.NoError(t, err)
@@ -10108,7 +10237,7 @@ func TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB(t *testing
 		entry.Topic = auditTopic
 		insertRealEventOutbox(t, ds, entry)
 		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
-			model.BrokerRecord{Topic: entry.Topic, Partition: spec.partition, Offset: spec.offset}))
+			model.BrokerRecord{Topic: entry.Topic, Partition: spec.partition, Offset: spec.offset}, true))
 	}
 
 	unconfirmed := newEventOutboxFixture(marker)
@@ -10217,8 +10346,18 @@ func TestOldestDeadLetterAgeByTopic_IsOneGroupedAggregate(t *testing.T) {
 
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
-	assert.Contains(t, issued, "MIN(COALESCE(last_attempted_at, occurred_at))",
-		"the age is measured from the last attempt, falling back to occurrence for a row that never attempted")
+	assert.Contains(t, issued, "WHEN NULLIF(dlt_topic, '') IS NULL THEN COALESCE(first_attempted_at, occurred_at)",
+		"a row whose dead-letter write is still OWED must be anchored on its FIRST attempt: the repair "+
+			"pass re-claims exactly those rows every tick and stamps last_attempted_at as it does, so "+
+			"anchoring them there let the process failing to preserve an event reset that event's own "+
+			"triage clock — and DeadLetterMessageStuck could never fire for the one class of event that "+
+			"reached no topic at all")
+	assert.Contains(t, issued, "ELSE COALESCE(last_attempted_at, occurred_at)",
+		"a PRESERVED entry is still measured from the last attempt, the moment it was given up on and "+
+			"therefore the moment it started waiting for a human; nothing rewrites that column once "+
+			"dlt_topic is set")
+	assert.Contains(t, issued, "MIN(",
+		"one grouped aggregate, not a per-topic query each")
 	assert.Contains(t, issued, "GROUP BY")
 	assert.NotContains(t, issued, "OFFSET",
 		"the deep tail offset this replaced is the cost PERF-P07 is about")
@@ -10261,6 +10400,178 @@ func TestOldestDeadLetterAgeByTopic_ErrorsAreWrapped(t *testing.T) {
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
+}
+
+// TestOldestDeadLetterAgeByTopic_OwedPreservationCannotHaveItsClockReset_RealDB is the
+// regression guard on the one state the age gauge could not measure.
+//
+// A row whose retry budget is spent and whose `<topic>.dlt` write ALSO failed is the only
+// copy of an event that reached no Kafka topic at all, and the relay's repair pass
+// re-claims exactly those rows on every one-second poll tick — stamping
+// last_attempted_at = NOW() as it does. Anchoring their age on that column meant the
+// process failing to preserve an event reset that event's own triage clock: the age stayed
+// pinned at a few tens of seconds however long the row had been stranded, and
+// DeadLetterMessageStuck could never fire for it while firing correctly for every
+// preserved entry beside it.
+//
+// So the repair claim is run HERE, through the production statement rather than a hand
+// written UPDATE, and the age is read on both sides of it. The assertion is that the claim
+// makes no difference to it.
+//
+// A PRESERVED entry is asserted in the same call, because the fix must not change it:
+// once dlt_topic is set no claim can reach the row, so last_attempted_at is exactly the
+// moment the event was given up on and therefore the moment its wait for a human began.
+func TestOldestDeadLetterAgeByTopic_OwedPreservationCannotHaveItsClockReset_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("dltage")
+	quiesceEventOutbox(t, ds, marker)
+
+	const (
+		owedTopic      = "blnk.transactions"
+		preservedTopic = "blnk.balances"
+	)
+
+	// MIN OVER A GROUP IS A WHOLE-TABLE READING, so a foreign row in either group would
+	// decide the answer and this test would describe someone else's data. Skipping is the
+	// only honest response on a shared database — it cannot mask the defect, because with
+	// no foreign rows the assertions below run in full.
+	var foreign int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM blnk.event_outbox
+		WHERE status IN ('failed', 'dead_lettered')
+		  AND topic IN ($1, $2)
+		  AND aggregate_id NOT LIKE $3
+	`, owedTopic, preservedTopic, marker+"%").Scan(&foreign),
+		"counting foreign unresolved rows must succeed")
+
+	if foreign > 0 {
+		t.Skipf(
+			"blnk.event_outbox holds %d unresolved row(s) on %s or %s that this test did not create, "+
+				"so the grouped MIN would report their age rather than the fixtures' and the assertion "+
+				"would be unanswerable",
+			foreign, owedTopic, preservedTopic)
+	}
+
+	// THE OWED ROW: a one-attempt budget, spent by its first failure, which is what leaves
+	// it terminal with dlt_topic still NULL.
+	owed := newEventOutboxFixture(marker)
+	owed.Topic = owedTopic
+	owed.MaxAttempts = 1
+	owed.OccurredAt = dbTimestamp(time.Now().Add(-50 * time.Minute))
+	insertRealEventOutbox(t, ds, owed)
+
+	owedToken := claimEventOutboxToken(t, ds, owed)
+	outcome, err := ds.MarkEventFailed(ctx, owed.ID, owedToken,
+		"the dead-letter write never landed", 0, false, testDeadLetterHandoffLease)
+	require.NoError(t, err)
+	require.True(t, outcome.Exhausted,
+		"a one-attempt budget is spent by its first failure, which is the state whose only copy is the row")
+
+	// AGED, because the debt has to be older than the alert threshold for the reading to
+	// mean anything, and a test cannot wait forty minutes. Only the timestamps are moved —
+	// the row's state is whatever the production transitions above made it. The lease is
+	// released and the row made due so the production repair claim can reach it, exactly as
+	// it would once the hand-off lease expired.
+	const owedDebtAge = 40 * time.Minute
+	_, err = ds.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET first_attempted_at = NOW() - $2::interval,
+			locked_until = NULL,
+			next_attempt_at = NOW() - INTERVAL '1 second'
+		WHERE id = $1
+	`, owed.ID, owedDebtAge.String())
+	require.NoError(t, err, "ageing the owed row's retry window must succeed")
+
+	// THE PRESERVED CONTROL: dlt_topic set, so the row is out of every claim's reach.
+	preserved := newEventOutboxFixture(marker)
+	preserved.EventType = "balance.created"
+	preserved.Topic = preservedTopic
+	preserved.OccurredAt = dbTimestamp(time.Now().Add(-50 * time.Minute))
+	insertRealEventOutbox(t, ds, preserved)
+
+	preservedToken := claimEventOutboxToken(t, ds, preserved)
+	require.NoError(t, ds.MarkEventDeadLettered(ctx, preserved.ID, preservedToken,
+		preservedTopic+".dlt",
+		json.RawMessage(`{"original_topic":"`+preservedTopic+`","attempt_count":5}`),
+		model.BrokerRecord{}))
+
+	const preservedWait = 20 * time.Minute
+	_, err = ds.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET first_attempted_at = NOW() - INTERVAL '45 minutes',
+			last_attempted_at  = NOW() - $2::interval
+		WHERE id = $1
+	`, preserved.ID, preservedWait.String())
+	require.NoError(t, err, "ageing the preserved row's wait must succeed")
+
+	ageFor := func(topic string) time.Duration {
+		t.Helper()
+
+		ages, ageErr := ds.OldestDeadLetterAgeByTopic(ctx, ".dlt")
+		require.NoError(t, ageErr)
+
+		for _, age := range ages {
+			if age.Topic == topic {
+				require.False(t, age.Oldest.IsZero(), "a group that exists must carry an instant")
+
+				return time.Since(age.Oldest)
+			}
+		}
+
+		require.FailNowf(t, "topic absent from the aggregate",
+			"%q holds an unresolved row, so it must appear in the grouped reading; a topic missing "+
+				"from it is an inventory the alert cannot see", topic)
+
+		return 0
+	}
+
+	const tolerance = 2 * time.Minute
+
+	before := ageFor(owedTopic + ".dlt")
+	assert.InDelta(t, owedDebtAge.Seconds(), before.Seconds(), tolerance.Seconds(),
+		"an owed dead-letter write must age from the FIRST attempt: that is when the debt started, "+
+			"and it is the only attempt timestamp the repair pass does not rewrite")
+	assert.Greater(t, before, 15*time.Minute,
+		"the whole point of the anchor: a row stranded for forty minutes must read past the "+
+			"fifteen-minute threshold DeadLetterMessageStuck compares against")
+
+	// THE PRODUCTION RESET, run deliberately. This is the statement the relay issues on
+	// every tick for exactly this row, and it stamps last_attempted_at = NOW().
+	claimed, err := ds.ClaimEventsOwedDeadLetter(ctx, 10, 30*time.Second)
+	require.NoError(t, err)
+
+	var reclaimed bool
+	for _, row := range claimed {
+		if row.EventID == owed.EventID {
+			reclaimed = true
+		}
+	}
+	require.True(t, reclaimed,
+		"the repair claim must reach the owed row, or the reset this test is about never happened "+
+			"and the assertion below would pass vacuously")
+
+	var stamped time.Time
+	require.NoError(t, ds.Conn.QueryRowContext(ctx,
+		`SELECT last_attempted_at FROM blnk.event_outbox WHERE id = $1`, owed.ID).Scan(&stamped))
+	assert.WithinDuration(t, time.Now(), stamped, tolerance,
+		"the claim must have moved last_attempted_at to now; if it did not, the reset this guards "+
+			"against did not occur and the assertion below is vacuous")
+
+	after := ageFor(owedTopic + ".dlt")
+	assert.InDelta(t, owedDebtAge.Seconds(), after.Seconds(), tolerance.Seconds(),
+		"THE REGRESSION: a repair attempt must not reset the triage clock of the row it failed to "+
+			"clear. Reading a few tens of seconds here is the defect — the age was pinned below the "+
+			"threshold for as long as the preservation kept failing, so the one class of event that "+
+			"reached no topic at all was the one class the alert was blind to")
+
+	preservedAge := ageFor(preservedTopic + ".dlt")
+	assert.InDelta(t, preservedWait.Seconds(), preservedAge.Seconds(), tolerance.Seconds(),
+		"a PRESERVED entry must still age from its last attempt — the moment it was given up on. "+
+			"No claim can reach a row whose dlt_topic is set, so that column is stable for it, and "+
+			"measuring it from the first attempt would over-report every entry's wait by its whole "+
+			"retry window")
 }
 
 // planNodeReferencing returns the plan node that reaches needle: the scan line PLUS the
@@ -10595,7 +10906,7 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 	// A row that has NOT been published at all, which must not be counted by either total.
 	untouched := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 	require.NoError(t, err)
 
 	tokens := make(map[string]string, 4)
@@ -10607,7 +10918,7 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 	require.Len(t, tokens, 4)
 
 	require.NoError(t, ds.MarkEventDispatched(ctx, confirmed.ID, tokens[confirmed.EventID],
-		eventOutboxBrokerRecord(marker, 0, 1)))
+		eventOutboxBrokerRecord(marker, 0, 1), true))
 
 	// Kafka leg done, HTTP leg outstanding. Not terminal, but on the topic — so it counts.
 	_, err = ds.MarkEventWebhookPending(ctx, pending.ID, tokens[pending.EventID],
@@ -10616,7 +10927,7 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 
 	// Published, acknowledged, but the library reported no coordinate.
 	require.NoError(t, ds.MarkEventDispatched(ctx, unconfirmed.ID, tokens[unconfirmed.EventID],
-		model.BrokerRecord{}))
+		model.BrokerRecord{}, true))
 
 	after, err := ds.AuditTerminalEventRecords(ctx, window)
 	require.NoError(t, err)
@@ -11166,7 +11477,7 @@ func TestTerminalTransitionsHoldTheSettlementLease_RealDB(t *testing.T) {
 			entry.MaxAttempts = tc.maxAttempts
 			insertRealEventOutbox(t, ds, entry)
 
-			claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+			claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute, "")
 			require.NoError(t, err)
 
 			var token string
@@ -11494,34 +11805,108 @@ func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t 
 }
 
 // TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey is the structural half of the
-// exclusion: the claim's earlier-same-key predicate compares the key the PUBLISHER uses
-// and not the stored column.
+// per-key serialisation: the claim groups and orders on the key the PUBLISHER uses, and not
+// on the stored column.
+//
+// The claim no longer expresses that serialisation as a correlated earlier-same-key
+// anti-join. That form was correct and unaffordable — it re-tested the whole blocked
+// population on every claim, so one key carrying 150,000 rows cost 1.5 seconds and 605,415
+// buffer accesses to return ONE row. The serialisation is now carried by three properties
+// this test pins in the SQL, and a fourth that only the relay can hold:
+//
+//  1. every key source and the per-key run resolve the key through the SAME expression;
+//  2. a key's rows are taken from its HEAD FORWARD in occurrence order, as a contiguous
+//     CLAIMABLE PREFIX, so a row is never claimed over an older sibling of its own key;
+//  3. the rows whose locks were actually taken are filtered back to a prefix PER KEY, which
+//     is what closes the race against a concurrent claimer taking the head;
+//  4. the relay publishes a run sequentially and abandons it at the first row that does not
+//     settle — asserted in event_relay_test.go, not here.
 func TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey(t *testing.T) {
 	t.Parallel()
 
-	// BOTH sides, because an exclusion comparing the effective key on one side and the column on
-	// the other is worse than either: it would match almost nothing and exclude almost nothing.
-	assert.Contains(t, claimPendingEventOutboxQuery, eventOutboxEffectiveKeySQL("earlier")+" = "+eventOutboxEffectiveKeySQL("candidate"),
-		"the claim must exclude a candidate when an earlier row shares its EFFECTIVE key, with the "+
-			"same expression on both sides")
+	// A KEY'S HEAD ARRIVES ONE OF TWO WAYS, and both must resolve the key through the same
+	// effective-key rule.
+	//
+	// The first is CARRIED: the age-ordered window scans the oldest unfinished rows, and a key
+	// that appears in that window has its head in the window too — the head sorts before every
+	// other row of the key, so it cannot be the one that fell outside. DISTINCT ON hands it back
+	// out of a scan the claim was already paying for.
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		"SELECT DISTINCT ON (window_rows.effective_key)",
+		"the age-ordered window must reduce to one row per key, and that row must be the key's "+
+			"head: a lookup per key is what made this claim's cost follow the backlog")
+	assert.Contains(t, claimPendingEventOutboxQuery, "window_rows.id AS head_id",
+		"the window must CARRY the head it already read, or the head has to be looked up again")
+	assert.Contains(t, claimPendingEventOutboxQuery, eventOutboxEffectiveKeySQL("window_row"),
+		"the window must resolve the key through the EFFECTIVE key expression")
 
-	assert.NotContains(t, claimPendingEventOutboxQuery, "earlier.partition_key = candidate.partition_key",
+	// The second is LOOKED UP, for keys the walk and the newest source contribute — and it goes
+	// through the pinned function rather than an inline lateral, because the planner reliably
+	// mis-plans the inline form. See sql/1781252500.sql for the measurements.
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		"blnk.event_outbox_key_head(keys.effective_key)",
+		"an uncarried key's head must be resolved through the pinned lookup, not an inline "+
+			"lateral: the inline form is planned as an age-ordered scan filtered on the key, "+
+			"which costs the whole claimable population per key")
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		"blnk.event_outbox_next_effective_key(",
+		"the rotation walk must step the key space through the pinned lookup for the same reason")
+
+	// And that lookup must be GUARDED, so it does not run in the state that matters. When the
+	// window already carries a batch of claimable heads, an uncarried key's head is newer than
+	// every carried one and cannot reach the batch, so looking it up cannot change the result.
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		"(SELECT ready FROM carried_supply) < $4",
+		"the per-key lookups must be skipped when the carried heads already fill a batch, which "+
+			"is the steady state and the whole of a high-key-spread backlog")
+
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		eventOutboxEffectiveKeySQL("candidate")+" = key_heads.effective_key",
+		"the successors claimed behind a head must be gathered on the same effective key")
+
+	assert.NotContains(t, claimPendingEventOutboxQuery, "candidate.partition_key = keys.effective_key",
 		"the superseded column comparison must not return: it leaves same-ledger rows with "+
 			"divergent stored keys unserialised while Kafka places them on one partition")
 
 	// The expression itself, spelled out here so a change to it has to be made in two places
 	// with this test's reasoning in front of the author.
 	assert.Equal(t,
-		"COALESCE(NULLIF(btrim(earlier.ledger_id), ''), btrim(earlier.partition_key))",
-		eventOutboxEffectiveKeySQL("earlier"),
+		"COALESCE(NULLIF(btrim(candidate.ledger_id), ''), btrim(candidate.partition_key))",
+		eventOutboxEffectiveKeySQL("candidate"),
 		"the SQL rendering must be model.EffectivePartitionKey term for term: ledger first, "+
 			"trimmed, with a blank ledger falling through to the partition key")
 
-	// And the ordering columns the exclusion's tuple comparison reads, which is what makes
-	// "earlier" mean earlier by OCCURRENCE rather than by insertion.
+	// HEAD FORWARD, IN OCCURRENCE ORDER. Without this ordering the run would be an arbitrary
+	// subset of the key's rows, and publishing it in order would still publish them out of
+	// order relative to the rows it skipped.
 	assert.Contains(t, claimPendingEventOutboxQuery,
-		"(earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)",
-		"the exclusion must compare occurrence order, with the surrogate key breaking ties")
+		"ORDER BY candidate.occurred_at ASC, candidate.id ASC"+
+			"\n\t\t\t\t\tLIMIT (SELECT allowance FROM run_allowance) - 1",
+		"a key's successors must be its OLDEST, bounded by the run allowance")
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		"(candidate.occurred_at, candidate.id) > (key_heads.occurred_at, key_heads.id)",
+		"a run must start at the head this claim locked and move forward, never behind it")
+
+	// THE CLAIMABLE PREFIX. bool_and over the run's own order stops the run at the first row
+	// that is leased, out of budget or not yet due — so the rows behind such a row are left
+	// where they are rather than published ahead of it.
+	assert.Contains(t, claimPendingEventOutboxQuery, "BOOL_AND(following.claimable) OVER (",
+		"the run must be cut at the first row that is not claimable, not filtered row by row")
+
+	// THE HEAD LOCK, which is the gate every claimant passes through: a key is enterable only
+	// through its oldest unfinished row, and that row must be LOCKED with SKIP LOCKED in the
+	// same node as the batch bound — so a head another claimant holds is skipped and the batch
+	// is filled from further down the key list instead of coming back short.
+	assert.Contains(t, claimPendingEventOutboxQuery, "candidate.id = ANY (ARRAY(SELECT id FROM key_heads))",
+		"the lock must be taken on the key HEADS, so holding a key's head is what excludes every other claimant from that key")
+	assert.Contains(t, claimPendingEventOutboxQuery, "LIMIT $4\n\t\t\tFOR UPDATE SKIP LOCKED",
+		"the batch bound and the skip-locked lock must be in one node, or a claimant returns short whenever another holds the oldest heads")
+
+	// And the UPDATE must name only the assembled set, which is also why two relay replicas
+	// cannot serialise on each other's row locks: every id it touches is a head this
+	// transaction locked or a successor of one.
+	assert.Contains(t, claimPendingEventOutboxQuery, "WHERE id = ANY (ARRAY(SELECT claim_id FROM claim_set))",
+		"the UPDATE must name only heads this transaction locked and their successors")
 }
 
 // TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB closes the gap
@@ -11583,4 +11968,97 @@ func TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB(t *test
 	assert.Zero(t, lingering,
 		"the superseded column index must be dropped: no statement probes it any more, so it is "+
 			"pure write amplification on every insert and every status transition")
+}
+
+// TestEventOutboxKeySpaceLookups_ArePinnedToTheEffectiveKeyIndex_RealDB checks the one thing
+// in the claim that a correct query and a present index are together not enough to
+// guarantee: which index PostgreSQL actually chooses.
+//
+// The claim asks the key space two questions — "the next distinct key after this cursor" and
+// "this key's oldest unfinished row" — and idx_event_outbox_effective_key_inflight answers
+// both by seeking to one entry. The planner does not pick it. It picks
+// idx_event_outbox_claim_order and applies the key as a filter, reading the whole claimable
+// population to answer a question about one key, because the number of rows matching status
+// IN ('pending','processing') is bimodal in an outbox — zero for long stretches, thousands
+// during a burst — so ANALYZE has almost always last run on an empty backlog and the
+// claimable set is valued at one row. At one row the scan is costed below the seek.
+//
+// Both questions are therefore asked through functions carrying SET enable_sort = 'off',
+// which are planned with that setting and never inlined. Both bodies order by the index's own
+// column order, so the age-ordered alternative would have to sort — and sorting is what has
+// been switched off. This test asserts the pin is in the catalog and that it produces the
+// intended plan, because without it the claim silently reverts to a cost that follows the
+// backlog: 2,215ms at 25,000 pending rows against 9.4ms, measured on the same table.
+func TestEventOutboxKeySpaceLookups_ArePinnedToTheEffectiveKeyIndex_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	for _, fn := range []string{"event_outbox_next_effective_key", "event_outbox_key_head"} {
+		var config sql.NullString
+		err := ds.Conn.QueryRowContext(ctx, `
+			SELECT array_to_string(proconfig, ',')
+			FROM pg_proc
+			WHERE pronamespace = 'blnk'::regnamespace
+			  AND proname = $1
+		`, fn).Scan(&config)
+		require.NoErrorf(t, err,
+			"blnk.%s must exist: the claim calls it, so a missing function is a claim that cannot "+
+				"execute at all. Apply sql/1781252500.sql.", fn)
+
+		assert.Containsf(t, config.String, "enable_sort=off",
+			"blnk.%s must carry SET enable_sort = off. It is the whole mechanism: without it the "+
+				"planner is free to answer a single-key question with an age-ordered scan of every "+
+				"claimable row, and it does.", fn)
+	}
+
+	// AND THE PIN MUST PRODUCE THE PLAN, which is a separate claim from carrying the setting.
+	// The body is planned here rather than the function called, because EXPLAIN of a call shows
+	// the call and not what happens inside it.
+	for name, statement := range map[string]string{
+		"next key": `
+			SELECT ` + eventOutboxEffectiveKeySQL("candidate") + `
+			FROM blnk.event_outbox candidate
+			WHERE candidate.status IN ('pending', 'processing')
+			  AND ` + eventOutboxEffectiveKeySQL("candidate") + ` > $1
+			ORDER BY ` + eventOutboxEffectiveKeySQL("candidate") + ` ASC
+			LIMIT 1`,
+		"key head": `
+			SELECT candidate.id, candidate.occurred_at
+			FROM blnk.event_outbox candidate
+			WHERE candidate.status IN ('pending', 'processing')
+			  AND ` + eventOutboxEffectiveKeySQL("candidate") + ` = $1
+			ORDER BY ` + eventOutboxEffectiveKeySQL("candidate") + ` ASC,
+				candidate.occurred_at ASC, candidate.id ASC
+			LIMIT 1`,
+	} {
+		tx, err := ds.Conn.BeginTx(ctx, nil)
+		require.NoError(t, err)
+
+		_, err = tx.ExecContext(ctx, "SET LOCAL enable_sort = off")
+		require.NoError(t, err, "the setting the function definition carries must be settable")
+
+		rows, err := tx.QueryContext(ctx, "EXPLAIN "+statement, "probe")
+		require.NoErrorf(t, err, "EXPLAIN of the %s lookup must succeed", name)
+
+		var plan strings.Builder
+		for rows.Next() {
+			var line string
+			require.NoError(t, rows.Scan(&line))
+			plan.WriteString(line)
+			plan.WriteString("\n")
+		}
+
+		require.NoError(t, rows.Err())
+		_ = rows.Close()
+		_ = tx.Rollback()
+
+		planText := plan.String()
+		assert.Containsf(t, planText, "idx_event_outbox_effective_key_inflight",
+			"under the pin, the %s lookup must SEEK on the effective-key index. Reached any other "+
+				"way it reads the claimable population per key, and the claim's cost then follows "+
+				"the backlog it is trying to drain.\nPlan was:\n%s", name, planText)
+		assert.NotContainsf(t, planText, "idx_event_outbox_claim_order",
+			"the %s lookup must not fall back to the age-ordered index: that is the plan the pin "+
+				"exists to exclude.\nPlan was:\n%s", name, planText)
+	}
 }

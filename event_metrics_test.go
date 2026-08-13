@@ -966,9 +966,9 @@ func (g *collectorRecordedInt64Gauge) values() []int64 {
 // collectorUnmeasuredReasons is how many reason labels one coverage tick publishes.
 //
 // It matches the closed reason set in internal/metrics — budget, unprovisioned,
-// measure_failed, registry_failed and topic_missing — and every tick writes all five,
-// including the zeros.
-const collectorUnmeasuredReasons = 5
+// measure_failed, registry_failed, topic_missing and broker_unconfigured — and every tick
+// writes all six, including the zeros.
+const collectorUnmeasuredReasons = 6
 
 // perTickTotals folds an ATTRIBUTED gauge's writes back into one number per tick.
 //
@@ -2483,6 +2483,9 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 		exported := map[string]struct{}{}
 		for _, instrument := range []string{
 			"blnk.dlt.oldest_message_age_seconds",
+			// The repair legs' owed work, which EventRepairBacklogStuck reads. It is the only
+			// series the legacy webhook leg's backlog appears on at all.
+			"blnk.events.repair.backlog",
 			"blnk.kafka.consumer_lag",
 			"blnk.kafka.consumer_lag_unmeasured_partitions",
 			"blnk.outbox.pending",
@@ -2501,6 +2504,10 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 			"blnk.kafka.consumer_lag_inventory_complete",
 			"blnk.event_metrics.last_collection_age_seconds",
 			"blnk.event_metrics.last_success_age_seconds",
+			// The relay's own claim, which no other series in this list can stand in for: a
+			// claim that does not complete publishes nothing while the backlog gauge merely
+			// rises and every health gauge stays green.
+			"blnk.events.relay.claims.total",
 		} {
 			exported[strings.ReplaceAll(instrument, ".", "_")] = struct{}{}
 		}
@@ -2543,20 +2550,26 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 		// wrong for exactly the subscribers it can no longer see. The lag signal cannot
 		// report that about itself; only this rule can.
 		//
+		// The REPAIR BACKLOG rule is counted for the same reason: the legacy webhook leg's
+		// owed rows are webhook_pending, a state the dead-letter inventory excludes and
+		// blnk_outbox_pending does not count, so that leg appears in no other series at all.
+		//
 		//   1. DeadLetterMessageStuck — events stranded in a dead-letter inventory
-		//   2. SubscriberConsumerLagHigh — a consumer falling behind
-		//   3. SubscriberRevocationOutstanding — a credential still owed a revocation
-		//   4. SubscriberCredentialOrphaned — a credential the registry does not record
-		//   5. SubscriberRevocationRefused — a revocation the broker refused
-		//   6. ConsumerLagMeasurementDegraded — a topic measured only in part
-		//   7. SubscriberLagCoverageStale — a rotation slower than its reading TTL
-		//   8. SubscriberLagCoverageIncomplete — a subscriber with no lag series at all
-		//   9. SubscriberSettlementNotProgressing — obligations outstanding, none settling
-		//  10. SubscriberSettlementOutstanding — one obligation outstanding too long
-		//  11. EventMetricsCollectionStale — the collector has stopped ticking
-		//  12. EventMetricsCollectionFailing — it ticks and achieves nothing
-		//  13. EventMetricsCollectionAbsent — there is no collector at all
-		assert.Equal(t, 13, found, "every event-streaming alert must be present")
+		//   2. EventRepairBacklogStuck — a repair leg that cannot clear what it owes
+		//   3. EventRelayClaimTimingOut — the claim itself is not completing
+		//   4. SubscriberConsumerLagHigh — a consumer falling behind
+		//   5. SubscriberRevocationOutstanding — a credential still owed a revocation
+		//   6. SubscriberCredentialOrphaned — a credential the registry does not record
+		//   7. SubscriberRevocationRefused — a revocation the broker refused
+		//   8. ConsumerLagMeasurementDegraded — a topic measured only in part
+		//   9. SubscriberLagCoverageStale — a rotation slower than its reading TTL
+		//  10. SubscriberLagCoverageIncomplete — a subscriber with no lag series at all
+		//  11. SubscriberSettlementNotProgressing — obligations outstanding, none settling
+		//  12. SubscriberSettlementOutstanding — one obligation outstanding too long
+		//  13. EventMetricsCollectionStale — the collector has stopped ticking
+		//  14. EventMetricsCollectionFailing — it ticks and achieves nothing
+		//  15. EventMetricsCollectionAbsent — there is no collector at all
+		assert.Equal(t, 15, found, "every event-streaming alert must be present")
 	})
 }
 
@@ -3417,6 +3430,9 @@ func TestEventMetricsCollector_ReportsWhetherTheSweepCoveredTheWholeRegistry(t *
 		assert.False(t, report.SweepComplete,
 			"four registered subscribers have no lag series this tick, and that must be published "+
 				"rather than left as an absence nothing can alert on")
+		assert.False(t, report.InventoryComplete,
+			"and the PUBLISHED gauge must agree on the first tick of a rotation, when four of the "+
+				"six really do have no series yet")
 		assert.True(t, report.BudgetReached)
 	})
 
@@ -3436,6 +3452,8 @@ func TestEventMetricsCollector_ReportsWhetherTheSweepCoveredTheWholeRegistry(t *
 		assert.False(t, report.SweepComplete,
 			"the number of rows never reached is UNKNOWN, and claiming completeness on an unknown is "+
 				"exactly the failure this signal exists to prevent")
+		assert.False(t, report.InventoryComplete,
+			"and the published gauge must not claim it either")
 	})
 
 	t.Run("a sweep whose measurement failed is incomplete even though the row was examined", func(t *testing.T) {
@@ -3490,6 +3508,149 @@ func TestEventMetricsCollector_ReportsWhetherTheSweepCoveredTheWholeRegistry(t *
 		assert.Equal(t, 1, report.LagSeriesPublished,
 			"only the topic that exists yields a series; the missing one contributes none, which is "+
 				"the silence this count exists to break")
+	})
+}
+
+// TestEventMetricsCollector_NoBrokerCoverageIsHonestAndNotPermanentlyAlerting is the
+// regression guard on the no-Kafka steady state.
+//
+// A deployment with KAFKA_BROKERS unset is a configuration this project supports and
+// documents: the publisher is a no-op, the relay does not start, and the ledger serves
+// normally. The collector still runs, because most of its gauges read PostgreSQL.
+//
+// What it must NOT do is report that state as a coverage failure. It did: the
+// not-configured branch returned before anything set the coverage boolean, so
+// blnk_kafka_consumer_lag_inventory_complete published 0 on every tick, and
+// SubscriberLagCoverageIncomplete fired thirty minutes after start-up and never cleared —
+// on a deployment where every reason on blnk_kafka_subscribers_unmeasured read zero, so
+// the notification's own instruction to "act on the reason" named nothing to act on.
+//
+// The two cases are different facts and are asserted apart: nothing registered is COMPLETE
+// coverage of an empty registry, while rows registered on a broker-less deployment is
+// genuinely incomplete — and that shortfall belongs to the broker, not to the budget whose
+// remedy cannot produce an offset from a broker that was never configured.
+func TestEventMetricsCollector_NoBrokerCoverageIsHonestAndNotPermanentlyAlerting(t *testing.T) {
+	unconfigured := func() *collectorFakeAdmin {
+		admin := newCollectorFakeAdmin()
+		admin.configured = false
+
+		return admin
+	}
+
+	t.Run("no brokers and no subscribers is complete coverage of nothing", func(t *testing.T) {
+		gauges := captureCoverageGauges(t)
+
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), &collectorFakeRegistry{}, nil, unconfigured(),
+		)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err,
+			"running without Kafka is a supported steady state and must not surface as a "+
+				"collection error")
+
+		// THE EXPORTED SERIES, not only the report: the alert reads the gauge, and every reason
+		// is written on every tick including the zeros, so an operator following the
+		// notification's "act on the reason" instruction sees a complete inventory.
+		tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+		require.Len(t, tick, 1)
+		for reason, count := range tick[0] {
+			assert.Zerof(t, count,
+				"reason %q must read zero: nothing is registered, so no row is unmeasured for any "+
+					"reason at all", reason)
+		}
+
+		assert.True(t, report.BrokerUnconfigured,
+			"the fact has to be carried on the report, because it is what the coverage gauges "+
+				"attribute the shortfall to and what the log line tells an operator")
+		assert.True(t, report.SweepComplete,
+			"an empty lag inventory covers an empty registry EXACTLY, so coverage is complete: "+
+				"publishing 0 here is what made SubscriberLagCoverageIncomplete fire for ever on a "+
+				"deployment with nothing wrong and nothing to do")
+		assert.Zero(t, report.SubscribersRegistered)
+		assert.Zero(t, report.SubscribersUnmeasured,
+			"nothing is registered, so nothing is unmeasured; a non-zero here would be an invention")
+	})
+
+	t.Run("no brokers with rows registered is incomplete, and it is the BROKER's fault", func(t *testing.T) {
+		gauges := captureCoverageGauges(t)
+
+		rows := []model.EventSubscriber{
+			collectorSubscriber("blnk.transactions"),
+			collectorSubscriber("blnk.balances"),
+			collectorSubscriber("blnk.identities"),
+		}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), &collectorFakeRegistry{rows: rows}, nil, unconfigured(),
+		)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		tick := gauges.unmeasured.perTickByReason(t, collectorUnmeasuredReasons)
+		require.Len(t, tick, 1)
+		assert.EqualValues(t, 3, tick[0][metrics.SubscribersUnmeasuredReasonBrokerUnconfigured],
+			"the whole registry belongs to the reason that names the actual cause")
+		assert.Zero(t, tick[0][metrics.SubscribersUnmeasuredReasonBudget],
+			"and NOT to the budget: it was never reached, and its remediation — raise "+
+				"RELAY_SUBSCRIBER_METRICS_BUDGET — cannot produce an offset from a broker that does "+
+				"not exist")
+
+		assert.True(t, report.BrokerUnconfigured)
+		assert.False(t, report.SweepComplete,
+			"three registered subscribers have no lag series and none can be produced, so coverage "+
+				"IS incomplete and the alert firing on it is truthful")
+		assert.Equal(t, int64(3), report.SubscribersRegistered,
+			"the registry count is read even on the paths that measure nothing, or the shortfall "+
+				"below has no denominator")
+		assert.Equal(t, int64(3), report.SubscribersUnmeasured,
+			"every row is unmeasured, and the whole registry must be reported as such rather than "+
+				"left as an absence nothing can alert on")
+
+		assert.Equal(t, metrics.SubscribersUnmeasuredReasonBrokerUnconfigured,
+			shortfallReasonFor(&report),
+			"THE ATTRIBUTION IS THE POINT: these rows were filed under 'budget', whose documented "+
+				"remedy is to raise RELAY_SUBSCRIBER_METRICS_BUDGET — the one action that cannot "+
+				"possibly help, because no budget produces an offset from a broker that was never "+
+				"configured")
+	})
+
+	t.Run("the shortfall reason is chosen most-specific first", func(t *testing.T) {
+		// The three whole-sweep conditions, each of which sends an operator somewhere different.
+		// A registry enumeration that failed is the most specific: the rows past the failure were
+		// never reached, and that is true whether or not a broker is configured.
+		for name, testCase := range map[string]struct {
+			report EventMetricsReport
+			want   string
+		}{
+			"neither condition is the rotation": {
+				report: EventMetricsReport{},
+				want:   metrics.SubscribersUnmeasuredReasonBudget,
+			},
+			"no broker configured": {
+				report: EventMetricsReport{BrokerUnconfigured: true},
+				want:   metrics.SubscribersUnmeasuredReasonBrokerUnconfigured,
+			},
+			"the registry enumeration failed": {
+				report: EventMetricsReport{ListingFailed: true},
+				want:   metrics.SubscribersUnmeasuredReasonRegistryFailed,
+			},
+			"both, and the enumeration wins": {
+				report: EventMetricsReport{ListingFailed: true, BrokerUnconfigured: true},
+				want:   metrics.SubscribersUnmeasuredReasonRegistryFailed,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				report := testCase.report
+				assert.Equal(t, testCase.want, shortfallReasonFor(&report),
+					"exactly one reason may carry the shortfall, or the aggregate would exceed the "+
+						"registry and the operator would be sent to two different places at once")
+			})
+		}
+
+		assert.Equal(t, metrics.SubscribersUnmeasuredReasonBudget, shortfallReasonFor(nil),
+			"a nil report must be answered rather than panicked on: this runs on a telemetry path, "+
+				"and a panic there would take down the process being observed")
 	})
 }
 
@@ -3693,16 +3854,42 @@ func TestRunbookURLs_ResolveToTheRulesOwnProcedure(t *testing.T) {
 
 	rootRules := readYAMLFile(t, filepath.Join(root, "alerts", "blnk-kafka-alerts.yml"))
 
-	embeddedText, ok := prometheusConfigMapData(t)["blnk-kafka-alerts.yml"].(string)
-	require.True(t, ok, "the ConfigMap must carry the alert rules")
-
-	var embeddedRules map[string]interface{}
-	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &embeddedRules))
-
+	// EVERY RULE KEY THE CONFIGMAP CARRIES, not just the mirrored one. Checking one key
+	// is what let a relative, fragmentless runbook_url survive in the other: this test
+	// read `blnk-kafka-alerts.yml` alone, and `make alerts_configmap` extracts that same
+	// single key, so `blnk-infra-alerts.yml` was outside both. Its KafkaBrokerVolumeFilling
+	// rule kept `docs/kafka-operations.md` — unopenable from a notification — while the
+	// thirteen beside it were absolute and fragment-scoped. Discovering the keys from the
+	// ConfigMap rather than naming them means a rule file added later is covered on the
+	// day it is added.
 	copies := map[string]map[string]interface{}{
-		"alerts/blnk-kafka-alerts.yml":                           rootRules,
-		"infrastructure/k8s-manifests/prometheus-configmap.yaml": embeddedRules,
+		"alerts/blnk-kafka-alerts.yml": rootRules,
 	}
+	covered := []string{"alerts/blnk-kafka-alerts.yml"}
+
+	for key, value := range prometheusConfigMapData(t) {
+		if !strings.HasSuffix(key, "-alerts.yml") {
+			continue
+		}
+
+		text, ok := value.(string)
+		require.Truef(t, ok, "the ConfigMap key %s must carry rules as a string", key)
+
+		var embedded map[string]interface{}
+		require.NoErrorf(t, yaml.Unmarshal([]byte(text), &embedded),
+			"the ConfigMap key %s must parse as a Prometheus rules document", key)
+
+		name := "infrastructure/k8s-manifests/prometheus-configmap.yaml[" + key + "]"
+		copies[name] = embedded
+		covered = append(covered, name)
+	}
+
+	// The discovery must have found BOTH keys. A rename that made the suffix stop matching
+	// would otherwise silently reduce this test to the root file again, which is the
+	// failure mode it exists to prevent.
+	require.Lenf(t, copies, 3,
+		"expected the root rule file plus both ConfigMap rule keys (blnk-kafka-alerts.yml and "+
+			"blnk-infra-alerts.yml); covered: %v", covered)
 
 	for name, rules := range copies {
 		t.Run(name, func(t *testing.T) {
@@ -4788,4 +4975,90 @@ func TestEventMetricsCollector_NeverReportsMoreUnmeasuredSubscribersThanExist(t 
 					"cannot disagree about how much is missing")
 		})
 	}
+}
+
+// TestEventMetricsCollector_ReportsInventoryCompletenessAcrossARotation is the guard on
+// the gauge the coverage alert actually evaluates.
+//
+// A registry larger than the measurement budget is covered over SEVERAL ticks by design:
+// the cursor rotates, and the readings of the subscribers a tick did not reach stay
+// exported for lagReadingTTL, so the exported inventory becomes complete before any single
+// sweep does. Publishing the sweep's figure under the inventory's name made the gauge
+// unusable for exactly those deployments — measured with 400 subscribers against the
+// default budget of 200: covered_subscribers 400, registered 400, every unmeasured reason
+// 0, and the gauge reporting 0, so SubscriberLagCoverageIncomplete fired permanently with
+// its own description telling the operator to read a breakdown that said nothing was wrong.
+func TestEventMetricsCollector_ReportsInventoryCompletenessAcrossARotation(t *testing.T) {
+	rows := make([]model.EventSubscriber, 0, 6)
+	for i := 0; i < 6; i++ {
+		rows = append(rows, collectorSubscriber("blnk.transactions"))
+	}
+
+	collector := NewEventMetricsCollector(
+		newCollectorFakeOutbox(), &collectorFakeRegistry{rows: rows}, nil, newCollectorFakeAdmin(),
+	).WithSubscriberBudget(2)
+
+	// Tick 1: two of six measured, so the inventory genuinely IS incomplete.
+	first, err := collector.Collect(context.Background())
+	require.NoError(t, err)
+	require.True(t, first.BudgetReached, "the premise: the registry is larger than one tick's budget")
+	assert.False(t, first.InventoryComplete,
+		"four subscribers have no series yet, so the gauge must say so")
+
+	// Ticks 2 and 3 walk the rest of the rotation.
+	var last EventMetricsReport
+
+	for tick := 2; tick <= 3; tick++ {
+		report, collectErr := collector.Collect(context.Background())
+		require.NoErrorf(t, collectErr, "tick %d must collect", tick)
+
+		last = report
+	}
+
+	// THE PROPERTY. Every subscriber now has a series, so the inventory is complete — even
+	// though no single sweep ever reached the whole registry and SweepComplete is therefore
+	// still false.
+	assert.True(t, last.InventoryComplete,
+		"the rotation has now covered every subscriber, so the gauge the coverage alert reads "+
+			"must report complete; reporting the SWEEP's figure here is what made the alert fire "+
+			"for ever on any registry larger than the budget")
+	assert.False(t, last.SweepComplete,
+		"and SweepComplete must still describe the sweep: one tick did not reach the end of the "+
+			"registry, which is true and is a different fact")
+
+	// AND THE TWO FIGURES THE ALERT'S OWN DESCRIPTION SENDS THE OPERATOR TO must agree with
+	// it, because a gauge that says 'incomplete' while every reason reads zero is an alert
+	// with no remedy in it.
+	assert.Equal(t, int64(6), last.SubscribersRegistered)
+	assert.Equal(t, 6, collector.coveredSubscriberCount(),
+		"every registered subscriber must be exported for the completeness above to be true")
+	assert.Zero(t, last.SubscribersUnmeasured,
+		"and nothing may be reported unmeasured while the inventory is reported complete")
+}
+
+// TestEventMetricsCollector_NeverClaimsCompletenessWhenTheRegistrySizeIsUnknown is the
+// other direction, and it is the one that fails silently.
+//
+// The registry COUNT and the registry ENUMERATION are separate reads and either can fail
+// alone. A failed count left the registered figure at zero, and zero registered is
+// indistinguishable from a deployment with no subscribers — so a tick that could not read
+// the registry at all reported complete coverage of it.
+func TestEventMetricsCollector_NeverClaimsCompletenessWhenTheRegistrySizeIsUnknown(t *testing.T) {
+	registry := &collectorFakeRegistry{
+		rows:     []model.EventSubscriber{collectorSubscriber("blnk.transactions")},
+		totalErr: errors.New("collector test: the registry aggregate is unavailable"),
+	}
+
+	collector := NewEventMetricsCollector(
+		newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+	)
+
+	report, err := collector.Collect(context.Background())
+	require.Error(t, err, "a registry count failure must be reported as a collection failure")
+
+	assert.True(t, report.RegistryCountFailed,
+		"the count failure must be recorded as its own fact, not inferred from a zero")
+	assert.False(t, report.InventoryComplete,
+		"coverage is unknowable when the registry's size is, and an unknown must never read as "+
+			"complete: that is the false reassurance the whole coverage surface exists to remove")
 }

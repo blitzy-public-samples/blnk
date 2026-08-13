@@ -250,6 +250,12 @@ func (c *movableTestClock) Set(at time.Time) {
 type replayFidelityStore struct {
 	mu sync.Mutex
 
+	// replaySettledLegacyLeg is set if a replay's terminal transition was ever told to
+	// settle the legacy webhook leg. It must stay false: the marker belongs to the pass that
+	// enqueued the webhook, and a replay that claimed it would strand a leg the repair pass
+	// would then never see.
+	replaySettledLegacyLeg bool
+
 	// rows holds every row by its business event id.
 	rows map[string]*model.EventOutbox
 
@@ -779,7 +785,16 @@ func (s *replayFidelityStore) MarkEventDispatched(
 	id int64,
 	claimToken string,
 	_ model.BrokerRecord,
+	settleLegacyLeg bool,
 ) error {
+	// A replay never settles the legacy leg, and this fixture asserts it rather than
+	// ignoring it: a replayed row may still owe a webhook that only the repair leg finishes.
+	if settleLegacyLeg {
+		s.mu.Lock()
+		s.replaySettledLegacyLeg = true
+		s.mu.Unlock()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2085,11 +2100,14 @@ func TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully(t *testing.T
 	assert.Equal(t, replayFidelityMaxAttempts, row.MaxAttempts)
 	assert.NotEmpty(t, row.EventID)
 	// A raw-JSON payload carries no typed aggregate for the producer to read, so the
-	// documented fallback chain ends at the event type. Asserted rather than glossed over,
-	// because the invariant that matters is that the PARTITION KEY is NEVER empty: an
-	// unkeyed message is spread across partitions and loses its ordering guarantee with
-	// nothing in the data to show it.
-	assert.Equal(t, fixture.eventType, row.PartitionKey)
+	// documented fallback chain ends at the EVENT'S OWN ID for the key and at the event
+	// TYPE for aggregate_id. The two diverge deliberately: a per-event key is what stops an
+	// aggregate-less stream collapsing onto one partition, while the type is the only
+	// grouping such a row has. Asserted rather than glossed over, because the invariant
+	// that matters is that the PARTITION KEY is NEVER empty: an unkeyed message is spread
+	// across partitions and loses its ordering guarantee with nothing in the data to show
+	// it.
+	assert.Equal(t, row.EventID, row.PartitionKey)
 	assert.Equal(t, fixture.eventType, row.AggregateID)
 	assert.NotEmpty(t, row.PartitionKey)
 	// The LEDGER column, by contrast, stays empty — and must. A raw-JSON payload carries

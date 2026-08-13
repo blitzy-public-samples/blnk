@@ -382,6 +382,53 @@ func subscriberPhaseContext(
 // It is granted ONCE per request rather than once per nested phase, which is what
 // subscriberCompensationWindow enforces.
 
+// subscriberDetachedSettlementBudget is the window a settlement that has LEFT the
+// response path is measured against, starting from the moment it starts.
+//
+// It is deliberately the same length as the issuance budget: the work is the same two
+// broker round trips and the same one or two registry writes, so what changes here is
+// not how much time cleanup deserves but WHEN the clock it is measured against starts.
+const subscriberDetachedSettlementBudget = SubscriberCredentialIssuanceBudget
+
+// rebaseSubscriberSettlementClock gives work that has left the response path a wall
+// clock of its own.
+//
+// WHY THIS IS NOT A HOLE IN "THE RESERVE IS A SLICE OF THE PROMISE". That rule exists so
+// that the ENDPOINT answers inside its five-second budget rather than inside its budget
+// plus a fresh one for every level of cleanup, and it is exactly right for a cleanup
+// that runs INLINE — there, the caller is still waiting, and the reserve is the last of
+// the time the caller lent us. This function is called only from the other arm: a
+// settlement handed to the background scheduler, which runs AFTER the response has been
+// written. No caller is waiting on it, so measuring it against a promise that has
+// already been kept does not protect anybody. It only guarantees the cleanup fails.
+//
+// And a cleanup that fails is not a missing log line. Measured on a 300-way concurrent
+// burst against the shipped behaviour, the request budget was spent by the forward path
+// in 274 of 300 cases, so every compensation began with the 1250ms floor of
+// boundedCompensationDeadline and had to complete two broker round trips inside it
+// against the very broker that had just proved too contended to answer in 3.75s. The
+// result was 132 SCRAM credentials left at the broker that could not be revoked, 132 ACL
+// grants that could not be removed, and 264 provisioning fences that could not be
+// released — each one a principal that can authenticate with no boundary recorded
+// against it, and each one an operator instruction to run kafka-acls by hand.
+//
+// The one-window rule still holds: a settlement already inside an open compensation
+// window keeps that window, so nesting cannot stack budgets even here.
+//
+// Parameters:
+//   - ctx context.Context: the issuance context, whose wall clock is spent or nearly so.
+//
+// Returns:
+//   - context.Context: ctx carrying a fresh wall clock. Cancellation is not stripped
+//     here; subscriberPhaseContext does that where every other detached phase does.
+func rebaseSubscriberSettlementClock(ctx context.Context) context.Context {
+	if _, open := subscriberCompensationWindow(ctx); open {
+		return ctx
+	}
+
+	return withSubscriberSLA(ctx, time.Now().Add(subscriberDetachedSettlementBudget))
+}
+
 // subscriberDurabilityContext derives the context the durable exposure markers are
 // written on.
 func subscriberDurabilityContext(ctx context.Context) (context.Context, context.CancelFunc) {

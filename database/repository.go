@@ -252,8 +252,8 @@ type eventOutbox interface {
 	// which is the no-op-when-unconfigured contract inherited from SendWebhook.
 
 	// Relay state machine: claim a batch, then drive each row to a terminal state.
-	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error               // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned
+	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration, keyCursor string) ([]model.EventOutbox, error) // Claims pending entries oldest first for publishing, a bounded contiguous run per partition key, taking a lease and stamping a claim token; keyCursor rotates which keys a claim offers when the backlog exceeds one batch
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord, settleLegacyLeg bool) error           // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned and, when settleLegacyLeg is set, folding the dual-delivery marker into the same UPDATE instead of spending a second statement on it
 
 	// MarkEventPermanentlyFailed records an attempt that failed PERMANENTLY, so the row
 	// becomes failed on this attempt whatever budget remained and the dead-letter write is

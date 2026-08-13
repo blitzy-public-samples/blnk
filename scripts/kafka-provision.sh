@@ -762,6 +762,13 @@ GENERATED_SECRET_FILES=()
 # Where the generated sample credential was recorded, if it was. Printed as a PATH; the
 # credential itself is never printed (Q4-20).
 SUBSCRIBER_SECRET_ARTIFACT=""
+# The producer's equivalent. DECLARED, and it was not: cleanup() compares each scratch file
+# against both artifact paths, and under "set -u" an undeclared name there aborted the
+# cleanup loop on its first surviving entry - leaving the mode-0600 file holding a live
+# password exactly where the trap exists to remove it from. The comparison was reachable
+# only when a scratch file OTHER than the client configuration survived to the trap, which is
+# why it went unseen: the client configuration is removed by the block above the loop.
+PRODUCER_SECRET_ARTIFACT=""
 CATEGORY_TOPICS=()
 # The topics a subscriber MAY be granted: every TENANT category topic, and never the internal
 # system topic or a dead-letter sibling. It is the shell's copy of
@@ -808,6 +815,15 @@ STAGED_SECRET_PATH=""
 GENERATED_PASSWORD=""
 CONTAINER_RUNTIME=()
 CONTAINER_STDIN_FLAG=()
+# The process id of a delegated container run while one is in flight, so a signal handler can
+# pass the signal on to it instead of leaving it running behind an exited script. Empty
+# whenever nothing is delegated.
+DELEGATED_PID=""
+# What the container-side sweep did, in one line, for the interrupted notice to print.
+DELEGATED_SWEEP_REPORT=""
+# This delegation's own mark, carried into the container so that the scratch files the
+# delegated copy writes can be told from a CONCURRENT run's. Set only when delegating.
+PROVISION_RUN_ID=""
 CONTAINER_TARGET=""
 CONTAINER_RUNTIME_LABEL=""
 
@@ -1797,10 +1813,17 @@ delegate_to_container() {
             "KAFKA_COMPOSE_SERVICE."
     fi
 
+    # THIS DELEGATION'S MARK, minted before anything is forwarded. It goes into the name of
+    # every scratch file the delegated copy writes, which is what lets an interrupted run
+    # remove its own files from the container without touching a concurrent run's. Filename
+    # safe by construction: a pid and two decimal numbers.
+    PROVISION_RUN_ID="$$-${SECONDS}-${RANDOM}"
+
     # Only names, never values, and the names come from THE canonical interface rather
     # than from a copy of it maintained here.
     local passthrough=(
         BLNK_KAFKA_PROVISION_IN_CONTAINER
+        BLNK_KAFKA_PROVISION_RUN_ID
         "${KAFKA_PROVISION_INTERFACE[@]}"
     )
 
@@ -1815,6 +1838,7 @@ delegate_to_container() {
     # silent-default failure the pass-through exists to prevent, reintroduced one line
     # lower down.
     export BLNK_KAFKA_PROVISION_IN_CONTAINER=1
+    export BLNK_KAFKA_PROVISION_RUN_ID="$PROVISION_RUN_ID"
     local exported
     for exported in "${KAFKA_PROVISION_INTERFACE[@]}"; do
         export "${exported?}"
@@ -1832,8 +1856,9 @@ delegate_to_container() {
         log "no Kafka CLI here; delegating to '${CONTAINER_RUNTIME_LABEL}'" \
             "running ${KAFKA_PROVISION_CONTAINER_SCRIPT} inside the container" \
             "broker: ${KAFKA_BOOTSTRAP_SERVER}"
-        exec "${CONTAINER_RUNTIME[@]}" "${env_flags[@]}" "$CONTAINER_TARGET" \
+        run_delegated "" "${env_flags[@]}" "$CONTAINER_TARGET" \
             bash "$KAFKA_PROVISION_CONTAINER_SCRIPT"
+        exit $?
     fi
 
     local source_path="${BASH_SOURCE[0]:-}"
@@ -1853,8 +1878,168 @@ delegate_to_container() {
     # "bash -s" makes the container's stdin this script's own source text. Every Kafka CLI
     # invocation therefore reads from /dev/null - see kafka_cli - because a child that
     # consumed stdin would eat the rest of the script and the run would end mid-function.
-    exec "${CONTAINER_RUNTIME[@]}" "${CONTAINER_STDIN_FLAG[@]}" "${env_flags[@]}" \
-        "$CONTAINER_TARGET" bash -s <"$source_path"
+    #
+    # The source path is handed to run_delegated rather than redirected onto it, because the
+    # delegated command is started asynchronously and an asynchronous command's stdin is
+    # /dev/null unless it carries an explicit redirection of its own - which would stream an
+    # EMPTY script into the container.
+    run_delegated "$source_path" "${CONTAINER_STDIN_FLAG[@]}" "${env_flags[@]}" \
+        "$CONTAINER_TARGET" bash -s
+    exit $?
+}
+
+# run_delegated runs one container command and returns ITS exit status.
+#
+# WHY THIS IS NOT `exec`. It used to be, and that single word was the whole of a defect:
+# `exec` REPLACES this shell, so the traps installed below stop existing and the process that
+# then receives an operator's Ctrl-C is the container runtime's client, which exits 0. An
+# interrupted provisioning run therefore reported SUCCESS - 22 lines of a 114-line run, no
+# notice of any kind, and a mode-0600 file holding the administrative password left inside
+# the container, because the in-container copy died on the severed stream through a signal it
+# did not trap and so never ran its own EXIT cleanup. A CI step wrapping this script in
+# `timeout` saw the same exit 0 over the same half-provisioned cluster.
+#
+# Keeping this shell alive costs one process and buys three things: the conventional status
+# (130 for INT, 143 for TERM), the interrupted notice, and a host-side sweep of the container
+# for the scratch file the interrupted copy could not remove itself.
+#
+# `wait` IS THE POINT, NOT AN IMPLEMENTATION DETAIL. Bash defers a trap until the current
+# FOREGROUND command finishes, so a signal arriving during a synchronous container run would
+# be acted on only after the whole run completed - which is the opposite of interrupting it.
+# A signal during `wait` is acted on immediately.
+#
+# Parameters:
+#   $1  - a file to stream on the delegated command's stdin, or "" for none.
+#   $@  - the arguments to append to CONTAINER_RUNTIME.
+#
+# Returns:
+#   - the delegated command's exit status.
+run_delegated() {
+    local stdin_source="$1"
+    shift
+
+    if [[ -n "$stdin_source" ]]; then
+        "${CONTAINER_RUNTIME[@]}" "$@" <"$stdin_source" &
+    else
+        # </dev/null explicitly rather than by inheritance, so a delegated run can never
+        # consume this script's own stdin.
+        "${CONTAINER_RUNTIME[@]}" "$@" </dev/null &
+    fi
+    DELEGATED_PID=$!
+
+    local status=0
+    # Guarded because "set -e" would otherwise abort here on a delegated failure, losing the
+    # status this function exists to return. A wait interrupted by a trapped signal never
+    # returns - on_signal exits - so no status is invented for that case.
+    wait "$DELEGATED_PID" || status=$?
+    DELEGATED_PID=""
+
+    return "$status"
+}
+
+# stop_delegated_run passes a received signal on to the delegated container run and then
+# makes sure no credential-bearing scratch file is left inside the container.
+#
+# THE CLIENT IS NOT THE RUN. Killing `docker exec` kills the CLIENT; the process inside the
+# container keeps going until it next writes to the severed stream. The PIPE and HUP traps
+# installed below are what let it clean up when that happens, and this sweep is what makes
+# the guarantee immediate rather than dependent on the in-container copy getting far enough
+# to notice. Both are needed: a container that has itself gone away can still be asked, and
+# a copy that never writes again would otherwise hold the file until its own budget expired.
+#
+# Parameters:
+#   $1 - the signal name to forward, as accepted by kill.
+#
+# Prints nothing. Every step is best-effort: this runs from a signal handler whose one
+# obligation is the exit status.
+stop_delegated_run() {
+    local name="$1"
+
+    if [[ -z "$DELEGATED_PID" ]]; then
+        return 0
+    fi
+
+    kill -"$name" "$DELEGATED_PID" 2>/dev/null || true
+
+    # Up to five seconds for the client to go, then insist. Long enough for a container
+    # runtime to tear an exec session down, short enough that Ctrl-C still feels like one.
+    local waited=0
+    while kill -0 "$DELEGATED_PID" 2>/dev/null && ((waited < 50)); do
+        sleep 0.1 || true
+        waited=$((waited + 1))
+    done
+    kill -KILL "$DELEGATED_PID" 2>/dev/null || true
+    DELEGATED_PID=""
+
+    sweep_delegated_secret_files
+}
+
+# sweep_delegated_secret_files removes THIS delegation's scratch files from the container it
+# delegated into.
+#
+# WHY A SWEEP AT ALL, WHEN THE DELEGATED COPY HAS ITS OWN EXIT TRAP. Because it may never
+# reach it. Killing the delegating client kills the CLIENT; the copy inside the container
+# keeps running against a stream the daemon still holds, so it is not guaranteed to see a
+# SIGPIPE at all, and a run whose remaining budget is a minute of broker polling would hold a
+# mode-0600 file containing the administrative password for that whole minute after the
+# operator pressed Ctrl-C. The traps make the copy clean up when it DOES notice; this makes
+# the guarantee immediate.
+#
+# SCOPED TO THIS RUN, NOT TO THE SCRIPT'S NAMING. The pattern carries
+# BLNK_KAFKA_PROVISION_RUN_ID, which only this delegation's files bear. Two concurrent
+# invocations against one container are supported, and a sweep on the script's whole naming
+# would take the other one's live credential file with it. The two artifact paths are excluded
+# on top of that, exactly as cleanup() exempts them: they hold a credential the broker has
+# already accepted and are the operator's copy by design.
+#
+# Sets DELEGATED_SWEEP_REPORT to a line describing what happened, for the interrupted notice
+# to print. Never fails the caller.
+sweep_delegated_secret_files() {
+    if [[ ${#CONTAINER_RUNTIME[@]} -eq 0 || -z "${CONTAINER_TARGET:-}" || -z "$PROVISION_RUN_ID" ]]; then
+        DELEGATED_SWEEP_REPORT="nothing was delegated, so there is no container-side file to remove"
+        return 0
+    fi
+
+    local pattern="blnk-kafka-*-${PROVISION_RUN_ID}-*"
+    DELEGATED_SWEEP_REPORT="'${CONTAINER_TARGET}' could not be asked about a temporary credential file; if it is still running, check for ${pattern} in its temporary directory"
+
+    local removed=""
+    # The remote command is deliberately tiny and takes its data as arguments rather than by
+    # interpolation. It searches the container's OWN temporary directory as well as /tmp,
+    # because new_secret_file writes under ${TMPDIR:-/tmp} as resolved THERE. Every failure is
+    # swallowed: this runs from a signal handler whose one obligation is the exit status.
+    removed="$(
+        "${CONTAINER_RUNTIME[@]}" "$CONTAINER_TARGET" sh -c '
+            pattern="$1"
+            keep_one="$2"
+            keep_two="$3"
+            count=0
+            for directory in "${TMPDIR:-/tmp}" /tmp; do
+                [ -d "$directory" ] || continue
+                for candidate in "$directory"/$pattern; do
+                    [ -f "$candidate" ] || continue
+                    [ "$candidate" = "$keep_one" ] && continue
+                    [ "$candidate" = "$keep_two" ] && continue
+                    rm -f "$candidate" 2>/dev/null && count=$((count + 1))
+                done
+            done
+            printf "%s" "$count"
+        ' sh "$pattern" "$SUBSCRIBER_SECRET_ARTIFACT" "$PRODUCER_SECRET_ARTIFACT" 2>/dev/null || true
+    )"
+
+    case "$removed" in
+        "" )
+            return 0
+            ;;
+        0 )
+            DELEGATED_SWEEP_REPORT="no temporary credential file of this run was left inside '${CONTAINER_TARGET}'"
+            ;;
+        * )
+            DELEGATED_SWEEP_REPORT="removed ${removed} temporary credential file(s) of this run from inside '${CONTAINER_TARGET}'"
+            ;;
+    esac
+
+    return 0
 }
 
 # ---------------------------------------------------------------------------------------
@@ -1890,15 +2075,27 @@ new_secret_file() {
     previous_umask="$(umask)"
     umask 077
 
+    # THE RUN TAG IS WHAT MAKES AN INTERRUPTED DELEGATED RUN CLEANABLE FROM OUTSIDE. A
+    # delegating invocation exports BLNK_KAFKA_PROVISION_RUN_ID, so every scratch file this
+    # copy writes carries that run's own mark and the host can remove exactly those on the way
+    # out. Without it the only available pattern would be this script's whole naming, and a
+    # sweep on that would take a CONCURRENT run's live credential file with it - two
+    # invocations against one container are supported and must stay that way. Empty for a run
+    # nobody delegated, which leaves the name exactly as it was.
+    local run_tag=""
+    if [[ -n "${BLNK_KAFKA_PROVISION_RUN_ID:-}" ]]; then
+        run_tag="${BLNK_KAFKA_PROVISION_RUN_ID}-"
+    fi
+
     if command -v mktemp >/dev/null 2>&1; then
-        path="$(mktemp "${directory%/}/blnk-kafka-${label}-XXXXXX" 2>/dev/null || true)"
+        path="$(mktemp "${directory%/}/blnk-kafka-${label}-${run_tag}XXXXXX" 2>/dev/null || true)"
     fi
 
     # Fallback for an image without mktemp. O_EXCL is approximated with an existence test
     # plus "set -o noclobber" on the redirection, which fails rather than truncating if the
     # path was created between the test and the write.
     if [[ -z "$path" ]]; then
-        path="${directory%/}/blnk-kafka-${label}-$$-${RANDOM}"
+        path="${directory%/}/blnk-kafka-${label}-${run_tag}$$-${RANDOM}"
         if ! (set -o noclobber && : >"$path") 2>/dev/null; then
             umask "$previous_umask"
             die "could not create a ${label} file in '${directory}'." \
@@ -1952,6 +2149,11 @@ readonly SIGNAL_REPORT_FD=9
 on_signal() {
     local name="$1" status="$2"
 
+    # FIRST, and before anything is printed: a delegated container run is signalled and the
+    # container is swept, because those are the actions this handler exists to take. The
+    # report below then states what happened rather than what was intended.
+    stop_delegated_run "$name"
+
     # The report is best-effort; the exit status is not. Any failure to write - stderr
     # closed at launch, a full disk - is swallowed here, because under "set -e" a failed
     # write would abort the handler before the exit below and the run would then report
@@ -1961,6 +2163,7 @@ on_signal() {
         printf '%s\n' "${YEL}==> interrupted:${NC} received SIG${name}; provisioning stopped."
         _continuation \
             "Any temporary client-properties file is removed on the way out." \
+            "${DELEGATED_SWEEP_REPORT:-No work had been delegated to a container.}" \
             "Whatever was already created on the broker is left in place - topic creation, ACL" \
             "addition and the SCRAM upsert are each idempotent, so re-running this script" \
             "finishes the job rather than duplicating it."
@@ -1972,6 +2175,15 @@ on_signal() {
 trap cleanup EXIT
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
+# HUP AND PIPE ARE TRAPPED FOR THE COPY OF THIS SCRIPT THAT RUNS INSIDE A CONTAINER, and they
+# are the other half of the interrupted-delegation fix. When the delegating client goes away,
+# the streams that copy is writing to are closed under it: bash then delivers SIGPIPE on its
+# next write, or SIGHUP when the session is torn down, and an UNTRAPPED fatal signal does not
+# run the EXIT trap - so the mode-0600 file holding the administrative password stayed in the
+# container's /tmp. Trapped, the same event exits through on_signal, which reaches cleanup.
+# The statuses are the conventional 128+n. Harmless on the host, where neither arrives.
+trap 'on_signal HUP 129' HUP
+trap 'on_signal PIPE 141' PIPE
 
 # Resolve the properties file the CLI will authenticate with.
 #

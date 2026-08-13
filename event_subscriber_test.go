@@ -1240,7 +1240,11 @@ func (s *subscriberTestStore) fencedWriteGuardLocked(
 
 	if requireActive && row.RevocationPendingAt != nil {
 		return apierror.NewAPIError(
-			apierror.ErrConflict,
+			// The code the real datasource answers with for this miss. A double that reported a
+			// generic conflict here would let a service-level regression pass: the tombstone
+			// arriving between the read and the write is the one path the in-memory guard cannot
+			// cover, and it is the code that proves the two agree.
+			apierror.ErrSubscriberDeprovisioning,
 			"This subscriber is being deregistered, so its access model can no longer be changed",
 			errors.New("subscriber test store: the row carries a revocation tombstone"),
 		)
@@ -2320,7 +2324,13 @@ func TestIssueSubscriberCredential_RefusesASubscriberBeingDeregistered(t *testin
 
 	var apiErr apierror.APIError
 	require.ErrorAs(t, err, &apiErr)
-	assert.Equal(t, apierror.ErrConflict, apiErr.Code)
+	// THE TYPED CODE, not the generic conflict it once carried. Registering a duplicate
+	// subscriber id is also a 409, and the remedies are opposite — pick another id, versus
+	// finish the deregistration and retry this one — so a client that can only read the
+	// status cannot tell which it was told.
+	assert.Equal(t, apierror.ErrSubscriberDeprovisioning, apiErr.Code)
+	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+		"the status is unchanged by the typed code; it is the discrimination that was missing")
 
 	assert.Empty(t, credential.Password(), "no secret may be generated for a subscriber being removed")
 	assert.Zero(t, run.log.count("ProvisionSubscriberPrincipal"))
@@ -2933,7 +2943,10 @@ func TestUpdateSubscriber_RefusesASubscriberBeingDeregistered(t *testing.T) {
 
 	require.Error(t, err, "an authorization change on a row being deregistered must be refused")
 	assert.Nil(t, updated)
-	requireSubscriberAPIError(t, err, apierror.ErrConflict)
+	// THE TYPED CODE. A bare 409 is what a duplicate subscriber id also answers, and the two
+	// remedies are opposite, so the discrimination has to be in the code rather than in the
+	// prose.
+	requireSubscriberAPIError(t, err, apierror.ErrSubscriberDeprovisioning)
 
 	// THE MESSAGE NAMES THE OPERATION THAT WAS REFUSED. The guard is shared with issuance,
 	// and reusing issuance's wording here would answer an authorization change with "no
@@ -2964,6 +2977,79 @@ func TestUpdateSubscriber_RefusesASubscriberBeingDeregistered(t *testing.T) {
 		"a refused update must not leave the subscriber fenced")
 }
 
+// TestRevocationTombstoneRefusals_AreDiscriminableFromEveryOther409 is the reachability
+// guard on the typed code.
+//
+// SUBSCRIBER_DEPROVISIONING was declared in the catalogue and mapped to 409, and then
+// raised nowhere: both operations the tombstone blocks answered the generic
+// GEN_CONFLICT, which is also what registering a duplicate subscriber id answers and
+// what a lost provisioning claim answers. Three conditions, one code, three opposite
+// remedies — pick another id, retry under a fresh claim, or finish the deregistration —
+// and the only thing separating them was English prose in the message. A declared code
+// nothing raises is worse than no code at all: a client written against the catalogue
+// branches on a value it will never receive.
+func TestRevocationTombstoneRefusals_AreDiscriminableFromEveryOther409(t *testing.T) {
+	tombstoned := func(t *testing.T) *subscriberLifecycle {
+		t.Helper()
+
+		row := subscriberFixtureRow(t)
+		pendingAt := time.Now().UTC().Add(-time.Minute)
+		row.RevocationPendingAt = &pendingAt
+
+		return newSubscriberLifecycle(t).seeded(row)
+	}
+
+	// BOTH operations the guard covers, because the code is what a client branches on and
+	// the message is what an operator reads: the two must share the code and differ in the
+	// message.
+	for name, refuse := range map[string]struct {
+		call    func(*testing.T, *subscriberLifecycle) error
+		message string
+	}{
+		"an authorization change": {
+			call: func(t *testing.T, run *subscriberLifecycle) error {
+				t.Helper()
+
+				_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+					SubscriberUpdate{AuthorizedTopics: []string{"blnk.transactions", "blnk.identities"}})
+
+				return err
+			},
+			message: "access model can no longer be changed",
+		},
+		"a credential issuance": {
+			call: func(t *testing.T, run *subscriberLifecycle) error {
+				t.Helper()
+
+				_, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+
+				return err
+			},
+			message: "no credential will be issued",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := refuse.call(t, tombstoned(t))
+			require.Error(t, err)
+
+			var apiErr apierror.APIError
+			require.ErrorAs(t, err, &apiErr)
+
+			assert.Equal(t, apierror.ErrSubscriberDeprovisioning, apiErr.Code,
+				"the catalogue declares this code for exactly this condition; raising the generic "+
+					"conflict instead leaves it dead")
+			assert.NotEqual(t, apierror.ErrConflict, apierror.Normalize(apiErr.Code),
+				"a duplicate subscriber id and a lost claim both answer the generic conflict, and "+
+					"neither shares this remedy")
+			assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+				"the status does not change: the request is well formed and it is the row's state "+
+					"that has to change first")
+			assert.Contains(t, err.Error(), refuse.message,
+				"and the message still names the operation that was refused")
+		})
+	}
+}
+
 // TestUpdateSubscriber_RefusesTheTombstonedRowAtThePersistenceBoundaryToo covers the
 // case the in-memory guard cannot: the tombstone arriving BETWEEN the read and the
 // write.
@@ -2986,7 +3072,10 @@ func TestUpdateSubscriber_RefusesTheTombstonedRowAtThePersistenceBoundaryToo(t *
 		SubscriberUpdate{AuthorizedTopics: []string{"blnk.transactions", "blnk.identities"}})
 
 	require.Error(t, err)
-	requireSubscriberAPIError(t, err, apierror.ErrConflict)
+	// The persistence boundary reports the SAME typed code the in-memory guard does: this is
+	// that guard's condition arriving a moment later, and a caller branching on the code must
+	// not have to know which layer noticed it.
+	requireSubscriberAPIError(t, err, apierror.ErrSubscriberDeprovisioning)
 	assert.Contains(t, err.Error(), "being deregistered")
 
 	// The prune ran — it could not have been prevented, because the row was clean when it was
@@ -8136,5 +8225,154 @@ func TestSubscriberAccessDeployment_AgreesWithEveryPreconditionIssuanceApplies(t
 		assert.False(t, deployment.SubscriberBrokersAdvertised,
 			"there is no fallback to KAFKA_BROKERS, so an unset subscriber list is a refusal rather "+
 				"than a substitution")
+	})
+}
+
+// ---------------------------------------------------------------------------------------
+// A settlement that has left the response path runs on a clock of its own
+// ---------------------------------------------------------------------------------------
+
+// TestDeferredSettlement_RunsOnItsOwnClockRatherThanTheCallersSpentOne is the guard on
+// the second half of the concurrent-issuance defect.
+//
+// The first half is capacity: an unbounded admin client lets a burst spend the whole
+// budget in the forward path. The second half is what happens NEXT. Compensation was
+// measured against the caller's wall clock, so a compensation that began after the budget
+// was spent got boundedCompensationDeadline's 1250ms floor and had to complete two broker
+// round trips inside it — against the broker that had just proved too contended to answer
+// in 3.75s. Measured on a 300-way burst that produced 132 SCRAM credentials left at the
+// broker that could not be revoked, 132 ACL grants that could not be removed and 264
+// fences that could not be released.
+//
+// The distinction this test pins is not "cleanup deserves more time". It is that a
+// settlement handed to the background scheduler runs AFTER the response has been written,
+// so the promise it was being measured against has already been kept, and measuring it
+// against a kept promise protects nobody while guaranteeing the cleanup fails. The INLINE
+// arm is unchanged and is covered by
+// TestIssueSubscriberCredential_CompensatesInsideTheSameWallClockBudget, which runs
+// without a scheduler installed.
+func TestDeferredSettlement_RunsOnItsOwnClockRatherThanTheCallersSpentOne(t *testing.T) {
+	// Small enough that the forward path can spend the whole of it inside the test.
+	const budget = 300 * time.Millisecond
+
+	run := newSubscriberLifecycle(t)
+	deferred := run.deferring()
+
+	// A non-conflict record failure is the branch that compensates.
+	run.store.failing("RecordSubscriberCredentialIfUnchanged", errors.New("write path unavailable"))
+
+	service := run.service.WithIssuanceBudget(budget)
+
+	// A broker call that ignores its context, which is what a genuinely contended broker
+	// looks like from here: it overruns the ABSOLUTE instant, not merely the forward slice.
+	run.admin.onProvision = func() { time.Sleep(budget + 150*time.Millisecond) }
+
+	started := time.Now()
+	_, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	elapsed := time.Since(started)
+
+	require.Error(t, err, "the premise: this issuance failed after provisioning")
+
+	// AAP-02 STILL HOLDS. The endpoint answers inside its own budget plus what the
+	// context-ignoring broker call cost it, and it does NOT wait for the settlement.
+	assert.Zero(t, run.log.count("ReleaseSubscriberProvisioningFence"),
+		"the response must not have waited for the settlement; that is what makes a fresh "+
+			"clock for the settlement harmless to the caller")
+	require.Equal(t, 1, deferred.pending(),
+		"the settlement must be waiting on the scheduler, in ONE task")
+
+	// The budget is long gone before the settlement runs, which is precisely the case the
+	// shipped floor could not serve.
+	time.Sleep(budget)
+	require.True(t, time.Since(started) > budget,
+		"the premise: the caller's wall clock is spent by the time the settlement starts")
+
+	deferred.drain()
+
+	for _, method := range []string{
+		"RevokeSubscriber",
+		"ClearSubscriberCredential",
+		"ReleaseSubscriberProvisioningFence",
+	} {
+		require.NotZero(t, run.log.count(method),
+			"%s must have run; a settlement that never happens is the orphan itself", method)
+
+		assert.False(t, run.log.arrivedExpired(method),
+			"%s must not arrive on an expired context: a compensation born expired is a "+
+				"compensation that never runs", method)
+
+		carried := run.log.budget(method)
+		require.Positive(t, carried,
+			"%s must arrive BOUNDED; an unbounded settlement is the same defect without a "+
+				"number on it", method)
+
+		// THE PROPERTY. The floor is what the caller's spent clock yields; anything at or
+		// below it means the settlement is still being measured against a promise that was
+		// already kept.
+		assert.Greater(t, carried, subscriberCompensationFloor,
+			"%s arrived with only %s, which is the floor a SPENT caller clock yields — the "+
+				"settlement left the response path, so it must be measured from when it "+
+				"started rather than from a budget the caller no longer holds", method, carried)
+
+		// And bounded ABOVE by the settlement's own budget, so this is a rebased clock rather
+		// than a removed one. subscriberDurabilityReserve and the cleanup headroom are carved
+		// out of it, so the arriving budget is necessarily less than the whole.
+		assert.LessOrEqual(t, carried, subscriberDetachedSettlementBudget,
+			"%s must be bounded by the settlement's own budget; a settlement with no ceiling "+
+				"is an unbounded goroutine holding a broker connection", method)
+	}
+
+	// One task, one window: the nested broker cleanup inside the registry cleanup shares the
+	// instant rather than carving a second slice, which is what subscriberCompensationWindow
+	// enforces and what rebaseSubscriberSettlementClock deliberately does not disturb.
+	revoke, ok := run.log.arrivedWithDeadline("RevokeSubscriber")
+	require.True(t, ok)
+
+	release, ok := run.log.arrivedWithDeadline("ReleaseSubscriberProvisioningFence")
+	require.True(t, ok)
+
+	assert.WithinDuration(t, revoke, release, 5*time.Millisecond,
+		"every phase of one settlement must share one instant; a second slice per phase is "+
+			"the stacked-budget defect in a different direction")
+
+	// Stated so the elapsed measurement is not silently dropped: the caller's own wait is
+	// bounded by its budget and the context-ignoring broker call, and NOT by the settlement
+	// that followed it.
+	assert.Less(t, elapsed, budget+time.Second,
+		"the endpoint must answer without waiting for a settlement that now has a clock of "+
+			"its own")
+}
+
+// TestRebaseSubscriberSettlementClock_GivesOneFreshWindowAndNeverASecond pins the helper
+// arithmetic directly, including the case the end-to-end test cannot reach.
+func TestRebaseSubscriberSettlementClock_GivesOneFreshWindowAndNeverASecond(t *testing.T) {
+	t.Run("a spent caller clock is replaced with the settlement's own", func(t *testing.T) {
+		spent := withSubscriberIssuanceDeadline(context.Background(), time.Now().Add(-time.Second))
+
+		before := time.Now()
+		rebased := rebaseSubscriberSettlementClock(spent)
+
+		deadline, ok := subscriberSLADeadline(rebased)
+		require.True(t, ok, "the rebased context must carry a wall clock")
+
+		assert.False(t, deadline.Before(before.Add(subscriberDetachedSettlementBudget)))
+		assert.False(t, deadline.After(time.Now().Add(subscriberDetachedSettlementBudget)))
+	})
+
+	t.Run("an open compensation window is left exactly as it is", func(t *testing.T) {
+		// The one-window rule. A settlement nested inside a settlement must inherit the
+		// instant it is already inside, or the budgets stack — which is the defect the slice
+		// rule was written to prevent, reappearing on the other arm.
+		window := time.Now().Add(90 * time.Millisecond)
+		open := withSubscriberCompensationWindow(
+			withSubscriberIssuanceDeadline(context.Background(), window), window)
+
+		rebased := rebaseSubscriberSettlementClock(open)
+
+		deadline, ok := subscriberSLADeadline(rebased)
+		require.True(t, ok)
+
+		assert.Equal(t, window, deadline,
+			"a settlement already inside an open window must keep it rather than open a second")
 	})
 }

@@ -557,6 +557,15 @@ type EventMetricsReport struct {
 	// while a failed one is a broker or ACL fault.
 	SubscribersFailed int
 
+	// RegistryCountFailed is true when the registry AGGREGATE could not be read, so the
+	// registry's size is unknown for this tick. Distinct from ListingFailed, which is the
+	// enumeration: the count can fail while the enumeration works and the other way round,
+	// and coverage is unknowable in either case. Without it a failed count left
+	// SubscribersRegistered at zero, and "zero registered" is indistinguishable from "no
+	// subscribers" — so a tick that could not read the registry at all reported COMPLETE
+	// coverage of it.
+	RegistryCountFailed bool
+
 	// ListingFailed is true when the registry enumeration itself failed, so an unknown number
 	// of subscribers were never reached. It is what stops a sweep claiming completeness on the
 	// strength of rows it happened to see before the query broke.
@@ -570,12 +579,42 @@ type EventMetricsReport struct {
 	// at the budget and never reached the end.
 	RegistrySize int
 
-	// SweepComplete is true only when this tick examined EVERY registered subscriber and
-	// nothing was left unmeasured by a failure. It is the value published to
-	// blnk.kafka.consumer_lag_inventory_complete, and it is the only thing that makes a
-	// permanently unmeasured subscriber alertable — the lag inventory is whole-set, so
-	// such a subscriber has no series to alert on at all.
+	// SweepComplete is true only when THIS TICK examined every registered subscriber and
+	// nothing was left unmeasured by a failure. It describes the sweep, so a registry
+	// larger than one tick's budget can never set it — which is correct for what it says
+	// and is why it is not what the inventory gauge reports.
 	SweepComplete bool
+
+	// InventoryComplete is true when EVERY registered subscriber currently has a lag
+	// series exported, whichever tick measured it. It is the value published to
+	// blnk.kafka.consumer_lag_inventory_complete, and it is the only thing that makes a
+	// permanently unmeasured subscriber alertable — the lag inventory is whole-set, so such
+	// a subscriber has no series to alert on at all.
+	//
+	// SEPARATE FROM SweepComplete, and the separation is the point. The two answer
+	// different questions — "did this tick reach the end of the registry" and "does every
+	// subscriber have a series" — and publishing the first under the second's name made the
+	// gauge unusable for any registry larger than the measurement budget: the rotation
+	// covers such a registry over several ticks by design, so the sweep figure is false on
+	// every one of them while the inventory is complete on all but the first. Measured with
+	// 400 subscribers against the default budget of 200: covered_subscribers 400,
+	// registered 400, every unmeasured reason 0 — and the gauge reporting 0, so
+	// SubscriberLagCoverageIncomplete fired permanently with its own description telling the
+	// operator to read a breakdown that said nothing was wrong.
+	//
+	// AN EMPTY REGISTRY IS COMPLETE, and saying so is the point: an empty inventory covers
+	// an empty registry exactly, so a deployment with no subscribers — the state every
+	// deployment starts in, and the steady state of one running without Kafka — must read 1.
+	// Reporting 0 there made SubscriberLagCoverageIncomplete fire permanently on a supported
+	// configuration, with nothing to act on and no way to clear it.
+	InventoryComplete bool
+
+	// BrokerUnconfigured is true when this tick had no Kafka admin client to difference
+	// offsets with, because the deployment configured no brokers. It is the legitimate
+	// no-Kafka steady state rather than a failure, and it is carried on the report so the
+	// coverage gauges can attribute an unmeasured registry to it BY NAME instead of to the
+	// budget, whose remedy cannot help.
+	BrokerUnconfigured bool
 
 	// RevocationsPending is how many subscribers still owe a broker-side credential
 	// revocation — the value published to the revocation-count gauge.
@@ -632,9 +671,12 @@ func (r EventMetricsReport) LogFields() logrus.Fields {
 		"subscribers_unmeasured":    r.SubscribersUnmeasured,
 		"subscribers_failed":        r.SubscribersFailed,
 		"subscriber_listing_failed": r.ListingFailed,
+		"registry_count_failed":     r.RegistryCountFailed,
 		"subscribers_topic_missing": r.SubscribersTopicMissing,
 		"registry_size":             r.RegistrySize,
 		"sweep_complete":            r.SweepComplete,
+		"inventory_complete":        r.InventoryComplete,
+		"broker_unconfigured":       r.BrokerUnconfigured,
 		"revocations_pending":       r.RevocationsPending,
 		"oldest_revocation_age":     r.OldestRevocationAge.String(),
 		"failures":                  len(r.Failures),
@@ -837,6 +879,12 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 		// exported series is retired.
 		report.LagSeriesCleared = c.publishLagInventory(nil, true)
 
+		// AND COMPLETE, because an empty inventory covers an empty registry exactly. There is
+		// no row anywhere that this tick failed to measure, so the coverage boolean has to say
+		// 1: the alert over it means "some registered subscriber has no lag series", and here
+		// there is no registered subscriber at all.
+		report.SweepComplete = true
+
 		// AND SAID SO. Nothing registered means nothing unmeasured, which is an honest zero
 		// and is not the same fact as writing nothing: a gauge that only speaks when
 		// something is wrong cannot distinguish this deployment from a collector that has
@@ -849,6 +897,7 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 	// READ BEFORE THE SWEEP, and read even on the paths that measure nothing.
 	registered, countErr := c.subscribers.CountEventSubscribers(ctx)
 	if countErr != nil {
+		report.RegistryCountFailed = true
 		report.Failures = append(report.Failures, fmt.Errorf("counting event subscribers: %w", countErr))
 	} else {
 		report.SubscribersRegistered = registered
@@ -859,6 +908,19 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 		// state, not a failure — and the empty inventory is what stops a deployment that has
 		// just lost its broker from continuing to export a stale lag.
 		report.LagSeriesCleared = c.publishLagInventory(nil, true)
+
+		// NAMED, so the shortfall below is attributed to the broker rather than to the budget.
+		// Every registry row here is unmeasurable for one reason and one reason only, and it
+		// is not a reason any amount of measurement budget addresses.
+		report.BrokerUnconfigured = true
+
+		// COMPLETE ONLY IF THERE IS NOTHING TO COVER. With no rows registered, the empty
+		// inventory covers the registry exactly and this is a fully measured deployment that
+		// happens to measure nothing — which is the documented steady state of running without
+		// Kafka, and it must not alert. With rows registered, coverage genuinely IS incomplete:
+		// those subscribers have no lag series and none can be produced, so the boolean stays
+		// 0 and the reason below tells the operator what to do about it.
+		report.SweepComplete = report.SubscribersRegistered == 0
 
 		// Nothing measured means the WHOLE registry is unmeasured, and saying so is the
 		// point: reporting zero here would be the false reassurance the coverage gauges exist
@@ -1067,15 +1129,105 @@ func (c *EventMetricsCollector) sweepWasComplete(report *EventMetricsReport, cov
 	return covered >= total && report.SubscribersFailed == 0 && report.SubscribersTopicMissing == 0
 }
 
+// shortfallReasonFor names the reason an UNATTRIBUTED coverage shortfall belongs to —
+// the registered subscribers with no exported lag series that none of the specific
+// per-row counts explains.
+//
+// THE REASON IS THE WHOLE VALUE OF THE LABEL, because SubscriberLagCoverageIncomplete's
+// remediation branches on it: only `budget` is answered by configuration, so a shortfall
+// filed under it sends an operator to raise a limit. Exactly one of these three
+// whole-sweep conditions can be responsible, and they are ordered most-specific first:
+// an enumeration that failed never reached the rows past the failure, a deployment with
+// no brokers could not have measured any row at all, and everything else is the rotation
+// not having got round the registry yet.
+//
+// Parameters:
+//   - report *EventMetricsReport: this tick's report, read for the two whole-sweep facts.
+//
+// Returns:
+//   - string: one value from metrics.SubscriberUnmeasuredReasons().
+func shortfallReasonFor(report *EventMetricsReport) string {
+	switch {
+	case report == nil:
+		// Unreachable from this file, and answered rather than panicked on: the caller is a
+		// telemetry path, and a nil dereference there would take down the process being observed.
+		return metrics.SubscribersUnmeasuredReasonBudget
+	case report.ListingFailed:
+		// The enumeration broke, so the rows past the failure were never reached — the same
+		// consequence as the budget with a completely different remedy. The shortfall is
+		// reported under THIS reason rather than added to the budget one, or one gap would be
+		// counted twice and the aggregate would exceed the registry.
+		return metrics.SubscribersUnmeasuredReasonRegistryFailed
+	case report.BrokerUnconfigured:
+		// NO BROKER AT ALL, which is the one shortfall the budget's remedy is guaranteed not to
+		// fix: the sweep never asked the broker for anything because there is no broker to ask.
+		// Reporting these rows under `budget` sent an operator to raise a limit that was never
+		// reached, on a deployment whose actual choice is to configure KAFKA_BROKERS or to
+		// remove registry rows it is not using.
+		return metrics.SubscribersUnmeasuredReasonBrokerUnconfigured
+	default:
+		return metrics.SubscribersUnmeasuredReasonBudget
+	}
+}
+
+// inventoryWasComplete reports whether every registered subscriber currently has a lag
+// series exported.
+//
+// It asks the question the gauge's consumers ask, and it asks it of the EXPORTED inventory
+// rather than of one tick's slice: a registry larger than the measurement budget is covered
+// over several ticks by design, and the readings of the subscribers a tick did not reach
+// stay exported for lagReadingTTL, so completeness is a property of the union rather than
+// of the last sweep.
+//
+// Three things make it false, and each has a distinct remedy the unmeasured-reason
+// breakdown names:
+//   - the registry could not be enumerated, so its size is unknown and nothing can be
+//     concluded about coverage;
+//   - a subscriber is registered and has no series, whether because the rotation has not
+//     reached it yet or because it has aged out;
+//   - a measurement failed, or named a topic the broker does not have, so that subscriber
+//     or that topic has no series even though its row was examined.
+//
+// A subscriber with nothing to measure — no authorised topics — is NOT counted against
+// completeness, for the same reason it is 'explained' in the shortfall: there is no reading
+// to take, so its absence is the row's own state rather than a gap in the collector.
+//
+// Parameters:
+//   - report *EventMetricsReport: this tick's report, already carrying the registry count
+//     and the per-reason tallies.
+//
+// Returns:
+//   - bool: whether every registered subscriber that CAN be measured is currently exported.
+func (c *EventMetricsCollector) inventoryWasComplete(report *EventMetricsReport) bool {
+	if report.ListingFailed || report.RegistryCountFailed {
+		return false
+	}
+
+	if report.SubscribersFailed != 0 || report.SubscribersTopicMissing != 0 {
+		return false
+	}
+
+	measurable := int(report.SubscribersRegistered) - report.SubscribersSkipped
+
+	return c.coveredSubscriberCount() >= measurable
+}
+
 // publishSweepCoverage records the coverage gauges for this tick.
 func (c *EventMetricsCollector) publishSweepCoverage(
 	ctx context.Context,
 	report *EventMetricsReport,
 	covered, total int,
 ) {
+	// THE EXPORTED INVENTORY, NOT THIS TICK'S SLICE, because that is the question the gauge
+	// is read to answer and the one its alert acts on. Derived from exactly the quantities
+	// the shortfall below is derived from, so the boolean and the count can never disagree —
+	// a gauge that says "incomplete" while every unmeasured reason reads zero is an alert
+	// with no remedy in it.
+	report.InventoryComplete = c.inventoryWasComplete(report)
+
 	if metrics.ConsumerLagInventoryComplete != nil {
 		complete := int64(0)
-		if report.SweepComplete {
+		if report.InventoryComplete {
 			complete = 1
 		}
 		metrics.ConsumerLagInventoryComplete.Record(ctx, complete)
@@ -1083,10 +1235,15 @@ func (c *EventMetricsCollector) publishSweepCoverage(
 
 	// THE SHORTFALL IS MEASURED AGAINST THE EXPORTED INVENTORY, NOT AGAINST THIS TICK'S
 	// SLICE.
-	budgetShortfall := 0
+	// UNATTRIBUTED UNTIL A REASON IS CHOSEN BELOW. It is the rows the exported inventory does
+	// not cover and no specific count explains, and it belongs to whichever of the three
+	// whole-sweep reasons applies — the budget, a broken registry enumeration, or no broker at
+	// all. Naming it after any one of them is how every one of these rows came to be reported
+	// as a budget shortfall on deployments that had no broker configured.
+	unattributedShortfall := 0
 	explained := report.SubscribersSkipped + report.SubscribersFailed + report.SubscribersTopicMissing
 	if shortfall := int(report.SubscribersRegistered) - c.coveredSubscriberCount() - explained; shortfall > 0 {
-		budgetShortfall = shortfall
+		unattributedShortfall = shortfall
 	}
 
 	// covered and total remain the SWEEP's figures and are what SweepComplete is derived from:
@@ -1098,23 +1255,17 @@ func (c *EventMetricsCollector) publishSweepCoverage(
 	// THE REASON THE SHORTFALL IS ATTRIBUTED TO, which is the whole value of the label: only
 	// 'budget' is answered by configuration, so an operator who reads the aggregate alone is as
 	// likely to raise a budget as to fix the broken query that actually caused it.
-	shortfallReason := metrics.SubscribersUnmeasuredReasonBudget
-	if report.ListingFailed {
-		// The enumeration broke, so the rows past the failure were never reached — the same
-		// consequence as the budget with a completely different remedy. The shortfall is
-		// reported under THIS reason rather than added to the budget one, or one gap would be
-		// counted twice and the aggregate would exceed the registry.
-		shortfallReason = metrics.SubscribersUnmeasuredReasonRegistryFailed
-	}
+	shortfallReason := shortfallReasonFor(report)
 
 	unmeasured := map[string]int64{
-		metrics.SubscribersUnmeasuredReasonBudget:         0,
-		metrics.SubscribersUnmeasuredReasonUnprovisioned:  int64(report.SubscribersSkipped),
-		metrics.SubscribersUnmeasuredReasonMeasureFailed:  int64(report.SubscribersFailed),
-		metrics.SubscribersUnmeasuredReasonRegistryFailed: 0,
-		metrics.SubscribersUnmeasuredReasonTopicMissing:   int64(report.SubscribersTopicMissing),
+		metrics.SubscribersUnmeasuredReasonBudget:             0,
+		metrics.SubscribersUnmeasuredReasonUnprovisioned:      int64(report.SubscribersSkipped),
+		metrics.SubscribersUnmeasuredReasonMeasureFailed:      int64(report.SubscribersFailed),
+		metrics.SubscribersUnmeasuredReasonRegistryFailed:     0,
+		metrics.SubscribersUnmeasuredReasonTopicMissing:       int64(report.SubscribersTopicMissing),
+		metrics.SubscribersUnmeasuredReasonBrokerUnconfigured: 0,
 	}
-	unmeasured[shortfallReason] = int64(budgetShortfall)
+	unmeasured[shortfallReason] = int64(unattributedShortfall)
 
 	// The report's single total and the attributed gauge are the SAME number by construction,
 	// summed from the one map, so the log line and the exported series can never disagree

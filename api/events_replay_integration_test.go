@@ -129,7 +129,7 @@ func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *t
 	// broker chose and the test cannot know it in advance. It is also the only place the
 	// service's view of the publish is observable from this package.
 	var acknowledged coremodel.BrokerRecord
-	datasource.On("MarkEventDispatched", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
+	datasource.On("MarkEventDispatched", mock.Anything, row.ID, row.ClaimToken, mock.Anything, false).
 		Return(nil).
 		Run(func(args mock.Arguments) {
 			record, isRecord := args.Get(3).(coremodel.BrokerRecord)
@@ -186,8 +186,11 @@ func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *t
 		"failure metadata has no place on a success")
 
 	// 3. THE BOOKKEEPING RAN, and the coordinate it recorded is a real one.
+	// The final argument is FALSE, and the assertion names it rather than accepting anything: a
+	// replay must not settle the legacy webhook leg. A row dead-lettered before its enqueue
+	// succeeded still owes one, and only the repair leg finishes it.
 	datasource.AssertCalled(t, "MarkEventDispatched",
-		mock.Anything, row.ID, row.ClaimToken, mock.Anything)
+		mock.Anything, row.ID, row.ClaimToken, mock.Anything, false)
 	datasource.AssertNotCalled(t, "ReleaseEventReplay",
 		mock.Anything, row.ID, row.ClaimToken, mock.Anything)
 

@@ -1240,10 +1240,13 @@ func TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation(t *testing.T) 
 		"and being dropped from the shell afterwards")
 
 	// THE DEAD END MUST BE RECORDED, so the next reader does not spend the afternoon rediscovering
-	// that the obvious fix is the one that cannot work.
+	// it. The dead end is precisely moving the INLINE value into a properties file UNCHANGED:
+	// --add-config needs the bracketed spelling and --add-config-file rejects it, while the
+	// unbracketed spelling a properties file does accept is invalid inline. Each option refuses
+	// the other's form, which is why the error below has to be quoted rather than described.
 	assert.Contains(t, body, "Invalid credential property SCRAM_SHA_512",
-		"the runbook must record that --add-config-file cannot express a SCRAM credential, and "+
-			"quote the error it produces, because it is the natural thing to reach for and it "+
+		"the runbook must quote the error a bracketed SCRAM value in a properties file produces, "+
+			"because moving the inline value into a file is the natural thing to reach for and it "+
 			"fails in a way that does not explain itself")
 	// AND THE PATH WHERE THE PROBLEM DOES NOT EXIST MUST BE NAMED.
 	assert.Contains(t, body, "AlterUserScramCredentials",

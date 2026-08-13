@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -345,25 +346,95 @@ func (cnf *Configuration) RemoteMonitoringDSN() string {
 	return ""
 }
 
+// decodeConfigFile layers the JSON configuration file over cnf when there is one to
+// layer, and reports the reason there is not when there is not.
+//
+// THE ABSENT FILE IS NOT AN ERROR, and it never has been: an environment-only deployment
+// is a first-class configuration mode, so a missing path is announced and skipped.
+// Two OTHER shapes are treated the same way rather than as a decode failure, because
+// neither carries any configuration and both are things a deployment does TO this path
+// rather than mistakes in a file's contents:
+//
+//   - A DIRECTORY. Docker materialises a missing bind-mount source, and for a source with
+//     no trailing slash it creates a directory. `./blnk.json:/blnk.json` against a clone —
+//     where blnk.json is gitignored and therefore never present — left every process
+//     started that way exiting on `read blnk.json: is a directory`, naming a path the
+//     operator never created. os.Stat succeeds on a directory and so does os.Open, so
+//     only an explicit check separates it from a real file.
+//   - AN EMPTY FILE, including one holding nothing but whitespace, which the decoder
+//     reports as io.EOF. A configuration file that was created but not yet written says
+//     nothing about the deployment, and "EOF" says nothing about the file.
+//
+// Both are WARNED about with the remedy, not passed over in silence: the operator either
+// intended file configuration and has to fix the path, or did not and can remove it.
+//
+// Parameters:
+//   - file string: the configuration file path, from --config or its default.
+//   - cnf *Configuration: the struct the file is decoded into. Left untouched when there
+//     is nothing to decode.
+//
+// Returns:
+//   - error: a stat failure other than absence, an open failure, or a JSON syntax error.
+//     Never an error for an absent, empty or directory path.
+func decodeConfigFile(file string, cnf *Configuration) error {
+	info, err := os.Stat(file)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		logrus.Info("config json not passed, will use env variables")
+		return nil
+	case err != nil:
+		// A path that exists but cannot be described - no execute permission on a parent
+		// directory, an I/O error - is a genuine fault and is reported rather than read as
+		// absence, because reading it as absence would silently discard the configuration
+		// the operator believes is in force.
+		return err
+	case info.IsDir():
+		logrus.WithField("path", file).Warn(
+			"the configuration path is a DIRECTORY, not a file, so no file configuration was " +
+				"loaded and this process is configured from its environment alone. A container " +
+				"runtime creates a directory when it is asked to bind-mount a file that does not " +
+				"exist, so this usually means a mount points at a path the host does not have. " +
+				"Remove the directory, and either mount a real file there or configure this " +
+				"process through the environment",
+		)
+		return nil
+	}
+
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	// CLOSED ON EVERY PATH. The handle used to be left open for the life of the process;
+	// harmless once, and wrong in a test binary that loads configuration repeatedly.
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			logrus.WithError(closeErr).WithField("path", file).
+				Warn("could not close the configuration file after reading it")
+		}
+	}()
+
+	if err := json.NewDecoder(f).Decode(cnf); err != nil {
+		if errors.Is(err, io.EOF) {
+			logrus.WithField("path", file).Warn(
+				"the configuration file is empty, so no file configuration was loaded and this " +
+					"process is configured from its environment alone",
+			)
+			return nil
+		}
+		return err
+	}
+
+	return nil
+}
+
 func loadConfigFromFile(file string) error {
 	var cnf Configuration
-	_, err := os.Stat(file)
-	if err == nil {
-		f, err := os.Open(file)
-		if err != nil {
-			return err
-		}
-		err = json.NewDecoder(f).Decode(&cnf)
-		if err != nil {
-			return err
-		}
-
-	} else if errors.Is(err, os.ErrNotExist) {
-		logrus.Info("config json not passed, will use env variables")
+	if err := decodeConfigFile(file, &cnf); err != nil {
+		return err
 	}
 
 	// override config from environment variables
-	err = envconfig.Process("blnk", &cnf)
+	err := envconfig.Process("blnk", &cnf)
 	if err != nil {
 		return explainEnvProcessError(err)
 	}

@@ -182,6 +182,24 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 			wantRetryable:      false,
 			wantReasonFragment: "failed at the broker",
 		},
+		{
+			// THE PRINCIPAL ALREADY CARRIED ALLOW BINDINGS BLNK DID NOT PROVISION, and this
+			// branch used to fall through to the provisioning-failure return above, answering
+			// 503 — the class reserved for a transient dependency failure. The broker answered
+			// perfectly well; the refusal is a judgement about the access its bindings amount
+			// to, and only a human removing them can change it. So it carries the same code the
+			// post-provisioning discovery of the identical condition carries, and its 409, or
+			// the same finding would report two status classes depending on when it was noticed
+			// — with the 503 half inviting a retry that can never succeed.
+			name:               "the principal carries foreign ALLOW bindings",
+			cause:              fmt.Errorf("provisioning: %w", ErrSubscriberForeignACLGrant),
+			result:             SubscriberProvisioningResult{CredentialWritten: true, Compensated: true},
+			wantCode:           apierror.ErrSubscriberAccessExceedsAuthorization,
+			wantRetryable:      false,
+			wantCredential:     true,
+			wantCompensated:    true,
+			wantReasonFragment: "foreign ALLOW ACL bindings",
+		},
 	}
 
 	for _, tc := range cases {

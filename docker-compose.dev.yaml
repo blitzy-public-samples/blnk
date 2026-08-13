@@ -24,6 +24,38 @@ services:
       TZ: ${TZ:-Etc/UTC}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
       # ---------------------------------------------------------------------
+      # THE TWO REQUIRED CONFIGURATION VALUES, AND THE ONLY TWO. config.go's
+      # validateRequiredFields refuses to start without both of them, so every service
+      # that runs the binary — this one, the worker, and the one-shot migration —
+      # declares both. Nothing else in this file is required.
+      #
+      # THE DEFAULT IS DERIVED FROM THE SERVICES THIS FILE ITSELF CREATES, which is what
+      # makes a clone bootable with no configuration beyond .env: the same POSTGRES_USER,
+      # POSTGRES_PASSWORD and POSTGRES_DB values that initialise the postgres service
+      # below, reached over the compose network by service name. Correct by construction
+      # rather than by an operator remembering to write it out.
+      #
+      # AN OPERATOR VALUE STILL WINS, and that is what points this stack at a database
+      # outside it. But note WHICH value: these two keys are also read by HOST processes
+      # (`make run`, `make test`, `blnk start` on the host), where the endpoint is
+      # localhost and the published port. A host-shaped value forwarded into a container
+      # names the container's own loopback and cannot reach anything, so either leave
+      # them EMPTY here and accept the derived default, or set the in-compose form
+      # .env.example documents beside each key.
+      #
+      # A PASSWORD TRAVELS IN A URL, so it has to be expressible in one: the default
+      # interpolates POSTGRES_PASSWORD into the userinfo, and a password containing "/",
+      # "@", "?" or "#" cannot appear there un-encoded. `stack.sh --init` generates from
+      # an alphanumeric alphabet for exactly this reason; a hand-written password with
+      # those characters needs BLNK_DATA_SOURCE_DNS set explicitly, percent-encoded.
+      BLNK_DATA_SOURCE_DNS: ${BLNK_DATA_SOURCE_DNS:-postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable}
+      # The same shape, and the password half is conditional rather than defaulted: the
+      # redis service below starts unauthenticated when REDIS_PASSWORD is empty, so a DSN
+      # carrying empty userinfo would describe a server that is not there. ${VAR:+...}
+      # emits the userinfo only when there is a password to put in it, which keeps the
+      # unset case byte-identical to an unauthenticated DSN.
+      BLNK_REDIS_DNS: ${BLNK_REDIS_DNS:-redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379}
+      # ---------------------------------------------------------------------
       # OBSERVABILITY — this is what makes /metrics EXIST
       #
       # Set BLNK_ENABLE_OBSERVABILITY=false in .env to opt out.
@@ -334,8 +366,27 @@ services:
       # rather than on a request.
       migration:
         condition: service_completed_successfully
-    volumes:
-      - ./blnk.json:/blnk.json
+    # NO ./blnk.json MOUNT, AND ITS ABSENCE IS THE FIX RATHER THAN AN OVERSIGHT.
+    #
+    # blnk.json is gitignored, so a clone never contains it. Docker does not fail on a
+    # missing bind source — it CREATES it, and for a path with no trailing slash it
+    # creates a DIRECTORY. All three application services then started against a
+    # directory named like their configuration file and exited with
+    # `error loading config: read blnk.json: is a directory`, on a path the operator
+    # never made, on the very first `docker compose up` after a clone. The binary now
+    # reports that shape and continues on environment configuration rather than dying
+    # (see loadConfigFromFile in config/config.go), but nothing here creates the
+    # directory in the first place any more.
+    #
+    # NOTHING IS LOST WITH IT: configuration reaches these containers through the
+    # environment block above, which is the only channel that works for a value living in
+    # .env. To use a file instead, mount your own and name it — the --config flag is
+    # honoured, so an override file is the whole of it:
+    #
+    #   services:
+    #     server:
+    #       volumes: ['./blnk.json:/blnk.json:ro']
+    #       command: ['blnk', 'start', '--config', '/blnk.json']
 
   worker:
     build: .
@@ -344,6 +395,17 @@ services:
     entrypoint: ["blnk", "workers"]
     environment:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      # ---------------------------------------------------------------------
+      # THE TWO REQUIRED CONFIGURATION VALUES, identical to the server's because the two
+      # roles run the same binary through the same validateRequiredFields. See the server
+      # service above for where the default comes from and why an operator value that was
+      # written for a host process must not be forwarded here.
+      #
+      # THIS ROLE NEEDS BOTH. The worker takes its work from Redis and captures events
+      # into the outbox inside the ledger transaction in PostgreSQL, so neither DSN is
+      # optional for it.
+      BLNK_DATA_SOURCE_DNS: ${BLNK_DATA_SOURCE_DNS:-postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable}
+      BLNK_REDIS_DNS: ${BLNK_REDIS_DNS:-redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379}
       # ---------------------------------------------------------------------
       # OBSERVABILITY — this is what makes /metrics EXIST
       #
@@ -407,12 +469,22 @@ services:
       # rather than on a request.
       migration:
         condition: service_completed_successfully
-    volumes:
-      - ./blnk.json:/blnk.json
+    # No ./blnk.json mount, for the reason given on the server service above.
 
   migration:
     build: .
     entrypoint: ["blnk", "migrate", "up"]
+    # THE MIGRATION RUNNER IS A FULL CONFIGURATION CONSUMER, and it used to be given
+    # nothing at all. `blnk migrate up` goes through the same config.Fetch as the server
+    # and the worker, so validateRequiredFields refuses it without BOTH DSNs — including
+    # the Redis one, which the migration itself never uses. This service therefore
+    # declares the identical pair rather than a PostgreSQL-only subset: a partial
+    # declaration would exit 1 on the value it does not need, and every service that
+    # waits for this one to COMPLETE would then never start.
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      BLNK_DATA_SOURCE_DNS: ${BLNK_DATA_SOURCE_DNS:-postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable}
+      BLNK_REDIS_DNS: ${BLNK_REDIS_DNS:-redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379}
     # BOUNDED, for the same reason kafka-init is: server and worker now wait for this
     # service to COMPLETE, so an uncapped retry on a permanent failure - a wrong
     # password, a migration that cannot apply - would leave "docker compose up" waiting
@@ -432,8 +504,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    volumes:
-      - ./blnk.json:/blnk.json
+    # No ./blnk.json mount, for the reason given on the server service above. This one
+    # mattered most: a one-shot the whole stack waits on cannot be the service that dies
+    # on a directory Docker created for it.
 
   # Redis stays. It carries TRANSACTION_QUEUE and the webhook queue, which outlives the
   # webhook transport because the hooks subsystem and the search indexer enqueue onto it
@@ -459,6 +532,12 @@ services:
     #   remediation available to this stack.
     image: redis:7.2.15@sha256:82aaa7644735e54d290a34e5eb9b1b97c4cf99c84d0250a794cc021f544c069f
     container_name: redis
+    # THE SAME POLICY THE PUBLISHED PROJECTION CARRIES, and the asymmetry it removes was
+    # only ever an omission: this file declares `restart: on-failure` on server, worker and
+    # migration but had nothing here, so a Redis that died took TRANSACTION_QUEUE and the
+    # webhook queue with it and stayed down while the services that depend on it kept
+    # restarting into a dependency that was never coming back.
+    restart: on-failure
     # AUTHENTICATION IS OPT-IN AND OFF BY DEFAULT, DELIBERATELY.
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
@@ -973,7 +1052,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       # The rule directory prometheus.yml's rule_files glob resolves against. Without
-      # this mount the stanza matches nothing and ALL 13 alert rules are inert, with no
+      # this mount the stanza matches nothing and ALL 15 alert rules are inert, with no
       # startup error to notice, so the mount and the glob have to be kept in step.
       # Mounted as a directory so a rule file added later needs no edit here.
       - ./alerts:/etc/prometheus/alerts:ro

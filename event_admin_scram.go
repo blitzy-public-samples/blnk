@@ -291,6 +291,19 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 		return result, err
 	}
 
+	// THE PERMIT IS TAKEN HERE, before the first round trip and therefore before anything
+	// this call could be left holding exists. A refusal at this line is a clean refusal:
+	// no credential at the broker, no binding, no obligation for the settlement processor
+	// to carry. That ordering is the whole point — the alternative, which is what an
+	// unbounded admin client produces, is a request that runs out of budget three round
+	// trips in, having already written the credential it can no longer authorise.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminForward)
+	if err != nil {
+		return result, err
+	}
+
+	defer releasePermit()
+
 	principal := req.principal()
 	iterations := req.iterations()
 	topics := req.normalizedTopics()
@@ -343,10 +356,50 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 		return result, err
 	}
 
-	if err := a.upsertScramCredential(ctx, upsertion); err != nil {
+	writeOutcome, err := a.upsertScramCredential(ctx, upsertion)
+
+	// SET FROM WHAT IS KNOWN, not from whether the call returned an error. An indeterminate
+	// write may have landed, and the flag is what every downstream decision reads: whether
+	// to compensate, whether to file a settlement obligation, and what the failure log says
+	// the broker was left holding. Treating unknown as nothing is what left principals at
+	// the broker that nothing afterwards could find.
+	result.CredentialWritten = writeOutcome.mayHaveReachedTheBroker()
+
+	if err != nil {
+		if writeOutcome == scramWriteRejected {
+			// The broker refused, so nothing exists to undo and the caller's own error is the
+			// whole story.
+			return result, err
+		}
+
+		// The credential may be live with no boundary at all, which is the same state the ACL
+		// failure below produces and is compensated the same way. Logged here because this is
+		// the one branch whose cause is an ABSENCE of information, and an operator reading the
+		// revocation that follows should be able to see why it was attempted.
+		logrus.WithFields(logrus.Fields{
+			"principal_hash":     subscriberLogLabel(principal),
+			"subscriber_id_hash": subscriberLogLabel(result.SubscriberID),
+			"error_class":        kafkaErrorClassField("provision_subscriber_principal", err),
+		}).Warn(
+			"kafka admin: the SCRAM credential write got no usable answer, so the credential may be " +
+				"live at the broker with no authorization boundary; it is being revoked as though it " +
+				"landed, because the safe reading of an unknown write is that it did",
+		)
+
+		if req.DeferCompensation {
+			result.CompensationOwed = true
+			result.OwedBindings = req.aclEntries()
+
+			return result, err
+		}
+
+		if cleanupErr := a.compensateFailedProvisioning(ctx, principal, req.aclEntries()); cleanupErr == nil {
+			result.CredentialWritten = false
+			result.Compensated = true
+		}
+
 		return result, err
 	}
-	result.CredentialWritten = true
 
 	// RECONCILED, not merely created. The broker's Blnk-owned bindings for this principal
 	// are made exactly what the row's authorization implies, so a topic removed from
@@ -789,12 +842,17 @@ func deriveScramUpsertion(principal, password string, iterations int) (kafka.Use
 func (a *KafkaAdminClient) upsertScramCredential(
 	ctx context.Context,
 	upsertion kafka.UserScramCredentialsUpsertion,
-) error {
+) (scramWriteOutcome, error) {
 	response, err := a.client.AlterUserScramCredentials(ctx, &kafka.AlterUserScramCredentialsRequest{
 		Upsertions: []kafka.UserScramCredentialsUpsertion{upsertion},
 	})
 	if err != nil {
-		return fmt.Errorf(
+		// NO ANSWER IS NOT A NO. The request may have reached the broker and been applied
+		// with only the reply lost — which is the ordinary shape of a deadline expiring on a
+		// contended broker — so the credential may exist. Reported as indeterminate rather
+		// than as a failure, because the caller's next decision is whether to compensate, and
+		// there is exactly one safe answer when the truth is unknown.
+		return scramWriteIndeterminate, fmt.Errorf(
 			"kafka admin: writing the %s credential for principal %q: %w",
 			SubscriberSASLMechanism, upsertion.Name, err,
 		)
@@ -805,20 +863,54 @@ func (a *KafkaAdminClient) upsertScramCredential(
 			continue
 		}
 		if outcome.Error != nil {
-			return fmt.Errorf(
+			// THE ONE CASE THAT IS DEFINITELY NOT WRITTEN. The broker answered, about this
+			// principal, and refused — so there is nothing at the broker to undo.
+			return scramWriteRejected, fmt.Errorf(
 				"kafka admin: broker rejected the %s credential for principal %q: %w",
 				SubscriberSASLMechanism, upsertion.Name, outcome.Error,
 			)
 		}
 
-		return nil
+		return scramWriteApplied, nil
 	}
 
-	return fmt.Errorf(
+	return scramWriteIndeterminate, fmt.Errorf(
 		"kafka admin: broker returned no result for principal %q when writing its %s credential, "+
 			"so the credential cannot be assumed to exist",
 		upsertion.Name, SubscriberSASLMechanism,
 	)
+}
+
+// scramWriteOutcome says what is known about a credential write, as distinct from
+// whether the call succeeded.
+//
+// The distinction exists because "the call failed" and "nothing was written" are not the
+// same statement, and conflating them is silent: a request whose deadline expires while
+// AlterUserScramCredentials is in flight sees an error, while the broker has applied the
+// credential. Recorded as "not written", that principal can authenticate, is absent from
+// the registry, and has no obligation filed against it — so nothing revokes it and
+// nothing reports it. Measured on a 300-way concurrent burst before this distinction
+// existed: 145 principals left at the broker that no log line, no registry column and no
+// settlement sweep knew about, against 18 that were correctly reported.
+type scramWriteOutcome int
+
+const (
+	// scramWriteApplied means the broker confirmed the write.
+	scramWriteApplied scramWriteOutcome = iota
+
+	// scramWriteRejected means the broker answered about this principal and refused, so
+	// there is nothing at the broker to undo.
+	scramWriteRejected
+
+	// scramWriteIndeterminate means no usable answer arrived, so the credential MAY exist
+	// and must be treated as though it does.
+	scramWriteIndeterminate
+)
+
+// mayHaveReachedTheBroker reports whether a credential could exist as a result of this
+// write, which is the only question compensation needs answered.
+func (o scramWriteOutcome) mayHaveReachedTheBroker() bool {
+	return o == scramWriteApplied || o == scramWriteIndeterminate
 }
 
 // CompensateProvisioning undoes the half-completed provisioning a deferred result
@@ -841,6 +933,17 @@ func (a *KafkaAdminClient) CompensateProvisioning(
 	if a == nil || !result.CompensationOwed || strings.TrimSpace(result.Principal) == "" {
 		return nil
 	}
+
+	// FROM THE COMPENSATING RESERVE, never the forward pool. This call runs while the
+	// forward queue is at its fullest — that is the condition that produced the work it is
+	// undoing — so sharing one pool would make the revocation of an unauthorised credential
+	// wait behind the attempts to mint more of them.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminCompensating)
+	if err != nil {
+		return err
+	}
+
+	defer releasePermit()
 
 	return a.compensateFailedProvisioning(ctx, result.Principal, result.OwedBindings)
 }

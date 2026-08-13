@@ -854,8 +854,8 @@ func (m *MockDataSource) InsertEventOutbox(ctx context.Context, e *model.EventOu
 	return args.Error(0)
 }
 
-func (m *MockDataSource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
-	args := m.Called(ctx, batchSize, lockDuration)
+func (m *MockDataSource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration, keyCursor string) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, batchSize, lockDuration, keyCursor)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
@@ -878,8 +878,11 @@ func (m *MockDataSource) ClaimFailedEventOutboxForDeadLetter(ctx context.Context
 	return args.Get(0).([]model.EventOutbox), args.Error(1)
 }
 
-func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error {
-	args := m.Called(ctx, id, claimToken, record)
+func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord, settleLegacyLeg bool) error {
+	// settleLegacyLeg is part of the expectation tuple so a test can assert WHICH transition
+	// this was: the relay's terminal settle folds the dual-delivery marker in and passes
+	// true, a replay passes false because the webhook leg may still be owed.
+	args := m.Called(ctx, id, claimToken, record, settleLegacyLeg)
 	return args.Error(0)
 }
 

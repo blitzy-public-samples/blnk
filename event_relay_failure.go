@@ -284,20 +284,25 @@ func (p *EventRelayProcessor) deliverLegacyWebhook(
 		return legacyLegOwed, err
 	}
 
-	bookkeeping, cancel := detachedBookkeepingContext(ctx)
-	defer cancel()
-
-	if err := p.store.MarkWebhookDispatched(bookkeeping, row.ID, row.ClaimToken); err != nil {
-		// The task is enqueued and will be delivered; only the marker is missing. A later
-		// claim re-enqueues under the same task identity, which the queue refuses as a
-		// duplicate, so this is an observability gap rather than a delivery defect — and the
-		// leg is reported as SETTLED, because it is: the webhook is on the queue.
-		withLoggableCause(logrus.WithFields(p.rowFields(row, row.Attempts+1)), err).Warn(
-			"event relay: the legacy webhook was enqueued but the row could not be marked; " +
-				"a re-enqueue is suppressed by the task identity",
-		)
-	}
-
+	// THE MARKER IS NOT WRITTEN HERE, and that is not an omission.
+	//
+	// It used to be, in a statement of its own, immediately after this enqueue. That was one
+	// extra row update and one extra commit for every event the relay published — measured at
+	// 2.95 updates and 3.97 commits per published event, a third and a quarter of them
+	// respectively belonging to this marker — and on a deployment with no webhook URL
+	// configured it recorded the dispatch of a delivery that was never enqueued at all.
+	//
+	// The terminal transition writes it instead: settleAfterKafkaSuccess passes
+	// settleLegacyLeg to MarkEventDispatched, which folds `webhook_dispatched` into the same
+	// UPDATE that records the Kafka leg. The leg is reported SETTLED here because it is — the
+	// webhook is on the queue — and the durable record of that follows within the same pass.
+	//
+	// WHAT A CRASH IN BETWEEN COSTS is one duplicate enqueue, suppressed. If the process dies
+	// after this enqueue and before the terminal write, or if the Kafka publish fails and the
+	// row is retried, the row returns with webhook_dispatched still false and this function
+	// re-enqueues under the same asynq task identity — which the queue refuses as a duplicate.
+	// That is the identical recovery the marker's own failure relied on when it was written
+	// here, so the window is wider by the length of one publish and no less safe.
 	return legacyLegSettled, nil
 }
 

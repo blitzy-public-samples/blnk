@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -8698,4 +8699,649 @@ func TestCreateACLBindings_IsTheUnbypassableGate(t *testing.T) {
 			"CreateACLs would leave the widened binding live and merely report it")
 	assert.Empty(t, fake.bindings,
 		"no binding may exist in the broker's store after a refused create")
+}
+
+// ---------------------------------------------------------------------------------------
+// Bounded administrative capacity
+// ---------------------------------------------------------------------------------------
+
+// TestAdmitAdminConversation_BoundsHowManyConversationsReachTheBrokerAtOnce is the guard
+// on the bound itself.
+//
+// A shared admin client with no bound inherits the broker's congestion curve, and that
+// curve collapses: measured on the local single-broker stack, offering 300 concurrent
+// credential issuances produced 26 successes and 274 requests that ran out of the
+// five-second budget PART-PROVISIONED, each leaving a SCRAM credential the registry did
+// not know about. The bound is what stops the queue forming inside the broker, where
+// nothing can refuse it, and forms it here instead, where a request that cannot be served
+// is refused before its first write.
+func TestAdmitAdminConversation_BoundsHowManyConversationsReachTheBrokerAtOnce(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, 6, 1)
+
+	var (
+		observe   sync.Mutex
+		inFlight  int
+		highWater int
+	)
+
+	// Held long enough that every goroutine below is admitted or queued before any of them
+	// finishes, which is what makes the high-water mark meaningful rather than a race.
+	release := make(chan struct{})
+
+	var admitted sync.WaitGroup
+
+	// Deliberately more than the pool, so the bound has something to bind.
+	offered := kafkaProvisioningPermits * 3
+
+	for i := 0; i < offered; i++ {
+		admitted.Add(1)
+
+		go func() {
+			defer admitted.Done()
+
+			ctx, done, err := admin.admitAdminConversation(context.Background(), kafkaAdminForward)
+			if err != nil {
+				return
+			}
+
+			defer done()
+
+			require.NotNil(t, ctx)
+
+			observe.Lock()
+			inFlight++
+			if inFlight > highWater {
+				highWater = inFlight
+			}
+			observe.Unlock()
+
+			<-release
+
+			observe.Lock()
+			inFlight--
+			observe.Unlock()
+		}()
+	}
+
+	// Wait for the pool to fill rather than sleeping for a fixed period: the assertion is
+	// about the ceiling, so it must be taken once the ceiling has actually been reached.
+	require.Eventually(t, func() bool {
+		observe.Lock()
+		defer observe.Unlock()
+
+		return inFlight == kafkaProvisioningPermits
+	}, 5*time.Second, time.Millisecond,
+		"the pool must admit its full complement; a bound that admits fewer would be a "+
+			"throttle rather than a ceiling")
+
+	observe.Lock()
+	reached := highWater
+	observe.Unlock()
+
+	assert.Equal(t, kafkaProvisioningPermits, reached,
+		"at most %d conversations may be open at once; %d were, so the bound is not being "+
+			"applied and the broker is being offered whatever arrives",
+		kafkaProvisioningPermits, reached)
+
+	close(release)
+	admitted.Wait()
+
+	// AND THE POOL IS RETURNED. A permit leaked on the success path is a bound that
+	// tightens with every request until the surface stops answering altogether, which is
+	// worse than having no bound at all.
+	ctx, done, err := admin.admitAdminConversation(context.Background(), kafkaAdminForward)
+	require.NoError(t, err,
+		"every permit must have been returned once the conversations finished")
+	require.NotNil(t, ctx)
+
+	done()
+}
+
+// TestAdmitAdminConversation_IsReentrantWithinOneConversation pins the property that
+// keeps a gated operation calling another gated operation from waiting on a permit it is
+// itself holding.
+//
+// ProvisionSubscriberPrincipal is a conversation of round trips, and some of its steps —
+// SubscriberCredentialExists is the clearest — are published operations in their own
+// right. Without reentrancy the nesting would deadlock, and it would deadlock only under
+// enough load to empty the pool, which is the worst possible time to discover it.
+func TestAdmitAdminConversation_IsReentrantWithinOneConversation(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, 6, 1)
+
+	// The whole pool, held.
+	held := make([]func(), 0, kafkaProvisioningPermits)
+
+	outer := context.Background()
+
+	for i := 0; i < kafkaProvisioningPermits; i++ {
+		ctx, done, err := admin.admitAdminConversation(context.Background(), kafkaAdminForward)
+		require.NoError(t, err)
+
+		held = append(held, done)
+
+		if i == 0 {
+			outer = ctx
+		}
+	}
+
+	defer func() {
+		for _, done := range held {
+			done()
+		}
+	}()
+
+	// A nested step of the first conversation. The pool is empty, so a non-reentrant
+	// implementation blocks here until the deadline and then fails.
+	nested, cancel := context.WithTimeout(outer, 250*time.Millisecond)
+	defer cancel()
+
+	inner, done, err := admin.admitAdminConversation(nested, kafkaAdminForward)
+	require.NoError(t, err,
+		"a nested step must run inside the permit its conversation already holds; waiting "+
+			"here is a deadlock that appears only when the pool is full")
+	require.NotNil(t, inner)
+
+	done()
+
+	// And a conversation that holds NOTHING is still bound by the empty pool, so
+	// reentrancy is scoped to the context that carries the permit rather than global.
+	fresh, cancelFresh := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelFresh()
+
+	_, doneFresh, err := admin.admitAdminConversation(fresh, kafkaAdminForward)
+	require.Error(t, err,
+		"reentrancy must follow the permit on the context, not exempt every caller once one "+
+			"permit is held")
+	doneFresh()
+}
+
+// TestProvisionSubscriberPrincipal_RefusesBeforeItsFirstWriteWhenCapacityIsSaturated is
+// the property that turns a saturated broker from a state-corrupting failure into a
+// retryable one.
+//
+// The failure this replaces is specific: the budget was spent three round trips in, so
+// the SCRAM credential had already been written and the ACL grant had not, and the
+// request answered 503 having created a principal that could authenticate with no
+// boundary recorded against it. Refusing at the queue instead means the answer is the
+// same 503 and the broker is untouched.
+func TestProvisionSubscriberPrincipal_RefusesBeforeItsFirstWriteWhenCapacityIsSaturated(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, 6, 1)
+
+	held := make([]func(), 0, kafkaProvisioningPermits)
+
+	for i := 0; i < kafkaProvisioningPermits; i++ {
+		_, done, err := admin.admitAdminConversation(context.Background(), kafkaAdminForward)
+		require.NoError(t, err)
+
+		held = append(held, done)
+	}
+
+	defer func() {
+		for _, done := range held {
+			done()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	result, err := admin.ProvisionSubscriberPrincipal(
+		ctx, NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
+
+	require.Error(t, err, "a saturated pool must refuse rather than queue inside the broker")
+	assert.Contains(t, err.Error(), "administrative capacity is saturated",
+		"the refusal must name its cause, because the operator's remedy — retry, or provision "+
+			"fewer principals at once — follows from it")
+
+	// THE POINT OF THIS TEST.
+	assert.Zero(t, fake.totalCalls(),
+		"nothing may have reached the broker: a refusal after the credential was written is "+
+			"the orphan this bound exists to prevent")
+	assert.Empty(t, fake.scramUpsertRequests, "no credential may have been written")
+	assert.Empty(t, fake.createACLsRequests, "no binding may have been created")
+	assert.False(t, result.CredentialWritten,
+		"the result must not claim a write that did not happen")
+	assert.False(t, result.CompensationOwed,
+		"and it must not ask for a compensation there is nothing to compensate")
+}
+
+// TestCompensateProvisioning_DrawsOnItsOwnReserveWhenProvisioningIsSaturated is the
+// guard on the reserve.
+//
+// Compensation exists for the moments when provisioning is failing, and those are exactly
+// the moments when the forward pool is full. One shared pool would make the revocation of
+// an unauthorised credential queue behind the attempts to mint more of them, so the
+// mechanism meant to prevent orphans would be the mechanism creating them.
+func TestCompensateProvisioning_DrawsOnItsOwnReserveWhenProvisioningIsSaturated(t *testing.T) {
+	principal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+	require.NoError(t, err)
+
+	fake := newFakeAdminClient()
+	fake.scram[principal] = []kafka.ScramMechanism{kafka.ScramMechanismSha512}
+
+	admin := newTestKafkaAdmin(fake, 6, 1)
+
+	// Every forward permit held, which is the condition a real compensation runs under.
+	held := make([]func(), 0, kafkaProvisioningPermits)
+
+	for i := 0; i < kafkaProvisioningPermits; i++ {
+		_, done, acquireErr := admin.admitAdminConversation(context.Background(), kafkaAdminForward)
+		require.NoError(t, acquireErr)
+
+		held = append(held, done)
+	}
+
+	defer func() {
+		for _, done := range held {
+			done()
+		}
+	}()
+
+	owed := SubscriberProvisioningResult{
+		SubscriberID:      testSubscriberID,
+		Principal:         principal,
+		CredentialWritten: true,
+		CompensationOwed:  true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	require.NoError(t, admin.CompensateProvisioning(ctx, owed),
+		"the compensating reserve must be available while the forward pool is full")
+
+	assert.NotEmpty(t, fake.scramUpsertRequests,
+		"the credential must actually have been revoked; a compensation that returns nil "+
+			"without a round trip leaves the orphan in place")
+	assert.Empty(t, fake.scram[principal],
+		"and the broker must no longer hold a credential for the principal")
+}
+
+// TestProvisionSubscriberPrincipal_TreatsAnUnansweredCredentialWriteAsWritten is the
+// guard on the difference between "the call failed" and "nothing was written".
+//
+// A credential write whose reply never arrives is the ordinary shape of a deadline
+// expiring against a contended broker, and the broker may well have applied it. Recorded
+// as not-written, that principal can authenticate, is absent from the registry, and has
+// no obligation filed against it — so nothing revokes it and nothing reports it. Measured
+// on a 300-way concurrent burst before this distinction existed: 145 principals left at
+// the broker that no log line, no registry column and no settlement sweep knew about.
+func TestProvisionSubscriberPrincipal_TreatsAnUnansweredCredentialWriteAsWritten(t *testing.T) {
+	t.Run("no answer at all means the credential may exist, so it is compensated", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		// The reply is lost. The broker's own state is not modelled as changed, which is the
+		// harder case for the assertion: the compensation must be attempted on the strength of
+		// not knowing, not on the strength of observing a credential.
+		fake.transportErrors["AlterUserScramCredentials"] = context.DeadlineExceeded
+
+		admin := newTestKafkaAdmin(fake, 6, 1)
+
+		request := NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword)
+		request.DeferCompensation = true
+
+		result, err := admin.ProvisionSubscriberPrincipal(context.Background(), request)
+
+		require.Error(t, err, "the premise: the write got no answer")
+
+		assert.True(t, result.CredentialWritten,
+			"an unanswered write must be reported as possibly written; recording it as not "+
+				"written is what leaves a principal nothing afterwards can find")
+		assert.True(t, result.CompensationOwed,
+			"and the compensation must be OWED, because the obligation to revoke follows from "+
+				"the credential possibly existing rather than from it definitely existing")
+		assert.Equal(t, request.aclEntries(), result.OwedBindings,
+			"the bindings the attempt would have created must travel with the obligation, so "+
+				"the compensation removes the same shapes this attempt could have left")
+	})
+
+	t.Run("a broker that answers and refuses leaves nothing to undo", func(t *testing.T) {
+		// The one outcome that IS definitely not written. Compensating it would revoke a
+		// credential the subscriber may legitimately already hold from an earlier issuance, so
+		// the distinction has to cut both ways.
+		fake := newFakeAdminClient()
+		fake.scramUpsertError = kafka.UnsupportedSASLMechanism
+
+		admin := newTestKafkaAdmin(fake, 6, 1)
+
+		request := NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword)
+		request.DeferCompensation = true
+
+		result, err := admin.ProvisionSubscriberPrincipal(context.Background(), request)
+
+		require.Error(t, err, "the premise: the broker refused the write")
+
+		assert.False(t, result.CredentialWritten,
+			"a refusal the broker stated is a write that definitely did not happen")
+		assert.False(t, result.CompensationOwed,
+			"and there is nothing at the broker to compensate, so revoking would only be able "+
+				"to destroy a credential this attempt did not create")
+		assert.Empty(t, fake.deleteACLsRequests,
+			"no compensation round trip may have been made")
+	})
+
+	t.Run("an answer about nobody is indeterminate, not success", func(t *testing.T) {
+		// The broker replied, but about no principal this request asked about. Nothing can be
+		// concluded, so the safe reading is the same as no reply at all.
+		fake := newFakeAdminClient()
+		fake.scramUpsertNoResult = true
+
+		admin := newTestKafkaAdmin(fake, 6, 1)
+
+		request := NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword)
+		request.DeferCompensation = true
+
+		result, err := admin.ProvisionSubscriberPrincipal(context.Background(), request)
+
+		require.Error(t, err)
+		assert.True(t, result.CredentialWritten,
+			"a reply that names nobody says nothing about whether the credential exists")
+		assert.True(t, result.CompensationOwed)
+	})
+
+	t.Run("with no scheduler the unanswered write is compensated inline", func(t *testing.T) {
+		// DeferCompensation false is the inline arm: there is nowhere to defer to, so the
+		// revocation happens before the error is returned and the result says so.
+		principal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+		require.NoError(t, err)
+
+		fake := newFakeAdminClient()
+		fake.transportErrors["AlterUserScramCredentials"] = context.DeadlineExceeded
+
+		admin := newTestKafkaAdmin(fake, 6, 1)
+
+		request := NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword)
+		request.DeferCompensation = false
+
+		result, provisionErr := admin.ProvisionSubscriberPrincipal(context.Background(), request)
+		require.Error(t, provisionErr)
+
+		// The revocation is itself an AlterUserScramCredentials, and it fails for the same
+		// injected reason — so what is asserted is that it was ATTEMPTED, which is the
+		// behaviour the flag drives.
+		assert.GreaterOrEqual(t, fake.callCount("AlterUserScramCredentials"), 2,
+			"the revocation must have been attempted; %q is the principal that would otherwise "+
+				"be left able to authenticate", principal)
+		assert.False(t, result.Compensated,
+			"and a revocation that itself got no answer must not be reported as compensated")
+	})
+}
+
+// ---------------------------------------------------------------------------------------
+// The per-status census is bounded by its reuse window, not by how often it is asked for
+// ---------------------------------------------------------------------------------------
+
+// TestEventStatusCensus_CollapsesConcurrentReadersOntoOneQuery is the guard on the
+// property that fixes the measured concurrency amplification.
+//
+// The census is O(non-dispatched rows) by nature: counting open work means visiting it.
+// Measured on a 400,000-row open backlog it takes ~34ms and two parallel workers with it,
+// so sixteen concurrent readers were costing 48 database backends to answer one question
+// that has one answer. Single flight is what makes the cost independent of concurrency.
+func TestEventStatusCensus_CollapsesConcurrentReadersOntoOneQuery(t *testing.T) {
+	census := &eventStatusCensus{entries: map[string]*eventCensusEntry{}}
+
+	var loads atomic.Int64
+
+	// Held open until every reader has arrived, so the collapse is a property rather than a
+	// race that happened to go the right way.
+	admitted := make(chan struct{})
+	release := make(chan struct{})
+
+	load := func(context.Context) (map[string]int64, error) {
+		loads.Add(1)
+		close(admitted)
+		<-release
+
+		return map[string]int64{model.EventOutboxStatusPending: 7}, nil
+	}
+
+	const readers = 16
+
+	var arrived, finished sync.WaitGroup
+
+	results := make([]map[string]int64, readers)
+
+	for i := 0; i < readers; i++ {
+		arrived.Add(1)
+		finished.Add(1)
+
+		go func(slot int) {
+			defer finished.Done()
+
+			arrived.Done()
+
+			counts, _, err := census.read(context.Background(), "unresolved", load)
+			require.NoError(t, err)
+
+			results[slot] = counts
+		}(i)
+	}
+
+	arrived.Wait()
+	<-admitted
+
+	// Every reader is now either running the load or waiting on it. Give the waiters a
+	// moment to reach the rendezvous before releasing, so a second load would have had
+	// every opportunity to start.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	finished.Wait()
+
+	assert.Equal(t, int64(1), loads.Load(),
+		"sixteen concurrent readers must share ONE census; %d loads means concurrency is "+
+			"still multiplying the database work", loads.Load())
+
+	for slot, counts := range results {
+		require.NotNilf(t, counts, "reader %d must have been served", slot)
+		assert.Equal(t, int64(7), counts[model.EventOutboxStatusPending],
+			"every reader must get the same answer, including the ones that joined the load")
+	}
+
+	// AND THE COPIES ARE INDEPENDENT. A memo handed out by reference would let one reader's
+	// mutation reach the next, which is a bug that only appears under exactly the
+	// concurrency this mechanism exists for.
+	results[0][model.EventOutboxStatusPending] = 999
+
+	counts, _, err := census.read(context.Background(), "unresolved", load)
+	require.NoError(t, err)
+	assert.Equal(t, int64(7), counts[model.EventOutboxStatusPending],
+		"a caller must not be able to mutate the memo other callers are still served from")
+}
+
+// TestEventStatusCensus_ReusesWithinItsWindowAndReloadsAfterIt pins the TTL, which is
+// what bounds a high request RATE rather than a high concurrency.
+func TestEventStatusCensus_ReusesWithinItsWindowAndReloadsAfterIt(t *testing.T) {
+	clock := time.Now()
+
+	census := &eventStatusCensus{
+		entries: map[string]*eventCensusEntry{},
+		ttl:     time.Second,
+		now:     func() time.Time { return clock },
+	}
+
+	loads := 0
+	load := func(context.Context) (map[string]int64, error) {
+		loads++
+
+		return map[string]int64{model.EventOutboxStatusPending: int64(loads)}, nil
+	}
+
+	first, takenFirst, err := census.read(context.Background(), "unresolved", load)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), first[model.EventOutboxStatusPending])
+	assert.Equal(t, clock, takenFirst, "the stamp must be the instant the census ran")
+
+	// Inside the window: served from the memo, and the STAMP is the original instant rather
+	// than now, because that is what makes the reuse honest to a reader.
+	clock = clock.Add(900 * time.Millisecond)
+
+	second, takenSecond, err := census.read(context.Background(), "unresolved", load)
+	require.NoError(t, err)
+	assert.Equal(t, 1, loads, "a read inside the reuse window must not query again")
+	assert.Equal(t, int64(1), second[model.EventOutboxStatusPending])
+	assert.Equal(t, takenFirst, takenSecond,
+		"a reused census must report WHEN it was taken, not when it was served; a stamp that "+
+			"advanced would make a one-second-old count look current")
+
+	// Past the window.
+	clock = clock.Add(200 * time.Millisecond)
+
+	third, takenThird, err := census.read(context.Background(), "unresolved", load)
+	require.NoError(t, err)
+	assert.Equal(t, 2, loads, "a read past the reuse window must query again")
+	assert.Equal(t, int64(2), third[model.EventOutboxStatusPending])
+	assert.Equal(t, clock, takenThird)
+
+	// A NEGATIVE TTL DISABLES REUSE, which is what a test asserting on raw query counts
+	// needs and what the offset snapshot's TTL already means.
+	census.ttl = -time.Second
+
+	_, _, err = census.read(context.Background(), "unresolved", load)
+	require.NoError(t, err)
+	assert.Equal(t, 3, loads, "a negative window must disable reuse entirely")
+}
+
+// TestEventStatusCensus_NeverMemoisesAFailureAndPrunesWhatItCannotReuse pins the two
+// housekeeping properties, both of which are silent when wrong.
+func TestEventStatusCensus_NeverMemoisesAFailureAndPrunesWhatItCannotReuse(t *testing.T) {
+	t.Run("a failed census is not remembered", func(t *testing.T) {
+		// A memoised failure would make one unlucky query answer every reader for a whole
+		// window, and the endpoint would report an outage that had already ended.
+		census := &eventStatusCensus{entries: map[string]*eventCensusEntry{}}
+
+		failing := errors.New("the outbox could not be read")
+		loads := 0
+
+		_, _, err := census.read(context.Background(), "unresolved",
+			func(context.Context) (map[string]int64, error) {
+				loads++
+
+				return nil, failing
+			})
+		require.ErrorIs(t, err, failing)
+
+		counts, _, err := census.read(context.Background(), "unresolved",
+			func(context.Context) (map[string]int64, error) {
+				loads++
+
+				return map[string]int64{model.EventOutboxStatusPending: 4}, nil
+			})
+		require.NoError(t, err, "the next reader must load afresh rather than be served a failure")
+		assert.Equal(t, 2, loads)
+		assert.Equal(t, int64(4), counts[model.EventOutboxStatusPending])
+		assert.Empty(t, census.entries["unresolved"].err,
+			"and the settled entry must carry no error")
+	})
+
+	t.Run("expired variants are pruned rather than accumulated", func(t *testing.T) {
+		// The windowed variant's key carries an instant truncated to the reuse window, so it
+		// moves on by construction. Without pruning the map gains an entry per window forever,
+		// which is a leak that only shows up on a long-lived process.
+		clock := time.Now()
+
+		census := &eventStatusCensus{
+			entries: map[string]*eventCensusEntry{},
+			ttl:     time.Second,
+			now:     func() time.Time { return clock },
+		}
+
+		load := func(context.Context) (map[string]int64, error) {
+			return map[string]int64{model.EventOutboxStatusPending: 1}, nil
+		}
+
+		for i := 0; i < 25; i++ {
+			_, _, err := census.read(context.Background(), fmt.Sprintf("history:%d", i), load)
+			require.NoError(t, err)
+
+			clock = clock.Add(2 * time.Second)
+		}
+
+		assert.LessOrEqual(t, len(census.entries), 2,
+			"every variant but the current one must have been pruned; %d entries means the "+
+				"memo grows for the life of the process", len(census.entries))
+	})
+}
+
+// TestCensusMemoStore_ServesTheCensusThroughTheMemoAndEverythingElseLive is the guard on
+// the decorator's scope.
+//
+// Memoising more than the census would be a correctness change rather than a cost one: the
+// interval audit is the outbox side of the zero-loss reconciliation and is compared against
+// offsets read in the same request, so serving it from a moment ago would compare two
+// different instants.
+func TestCensusMemoStore_ServesTheCensusThroughTheMemoAndEverythingElseLive(t *testing.T) {
+	store := &statsFakeStore{
+		counts:  map[string]int64{model.EventOutboxStatusPending: 5},
+		handoff: map[string]int64{},
+	}
+
+	memo := &censusMemoStore{
+		eventStatisticsStore: store,
+		census:               &eventStatusCensus{entries: map[string]*eventCensusEntry{}},
+	}
+
+	for i := 0; i < 4; i++ {
+		counts, err := memo.CountUnresolvedEventOutbox(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, int64(5), counts[model.EventOutboxStatusPending])
+	}
+
+	assert.Equal(t, 1, store.unresolvedCalls,
+		"four reads inside one window must cost one census")
+
+	for i := 0; i < 4; i++ {
+		_, err := memo.AuditEventRecordsInIntervals(context.Background(), nil)
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 4, store.auditCalls,
+		"the interval audit must stay LIVE: it is compared against offsets read in the same "+
+			"request, so a memoised audit would compare two different instants")
+
+	// And the stamp is what the statistics report as GeneratedAt.
+	assert.False(t, memo.LastCensusAt().IsZero(),
+		"the decorator must report when the census it served was taken")
+	assert.False(t, memo.LastCensusAt().After(time.Now()),
+		"and never an instant in the future")
+}
+
+// TestEventOutboxStatistics_ReportsWhenTheCountsWereReadRatherThanWhenItAnswered pins
+// GeneratedAt's meaning, which the memo makes observable.
+func TestEventOutboxStatistics_ReportsWhenTheCountsWereReadRatherThanWhenItAnswered(t *testing.T) {
+	store := &statsFakeStore{
+		counts:  map[string]int64{model.EventOutboxStatusPending: 2},
+		handoff: map[string]int64{},
+	}
+
+	taken := time.Now().Add(-750 * time.Millisecond)
+
+	memo := &censusMemoStore{
+		eventStatisticsStore: store,
+		census: &eventStatusCensus{
+			entries: map[string]*eventCensusEntry{},
+			now:     func() time.Time { return taken },
+		},
+	}
+
+	offsetCalls := 0
+
+	statistics, err := eventOutboxStatistics(context.Background(), memo,
+		statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), EventOffsetsSkipped, 0)
+	require.NoError(t, err)
+
+	assert.WithinDuration(t, taken.UTC(), statistics.GeneratedAt, 5*time.Millisecond,
+		"GeneratedAt is documented as when the outbox side was READ, so a reused census must "+
+			"report its own instant; reporting the assembly instant would make a second-old "+
+			"count indistinguishable from a live one")
+
+	// A store that always reads live is unchanged: no stamper, so the wall clock stands.
+	plain, err := eventOutboxStatistics(context.Background(), store,
+		statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), EventOffsetsSkipped, 0)
+	require.NoError(t, err)
+
+	assert.WithinDuration(t, time.Now().UTC(), plain.GeneratedAt, time.Second,
+		"a live store must still report the wall clock")
 }

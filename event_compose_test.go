@@ -1172,8 +1172,10 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 		// whose logic was inverted, and the whole value of this file is its exit status.
 		manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
 
-		refuse := exec.Command(script, manifests)
-		refuse.Env = append(os.Environ(), "NO_COLOR=1")
+		// --skip-secrets, and an environment with no cluster in it, because the subject here
+		// is the IMAGE gate. See hermeticPreflightEnv for what inheriting the ambient one did.
+		refuse := exec.Command(script, "--skip-secrets", manifests)
+		refuse.Env = hermeticPreflightEnv(t)
 		refusedOutput, refuseErr := refuse.CombinedOutput()
 
 		require.Errorf(t, refuseErr,
@@ -1195,8 +1197,8 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 		const fakeDigest = "ghcr.io/blnkfinance/blnk@sha256:" +
 			"1111111111111111111111111111111111111111111111111111111111111111"
 
-		accept := exec.Command(script, "--render", rendered, manifests)
-		accept.Env = append(os.Environ(), "NO_COLOR=1", "BLNK_IMAGE="+fakeDigest)
+		accept := exec.Command(script, "--skip-secrets", "--render", rendered, manifests)
+		accept.Env = hermeticPreflightEnv(t, "BLNK_IMAGE="+fakeDigest)
 		acceptedOutput, acceptErr := accept.CombinedOutput()
 
 		require.NoErrorf(t, acceptErr,
@@ -1245,7 +1247,7 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 		// for the wrong key, or stopped at the first entry of an env list, would agree with
 		// itself and disagree here.
 		list := exec.Command(script, "--list-secrets", manifests)
-		list.Env = append(os.Environ(), "NO_COLOR=1")
+		list.Env = hermeticPreflightEnv(t)
 		listed, listErr := list.CombinedOutput()
 		require.NoErrorf(t, listErr,
 			"scripts/k8s-preflight.sh --list-secrets must exit 0 and contact no cluster; it is the "+
@@ -1276,6 +1278,150 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 				"key that nothing consumes sends an operator to create something unused; the reverse "+
 				"is the ContainerCreating failure this check exists for. Reported: %v. Required: %v",
 			len(reported), len(required), reported, required)
+	})
+
+	// The Secret check's own behaviour, against a cluster THIS TEST OWNS.
+	//
+	// The check asks a question only a cluster can answer, and that is exactly why its
+	// verdict may never be read out of the ambient one: the subtests above used to inherit
+	// the pod's in-cluster ServiceAccount, so `kubectl` reached a real API server and a
+	// Secret some unrelated process had created decided whether a MANIFEST-HARDENING test
+	// passed. The same commit then passed and failed according to external state, which is
+	// the one property a unit test may not have.
+	//
+	// So the cluster is stubbed instead of excluded. Excluding it would leave the branch
+	// that produced the flake — the reachable-cluster path, lines the script only runs when
+	// a namespace answers — permanently unexecuted, and it is the branch an operator's
+	// pre-apply run actually takes. A stub makes each arm a decision the test states.
+	t.Run("the Secret check reports on the cluster it is given and never on the manifests' images", func(t *testing.T) {
+		script := filepath.Join(root, "scripts", "k8s-preflight.sh")
+		manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
+
+		required := manifestSecretKeyRefs(t, manifests)
+		require.NotEmpty(t, required,
+			"the manifests must reference at least one Secret key, or every arm below is vacuous")
+
+		// FIRST, the property the arms below rely on and the one whose absence produced the
+		// original defect: nothing in the invocation environment can reach a cluster. Asserted
+		// directly rather than inferred, because a revert to os.Environ() would leave every
+		// stubbed arm still passing while the image gate silently became non-hermetic again.
+		t.Run("the invocation environment carries no cluster of its own", func(t *testing.T) {
+			for _, entry := range hermeticPreflightEnv(t) {
+				name, value, _ := strings.Cut(entry, "=")
+
+				assert.NotContainsf(t, name, "KUBERNETES_",
+					"%s reaches the child, and inside a pod that name plus the projected "+
+						"ServiceAccount token is a usable API server: the Secret check would then "+
+						"report on whatever cluster this happens to run in", name)
+
+				if name != "KUBECONFIG" {
+					continue
+				}
+
+				require.NotEmpty(t, value,
+					"an empty KUBECONFIG is read as unset, and kubectl then falls back to "+
+						"~/.kube/config — the other cluster this is excluding")
+				_, statErr := os.Stat(value)
+				assert.Truef(t, os.IsNotExist(statErr),
+					"KUBECONFIG must name a path that does not exist; %q resolves to something "+
+						"kubectl could use (stat: %v)", value, statErr)
+			}
+		})
+
+		// The key that gets withheld, and the Secret that gets withdrawn. Both are read from
+		// the manifests rather than named here, so this test cannot drift from them.
+		withheld := required[0]
+		withheldSecret, withheldKey, found := strings.Cut(withheld, "/")
+		require.Truef(t, found, "manifestSecretKeyRefs must report SECRET/KEY pairs; got %q", withheld)
+
+		for _, arm := range []struct {
+			name string
+			// keys is the SECRET/KEY inventory the stubbed cluster holds.
+			keys []string
+			// namespaceExit is what the stub answers `get namespace` with: 0 reachable.
+			namespaceExit string
+			// absent is a Secret the stub reports as non-existent.
+			absent string
+			// arguments are appended to the invocation.
+			arguments []string
+			refused   bool
+			// expect is text the output must carry, so a right verdict for a wrong reason
+			// still fails.
+			expect string
+		}{
+			{
+				name:          "an unreachable cluster is a warning, because the image checks must still run in CI",
+				keys:          required,
+				namespaceExit: "1",
+				expect:        "Secret check NOT RUN",
+			},
+			{
+				name:          "--require-secrets turns that warning into a refusal, for the run that is about to apply",
+				keys:          required,
+				namespaceExit: "1",
+				arguments:     []string{"--require-secrets"},
+				refused:       true,
+				expect:        "the Secret check could not run",
+			},
+			{
+				name:          "every referenced key present is a pass",
+				keys:          required,
+				namespaceExit: "0",
+				expect:        "verified present in namespace",
+			},
+			{
+				name:          "a Secret carrying the wrong key name is refused, which is the failure that survives an apply",
+				keys:          required[1:],
+				namespaceExit: "0",
+				refused:       true,
+				expect:        "carries no key " + withheldKey,
+			},
+			{
+				name:          "a Secret that does not exist at all is refused and named",
+				keys:          required,
+				namespaceExit: "0",
+				absent:        withheldSecret,
+				refused:       true,
+				expect:        "Secret " + withheldSecret + " does not exist",
+			},
+		} {
+			t.Run(arm.name, func(t *testing.T) {
+				stub := preflightKubectlStub(t, arm.keys)
+
+				// A resolved image, so the ONLY thing that can decide the verdict is the Secret
+				// check. The digest is syntactically valid and refers to nothing; no registry is
+				// ever contacted.
+				const fakeDigest = "ghcr.io/blnkfinance/blnk@sha256:" +
+					"2222222222222222222222222222222222222222222222222222222222222222"
+
+				arguments := append([]string{"--render", filepath.Join(t.TempDir(), "rendered")}, arm.arguments...)
+				arguments = append(arguments, manifests)
+
+				command := exec.Command(script, arguments...)
+				command.Env = hermeticPreflightEnv(t,
+					"BLNK_IMAGE="+fakeDigest,
+					"PATH="+stub.directory+string(os.PathListSeparator)+os.Getenv("PATH"),
+					"STUB_NAMESPACE_EXIT="+arm.namespaceExit,
+					"STUB_SECRET_KEYS="+stub.inventory,
+					"STUB_ABSENT_SECRET="+arm.absent,
+				)
+
+				output, runErr := command.CombinedOutput()
+
+				if arm.refused {
+					require.Errorf(t, runErr,
+						"the preflight must refuse this cluster.\n--- output ---\n%s", output)
+				} else {
+					require.NoErrorf(t, runErr,
+						"the preflight must accept this cluster; the image is resolved and the Secret "+
+							"check is the only remaining judgement.\n--- output ---\n%s", output)
+				}
+
+				assert.Containsf(t, string(output), arm.expect,
+					"the outcome must be attributable: an operator needs the reason, not only the "+
+						"exit status.\n--- output ---\n%s", output)
+			})
+		}
 	})
 
 	// A SHAPE assertion on the one manifest that can silently corrupt a metadata log.
@@ -2319,6 +2465,154 @@ func manifestSecretKeyRefs(t *testing.T, directory string) []string {
 
 	return pairs
 }
+
+// hermeticPreflightEnv is the environment every scripts/k8s-preflight.sh invocation in
+// this file runs with, and it exists because inheriting the ambient one made a
+// manifest-hardening test's verdict a property of the world outside the repository.
+//
+// The script's Secret check is the part that reaches out: it runs `kubectl get namespace`
+// and, when that answers, enumerates each Secret's keys. Inside a pod, `kubectl` needs no
+// kubeconfig to do that — KUBERNETES_SERVICE_HOST/PORT name the API server and the
+// projected ServiceAccount token authenticates to it — so a test that forwarded
+// os.Environ() was handed a live cluster it never asked for. One that had a `blnk`
+// namespace whose Secrets were created by unrelated work then failed the image gate,
+// deterministically, on a tree with nothing wrong in it.
+//
+// Both names are therefore removed rather than overridden, and KUBECONFIG is pointed at a
+// path that cannot exist. An EMPTY KUBECONFIG would not do: kubectl reads empty as
+// "unset" and falls back to ~/.kube/config, which is the other cluster this is excluding.
+//
+// Parameters:
+//   - t *testing.T: the test, for the temporary directory the absent kubeconfig names.
+//   - extra ...string: further KEY=VALUE entries. Appended last, so they override — os/exec
+//     resolves a duplicated name to its final occurrence.
+//
+// Returns:
+//   - []string: the child environment, with NO_COLOR set so assertions match plain text.
+func hermeticPreflightEnv(t *testing.T, extra ...string) []string {
+	t.Helper()
+
+	ambient := os.Environ()
+	env := make([]string, 0, len(ambient)+len(extra)+2)
+
+	for _, entry := range ambient {
+		name, _, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+
+		if strings.HasPrefix(name, "KUBERNETES_") || name == "KUBECONFIG" {
+			continue
+		}
+
+		env = append(env, entry)
+	}
+
+	env = append(env,
+		"NO_COLOR=1",
+		"KUBECONFIG="+filepath.Join(t.TempDir(), "no-such-kubeconfig"),
+	)
+
+	return append(env, extra...)
+}
+
+// preflightKubectlStubPaths is where preflightKubectlStub put the two files it wrote.
+type preflightKubectlStubPaths struct {
+	// directory holds the stub executable, for prepending to PATH.
+	directory string
+	// inventory is the "SECRET<TAB>KEY" file the stub answers from.
+	inventory string
+}
+
+// preflightKubectlStub writes a `kubectl` the test owns, and the Secret inventory it
+// answers from.
+//
+// The stub covers exactly the two calls scripts/k8s-preflight.sh makes — `get namespace`
+// to decide reachability, and `get secret NAME -o go-template=…` to list one Secret's
+// keys — and takes its answers from the environment, so one executable serves every arm.
+// It contacts nothing and needs no cluster.
+//
+// Parameters:
+//   - t *testing.T: the test, for the temporary directory and write failures.
+//   - keys []string: the "SECRET/KEY" pairs the stubbed cluster holds. Pairs are written
+//     tab-separated because a Secret name never contains a tab and a key never contains
+//     one either, so the stub can split on it without quoting rules.
+//
+// Returns:
+//   - preflightKubectlStubPaths: the directory to prepend to PATH and the inventory file.
+func preflightKubectlStub(t *testing.T, keys []string) preflightKubectlStubPaths {
+	t.Helper()
+
+	directory := t.TempDir()
+
+	inventory := filepath.Join(directory, "secret-keys.tsv")
+	lines := make([]string, 0, len(keys))
+	for _, pair := range keys {
+		secret, key, found := strings.Cut(pair, "/")
+		require.Truef(t, found, "the stub inventory takes SECRET/KEY pairs; got %q", pair)
+		lines = append(lines, secret+"\t"+key)
+	}
+	require.NoError(t, os.WriteFile(inventory, []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+
+	// 0o755 rather than 0o700: the script invokes it through PATH, and a mode that depends
+	// on the runner's umask is the kind of difference that makes a test pass on one host.
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "kubectl"),
+		[]byte(preflightKubectlStubScript), 0o755))
+
+	return preflightKubectlStubPaths{directory: directory, inventory: inventory}
+}
+
+// preflightKubectlStubScript is the stub's body.
+//
+// The argument scan is positional rather than a getopts contract because it only has to
+// recognise two shapes, and both are literal in the script under test: the word
+// `namespace` decides one, and the word after `secret` is the name being read.
+const preflightKubectlStubScript = `#!/usr/bin/env bash
+# A kubectl the test owns. Answers are supplied through the environment:
+#
+#   STUB_NAMESPACE_EXIT  exit status for 'get namespace' — 0 reachable, non-zero not
+#   STUB_SECRET_KEYS     file of "SECRET<TAB>KEY" lines the cluster is pretending to hold
+#   STUB_ABSENT_SECRET   a Secret name to report as non-existent
+set -u
+
+subject=''
+secret=''
+previous=''
+
+for argument in "$@"; do
+    if [ "${previous}" = 'secret' ]; then
+        secret="${argument}"
+    fi
+
+    case "${argument}" in
+        namespace) subject='namespace' ;;
+        secret) subject='secret' ;;
+    esac
+
+    previous="${argument}"
+done
+
+case "${subject}" in
+    namespace)
+        exit "${STUB_NAMESPACE_EXIT:-0}"
+        ;;
+    secret)
+        # An unreachable cluster cannot answer this either; the script never asks, and
+        # answering anyway would hide a wrong call order.
+        [ "${STUB_NAMESPACE_EXIT:-0}" -eq 0 ] || exit 1
+        [ -n "${STUB_ABSENT_SECRET:-}" ] && [ "${secret}" = "${STUB_ABSENT_SECRET}" ] && exit 1
+
+        while IFS="$(printf '\t')" read -r name key; do
+            [ "${name}" = "${secret}" ] || continue
+            printf '%s\n' "${key}"
+        done < "${STUB_SECRET_KEYS:-/dev/null}"
+
+        exit 0
+        ;;
+esac
+
+exit 0
+`
 
 // collectSecretKeyRefs walks a decoded YAML document and records every secretKeyRef it
 // carries as "name/key".

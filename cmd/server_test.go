@@ -739,7 +739,7 @@ func TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers(t *t
 }
 
 // TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath is the guard on
-// the single call that stands between thirteen alert rules and no series at all.
+// the single call that stands between fifteen alert rules and no series at all.
 //
 // The event pipeline's three gauges have exactly one production maintainer, the
 // collector in event_metrics.go.

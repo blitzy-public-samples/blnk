@@ -941,11 +941,38 @@ func scanDeadLetterInventoryEntry(s eventOutboxScanner) (model.DeadLetterInvento
 
 // oldestDeadLetterAgeByTopicQuery reports the oldest outstanding entry per dead-letter
 // topic as ONE grouped aggregate.
+//
+// THE AGE ANCHOR DEPENDS ON WHETHER THE ROW HAS REACHED A TOPIC, and it has to, because
+// the two states are cleared by different actors and only one of them can be trusted to
+// leave a timestamp alone.
+//
+//   - A row that HAS been preserved (dlt_topic set) is measured from last_attempted_at:
+//     the moment it was given up on, and therefore the moment it started waiting for a
+//     human. Nothing touches that column again — the claim statements that do all
+//     require dlt_topic IS NULL — so the clock runs.
+//
+//   - A row that is still OWED its dead-letter write (dlt_topic NULL) is measured from
+//     first_attempted_at instead. The repair pass re-claims exactly these rows on every
+//     poll tick and stamps last_attempted_at = NOW() as it does, so anchoring them there
+//     RESET THE CLOCK ON EVERY ATTEMPT: the age of a row nothing could preserve stayed
+//     pinned at a few tens of seconds, DeadLetterMessageStuck could never fire for it,
+//     and the one class of event that exists in no Kafka topic at all was the one class
+//     the alert was blind to. first_attempted_at is stamped once
+//     (COALESCE(first_attempted_at, NOW())) and never rewritten, so the debt ages
+//     monotonically and the process failing to discharge it cannot hide it.
+//
+// occurred_at remains the fallback in both arms, so a row with no attempt timestamp at
+// all still ages — from something older, which errs toward reporting a problem.
 const oldestDeadLetterAgeByTopicQuery = `
 		SELECT
 			COALESCE(NULLIF(dlt_topic, ''), topic || $3) AS age_topic,
-			MIN(COALESCE(last_attempted_at, occurred_at)) AS oldest,
-			COUNT(*)                                     AS outstanding
+			MIN(
+				CASE
+					WHEN NULLIF(dlt_topic, '') IS NULL THEN COALESCE(first_attempted_at, occurred_at)
+					ELSE COALESCE(last_attempted_at, occurred_at)
+				END
+			)        AS oldest,
+			COUNT(*) AS outstanding
 		FROM blnk.event_outbox
 		WHERE status IN ($1, $2)
 		GROUP BY age_topic

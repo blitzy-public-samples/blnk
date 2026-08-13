@@ -150,16 +150,37 @@ func TestPartitionKeyContract_ProductionCallSitesKeyOnTheLedger(t *testing.T) {
 		assert.Equal(t, "bulk_f04", key)
 	})
 
-	t.Run("system.error keys on the event type, giving the error stream a total order", func(t *testing.T) {
+	t.Run("system.error keys on the event itself, so the error stream spreads", func(t *testing.T) {
 		// blnk.go's registered sender supplies no ledger option, and system.error has no
-		// aggregate of any kind. Falling back to the event type puts the whole stream on one
-		// partition, which is what an error stream wants.
-		key := preparedKey(t, instance, NewWebhook{
+		// aggregate of any kind, so the key falls back to the event's own id.
+		//
+		// IT USED TO FALL BACK TO THE EVENT TYPE, which put the whole stream on one partition
+		// and read as a virtue — a total order over the errors. It was a per-category
+		// throughput ceiling: one key is claimed by one relay instance and published one
+		// message at a time, measured at 1.00 event per second while errors arrived far
+		// faster, until the backlog was 59% of the whole outbox. Two unrelated internal
+		// errors have no causal order, so nothing was lost that a consumer could have used;
+		// occurred_at carries time order.
+		//
+		// Asserted as two DISTINCT keys rather than against a literal, because the property
+		// that matters is the spread: one key per event, so the partition count is the only
+		// thing bounding this stream's parallelism.
+		first := preparedKey(t, instance, NewWebhook{
 			Event:   model.EventTypeSystemError,
 			Payload: map[string]interface{}{"error": "something failed", "time": time.Now().UTC()},
 		})
+		second := preparedKey(t, instance, NewWebhook{
+			Event:   model.EventTypeSystemError,
+			Payload: map[string]interface{}{"error": "something else failed", "time": time.Now().UTC()},
+		})
 
-		assert.Equal(t, model.EventTypeSystemError, key)
+		assert.NotEqual(t, model.EventTypeSystemError, first,
+			"the event TYPE must not be the key: it is the same string for every error, so it "+
+				"pins the whole category to one partition and one publisher")
+		assert.NotEmpty(t, first, "an event with no aggregate must still be keyed")
+		assert.NotEqual(t, first, second,
+			"two error events must carry DIFFERENT keys, or they share a partition and the "+
+				"category's throughput is bounded by a single ordered stream")
 	})
 }
 
@@ -401,7 +422,11 @@ func TestPartitionKeyContract_DocumentationMatchesTheProducers(t *testing.T) {
 		dimensionKeyword := map[model.EventKeyDimension]string{
 			model.EventKeyDimensionLedger:    "ledger",
 			model.EventKeyDimensionAggregate: "id",
-			model.EventKeyDimensionEventType: "event type",
+			// "event id", not "event type": the type-wide key was replaced by a per-event one so
+			// that an aggregate-less stream spreads across partitions instead of serialising onto
+			// one, and the published table has to say which of the two a subscriber gets — the
+			// difference is whether it may size a consumer group above one.
+			model.EventKeyDimensionEvent: "event id",
 		}
 
 		for eventType, dimension := range model.EventKeyDimensionsByType() {

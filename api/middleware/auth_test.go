@@ -13,6 +13,7 @@ import (
 	"github.com/blnkfinance/blnk/database"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func setupBlnk() (*blnk.Blnk, error) {
@@ -719,6 +720,117 @@ func TestExtractKey(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+// TestMasterKeyRequest_ResolvesTheCredentialWhenNothingElseDecided covers the gate the
+// privileged management surfaces read.
+//
+// Authenticate sets "isMasterKey" only on the path where it recognises the master key, and
+// with SECURE MODE OFF it returns before comparing anything at all — authentication is
+// disabled, so every route is open and nothing sets the value. Reading the value alone
+// therefore refused the master key on that configuration, which is how the whole /events
+// and /subscribers surface came to answer 403 AUTH_MASTER_KEY_REQUIRED on the shipped
+// Compose default: the dead-letter triage and daily reconciliation runbooks are operated
+// entirely through those endpoints, and neither could be run against a local stack.
+//
+// Both directions are asserted, because the value of the fix is that it changed exactly one
+// of them. A caller presenting the configured master key must pass; a caller presenting
+// nothing, the wrong key, or arriving at a deployment with no master key configured must
+// still be refused — the fallback can only ever agree with the comparison Authenticate
+// itself would have made.
+func TestMasterKeyRequest_ResolvesTheCredentialWhenNothingElseDecided(t *testing.T) {
+	const masterKey = "master-key-for-the-gate-test"
+
+	// MockConfig runs the same validation the real loader does, so the required DSNs have to
+	// be present or the configuration is refused and the previous test's config stays in the
+	// store — which would make every assertion below read a value this test did not set.
+	mockServer := func(t *testing.T, secure bool, secret string) {
+		t.Helper()
+
+		config.MockConfig(&config.Configuration{
+			Redis:      config.RedisConfig{Dns: "localhost:6379"},
+			DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
+			Server:     config.ServerConfig{Secure: secure, SecretKey: secret},
+		})
+
+		conf, err := config.Fetch()
+		require.NoError(t, err, "the mocked configuration must be readable")
+		require.Equal(t, secret, conf.Server.SecretKey,
+			"the mocked master key must have reached the config store, or this test asserts against "+
+				"another test's configuration")
+	}
+
+	newRequest := func(t *testing.T, header string) *gin.Context {
+		t.Helper()
+
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodGet, "/events/stats", nil)
+		if header != "" {
+			c.Request.Header.Set(KeyHeader, header)
+		}
+
+		return c
+	}
+
+	t.Run("the middleware's decision is authoritative wherever it made one", func(t *testing.T) {
+		// Both arms, because the flag has to keep deciding in BOTH directions: an API-key caller
+		// the middleware refused must stay refused even while holding a key that is not the
+		// master one, and a master caller must not be re-checked.
+		mockServer(t, true, masterKey)
+
+		granted := newRequest(t, "")
+		granted.Set("isMasterKey", true)
+		assert.True(t, MasterKeyRequest(granted),
+			"a request the middleware recognised must pass without presenting the header again")
+
+		refused := newRequest(t, masterKey)
+		refused.Set("isMasterKey", false)
+		assert.False(t, MasterKeyRequest(refused),
+			"an explicit false must not be overridden by the fallback; a middleware that has "+
+				"already decided is the authority, and every handler test sets this value directly")
+	})
+
+	t.Run("with secure mode off the presented master key is recognised", func(t *testing.T) {
+		// THE DEFECT. Nothing sets the context value on this path, so before the fallback this
+		// returned false and the management surface refused its own documented credential.
+		mockServer(t, false, masterKey)
+
+		assert.True(t, MasterKeyRequest(newRequest(t, masterKey)),
+			"the credential the runbooks name must work on the configuration the project ships")
+	})
+
+	t.Run("it stays fail-closed for everything else", func(t *testing.T) {
+		mockServer(t, false, masterKey)
+
+		assert.False(t, MasterKeyRequest(newRequest(t, "")),
+			"no header is no credential: insecure mode opens the ordinary routes, it does not open "+
+				"the privileged ones")
+		assert.False(t, MasterKeyRequest(newRequest(t, "not-the-master-key")),
+			"a wrong key must be refused, or the gate would be decoration")
+		assert.False(t, MasterKeyRequest(newRequest(t, masterKey+"-suffixed")),
+			"a key with the master key as a PREFIX must be refused; the comparison is on the whole "+
+				"value and is constant time")
+
+		t.Run("and when no master key is configured at all", func(t *testing.T) {
+			// An unconfigured secret must never match. Comparing against "" would make every
+			// caller — including one presenting an empty header — a master caller.
+			mockServer(t, false, "")
+
+			assert.False(t, MasterKeyRequest(newRequest(t, masterKey)))
+			assert.False(t, MasterKeyRequest(newRequest(t, "")))
+		})
+	})
+
+	t.Run("a nil context or a context with no request is not a master key request", func(t *testing.T) {
+		// This runs inside request handlers, and a panic in an authorization gate would be a
+		// denial of service on the surface it protects.
+		mockServer(t, false, masterKey)
+
+		assert.False(t, MasterKeyRequest(nil))
+
+		bare, _ := gin.CreateTestContext(httptest.NewRecorder())
+		assert.False(t, MasterKeyRequest(bare))
+	})
 }
 
 func TestHasPermission(t *testing.T) {

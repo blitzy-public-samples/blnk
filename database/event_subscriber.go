@@ -486,7 +486,12 @@ func fencedWriteMissError(subscriberID string, miss subscriberFenceMiss) error {
 				"under a fresh claim", id))
 
 	case subscriberFenceMissRevocationPending:
-		return apierror.NewAPIError(apierror.ErrConflict,
+		// THE SAME TYPED CODE THE SERVICE-LEVEL GUARD RAISES. This is that guard's condition
+		// arriving a moment later — the tombstone landed between the read and the write — and a
+		// caller that branched on SUBSCRIBER_DEPROVISIONING would otherwise see a bare
+		// GEN_CONFLICT for the identical state purely because of WHEN it was noticed. The
+		// remedy is the same either way: complete or reverse the deregistration, then retry.
+		return apierror.NewAPIError(apierror.ErrSubscriberDeprovisioning,
 			"This subscriber is being deregistered, so its access model can no longer be changed",
 			fmt.Errorf("event subscriber: subscriber %q carries a revocation tombstone, so its "+
 				"authorization is frozen; complete or reverse its deregistration first", id))

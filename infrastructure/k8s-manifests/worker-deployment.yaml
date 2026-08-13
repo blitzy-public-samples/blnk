@@ -69,6 +69,26 @@ spec:
             - --config
             - /blnk.json
           env:
+            # THE HEAP'S KNOWLEDGE OF ITS OWN CONTAINER. Go's collector sizes the heap
+            # against GOGC alone unless told otherwise, so it does not know a cgroup limit
+            # exists: it grows until the kernel OOM-kills the container, and the pod
+            # restarts mid-backlog with no panic, no log line and nothing on the process to
+            # explain it. GOMEMLIMIT makes the limit below a GC target rather than a
+            # discovery.
+            #
+            # 672MiB against a 768Mi limit leaves ~96MiB for everything the Go heap is not:
+            # the runtime's own stacks and metadata, the SQL and Kafka drivers' buffers, and
+            # the OS pages the binary itself occupies. It is a SOFT limit, so the collector
+            # works harder as it is approached rather than failing an allocation — which is
+            # the behaviour wanted here, because the alternative to a slower relay is a
+            # killed one.
+            #
+            # Measured before choosing it: draining a 500,000-row backlog holds RSS at a
+            # 90MiB plateau with the in-use heap under 21MiB, so this ceiling is roughly
+            # five times the observed working set and exists for the pathological case
+            # rather than the ordinary one.
+            - name: GOMEMLIMIT
+              value: 672MiB
             # ---------------------------------------------------------------------
             # AUTHENTICATION AND THE MONITORING SURFACE.
             - name: BLNK_SERVER_SECURE
@@ -167,6 +187,26 @@ spec:
             # decision rather than drift. It is recorded on this side too, because a
             # manifest is read one workload at a time and an unexplained omission reads
             # as an oversight to whoever is comparing them.
+            # THE SWITCH THAT MAKES /metrics EXIST ON THIS ROLE, and it is not a
+            # verbosity setting. cmd/workers.go registers the monitoring listener's
+            # metrics handler only when the OpenTelemetry SDK was set up, and the SDK is
+            # set up only when this is true — so with it false there is no /metrics route
+            # here at all, every scrape of this pod returns 404, and no series this role
+            # records is ever exported.
+            #
+            # WHAT THAT COSTS, QUANTIFIED, and the asymmetry with the server decides how
+            # a DOWN target here should be read: all 15 rules in
+            # alerts/blnk-kafka-alerts.yml evaluate series recorded by Blnk, and a rule
+            # over a series nothing exports cannot fire and looks exactly like a healthy
+            # system. What this variable does NOT do is disarm the event-streaming rules:
+            # every one of those 15 rules reads series the SERVER publishes — the relay
+            # and its metrics collector run in the server role only, which is why
+            # EventMetricsCollectionAbsent is scoped to job="blnk-server" — so they keep
+            # evaluating whatever this role does. The cost of leaving it false here is the
+            # pre-existing transaction, queue and worker-retry families, which disappear
+            # with it, and — because prometheus.yml scrapes this pod as a separate job — a
+            # permanently red blnk-worker target beside them that trains an operator to
+            # ignore exactly the panel a genuinely absent server target would appear on.
             - name: BLNK_ENABLE_OBSERVABILITY
               valueFrom:
                 configMapKeyRef:

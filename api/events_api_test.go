@@ -1379,10 +1379,16 @@ func newEventsAPIOverMockDatasource(
 
 	cnf, err := config.Fetch()
 	require.NoError(t, err, "the mocked configuration must load")
-	require.True(t, cnf.Server.Secure,
-		"secure mode must survive validateAndAddDefaults, or the authentication middleware "+
-			"returns before it consults the resource map and the authorization tests below "+
-			"pass vacuously")
+	// THE CALLER'S OWN POSTURE MUST SURVIVE validateAndAddDefaults, whichever it asked for.
+	// Asserted rather than assumed in both directions: with secure mode on, a value silently
+	// defaulted back to false would make the authentication middleware return before it
+	// consults the resource map and every authorization assertion below would pass vacuously;
+	// with it deliberately off — the posture docker-compose.yaml ships, and the one
+	// TestEventsAPI_IsOperableWithSecureModeOff covers — a value defaulted back to true would
+	// mean that test never exercised the path it exists for.
+	require.Equal(t, cfg.Server.Secure, cnf.Server.Secure,
+		"the mocked secure-mode posture must survive validateAndAddDefaults; the harness and the "+
+			"middleware would otherwise disagree about which authentication path is under test")
 	// THE DEFAULT POSTURE IS NO BROKER, and it is asserted rather than assumed: it is what
 	// makes a replay answer EVENT_KAFKA_UNAVAILABLE deterministically and it is the
 	// graceful-degradation deployment the listing and statistics routes must work in.
@@ -1798,6 +1804,81 @@ func TestEnsureEventManagementAuthorized_AdmitsTheMasterKeyAndRefusesEveryoneEls
 			assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
 		})
 	}
+}
+
+// TestEventsAPI_IsOperableWithSecureModeOff is the reachability guard on the
+// configuration the project SHIPS.
+//
+// docker-compose.yaml sets no BLNK_SERVER_SECURE, so a local stack runs with secure mode
+// off — and on that configuration the auth middleware returns before comparing any
+// credential, because authentication is disabled. Nothing then sets the "isMasterKey"
+// context value, so the gate, which read only that value, refused every caller INCLUDING
+// the master key: all three of these endpoints answered 403 AUTH_MASTER_KEY_REQUIRED with
+// the correct key presented.
+//
+// That made two published procedures unexecutable rather than merely awkward. The
+// dead-letter triage runbook and the daily outbox-versus-offset reconciliation in
+// docs/kafka-operations.md are operated ENTIRELY through this surface, and an operator
+// following either on a shipped local stack could not complete a single step of it.
+//
+// The refusal must survive for a caller that presents nothing, which is the other half of
+// the same assertion: insecure mode opens the ordinary routes, and it must not open the
+// privileged ones.
+func TestEventsAPI_IsOperableWithSecureModeOff(t *testing.T) {
+	insecure := func(cfg *config.Configuration) {
+		cfg.Server.Secure = false
+	}
+
+	t.Run("the master key reaches the handler", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, insecure)
+		// The DEFAULT reading's aggregate, which is the one an operator following either runbook
+		// takes: no include_offsets, so the unresolved inventory is counted exactly and the
+		// dispatched history is not scanned at all.
+		ds.On("CountUnresolvedEventOutbox", mock.Anything).
+			Return(eventsStatsUnresolvedCounts(), nil).Once()
+		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/stats", eventsMockMasterKey)
+
+		require.Equal(t, http.StatusOK, recorder.Code,
+			"THE FINDING: with secure mode off this answered 403 AUTH_MASTER_KEY_REQUIRED for the "+
+				"very credential docs/kafka-operations.md tells an operator to use. body: %s",
+			recorder.Body.String())
+
+		// REACHED THE HANDLER, not merely passed the gate: the repository call is what proves the
+		// request was served rather than short-circuited into an empty 200.
+		ds.AssertCalled(t, "CountUnresolvedEventOutbox", mock.Anything)
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("and a caller with no credential is still refused", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, insecure)
+
+		for _, route := range eventsAPIRoutes {
+			t.Run(route.name, func(t *testing.T) {
+				recorder := eventsKeyedRequest(t, router, route.method, route.path, "")
+
+				assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+			})
+		}
+
+		assert.Empty(t, eventsRepositoryCallsExcludingAuth(ds),
+			"a refused request must never reach the repository, whatever secure mode is set to; "+
+				"it reached %v", eventsRepositoryCallsExcludingAuth(ds))
+	})
+
+	t.Run("and a caller presenting the wrong key is still refused", func(t *testing.T) {
+		router, _ := setupEventsRouter(t, insecure)
+
+		// A key that is not the master key and is not an issued API key either. With secure mode
+		// off the middleware does not look it up at all, so the gate is the only thing that can
+		// refuse it — which is exactly the path the fallback comparison runs on.
+		recorder := eventsKeyedRequest(t, router,
+			http.MethodGet, "/events/stats", eventsMockMasterKey+"-not-really")
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+	})
 }
 
 // eventsDeadLetterEntry builds one inventory entry with every field populated.

@@ -118,13 +118,26 @@ func resolveAttempt(req PublishRequest) int {
 	return req.Attempt
 }
 
-// normalizeBrokers cleans a configured broker list.
+// normalizeBrokers cleans a configured broker list: it trims each address, drops the blanks,
+// and drops repeats, keeping the order of first appearance.
+//
+// It matches config.normalizeBrokers deliberately, because the two answer the same question
+// for the same value at different layers, and a bootstrap list is a SET of discovery seeds:
+// the same address named twice is one broker, and counting it twice is what made
+// `broker_count=3` appear in this package's start-up line for a single-broker stack.
 func normalizeBrokers(brokers []string) []string {
+	seen := make(map[string]struct{}, len(brokers))
 	normalized := make([]string, 0, len(brokers))
 	for _, broker := range brokers {
-		if trimmed := strings.TrimSpace(broker); trimmed != "" {
-			normalized = append(normalized, trimmed)
+		trimmed := strings.TrimSpace(broker)
+		if trimmed == "" {
+			continue
 		}
+		if _, already := seen[trimmed]; already {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
 	}
 
 	return normalized
@@ -244,6 +257,73 @@ func recordCaptureToDispatch(ctx context.Context, result PublishResult) {
 		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
 		attribute.String(publishAttrAttempt, attemptLabel(result.Purpose, result.Attempt)),
 	))
+}
+
+// Claim outcome labels. They partition every claim the relay issues into four states, and
+// the partition is exhaustive on purpose: an operator adding the four series together must
+// get the claim count, or a state has gone unrecorded.
+const (
+	// claimOutcomeRows is a claim that returned work.
+	claimOutcomeRows = "rows"
+	// claimOutcomeEmpty is a claim that found nothing claimable, which is the normal
+	// steady state of a drained outbox and is what distinguishes an IDLE relay from a
+	// stopped one.
+	claimOutcomeEmpty = "empty"
+	// claimOutcomeError is a claim the repository rejected or the driver failed.
+	claimOutcomeError = "error"
+	// claimOutcomeTimeout is a claim cancelled by its own budget — the state that used to
+	// be invisible, because a statement that never returns produces no error to log.
+	claimOutcomeTimeout = "timeout"
+)
+
+// recordEventClaim records the outcome, duration and size of ONE outbox claim.
+//
+// It is called on EVERY claim, including the ones that fail, because the reading that
+// matters most is taken while claims are going wrong: the duration climbs before any
+// throughput counter falls, which makes it the leading indicator of a relay whose claim has
+// outgrown its indexes.
+//
+// Parameters:
+//   - ctx context.Context: the recording context.
+//   - elapsed time.Duration: how long the claim took, measured across the repository call.
+//   - claimed int: how many rows it returned.
+//   - err error: the claim's error, or nil.
+//   - budgetExpired bool: whether the claim's own deadline had passed, which is what
+//     separates a timed-out claim from a rejected one.
+func recordEventClaim(ctx context.Context, elapsed time.Duration, claimed int, err error, budgetExpired bool) {
+	// Observability is optional throughout this pipeline, and a claim must not fail because
+	// the instruments were never created. Guarded on the counter alone: Init assigns all
+	// three together or returns, so one being present means all are.
+	if metrics.EventRelayClaimsTotal == nil {
+		return
+	}
+
+	outcome := claimOutcomeRows
+
+	switch {
+	case err != nil && budgetExpired:
+		outcome = claimOutcomeTimeout
+	case err != nil:
+		outcome = claimOutcomeError
+	case claimed == 0:
+		outcome = claimOutcomeEmpty
+	}
+
+	attributes := otelmetric.WithAttributes(attribute.String(publishAttrOutcome, outcome))
+
+	metrics.EventRelayClaimsTotal.Add(ctx, 1, attributes)
+
+	if elapsed >= 0 {
+		metrics.EventRelayClaimDuration.Record(ctx, elapsed.Seconds(), attributes)
+	}
+
+	if claimed > 0 {
+		// Rows and claims are counted separately rather than one being derived from the
+		// other, because their RATIO is the diagnosis: 100 rows per claim is a relay working
+		// at its batch size, and one row per claim is a relay paying a claim's cost for every
+		// event.
+		metrics.EventRelayClaimedRows.Add(ctx, int64(claimed), attributes)
+	}
 }
 
 // kafkaLogger adapts kafka-go's logging hook to logrus, so that anything the client has

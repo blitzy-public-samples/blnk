@@ -212,6 +212,64 @@ func TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree(t *testing.T) {
 	})
 }
 
+// TestListDeadLetterEvents_RefusesAFilterCarryingANulByte closes the last filter value
+// this endpoint answered an INTERNAL error for.
+//
+// A PostgreSQL text value cannot hold a NUL byte in any encoding, so a filter carrying
+// one aborts the query with SQLSTATE 22021 and the repository reports a driver failure —
+// which surfaced as 500 GEN_INTERNAL. The value came from the caller, so that is the
+// wrong class of answer twice over: it tells an operator triaging a dead-letter backlog
+// that Blnk is broken, and it is the one refusal on this endpoint that did not match the
+// four beside it (`limit`, `cursor`, `status` and the occurrence bounds all answer 400).
+func TestListDeadLetterEvents_RefusesAFilterCarryingANulByte(t *testing.T) {
+	router := deadLetterTestRouter(t, true)
+
+	// %00 is the encoded NUL. Both spellings of the topic filter are covered because they
+	// collapse into ONE service-level filter, and the refusal must still name the
+	// parameter the caller actually sent.
+	for _, parameter := range []string{"event_type", "topic", "dlt_topic"} {
+		t.Run(parameter, func(t *testing.T) {
+			for _, suffix := range []string{"", "&include_count=true"} {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet,
+					"/events/dead-letter?"+parameter+"=a%00b"+suffix, nil)
+				router.ServeHTTP(recorder, request)
+
+				require.Equal(t, http.StatusBadRequest, recorder.Code,
+					"a malformed filter value is a client error; 500 sends an operator looking for "+
+						"a fault in Blnk. body: %s", recorder.Body.String())
+				assert.Equal(t, string(apierror.ErrGenValidation),
+					deadLetterErrorCode(t, recorder.Body.Bytes()),
+					"and the typed validation code, which is what a caller branches on")
+				assert.Contains(t, recorder.Body.String(), parameter,
+					"the refusal must name the parameter it could not honour, or an operator cannot "+
+						"tell which of eight filters was rejected")
+
+				// THE VALUE IS NOT ECHOED. It is unvalidated caller input carrying a control byte,
+				// and a response that repeats it hands a log aggregator or a terminal whatever else
+				// was wrapped around the NUL.
+				assert.NotContains(t, recorder.Body.String(), "\x00",
+					"the refusal must not echo the NUL byte back")
+			}
+		})
+	}
+
+	t.Run("a legitimate value on the same filter is still honoured", func(t *testing.T) {
+		for _, query := range []string{
+			"event_type=transaction.applied",
+			"topic=blnk.transactions",
+			"dlt_topic=blnk.transactions.dlt",
+		} {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/events/dead-letter?"+query, nil)
+			router.ServeHTTP(recorder, request)
+
+			assert.NotEqual(t, http.StatusBadRequest, recorder.Code,
+				"the guard must reject the NUL byte and nothing else: %s", recorder.Body.String())
+		}
+	})
+}
+
 // deadLetterErrorCode reads error_detail.code from a refusal.
 //
 // The CODE and not the status is what these tests assert on, for the reason spelled out

@@ -106,6 +106,23 @@ var EventCaptureToDispatchDuration metric.Float64Histogram
 // dead-letter rate is a fraction of.
 var EventsDeadLetteredTotal metric.Int64Counter
 
+// EventRelayClaimsTotal counts the relay's outbox CLAIMS by outcome — rows, empty, error
+// or timeout — and EventRelayClaimDuration records how long each one took.
+//
+// THIS PAIR EXISTS BECAUSE A RELAY THAT HAS STOPPED CLAIMING LOOKS EXACTLY LIKE A RELAY
+// WITH NOTHING TO DO. Every other instrument in this file is fed by a publish: they all
+// read zero whether the relay is idle, wedged inside a claim, or dead. A claim that ran for
+// 504 seconds without returning was observed producing no log line, no error and no counter
+// movement, and the only way to see it was a goroutine dump. These two move on the claim
+// itself, so an idle relay reads as a rising `empty` count with a millisecond duration,
+// while a struggling one reads as a duration climbing into seconds and, past the relay's
+// claim budget, as a rising `timeout` count.
+var (
+	EventRelayClaimsTotal   metric.Int64Counter
+	EventRelayClaimDuration metric.Float64Histogram
+	EventRelayClaimedRows   metric.Int64Counter
+)
+
 // EVERY GAUGE BELOW is maintained by ONE production caller, the periodic
 // EventMetricsCollector in event_metrics.go, and by nothing else — the dead-letter age,
 // the consumer-lag pair and its coverage gauges, the outbox backlog, the registry size,
@@ -116,11 +133,18 @@ var EventsDeadLetteredTotal metric.Int64Counter
 // DLTOldestMessageAgeSeconds is the age, in seconds, of the oldest UNRESOLVED
 // dead-letter entry destined for each dead-letter topic. Alerting fires above 900s.
 //
-// MEASURED FROM last_attempted_at, the moment the event was given up on and therefore the
-// moment it started waiting. There is no dead_lettered_at column; when last_attempted_at
-// is absent the row's occurred_at is used instead, which is older and so errs toward
-// reporting a problem rather than hiding one. The authoritative implementation is
-// RefreshDeadLetterAgeGauge.
+// THE ANCHOR DEPENDS ON WHETHER THE ENTRY REACHED ITS TOPIC, because only one of the two
+// states has a timestamp nothing rewrites. An entry that has been preserved on its
+// `<topic>.dlt` sibling is MEASURED FROM last_attempted_at, the moment the event was
+// given up on and therefore the moment it started waiting for a human. An entry whose
+// dead-letter write is still OWED is measured from first_attempted_at, because the repair
+// pass re-claims exactly those rows every poll tick and stamps last_attempted_at as it
+// does — anchoring them there let the process failing to preserve an event reset that
+// event's own triage clock, so the entries that exist in no Kafka topic at all were the
+// ones this gauge could not age. There is no dead_lettered_at column; when neither
+// attempt timestamp is present the row's occurred_at is used instead, which is older and
+// so errs toward reporting a problem rather than hiding one. The authoritative
+// implementation is RefreshDeadLetterAgeGauge.
 var DLTOldestMessageAgeSeconds metric.Float64Gauge
 
 // SubscriberConsumerLag is how many messages a subscriber's consumer group trails the
@@ -285,6 +309,17 @@ const (
 	// and no unreadable partitions, so the subscriber looks measured and the gap it leaves
 	// is silent.
 	SubscribersUnmeasuredReasonTopicMissing = "topic_missing"
+
+	// SubscribersUnmeasuredReasonBrokerUnconfigured is a registry row on a deployment with
+	// no KAFKA_BROKERS at all. There is no broker to difference offsets against, so nothing
+	// about the row can be measured however healthy it is.
+	//
+	// IT NEEDS ITS OWN REASON BECAUSE EVERY OTHER ONE MISDIRECTS. These rows were reported
+	// under `budget`, whose documented remedy is to raise the measurement budget — the one
+	// action that cannot possibly help, since no amount of budget produces an offset from a
+	// broker that was never configured. The remedy here is to configure KAFKA_BROKERS or to
+	// remove registry rows the deployment is not using.
+	SubscribersUnmeasuredReasonBrokerUnconfigured = "broker_unconfigured"
 )
 
 // SubscriberUnmeasuredReasons returns every value of SubscribersUnmeasured's reason
@@ -299,6 +334,7 @@ func SubscriberUnmeasuredReasons() []string {
 		SubscribersUnmeasuredReasonMeasureFailed,
 		SubscribersUnmeasuredReasonRegistryFailed,
 		SubscribersUnmeasuredReasonTopicMissing,
+		SubscribersUnmeasuredReasonBrokerUnconfigured,
 	}
 }
 
@@ -453,8 +489,35 @@ var EventPublishDurationBuckets = []float64{
 
 // EventCaptureToDispatchDurationBuckets are the explicit bucket boundaries, in SECONDS,
 // of EventCaptureToDispatchDuration.
+//
+// THE BOUNDARIES ABOVE 300 SECONDS ARE NOT DECORATION. This histogram answers the
+// acceptance question "is the p99 age of a first-attempt publish under 2 seconds", and a
+// quantile can only be interpolated inside a finite bucket: everything past the largest
+// boundary lands in (largest, +Inf] and reports AS the largest boundary. When the top
+// boundary was 300, a backlog whose true p50, p95 and p99 were all minutes past it read as
+// exactly 300.0000 s across the board — a floor pretending to be a measurement, and one
+// that would keep reading 300 whether the real answer was five minutes or five hours.
+//
+// The tail is coarse on purpose. A breach of a 2-second objective does not need resolution
+// past its order of magnitude; it needs to be a NUMBER, distinguishable from the next
+// number, so an operator can tell a slow drain from a stalled one and see recovery move.
+// The boundaries below 31 seconds are unchanged, so every reading that was previously
+// interpolable still interpolates identically.
 var EventCaptureToDispatchDurationBuckets = []float64{
 	0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 20, 31, 60, 300,
+	900, 1800, 3600, 21600, 86400,
+}
+
+// EventRelayClaimDurationBuckets are the explicit bucket boundaries, in SECONDS, of
+// EventRelayClaimDuration.
+//
+// The lower end is sub-millisecond because a healthy claim IS sub-millisecond to
+// single-digit-millisecond: it reads two bounded windows of the claim-order index, walks a
+// bounded number of keys, and updates at most one batch of rows. The upper end runs past
+// the relay's claim budget so a claim that is cancelled at the budget still lands in a
+// finite bucket rather than in the overflow.
+var EventRelayClaimDurationBuckets = []float64{
+	0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30,
 }
 
 // Init creates all metric instruments. It should be called once during application
@@ -659,8 +722,37 @@ func Init() error {
 		return err
 	}
 
+	EventRelayClaimsTotal, err = meter.Int64Counter("blnk.events.relay.claims.total",
+		metric.WithDescription("Total number of event outbox claims the relay issued, by outcome: rows, empty, error or timeout"),
+		metric.WithUnit("{claim}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventRelayClaimDuration, err = meter.Float64Histogram("blnk.events.relay.claim.duration",
+		metric.WithDescription("Duration of one event outbox claim, by outcome"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(EventRelayClaimDurationBuckets...),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventRelayClaimedRows, err = meter.Int64Counter("blnk.events.relay.claimed_rows.total",
+		metric.WithDescription("Total number of outbox rows the relay's claims returned, so claim size is comparable with claim count"),
+		metric.WithUnit("{row}"),
+	)
+	if err != nil {
+		return err
+	}
+
 	DLTOldestMessageAgeSeconds, err = meter.Float64Gauge("blnk.dlt.oldest_message_age_seconds",
-		metric.WithDescription("Seconds the oldest unresolved dead-letter entry has been waiting, over rows in the failed or dead_lettered state, measured from the last publish attempt"),
+		metric.WithDescription(
+			"Seconds the oldest unresolved dead-letter entry has been waiting, over rows in the failed or "+
+				"dead_lettered state, measured from the last publish attempt once the entry is preserved on "+
+				"its dead-letter topic and from the first attempt while that write is still owed",
+		),
 		metric.WithUnit("s"),
 	)
 	if err != nil {

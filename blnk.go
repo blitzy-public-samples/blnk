@@ -69,6 +69,14 @@ type Blnk struct {
 	// background tracks compensating work scheduled off a response path.
 	background sync.WaitGroup
 
+	// censusOnce builds eventCensus on first use, so a Blnk assembled as a struct literal
+	// is as bounded as one NewBlnk returned.
+	censusOnce sync.Once
+
+	// eventCensus memoises the outbox's per-status census, so its cost is bounded by the
+	// reuse window rather than by how often the statistics are asked for.
+	eventCensus *eventStatusCensus
+
 	// legacyWebhookNow is the clock ProcessWebhook evaluates the webhook sunset against.
 	legacyWebhookNow func() time.Time
 }

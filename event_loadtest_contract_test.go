@@ -667,7 +667,11 @@ func TestLoadTestDeadLetterNumerator_IsASameWindowDelta(t *testing.T) {
 	numerator := stripLineComments(scriptRegion(t,
 		source,
 		"  // --- The dead-letter numerator and its provenance, resolved BEFORE the arithmetic",
-		"  // THE DIVISOR IS THE LOAD INTERVAL",
+		// The region terminator, and it moved when the divisor was corrected: the whole-run
+		// mean now divides by the MEASURED WINDOW so its numerator and denominator describe
+		// the same interval. See the divisor comment in the scenario for the 2.2x
+		// overstatement dividing by the load interval produced.
+		"  // THE DIVISOR IS THE MEASURED WINDOW",
 	))
 
 	assert.Containsf(t, numerator,
@@ -767,7 +771,9 @@ func TestLoadTestAcceptance_RequiresAnIsolatedInstance(t *testing.T) {
 	sound := stripLineComments(scriptRegion(t,
 		source,
 		"  var measurementSound =",
-		"  if (measurementSound && published.code !== SERIES_CODE_ABSENT",
+		// The FULL condition, because the offered-load figure is recorded by a second gate
+		// whose first clause is identical; a prefix anchor now matches both.
+		"  if (measurementSound && published.code !== SERIES_CODE_ABSENT && measuredWindow > 0) {",
 	))
 	assert.Containsf(t, sound, "isolationHeld",
 		"%s: no verdict gauge may be recorded for a population that is not this run's — an "+

@@ -194,9 +194,23 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
   # THE TEMPORARY DESTINATIONS, defined beside the real ones so every writer below agrees on
   # them. k6 writes here and the paths are promoted only after a zero exit; see the artifact
   # lifecycle note further down.
+  #
+  # THE RUN MARKER IS A PREFIX ON THE BASENAME RATHER THAN A SUFFIX ON THE PATH, and for the
+  # raw stream that is load-bearing rather than cosmetic: k6's `--out json` decides whether to
+  # gzip from the DESTINATION'S EXTENSION. A temporary named
+  # `run-event-streaming.ndjson.gz.partial.4242-1700000000` ends in `.4242-1700000000`, so k6
+  # writes it uncompressed — and promoting that file onto the `.gz` name the operator asked for
+  # publishes plain NDJSON under an extension that says otherwise, which `gzip -t`, `zcat` and
+  # every reader keying off the name reject. Verified on this toolchain: `--out json=o.gz`
+  # produces gzip, `--out json=o.gz.partial.123` produces plain text, and
+  # `--out json=.partial.123.o.gz` produces gzip again. Prefixing keeps the extension the
+  # operator chose intact, so the choice keeps its effect.
+  #
+  # The marker still spells `.partial.`, which is what the artifact-integrity tests scan the
+  # directory for, and the leading dot keeps an in-flight run out of a bare `ls`.
   events_run_id="$$-$(date +%s)"
-  EVENTS_SUMMARY_TMP="${EVENTS_SUMMARY_OUT}.partial.${events_run_id}"
-  EVENTS_NDJSON_TMP="${EVENTS_NDJSON_OUT}.partial.${events_run_id}"
+  EVENTS_SUMMARY_TMP="$(dirname -- "${EVENTS_SUMMARY_OUT}")/.partial.${events_run_id}.$(basename -- "${EVENTS_SUMMARY_OUT}")"
+  EVENTS_NDJSON_TMP="$(dirname -- "${EVENTS_NDJSON_OUT}")/.partial.${events_run_id}.$(basename -- "${EVENTS_NDJSON_OUT}")"
 
   # THIS ARRAY CARRIES NO CREDENTIAL VALUE, and that is a deliberate property to
   # preserve Every value appended to it is non-sensitive — endpoints, the scenario name,
@@ -358,7 +372,14 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
   # twice as many balances in a database with no delete endpoint for either.
   # ISOLATED_INSTANCE and its relaxations are here because the acceptance run refuses to
   # measure a shared deployment.
-  for setting in RATE DURATION VUS MAX_VUS LEDGER_SPREAD TARGET_EVENTS_PER_SEC \
+  #
+  # OFFER_MODE is here because it decides what the run's numbers are ABOUT. The default,
+  # "transactions", offers the faithful end-to-end path and is bounded by the asynq worker's
+  # apply rate — measured at 66.1 events/sec against 487.4 requests/sec accepted, so the
+  # 500-events/sec target cannot be presented to the relay through it. "ledgers" offers one
+  # ledger.created per request, captured inside the request, and is the mode V-1 and V-3 are
+  # demonstrable in.
+  for setting in RATE DURATION VUS MAX_VUS LEDGER_SPREAD TARGET_EVENTS_PER_SEC OFFER_MODE \
     MAX_DEAD_LETTER_RATIO MAX_P99_PUBLISH_SECONDS REQUIRE_METRICS \
     LEDGER_PAIRS ALLOW_FIXTURE_CREATION MIN_LEDGER_SPREAD SMOKE \
     ISOLATED_INSTANCE REQUIRE_ISOLATION ISOLATION_PROBE_SECONDS \
@@ -396,8 +417,52 @@ if [[ "${CASE_NAME}" == "event-streaming" ]]; then
     exit 1
   fi
 
+  # AN OFFER MODE THE SCENARIO WOULD REFUSE IS REFUSED HERE, so a typo costs a line rather
+  # than a k6 start-up.
+  case "${OFFER_MODE:-transactions}" in
+  transactions | ledgers) ;;
+  *)
+    echo "error: OFFER_MODE must be 'transactions' or 'ledgers'; got '${OFFER_MODE}'." >&2
+    echo "       transactions  the faithful end-to-end path. The transaction is applied by the" >&2
+    echo "                     asynq worker and the outbox row is written at apply time, so the" >&2
+    echo "                     rate offered to the relay is the worker's APPLY rate: measured at" >&2
+    echo "                     66.1 events/sec while the API accepted 487.4 requests/sec." >&2
+    echo "       ledgers       one ledger.created per request, captured INSIDE the request, so" >&2
+    echo "                     the rate offered to the outbox is the rate k6 achieves. This is" >&2
+    echo "                     the mode a 500-events/sec target is presentable in. It measures" >&2
+    echo "                     the outbox and the relay, and says nothing about the transaction" >&2
+    echo "                     pipeline." >&2
+    exit 1
+    ;;
+  esac
+
+  # LEDGERS MODE CREATES FAR MORE THAN A FIXTURE POOL, so it gets its own acknowledgement
+  # and a count the operator can actually weigh. One ledger per request at the offered rate
+  # for the whole duration, none of which Blnk can delete.
+  if [[ "${OFFER_MODE:-transactions}" == "ledgers" ]] &&
+    [[ "${ALLOW_FIXTURE_CREATION:-0}" != "1" ]] &&
+    [[ "${SMOKE:-0}" != "1" ]]; then
+    echo "error: OFFER_MODE=ledgers creates ONE PERMANENT LEDGER PER REQUEST — about" >&2
+    echo "       \$((RATE)) per second for the whole run, and Blnk has no DELETE endpoint for a" >&2
+    echo "       ledger, so every later run and benchmark sees all of them. At the defaults" >&2
+    echo "       (RATE=${RATE:-600}, DURATION=${DURATION:-30m}) that is on the order of a million rows." >&2
+    echo "" >&2
+    echo "       Point it at a disposable or per-run database and acknowledge it:" >&2
+    echo "         ALLOW_FIXTURE_CREATION=1 OFFER_MODE=ledgers bash tests/loadtest/run_case.sh events" >&2
+    echo "" >&2
+    echo "       Or SMOKE=1 for a shakeout whose numbers are not quoted." >&2
+    exit 1
+  fi
+
   # A FIXTURE DECISION IS REFUSED HERE RATHER THAN IN setup.
+  #
+  # The balance-pair pool is the TRANSACTION path's spread mechanism, so it is not
+  # provisioned in ledgers mode and there is nothing to acknowledge for it there — the
+  # per-request ledgers are covered by their own gate above.
   events_spread="${LEDGER_SPREAD:-128}"
+  if [[ "${OFFER_MODE:-transactions}" == "ledgers" ]]; then
+    events_spread=0
+  fi
   if [[ "${events_spread}" =~ ^[0-9]+$ ]] && ((events_spread > 0)) &&
     [[ -z "${LEDGER_PAIRS:-}" ]] &&
     [[ "${ALLOW_FIXTURE_CREATION:-0}" != "1" ]] &&

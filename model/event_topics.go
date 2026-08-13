@@ -373,10 +373,29 @@ const (
 	// carries its own ledger-keyed transaction event.
 	EventKeyDimensionAggregate EventKeyDimension = "aggregate"
 
-	// EventKeyDimensionEventType is declared for event types with no aggregate of any
-	// kind. Keying on the type gives the stream a single partition and therefore a total
-	// order, which is what an error stream wants.
-	EventKeyDimensionEventType EventKeyDimension = "event_type"
+	// EventKeyDimensionEvent is declared for event types with no aggregate of any kind, and
+	// it means the key is THE EVENT'S OWN ID: every such event gets a distinct key and
+	// therefore spreads across the topic's partitions.
+	//
+	// IT REPLACED A TYPE-WIDE KEY, and the replacement is the whole point. Keying on the
+	// event TYPE put every event of that type on one partition, which reads as a virtue —
+	// a total order over the stream — and is in practice a per-category throughput
+	// ceiling that no amount of horizontal scaling can raise: one key is claimed by one
+	// relay instance and published by one goroutine, one message at a time. A production
+	// run measured that ceiling at 1.00 event per second while errors arrived far faster,
+	// and the resulting backlog reached 307,787 rows — 59% of the whole outbox — where it
+	// also became the oldest population every other key had to be claimed around.
+	//
+	// The total order it bought was not worth that, because it was not a MEANINGFUL order.
+	// These events share no aggregate: two unrelated internal errors have no causal
+	// relationship, so nothing about their relative position on a partition tells a
+	// consumer anything it could act on. A consumer that wants them in time order sorts by
+	// occurred_at, which is on the envelope and is the only ordering that was ever real.
+	//
+	// What a subscriber loses, stated plainly: events of these types arrive INTERLEAVED
+	// across partitions and in no mutual order. What every other event type promises is
+	// unchanged — a per-event key is used only where there is no aggregate to key on.
+	EventKeyDimensionEvent EventKeyDimension = "event"
 )
 
 // eventKeyDimensions declares the key dimension of every catalogued event type.
@@ -392,7 +411,7 @@ var eventKeyDimensions = map[string]EventKeyDimension{
 	"balance.monitor":       EventKeyDimensionLedger,
 	"ledger.created":        EventKeyDimensionLedger,
 	"identity.created":      EventKeyDimensionAggregate,
-	"system.error":          EventKeyDimensionEventType,
+	"system.error":          EventKeyDimensionEvent,
 }
 
 // KeyDimensionForEventType returns the declared key dimension of an event type.

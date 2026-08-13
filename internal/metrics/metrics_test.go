@@ -150,6 +150,9 @@ func eventStreamingInstruments() []namedInstrument {
 		{"EventPublishAttemptsTotal", EventPublishAttemptsTotal},
 		{"EventPublishDuration", EventPublishDuration},
 		{"EventCaptureToDispatchDuration", EventCaptureToDispatchDuration},
+		{"EventRelayClaimsTotal", EventRelayClaimsTotal},
+		{"EventRelayClaimDuration", EventRelayClaimDuration},
+		{"EventRelayClaimedRows", EventRelayClaimedRows},
 		{"EventsDeadLetteredTotal", EventsDeadLetteredTotal},
 		{"DLTOldestMessageAgeSeconds", DLTOldestMessageAgeSeconds},
 		{"SubscriberConsumerLag", SubscriberConsumerLag},
@@ -280,6 +283,16 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 		{"EventPublishAttemptsTotal", EventPublishAttemptsTotal, (*metric.Int64Counter)(nil)},
 		{"EventPublishDuration", EventPublishDuration, (*metric.Float64Histogram)(nil)},
 		{"EventCaptureToDispatchDuration", EventCaptureToDispatchDuration, (*metric.Float64Histogram)(nil)},
+		{"EventRelayClaimsTotal", EventRelayClaimsTotal, (*metric.Int64Counter)(nil)},
+		{"EventRelayClaimDuration", EventRelayClaimDuration, (*metric.Float64Histogram)(nil)},
+		{
+			// A COUNTER beside the claim counter above, because the ratio of the two is the
+			// reading: rows per claim. A gauge of "rows in the last claim" would answer a
+			// different and much less useful question.
+			"EventRelayClaimedRows",
+			EventRelayClaimedRows,
+			(*metric.Int64Counter)(nil),
+		},
 		{"EventsDeadLetteredTotal", EventsDeadLetteredTotal, (*metric.Int64Counter)(nil)},
 		{"DLTOldestMessageAgeSeconds", DLTOldestMessageAgeSeconds, (*metric.Float64Gauge)(nil)},
 		{"SubscriberConsumerLag", SubscriberConsumerLag, (*metric.Int64ObservableGauge)(nil)},
@@ -853,6 +866,18 @@ func recordEveryEventInstrument(ctx context.Context) {
 		attribute.String("topic", "blnk.transactions"),
 		attribute.String("attempt", "1"),
 	))
+	// The three claim instruments carry ONE attribute between them — the claim's outcome —
+	// and no topic or event type, because a claim is issued against the outbox as a whole
+	// and belongs to no single event.
+	EventRelayClaimsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", "rows"),
+	))
+	EventRelayClaimDuration.Record(ctx, 0.0012, metric.WithAttributes(
+		attribute.String("outcome", "rows"),
+	))
+	EventRelayClaimedRows.Add(ctx, 100, metric.WithAttributes(
+		attribute.String("outcome", "rows"),
+	))
 	EventsDeadLetteredTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("topic", "blnk.transactions"),
 		attribute.String("event_type", "transaction.applied"),
@@ -1018,14 +1043,45 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			description: "End-to-end age of a published event, from its capture in the transactional outbox to broker acknowledgement",
 		},
 		{
+			// PER CLAIM, not per row, and recorded on EVERY claim including the empty ones —
+			// which is what makes a stopped relay distinguishable from an idle one.
+			name:        "blnk.events.relay.claims.total",
+			unit:        "{claim}",
+			description: "Total number of event outbox claims the relay issued, by outcome: rows, empty, error or timeout",
+		},
+		{
+			// THE LEADING INDICATOR of a claim whose cost has grown with the backlog: it rises
+			// long before any throughput counter falls, because a slow claim still returns rows.
+			name:        "blnk.events.relay.claim.duration",
+			unit:        "s",
+			description: "Duration of one event outbox claim, by outcome",
+		},
+		{
+			// UNIT {row}, against {claim} above, and the pairing is the point: their quotient is
+			// rows per claim, which is the reading that separates a relay working at its batch
+			// size from one paying a whole claim per event.
+			name:        "blnk.events.relay.claimed_rows.total",
+			unit:        "{row}",
+			description: "Total number of outbox rows the relay's claims returned, so claim size is comparable with claim count",
+		},
+		{
 			name:        "blnk.events.dead_lettered.total",
 			unit:        "{event}",
 			description: "Total number of events dead-lettered after retry exhaustion by topic and event type",
 		},
 		{
-			name:        "blnk.dlt.oldest_message_age_seconds",
-			unit:        "s",
-			description: "Seconds the oldest unresolved dead-letter entry has been waiting, over rows in the failed or dead_lettered state, measured from the last publish attempt",
+			name: "blnk.dlt.oldest_message_age_seconds",
+			unit: "s",
+			// THE ANCHOR IS PART OF THE DESCRIPTION, and it has to be: the two populations this
+			// gauge covers are measured from different timestamps, and an operator reading the
+			// exposition needs to know which — a `failed` entry's age is the age of its whole
+			// retry-and-preserve debt, while a preserved entry's is how long it has waited for
+			// triage. The repair pass rewrites last_attempted_at on every tick for exactly the
+			// rows whose dead-letter write is still owed, so anchoring those there reported them
+			// as seconds old however long they had been stranded.
+			description: "Seconds the oldest unresolved dead-letter entry has been waiting, over rows in the failed or " +
+				"dead_lettered state, measured from the last publish attempt once the entry is preserved on " +
+				"its dead-letter topic and from the first attempt while that write is still owed",
 		},
 		{
 			name:        "blnk.kafka.consumer_lag",
@@ -1305,6 +1361,27 @@ func TestEventCaptureToDispatchDuration_BracketsTheTargetAndKeepsABacklogOnScale
 		"a backlogged pipeline must stay on the scale: without a long edge, one minute behind and five "+
 			"are indistinguishable in +Inf")
 
+	// THE BREACH MUST REPORT A NUMBER, NOT A FLOOR, and this is the assertion that pins it.
+	//
+	// A quantile is interpolable only INSIDE a finite bucket; a rank that falls past the
+	// largest boundary is reported AS that boundary. With 300 as the top edge, a run whose
+	// true p50, p95 and p99 were all minutes past it read as exactly 300.0000 across the
+	// board — the same value whether the real answer was five minutes or five hours, which
+	// is a floor pretending to be a measurement and is unusable for deciding whether a
+	// recovery is progressing.
+	//
+	// An hour is the threshold asserted rather than the exact tail, so the boundaries above
+	// can be re-spaced without failing here, while the property — the scale reaches far
+	// enough past the objective for a breach to be a distinguishable number — cannot be
+	// removed. Coarse resolution up there is correct: a breach of a two-second objective
+	// needs its order of magnitude, not its milliseconds.
+	require.NotEmpty(t, point.Bounds)
+	assert.GreaterOrEqual(t, point.Bounds[len(point.Bounds)-1], float64(3600),
+		"the top finite boundary is %v, so any age past it is reported as that boundary. A breach of "+
+			"the two-second objective must come back as a NUMBER an operator can watch move, and a "+
+			"scale that stops minutes past the target cannot tell a slow drain from a stalled one",
+		point.Bounds[len(point.Bounds)-1])
+
 	// 1.75s must fall in the bucket ending at 2s: the cheapest possible proof that the
 	// boundaries are seconds and that the target edge is where the target is.
 	require.Len(t, point.BucketCounts, len(point.Bounds)+1, "bucket counts must be boundaries+1")
@@ -1350,6 +1427,14 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// No outcome: only an acknowledged publish has an end-to-end age to report, so the
 		// attribute would carry one value on every series and add nothing.
 		{metric: "blnk.events.capture_to_dispatch.duration", keys: []string{"topic", "attempt"}},
+		// The three CLAIM instruments carry `outcome` and nothing else. No topic and no event
+		// type: a claim is issued against the outbox as a whole, so it belongs to no topic and
+		// to no event — attributing it to one would invent a dimension the measurement does
+		// not have. `outcome` is closed at four values (rows, empty, error, timeout), and it is
+		// necessary because a timed-out claim and a rejected one need different remedies.
+		{metric: "blnk.events.relay.claims.total", keys: []string{"outcome"}},
+		{metric: "blnk.events.relay.claim.duration", keys: []string{"outcome"}},
+		{metric: "blnk.events.relay.claimed_rows.total", keys: []string{"outcome"}},
 		{metric: "blnk.events.dead_lettered.total", keys: []string{"topic", "event_type"}},
 		{metric: "blnk.dlt.oldest_message_age_seconds", keys: []string{"topic"}},
 		{metric: "blnk.kafka.consumer_lag", keys: []string{"subscriber", "group", "topic"}},
@@ -1572,9 +1657,10 @@ func TestEventPublishTelemetry_LabelDomainsStayClosed(t *testing.T) {
 // the one attribute an alert's REMEDIATION branches on.
 //
 // SubscriberLagCoverageIncomplete does not tell an operator to go and investigate; it
-// names each reason and gives each its own action, because the five mean five different
-// faults in five different places — the budget, the registry row, the broker, the
-// registry query and the topic provisioning.
+// names each reason and gives each its own action, because the six mean six different
+// faults in six different places — the budget, the registry row, the broker, the
+// registry query, the topic provisioning, and a deployment that configured no broker at
+// all.
 //
 // A reason ADDED here and not added to the remediation leaves an operator holding a
 // series with a reason the runbook does not explain.
@@ -1589,6 +1675,11 @@ func TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary(t *testing
 		SubscribersUnmeasuredReasonMeasureFailed,
 		SubscribersUnmeasuredReasonRegistryFailed,
 		SubscribersUnmeasuredReasonTopicMissing,
+		// THE REASON A DEPLOYMENT WITH NO BROKER GETS ITS OWN VALUE. Those rows were counted
+		// under `budget`, whose documented remedy is to raise the measurement budget — which
+		// cannot produce an offset from a broker that was never configured, so the one series an
+		// operator was told to act on named the one action that could not help.
+		SubscribersUnmeasuredReasonBrokerUnconfigured,
 	}, reasons,
 		"the reason domain is a published contract: SubscriberLagCoverageIncomplete's remediation "+
 			"branches on every one of these values, so adding or renaming one without updating that "+

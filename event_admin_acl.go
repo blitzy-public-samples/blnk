@@ -478,6 +478,15 @@ func (a *KafkaAdminClient) PruneSubscriberAccess(
 
 	report := SubscriberACLReconciliation{Principal: principal, Desired: len(desired)}
 
+	// Compensating class: pruning REMOVES access, and narrowing a boundary must not wait
+	// behind the queue of requests trying to widen one.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminCompensating)
+	if err != nil {
+		return report, err
+	}
+
+	defer releasePermit()
+
 	observed, err := a.describeSubscriberACLs(ctx, principal)
 	if err != nil {
 		return report, err
@@ -578,6 +587,15 @@ func (a *KafkaAdminClient) GrantSubscriberAccess(
 
 		return report, nil
 	}
+
+	// Forward class: granting widens access, so it draws on the same bounded pool as
+	// provisioning and leaves the compensating reserve untouched.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminForward)
+	if err != nil {
+		return report, err
+	}
+
+	defer releasePermit()
 
 	observed, err := a.describeSubscriberACLs(ctx, principal)
 	if err != nil {
@@ -1013,6 +1031,15 @@ func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, princi
 		return errors.New("kafka admin: a principal is required to revoke a SCRAM credential")
 	}
 
+	// From the compensating reserve: withdrawing a credential is the operation that must
+	// not be starved by the attempts to issue more of them.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminCompensating)
+	if err != nil {
+		return err
+	}
+
+	defer releasePermit()
+
 	response, err := a.client.AlterUserScramCredentials(ctx, &kafka.AlterUserScramCredentialsRequest{
 		Deletions: []kafka.UserScramCredentialsDeletion{{
 			Name:      principal,
@@ -1075,6 +1102,17 @@ func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *mod
 				"so there is nothing to revoke",
 		)
 	}
+
+	// ONE permit for both round trips below, from the compensating reserve. Taken here
+	// rather than left to the two calls it makes, so the pair is admitted together and
+	// cannot half-complete because the reserve emptied between them; the permit is
+	// reentrant, so RevokeSubscriberPrincipal runs inside this one.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminCompensating)
+	if err != nil {
+		return err
+	}
+
+	defer releasePermit()
 
 	bindingErr := a.deleteAllPrincipalBindings(ctx, principal)
 	credentialErr := a.RevokeSubscriberPrincipal(ctx, principal)
@@ -1142,6 +1180,15 @@ func (a *KafkaAdminClient) ReconcileSubscriberACLs(
 				"so there are no ACL bindings to reconcile",
 		)
 	}
+
+	// Forward class: this widens or restates access, so it queues with provisioning rather
+	// than with the reserve that withdraws access.
+	ctx, releasePermit, err := a.admitAdminConversation(ctx, kafkaAdminForward)
+	if err != nil {
+		return err
+	}
+
+	defer releasePermit()
 
 	// The revoked bindings are built from a request carrying ONLY the removed topics, so
 	// aclEntries — the single place a subscriber's binding shape is expressed — produces

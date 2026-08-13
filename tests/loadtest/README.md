@@ -113,8 +113,9 @@ throughput target is stated over.
 | `RATE` | `550` (derived) | Offered arrival rate; `ceil(TARGET × HEADROOM)` unless set |
 | `DURATION` | `30m` | Every verdict below is stated over this window |
 | `VUS` / `MAX_VUS` | `400` / `1600` | Executor pool; too low and arrivals are dropped rather than slow |
-| `LEDGER_SPREAD` | `128` | Independent aggregates the load is spread over. Replaces `SOURCE_BUCKETS`/`DESTINATION_BUCKETS`, which mean nothing here |
+| `LEDGER_SPREAD` | `128` | Independent aggregates the load is spread over. Replaces `SOURCE_BUCKETS`/`DESTINATION_BUCKETS`, which mean nothing here. Not used by `OFFER_MODE=ledgers` |
 | `MIN_LEDGER_SPREAD` | see file | Floor below which acceptance mode refuses to measure |
+| `OFFER_MODE` | `transactions` | Which ledger mutation the load offers: `transactions` (the whole path, bounded by the asynq worker) or `ledgers` (one synchronous event per request, the mode 500 events/sec is presentable in). See below |
 
 **Verdict thresholds** — the pass/fail bars. Relaxing one does not make a run invalid, but the
 summary records that you did, and a figure quoted against the acceptance criteria must come from
@@ -137,7 +138,7 @@ the defaults.
 | `EVENTS_STATS_URL`, `LEDGERS_URL`, `BALANCES_URL` | derived from `URL` | Sibling endpoints for corroboration and fixtures |
 | `METRICS_BEARER_TOKEN` | none | Required when `server.secure` is on, or every scrape is refused |
 | `MASTER_KEY` (or `BLNK_MASTER_KEY`) | none | Reads the master-key gated `GET /events/stats` |
-| `API_KEY` (or `BLNK_API_KEY`) | none | Authenticates the offered transactions |
+| `API_KEY` (or `BLNK_API_KEY`) | none | Authenticates the offered transactions. Required when the deployment runs `BLNK_SERVER_SECURE=true`, ignored when it does not — see [the acceptance recipe](#the-complete-acceptance-recipe) |
 
 **Fixtures** — these decide whether a run is permitted to create permanent ledgers and balances.
 Read the fixture note under the acceptance run before using any of them.
@@ -224,18 +225,67 @@ The case's defaults are the acceptance criteria's own figures — 550/s offered 
 judged against the 500/s throughput target — so override the load shape for a first attempt. The runner forwards
 `RATE`, `DURATION`, `VUS` and `MAX_VUS` only when you set them, and prints which of the two shapes
 it used. Override the ceilings too, or a ten-second run at rate 5 is judged against a target
-stated over thirty minutes at 500:
+stated over thirty minutes at 500.
+
+Shortening the run is not enough on its own, and this is where a first attempt goes wrong: **the
+sustained verdict is stated over subwindows, so the judging windows have to be shortened with the
+run or there is nothing left to judge.** The defaults cut the run into 30-second subwindows,
+disqualify any window within one subwindow of either end as ramp, and require three qualifying
+windows before the verdict may be formed at all. A ten-second run yields none, so the verdict reads
+`NO QUALIFYING SUBWINDOW WAS JUDGED` instead of a number. Because that verdict is a k6 threshold,
+the run also exits non-zero, and the runner promotes its summary only on a clean exit — so the
+shortened run produces neither a verdict nor a file. These are the four ceilings a shorter run has
+to bring down with it:
+
+| Override | Default | What it decides |
+|----------|---------|-----------------|
+| `TARGET_EVENTS_PER_SEC` | 500 | the rate every judged window is measured against |
+| `SUBWINDOW_SECONDS` | 30 | how the run is cut into windows |
+| `RAMP_EXCLUSION_SECONDS` | one subwindow | how much of each end is disqualified as ramp |
+| `MIN_QUALIFYING_SUBWINDOWS` | 3 | how many windows must survive before a verdict is formed |
+
+Only the first two have to be set, and the set below is the smallest one that still yields both a
+verdict and a file. A hundred seconds cut into ten-second windows leaves seven or eight of them to
+judge once the ramp exclusion has taken one from each end — comfortably above the floor of three, so
+the floor itself stays where the acceptance run puts it rather than being lowered to fit a short
+run. The run prints how many it judged:
 
 ```bash
-RATE=5 DURATION=10s VUS=5 MAX_VUS=10 \
-  TARGET_EVENTS_PER_SEC=1 SMOKE=1 \
+set -a; . ./.env; set +a          # the master key and the metrics bearer token
+export API_KEY="${BLNK_SERVER_SECRET_KEY}"
+
+ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 SERVER_REPLICAS=1 LEDGER_SPREAD=64 \
+  RATE=5 DURATION=100s VUS=5 MAX_VUS=10 \
+  TARGET_EVENTS_PER_SEC=1 SUBWINDOW_SECONDS=10 \
   bash tests/loadtest/run_case.sh event-streaming
 ```
 
+With those overrides every verdict is decided rather than withheld, and a passing run ends in
+`ALL CRITERIA PASS` and writes `summary-event-streaming.json`. Passing is still a measurement, not a
+formality: `V-1 p99 publish` is the relay's own capture-to-dispatch latency against a two-second
+bound, so on a host that is busy with other work it can legitimately miss — and since a crossed
+threshold is a non-zero exit, that run publishes nothing. Run it on a machine that is not otherwise
+loaded, and read a p99 miss as a reading of the stack rather than as a mistake in the command.
+
+Three prerequisites sit behind the command, and each one turns into a failure several layers from
+its cause when it is missing. Both process roles have to be up — `blnk start` for the API the load is posted to,
+`blnk workers` for the transaction queue that drains it — or the load is accepted and no event is
+ever published. `API_KEY` has to hold a key the server accepts, which on a local stack is the
+master key itself; without it every `POST /ledgers`, `POST /balances` and `POST /transactions` is
+refused and the abort blames the partition-key spread. And `LEDGER_SPREAD` is a floor rather than
+a preference: the relay claims at most one row per partition key per poll, so a spread far below
+the offered rate throttles the very pipeline the run measures. Keep `SERVER_REPLICAS` at the
+number of processes the URL fronts — one, here — or the verdicts are withheld rather than decided.
+
 `SMOKE=1` is the explicit opt-out from the acceptance contract: it permits the single-aggregate
 fallback so a shakeout does not have to provision fixtures first, and it relaxes the
-dedicated-instance requirement. Never set it for a run whose numbers are quoted against the
-acceptance criteria — the summary records which mode produced every figure.
+dedicated-instance requirement. What it does not do is satisfy the attribution contract it
+relaxes. A `SMOKE=1` run still reports `attribution FAIL — NOT ISOLATED`, still withholds its
+verdict inputs, still ends in `ALL CRITERIA FAIL`, and — because that failure is a threshold, and
+the runner promotes nothing after a non-zero exit — still writes no artifact. Reach for it to
+prove the wiring reaches load generation; reach for the command above when you want a verdict or a
+file. Never quote a `SMOKE=1` run's numbers against the acceptance criteria: the summary records
+which mode produced every figure.
 
 ### Why those two variables are not optional, and why neither is in `.env`
 
@@ -264,15 +314,26 @@ verdict is computed inside the scenario and recorded there. The raw k6 NDJSON st
 because a thirty-minute run at 500/s writes tens of millions of records and gigabytes from the
 load generator while it is trying to measure sub-second latency — the artifact would degrade the
 verdict it exists to evidence. Ask for it when you want per-request detail from a short run, and
-prefer a `.gz` destination, which k6 compresses directly:
+prefer a `.gz` destination, which k6 compresses as it writes. This is the short run from above with
+the stream turned on:
 
 ```bash
 NDJSON_OUT=tests/loadtest/run-event-streaming.ndjson.gz \
-  RATE=5 DURATION=10s VUS=5 MAX_VUS=10 TARGET_EVENTS_PER_SEC=1 SMOKE=1 \
+  ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 SERVER_REPLICAS=1 LEDGER_SPREAD=64 \
+  RATE=5 DURATION=100s VUS=5 MAX_VUS=10 \
+  TARGET_EVENTS_PER_SEC=1 SUBWINDOW_SECONDS=10 \
   bash tests/loadtest/run_case.sh event-streaming
 ```
 
 `RAW_OUTPUT=1` does the same at the default path. Naming `NDJSON_OUT` implies it.
+
+The compression is real, and `gzip -t tests/loadtest/run-event-streaming.ndjson.gz` is how to
+confirm it. That is worth knowing because it depends on the runner as well as on k6: the run writes
+through a temporary and promotes it only on a clean exit, so the temporary has to keep the extension
+you asked for — k6 reads the destination's name to decide whether to compress, and a marker appended
+after `.gz` would silently produce plain text under a `.gz` name. The runner marks the basename
+instead, which is why the name you choose keeps its effect. Both forms are ignored by git, so
+neither a `.json`, `.ndjson` nor `.gz` artifact can be committed by accident.
 
 The `[queue-mode]` argument is accepted for this case and has no effect on it. There is no queue
 benchmark for it to widen.
@@ -298,10 +359,50 @@ acceptance criteria, and it prints a verdict for each:
 |----------------|-----------|
 | `event_publish_window_events_per_second` | throughput — 500 events/sec sustained, weakest window |
 | `event_publish_subwindow_met_target` | throughput — the fraction of windows that met the target |
-| `event_publish_events_per_second` | the whole-run mean. A **diagnostic** while the sampler runs; the verdict only when it is off |
+| `event_publish_events_per_second` | the whole-run mean **over the measured window**. A **diagnostic** while the sampler runs; the verdict only when it is off |
+| `event_publish_offered_events_per_second` | the same delta over the **configured load interval**. Answers "how much of the offered load became events" and certifies nothing |
 | `event_publish_p99_seconds` | latency — p99 capture-to-dispatch under 2s, first attempts only |
 | `event_publish_dead_letter_ratio` | dead-letter rate — under 0.1% of events dead-lettered |
 | `event_publish_verdicts_available` | the three above were actually measured |
+
+### `OFFER_MODE`: what the run can actually offer the relay
+
+**The default mode cannot present 500 events/sec to the relay, and no amount of load makes it.**
+`POST /transactions` is accepted synchronously and **applied asynchronously by the asynq worker**,
+and the outbox row is written at apply time — so the rate offered to the outbox is the worker's
+*apply* rate, not the API's *accept* rate. Measured on a 30-minute run at the defaults: the API
+accepted **487.4 requests/sec** while `transaction.*` outbox rows grew at **66.1 events/sec** and
+the asynq backlog reached **567,644** pending tasks. The relay was never offered more than 66
+events/sec, so a 500-events/sec target could not be *presented* to it however hard the API was
+driven, and the accept latency degraded as the backlog grew.
+
+The worker's concurrency is outside this change's scope, so the harness gets a second way to offer
+the rate rather than the ceiling being raised:
+
+| `OFFER_MODE` | What it posts | What it measures | What it does NOT measure |
+|---|---|---|---|
+| `transactions` (default) | `POST /transactions` | The whole path end to end, as a deployment actually uses it | Anything at a rate above the worker's apply rate |
+| `ledgers` | `POST /ledgers` | The **outbox and the relay** at the rate k6 achieves: capture, claim, publish, ordering, dead-letter rate | The transaction pipeline — no run in this mode says anything about it |
+
+`ledger.created` is captured **inside the request**, in the same database transaction as the ledger
+row, so one request is one event and the offered rate is whatever k6 achieves. Every event's
+partition key is the id of the ledger the request just created, so the key spread is **one key per
+event** — the favourable end of the range, stated here rather than left to be discovered. A
+deployment whose events concentrate on few keys is bounded by the per-key ordering guarantee
+instead; the key-spread sweep is the measurement for that, not this.
+
+```bash
+# V-1 and V-3, in the mode the target is presentable in. The ledgers are PERMANENT —
+# one per request — so ALLOW_FIXTURE_CREATION=1 is required and the database must be
+# disposable or per-run.
+ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 OFFER_MODE=ledgers \
+  bash tests/loadtest/run_case.sh events
+```
+
+Both the summary's `configuration.offer_mode` and a note beside it record which mode produced the
+numbers, so a figure cannot be attributed to the wrong path months later. No balance-pair pool is
+provisioned in `ledgers` mode, and the partition-key row in the summary says so rather than
+reporting a zero that would otherwise read as the single-aggregate fallback.
 
 ### Before the first run: both process roles, and fixtures
 
@@ -336,17 +437,25 @@ against a database you are willing to grow. Run it with:
 
 ```bash
 set -a; . ./.env; set +a                  # master key (BLNK_SERVER_SECRET_KEY) + metrics bearer token
-export API_KEY="$BLNK_SERVER_SECRET_KEY"  # REQUIRED: ./.env ships no API key of its own
+export API_KEY="$BLNK_SERVER_SECRET_KEY"  # needed when BLNK_SERVER_SECURE=true; harmless otherwise
 ISOLATED_INSTANCE=1 LEDGER_SPREAD=64 SERVER_REPLICAS=1 \
   ALLOW_FIXTURE_CREATION=1 bash tests/loadtest/run_case.sh event-streaming
 ```
 
-`API_KEY` is not optional and sourcing `./.env` does not provide it — that file ships the master
-key under `BLNK_SERVER_SECRET_KEY` and no API key at all. Without one, `POST /ledgers`,
-`POST /balances` and `POST /transactions` are all refused with `401`, and the run then aborts in
-`setup()` complaining that provisioning yielded too few partition keys — several layers away from
-the authentication error that caused it. The runner prints a note when no key is set. Reusing the
-master key as above is appropriate for a local stack; issue a real API key for anything else.
+**`API_KEY` is required exactly when the deployment under test runs with `BLNK_SERVER_SECURE=true`**,
+and sourcing `./.env` does not provide it — that file ships the master key under
+`BLNK_SERVER_SECRET_KEY` and no API key at all. In secure mode, without one, `POST /ledgers`,
+`POST /balances` and `POST /transactions` are all refused with `401 AUTH_MISSING_API_KEY`, and the run
+then aborts in `setup()` complaining that provisioning yielded too few partition keys — several
+layers away from the authentication error that caused it. The runner prints a note when no key is set.
+
+With secure mode **off**, which is the shipped default — `.env.example` declares
+`BLNK_SERVER_SECURE` nowhere and the server defaults it to false — authentication is skipped for the
+whole API, those three endpoints answer `201` with no key at all, and the export above is simply
+ignored. Export it anyway: it costs nothing, it is what makes the same command work against either
+mode, and a run that silently depended on secure mode being off would fail the first time it was
+pointed at a deployment that has it on. Reusing the master key as above is appropriate for a local
+stack; issue a real API key for anything else.
 
 Nothing else is needed: the load shape, the target, the latency ceiling and the dead-letter
 ceiling all default to the criteria's own figures — 550/s offered for 30 minutes and judged
@@ -464,21 +573,34 @@ before it starts; see "Attribution" below.
 **The load shape defaults to the criterion's own figures — 550/s offered for 30 minutes and
 judged against the 500/s throughput target — and the
 runner does not substitute the transaction cases' defaults for them.** Pass `RATE` or
-`DURATION` explicitly for a shorter run, and the run announces that you did. The two
-prerequisites do not go away with the load shape — a two-minute run is still measured off the
-same process-global counters and still needs fixtures — so they travel with it:
+`DURATION` explicitly for a shorter run, and the run announces that you did. Two things travel with
+the shape and are easy to leave behind. The prerequisites are the first: a two-minute run is still
+measured off the same process-global counters and still needs fixtures. **The judging windows are
+the second, and they are what silently costs a shorter run its verdict** — `TARGET_EVENTS_PER_SEC`,
+`SUBWINDOW_SECONDS`, `RAMP_EXCLUSION_SECONDS` and `MIN_QUALIFYING_SUBWINDOWS` are all stated for a
+thirty-minute run at 500/s, and a run too short to fill three 30-second windows outside the ramp is
+refused a sustained verdict rather than given a low one. This is the same command as under
+["Fastest way to run a case"](#fastest-way-to-run-a-case), repeated so this section stands on its
+own:
 
 ```bash
 set -a; . ./.env; set +a
+export API_KEY="${BLNK_SERVER_SECRET_KEY}"
 
-ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 \
-  RATE=50 DURATION=2m \
+ISOLATED_INSTANCE=1 ALLOW_FIXTURE_CREATION=1 SERVER_REPLICAS=1 LEDGER_SPREAD=64 \
+  RATE=5 DURATION=100s VUS=5 MAX_VUS=10 \
+  TARGET_EVENTS_PER_SEC=1 SUBWINDOW_SECONDS=10 \
   bash tests/loadtest/run_case.sh event-streaming
 ```
 
+Scale it by moving the offered rate and the target together, and keep enough windows outside the
+ramp to satisfy `MIN_QUALIFYING_SUBWINDOWS`; the table under "Fastest way to run a case" lists each
+default.
+
 A shorter run's verdicts are real for the load it offered, which is not the load the criteria are
 stated over. Only a default run certifies the acceptance criteria. `SMOKE=1` is the one form that drops both
-prerequisites, and it drops the claim with them.
+prerequisites, and it drops the claim with them — along with its artifact, because the attribution
+verdict it does not satisfy is itself a threshold.
 
 ### Reading the verdict honestly
 

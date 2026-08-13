@@ -210,7 +210,14 @@ const (
 	orderingDivergentRelayCount = 2
 
 	// orderingDivergentProbeLease is the lease the claim-level probe takes.
-	orderingDivergentProbeLease = 300 * time.Millisecond
+	//
+	// It has to outlive a SECOND claim issued while the first is still held, because the
+	// exclusion under test is "no second claimant enters a held key" — a lease that
+	// expired between the two claims would let the second one in legitimately and the
+	// probe would report a defect that is not there. Five seconds is far longer than a
+	// claim needs (single-digit milliseconds) and is released explicitly the moment the
+	// probe is done, so the delivery subtest that follows does not wait it out.
+	orderingDivergentProbeLease = 5 * time.Second
 
 	// orderingLedgerMintAttempts bounds the search for a ledger id set that spans more
 	// than one partition. One attempt fails with probability 6 * (1/6)^12 — about three in
@@ -2177,7 +2184,7 @@ func orderingAssertClaimYieldsOccurrenceOrder(t *testing.T, f *orderingFixture) 
 				round+1, foreign)
 		}
 
-		batch, err := f.ds.ClaimPendingEventOutbox(ctx, orderingClaimBatchSize, orderingClaimLease)
+		batch, err := f.ds.ClaimPendingEventOutbox(ctx, orderingClaimBatchSize, orderingClaimLease, "")
 		require.NoError(t, err, "claiming batch %d failed", round+1)
 
 		mine := make([]model.EventOutbox, 0, orderingClaimBatchSize)
@@ -2210,7 +2217,7 @@ func orderingAssertClaimYieldsOccurrenceOrder(t *testing.T, f *orderingFixture) 
 			require.NotEmpty(t, row.ClaimToken,
 				"a claimed row must carry the claim token every subsequent transition is conditional on")
 
-			require.NoError(t, f.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}),
+			require.NoError(t, f.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}, true),
 				"marking event %s dispatched failed", row.EventID)
 			claimed = append(claimed, row.EventID)
 		}
@@ -2489,8 +2496,10 @@ func TestEventOrdering_OperationsGuideAgreesWithThePublishedKeyContract(t *testi
 // Two independent mechanisms serialise same-key rows, and they fail differently:
 //
 //   - groupEventRowsByPartitionKey groups a CLAIMED BATCH by the effective key and
-//     publishes each group with one goroutine.
-//   - The claim's earlier-same-key exclusion is what holds ACROSS processes.
+//     publishes each group with one goroutine, in the order the claim returned the rows.
+//   - The claim's one-claimant-per-key exclusion is what holds ACROSS processes: a key is
+//     enterable only through its oldest unfinished row, under FOR UPDATE SKIP LOCKED, so a
+//     key another claimant already holds is skipped whole.
 func TestEventOrdering_DivergentStoredKeysStaySerialisedAcrossRelayReplicas(t *testing.T) {
 	fixture := newOrderingFixture(t)
 	ctx := context.Background()
@@ -2504,7 +2513,7 @@ func TestEventOrdering_DivergentStoredKeysStaySerialisedAcrossRelayReplicas(t *t
 
 	rows, eventIDs := fixture.seedDivergentKeyRows(ctx, t, ledgerID)
 
-	t.Run("one claim admits at most one row of the ledger", func(t *testing.T) {
+	t.Run("one claimant at a time holds the ledger, head first", func(t *testing.T) {
 		orderingAssertClaimSerialisesDivergentKeys(ctx, t, fixture, ledgerID, eventIDs)
 	})
 
@@ -2584,8 +2593,15 @@ func (f *orderingFixture) seedDivergentKeyRows(
 // orderingAssertClaimSerialisesDivergentKeys is the deterministic detector for
 // the effective-key claim.
 //
-// The lease it takes is short and the rows are left pending, because the delivery
-// assertion that follows needs them.
+// It asserts the two properties the cross-process ordering guarantee rests on, on rows
+// whose STORED partition key differs from the key they publish under:
+//
+//   - one claim hands a key's rows over as a contiguous run taken head-first, in
+//     occurrence order, so the relay's sequential per-key publish appends them in order;
+//   - while that claimant holds the key, a second claim admits none of it.
+//
+// Every row it leases is released before it returns, because the delivery assertion that
+// follows needs them claimable.
 //
 // Parameters:
 //   - ctx context.Context: the context for the claim.
@@ -2602,18 +2618,110 @@ func orderingAssertClaimSerialisesDivergentKeys(
 ) {
 	t.Helper()
 
-	seeded := make(map[string]struct{}, len(eventIDs))
-	for _, eventID := range eventIDs {
-		seeded[eventID] = struct{}{}
+	// Occurrence position of every seeded row, one-based, so a returned batch can be
+	// described as positions rather than as opaque identifiers.
+	position := make(map[string]int, len(eventIDs))
+	for index, eventID := range eventIDs {
+		position[eventID] = index + 1
 	}
 
-	batch, err := f.ds.ClaimPendingEventOutbox(ctx, len(eventIDs)*2, orderingDivergentProbeLease)
+	first, err := f.ds.ClaimPendingEventOutbox(ctx, len(eventIDs)*2, orderingDivergentProbeLease, "")
 	require.NoError(t, err, "the probe claim failed")
 
-	mine := make([]string, 0, len(eventIDs))
-	keys := make([]string, 0, len(eventIDs))
+	mine, keys := orderingRowsOfSeededKey(first, position)
+
+	// Released rather than left leased, so the relays that follow do not wait out the
+	// probe's lease. Any row it did claim is returned to the claimable set with its retry
+	// budget untouched — the claim spends no attempt. Deferred so it also runs when an
+	// assertion below fails.
+	defer f.releaseProbeLease(ctx, t, mine)
+
+	require.NotEmpty(t, mine,
+		"the probe claim admitted NONE of the %d seeded rows of ledger %s. Every one of them "+
+			"is pending, unleased and a year old, so the oldest of them is this key's head and "+
+			"a claim must admit it — a claim that admits nothing here cannot drain the key at "+
+			"all.",
+		len(eventIDs), ledgerID)
+
+	// PROPERTY ONE: the rows arrive as a contiguous run taken head-first, in occurrence
+	// order. A claim may hold several rows of one key — that is what keeps a low-key-spread
+	// backlog from being capped at one row per key per claim — but the relay publishes a
+	// group sequentially, so the ROWS IT HANDS OVER must already be in occurrence order and
+	// must start at the key's oldest unfinished row. A batch that started in the middle
+	// would append a later event before an earlier one that is still pending.
+	expected := make([]int, 0, len(mine))
+	for index := range mine {
+		expected = append(expected, index+1)
+	}
+
+	observed := make([]int, 0, len(mine))
+	for _, eventID := range mine {
+		observed = append(observed, position[eventID])
+	}
+
+	require.Equal(t, expected, observed,
+		"one claim returned rows of ledger %s at occurrence positions %v instead of the "+
+			"head-first contiguous run %v.\n"+
+			"Every one of these rows publishes under the ledger as its Kafka message key, so "+
+			"they share ONE partition, and the relay publishes a key's rows one after another in "+
+			"the order the claim returned them. The claim must therefore hand them over starting "+
+			"at the key's OLDEST unfinished row and ascending — a gap or a transposition here is "+
+			"published as a gap or a transposition on the partition. The rows' STORED partition "+
+			"keys all differ (%v) while their EFFECTIVE keys are all %s, which is the divergence "+
+			"this test exists to hold the claim to.",
+		ledgerID, observed, expected, keys, ledgerID)
+
+	// PROPERTY TWO, and the one that holds ACROSS PROCESSES: while this claimant holds the
+	// key, no second claimant may enter it. The first claim leased the key's head, and a
+	// key is only enterable through its head — so a second claim issued now must come back
+	// with none of these rows, however many of them are still pending.
+	second, err := f.ds.ClaimPendingEventOutbox(ctx, len(eventIDs)*2, orderingDivergentProbeLease, "")
+	require.NoError(t, err, "the second probe claim failed")
+
+	theirs, theirKeys := orderingRowsOfSeededKey(second, position)
+	defer f.releaseProbeLease(ctx, t, theirs)
+
+	require.Emptyf(t, theirs,
+		"a second claim issued while the first still holds ledger %s admitted %d more of its "+
+			"rows (occurrence positions %v, keys %v).\n"+
+			"Two relay replicas would then hold rows of ONE Kafka partition at the same time and "+
+			"append them in either order. Exactly one claimant may hold a key at a time: the "+
+			"claim enters a key only through its head, under FOR UPDATE SKIP LOCKED, so a head "+
+			"another claimant leased must exclude the whole key rather than letting the second "+
+			"claimant start further down it.",
+		ledgerID, len(theirs), func() []int {
+			positions := make([]int, 0, len(theirs))
+			for _, eventID := range theirs {
+				positions = append(positions, position[eventID])
+			}
+			return positions
+		}(), theirKeys)
+
+	t.Logf("the probe claim admitted %d of %d seeded rows as one head-first run and a second "+
+		"concurrent claim admitted none, which is the serialisation the ordering guarantee "+
+		"rests on", len(mine), len(eventIDs))
+}
+
+// orderingRowsOfSeededKey narrows a claimed batch to the rows this test seeded, keeping the
+// order the claim returned them in.
+//
+// The outbox is shared with every other run against this database, so a claim legitimately
+// returns rows belonging to other tests; only the seeded ones carry an ordering conclusion.
+//
+// Parameters:
+//   - batch []model.EventOutbox: the rows one claim returned, in claim order.
+//   - position map[string]int: the seeded event ids, mapped to their one-based occurrence
+//     position.
+//
+// Returns:
+//   - []string: the seeded event ids the claim returned, in claim order.
+//   - []string: the same rows described as "effective key(stored key)", for failure output.
+func orderingRowsOfSeededKey(batch []model.EventOutbox, position map[string]int) ([]string, []string) {
+	mine := make([]string, 0, len(position))
+	keys := make([]string, 0, len(position))
+
 	for _, row := range batch {
-		if _, ok := seeded[row.EventID]; !ok {
+		if _, seeded := position[row.EventID]; !seeded {
 			continue
 		}
 
@@ -2621,24 +2729,7 @@ func orderingAssertClaimSerialisesDivergentKeys(
 		keys = append(keys, fmt.Sprintf("%s(stored %s)", row.EffectiveKey(), row.PartitionKey))
 	}
 
-	require.LessOrEqual(t, len(mine), 1,
-		"one claim returned %d rows of ledger %s at once: %v.\n"+
-			"Every one of these rows publishes under the ledger as its Kafka message key, so they "+
-			"share ONE partition — and the claim must therefore admit at most one of them at a "+
-			"time, across every relay instance. Returning several means the earlier-same-key "+
-			"exclusion is comparing a different key from the one the publisher uses: the rows' "+
-			"STORED partition keys all differ (%v) while their EFFECTIVE keys are all %s. Two "+
-			"relay replicas can then hold two rows of one partition and append them in either "+
-			"order.",
-		len(mine), ledgerID, mine, keys, ledgerID)
-
-	// Released rather than left leased, so the relays that follow do not wait out the
-	// probe's lease. Any row it did claim is returned to the claimable set with its retry
-	// budget untouched — the claim spends no attempt.
-	f.releaseProbeLease(ctx, t, mine)
-
-	t.Logf("the probe claim admitted %d of %d seeded rows, which is the serialisation the "+
-		"ordering guarantee rests on", len(mine), len(eventIDs))
+	return mine, keys
 }
 
 // releaseProbeLease returns rows the probe claim leased to the claimable set

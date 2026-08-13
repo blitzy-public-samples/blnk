@@ -176,8 +176,12 @@ func (s *EventDeadLetterService) ReplayDeadLetteredEvent(
 		return outcome, err
 	}
 
+	// settleLegacyLeg is FALSE, deliberately. A replay re-publishes to Kafka and says nothing
+	// about the legacy webhook leg — a row dead-lettered before its enqueue succeeded still
+	// owes one, and the repair leg is what finishes it. Settling the marker here would strand
+	// that webhook behind a state nothing revisits.
 	if markErr := s.store.MarkEventDispatched(
-		ctx, row.ID, row.ClaimToken, result.Record,
+		ctx, row.ID, row.ClaimToken, result.Record, false,
 	); markErr != nil {
 		// The event HAS been republished. The bookkeeping has not, so the row is still listed
 		// as dead-lettered and can be replayed again — a duplicate that the subscriber's
