@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/blnkfinance/blnk/model"
@@ -232,10 +231,23 @@ func validateSubscriberName(name string, required bool) error {
 		)
 	}
 
-	for _, r := range trimmed {
-		if unicode.IsControl(r) {
-			return fmt.Errorf("name must not contain control characters")
-		}
+	// ONE RULE, IN model.InspectSubscriberText. This loop used to test unicode.IsControl
+	// and nothing else, which let every Unicode FORMAT character through: a label carrying
+	// U+202E RIGHT-TO-LEFT OVERRIDE was stored and echoed back verbatim, so it rendered as
+	// its own reverse wherever a human read it while remaining a different byte string to
+	// every machine that compared it.
+	switch defect, character := model.InspectSubscriberText(trimmed); defect {
+	case model.TextDefectControl:
+		return fmt.Errorf("name must not contain control characters")
+	case model.TextDefectInvisible:
+		// THE CODE POINT, never the character. Echoing it back would hand the caller a
+		// message their own terminal renders wrongly, and would put the offending character
+		// into the access log line that records the refusal.
+		return fmt.Errorf(
+			"name must not contain invisible or direction-altering characters, found %s",
+			model.FormatCodePoint(character),
+		)
+	case model.TextDefectNone:
 	}
 
 	return nil
@@ -342,10 +354,20 @@ func validateSubscriberKeyScope(prefix string) error {
 			maxSubscriberKeyScopeLen, len(prefix))
 	}
 
-	for _, character := range prefix {
-		if character < 0x20 || character == 0x7f {
-			return fmt.Errorf("partition_key_prefix must not contain control characters")
-		}
+	// THE SAME ONE RULE the name is held to, for a value with more riding on it: a key
+	// prefix is compared byte-for-byte against a record key, so an invisible character in
+	// it produces a boundary that filters nothing while LOOKING like the boundary the
+	// subscriber was promised. The previous test — control characters below 0x20 plus DEL —
+	// missed the C1 controls as well as the whole format category.
+	switch defect, character := model.InspectSubscriberText(prefix); defect {
+	case model.TextDefectControl:
+		return fmt.Errorf("partition_key_prefix must not contain control characters")
+	case model.TextDefectInvisible:
+		return fmt.Errorf(
+			"partition_key_prefix must not contain invisible or direction-altering characters, found %s",
+			model.FormatCodePoint(character),
+		)
+	case model.TextDefectNone:
 	}
 
 	return nil

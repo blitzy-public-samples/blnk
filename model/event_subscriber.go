@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // EventSubscriber is one row of blnk.event_subscribers: a registered Kafka subscriber,
@@ -483,6 +484,98 @@ func ValidateSubscriberTopics(topics []string) error {
 	}
 
 	return nil
+}
+
+// TextDefect names why a caller-supplied string cannot be stored on a subscriber.
+//
+// A subscriber's name and partition-key prefix are the two values a caller writes in
+// free text, and both are echoed back in API responses and written into operator-facing
+// log fields, alert annotations and trace attributes. The defects below are the two
+// classes that make such a value a forgery tool rather than a label.
+type TextDefect string
+
+const (
+	// TextDefectNone reports a string every consumer can store, render and log.
+	TextDefectNone TextDefect = ""
+
+	// TextDefectControl reports a C0 control, DEL, or a C1 control. A newline forges a
+	// second log entry, a carriage return overwrites the line already written, a NUL
+	// truncates a C-side consumer, and an escape sequence — CSI is U+001B '[' in C0 and
+	// U+009B on its own in C1 — rewrites an operator's terminal.
+	TextDefectControl TextDefect = "control"
+
+	// TextDefectInvisible reports a Unicode format character (category Cf) that renders as
+	// nothing or silently reorders what follows it. U+202E RIGHT-TO-LEFT OVERRIDE makes
+	// "readonly-ops" render as its own reverse, so two subscribers can present the same
+	// label to a human while being different principals; U+200B, U+00AD and U+FEFF are
+	// invisible entirely, so two labels that differ only by one are indistinguishable on
+	// screen and in a support ticket.
+	TextDefectInvisible TextDefect = "invisible"
+)
+
+// zeroWidthNonJoiner and zeroWidthJoiner are the two Cf characters that carry meaning
+// rather than deception, and they are the whole exception list for TextDefectInvisible.
+//
+// ZWNJ and ZWJ are orthographically REQUIRED in Persian, Arabic and several Indic
+// scripts, and ZWJ is what binds an emoji sequence together. Refusing them would bound
+// the alphabet a human label may be written in — which is exactly what the name field is
+// documented not to do — while refusing the direction and zero-width characters bounds
+// only the ways a label can lie about itself. UTS #39 draws the same line: bidi controls
+// are restricted, the joiners are permitted under context rules.
+const (
+	zeroWidthNonJoiner = '\u200C'
+	zeroWidthJoiner    = '\u200D'
+)
+
+// InspectSubscriberText reports the first character in a caller-supplied subscriber
+// string that must not be stored, and is the SINGLE definition of that rule.
+//
+// It is a rune-level inspection rather than a validator because its two callers need
+// different error shapes — the request DTOs in api/model return plain field-prefixed
+// errors, the registry service returns a typed apierror — while the RULE must not be
+// stated twice. A rule with two copies is a rule with two answers the moment one copy is
+// extended, and the API boundary is not the only door into the registry: the service is
+// reachable from the CLI and from any future caller that builds a registration directly.
+//
+// Parameters:
+//   - value string: the caller-supplied name or partition-key prefix, as received.
+//
+// Returns:
+//   - TextDefect: TextDefectNone when every character is storable, otherwise the class of
+//     the first offending character.
+//   - rune: the offending character, so a caller can name it as a code point. Read the
+//     defect, not this rune, to decide whether there is a defect at all: a NUL is itself
+//     the zero rune. Render it with FormatCodePoint and never verbatim — echoing an
+//     invisible character back into a message or a log line reproduces the very problem
+//     the refusal exists to prevent.
+func InspectSubscriberText(value string) (TextDefect, rune) {
+	for _, character := range value {
+		switch {
+		case unicode.IsControl(character):
+			return TextDefectControl, character
+		case character == zeroWidthNonJoiner || character == zeroWidthJoiner:
+			// Permitted; see the constant block above.
+		case unicode.Is(unicode.Cf, character):
+			return TextDefectInvisible, character
+		}
+	}
+
+	return TextDefectNone, 0
+}
+
+// FormatCodePoint renders a rune as its Unicode code point, "U+202E".
+//
+// This is how every refusal names the character it rejected. The character itself is
+// unprintable or invisible by definition, so quoting it would produce a message an
+// operator cannot read and a log line a hostile value could still reorder.
+//
+// Parameters:
+//   - character rune: the offending character from InspectSubscriberText.
+//
+// Returns:
+//   - string: the "U+XXXX" rendering, at least four hexadecimal digits, uppercase.
+func FormatCodePoint(character rune) string {
+	return fmt.Sprintf("U+%04X", character)
 }
 
 // DeclaresKeyScope reports whether this subscriber records a partition-key scope.

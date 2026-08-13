@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"net"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -439,13 +440,39 @@ func splitPunctuation(token string) (string, string, string) {
 	return token[:start], core, token[start+len(core):]
 }
 
+// zeroWidthNonJoiner and zeroWidthJoiner are the two Unicode format characters this
+// package keeps: they carry orthographic meaning in Persian, Arabic and Indic scripts
+// and bind emoji sequences, so dropping them would corrupt a legitimate value rather
+// than sanitise a hostile one. Every other format character is removed below.
+const (
+	zeroWidthNonJoiner = '\u200C'
+	zeroWidthJoiner    = '\u200D'
+)
+
 // clean removes the characters that let a value forge log structure.
+//
+// Two classes forge that structure, not one. Control characters do it by writing it — a
+// newline starts a second entry, a carriage return overwrites the entry already there,
+// an escape sequence rewrites the terminal rendering it. Unicode FORMAT characters do it
+// by reordering or hiding it: U+202E RIGHT-TO-LEFT OVERRIDE reverses everything after it
+// on the rendered line, so a value can make the fields that follow read as something
+// else entirely, and U+200B, U+00AD and U+FEFF are invisible, so two different values
+// can present one appearance to whoever reads the log. Both classes are dropped. This
+// mirrors model.InspectSubscriberText, which REFUSES the same two classes at the
+// subscriber write boundary; this package cannot import that rule because it is a
+// stdlib-only leaf every layer logs through, so the two exceptions are restated above.
 func clean(value string) string {
 	cleaned := strings.Map(func(r rune) rune {
 		switch {
 		case r == '\n' || r == '\r' || r == '\t':
 			return ' '
-		case r < 0x20 || r == 0x7f:
+		case unicode.IsControl(r):
+			// C0, DEL and the C1 range: U+009B is a CSI introducer on its own, so a test that
+			// stopped at 0x7f left an escape introducer in the line.
+			return -1
+		case r == zeroWidthNonJoiner || r == zeroWidthJoiner:
+			return r
+		case unicode.Is(unicode.Cf, r):
 			return -1
 		default:
 			return r

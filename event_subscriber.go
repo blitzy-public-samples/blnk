@@ -1005,18 +1005,36 @@ func normalizeSubscriberName(name string) (string, error) {
 		)
 	}
 
-	for _, character := range trimmed {
-		if character < 0x20 || character == 0x7f {
-			return "", apierror.NewAPIError(
-				apierror.ErrGenValidation,
-				"A subscriber name must not contain control characters",
-				errors.New(
-					"event subscriber: name carries a control character; a newline in a label forges a "+
-						"second line in any log that renders it, and an escape sequence can rewrite a "+
-						"terminal",
-				),
-			)
-		}
+	// ONE RULE, IN model.InspectSubscriberText, shared with the request DTO. The test here
+	// used to be "below 0x20 or DEL", which missed both the C1 controls (U+009B is CSI on
+	// its own) and every Unicode FORMAT character, so a label carrying U+202E RIGHT-TO-LEFT
+	// OVERRIDE was stored and echoed back verbatim.
+	switch defect, character := model.InspectSubscriberText(trimmed); defect {
+	case model.TextDefectControl:
+		return "", apierror.NewAPIError(
+			apierror.ErrGenValidation,
+			"A subscriber name must not contain control characters",
+			errors.New(
+				"event subscriber: name carries a control character; a newline in a label forges a "+
+					"second line in any log that renders it, and an escape sequence can rewrite a "+
+					"terminal",
+			),
+		)
+	case model.TextDefectInvisible:
+		return "", apierror.NewAPIError(
+			apierror.ErrGenValidation,
+			"A subscriber name must not contain invisible or direction-altering characters",
+			fmt.Errorf(
+				"event subscriber: name carries %s, a Unicode format character that renders as "+
+					"nothing or reverses what follows it; the label is echoed in API responses and "+
+					"log fields, so two principals could present one appearance to an operator while "+
+					"remaining distinct byte strings to every machine that compares them",
+				// THE CODE POINT, never the character: the whole complaint is that it is
+				// invisible, so putting it in the reason would corrupt the log line reporting it.
+				model.FormatCodePoint(character),
+			),
+		)
+	case model.TextDefectNone:
 	}
 
 	return trimmed, nil
@@ -1062,17 +1080,30 @@ func normalizeSubscriberKeyScope(prefix *string) (*string, error) {
 		)
 	}
 
-	for _, character := range value {
-		if character < 0x20 || character == 0x7f {
-			return nil, apierror.NewAPIError(
-				apierror.ErrGenValidation,
-				"The partition key prefix must not contain control characters",
-				errors.New(
-					"event subscriber: the partition key prefix contains a control character, which "+
-						"corrupts every log line and dashboard label it appears in",
-				),
-			)
-		}
+	switch defect, character := model.InspectSubscriberText(value); defect {
+	case model.TextDefectControl:
+		return nil, apierror.NewAPIError(
+			apierror.ErrGenValidation,
+			"The partition key prefix must not contain control characters",
+			errors.New(
+				"event subscriber: the partition key prefix contains a control character, which "+
+					"corrupts every log line and dashboard label it appears in",
+			),
+		)
+	case model.TextDefectInvisible:
+		return nil, apierror.NewAPIError(
+			apierror.ErrGenValidation,
+			"The partition key prefix must not contain invisible or direction-altering characters",
+			fmt.Errorf(
+				"event subscriber: the partition key prefix contains %s, a Unicode format character; "+
+					"HasKeyAccess compares the prefix against a record key byte-for-byte, so an "+
+					"invisible character produces a boundary that matches nothing while reading, on "+
+					"screen and in the credential response, exactly like the boundary the subscriber "+
+					"was told it has",
+				model.FormatCodePoint(character),
+			),
+		)
+	case model.TextDefectNone:
 	}
 
 	// Copied rather than aliased: the caller's pointer may be reused or mutated, and the row

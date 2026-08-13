@@ -6802,12 +6802,120 @@ func TestNormalizeSubscriberName_BoundsTheLabelAtTheService(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("an invisible or direction-altering character is refused", func(t *testing.T) {
+		// A DIFFERENT CLASS FROM THE CONTROL CHARACTERS ABOVE, and the class the previous
+		// check missed entirely: these are Unicode FORMAT characters. The label is echoed in
+		// the create response, in the subscriber list and in operator-facing log fields, so a
+		// name carrying U+202E renders as its own reverse wherever a human reads it while
+		// staying a distinct byte string for every machine that compares it — two principals
+		// with one appearance to whoever authorises a grant.
+		for label, value := range map[string]string{
+			"a right-to-left override": "readonly\u202eetirw-lluf",
+			"a left-to-right mark":     "ledger\u200eops",
+			"a zero-width space":       "ledger\u200bops",
+			"a soft hyphen":            "ledger\u00adops",
+			"a byte-order mark":        "ledger\ufeffops",
+			"a right-to-left isolate":  "ledger\u2067ops",
+		} {
+			_, err := normalizeSubscriberName(value)
+			requireAPIErrorCode(t, err, apierror.ErrGenValidation)
+			assert.Errorf(t, err, "%s must be refused in a label", label)
+
+			if err != nil {
+				assert.NotContainsf(t, err.Error(), value,
+					"%s: the refusal names the code point; echoing the value would put the "+
+						"offending character into the log line reporting it", label)
+			}
+		}
+	})
+
+	t.Run("a C1 control is refused too", func(t *testing.T) {
+		// U+009B is a CSI introducer on its own, so the previous "below 0x20 or DEL" test let
+		// a value through that can still drive a terminal.
+		_, err := normalizeSubscriberName("ledger\u009bops")
+		requireAPIErrorCode(t, err, apierror.ErrGenValidation)
+	})
+
+	t.Run("the joiners are accepted, because the alphabet is not what is bounded", func(t *testing.T) {
+		// ZWNJ and ZWJ are format characters like the refused ones, and both are required:
+		// Persian and several Indic scripts spell words with ZWNJ, and an emoji sequence is
+		// bound by ZWJ. Refusing them would restrict the scripts a label may be written in.
+		persian, err := normalizeSubscriberName("کتاب\u200cها")
+		require.NoError(t, err, "a zero-width non-joiner carries orthography")
+		assert.Contains(t, persian, "\u200c", "and it must survive normalisation rather than be stripped")
+
+		emoji, err := normalizeSubscriberName("ops \U0001F468\u200D\U0001F4BB")
+		require.NoError(t, err, "a zero-width joiner binds an emoji sequence")
+		assert.Contains(t, emoji, "\u200d")
+	})
+
 	t.Run("the two layers agree on the bound", func(t *testing.T) {
 		// They are separate constants by design — the API package depends on this one and not
 		// the other way round — so nothing but this assertion keeps them equal, and a
 		// divergence would make a label acceptable at one layer and refused at the other.
 		assert.Equal(t, 256, maxSubscriberNameLength,
 			"api/model.maxSubscriberNameLen is 256; the two must match")
+	})
+}
+
+// TestNormalizeSubscriberKeyScope_RefusesAPrefixThatCannotBeRead is the same rule on the
+// value that has more riding on it than the label does.
+//
+// HasKeyAccess compares a recorded prefix against a record key byte-for-byte, with no case
+// folding, trimming or Unicode normalisation. So a prefix carrying an invisible character
+// matches nothing while READING, in the credential response and on a dashboard, exactly
+// like the boundary the subscriber was told it has — a boundary that is announced and does
+// not exist. The API boundary refuses the same values, and this is the service's own check,
+// which is what holds when the registry is reached from the CLI or from a direct caller.
+func TestNormalizeSubscriberKeyScope_RefusesAPrefixThatCannotBeRead(t *testing.T) {
+	t.Run("an ordinary prefix is recorded unchanged", func(t *testing.T) {
+		normalized, err := normalizeSubscriberKeyScope(stringPointer("ldg_9f1c8a72"))
+		require.NoError(t, err)
+		require.NotNil(t, normalized)
+		assert.Equal(t, "ldg_9f1c8a72", *normalized)
+	})
+
+	t.Run("an absent or blank prefix stays absent", func(t *testing.T) {
+		normalized, err := normalizeSubscriberKeyScope(nil)
+		require.NoError(t, err)
+		assert.Nil(t, normalized)
+
+		normalized, err = normalizeSubscriberKeyScope(stringPointer("   "))
+		require.NoError(t, err, "blank is the clearing case, not an error")
+		assert.Nil(t, normalized)
+	})
+
+	t.Run("a control character is refused", func(t *testing.T) {
+		for label, value := range map[string]string{
+			"a newline":           "ldg_9f1c\n8a72",
+			"a NUL":               "ldg_9f1c\x008a72",
+			"an escape sequence":  "ldg_9f1c\x1b[31m8a72",
+			"DEL":                 "ldg_9f1c\x7f8a72",
+			"a C1 CSI introducer": "ldg_9f1c\u009b8a72",
+		} {
+			_, err := normalizeSubscriberKeyScope(stringPointer(value))
+			requireAPIErrorCode(t, err, apierror.ErrGenValidation)
+			assert.Errorf(t, err, "%s must be refused in a key prefix", label)
+		}
+	})
+
+	t.Run("an invisible or direction-altering character is refused", func(t *testing.T) {
+		for label, value := range map[string]string{
+			"a right-to-left override": "ldg_9f1c\u202e8a72",
+			"a zero-width space":       "ldg_9f1c\u200b8a72",
+			"a soft hyphen":            "ldg_9f1c\u00ad8a72",
+			"a byte-order mark":        "ldg_9f1c\ufeff8a72",
+			"a word joiner":            "ldg_9f1c\u20608a72",
+		} {
+			_, err := normalizeSubscriberKeyScope(stringPointer(value))
+			requireAPIErrorCode(t, err, apierror.ErrGenValidation)
+			assert.Errorf(t, err, "%s must be refused in a key prefix", label)
+
+			if err != nil {
+				assert.NotContainsf(t, err.Error(), value,
+					"%s: the refusal must name the code point rather than echo the prefix", label)
+			}
+		}
 	})
 }
 

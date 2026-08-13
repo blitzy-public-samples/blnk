@@ -340,6 +340,26 @@ func TestBoundedErrorText_NeutralisesAndBounds(t *testing.T) {
 	assert.Equal(t, "keep", boundedErrorText(errors.New("keep\x7f")),
 		"delete is a control character too")
 
+	assert.Equal(t, "csi31m", boundedErrorText(errors.New("csi\u009b31m")),
+		"a C1 control is dropped as well: U+009B is a CSI introducer on its own, so a test "+
+			"that stopped at DEL left an escape introducer in the field")
+
+	// THE SECOND CLASS. A direction override does not write log structure, it reorders the
+	// rendering of everything after it — so a dependency's error text carrying one rewrites
+	// how the rest of the entry reads — and the zero-width characters hide differences
+	// between two entries entirely.
+	assert.Equal(t, "brokerdesufer", boundedErrorText(errors.New("broker\u202edesufer")),
+		"a right-to-left override is dropped so it cannot reorder the entry it appears in")
+	assert.Equal(t, "broker down", boundedErrorText(errors.New("bro\u200bker\u00ad down\ufeff")),
+		"invisible format characters are dropped so two different messages cannot look alike")
+
+	// KEPT: both carry orthography rather than deception, so dropping them would corrupt a
+	// legitimate message instead of sanitising a hostile one.
+	assert.Equal(t, "کتاب\u200cها", boundedErrorText(errors.New("کتاب\u200cها")),
+		"a zero-width non-joiner spells the word and must survive")
+	assert.Equal(t, "\U0001F468\u200D\U0001F4BB", boundedErrorText(errors.New("\U0001F468\u200D\U0001F4BB")),
+		"a zero-width joiner binds an emoji sequence and must survive")
+
 	t.Run("truncation happens on a rune boundary", func(t *testing.T) {
 		// Multi-byte runes, so a byte-wise cut would produce invalid UTF-8 and corrupt the
 		// log line rather than shorten it.

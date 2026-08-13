@@ -59,6 +59,38 @@ func TestValue_StripsForgeryCharactersAndBounds(t *testing.T) {
 			max:   128,
 			want:  "esc[31mrednul",
 		},
+		{
+			// U+009B is a CSI introducer on its own, so a test that stopped at DEL left an
+			// escape introducer in the line.
+			name:  "C1 controls are removed too",
+			value: "csi\u009b31mred",
+			max:   128,
+			want:  "csi31mred",
+		},
+		{
+			// THE SECOND FORGERY CLASS. A right-to-left override does not write log structure,
+			// it REORDERS the rendering of everything after it, so a value carrying one makes
+			// the fields that follow read as something else entirely.
+			name:  "a direction override is removed so it cannot reorder the line",
+			value: "subscriber\u202edeirotcaf",
+			max:   128,
+			want:  "subscriberdeirotcaf",
+		},
+		{
+			name:  "invisible format characters are removed so two values cannot look alike",
+			value: "led\u200bger\u00adops\ufeff",
+			max:   128,
+			want:  "ledgerops",
+		},
+		{
+			// KEPT, because they carry orthography rather than deception: refusing them would
+			// corrupt a legitimate Persian, Indic or emoji value instead of sanitising a
+			// hostile one.
+			name:  "the two joiners survive",
+			value: "کتاب\u200cها",
+			max:   128,
+			want:  "کتاب\u200cها",
+		},
 		{name: "surrounding whitespace is trimmed", value: "  padded  ", max: 128, want: "padded"},
 		{name: "value at the cap is untouched", value: "abcde", max: 5, want: "abcde"},
 		{

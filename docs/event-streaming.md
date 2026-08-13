@@ -904,7 +904,15 @@ A credential response for a key-scoped subscriber therefore always describes a l
 - **Clearing your prefix widens you.** An operator who removes it re-grants topic `Read`, and you go back to consuming directly from the brokers — and to reading the whole topic. `PUT /subscribers/{id}` is where that happens, and your next credential response will say so.
 - **`event_id` deduplication remains yours either way.** Kafka delivery is at-least-once on both paths; nothing about a key scope changes that obligation.
 
-`not_enforced_by` carries `partition_key` for exactly one state — `requested`, a prefix your deployment declares nothing to keep — and is empty otherwise. It stays in the body even when empty, because an absent key would read as "not stated" rather than as "nothing is unenforced". `enforced_by` carries `partition_key` in the complementary `available` and `attested` states, so the dimension is always in one list or the other and never both — assert on the pair if you want a test that fails when the contract changes.
+`not_enforced_by` carries `partition_key` for exactly one state — `requested`, a prefix your deployment declares nothing to keep — and is empty otherwise. It stays in the body even when empty, because an absent key would read as "not stated" rather than as "nothing is unenforced". `enforced_by` carries `partition_key` in the complementary `available` and `attested` states. **In `not_requested` the dimension appears in neither list**, and that is the shipped default: you asked for no key boundary, so there is none to keep and none to disclaim — your `authorized_topics` and consumer-group namespace are the whole boundary, both of them in `enforced_by`. The dimension is therefore never in both lists, and it is in one of them exactly when a prefix is recorded:
+
+| `partition_key_scope_state` | `partition_key` appears in |
+|---|---|
+| `not_requested` | neither list |
+| `requested` | `not_enforced_by` |
+| `available`, `attested` | `enforced_by` |
+
+Assert on the pair if you want a test that fails when the contract changes — and assert the `not_requested` row as "in neither" rather than as "in `not_enforced_by`", or your test will fail against a subscriber that simply has no prefix.
 
 `guidance` is prose for a human reading a response or a support ticket, and its wording may change. Branch on `gateway_delivery_required`, or assert on the `enforced_by` / `not_enforced_by` pair; those are the machine-readable contract.
 

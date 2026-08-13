@@ -243,6 +243,120 @@ func TestValidateSubscriberTopics_RefusesEveryShapeThatCouldReachAnACL(t *testin
 	})
 }
 
+// TestInspectSubscriberText_RefusesControlAndInvisibleCharacters pins the ONE character
+// rule both subscriber write paths are held to.
+//
+// The rule used to be "control characters" alone, and a subscriber name carrying U+202E
+// RIGHT-TO-LEFT OVERRIDE was therefore stored and echoed back verbatim: it rendered as its
+// own reverse for every human who read it while remaining a distinct byte string for every
+// machine that compared it. The two classes below are what a caller-supplied label and key
+// prefix can use to lie about themselves, and the exemptions are what keeps the rule from
+// bounding the alphabet a human label may be written in.
+func TestInspectSubscriberText_RefusesControlAndInvisibleCharacters(t *testing.T) {
+	t.Run("ordinary text in any script is accepted", func(t *testing.T) {
+		for _, value := range []string{
+			"",
+			"ledger-ops",
+			"ldg_9f1c8a72",
+			"réconciliation d'équipe 🇫🇷",
+			"台北結算",
+			"مطابقة الحسابات",
+		} {
+			defect, character := InspectSubscriberText(value)
+			assert.Equal(t, TextDefectNone, defect,
+				"%q is a legitimate label and must not be refused; offending rune %q", value, character)
+		}
+	})
+
+	t.Run("the joiners are exempt because they carry orthography, not deception", func(t *testing.T) {
+		// ZWNJ and ZWJ are format characters like the refused ones, and both are REQUIRED:
+		// Persian and several Indic scripts spell words with them, and an emoji sequence is
+		// bound by ZWJ. Refusing them would bound the alphabet rather than the value.
+		for name, value := range map[string]string{
+			"a Persian plural formed with ZWNJ": "کتاب\u200cها",
+			"an emoji sequence bound by ZWJ":    "ops \U0001F468\u200D\U0001F4BB",
+		} {
+			defect, _ := InspectSubscriberText(value)
+			assert.Equalf(t, TextDefectNone, defect, "%s must be accepted", name)
+		}
+	})
+
+	t.Run("control characters are reported, C1 included", func(t *testing.T) {
+		for name, expectation := range map[string]struct {
+			value     string
+			offending rune
+		}{
+			"a newline":              {"ledger\nops", '\n'},
+			"a carriage return":      {"ledger\rops", '\r'},
+			"a tab":                  {"ledger\tops", '\t'},
+			"a NUL":                  {"ledger\x00ops", '\x00'},
+			"a C0 escape introducer": {"ledger\x1b[31mops", '\x1b'},
+			"DEL":                    {"ledger\x7fops", '\x7f'},
+			// U+009B is a CSI introducer ON ITS OWN, so the previous "below 0x20 or DEL" test
+			// let a value through that can still drive a terminal.
+			"a C1 CSI introducer": {"ledger\u009b31mops", '\u009b'},
+		} {
+			defect, character := InspectSubscriberText(expectation.value)
+			assert.Equalf(t, TextDefectControl, defect, "%s must be reported as a control character", name)
+			assert.Equalf(t, expectation.offending, character, "%s must name the offending rune", name)
+		}
+	})
+
+	t.Run("invisible and direction-altering characters are reported", func(t *testing.T) {
+		// Every one of these is category Cf. They are refused because each renders as
+		// nothing or reorders what follows it, which is what lets one label impersonate
+		// another on screen.
+		for name, value := range map[string]string{
+			"a right-to-left override":  "payments\u202egnitidua",
+			"a left-to-right override":  "payments\u202dops",
+			"a right-to-left embedding": "payments\u202bops",
+			"a pop directional format":  "payments\u202cops",
+			"a right-to-left isolate":   "payments\u2067ops",
+			"a pop directional isolate": "payments\u2069ops",
+			"a left-to-right mark":      "payments\u200eops",
+			"an Arabic letter mark":     "payments\u061cops",
+			"a zero-width space":        "payments\u200bops",
+			"a word joiner":             "payments\u2060ops",
+			"an invisible times":        "payments\u2062ops",
+			"a soft hyphen":             "payments\u00adops",
+			"a byte-order mark":         "payments\ufeffops",
+			"an interlinear anchor":     "payments\ufff9ops",
+			"a language tag":            "payments\U000E0001ops",
+		} {
+			defect, character := InspectSubscriberText(value)
+			assert.Equalf(t, TextDefectInvisible, defect, "%s must be reported as invisible", name)
+			assert.NotZerof(t, character, "%s must name the offending rune", name)
+		}
+	})
+
+	t.Run("the first defect wins, so a message names what the reader should look for", func(t *testing.T) {
+		defect, character := InspectSubscriberText("ops\u202e\nforged")
+		assert.Equal(t, TextDefectInvisible, defect, "the override comes first")
+		assert.Equal(t, '\u202e', character)
+
+		defect, character = InspectSubscriberText("ops\n\u202eforged")
+		assert.Equal(t, TextDefectControl, defect, "the newline comes first")
+		assert.Equal(t, '\n', character)
+	})
+}
+
+// TestFormatCodePoint_NamesTheCharacterWithoutReproducingIt is the reason the refusals
+// can say WHICH character was rejected at all.
+//
+// The rejected characters are invisible or unprintable by definition, so quoting one into
+// a message would produce a refusal an operator cannot read — and would put the offending
+// character into the very log line that reports it.
+func TestFormatCodePoint_NamesTheCharacterWithoutReproducingIt(t *testing.T) {
+	assert.Equal(t, "U+202E", FormatCodePoint('\u202e'))
+	assert.Equal(t, "U+000A", FormatCodePoint('\n'), "four digits minimum keeps the rendering scannable")
+	assert.Equal(t, "U+00AD", FormatCodePoint('\u00ad'))
+	assert.Equal(t, "U+E0001", FormatCodePoint('\U000E0001'), "a code point past four digits is not truncated")
+
+	rendered := FormatCodePoint('\u202e')
+	assert.NotContains(t, rendered, "\u202e",
+		"the rendering must not carry the character itself, or a message quoting it is reordered by it")
+}
+
 // TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming covers the four state predicates on
 // the registry row, including the migration-stamp and key-scope predicates.
 func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {

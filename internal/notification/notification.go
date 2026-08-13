@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/blnkfinance/blnk/internal/request"
 
@@ -355,6 +356,15 @@ const maxLoggedErrorLength = 512
 // error from a genuinely short one and does not diagnose the truncation as the error.
 const logTruncationSuffix = "…[truncated]"
 
+// zeroWidthNonJoiner and zeroWidthJoiner are the two Unicode format characters
+// boundedErrorText keeps rather than drops: both carry orthographic meaning — in Persian,
+// Arabic and Indic scripts, and in emoji sequences — so removing them would corrupt a
+// legitimate message instead of neutralising a hostile one.
+const (
+	zeroWidthNonJoiner = '\u200C'
+	zeroWidthJoiner    = '\u200D'
+)
+
 // boundedErrorText renders an error for a log FIELD: control characters neutralised and
 // the length capped.
 func boundedErrorText(err error) string {
@@ -371,9 +381,20 @@ func boundedErrorText(err error) string {
 			// Replaced with a space rather than dropped: removing them would run words
 			// together and make a multi-line error harder to read than it needs to be.
 			builder.WriteRune(' ')
-		case character < 0x20 || character == 0x7f:
+		case unicode.IsControl(character):
 			// Every other control character is dropped. None of them is legible, and a
-			// terminal escape sequence in particular can rewrite what an operator sees.
+			// terminal escape sequence in particular can rewrite what an operator sees. The
+			// range includes the C1 controls, where U+009B is a CSI introducer on its own — a
+			// test that stopped at DEL left that introducer in the field.
+		case character == zeroWidthNonJoiner || character == zeroWidthJoiner:
+			// Kept: these two format characters carry orthographic meaning, so dropping them
+			// would corrupt a legitimate message rather than sanitise a hostile one.
+			builder.WriteRune(character)
+		case unicode.Is(unicode.Cf, character):
+			// Dropped for the same reason as a control character, by a different mechanism:
+			// U+202E RIGHT-TO-LEFT OVERRIDE reverses the rendering of everything after it, so
+			// an error string carrying one rewrites how the rest of the log entry reads, and
+			// U+200B and U+FEFF are invisible, so they hide differences between two entries.
 		default:
 			builder.WriteRune(character)
 		}

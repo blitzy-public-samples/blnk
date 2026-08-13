@@ -226,6 +226,16 @@ func TestSubscriberRequests_AdjudicateTheKeyScopeShape(t *testing.T) {
 		"a prefix with a newline":  "ldg_9f1c\n8a72",
 		"a prefix with whitespace": " ldg_9f1c ",
 		"an over-long prefix":      strings.Repeat("k", 500),
+		// A C1 CONTROL, which the previous "below 0x20 or DEL" test let through.
+		"a prefix with a C1 control": "ldg_9f1c\u009b8a72",
+		// INVISIBLE AND DIRECTION-ALTERING CHARACTERS. HasKeyAccess compares this prefix
+		// against a record key byte-for-byte, so a prefix carrying one of these matches
+		// nothing while reading — in the credential response, on a dashboard and in a support
+		// ticket — exactly like the boundary the subscriber was told it has.
+		"a prefix with a right-to-left override": "ldg_9f1c\u202e8a72",
+		"a prefix with a zero-width space":       "ldg_9f1c\u200b8a72",
+		"a prefix with a soft hyphen":            "ldg_9f1c\u00ad8a72",
+		"a prefix with a byte-order mark":        "ldg_9f1c\ufeff8a72",
 	} {
 		t.Run(name, func(t *testing.T) {
 			create := validCreateSubscriber()
@@ -286,6 +296,42 @@ func TestValidateSubscriberName_RefusesUnstorableLabels(t *testing.T) {
 
 	assert.NoError(t, validateSubscriberName("réconciliation d'équipe 🇫🇷", true),
 		"the alphabet is deliberately unrestricted: a name is a human label")
+
+	// INVISIBLE AND DIRECTION-ALTERING CHARACTERS, which the control-character test above
+	// does not catch: they are Unicode FORMAT characters, not controls. A label carrying
+	// U+202E was accepted, stored, and echoed back verbatim in the create response and the
+	// subscriber list — rendering as its own reverse for every human who read it while
+	// remaining a different byte string for every machine that compared it, which is two
+	// subscribers presenting one appearance to whoever authorises a grant.
+	for name, value := range map[string]string{
+		"a right-to-left override": "readonly\u202eetirw-lluf",
+		"a left-to-right override": "ledger\u202dops",
+		"a right-to-left isolate":  "ledger\u2067ops",
+		"a left-to-right mark":     "ledger\u200eops",
+		"a zero-width space":       "ledger\u200bops",
+		"a soft hyphen":            "ledger\u00adops",
+		"a byte-order mark":        "ledger\ufeffops",
+		"a word joiner":            "ledger\u2060ops",
+	} {
+		err := validateSubscriberName(value, true)
+		assert.Errorf(t, err, "%s must be refused in a label", name)
+
+		if err != nil {
+			assert.NotContainsf(t, err.Error(), value,
+				"%s: the refusal must name the code point rather than echo the value back", name)
+		}
+	}
+
+	assert.Error(t, validateSubscriberName("ledger\u009bops", true),
+		"a C1 control is a control character too, and U+009B is a CSI introducer on its own")
+
+	// THE TWO EXEMPT FORMAT CHARACTERS. Refusing these would bound the alphabet rather
+	// than the value: Persian and several Indic scripts spell words with ZWNJ, and an
+	// emoji sequence is bound by ZWJ.
+	assert.NoError(t, validateSubscriberName("کتاب\u200cها", true),
+		"a zero-width non-joiner carries orthography and must be accepted")
+	assert.NoError(t, validateSubscriberName("ops \U0001F468\u200D\U0001F4BB", true),
+		"a zero-width joiner binds an emoji sequence and must be accepted")
 }
 
 // ---------------------------------------------------------------------------
