@@ -7,7 +7,7 @@
 ![Build and Test Status](https://github.com/blnkfinance/blnk/actions/workflows/go.yml/badge.svg)
 ![Deploy to Docker Status](https://github.com/blnkfinance/blnk/actions/workflows/docker-publish.yml/badge.svg)
 ![Linter Status](https://github.com/blnkfinance/blnk/actions/workflows/lint.yml/badge.svg)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 
 <br/>
 
@@ -28,9 +28,9 @@ The fastest way to understand Blnk is to deploy a sandbox and follow the develop
 Start here:
 
 - [Install Blnk locally](https://docs.blnkfinance.com/home/install) or [Deploy your sandbox](https://cloud.blnkfinance.com/auth/sign-up?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
-- [Create your first ledger, balance, and transaction](https://docs.blnkfinance.com/tutorials/quick-start/create-your-first-ledger-balance-and-transaction?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
+- [Create your first ledger, balance, and transaction](https://docs.blnkfinance.com/tutorials/quick-start/wallet-management?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing), which the wallet quick start walks through in that order
 - [Explore Blnk tutorials](https://docs.blnkfinance.com/tutorials?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
-- [Read the API reference](https://docs.blnkfinance.com/api-reference?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
+- [Read the API reference](https://docs.blnkfinance.com/reference/overview?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
 - [Set up Kafka event streaming](docs/kafka-operations.md), which is optional: the Docker Compose stack ships a single-broker Kafka with SASL/SCRAM behind an opt-in `kafka` profile and provisions the topics at startup, and with `KAFKA_BROKERS` unset the ledger runs exactly as before
 
 <br/>

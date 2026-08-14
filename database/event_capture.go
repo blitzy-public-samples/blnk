@@ -18,7 +18,12 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"strings"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/blnkfinance/blnk/model"
 )
@@ -130,4 +135,120 @@ func transactionLedgerIDFromSet(txn *model.Transaction, ledgers map[string]strin
 	}
 
 	return ledgers[txn.Destination]
+}
+
+// handoffLifecycleEventType names the lifecycle event of a transaction that is being
+// persisted on its OWN, without a balance movement beside it — which is to say a
+// transaction the queue has accepted but not yet executed.
+//
+// Those are the only two statuses this file captures for. Every other status belongs to a
+// transaction that moved money, and its event is captured by the atomic writer alongside
+// the balance updates; capturing it here as well would attempt a second row under the
+// same derived event id, and blnk.event_outbox's unique index on event_id would then roll
+// back the ledger write itself. The guard is therefore load-bearing rather than tidy.
+//
+// Parameters:
+//   - txn *model.Transaction: the transaction about to be recorded. May be nil.
+//
+// Returns:
+//   - string: the event name to capture, or "" when this transaction's event belongs to
+//     another writer.
+func handoffLifecycleEventType(txn *model.Transaction) string {
+	if txn == nil {
+		return ""
+	}
+
+	switch eventType := model.EventTypeForTransactionStatus(txn.Status); eventType {
+	case model.EventTypeTransactionQueued, model.EventTypeTransactionScheduled:
+		return eventType
+	default:
+		return ""
+	}
+}
+
+// captureHandoffTransactionEvent builds the event-outbox row for a transaction being
+// recorded in the QUEUED or SCHEDULED state, so the queue's acceptance of it is announced
+// with the same durability as its eventual execution.
+//
+// Parameters:
+//   - ctx context.Context: the writer's context. Used for tracing and for the ledger
+//     lookup below.
+//   - txn *model.Transaction: the transaction about to be recorded.
+//
+// Returns:
+//   - *model.EventOutbox: the row to commit with the transaction, or nil when this
+//     transaction's event is another writer's to capture or event publishing is
+//     unconfigured.
+//   - error: a real capture failure, such as a payload that will not serialise. The
+//     caller must refuse the write rather than commit a movement no subscriber is told
+//     about — the posture persistSingleTransactionExecutionWork already takes.
+func (d Datasource) captureHandoffTransactionEvent(ctx context.Context, txn *model.Transaction) (*model.EventOutbox, error) {
+	if handoffLifecycleEventType(txn) == "" {
+		return nil, nil
+	}
+
+	capture := registeredTransactionEventCapture()
+	if capture == nil {
+		return nil, nil
+	}
+
+	return capture(ctx, txn, d.transactionLedgerID(ctx, txn))
+}
+
+// transactionLedgerID resolves the ledger a transaction belongs to by reading it off the
+// transaction's own balances.
+//
+// The atomic writers do not need this: they are already holding the balance rows they are
+// updating, so they resolve the ledger from the set in memory. A transaction recorded on
+// its own has no such set — the balances were fetched while it was being prepared and
+// discarded — and the ledger is what the event's partition key and ledger_id column are
+// built from, so a lookup is the only way to key the event on the dimension its type
+// declares. One indexed read, on the acceptance path rather than the relay's, and a miss
+// is not an error: the capture then keys the event on its aggregate instead.
+//
+// Parameters:
+//   - ctx context.Context: cancels the lookup.
+//   - txn *model.Transaction: the transaction whose ledger is wanted.
+//
+// Returns:
+//   - string: the ledger id, preferring the source balance's, or "" when neither balance
+//     names one.
+func (d Datasource) transactionLedgerID(ctx context.Context, txn *model.Transaction) string {
+	if txn == nil {
+		return ""
+	}
+
+	source := strings.TrimSpace(txn.Source)
+	destination := strings.TrimSpace(txn.Destination)
+	if source == "" && destination == "" {
+		return ""
+	}
+
+	var ledgerID sql.NullString
+
+	// ORDERED SO THE SOURCE WINS, matching transactionLedgerIDFromSet's preference above:
+	// the two resolutions must agree, or one transaction's queued event and its applied
+	// event would be keyed on different ledgers and could be published out of order
+	// against each other.
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT balance.ledger_id
+		FROM blnk.balances balance
+		WHERE balance.balance_id IN ($1, $2)
+		ORDER BY CASE WHEN balance.balance_id = $1 THEN 0 ELSE 1 END
+		LIMIT 1
+	`, source, destination).Scan(&ledgerID)
+	if err != nil {
+		// A miss is the ordinary outcome for an internal balance reference that names no
+		// stored row, so it is not reported as a fault. Logged at debug so a systematic miss
+		// is still discoverable.
+		if !errors.Is(err, sql.ErrNoRows) {
+			logrus.WithField("cause", databaseErrorClass(err)).Debug(
+				"the ledger of a queued transaction could not be read, so its event is keyed on " +
+					"its aggregate rather than its ledger")
+		}
+
+		return ""
+	}
+
+	return strings.TrimSpace(ledgerID.String)
 }

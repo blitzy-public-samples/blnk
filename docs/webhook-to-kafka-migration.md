@@ -257,6 +257,15 @@ curl -sS -X POST --config "$BLNK_CURL_CONFIG" \
 
 This records the endpoint you receive pushes on today so that your cutover can be tracked, and it clears `migrated_at` in the same statement — recording an address puts the subscriber back into the population awaiting migration. It **does not** start, stop or redirect any delivery: read [The webhook-subscription routes track migration only](#the-webhook-subscription-routes-track-migration-only) before you rely on it. The route is one of the four deprecated ones, so it answers `410 Gone` once the retirement instant has passed; by then there is nothing left to record.
 
+**Two URL shapes are refused with `400`, and one of them will surprise you if your endpoint uses HTTP basic auth.**
+
+| Refused | Example | Why, and what to send instead |
+|---|---|---|
+| **Embedded credentials** — anything before an `@` in the authority | `https://user:secret@events.acme.example/blnk` | This column is stored verbatim, read by operators, and returned by `GET .../webhook-subscription`, so a password written into it is a password disclosed wherever the subscriber record goes — an API response, a support export, a database backup. **Record the URL without the credentials** (`https://events.acme.example/blnk`) and keep the credential where it belongs, in a header your endpoint checks. The column tracks *which* endpoint, never *how to authenticate to* it, and nothing in Blnk dials it. An `@` after the authority is untouched: `https://events.acme.example/hook@v2` is accepted. |
+| **A literal space or ASCII control character** | `https://events.acme.example/a b` | Percent-encode it: `https://events.acme.example/a%20b` denotes the identical URL, and storing the canonical form is what keeps two spellings of one endpoint from being recorded as two different destinations. The refusal names the byte offset so you can find it. |
+
+Values recorded before these rules existed were rewritten in place by `sql/1781252700.sql` — userinfo stripped, literal spaces percent-encoded, host, port, path, query and fragment otherwise untouched. If a subscriber's recorded URL looks shorter than you remember, that is why, and the credential it used to carry is gone from the table.
+
 **2. Issue the credentials** (operator, master key).
 
 Write the response **straight to a mode-0600 file** and read the password out of that file. Do not

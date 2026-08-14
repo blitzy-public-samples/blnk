@@ -260,6 +260,39 @@ run_workers:
 # the caller's environment over .env below; it is not a special case anywhere.
 CONFIG_FILE?=blnk.json
 
+# WHETHER THE OPERATOR NAMED A CONFIGURATION FILE, as opposed to inheriting the default above.
+#
+# `$(origin)` is what separates the two, and nothing else can: by the time a recipe runs,
+# `CONFIG_FILE` holds `blnk.json` either way. It reports `file` when the `?=` above supplied
+# the value and `command line` or `environment` when the operator did — so
+# `make run_relay CONFIG_FILE=/etc/blnk/prod.json` is a naming and a bare `make run_relay` is
+# not.
+#
+# WHY THAT DISTINCTION DECIDES WHETHER `--config` IS PASSED AT ALL. cmd/main.go draws a
+# deliberate line: an explicitly named file that cannot be read is FATAL, while the default
+# path's absence is tolerated, because environment-only configuration is a first-class mode —
+# it is how the compose stack, the Kubernetes manifests and the entire test suite run. Passing
+# `--config blnk.json` unconditionally erased that line. It turned the tolerated case into the
+# fatal one, so this target was the only way to start Blnk that could not start it from its
+# environment, and a clean checkout configured through `.env` — the arrangement `stack.sh
+# --init` produces and the runbook documents — failed with the application demanding a file no
+# instruction had asked anyone to create. Every other run target (`run`, `run_workers`,
+# `migrate_up`) passes no `--config` at all, so this was also the odd one out.
+#
+# The flag is therefore passed when it MEANS something and omitted when it does not:
+#
+#   - named by the operator      -> passed, and a missing file is fatal. That is the point of
+#                                   naming one, and the diagnostic belongs to the application.
+#   - default, and the file IS   -> passed. Identical behaviour to before for everyone who
+#     there                         has a blnk.json, which is what the gate below reads.
+#   - default, and it is ABSENT  -> OMITTED, so the application configures itself from the
+#                                   environment exactly as `make run` already does.
+#
+# Resolved per-recipe rather than at parse time, because the file can be created between
+# reading the makefile and running the target.
+CONFIG_FILE_NAMED := $(if $(filter command line environment,$(origin CONFIG_FILE)),yes,)
+CONFIG_FLAG_ARGS = $$(if [ -n "$(CONFIG_FILE_NAMED)" ] || [ -f "$(CONFIG_FILE)" ]; then printf '%s %s' --config "$(CONFIG_FILE)"; fi)
+
 # Answers "does ${CONFIG_FILE} declare at least one USABLE Kafka broker?" through an
 # exit status: 0 yes, non-zero no.
 #
@@ -299,7 +332,13 @@ run_server_relay:
 	echo "same predicate the relay's own gate uses. Its refusal names every source it read."; \
 	echo "'KAFKA_BROKERS= make run_relay' therefore means no brokers for this run and is refused,"; \
 	echo "because a name that is set and empty clears a list ${CONFIG_FILE} supplied."; \
-	exec ./${PROJECT} start --config "${CONFIG_FILE}" --require-kafka
+	config_args="${CONFIG_FLAG_ARGS}"; \
+	if [ -z "$$config_args" ]; then \
+		echo "No ${CONFIG_FILE} is present and none was named, so --config is not passed and the"; \
+		echo "application configures itself from the environment — the same way 'make run' does."; \
+		echo "Pass CONFIG_FILE=<path> to require a file instead."; \
+	fi; \
+	exec ./${PROJECT} start $$config_args --require-kafka
 
 # Identical behaviour, including the announcement above, so neither spelling can leave
 # an operator believing a bare relay is what came up.
@@ -475,6 +514,20 @@ alerts_configmap:
 
 # Everything the alert rules are gated on, in one run.
 alerts: alerts_test alerts_configmap
+
+# THE DOCUMENTATION'S LINKS, BOTH HALVES.
+#
+# Two README links shipped as 404s because the documentation site retired the pages they
+# pointed at. The hermetic half — relative paths, section anchors, path case — runs in the
+# ordinary test suite and needs no network. This target adds the half that does: it resolves
+# every external link for real.
+#
+# Run it before changing a link, and after replacing one. CI runs the same script weekly,
+# because a page retired by somebody else arrives with no commit to trigger on.
+docs_links:
+	@set -e; \
+	go test -count=1 -run 'TestDocumentationLinks' . ; \
+	./scripts/check-doc-links.sh
 
 migrate_up:
 	./${PROJECT} migrate up

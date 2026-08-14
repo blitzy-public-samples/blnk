@@ -1585,6 +1585,266 @@ func TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate(t *testing.T) {
 // the partition count the application actually creates.
 //
 // The first subtest derives the geometry from the code and asserts the volume holds it.
+// TestManifests_PostgresStorageClaimIsPreProvisionedUnderTheNameTheSetResolves holds
+// pg-data-persistentvolumeclaim.yaml to the same contract its Kafka counterpart above is
+// held to, and for the same reason: a claim is either mounted by something or it is a
+// volume nobody uses.
+//
+// THIS FILE USED TO BE THE SECOND KIND. It was a kompose conversion artifact holding a
+// claim named `pg-data` — the volumeClaimTemplate's name rather than the claim's — so the
+// StatefulSet resolved `pg-data-postgres-0`, created it from the template, and this object
+// sat Pending for ever. It requested 100Mi, four orders of magnitude below what the event
+// outbox needs, so a version of it that HAD been adopted would have been worse than the
+// orphan: the database would have run out of disk rather than merely wasted a manifest.
+//
+// The two claims that shipped alongside it, `server-claim0` and `worker-claim0`, were
+// DELETED rather than corrected, and the asymmetry is deliberate. Those belonged to
+// Deployments, which have no volumeClaimTemplate and therefore no derived name to correct
+// them to; the server and worker keep their working state in an emptyDir, and both scale to
+// ten replicas under their HPAs, so one ReadWriteOnce claim could not have served them
+// anyway — it is one volume mountable by one node. There was no correct wiring for those
+// two, only a correct deletion.
+func TestManifests_PostgresStorageClaimIsPreProvisionedUnderTheNameTheSetResolves(t *testing.T) {
+	statefulSet := readYAMLFile(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "postgres-statefulset.yaml",
+	))
+
+	metadata, ok := statefulSet["metadata"].(map[string]interface{})
+	require.True(t, ok, "postgres-statefulset.yaml must declare metadata")
+	setName := toStringValue(metadata["name"])
+	require.NotEmpty(t, setName, "the StatefulSet must be named for its claim name to be derivable")
+
+	spec, ok := statefulSet["spec"].(map[string]interface{})
+	require.True(t, ok, "postgres-statefulset.yaml must declare a spec")
+
+	// Defaults to one when omitted, exactly as Kubernetes does, so this test does not
+	// require a field the manifest is free to leave out.
+	replicas := 1
+	if declared, isInt := spec["replicas"].(int); isInt {
+		replicas = declared
+	}
+	require.Positive(t, replicas, "a database set with no replicas has no storage to claim")
+
+	templates, ok := spec["volumeClaimTemplates"].([]interface{})
+	require.Truef(t, ok && len(templates) == 1,
+		"postgres-statefulset.yaml must declare exactly one volumeClaimTemplate; a second one "+
+			"changes the claim name this test derives and the pre-provisioned claim would be orphaned")
+
+	template, ok := templates[0].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must be a mapping")
+	templateMeta, ok := template["metadata"].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must declare metadata")
+	templateName := toStringValue(templateMeta["name"])
+	require.NotEmpty(t, templateName, "the volumeClaimTemplate must be named")
+
+	templateSpec, ok := template["spec"].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must declare a spec")
+	templateResources, _ := templateSpec["resources"].(map[string]interface{})
+	templateRequests, _ := templateResources["requests"].(map[string]interface{})
+	templateBytes := parseKubernetesQuantityBytes(t, toStringValue(templateRequests["storage"]))
+
+	templateModes := stringListValue(templateSpec["accessModes"])
+	require.NotEmpty(t, templateModes, "the volumeClaimTemplate must declare an access mode")
+
+	claims := readYAMLDocuments(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "pg-data-persistentvolumeclaim.yaml",
+	))
+
+	byName := make(map[string]map[string]interface{}, len(claims))
+	for _, claim := range claims {
+		assert.Equalf(t, "PersistentVolumeClaim", toStringValue(claim["kind"]),
+			"pg-data-persistentvolumeclaim.yaml must hold only claims")
+
+		claimMeta, isMap := claim["metadata"].(map[string]interface{})
+		require.True(t, isMap, "every claim must declare metadata")
+		byName[toStringValue(claimMeta["name"])] = claim
+	}
+
+	t.Run("one claim per replica, named as the StatefulSet will look for it", func(t *testing.T) {
+		expected := make([]string, 0, replicas)
+		for ordinal := 0; ordinal < replicas; ordinal++ {
+			expected = append(expected, fmt.Sprintf("%s-%s-%d", templateName, setName, ordinal))
+		}
+
+		actual := make([]string, 0, len(byName))
+		for name := range byName {
+			actual = append(actual, name)
+		}
+		sort.Strings(actual)
+		sort.Strings(expected)
+
+		assert.Equalf(t, expected, actual,
+			"the claims in pg-data-persistentvolumeclaim.yaml must be exactly %v, because that is "+
+				"the <template>-<set>-<ordinal> form the StatefulSet resolves. A claim under any "+
+				"other name is never mounted — it provisions a volume nothing uses, which is exactly "+
+				"what this file held before it was corrected",
+			expected)
+	})
+
+	t.Run("no bare singleton claim under the template's own name", func(t *testing.T) {
+		_, present := byName[templateName]
+		assert.Falsef(t, present,
+			"a claim named exactly %q must NOT exist. It is the shape this file held as a kompose "+
+				"artifact: %q is the TEMPLATE's name, not a claim's, so the StatefulSet resolves %q "+
+				"and creates it from the template, leaving a claim of this name Pending for ever",
+			templateName, templateName, fmt.Sprintf("%s-%s-0", templateName, setName))
+	})
+
+	t.Run("the claim requests what the template requests", func(t *testing.T) {
+		for name, claim := range byName {
+			claimSpec, isMap := claim["spec"].(map[string]interface{})
+			require.Truef(t, isMap, "%s must declare a spec", name)
+
+			resources, _ := claimSpec["resources"].(map[string]interface{})
+			requests, _ := resources["requests"].(map[string]interface{})
+			claimBytes := parseKubernetesQuantityBytes(t, toStringValue(requests["storage"]))
+
+			assert.Equalf(t, templateBytes, claimBytes,
+				"%s requests %d bytes against the volumeClaimTemplate's %d. Kubernetes ADOPTS a "+
+					"pre-existing claim rather than reconciling it, so the smaller number wins "+
+					"silently and the database runs with less disk than the retention arithmetic was "+
+					"sized against — which surfaces as a ledger that has stopped accepting writes, "+
+					"not as a manifest error. The sizing figure belongs in BOTH files, changed together",
+				name, claimBytes, templateBytes)
+
+			assert.Equalf(t, templateModes, stringListValue(claimSpec["accessModes"]),
+				"%s declares access modes the template does not. The scheduler places the pod using "+
+					"the CLAIM's modes, so a mismatch here is a pod that cannot be placed where the "+
+					"workload assumed it could", name)
+
+			assert.Equalf(t, toStringValue(templateSpec["storageClassName"]),
+				toStringValue(claimSpec["storageClassName"]),
+				"%s and the volumeClaimTemplate must name the same storage class (both omit it today, "+
+					"taking the cluster default). Naming it on one side only means the adopted volume "+
+					"is backed by storage the workload never asked for — different IOPS, different "+
+					"durability, possibly a class that cannot expand", name)
+
+			claimMeta, _ := claim["metadata"].(map[string]interface{})
+			assert.Equalf(t, "blnk", toStringValue(claimMeta["namespace"]),
+				"%s must live in the blnk namespace alongside the StatefulSet. A claim in another "+
+					"namespace is invisible to the set, so the set creates its own and this one "+
+					"provisions a volume nothing mounts", name)
+		}
+	})
+}
+
+// TestManifests_EveryPersistentVolumeClaimIsEitherMountedOrPreProvisioned is the check that
+// would have caught all three orphans as a class rather than one at a time.
+//
+// A claim earns its place in this tree one of exactly two ways: something names it in a
+// `claimName`, or it is the pre-provisioning half of a StatefulSet's volumeClaimTemplate and
+// carries the derived `<template>-<set>-<ordinal>` name that set resolves. A claim that is
+// neither provisions storage no pod ever mounts — it binds a PersistentVolume, it can cost
+// money on a cloud provider, and it reports nothing but `Pending`.
+func TestManifests_EveryPersistentVolumeClaimIsEitherMountedOrPreProvisioned(t *testing.T) {
+	manifests := filepath.Join(moduleRootDir(t), "infrastructure", "k8s-manifests")
+
+	entries, err := os.ReadDir(manifests)
+	require.NoError(t, err, "the manifest directory must be readable")
+
+	// Every name a workload mounts by claimName, and every name a StatefulSet will resolve
+	// from its own template. The union is what a committed claim may legitimately be called.
+	mounted := make(map[string]string)
+	derived := make(map[string]string)
+	declared := make(map[string]string)
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
+			continue
+		}
+
+		for _, document := range readYAMLDocuments(t, filepath.Join(manifests, entry.Name())) {
+			if document == nil {
+				continue
+			}
+
+			switch toStringValue(document["kind"]) {
+			case "PersistentVolumeClaim":
+				meta, _ := document["metadata"].(map[string]interface{})
+				if name := toStringValue(meta["name"]); name != "" {
+					declared[name] = entry.Name()
+				}
+
+			case "StatefulSet":
+				meta, _ := document["metadata"].(map[string]interface{})
+				spec, _ := document["spec"].(map[string]interface{})
+				setName := toStringValue(meta["name"])
+
+				replicas := 1
+				if value, isInt := spec["replicas"].(int); isInt {
+					replicas = value
+				}
+
+				templates, _ := spec["volumeClaimTemplates"].([]interface{})
+				for _, raw := range templates {
+					template, isMap := raw.(map[string]interface{})
+					if !isMap {
+						continue
+					}
+					templateMeta, _ := template["metadata"].(map[string]interface{})
+					templateName := toStringValue(templateMeta["name"])
+					if templateName == "" {
+						continue
+					}
+					for ordinal := 0; ordinal < replicas; ordinal++ {
+						derived[fmt.Sprintf("%s-%s-%d", templateName, setName, ordinal)] = entry.Name()
+					}
+				}
+			}
+
+			collectClaimNames(document, entry.Name(), mounted)
+		}
+	}
+
+	require.NotEmpty(t, declared, "the manifest set must declare at least one claim for this to hold")
+
+	for name, file := range declared {
+		mountedIn, isMounted := mounted[name]
+		derivedFrom, isDerived := derived[name]
+
+		assert.Truef(t, isMounted || isDerived,
+			"the claim %q declared in %s is neither mounted by any claimName in this manifest set nor "+
+				"the derived <template>-<set>-<ordinal> name of any StatefulSet's volumeClaimTemplate. "+
+				"It therefore provisions a volume nothing ever mounts and reports only Pending. Either "+
+				"give it a consumer, rename it to the derived name a StatefulSet resolves, or delete "+
+				"it. Three claims in this tree — pg-data, server-claim0 and worker-claim0 — were "+
+				"exactly this, and two of them had no correct wiring available at all",
+			name, file)
+
+		if isMounted && isDerived {
+			assert.Failf(t, "a claim cannot be both",
+				"the claim %q is mounted by a claimName in %s AND is the derived name of a "+
+					"volumeClaimTemplate in %s. The StatefulSet will adopt it while another workload "+
+					"mounts it, so two pods write to one ReadWriteOnce volume",
+				name, mountedIn, derivedFrom)
+		}
+	}
+}
+
+// collectClaimNames walks an arbitrary manifest document and records every
+// persistentVolumeClaim.claimName it finds, mapped to the file it came from. Written as a
+// generic walk rather than a path-specific lookup because claimName appears at different
+// depths in Deployments, StatefulSets, Jobs and bare Pods, and a lookup that knew only about
+// Deployments would report a claim mounted by a Job as unmounted.
+func collectClaimNames(node interface{}, file string, into map[string]string) {
+	switch typed := node.(type) {
+	case map[string]interface{}:
+		if claim, isMap := typed["persistentVolumeClaim"].(map[string]interface{}); isMap {
+			if name := toStringValue(claim["claimName"]); name != "" {
+				into[name] = file
+			}
+		}
+		for _, value := range typed {
+			collectClaimNames(value, file, into)
+		}
+
+	case []interface{}:
+		for _, value := range typed {
+			collectClaimNames(value, file, into)
+		}
+	}
+}
+
 func TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor(t *testing.T) {
 	categories := model.AllEventCategories()
 	require.NotEmpty(t, categories, "the event catalogue must resolve at least one category")
@@ -1950,9 +2210,27 @@ func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T)
 
 	// Comments cannot appear inside a recipe's shell continuation, so nothing is stripped here:
 	// every line asserted about below is executed.
-	assert.Truef(t, strings.Contains(recipe, `exec ./${PROJECT} start --config "${CONFIG_FILE}" --require-kafka`),
+	assert.Truef(t, strings.Contains(recipe, `exec ./${PROJECT} start $$config_args --require-kafka`),
 		"%s: the %s recipe must exec the server with --require-kafka, so the APPLICATION decides "+
 			"whether brokers are configured", makefilePath, relayTargetName)
+
+	// AND THE CONFIG FLAG MUST STAY CONDITIONAL. It used to be spelled
+	// `--config "${CONFIG_FILE}"` inline, which made a file the operator never asked for
+	// MANDATORY: cmd/main.go treats a named-but-missing file as fatal while tolerating the
+	// default path's absence, so the inline form was the one way to start Blnk that could not
+	// start it from its environment. Reinstating it inline would restore that, so the recipe
+	// must go through the expansion that decides — held in all three cases by
+	// TestMakeRunRelay_PassesConfigOnlyWhenItMeansSomething.
+	assert.Falsef(t, strings.Contains(recipe, `--config "${CONFIG_FILE}"`),
+		"%s: the %s recipe must not pass --config unconditionally. An environment-only "+
+			"deployment is a first-class mode — the compose stack, the Kubernetes manifests and "+
+			"this test suite all run that way — and naming a file that is not there is fatal",
+		makefilePath, relayTargetName)
+
+	assert.Truef(t, strings.Contains(recipe, `config_args="${CONFIG_FLAG_ARGS}"`),
+		"%s: the %s recipe must resolve the config flag through CONFIG_FLAG_ARGS, which passes it "+
+			"only when the operator named a file or one is actually present", makefilePath,
+		relayTargetName)
 
 	// THE SHELL RESOLUTION, in every form it took. Each of these RANKS or TESTS the
 	// sources — picks a winner, reads a value, or inspects the config file — and ranking

@@ -512,8 +512,17 @@ const (
 	EventTypeTransactionInflight  = "transaction.inflight"
 	EventTypeTransactionVoid      = "transaction.void"
 	EventTypeTransactionRejected  = "transaction.rejected"
-	// EventTypeTransactionUnknown is a REAL, REACHABLE value and not a placeholder. The
-	// COMMIT status has no case in EventTypeForTransactionStatus and falls through to it.
+	// EventTypeTransactionUnknown is the DEFENSIVE DEFAULT for a status this mapping has no
+	// case for, and that is the whole of what it is. It is not the name of any transaction
+	// outcome, and no code path in this repository produces it.
+	//
+	// It used to be described here as the name a COMMIT is announced under, which was
+	// wrong: updateTransactionDetails normalises COMMIT to APPLIED before the event is
+	// derived, so a committed inflight transaction is announced transaction.applied — over
+	// Kafka today and over the HTTP webhook before it. The fall-through is real in this
+	// function and pinned by a test so an unmapped status can never be dropped silently,
+	// but reaching it requires a status no writer assigns. A consumer should tolerate the
+	// name and must not wait for it. See "The COMMIT Status" in docs/event-streaming.md.
 	EventTypeTransactionUnknown = "transaction.unknown"
 )
 
@@ -558,7 +567,10 @@ func EventTypeForTransactionStatus(status string) string {
 	case transactionStatusRejected:
 		return EventTypeTransactionRejected
 	default:
-		// COMMIT lands here. See the note above; this fall-through is intentional.
+		// A status this mapping has no case for. Nothing in this repository reaches it —
+		// COMMIT does not, because it is normalised to APPLIED before an event is derived
+		// from it — so this arm exists so that a status added in future cannot be dropped
+		// silently. See the note on EventTypeTransactionUnknown.
 		return EventTypeTransactionUnknown
 	}
 }

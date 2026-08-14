@@ -1660,9 +1660,10 @@ func (h *publisherRecordedHistogram) snapshot() []publisherMetricRecord {
 func publisherAttributeMap(set attribute.Set) map[string]string {
 	attributes := make(map[string]string, set.Len())
 	for _, keyValue := range set.ToSlice() {
-		// Value.Emit renders the string, int64 and bool attributes the publisher records
-		// exactly as they were recorded.
-		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
+		// Value.String renders the string, int64 and bool attributes the publisher records
+		// exactly as they were recorded. It replaces Value.Emit, deprecated in
+		// go.opentelemetry.io/otel v1.44.0, and for these kinds the bytes are identical.
+		attributes[string(keyValue.Key)] = keyValue.Value.String()
 	}
 
 	return attributes

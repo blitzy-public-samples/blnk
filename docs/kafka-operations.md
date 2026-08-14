@@ -4,7 +4,7 @@ This is the operator's runbook for Blnk's Kafka event pipeline: how to provision
 
 ## How to Use This Document
 
-Every rule in `alerts/blnk-kafka-alerts.yml` names this file as its `runbook_url`, and **all 14 of them are listed below** — the table is the complete set, not a selection. `TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere` fails if a rule is added without a row here. If you arrived from a notification, go straight to your alert:
+Every rule in `alerts/blnk-kafka-alerts.yml` names this file as its `runbook_url`, and **all 16 of them are listed below** — the table is the complete set, not a selection. `TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere` fails if a rule is added without a row here. If you arrived from a notification, go straight to your alert:
 
 | Alert | Response section |
 |-------|-----------------|
@@ -23,8 +23,9 @@ Every rule in `alerts/blnk-kafka-alerts.yml` names this file as its `runbook_url
 | `EventMetricsCollectionFailing` | [EventMetricsCollectionFailing](#eventmetricscollectionfailing) |
 | `EventMetricsCollectionAbsent` | [EventMetricsCollectionAbsent](#eventmetricscollectionabsent) |
 | `EventRelayClaimTimingOut` | [EventRelayClaimTimingOut](#eventrelayclaimtimingout) |
+| `TaskQueueBacklogHigh` | [TaskQueueBacklogHigh](#taskqueuebackloghigh) |
 
-**One further rule exists on Kubernetes only, and is deliberately not a row above.** The `prometheus-configmap.yaml` projection mounts a second group, `blnk-infra-alerts`, holding [KafkaBrokerVolumeFilling](#kafkabrokervolumefilling) — the broker's own disk, read from kubelet series this repository does not publish, so the rule has no Compose counterpart and no entry in `alerts/blnk-kafka-alerts.yml`. Its `runbook_url` resolves to that section. The table above stays exactly the thirteen of the rule file it indexes.
+**One further rule exists on Kubernetes only, and is deliberately not a row above.** The `prometheus-configmap.yaml` projection mounts a second group, `blnk-infra-alerts`, holding [KafkaBrokerVolumeFilling](#kafkabrokervolumefilling) — the broker's own disk, read from kubelet series this repository does not publish, so the rule has no Compose counterpart and no entry in `alerts/blnk-kafka-alerts.yml`. Its `runbook_url` resolves to that section. The table above stays exactly the sixteen of the rule file it indexes.
 
 If you arrived for routine work, the four procedures are [Provisioning](#provisioning), [The ACL Model](#the-acl-model), [Dead-Letter Triage and Replay](#dead-letter-triage-and-replay) and [The Daily Outbox-versus-Offset Reconciliation](#the-daily-outbox-versus-offset-reconciliation). If you are deciding how to isolate subscribers from one another, read [Requirement Divergence — Partition-Key Scoping Has No Enforcement Point In This Repository](#requirement-divergence--partition-key-scoping-has-no-enforcement-point-in-this-repository) first: one of the three dimensions of the access model is not enforced by anything shipped here.
 
@@ -350,6 +351,27 @@ It also accepts an optional trailing command to `exec` after a successful bootst
 scripts/kafka-bootstrap.sh                 # format, report, exit 0 — caller starts the broker
 scripts/kafka-bootstrap.sh kafka-server-start.sh /etc/kafka/server.properties
 ```
+
+### Restarts, and the one rotation that does not survive one
+
+A broker restart re-runs the bootstrap; it does **not** re-format. That is what makes a rolling restart safe, and it is also what makes one particular mistake unrecoverable by restarting. Both deserve to be stated plainly, because the failure they produce does not look like what it is.
+
+**A restart is safe and needs nothing from you.** On Kubernetes the liveness probe restarting a broker, `kubectl rollout restart statefulset/kafka`, and a node drain all take the same path: the init container finds the volume already formatted, skips the format, regenerates `server.properties` into a memory-backed `emptyDir`, and the broker replays the metadata log and rejoins the quorum. Topics, ACLs, offsets and every subscriber's SCRAM credential live in the log and on the data volume, so they are all still there afterwards. Verified by restarting a formatted broker and confirming it served reads and accepted writes on a pre-existing topic with **zero** `Failed authentication` entries in the restart log.
+
+**Inter-broker authentication deliberately does not use SCRAM.** The `BROKER` listener enables both `PLAIN` and `SCRAM-SHA-512`, and `sasl.mechanism.inter.broker.protocol` is `PLAIN`. Blnk, the provisioning Job and every subscriber authenticate with SCRAM-SHA-512 exactly as before — the change is invisible to them. What changes is where a *broker's own* credential comes from: `PLAIN` reads it from the static JAAS configuration the init container writes from the Secret on every start, so it is a value the pod always has. SCRAM credentials, by contrast, are seeded into the metadata log once and only at format time. Using SCRAM for inter-broker traffic couples a broker's ability to talk to its peers to a value it cannot re-read, and the two can drift apart — after which a restarted broker registers with the controller, transitions to `RECOVERY`, and then waits to be unfenced for ever while logging `invalid credentials with SASL mechanism SCRAM-SHA-512` against its own peers. That is a whole broker lost to a configuration mismatch, and the controller listener staying up throughout makes it read like a network fault rather than a credential one.
+
+**Rotating `admin-secret` in the Secret alone breaks nothing and fixes nothing — it is simply not a rotation.** The metadata log still holds the old password, so the new one authenticates nothing. Because a restart skips the format, restarting does not repair it either. The bootstrap detects this rather than letting you discover it:
+
+- It records a fingerprint of the administrative credential — `sha256(user \0 secret)`, mode 0600, in the first log directory — when **it** formats the volume.
+- On a later start it compares. A match is silent. A mismatch **refuses to start**, names both remedies, and clears the configuration it had already generated so nothing downstream can act on a config it declined to stand behind.
+- A volume formatted before this guard existed carries no fingerprint. That case **warns** and continues: the guard cannot judge a log it did not seed, and writing the current fingerprint would bless whatever is in there.
+
+The two remedies are not equivalent, and the first is almost always the one you want:
+
+1. **Keep the data.** Put the original secret back, let the cluster come up, then rotate through the broker so the new credential is written *into* the metadata log — the file-based form under [Adding a runtime SCRAM user](#adding-a-runtime-scram-user), not `--add-config`, which puts the password in `argv`. Then update the Secret and the fingerprint file. This is the only rotation that survives a restart.
+2. **Discard the data.** Delete the broker's `PersistentVolumeClaim` so the volume is re-formatted with the current secret. On a three-broker quorum, one at a time with the cluster healthy in between, this costs only that node's replicas. All three at once destroys every event still on a topic, every ACL and every subscriber credential.
+
+Verified in both directions: a re-run with the same secret passes and the broker restarts normally; a re-run with a rotated secret exits non-zero, prints both remedies, and leaves no generated configuration behind. And because inter-broker traffic no longer depends on SCRAM, a broker whose JAAS credential has diverged from the metadata log still starts, still serves and still accepts writes — the mismatch is contained to the clients presenting the wrong password instead of taking the broker down with it.
 
 ### Step 2 — Provision the topics and principals
 
@@ -2658,6 +2680,26 @@ Critical rather than warning, because it means the pipeline's entire observabili
 3. **Is the job name still `blnk-server`?** See above.
 4. **Is the server role running?** The worker role publishes no collector series.
 
+### TaskQueueBacklogHigh
+
+```text
+expr:     blnk_queue_backlog{state="pending"} > 25000
+for:      10m
+severity: warning
+```
+
+**Work is arriving faster than it is being done.** The index queue reached 609,673 pending tasks during a sustained load run, draining at 276/s against 550/s arriving. Nothing reported it, because no series existed for a rule to read — the asynqmon dashboard showed it to whoever opened the dashboard, which is not monitoring. This gauge and this rule exist so that the imbalance is found while it is still only an imbalance.
+
+**It reads `pending` only, and that is a deliberate exclusion rather than an oversight.** `pending` is work that has arrived and not been started, which is precisely what accumulates when a drain rate falls behind an arrival rate. `retry` and `scheduled` are work deferred to a FUTURE time: both look like a backlog on a dashboard while actually waiting on a clock rather than on a worker, and alerting on them would page for a queue behaving exactly as designed. `active` is bounded by the server's configured concurrency and cannot accumulate. All four states are published, so the dashboard can show what the alert ignores.
+
+**Triage, in the order that distinguishes the causes.**
+
+1. **Has the per-task cost regressed?** This is what the rule was written for. Every index task used to construct a TypeSense client and re-assert the collection schema — five collection creates plus the default-ledger upsert, six HTTP round trips, on a connection that was discarded with the task and so never pooled. Measured against an idle TypeSense that was 10.66ms of pure setup per task, and under load each round trip inflates. The client and its schema assurance are now established once per worker process; if a change reintroduces per-task setup, this alert is how you find out.
+2. **Is the queue starved of worker slots?** The webhook and index queues share one asynq server whose goroutine pool is `BLNK_QUEUE_WEBHOOK_CONCURRENCY` (default 20), divided by queue weight. A queue with a low weight competing against a busy neighbour drains slowly even when each task is cheap.
+3. **Is the downstream service slow?** Index tasks call TypeSense. A backlog with healthy per-task code and adequate slots is TypeSense applying backpressure, and the queue is doing its job by absorbing it.
+
+**The distinction worth making before you act:** a backlog that clears as soon as load stops is a CAPACITY problem — the queue is sized for a lower arrival rate than it is receiving. A backlog that persists while the system is idle is a FAILING TASK being retried, and the `retry` series for the same queue will show it.
+
 ### EventRelayClaimTimingOut
 
 ```text
@@ -2852,7 +2894,17 @@ docker compose --profile monitoring up -d prometheus
 
 ## Relay Operations
 
-**The event relay runs in the server process role**, started immediately after the fund-lineage outbox processor it is modelled on — this repository's established home for an outbox relay, which also avoids standing up a fourth asynq server for one poll loop. There is no separate relay binary and no relay subcommand: `blnk start` *is* how the relay is run. `make run_relay` is a CONVENIENCE ALIAS for the server role and nothing more — `make run_server_relay` is the same target under the name that says what starts. It exists so that "where does the relay run" is answerable without reading `cmd/server.go`, and because AAP §0.5.1 Group 7 names that target. It loads `.env` the way `make kafka_provision` does — the file supplies defaults, the caller's environment wins — and then execs `blnk start --config blnk.json --require-kafka`.
+**The event relay runs in the server process role**, started immediately after the fund-lineage outbox processor it is modelled on — this repository's established home for an outbox relay, which also avoids standing up a fourth asynq server for one poll loop. There is no separate relay binary and no relay subcommand: `blnk start` *is* how the relay is run. `make run_relay` is a CONVENIENCE ALIAS for the server role and nothing more — `make run_server_relay` is the same target under the name that says what starts. It exists so that "where does the relay run" is answerable without reading `cmd/server.go`, and because AAP §0.5.1 Group 7 names that target. It loads `.env` the way `make kafka_provision` does — the file supplies defaults, the caller's environment wins — and then execs `blnk start --require-kafka`.
+
+**`--config` is passed only when it means something,** which is the difference between a target that works in a clean checkout and one that does not. `blnk` treats a configuration file *named on the command line* as required — a path that cannot be read is fatal, because naming a file is a statement that the file holds the configuration and silently continuing from the environment is how a typo becomes a deployment with defaults nobody chose. The **default** path's absence is tolerated, because environment-only configuration is a first-class mode: it is how the compose stack, the Kubernetes manifests and the whole test suite run. So the target passes the flag in the two cases where it carries information and omits it in the one where it does not:
+
+| Situation | `--config` | Why |
+|---|---|---|
+| `make run_relay` with a `blnk.json` present | passed | the file exists and is what the broker-declaration gate read |
+| `make run_relay` with **no** `blnk.json` | **omitted**, and the target says so | the application configures itself from the environment, exactly as `make run` does |
+| `make run_relay CONFIG_FILE=/path/to.json` | passed, even if the path is absent | you named it; the application reports that the file it was told to read is missing |
+
+This target used to pass `--config blnk.json` unconditionally, which made it the only way to start Blnk that could not start it from its environment: a checkout configured through `.env` — the arrangement `./stack.sh --init` produces and this document describes below — failed with the application demanding a file no instruction had asked anyone to create.
 
 **IT IS NOT ISOLATED RELAY EXECUTION.** `blnk start` brings up the HTTP API on its port, the fund-lineage outbox processor, the balance-monitor handoff processor and the metrics collector alongside the event relay, and every one of them claims rows or serves traffic. That matters for two things operators reach for this target to do: a load test taken against it measures the whole server role rather than the relay, and a backlog you are watching drain is being drained by more than the relay. If you need the relay's own numbers, read `blnk.events.publish.duration` and `blnk_outbox_pending` rather than inferring them from process behaviour.
 
@@ -3040,7 +3092,7 @@ quietly leave the runbook wrong.
 
 Retention is a separate, optional sweep, and **exactly one status is ever eligible for it: `dispatched`.** A dispatched row is a receipt — the event reached the broker and a subscriber has had it — so age alone governs it. Every other status is excluded, and for two different reasons. A `pending`, `processing` or `replaying` row is still owed a delivery attempt. A `dead_lettered` row is the record of an event **nobody received**, so age must never remove it: it leaves the table by being **replayed** through `POST /events/dead-letter/:event_id/replay`, and only once the broker acknowledges that re-publish — making the row `dispatched` — does this period begin to apply to it. A `failed` row is worse still, because its `.dlt` write has not landed, so this table is the only copy of that event in existence. That is what makes any finite retention period safe to set: the purge cannot destroy the evidence of a loss nobody has dealt with.
 
-**The default depends on how you deploy.** `RELAY_EVENT_RETENTION_DAYS` defaults to `0` — **disabled** — in the Go configuration and in both Compose files, deliberately, because the period your jurisdiction, audit programme or legal hold requires is not something a default can guess. The shipped Kubernetes manifests take the other decision explicitly: `infrastructure/k8s-manifests/blnk-config.yaml` sets it to `"90"`, so a deployment applied from those manifests **is** purging dispatched rows older than ninety days unless you change it. Check the value your deployment actually has before concluding that nothing is being deleted, or that something is. Bear in mind what an undeleted row holds: the payload is the webhook body verbatim, so a transaction event carries amounts and balance identifiers and an identity event carries names, email addresses, phone numbers, postal addresses and dates of birth. Confirm the sweep is running with `blnk_events_purged_total`, but read it **against eligibility**: a flat
+**The default depends on how you deploy.** `RELAY_EVENT_RETENTION_DAYS` defaults to `0` — **disabled** — in the Go configuration and in both Compose files, deliberately, because the period your jurisdiction, audit programme or legal hold requires is not something a default can guess. The shipped Kubernetes manifests take the other decision explicitly: `infrastructure/k8s-manifests/blnk-config.yaml` sets it to `"3"`, so a deployment applied from those manifests **is** purging dispatched rows older than three days unless you change it. Three is not a compliance recommendation — it is the shortest period that leaves the daily reconciliation a window both sides still hold, and it keeps the storage figure in [Retention Sizing](#retention-sizing) to something a reference manifest can honestly ship. Raise it to whatever your own retention obligation requires, and read that section first: above **7 days** you must raise `log.retention.hours` in `kafka-statefulset.yaml` in the same change, or the reconciliation compares against broker records that have already aged out. Check the value your deployment actually has before concluding that nothing is being deleted, or that something is. Bear in mind what an undeleted row holds: the payload is the webhook body verbatim, so a transaction event carries amounts and balance identifiers and an identity event carries names, email addresses, phone numbers, postal addresses and dates of birth. Confirm the sweep is running with `blnk_events_purged_total`, but read it **against eligibility**: a flat
 counter most often means nothing is past the retention cutoff yet, and only otherwise means the sweep is
 disabled or stuck. Because the sweep deletes in batches, a step-shaped series is its normal signature.
 
@@ -3109,7 +3161,9 @@ Two properties of that edit decide when you can make it:
 - **`volumeClaimTemplates` is immutable on an existing StatefulSet.** `kubectl apply` on a running `postgres` StatefulSet with a changed storage request is rejected by the API server. On an existing cluster the size is changed by `kubectl delete statefulset postgres --cascade=orphan` (which leaves the pod and the `pg-data-postgres-0` claim running), then applying the edited manifest, then deleting the pod so it is recreated against the new template — the same procedure documented for the Kafka StatefulSet below.
 - **Growing the claim later needs a `StorageClass` with `allowVolumeExpansion: true`.** Arrange that before you need it: expanding a claim whose class forbids it means a restore, and the moment you need the space is the moment the ledger has stopped accepting writes.
 
-There is also a standalone `pg-data` PersistentVolumeClaim in `infrastructure/k8s-manifests/pg-data-persistentvolumeclaim.yaml` requesting `100Mi`. It predates this work, it is referenced by no `claimName` in the manifest set, and it is not what postgres runs on — the StatefulSet's template generates `pg-data-postgres-0`. Ignore it, or delete it in a change of its own; do not size the outbox against it.
+`infrastructure/k8s-manifests/pg-data-persistentvolumeclaim.yaml` is the **optional pre-provisioning half** of that storage, and it is where the size decision above can be made before the database first starts. It holds one claim named `pg-data-postgres-0` — the `<template>-<set>-<ordinal>` form the StatefulSet resolves — so applying it before `postgres-statefulset.yaml` makes the StatefulSet *adopt* it instead of creating its own. Applying it is not required: skip the file and the template creates the same claim. Apply it when you want to bind a specific `PersistentVolume` to the database, which is how a ledger is restored from a snapshot, or when you want the storage request reviewed on its own.
+
+Two rules if you do apply it. **Its size must equal the template's**, because Kubernetes adopts a pre-existing claim rather than reconciling it against the template — so the smaller number wins silently, and a claim you sized at the development default is what the database gets no matter what the template says. **Its name must stay `pg-data-postgres-0`**; under any other name nothing looks for it and it sits `Pending` for ever, provisioning a volume no pod mounts. That is exactly what this file used to be: a kompose artifact named `pg-data` — the template's name rather than the claim's — requesting `100Mi`, four orders of magnitude below what the outbox needs. `kafka-data-persistentvolumeclaim.yaml` records the same defect and the same correction for the brokers.
 
 Two consequences worth stating plainly:
 

@@ -927,9 +927,11 @@ func (g *collectorRecordedInt64Gauge) Record(_ context.Context, value int64, opt
 
 	attributes := map[string]string{}
 	for _, keyValue := range recorded.ToSlice() {
-		// Value.Emit renders the string, int64 and bool attributes these instruments
-		// record exactly as they were recorded.
-		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
+		// Value.String renders the string, int64 and bool attributes these instruments
+		// record exactly as they were recorded. It replaces Value.Emit, which
+		// go.opentelemetry.io/otel v1.44.0 deprecated; for these three kinds the two produce
+		// identical bytes, so no assertion below changes meaning.
+		attributes[string(keyValue.Key)] = keyValue.Value.String()
 	}
 
 	g.mu.Lock()
@@ -2508,6 +2510,11 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 			// claim that does not complete publishes nothing while the backlog gauge merely
 			// rises and every health gauge stays green.
 			"blnk.events.relay.claims.total",
+			// The worker fleet's queue depths. Counted here for the same reason as the
+			// repair backlog: a queue whose arrival rate outruns its drain rate appears in
+			// no other series, so before this gauge existed the index queue could reach
+			// 609,673 pending tasks with every other signal reading healthy.
+			"blnk.queue.backlog",
 		} {
 			exported[strings.ReplaceAll(instrument, ".", "_")] = struct{}{}
 		}
@@ -2569,7 +2576,8 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 		//  13. EventMetricsCollectionStale — the collector has stopped ticking
 		//  14. EventMetricsCollectionFailing — it ticks and achieves nothing
 		//  15. EventMetricsCollectionAbsent — there is no collector at all
-		assert.Equal(t, 15, found, "every event-streaming alert must be present")
+		//  16. TaskQueueBacklogHigh — a task queue is not keeping pace with arrivals
+		assert.Equal(t, 16, found, "every event-streaming alert must be present")
 	})
 }
 
@@ -2993,10 +3001,11 @@ func (c *collectorRecordedInt64Counter) Add(_ context.Context, value int64, opti
 
 	attributes := map[string]string{}
 	for _, keyValue := range recorded.ToSlice() {
-		// Emit is the attribute package's rendering accessor at the version this module pins.
-		// Every attribute this fake ever receives is an attribute.String, and for the STRING
-		// kind it returns the raw value unchanged.
-		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
+		// String is the attribute package's rendering accessor at the version this module
+		// pins, and the one that replaced the deprecated Emit in v1.44.0. Every attribute this
+		// fake ever receives is an attribute.String, and for the STRING kind both accessors
+		// return the raw value unchanged.
+		attributes[string(keyValue.Key)] = keyValue.Value.String()
 	}
 
 	c.mu.Lock()

@@ -225,13 +225,13 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 
 | Event type | Topic | Fires when |
 |-----------|-------|-----------|
-| `transaction.queued` | `blnk.transactions` | A transaction is accepted and queued for asynchronous processing. Not produced today — see [the note below](#three-names-in-the-vocabulary-are-not-currently-reachable). |
+| `transaction.queued` | `blnk.transactions` | A transaction is accepted and queued for asynchronous processing. Its `aggregate_id` is the **queued parent**, not the executed copy — see [what a queued transaction announces](#a-queued-transaction-announces-itself-twice-under-two-ids). |
 | `transaction.applied` | `blnk.transactions` | A transaction is committed to the ledger and balances have moved. |
-| `transaction.scheduled` | `blnk.transactions` | A transaction is recorded for a future effective date rather than applied now. Not produced today — see [the note below](#three-names-in-the-vocabulary-are-not-currently-reachable). |
+| `transaction.scheduled` | `blnk.transactions` | A transaction is recorded for a future effective date rather than applied now. |
 | `transaction.inflight` | `blnk.transactions` | A transaction is authorised and holding funds, awaiting commit or void. |
 | `transaction.void` | `blnk.transactions` | An inflight transaction is voided and its hold released. |
 | `transaction.rejected` | `blnk.transactions` | A transaction is refused — insufficient funds, an overdraft limit, or a terminal processing error. |
-| `transaction.unknown` | `blnk.transactions` | A transaction reaches a status the event mapping has no name for. Not produced by any current code path — see [the note below](#three-names-in-the-vocabulary-are-not-currently-reachable) and [The `COMMIT` Status](#the-commit-status). |
+| `transaction.unknown` | `blnk.transactions` | A transaction reaches a status the event mapping has no name for. **Not produced by any current code path** — see [`transaction.unknown` is a defensive default](#transactionunknown-is-a-defensive-default) and [The `COMMIT` Status](#the-commit-status). |
 | `bulk_transaction.<status>` | `blnk.transactions` | A bulk batch reaches an outcome, **and only for a batch submitted with `"run_async": true`** — a synchronous submission returns its outcome in its own response and emits nothing. The suffix is the batch status, so this is a **family** of names, not one — see below. |
 | `balance.created` | `blnk.balances` | A balance is created. |
 | `balance.monitor` | `blnk.balances` | A balance monitor's condition is met. Fires on every occurrence, so the same monitor produces many of these. |
@@ -241,31 +241,54 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 
 The seven `transaction.*` names are derived from the transaction's status by a single mapping, which is why a transaction's whole lifecycle appears under this one prefix.
 
-### Three names in the vocabulary are not currently reachable
+### A queued transaction announces itself twice, under two ids
 
-`transaction.queued`, `transaction.scheduled` and `transaction.unknown` are part of the event
-vocabulary, and the mapping genuinely produces them, but **no transaction currently produces them
-on either transport.** The reason is that the transaction's status is normalised *before* the event
-name is derived from it: on the execution path `updateTransactionDetails` runs first and collapses
-`QUEUED`, `SCHEDULED` and `COMMIT` onto `APPLIED`. A queued, scheduled or committed-inflight
-transaction is therefore announced as `transaction.applied`, and the `COMMIT` fall-through to
-`transaction.unknown` — described in [The `COMMIT` Status](#the-commit-status) — sits behind that
-normalisation.
+`POST /transactions` without `skip_queue` does two things, and each of them is announced.
 
-This is exactly the pre-Kafka behaviour of the HTTP webhook, preserved deliberately so that the two
-transports carry identical payloads during the dual-delivery window.
+1. The request is **accepted**. A transaction row is written in the `QUEUED` state — or
+   `SCHEDULED`, when the request carried a `scheduled_for` in the future — and
+   `transaction.queued` or `transaction.scheduled` is captured in the same database
+   transaction as that row. This is the acknowledgement Blnk has taken responsibility for the
+   movement, not that any balance has changed.
+2. Later a worker **executes** it. Execution persists a separate transaction row — a copy
+   whose `parent_transaction` is the accepted one and whose `reference` is the accepted
+   reference with `_q` appended — and `transaction.applied` is captured alongside the balance
+   updates.
+
+So one submission produces two events with **two different `aggregate_id` values**: the accepted
+parent's transaction id, then the executed copy's. They are keyed on the same ledger, so they
+arrive in that order on the same partition.
 
 What this means for your consumer:
 
-- **Do not build a handler that waits for one of these three names.** Nothing will arrive.
-- **Do tolerate them anyway.** They are documented because they can appear in a future release, and
-  because an event type absent from the mapping still resolves to `transaction.unknown` rather than
-  being dropped. Treat an unexpected `transaction.*` name as data to log, not as a fatal error.
+- **`transaction.queued` is not a settlement.** Do not credit anything on it. It is the event to
+  correlate a submission against, and the event that tells you a movement Blnk accepted has not
+  been applied yet.
+- **Correlate the two through `payload.data.parent_transaction`**, which the applied event carries
+  and which holds the queued event's `aggregate_id`.
+- **A `skip_queue` submission produces only `transaction.applied`**, because nothing was queued.
+- **A scheduled transaction produces `transaction.scheduled` at submission** and
+  `transaction.applied` when its time arrives.
+
+### `transaction.unknown` is a defensive default
+
+`transaction.unknown` is in the vocabulary and **no code path in this repository produces it.** It
+is the default arm of the status-to-event mapping, and it exists so that a status added in a future
+release cannot be dropped silently — not as the name of any transaction outcome.
+
+In particular it is **not** what a committed inflight transaction is announced under. The status is
+normalised to `APPLIED` before the event name is derived, so `COMMIT` never reaches the mapping's
+default arm; see [The `COMMIT` Status](#the-commit-status) for the full account. That normalisation
+is exactly the pre-Kafka behaviour of the HTTP webhook, preserved deliberately so the two transports
+carry identical payloads during the dual-delivery window.
+
+What this means for your consumer:
+
+- **Do not build a handler that waits for `transaction.unknown`.** Nothing emits it, so a consumer
+  blocking on it would block for ever.
+- **Do tolerate it.** Treat an unexpected `transaction.*` name as data to log, not as a fatal error.
 - **Read `payload.data.status` when you need the authoritative status.** The status field says what
   happened; `event_type` says which mapping produced the message.
-
-Correcting the `COMMIT` fall-through changes what BOTH transports carry, so it belongs in its own
-deliberate, announced change rather than alongside a transport migration.
 
 ### `bulk_transaction.<status>` is matched by prefix, not by equality
 
@@ -701,8 +724,8 @@ One qualification matters, and it is the reason this is a documented quirk rathe
 will observe: on the execution path the status is normalised to `APPLIED` before the name is
 derived, so a committed inflight transaction is announced today as `transaction.applied`. The
 fall-through is real in the mapping and pinned by a test, but it sits behind that normalisation —
-see [Three names in the vocabulary are not currently
-reachable](#three-names-in-the-vocabulary-are-not-currently-reachable).
+which is why `transaction.unknown` reaches no topic. See [`transaction.unknown` is a defensive
+default](#transactionunknown-is-a-defensive-default).
 
 **This is pre-existing behaviour, not a regression introduced by the move to Kafka.** The same mapping produced the same event name over the HTTP webhook, so a subscriber migrating from webhooks sees no change here.
 

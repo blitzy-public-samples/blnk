@@ -1974,3 +1974,102 @@ func TestLoadTestReadmeCertifyingRun_IsRunnableAsDocumented(t *testing.T) {
 			"that permits quoting the result — ALLOW_FIXTURE_CREATION=1 or LEDGER_PAIRS. "+
 			"Without one it aborts, which is exactly the defect this guards. Got %q", certifying)
 }
+
+// queueBenchmarkPath is the drain-measuring tool the runner launches alongside k6. Its verdict
+// is what the queue cases are for, so its EXIT STATUS is part of the harness contract rather
+// than an implementation detail of a helper binary.
+const queueBenchmarkPath = "tests/loadtest/tools/queue_benchmark.go"
+
+// TestQueueBenchmark_FailsTheRunWhenTheQueuesNeverDrain pins the exit-status contract of the
+// drain benchmark and the runner's propagation of it.
+//
+// WHAT WENT WRONG. The tool measured the drain correctly and reported it correctly — the
+// summary carried `drained: false` with a failing pass/fail pair — and then returned 0. Every
+// caller that decides pass or fail from a process status rather than by parsing JSON therefore
+// recorded a pass, including tests/loadtest/run_case.sh, which runs under `set -euo pipefail`
+// and waits on the process. A queue case whose backlog was still growing when the clock ran
+// out reported a successful run.
+//
+// The three properties below are what make the verdict trustworthy, and each fails
+// differently: without the flag the tool cannot tell a timeout from a drain, without the exit
+// the status contradicts the summary, and without the ordering the failure destroys the
+// evidence that explains it.
+func TestQueueBenchmark_FailsTheRunWhenTheQueuesNeverDrain(t *testing.T) {
+	source := readRepoFile(t, queueBenchmarkPath)
+
+	t.Run("the timeout is recorded where it happens, not inferred later", func(t *testing.T) {
+		// "Ended with work still queued" has three causes — the timeout, an interrupt, and a
+		// drain a later arrival added to — and only the first is a failure of the measurement.
+		// Inferring it after the loop cannot separate them, so it is recorded at the break.
+		assert.Containsf(t, collapseWhitespace(source),
+			"if time.Now().After(startDeadline) { timedOut = true",
+			"%s: the deadline break must set timedOut. Deciding afterwards from "+
+				"`!isDrained(end)` alone cannot distinguish a timeout from an interrupt, and "+
+				"failing an interrupted run turns run_case.sh's own teardown into a failure",
+			queueBenchmarkPath)
+	})
+
+	t.Run("a timed-out run that never drained exits non-zero", func(t *testing.T) {
+		assert.Containsf(t, collapseWhitespace(source),
+			"if timedOut && !isDrained(endSnapshot) {",
+			"%s: the tool must exit non-zero when it timed out with work still queued. Both "+
+				"conditions are required: timedOut alone would fail a run that drained on the "+
+				"final poll, and !isDrained alone would fail an interrupted run",
+			queueBenchmarkPath)
+
+		assert.Containsf(t, source, "os.Exit(1)",
+			"%s: the non-drained timeout must exit non-zero, or the status keeps contradicting "+
+				"the summary", queueBenchmarkPath)
+	})
+
+	t.Run("the summary is written before the failing exit", func(t *testing.T) {
+		// The artifact is how the failure gets diagnosed — how far the backlog got, whether it
+		// was moving at all. Exiting first would report the failure and destroy its evidence.
+		finalWrite := strings.Index(source, "failed to write final summary")
+		failingExit := strings.LastIndex(source, "queue benchmark FAILED")
+		require.Positivef(t, finalWrite, "%s must write a final summary", queueBenchmarkPath)
+		require.Positivef(t, failingExit, "%s must report a failed drain", queueBenchmarkPath)
+
+		assert.Lessf(t, finalWrite, failingExit,
+			"%s: the final summary must be written BEFORE the failing exit. A tool that exits "+
+				"first reports the failure and deletes the evidence for it in one step",
+			queueBenchmarkPath)
+	})
+
+	t.Run("an interrupt is not a failure", func(t *testing.T) {
+		// run_case.sh's EXIT trap sends SIGINT when it tears the benchmark down early. A partial
+		// result that was explicitly asked for is not a failed measurement.
+		assert.NotContainsf(t, collapseWhitespace(source),
+			"if interrupted { os.Exit(1)",
+			"%s: an interrupted run must still exit 0. run_case.sh's cleanup trap sends SIGINT, "+
+				"so failing on interrupt makes every early teardown look like a failed drain",
+			queueBenchmarkPath)
+	})
+
+	t.Run("the runner propagates the status after reporting the artefacts", func(t *testing.T) {
+		runner := readRepoFile(t, loadTestRunnerPath)
+		collapsed := collapseWhitespace(runner)
+
+		assert.Containsf(t, collapsed,
+			`wait "${QUEUE_BENCH_PID}" || QUEUE_BENCH_STATUS=$?`,
+			"%s: the wait must capture the benchmark's status. A bare `wait` under `set -e` "+
+				"aborts here, before the Generated files list — which is the only place this "+
+				"script says where the summary it just wrote actually is", loadTestRunnerPath)
+
+		assert.Containsf(t, collapsed,
+			`exit "${QUEUE_BENCH_STATUS}"`,
+			"%s: the captured status must be re-raised as this script's exit code. Capturing it "+
+				"and not re-raising it is the original defect moved one level up",
+			loadTestRunnerPath)
+
+		// Order, not just presence: the paths have to be printed before the exit.
+		filesList := strings.Index(runner, "Generated files:")
+		reRaise := strings.Index(runner, `exit "${QUEUE_BENCH_STATUS}"`)
+		require.Positivef(t, filesList, "%s must list the generated files", loadTestRunnerPath)
+		require.Positivef(t, reRaise, "%s must re-raise the benchmark status", loadTestRunnerPath)
+
+		assert.Lessf(t, filesList, reRaise,
+			"%s: the generated-file list must come BEFORE the failing exit, or a failed drain "+
+				"reports no way to find the summary that explains it", loadTestRunnerPath)
+	})
+}

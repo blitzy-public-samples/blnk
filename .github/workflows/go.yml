@@ -19,7 +19,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.25.13
 
       # A CHECK, NOT A REPAIR. `go mod tidy` on its own MUTATES the manifests and then the job
       # builds and tests the repaired tree, so a pull request that added an import without
@@ -36,6 +36,51 @@ jobs:
 
       - name: Build
         run: go build ./cmd/*.go
+
+  # THE TOOLCHAIN AND DEPENDENCY PINS ABOVE ARE A CLAIM, AND THIS IS WHAT CHECKS IT.
+  #
+  # go.mod deliberately declares the LANGUAGE version as the minimum this module needs, so the
+  # patched toolchain is pinned by the four go-version values in this workflow and by the
+  # Dockerfile's floating golang:1.25-alpine tag instead. That arrangement is correct and it was
+  # also unenforced: nothing in CI could tell whether the pinned patch still carried a fixed
+  # standard library, or whether a required module had grown a reachable advisory since it was
+  # added. Eight reachable vulnerabilities accumulated that way — seven in the standard library
+  # of the pinned patch and one in go.opentelemetry.io/otel — and every job above stayed green
+  # throughout, because a build and a test suite cannot see a CVE.
+  #
+  # `govulncheck` is a REACHABILITY analysis, not an inventory: it exits non-zero only when the
+  # module's own code can actually reach a vulnerable symbol, and reports everything else as
+  # informational. So this gate does not fire on an advisory in a dependency Blnk merely
+  # requires, and it does fire the moment one becomes callable. That is the distinction that
+  # makes it usable as a required check rather than a permanently red one — a scanner that
+  # reported the module graph would be muted within a week.
+  #
+  # The Go version here MUST track the pins above. The standard library govulncheck measures is
+  # the one this job's toolchain ships, so a stale value here would clear a patch nothing builds
+  # with and miss the one everything does.
+  vulnerabilities:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+
+      # Pinned rather than @latest, for the same reason every other tool in this workflow is:
+      # a scanner that changes under the repository turns an unrelated release into a failed
+      # build, and the version that produced a verdict has to be recoverable from the commit.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      # EVERY PACKAGE, including cmd and the test-only ones. A vulnerability reachable from a
+      # test helper is not exploitable in production, but it is a signal that the same call
+      # exists in the module, and the cost of scanning it is seconds.
+      - name: Scan for reachable vulnerabilities
+        run: govulncheck ./...
 
   # ALERT RULES ARE A BUILD ARTEFACT AND ARE GATED LIKE ONE.
   #
@@ -139,7 +184,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.25.13
 
       # A CHECK, NOT A REPAIR. `go mod tidy` on its own MUTATES the manifests and then the job
       # builds and tests the repaired tree, so a pull request that added an import without
@@ -212,7 +257,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.25.13
 
       # A CHECK, NOT A REPAIR. `go mod tidy` on its own MUTATES the manifests and then the job
       # builds and tests the repaired tree, so a pull request that added an import without
@@ -344,7 +389,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.12
+          go-version: 1.25.13
 
       # Generated per run rather than committed. A credential in a workflow file is a
       # credential in the repository (CWE-798), and these scripts enforce a 32-character,

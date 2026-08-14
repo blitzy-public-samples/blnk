@@ -88,6 +88,13 @@ func main() {
 	var haveLatestSnapshot bool
 	interrupted := false
 
+	// Whether the loop ended because the clock ran out rather than because the queues
+	// drained. Recorded at the break rather than inferred afterwards, because "ended with work
+	// still queued" has three causes — the timeout, an interrupt, and a genuine drain that a
+	// later arrival then added to — and only the first is a failure of the thing being
+	// measured.
+	timedOut := false
+
 	for {
 		snap, err := takeSnapshot(inspector, cfg)
 		if err != nil {
@@ -135,6 +142,8 @@ func main() {
 		}
 
 		if time.Now().After(startDeadline) {
+			timedOut = true
+
 			break
 		}
 
@@ -173,6 +182,36 @@ func main() {
 	)
 	if interrupted {
 		fmt.Println("benchmark interrupted; summary contains partial results up to the last poll")
+	}
+
+	// A RUN THAT NEVER DRAINED IS A FAILED RUN, and it has to say so in its exit status.
+	//
+	// This tool exists to answer one question — do these queues clear, and how fast — and a
+	// timeout means the answer was no. It previously reported that answer in the summary
+	// (`drained: false`, `pass: 0`, `fail: 1`) and then exited 0 anyway, so every caller that
+	// checks a status rather than parsing JSON recorded a pass. tests/loadtest/run_case.sh
+	// runs under `set -e` and waits on this process, so the acceptance run it drives reported
+	// success for a backlog that was still growing when the clock ran out.
+	//
+	// THE ORDER MATTERS: the summary is written and the human-readable lines are printed
+	// FIRST, above, and only then does this exit. The artifact is how anyone diagnoses the
+	// failure — how far the backlog got, how fast it was draining, whether it was moving at
+	// all — so exiting before writing it would report the failure and destroy the evidence for
+	// it in the same step.
+	//
+	// AN INTERRUPT IS NOT THIS CASE and deliberately still exits 0. SIGINT and SIGTERM mean
+	// someone or something stopped the run on purpose — run_case.sh's own EXIT trap sends
+	// SIGINT when it tears the benchmark down early — and a partial result that was asked for
+	// is not a failed measurement. It is reported on its own line above so it cannot be
+	// mistaken for a completed run.
+	if timedOut && !isDrained(endSnapshot) {
+		fmt.Fprintf(os.Stderr,
+			"queue benchmark FAILED: the queues did not drain within %s. %d task(s) were still "+
+				"queued at the last poll (%s). The summary at %s carries the full sample series; "+
+				"read the drain rate against the arrival rate to tell a slow consumer from a "+
+				"stalled one, and raise -timeout only once you know which it is.\n",
+			cfg.timeout, outstandingWork(endSnapshot), describeOutstandingWork(endSnapshot), cfg.outPath)
+		os.Exit(1)
 	}
 }
 
@@ -338,6 +377,44 @@ func hasWork(s snapshot) bool {
 
 func isDrained(s snapshot) bool {
 	return !hasWork(s)
+}
+
+// outstandingWork totals the task states hasWork counts, so the number reported when a run
+// fails is the same number that decided it failed. Summing a different set — `size`, say, or
+// pending alone — would let the tool exit non-zero while reporting nothing outstanding.
+func outstandingWork(s snapshot) int {
+	return s.pending + s.active + s.scheduled + s.retry + s.aggregating
+}
+
+// describeOutstandingWork breaks that total down by state, because the states mean different
+// things to whoever has to act on the failure: pending is work the consumers have not reached,
+// active is work in flight, retry is work that FAILED and is coming back, and scheduled is
+// work not yet due — a backlog that is entirely scheduled has not stalled at all, it is
+// waiting for its own clock. Only non-zero states are listed so the line stays readable.
+func describeOutstandingWork(s snapshot) string {
+	states := []struct {
+		name  string
+		count int
+	}{
+		{"pending", s.pending},
+		{"active", s.active},
+		{"scheduled", s.scheduled},
+		{"retry", s.retry},
+		{"aggregating", s.aggregating},
+	}
+
+	parts := make([]string, 0, len(states))
+	for _, state := range states {
+		if state.count > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", state.name, state.count))
+		}
+	}
+
+	if len(parts) == 0 {
+		return "no outstanding tasks"
+	}
+
+	return strings.Join(parts, " ")
 }
 
 func buildSummary(cfg benchmarkConfig, start, end snapshot, samples []snapshot) map[string]interface{} {

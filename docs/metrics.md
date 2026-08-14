@@ -119,10 +119,11 @@ establishes, so one setup serves both documents.
 |----------------|------|------------|-------------|
 | `blnk_queue_enqueued_total` | Counter | `queue_name` | Transactions enqueued for async processing. Use to monitor inflow rate per queue. |
 | `blnk_queue_processing_duration_seconds` | Histogram | `result` | Time spent processing a transaction in the worker. Use to detect worker slowdowns. |
+| `blnk_queue_backlog` | Gauge | `queue`, `state` | Tasks waiting in an asynq queue, published by the worker process every 15 seconds for every queue that exists in Redis. **Alert on `state="pending"` only** — that is work which has arrived and not been started, and it is what accumulates when a drain rate falls behind an arrival rate. `retry` and `scheduled` are work deferred to a FUTURE time: they look like a backlog and are not one, because they are waiting on a clock rather than on a worker. `active` is bounded by the server's configured concurrency. This gauge exists because the index queue reached 609,673 pending tasks while draining at 276/s against 550/s arriving, and no series existed for any rule to read — see [TaskQueueBacklogHigh](kafka-operations.md#taskqueuebackloghigh). |
 
 **`queue_name` values**: `new:transaction_1` through `new:transaction_N` (sharded queues), `hot_transactions` (hot lane)
 
-**`result` values**: `success`
+**`result` values**: `success`, `already_applied` — the latter is a task acknowledged because its transaction had ALREADY been written, which is the expected outcome of coalescing (a leader commits its followers' work) and of at-least-once redelivery. It is recorded on the same histogram as `success` because the task did complete; it is labelled separately so a change in its rate stays visible without being mistaken for a fault. It replaced a `system.error` notification that raised one operator-facing error and one event-outbox row per occurrence.
 
 ### Balance Metrics
 

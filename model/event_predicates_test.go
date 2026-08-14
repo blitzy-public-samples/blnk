@@ -15,6 +15,7 @@
 package model
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -430,7 +431,10 @@ func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 // TestEventTypeForTransactionStatus_CoversEverySevenNamesIncludingTheCommitFallThrough
 // is the requirement transaction half.
 //
-// The COMMIT case is asserted as transaction.unknown ON PURPOSE.
+// The COMMIT case is asserted as transaction.unknown ON PURPOSE: it is what this MAPPING
+// returns for a status it has no case for. It is NOT what a committed inflight transaction
+// is announced under — the root package normalises COMMIT to APPLIED before deriving the
+// name, so this arm is a defensive default rather than a live event name.
 func TestEventTypeForTransactionStatus_CoversEverySevenNamesIncludingTheCommitFallThrough(t *testing.T) {
 	cases := map[string]string{
 		"QUEUED":    EventTypeTransactionQueued,
@@ -450,9 +454,10 @@ func TestEventTypeForTransactionStatus_CoversEverySevenNamesIncludingTheCommitFa
 	}
 
 	assert.Equal(t, EventTypeTransactionUnknown, EventTypeForTransactionStatus("COMMIT"),
-		"COMMIT has no case of its own and falls through to transaction.unknown. This is the LEGACY "+
-			"behaviour, preserved deliberately so the dual-delivery byte comparison holds; changing it is "+
-			"a separate, intentional change")
+		"COMMIT has no case of its own and falls through to transaction.unknown. That is this "+
+			"function's LEGACY behaviour and is preserved deliberately, but nothing reaches it: a "+
+			"committed inflight transaction is normalised to APPLIED before its event name is "+
+			"derived, so it is announced transaction.applied on both transports")
 }
 
 // TestEventIdentityAndDerivation_MakeACaptureIdempotent covers the identity helpers together,
@@ -869,9 +874,155 @@ func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
 	t.Run("an unparseable URL does not echo the parser's rendering of it", func(t *testing.T) {
 		// url.Parse quotes the input back, and the input has no business in Blnk's error
 		// responses or logs.
-		message, reason := ValidateWebhookURL("https://exa mple.com/\x7f")
+		//
+		// The input has to be one the LITERAL-BYTE check passes, or the parser is never
+		// reached and this asserts nothing about it. A malformed percent-escape is the case
+		// that qualifies: every byte is printable ASCII, so only url.Parse can object.
+		message, reason := ValidateWebhookURL("https://hooks.example.com/%GGsecret-path")
 		require.NotEmpty(t, message)
-		assert.NotContains(t, reason, "exa mple")
+		assert.Contains(t, message, "not a valid URL")
+		assert.NotContains(t, reason, "secret-path")
+		assert.NotContains(t, reason, "%GG")
+	})
+
+	t.Run("embedded credentials are refused in every spelling", func(t *testing.T) {
+		// The column is stored verbatim, read by operators and returned by GET, so a password
+		// written into a webhook URL is a password disclosed wherever the subscriber record is:
+		// an API response, a support export, a database backup. All four spellings reached
+		// storage before this rule existed, including the percent-encoded password, and the
+		// stored value was echoed back unchanged.
+		for name, raw := range map[string]string{
+			"username only":            "https://user@hooks.example.com/blnk",
+			"username and password":    "https://user:secret@hooks.example.com/blnk",
+			"percent-encoded password": "https://user:p%40ss@hooks.example.com/blnk",
+			"empty userinfo":           "https://@hooks.example.com/blnk",
+			"doubled separator":        "https://user@@hooks.example.com/blnk",
+			"with an explicit port":    "https://user:secret@hooks.example.com:8443/blnk?v=1",
+		} {
+			t.Run(name, func(t *testing.T) {
+				message, reason := ValidateWebhookURL(raw)
+				require.NotEmptyf(t, message, "%q embeds credentials and must be refused", raw)
+				assert.Contains(t, message, "credentials", "the refusal must name what is wrong")
+				assert.Contains(t, reason, "userinfo")
+
+				// AND THE SECRET IS NOT REPEATED BACK. Answering "user:secret@host is not
+				// allowed" would put the credential into the API response and the log line,
+				// which is the disclosure this rule exists to prevent.
+				assert.NotContains(t, message, "secret")
+				assert.NotContains(t, reason, "secret@")
+				assert.NotContains(t, reason, "p%40ss")
+			})
+		}
+	})
+
+	t.Run("credentials are refused before any other fault is considered", func(t *testing.T) {
+		// The guarantee is "no userinfo is ever stored", and it has to hold independently of
+		// the rest of the policy: a caller must not be able to arrange for a different rule to
+		// fire first and so change which fault is reported. Each of these is ALSO wrong in a
+		// second way — cleartext scheme, internal host, no host at all — and each must still be
+		// refused for its credentials.
+		for name, raw := range map[string]string{
+			"cleartext as well":        "http://user:secret@hooks.example.com/blnk",
+			"internal host as well":    "https://user:secret@127.0.0.1/blnk",
+			"unqualified host as well": "https://user:secret@postgres/blnk",
+		} {
+			t.Run(name, func(t *testing.T) {
+				message, _ := ValidateWebhookURL(raw)
+				require.NotEmpty(t, message)
+				assert.Contains(t, message, "credentials",
+					"credentials must be the reported fault whatever else is wrong")
+			})
+		}
+	})
+
+	t.Run("an '@' outside the userinfo position is not a credential", func(t *testing.T) {
+		// url.Parse only reads userinfo before the first '/', so an '@' in the path or the
+		// query is an ordinary character. Refusing these would break legitimate endpoints for
+		// the sake of a rule about a different part of the URL.
+		for _, raw := range []string{
+			"https://hooks.example.com/hook@v2",
+			"https://hooks.example.com/?notify=ops@example.com",
+			"https://hooks.example.com/a/b@c/d",
+		} {
+			message, _ := ValidateWebhookURL(raw)
+			assert.Emptyf(t, message, "%q carries no userinfo and is a legitimate destination", raw)
+		}
+	})
+
+	t.Run("a literal space or control byte is refused, and the canonical escape is not", func(t *testing.T) {
+		// A literal space is the case that mattered: url.Parse ACCEPTS it and folds it into the
+		// path, so the value was stored with the space intact and two spellings of one endpoint
+		// became two subscribers pointing at the same place. Control bytes the parser does
+		// reject, but with a generic message that names no byte, so the check answers for both
+		// and reports the OFFSET.
+		for name, offending := range map[string]struct {
+			raw    string
+			offset int
+			hex    string
+		}{
+			"space in the path":   {"https://hooks.example.com/a b", 27, ""},
+			"space in the query":  {"https://hooks.example.com/hook?note=a b", 37, ""},
+			"space in the host":   {"https://hooks exa.com/blnk", 13, ""},
+			"tab":                 {"https://hooks.example.com/a\tb", 27, "0x09"},
+			"line feed":           {"https://hooks.example.com/a\nb", 27, "0x0a"},
+			"carriage return":     {"https://hooks.example.com/a\rb", 27, "0x0d"},
+			"NUL":                 {"https://hooks.example.com/a\x00b", 27, "0x00"},
+			"DEL":                 {"https://hooks.example.com/a\x7fb", 27, "0x7f"},
+			"unit separator 0x1f": {"https://hooks.example.com/a\x1fb", 27, "0x1f"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				message, reason := ValidateWebhookURL(offending.raw)
+				require.NotEmptyf(t, message,
+					"%q must be refused rather than stored as written", offending.raw)
+				assert.Contains(t, message, "literal spaces or control characters")
+
+				// THE FIRST offending byte, by exact offset: an integer discloses nothing about a
+				// third party's endpoint, and it is the one thing that tells the caller which byte
+				// to fix. Asserting the exact number also pins that the scan reports the FIRST
+				// occurrence rather than an arbitrary one.
+				assert.Containsf(t, reason, fmt.Sprintf("byte %d", offending.offset),
+					"the reason must locate the offending byte exactly; got %q", reason)
+
+				if offending.hex == "" {
+					assert.Contains(t, reason, "literal space")
+					assert.Contains(t, reason, "%20", "the reason must name the correct spelling")
+				} else {
+					assert.Containsf(t, reason, offending.hex,
+						"a control byte must be named so the caller can find it; got %q", reason)
+				}
+
+				// AND NOTHING OF THE ENDPOINT ITSELF, which is a third party's and can carry a
+				// token in its path or query.
+				assert.NotContains(t, reason, "hooks")
+				assert.NotContains(t, reason, "example.com")
+			})
+		}
+
+		// AND THE CANONICAL FORM STAYS ACCEPTABLE, which is the whole point of refusing the
+		// literal one: there is a correct way to express the same endpoint.
+		for _, raw := range []string{
+			"https://hooks.example.com/a%20b",
+			"https://hooks.example.com/hook?note=a%20b",
+			"https://hooks.example.com/a%09b",
+			"https://hooks.example.com/a%7Fb",
+		} {
+			message, _ := ValidateWebhookURL(raw)
+			assert.Emptyf(t, message, "%q is the canonical escaping and must be accepted", raw)
+		}
+	})
+
+	t.Run("bytes above ASCII are left alone", func(t *testing.T) {
+		// A UTF-8 path is written with bytes at or above 0x80, url.Parse accepts them, and
+		// endpoints spelled this way work today. Refusing them would buy purity at the cost of
+		// rejecting working destinations, so the byte scan is scoped to ASCII space, the C0
+		// controls and DEL, and nothing else.
+		for _, raw := range []string{
+			"https://hooks.example.com/wébhook",
+			"https://hooks.example.com/请求",
+		} {
+			message, _ := ValidateWebhookURL(raw)
+			assert.Emptyf(t, message, "%q is a working destination and must not be refused", raw)
+		}
 	})
 
 	t.Run("an external host is not classified as internal", func(t *testing.T) {

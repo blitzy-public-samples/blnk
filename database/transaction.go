@@ -172,6 +172,35 @@ func (d Datasource) RecordTransaction(ctx context.Context, txn *model.Transactio
 		return nil, err
 	}
 
+	// THE QUEUE'S ACCEPTANCE IS AN EVENT TOO, and this is the only writer that sees it.
+	//
+	// A transaction the queue accepts is recorded here in the QUEUED or SCHEDULED state
+	// and then executed later by a worker, which persists the EXECUTED copy through an
+	// atomic writer. That writer captures transaction.applied for the copy; nothing
+	// captured anything for the accepted parent, so transaction.queued and
+	// transaction.scheduled were named in the catalogue and never published. Capturing
+	// them here — inside the same database transaction as the row they describe, on the
+	// same terms as every other event — is what makes the two names real.
+	//
+	// Only when the caller supplied nothing: transaction_rejection.go hands its own row in,
+	// and a caller's row is always authoritative over a derived one.
+	if len(eventRows) == 0 {
+		handoffEvent, captureErr := d.captureHandoffTransactionEvent(ctx, txn)
+		if captureErr != nil {
+			// REFUSING THE WRITE IS THE POINT. Preparing an event costs one JSON marshal, so
+			// the only failure it reports is a producer defect; committing the transaction
+			// anyway would accept a movement no subscriber is ever told about and leave no
+			// outbox row for the daily reconciliation to count. Same posture as
+			// persistSingleTransactionExecutionWork.
+			span.RecordError(captureErr)
+			return nil, captureErr
+		}
+
+		if handoffEvent != nil {
+			eventRows = []*model.EventOutbox{handoffEvent}
+		}
+	}
+
 	if len(eventRows) > 0 {
 		return d.recordTransactionWithEvents(ctx, span, txn, eventRows)
 	}

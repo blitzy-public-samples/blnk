@@ -278,7 +278,20 @@ func TestValidateQueuedBatchTransactionReferenceUsesPrefetchedSet(t *testing.T) 
 	assert.Contains(t, err.Error(), "already been used")
 }
 
-func TestValidateQueuedBatchTransactionReferenceNotifiesDuplicateReference(t *testing.T) {
+// A DUPLICATE REFERENCE MUST NOT BE PUBLISHED AS A SYSTEM ERROR.
+//
+// This test previously asserted the opposite, and the behaviour it pinned is the defect a
+// load run then measured: 1,763 error lines and 1,366 pending system.error events, produced
+// in proportion to how often the ledger CORRECTLY refused a duplicate. Every route into this
+// validator is a case the system handles — a coalesced follower whose leader already
+// committed its transaction, an at-least-once redelivery, or a client resubmitting a
+// reference the API answers with 409 — so none of them is a fault to page an operator about,
+// and none should cost a row in blnk.event_outbox.
+//
+// The error itself is unchanged and still returned, which is what the caller acts on. What
+// changed is that notification.NotifyError now recognises it as an expected condition and
+// records it at info level instead of publishing it. See internal/notification.
+func TestValidateQueuedBatchTransactionReferenceDoesNotNotifyDuplicateReference(t *testing.T) {
 	if currentConfig, err := config.Fetch(); err == nil {
 		t.Cleanup(func() { config.MockConfig(currentConfig) })
 	}
@@ -302,14 +315,29 @@ func TestValidateQueuedBatchTransactionReferenceNotifiesDuplicateReference(t *te
 		Reference: "duplicate_ref_q",
 	}, map[string]struct{}{"duplicate_ref_q": {}}, map[string]struct{}{"duplicate_ref_q": {}}, map[string]struct{}{})
 
+	// The verdict is still produced and still classifiable — that is what the caller needs.
 	assert.Error(t, err)
 	assert.True(t, IsDuplicateReferenceError(err))
 
+	// And it must not have been published.
 	select {
 	case event := <-events:
-		assert.Equal(t, "system.error", event)
+		t.Fatalf("a duplicate reference published a %q event. Publishing this correctly-refused "+
+			"duplicate is what produced 1,366 pending system.error events under a coalescing "+
+			"load, each one an outbox row the relay had to carry.", event)
 	case <-time.After(time.Second):
-		t.Fatal("expected system.error webhook event for duplicate reference")
+	}
+
+	// POSITIVE CONTROL, so the absence asserted above is not merely an unwired channel.
+	notification.NotifyError(errors.New("positive control: a genuine system error"))
+
+	select {
+	case event := <-events:
+		assert.Equal(t, "system.error", event,
+			"a genuine system error must still be published")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the positive control did not arrive, so this test cannot tell 'not published' " +
+			"from 'not observable'")
 	}
 }
 

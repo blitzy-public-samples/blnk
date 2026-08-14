@@ -138,7 +138,7 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 			name:      "transaction unknown",
 			eventType: "transaction.unknown",
 			want:      EventCategoryTransactions,
-			reason:    "transaction.unknown is reachable, not a placeholder: the status-to-event mapping has no COMMIT case, so a committed inflight transaction falls through to it and its events must still reach the transactions topic",
+			reason:    "transaction.unknown is the status-to-event mapping's defensive default for a status no case names. No code path produces it today — a committed inflight transaction is normalised to APPLIED before its name is derived — but it must still route to the transactions topic so a status added in future cannot be dropped",
 		},
 
 		// --- transactions: bulk names, composed at runtime as prefix + status ---

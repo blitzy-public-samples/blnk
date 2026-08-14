@@ -196,6 +196,17 @@ func eventOutboxClaimableSQL(alias string) string {
 // two lookups whose correct plan is not in doubt. sql/1781252500.sql holds the measurements and
 // the rejected alternatives.
 //
+// "Would have to sort" took a SECOND migration to become true of the head lookup, and the
+// reason is worth knowing before either function is edited. Selecting the key with an
+// EQUALITY puts it in an equivalence class, the planner folds the leading ORDER BY column to
+// a constant, and idx_event_outbox_claim_order then satisfies the whole ordering with no sort
+// node — so enable_sort = off excluded nothing and, at the one-row estimate ANALYZE reports
+// for an empty claimable set, the age-ordered scan was the CHEAPER plan and won, reading the
+// claimable population per key. blnk.event_outbox_key_head therefore selects its key with
+// `>= key AND <= key`, which returns the same rows and forms no equivalence class.
+// sql/1781252600.sql carries that correction. Keep any future predicate over the effective
+// key in that shape.
+//
 // carried_supply is what makes the removal complete rather than partial. The keys the walk and
 // the newest source contribute arrive without a head and still need a lookup — but a key from
 // either source has its head OUTSIDE the oldest window by definition, so that head is newer

@@ -409,6 +409,19 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 
 // MarkWebhookDispatched records that the legacy HTTP webhook leg was dispatched for
 // this entry, and does so ONLY IF the caller still holds the claim.
+//
+// It also RELEASES the claim when the row's Kafka leg has already settled, which is the
+// repair path's case and the only case where the webhook enqueue is the last thing the
+// claim was taken for. See the note on the statement below.
+//
+// Parameters:
+//   - ctx context.Context: cancels the update.
+//   - id int64: the row's surrogate key.
+//   - claimToken string: the token the claim issued; the update is refused without it.
+//
+// Returns:
+//   - error: a validation error for a blank token, the typed conflict when no row matched
+//     the claim, or a wrapped driver error.
 func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkWebhookDispatched")
 	defer span.End()
@@ -419,9 +432,38 @@ func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimTo
 		return err
 	}
 
+	// THE LEASE IS RELEASED WHEN, AND ONLY WHEN, NOTHING ELSE IS OWED ON THIS CLAIM.
+	//
+	// This statement serves two callers with opposite needs. The DUAL-DELIVERY path calls it
+	// mid-claim, while the row is 'processing' and its Kafka leg has not been recorded yet:
+	// clearing the token there would make the MarkEventDispatched that follows fail as a lost
+	// claim, and the row would be published again on a later pass. The REPAIR path calls it on
+	// a row whose Kafka leg is already settled — the repair claim only ever offers
+	// 'dispatched', 'failed' or 'dead_lettered' — and the webhook enqueue is the last thing
+	// that claim was taken for, so holding the lease afterwards serves nothing.
+	//
+	// It held it anyway. A repaired row kept locked_until and claim_token until the lease
+	// expired, which put it out of reach of the dead-letter-owed claim (a 'failed' row still
+	// owes its .dlt write) for up to the lease duration, and left an operator reading the row
+	// unable to tell a finished repair from one in flight. The CASE releases it in the
+	// terminal-leg states and leaves the mid-claim states untouched, so both callers get the
+	// behaviour they need from one statement.
+	//
+	// Idempotency is preserved where it is relied on: a re-call from the claim holder on a
+	// 'processing' row still matches. On a released row a re-call reports a lost claim, which
+	// is correct — the claim IS gone — and no caller re-calls, because webhook_dispatched is
+	// what makes a row a repair candidate at all.
 	result, err := d.Conn.ExecContext(ctx, `
 		UPDATE blnk.event_outbox
-		SET webhook_dispatched = TRUE
+		SET webhook_dispatched = TRUE,
+			locked_until = CASE
+				WHEN status IN ('dispatched', 'failed', 'dead_lettered') THEN NULL
+				ELSE locked_until
+			END,
+			claim_token = CASE
+				WHEN status IN ('dispatched', 'failed', 'dead_lettered') THEN NULL
+				ELSE claim_token
+			END
 		WHERE id = $1 AND claim_token = $2
 	`, id, claimToken)
 	if err != nil {

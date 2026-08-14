@@ -1,0 +1,561 @@
+# Copyright 2024 Blnk Finance Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# THE PRODUCER PRINCIPAL AND ITS ACLS. NOTHING IN THIS TREE CREATED THEM.
+#
+# WHAT WAS MISSING. kafka-statefulset.yaml bootstraps the broker and seeds ONE credential —
+# the administrative principal, through `kafka-storage format --add-scram`, because in KRaft
+# mode a SCRAM user must exist in the metadata log before any broker can authenticate at
+# all. Everything else was left to `scripts/kafka-provision.sh`, which docker-compose.yaml
+# runs as its `kafka-init` one-shot. Kubernetes has no host directory to mount that script
+# from and no equivalent workload, so a cluster deployed from these manifests came up with a
+# healthy three-broker quorum, correct TLS, an enforcing authorizer — and no producer
+# credential and no ACLs.
+#
+# HOW THAT FAILS, and it is worth stating because it does not look like a permissions
+# problem: config.ProducerSASL REFUSES to publish as the administrative principal, so the
+# relay authenticates as KAFKA_SASL_USER. With no such user in the metadata log every
+# publish is refused, and Kafka masks an unauthorized topic as an ABSENT one — the relay
+# reports `[3] Unknown Topic Or Partition` against topics that plainly exist. Rows
+# accumulate in blnk.event_outbox with a TOPIC_AUTHORIZATION_FAILED or unknown-topic
+# last_error while the ledger keeps accepting transactions.
+#
+# NOTHING IS LOST WHILE THIS JOB HAS NOT RUN, which is why ordering it is a matter of
+# operational tidiness rather than correctness: the transactional outbox is the durable
+# record, the relay retries with bounded backoff, and once the principal and its grants
+# exist the backlog drains in occurrence order. Apply this Job BEFORE the server so no
+# backlog forms at all:
+#
+#   kubectl apply -f namespace.yaml
+#   kubectl apply -f blnk-config.yaml -f kafka-service.yaml -f kafka-statefulset.yaml
+#   kubectl -n blnk rollout status statefulset/kafka --timeout=10m
+#   kubectl apply -f kafka-provision-job.yaml
+#   kubectl -n blnk wait --for=condition=complete job/kafka-provision --timeout=10m
+#   kubectl apply -f server-deployment.yaml -f worker-deployment.yaml
+#
+# WHY THE SCRIPT IS INLINE RATHER THAN MOUNTED FROM A ConfigMap. It follows this tree's own
+# precedent: kafka-statefulset.yaml inlines its bootstrap script for the same reason, which
+# is that Kubernetes cannot bind-mount a repository directory. The alternative — projecting
+# the 245 KB scripts/kafka-provision.sh into a ConfigMap — would put a COPY of it in this
+# tree, and a copy of a script is a thing that silently diverges from the original. What is
+# inlined here is deliberately the SUBSET this cluster needs, and it matches that script's
+# semantics exactly where it overlaps: the same four event categories and their dead-letter
+# siblings, the same Write-and-Describe grant on literal topic patterns and nothing else, and
+# the same refusal to reuse the administrative principal as the producer. The sample
+# subscriber that script also creates is a LOCAL-DEVELOPMENT convenience and is deliberately
+# absent here.
+#
+# IT IS IDEMPOTENT, so a retry, a re-apply or a manual re-run changes nothing on a cluster
+# that is already provisioned. `--add-config` overwrites a credential, `--if-not-exists`
+# skips an existing topic, and `kafka-acls --add` is a no-op on a binding that is already
+# there.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-provision
+  namespace: blnk
+  labels:
+    app: kafka-provision
+    app.kubernetes.io/name: kafka-provision
+    app.kubernetes.io/part-of: blnk
+spec:
+  # BOUNDED, never uncapped. The script's failures are configuration failures — a missing
+  # secret, an unreachable broker, a principal that collides with the administrator — and
+  # none of them becomes true on the seventh attempt. Uncapped, a misconfiguration restarts
+  # for ever and buries the one error worth reading under identical copies of itself.
+  backoffLimit: 6
+  # Deleted an hour after it finishes, so a namespace does not accumulate one completed Job
+  # per deployment. An hour is long enough to read the logs of a Job that completed while
+  # nobody was watching.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: kafka-provision
+    spec:
+      # OnFailure and not Never: a failed attempt restarts the container in place rather than
+      # leaving a Failed pod behind for every try, which keeps `kubectl logs job/...`
+      # pointing at something readable.
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka-provision
+          # THE SAME IMAGE AND THE SAME DIGEST as the broker. The CLI tools have to be the
+          # ones that match the cluster they administer, and a floating tag here could put a
+          # different Kafka generation's kafka-configs.sh against this broker.
+          image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          env:
+            - name: TZ
+              value: Etc/UTC
+            # THE ADDRESS THE SERVER ITSELF DIALS, read from the same ConfigMap key, so this
+            # Job exercises the exact DNS, TLS and SASL path the relay will use rather than
+            # a parallel one that can succeed while the relay's fails.
+            #
+            # That matters here more than it looks: ssl.endpoint.identification.algorithm is
+            # https, so every connection verifies the broker's certificate against the
+            # hostname it dialled. A Job that bootstrapped on a different name could pass
+            # against a certificate that does not carry the name the server uses, and report
+            # a provisioned cluster the server cannot reach.
+            #
+            # Optional, and the script falls back to the three per-pod FQDNs — the names
+            # kafka-statefulset.yaml's SAN contract guarantees most explicitly — so this Job
+            # still works on a cluster where the operator has not set the key yet.
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_BROKERS
+                  optional: true
+            # THE ADMINISTRATOR, which is who this Job authenticates AS. It is the only
+            # principal that exists before this Job runs, and it is a super.user, so it is
+            # the only one that can create another.
+            - name: KAFKA_SASL_ADMIN_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SASL_ADMIN_USER
+            - name: KAFKA_SASL_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: admin-secret
+            # THE PRODUCER, which is who this Job CREATES — and the same two values the
+            # server and worker read, from the same ConfigMap key and the same Secret key, so
+            # the credential the broker is given and the credential Blnk presents cannot
+            # drift apart.
+            - name: KAFKA_SASL_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SASL_USER
+            - name: KAFKA_SASL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: producer-secret
+            # The topic layout, read from the same ConfigMap the server resolves it from, so
+            # the topics this Job creates are the topics Blnk publishes to.
+            - name: KAFKA_TOPIC_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TOPIC_PREFIX
+            - name: KAFKA_MIN_PARTITIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_MIN_PARTITIONS
+            - name: KAFKA_REPLICATION_FACTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_REPLICATION_FACTOR
+            # CONSENT TO RE-MAP KEYS, and it is shipped false. Growing a topic that already
+            # holds records moves keys between partitions, which breaks the per-aggregate
+            # ordering guarantee that keying by ledger ID exists to provide — permanently and
+            # silently, for every key affected. Read from the ConfigMap so one value governs
+            # this Job, the compose provisioning script and Blnk's own topic assurance.
+            - name: KAFKA_ALLOW_PARTITION_GROWTH
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_ALLOW_PARTITION_GROWTH
+                  optional: true
+            # The namespace, for building the per-pod fallback bootstrap list.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KAFKA_TLS_TRUSTSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-tls
+                  key: truststore-password
+            # How long to wait for a broker that can answer. Ten minutes covers a cold
+            # three-node quorum election on a cluster whose nodes are still pulling images.
+            - name: KAFKA_PROVISION_TIMEOUT_SECONDS
+              value: "600"
+          volumeMounts:
+            # The truststore, so this Job can verify the brokers' certificates. It needs no
+            # keystore: the brokers do not require client certificates, they require SASL.
+            - name: kafka-tls
+              mountPath: /etc/kafka/tls
+              readOnly: true
+            # readOnlyRootFilesystem is true, so the client configuration and the CLI's own
+            # scratch space need a writable mount. Memory-backed, because the file it holds
+            # carries the administrative password and has no business on a disk.
+            - name: provision-work
+              mountPath: /tmp/blnk-kafka
+            - name: kafka-cli-logs
+              mountPath: /opt/kafka/logs
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              WORK=/tmp/blnk-kafka
+              CLIENT_CONFIG="${WORK}/client-admin.properties"
+              PREFIX="${KAFKA_TOPIC_PREFIX:-blnk}"
+              PARTITIONS="${KAFKA_MIN_PARTITIONS:-6}"
+              REPLICATION="${KAFKA_REPLICATION_FACTOR:-3}"
+              NAMESPACE="${POD_NAMESPACE:-blnk}"
+
+              # THE BOOTSTRAP ADDRESS: whatever the server dials, or the per-pod names if the
+              # operator has not set it yet. The fallback lists all three deliberately — a
+              # single pod name would make this Job depend on kafka-0 specifically, and the
+              # point of a three-node quorum is that any one of them can be down.
+              BOOTSTRAP="$(printf '%s' "${KAFKA_BROKERS:-}" | tr -d '[:space:]')"
+              if [ -z "${BOOTSTRAP}" ]; then
+                BOOTSTRAP="kafka-0.kafka-headless.${NAMESPACE}.svc.cluster.local:9092"
+                BOOTSTRAP="${BOOTSTRAP},kafka-1.kafka-headless.${NAMESPACE}.svc.cluster.local:9092"
+                BOOTSTRAP="${BOOTSTRAP},kafka-2.kafka-headless.${NAMESPACE}.svc.cluster.local:9092"
+                echo "kafka-provision: KAFKA_BROKERS is empty; using the per-pod names ${BOOTSTRAP}"
+                echo "kafka-provision: NOTE — empty KAFKA_BROKERS also means the relay will not run."
+                echo "kafka-provision: This Job provisions the cluster anyway, so that setting the key"
+                echo "kafka-provision: later is the whole of the change, but nothing drains the event"
+                echo "kafka-provision: outbox until blnk-config carries a broker list."
+              fi
+
+              # EVERY REQUIRED VALUE IS CHECKED BEFORE ANYTHING IS ATTEMPTED, so a missing
+              # secret is one clear line rather than a CLI error about a connection.
+              for required in KAFKA_SASL_ADMIN_USER KAFKA_SASL_ADMIN_SECRET \
+                              KAFKA_SASL_USER KAFKA_SASL_SECRET \
+                              KAFKA_TLS_TRUSTSTORE_PASSWORD; do
+                if [ -z "${!required:-}" ]; then
+                  echo "kafka-provision: ${required} is empty." >&2
+                  echo "kafka-provision: KAFKA_SASL_ADMIN_USER and KAFKA_SASL_USER come from the" >&2
+                  echo "kafka-provision: blnk-config ConfigMap; admin-secret and producer-secret from" >&2
+                  echo "kafka-provision: Secret kafka-credentials; truststore-password from Secret" >&2
+                  echo "kafka-provision: kafka-tls. Create them before applying this Job." >&2
+                  exit 1
+                fi
+              done
+
+              # THE PRODUCER MUST NOT BE THE ADMINISTRATOR, and this refuses rather than
+              # warns. config.ProducerSASL refuses to publish as the administrative
+              # principal, so a deployment that set them equal would provision a credential
+              # Blnk will not use and then fail every publish with a message about the
+              # principal rather than about the configuration. The administrator is also a
+              # super.user, so granting it the producer's ACLs would be meaningless.
+              if [ "${KAFKA_SASL_USER}" = "${KAFKA_SASL_ADMIN_USER}" ]; then
+                echo "kafka-provision: KAFKA_SASL_USER and KAFKA_SASL_ADMIN_USER are the same" >&2
+                echo "kafka-provision: principal (${KAFKA_SASL_USER}). They must differ: Blnk refuses" >&2
+                echo "kafka-provision: to publish as the administrative principal, which is a" >&2
+                echo "kafka-provision: super.user and bypasses every ACL. Give the producer its own" >&2
+                echo "kafka-provision: name in blnk-config." >&2
+                exit 1
+              fi
+
+              # THE CLIENT CONFIGURATION, written 0600 and never echoed. The password is
+              # interpolated into a JAAS line, so it is written with printf to a file rather
+              # than passed on a command line where `ps` and any audit log would capture it.
+              umask 077
+              cat >"${CLIENT_CONFIG}" <<CLIENT
+              security.protocol=SASL_SSL
+              sasl.mechanism=SCRAM-SHA-512
+              ssl.truststore.location=/etc/kafka/tls/truststore.jks
+              ssl.truststore.password=${KAFKA_TLS_TRUSTSTORE_PASSWORD}
+              ssl.endpoint.identification.algorithm=https
+              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_SASL_ADMIN_USER}" password="${KAFKA_SASL_ADMIN_SECRET}";
+              CLIENT
+
+              # WAIT FOR A BROKER THAT CAN ANSWER, not for one that resolves. The headless
+              # Service publishes not-ready addresses so the name resolves long before the
+              # quorum has a leader, and every CLI call below would fail against a broker
+              # that has not finished electing one. `--list` is the cheapest call that
+              # exercises DNS, TLS, SASL and the metadata path together.
+              DEADLINE=$(( $(date +%s) + KAFKA_PROVISION_TIMEOUT_SECONDS ))
+              until /opt/kafka/bin/kafka-topics.sh \
+                      --bootstrap-server "${BOOTSTRAP}" \
+                      --command-config "${CLIENT_CONFIG}" \
+                      --list >/dev/null 2>&1; do
+                if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+                  echo "kafka-provision: no broker answered on ${BOOTSTRAP} within" >&2
+                  echo "kafka-provision: ${KAFKA_PROVISION_TIMEOUT_SECONDS}s. The three usual causes:" >&2
+                  echo "kafka-provision: the StatefulSet has not reached a quorum, the" >&2
+                  echo "kafka-provision: administrative credential in Secret kafka-credentials is not" >&2
+                  echo "kafka-provision: the one the brokers' metadata log was formatted with, or the" >&2
+                  echo "kafka-provision: truststore in Secret kafka-tls does not trust the brokers'" >&2
+                  echo "kafka-provision: certificates. The last of the three is the only one that" >&2
+                  echo "kafka-provision: fails identically to a network problem." >&2
+                  echo "kafka-provision: Diagnose with: kubectl -n blnk logs kafka-0 -c kafka" >&2
+                  exit 1
+                fi
+                echo "kafka-provision: waiting for a broker on ${BOOTSTRAP}"
+                sleep 5
+              done
+              echo "kafka-provision: broker reached on ${BOOTSTRAP}"
+
+              # THE TOPIC CATALOGUE. Four categories and a dead-letter sibling for each, which
+              # is exactly what model/event_topics.go resolves and what
+              # scripts/kafka-provision.sh creates. The fourth category, 'system', exists
+              # because ledger.created and system.error belong to none of the three the
+              # requirement names and 100% event coverage is mandatory.
+              TOPICS=()
+              for category in transactions balances identities system; do
+                TOPICS+=("${PREFIX}.${category}" "${PREFIX}.${category}.dlt")
+              done
+
+              for topic in "${TOPICS[@]}"; do
+                # --if-not-exists rather than a create-then-ignore-the-error, so a topic
+                # somebody else created is left exactly as it is and this Job stays a no-op on
+                # a provisioned cluster.
+                /opt/kafka/bin/kafka-topics.sh \
+                  --bootstrap-server "${BOOTSTRAP}" \
+                  --command-config "${CLIENT_CONFIG}" \
+                  --create --if-not-exists \
+                  --topic "${topic}" \
+                  --partitions "${PARTITIONS}" \
+                  --replication-factor "${REPLICATION}"
+
+                # WHETHER THE GEOMETRY IS RIGHT, and what to do when it is not. Kafka cannot
+                # reduce a partition count, so the only question is whether to RAISE one, and
+                # raising is not always safe.
+                CURRENT="$(
+                  /opt/kafka/bin/kafka-topics.sh \
+                    --bootstrap-server "${BOOTSTRAP}" \
+                    --command-config "${CLIENT_CONFIG}" \
+                    --describe --topic "${topic}" \
+                    | sed -n '1s/.*PartitionCount:[[:space:]]*\([0-9]*\).*/\1/p'
+                )"
+
+                if [ -z "${CURRENT}" ]; then
+                  echo "kafka-provision: could not read the partition count of ${topic}." >&2
+                  echo "kafka-provision: --describe returned no PartitionCount, which usually means" >&2
+                  echo "kafka-provision: the administrative principal lacks Describe on it." >&2
+                  exit 1
+                fi
+
+                if [ "${CURRENT}" -gt "${PARTITIONS}" ]; then
+                  # MORE than configured. Left alone and NOT an error, matching
+                  # scripts/kafka-provision.sh: reducing is impossible, the extra partitions
+                  # are harmless to ordering, and an operator who raised the count
+                  # deliberately should not have a Job fail on them.
+                  echo "kafka-provision: ${topic} has ${CURRENT} partitions, more than the configured"
+                  echo "kafka-provision: ${PARTITIONS}. Left alone — Kafka cannot reduce a partition"
+                  echo "kafka-provision: count, and the extra partitions are harmless. Raise"
+                  echo "kafka-provision: KAFKA_MIN_PARTITIONS to ${CURRENT} if you want configuration"
+                  echo "kafka-provision: and reality to agree."
+                elif [ "${CURRENT}" -lt "${PARTITIONS}" ]; then
+                  # FEWER than configured, and this is where the care is needed. GROWING A
+                  # TOPIC THAT HOLDS RECORDS RE-MAPS KEYS: an aggregate's events already
+                  # written land on one partition and its later events land on another, so a
+                  # consumer can observe them out of order. That breaks the per-aggregate
+                  # ordering guarantee keying by ledger ID exists to provide — permanently, for
+                  # every key affected, and with no error anywhere.
+                  #
+                  # So emptiness is established first, and an EMPTY topic is grown freely
+                  # because there are no keys to re-map. A non-empty one is grown only on the
+                  # explicit consent KAFKA_ALLOW_PARTITION_GROWTH carries, which blnk-config
+                  # ships as false. This is the same rule scripts/kafka-provision.sh applies,
+                  # and it has to be the same rule: two provisioners that answered differently
+                  # for one ConfigMap would make the outcome depend on which one ran.
+                  RECORDS="$(
+                    /opt/kafka/bin/kafka-get-offsets.sh \
+                      --bootstrap-server "${BOOTSTRAP}" \
+                      --command-config "${CLIENT_CONFIG}" \
+                      --topic "${topic}" 2>/dev/null \
+                      | awk -F: '{ total += $3 } END { print total + 0 }'
+                  )" || RECORDS=""
+
+                  if [ "${RECORDS:-}" = "0" ]; then
+                    echo "kafka-provision: growing empty ${topic} from ${CURRENT} to ${PARTITIONS} partitions"
+                    /opt/kafka/bin/kafka-topics.sh \
+                      --bootstrap-server "${BOOTSTRAP}" \
+                      --command-config "${CLIENT_CONFIG}" \
+                      --alter --topic "${topic}" --partitions "${PARTITIONS}"
+                  elif [ "${KAFKA_ALLOW_PARTITION_GROWTH:-}" = "true" ] \
+                    || [ "${KAFKA_ALLOW_PARTITION_GROWTH:-}" = "1" ] \
+                    || [ "${KAFKA_ALLOW_PARTITION_GROWTH:-}" = "yes" ]; then
+                    echo "kafka-provision: growing ${topic} from ${CURRENT} to ${PARTITIONS} partitions"
+                    echo "kafka-provision: even though it is not known to be empty, because"
+                    echo "kafka-provision: KAFKA_ALLOW_PARTITION_GROWTH is set. Keys already written will"
+                    echo "kafka-provision: re-map, so per-aggregate ordering is broken for those keys."
+                    /opt/kafka/bin/kafka-topics.sh \
+                      --bootstrap-server "${BOOTSTRAP}" \
+                      --command-config "${CLIENT_CONFIG}" \
+                      --alter --topic "${topic}" --partitions "${PARTITIONS}"
+                  else
+                    # REFUSED, not warned past. A topic that stays under-partitioned caps how
+                    # far subscriber consumption can parallelise, which is a performance
+                    # ceiling; growing it silently breaks ordering, which is a correctness
+                    # failure. Neither is this Job's decision to make, so it stops and says so.
+                    echo "kafka-provision: ${topic} has ${CURRENT} partitions, fewer than the" >&2
+                    echo "kafka-provision: configured ${PARTITIONS}, and it is not known to be empty" >&2
+                    echo "kafka-provision: (${RECORDS:-unreadable} records)." >&2
+                    echo "kafka-provision: NOT GROWN. Growing it would re-map keys already written to" >&2
+                    echo "kafka-provision: different partitions: one aggregate's events would be split" >&2
+                    echo "kafka-provision: across two partitions and a consumer could observe them out" >&2
+                    echo "kafka-provision: of order, permanently. Choose one:" >&2
+                    echo "kafka-provision:   - leave it, and set KAFKA_MIN_PARTITIONS to ${CURRENT} so" >&2
+                    echo "kafka-provision:     configuration and reality agree. Consumption parallelism" >&2
+                    echo "kafka-provision:     stays capped at ${CURRENT}." >&2
+                    echo "kafka-provision:   - set KAFKA_ALLOW_PARTITION_GROWTH=true in blnk-config and" >&2
+                    echo "kafka-provision:     accept the ordering break for keys already written." >&2
+                    exit 1
+                  fi
+                fi
+              done
+              echo "kafka-provision: ${#TOPICS[@]} topics present with the configured geometry"
+
+              # THE PRODUCER'S CREDENTIAL. --add-config OVERWRITES, which is what makes this
+              # idempotent and what makes a rotation work: change producer-secret in the
+              # Secret, re-run this Job, restart the server. Unlike the administrative
+              # credential this one is NOT tied to the format, so rotating it needs no
+              # re-format and destroys nothing.
+              #
+              # 4096 iterations is the minimum Kafka accepts for SCRAM and the value
+              # scripts/kafka-provision.sh uses, so a credential minted here and one minted
+              # locally are the same shape.
+              #
+              # THE PASSWORD IS ON A COMMAND LINE HERE and that is unavoidable:
+              # kafka-configs.sh takes --add-config as an argument and offers no file form.
+              # The exposure is bounded to this container's own process list for the duration
+              # of one call, in a pod that runs nothing else, and the value is already in this
+              # process's environment.
+              /opt/kafka/bin/kafka-configs.sh \
+                --bootstrap-server "${BOOTSTRAP}" \
+                --command-config "${CLIENT_CONFIG}" \
+                --alter \
+                --entity-type users \
+                --entity-name "${KAFKA_SASL_USER}" \
+                --add-config "SCRAM-SHA-512=[iterations=4096,password=${KAFKA_SASL_SECRET}]" \
+                >/dev/null
+              echo "kafka-provision: SCRAM-SHA-512 credential set for User:${KAFKA_SASL_USER}"
+
+              # AND ITS GRANT: Write and Describe on every topic Blnk publishes to, and
+              # nothing else.
+              #
+              # WHY DESCRIBE AS WELL AS WRITE. A producer fetches topic metadata before it can
+              # choose a partition, and that fetch is authorized as Describe. Write alone
+              # authenticates and then fails every publish.
+              #
+              # WHY NO READ, NO GROUP AND NO CLUSTER AUTHORITY. Blnk publishes; it never
+              # consumes through this principal. A Read grant here would let a leaked producer
+              # credential read every ledger event in the cluster.
+              #
+              # WHY LITERAL PATTERNS AND NOT A PREFIXED GRANT ON "${PREFIX}". A prefixed grant
+              # would also cover any future topic whose name begins that way, including ones
+              # this feature does not own. One binding per topic and operation costs sixteen
+              # bindings instead of two and grants exactly what is intended.
+              for topic in "${TOPICS[@]}"; do
+                /opt/kafka/bin/kafka-acls.sh \
+                  --bootstrap-server "${BOOTSTRAP}" \
+                  --command-config "${CLIENT_CONFIG}" \
+                  --add \
+                  --allow-principal "User:${KAFKA_SASL_USER}" \
+                  --operation Write \
+                  --operation Describe \
+                  --topic "${topic}" \
+                  >/dev/null
+              done
+              echo "kafka-provision: Write and Describe granted to User:${KAFKA_SASL_USER} on ${#TOPICS[@]} topics"
+
+              # PROVE IT, rather than assuming the calls above had the effect they reported.
+              # A credential that was accepted and an ACL that was written are two claims; that
+              # the producer can actually authenticate and see its topics is the one that
+              # matters, and it is the one the relay depends on.
+              PRODUCER_CONFIG="${WORK}/client-producer.properties"
+              cat >"${PRODUCER_CONFIG}" <<PRODUCER
+              security.protocol=SASL_SSL
+              sasl.mechanism=SCRAM-SHA-512
+              ssl.truststore.location=/etc/kafka/tls/truststore.jks
+              ssl.truststore.password=${KAFKA_TLS_TRUSTSTORE_PASSWORD}
+              ssl.endpoint.identification.algorithm=https
+              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_SASL_USER}" password="${KAFKA_SASL_SECRET}";
+              PRODUCER
+
+              # THE PROBE IS kafka-get-offsets.sh AND NOT kafka-topics.sh --describe, and the
+              # difference is not cosmetic. `--describe` issues a DescribeConfigs request as
+              # well as a Metadata one, and DescribeConfigs is authorized by DESCRIBE_CONFIGS
+              # — an authority this principal deliberately does NOT hold. Probing with it
+              # fails on a correctly-provisioned cluster and would send an operator looking
+              # for a broken grant instead of a broken probe.
+              #
+              # kafka-get-offsets.sh asks for exactly what a producer asks for: topic metadata
+              # and partition offsets, both authorized by DESCRIBE on the topic. It therefore
+              # proves the credential authenticates, the grant is effective, and the topic has
+              # the partitions this Job asked for — in one call, and using only the authority
+              # the producer legitimately has.
+              for topic in "${TOPICS[@]}"; do
+                OFFSETS="$(
+                  /opt/kafka/bin/kafka-get-offsets.sh \
+                    --bootstrap-server "${BOOTSTRAP}" \
+                    --command-config "${PRODUCER_CONFIG}" \
+                    --topic "${topic}" 2>/dev/null
+                )" || OFFSETS=""
+
+                SEEN="$(printf '%s' "${OFFSETS}" | grep -c . || true)"
+
+                if [ "${SEEN}" -eq 0 ]; then
+                  echo "kafka-provision: the credential and the grant for User:${KAFKA_SASL_USER} were" >&2
+                  echo "kafka-provision: both accepted, but it cannot see ${topic}. Either the brokers" >&2
+                  echo "kafka-provision: have not yet applied the metadata records this Job wrote — in" >&2
+                  echo "kafka-provision: which case this Job's backoffLimit will retry it and succeed —" >&2
+                  echo "kafka-provision: or an explicit DENY binding overrides the ALLOW above. A DENY" >&2
+                  echo "kafka-provision: wins in Kafka regardless of order, and this Job does not" >&2
+                  echo "kafka-provision: remove one. Check with:" >&2
+                  echo "kafka-provision:   kafka-acls.sh --list --topic ${topic}" >&2
+                  exit 1
+                fi
+
+                # AT LEAST the configured count, not exactly it — the same asymmetry the
+                # geometry step above applies, and it has to be the same or the two contradict
+                # each other. A topic an operator deliberately raised above
+                # KAFKA_MIN_PARTITIONS is reported as harmless up there, so failing on it here
+                # would make this Job refuse a cluster it had just declared correct. A
+                # SHORTFALL is different: it means the assurance above did not take effect.
+                if [ "${SEEN}" -lt "${PARTITIONS}" ]; then
+                  echo "kafka-provision: ${topic} presents only ${SEEN} partitions to the producer but" >&2
+                  echo "kafka-provision: this Job asked for ${PARTITIONS}. The geometry assurance above" >&2
+                  echo "kafka-provision: reported success, so this is a shortfall that appeared after it:" >&2
+                  echo "kafka-provision: the partition count bounds how far subscriber consumption can" >&2
+                  echo "kafka-provision: parallelise, so it is reported rather than accepted." >&2
+                  exit 1
+                fi
+              done
+
+              rm -f "${CLIENT_CONFIG}" "${PRODUCER_CONFIG}"
+              echo "kafka-provision: verified — User:${KAFKA_SASL_USER} authenticates, and every one of"
+              echo "kafka-provision: the ${#TOPICS[@]} topics it publishes to presents at least ${PARTITIONS} partitions to it"
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+            defaultMode: 288
+        - name: provision-work
+          emptyDir:
+            medium: Memory
+        - name: kafka-cli-logs
+          emptyDir: {}

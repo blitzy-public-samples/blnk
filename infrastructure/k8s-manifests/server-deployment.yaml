@@ -63,14 +63,39 @@ spec:
             - up
             - --config
             - /blnk.json
-          # Migrations need the database and nothing else, so this container gets the
-          # DSN and none of the other credentials.
+          # MIGRATIONS NEED THE DATABASE AND REDIS, and the second half of that was the
+          # defect. "Migrations need the database and nothing else" is true of the SQL this
+          # container applies and false of the PROCESS that applies it: `blnk migrate up`
+          # runs through the root command's PersistentPreRunE, which builds the whole
+          # service container for ProcessRoleTool — including the Redis client — before the
+          # migrate subcommand's own RunE is ever reached. config.validateRequiredFields
+          # refuses to start without a Redis DSN for the same reason.
+          #
+          # So a container given no BLNK_REDIS_DNS does not skip Redis; it falls back to the
+          # value in the mounted blnk.json, which is the unauthenticated "redis:6379" this
+          # repository ships as its no-password default. Against the Redis this tree
+          # actually deploys — password-protected, --requirepass from Secret blnk-redis —
+          # that connection is refused with NOAUTH, the init container exits non-zero, and
+          # the pod restarts it for ever. The server never starts, the migrations never
+          # apply, and the only evidence is a NOAUTH line in a container that is not the one
+          # anybody looks at.
+          #
+          # The fix is the SAME secret reference the main container carries, verbatim
+          # including optional: true — one Redis, one DSN, and a value the two containers of
+          # one pod cannot disagree about. optional stays true so a deployment running an
+          # unauthenticated Redis (where blnk.json's default IS correct) is unaffected.
           env:
             - name: BLNK_DATA_SOURCE_DNS
               valueFrom:
                 secretKeyRef:
                   name: blnk-datasource
                   key: dsn
+            - name: BLNK_REDIS_DNS
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-redis
+                  key: dns
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

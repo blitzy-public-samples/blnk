@@ -73,6 +73,53 @@ services:
       # exercised locally at all.
       BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE: ${BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE:-true}
       # ---------------------------------------------------------------------
+      # THE MASTER KEY — this is what makes /events and /subscribers REACHABLE
+      #
+      # Every route under /events and /subscribers is an operator action gated on the
+      # master key: authz.MasterKeyRequest compares the X-Blnk-Key header against
+      # server.secret_key, and a deployment that has not set one has no master credential
+      # to present, so the comparison can never succeed. Without this projection the
+      # entire event-management and subscriber-management surface — dead-letter listing,
+      # replay, outbox statistics, subscriber CRUD and Kafka credential issuance —
+      # answers 403 AUTH_MASTER_KEY_REQUIRED to every caller, including one holding the
+      # key from .env. The services start, the routes are registered and nothing logs an
+      # error, which is what made this hard to see: the stack looks healthy and half its
+      # API is unusable.
+      #
+      # `stack.sh --init` generates a value. Set it by hand only if you want a specific
+      # one; leaving it empty leaves those routes gated shut, which is the correct
+      # behaviour for a stack with no operator credential rather than a failure.
+      BLNK_SERVER_SECRET_KEY: ${BLNK_SERVER_SECRET_KEY:-}
+      # SECURE MODE IS SEPARATE FROM THE MASTER KEY, and only the key above is needed to
+      # reach the operator surface. This switch decides whether EVERY OTHER route demands
+      # a credential too: left at the shipped default the ledger, balance, transaction
+      # and identity endpoints stay open, which is what makes a fresh clone usable
+      # without a key. Set BLNK_SERVER_SECURE=true in .env to exercise the authenticated
+      # posture a deployment actually runs — and note that /metrics then REQUIRES
+      # BLNK_METRICS_BEARER_TOKEN, because secure mode with no token refuses the endpoint
+      # outright rather than serving it unauthenticated.
+      BLNK_SERVER_SECURE: ${BLNK_SERVER_SECURE:-}
+      # ---------------------------------------------------------------------
+      # SEARCH — this is what makes /search RETURN RESULTS
+      #
+      # The typesense service below is started by this file, and starting it is not the
+      # same as reaching it: Blnk reads its endpoint and key from configuration, so
+      # without these two the search client has nothing to dial and every /search request
+      # answers 404 while a healthy TypeSense sits on the compose network unused. The
+      # index queue keeps enqueueing and the indexer keeps failing, so the failure grows
+      # a backlog rather than announcing itself.
+      #
+      # BOTH DEFAULTS ARE DERIVED FROM THE SERVICE THIS FILE CREATES, by name over the
+      # compose network and with the same --api-key value the typesense command below is
+      # given, so a clone is searchable with no configuration at all. An operator value
+      # still wins, and as with the two DSNs above, note WHICH value: these keys are also
+      # read by HOST processes, where the endpoint is localhost and the published port. A
+      # host-shaped value forwarded into a container names the container's own loopback,
+      # so either leave them empty and accept the derived default or set the in-compose
+      # form.
+      BLNK_TYPESENSE_DNS: ${BLNK_TYPESENSE_DNS:-http://typesense:8108}
+      BLNK_TYPESENSE_KEY: ${BLNK_TYPESENSE_KEY:-${TYPESENSE_API_KEY:-blnk-api-key}}
+      # ---------------------------------------------------------------------
       # Kafka event publishing and the outbox relay. Every name below is the bare,
       # un-prefixed form .env.example declares, which is the mandated contract.
       #
@@ -249,8 +296,19 @@ services:
       # delete nothing at all, which is a silently broken sweeper rather than a disabled
       # one. The per-sweep ceiling is what stops one sweep attempting an entire
       # historical backlog on a live relay.
+      #
+      # 1000 x 4000 = 4,000,000 rows an hour, and the sweep runs hourly, so that IS the
+      # hourly capacity. It is chosen against the validated 500 events a second —
+      # 1,800,000 arrivals an hour — to clear arrivals TWICE OVER. Capacity merely
+      # exceeding arrival is not enough: a sweep cut short by its own timeout has to be
+      # able to catch up on the next one, and a sweeper that never catches up leaves the
+      # retention period unenforced however short it is set. These are the same two values
+      # config/config.go defaults to, .env.example ships and blnk-config.yaml applies, so
+      # the knob means one thing in every deployment. The ceiling used to be 2000 here and
+      # nowhere else, which cleared arrivals only 1.1x — below the project's own rule, and
+      # reachable by any operator who turned retention on without also setting this.
       RELAY_EVENT_RETENTION_BATCH_SIZE: ${RELAY_EVENT_RETENTION_BATCH_SIZE:-1000}
-      RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP: ${RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP:-2000}
+      RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP: ${RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP:-4000}
       # THE REPAIR SWEEP'S THREE DIMENSIONS, forwarded because .env.example documents
       # them and config/config.go resolves them: an operator who sets one and sees the
       # bring-up succeed would otherwise have no way to learn it never reached the
@@ -414,6 +472,36 @@ services:
       # The bearer token that gates /metrics — and, on the worker, the asynqmon queue
       # dashboard at /monitoring.
       BLNK_METRICS_BEARER_TOKEN: ${BLNK_METRICS_BEARER_TOKEN:-}
+      # ---------------------------------------------------------------------
+      # SEARCH — this is what makes the INDEX QUEUE DRAIN
+      #
+      # The indexer runs HERE, not on the server: ledger, balance and identity writes
+      # enqueue onto the index queue and this role's handlers build a TypeSense client and
+      # push the document. Without these two the client has nothing to dial, every index
+      # task fails, and because the tasks are retried the queue grows without bound while
+      # /search on the server answers 404. Nothing about that failure is loud — the ledger
+      # writes all succeed, so the only symptom is stale search results and a backlog.
+      #
+      # Derived from the typesense service this file creates, exactly as on the server, so
+      # the two roles cannot disagree about where the index is.
+      BLNK_TYPESENSE_DNS: ${BLNK_TYPESENSE_DNS:-http://typesense:8108}
+      BLNK_TYPESENSE_KEY: ${BLNK_TYPESENSE_KEY:-${TYPESENSE_API_KEY:-blnk-api-key}}
+      # ---------------------------------------------------------------------
+      # THE SAME TWO CREDENTIAL SETTINGS AS THE SERVER, and projected here for a reason
+      # this role's lack of an operator API does not remove.
+      #
+      # BLNK_SERVER_SECURE is read by this process: MetricsAuthHandler refuses /metrics
+      # and the asynqmon dashboard at /monitoring OUTRIGHT when secure mode is on and no
+      # bearer token is set, so a stack that enabled secure mode on the server alone would
+      # leave the worker serving its dashboard unauthenticated — two roles, one database,
+      # two different postures.
+      #
+      # BLNK_SERVER_SECRET_KEY is projected for the same reason the two DSNs are: the two
+      # roles run one binary through one configuration tree, and a value present in one
+      # process and absent in the other is a divergence that costs nothing to avoid and is
+      # very hard to diagnose when it matters.
+      BLNK_SERVER_SECURE: ${BLNK_SERVER_SECURE:-}
+      BLNK_SERVER_SECRET_KEY: ${BLNK_SERVER_SECRET_KEY:-}
       # ---------------------------------------------------------------------
       # FOUR EVENT-STREAMING KEYS, AND NO CREDENTIAL OF ANY KIND. `blnk workers`
       # resolves to ProcessRoleWorker, and ProcessRole.PublishesEvents is an allowlist
@@ -976,7 +1064,13 @@ services:
     image: typesense/typesense:29.0
     container_name: typesense
     command:
-      ["--data-dir", "/data", "--api-key=blnk-api-key", "--listen-port", "8108"]
+      # THE KEY IS INTERPOLATED, not literal, and it must stay that way. The server and
+      # worker services above read BLNK_TYPESENSE_KEY, defaulted from this same
+      # TYPESENSE_API_KEY, so both halves of the pair are derived from ONE value and an
+      # operator who changes it in .env changes the index and its clients together. A
+      # hardcoded key here would let the two drift, and the symptom of that drift is a
+      # healthy TypeSense refusing every request Blnk makes to it with 401.
+      ["--data-dir", "/data", "--api-key=${TYPESENSE_API_KEY:-blnk-api-key}", "--listen-port", "8108"]
     ports:
       - "8108:8108"
     volumes:
@@ -1042,6 +1136,64 @@ services:
   # class of breakage a floating tag introduces silently on the next `docker compose
   # pull`. Re-pin the tag and the digest together, and re-run `promtool check rules`
   # when you do.
+  # THE SCRAPE CREDENTIAL, MATERIALISED SO prometheus.yml CAN AUTHENTICATE UNCONDITIONALLY.
+  #
+  # WHAT WAS BROKEN. /metrics is guarded by MetricsAuth, and once BLNK_METRICS_BEARER_TOKEN
+  # is set every request without `Authorization: Bearer <token>` is refused. Prometheus sent
+  # none, so both jobs collected NOTHING: the targets showed down, every series the fifteen
+  # Kafka alert rules match on was absent, and the rules reported no error while being unable
+  # to fire. An alert that cannot fire is indistinguishable from a system with nothing wrong,
+  # which is why this was the worst kind of gap — the monitoring stack came up green and
+  # measured nothing.
+  #
+  # WHY IT WAS COMMENTED OUT RATHER THAN JUST ENABLED, and why that is now fixed rather than
+  # merely inverted: `credentials_file` is validated at CONFIG LOAD, so Prometheus REFUSES TO
+  # START when the file is absent. Enabling the blocks against a host path would therefore
+  # have broken every local stack that runs without a token — trading a silent failure for a
+  # loud one on the larger population. Asking the operator to create the file by hand is what
+  # the old comment did, and an instruction nobody executes is not a control.
+  #
+  # SO THE FILE IS ALWAYS THERE. This one-shot writes it into a named volume before Prometheus
+  # starts, on every bring-up, from the same variable the server and worker read — so the
+  # scrape credential cannot drift from the one that gates the endpoint. With no token
+  # configured the file is EMPTY, which Prometheus accepts (verified against
+  # prom/prometheus:v3.13.2 with `promtool check config`); it then sends an empty bearer and
+  # MetricsAuth ignores the header entirely, because with no token configured it calls
+  # c.Next() without reading it. Both postures work with one committed configuration and no
+  # manual step.
+  #
+  # THE SAME IMAGE AS PROMETHEUS, so this adds nothing to pull, and `user: root` because a
+  # fresh named volume is root-owned and the prometheus image runs as nobody. The file is
+  # handed to uid 65534 read-only afterwards, which is the account that has to read it.
+  #
+  # THE TOKEN TRAVELS AS AN ENVIRONMENT VARIABLE, never as an argument: an argv is visible in
+  # `docker inspect` and in the process table, and a scrape credential has no business in
+  # either.
+  prometheus-init:
+    profiles:
+      - monitoring
+    image: prom/prometheus:v3.13.2@sha256:1147c92841726a6fef55fe6124491d6f85480f8de204f7d420304ca5bbd0a8f7
+    container_name: prometheus-init
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      BLNK_METRICS_BEARER_TOKEN: ${BLNK_METRICS_BEARER_TOKEN:-}
+    command:
+      # printf rather than echo, so no trailing newline is written: Prometheus sends the
+      # file's bytes verbatim, and a newline inside the bearer value is a token that never
+      # matches. `set -eu` so a failed write fails the container rather than leaving
+      # Prometheus to start against a stale file.
+      - >-
+        set -eu;
+        umask 077;
+        printf '%s' "$${BLNK_METRICS_BEARER_TOKEN}" > /secrets/metrics-bearer-token;
+        chown 65534:65534 /secrets/metrics-bearer-token;
+        chmod 400 /secrets/metrics-bearer-token;
+        echo "wrote /secrets/metrics-bearer-token ($$(wc -c < /secrets/metrics-bearer-token) bytes)"
+    volumes:
+      - prometheus_secrets:/secrets
+
   prometheus:
     image: prom/prometheus:v3.13.2@sha256:1147c92841726a6fef55fe6124491d6f85480f8de204f7d420304ca5bbd0a8f7
     container_name: prometheus
@@ -1052,13 +1204,25 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       # The rule directory prometheus.yml's rule_files glob resolves against. Without
-      # this mount the stanza matches nothing and ALL 15 alert rules are inert, with no
+      # this mount the stanza matches nothing and ALL 16 alert rules are inert, with no
       # startup error to notice, so the mount and the glob have to be kept in step.
       # Mounted as a directory so a rule file added later needs no edit here.
       - ./alerts:/etc/prometheus/alerts:ro
+      # The scrape credential prometheus.yml's two credentials_file paths resolve to,
+      # written by prometheus-init above. Read-only, and a VOLUME rather than a host bind
+      # so the file exists on a fresh clone with no manual step and is never a candidate
+      # for accidental commit.
+      - prometheus_secrets:/etc/prometheus/secrets:ro
     depends_on:
-      - server
-      - worker
+      server:
+        condition: service_started
+      worker:
+        condition: service_started
+      # THE GATE THAT MAKES credentials_file SAFE. Prometheus validates the file at config
+      # load and refuses to start without it, so it must not start before the one-shot that
+      # writes it has finished.
+      prometheus-init:
+        condition: service_completed_successfully
 
 volumes:
   pg_data:
@@ -1068,3 +1232,8 @@ volumes:
   # SCRAM credentials, the sample subscriber's password and every ACL — and forces a
   # re-bootstrap.
   kafka_data:
+  # The scrape credential prometheus-init writes and prometheus reads. A named volume and
+  # not a host bind, deliberately: the file then exists on a fresh clone with no manual step,
+  # it cannot be committed by accident, and it is scoped to the two containers that mount it.
+  # Removing this volume is harmless — the one-shot rewrites it on the next bring-up.
+  prometheus_secrets:

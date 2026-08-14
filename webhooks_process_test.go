@@ -1230,10 +1230,13 @@ func TestGetEventFromStatus_PinsTheTransactionEventVocabulary(t *testing.T) {
 		"an empty status must fall through to transaction.unknown rather than producing an empty event name")
 }
 
-// TestGetEventFromStatus_CommitFallsThroughToUnknown pins a DEFECT THAT IS PRESERVED ON
-// PURPOSE. Do not "correct" the mapping to make this test read differently.
+// TestGetEventFromStatus_CommitFallsThroughToUnknown pins the MAPPING's treatment of a
+// status it has no case for, which is PRESERVED ON PURPOSE. Do not "correct" the mapping to
+// make this test read differently.
 //
-// THIS IS PRE-EXISTING BEHAVIOUR, NOT A REGRESSION.
+// THIS IS PRE-EXISTING BEHAVIOUR, NOT A REGRESSION. It is also not a message shape any
+// subscriber receives: see TestCommittedInflightTransaction_IsAnnouncedAsApplied for what a
+// committed inflight transaction actually announces.
 func TestGetEventFromStatus_CommitFallsThroughToUnknown(t *testing.T) {
 	assert.Equal(t, "transaction.unknown", getEventFromStatus(StatusCommit),
 		"COMMIT has no case in the mapping and must keep falling through to transaction.unknown; "+
@@ -1247,11 +1250,14 @@ func TestGetEventFromStatus_CommitFallsThroughToUnknown(t *testing.T) {
 	assert.Equal(t, getEventFromStatus(StatusCommit), getEventFromStatus("COMMIT"),
 		"the constant and its literal spelling must resolve identically")
 
-	// transaction.unknown is therefore a REAL event name reached by a REAL status, not a
-	// defensive default nothing produces — which is exactly why it must be treated as part
-	// of the vocabulary rather than as an error case.
+	// COMMIT and an unrecognised status are indistinguishable TO THIS FUNCTION. That is the
+	// whole of the fall-through's reach: nothing calls this function with COMMIT, because
+	// updateTransactionDetails normalises the status to APPLIED before the name is derived,
+	// so transaction.unknown reaches no topic. The claim that a committed inflight
+	// transaction is announced under it was wrong and is pinned correctly by
+	// TestCommittedInflightTransaction_IsAnnouncedAsApplied.
 	assert.Equal(t, getEventFromStatus("NO_SUCH_STATUS"), getEventFromStatus(StatusCommit),
-		"a committed transaction and an unrecognised status are indistinguishable on the wire today")
+		"the mapping must treat COMMIT exactly as it treats any status it has no case for")
 
 	// And it travels in the frozen envelope like any other name, which is the form in which the
 	// dual-delivery comparison sees it.

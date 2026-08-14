@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,7 +37,6 @@ import (
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/hotpairs"
 	"github.com/blnkfinance/blnk/internal/metrics"
-	"github.com/blnkfinance/blnk/internal/notification"
 	redis_db "github.com/blnkfinance/blnk/internal/redis-db"
 	"github.com/blnkfinance/blnk/internal/search"
 	trace "github.com/blnkfinance/blnk/internal/traces"
@@ -82,9 +82,42 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 	}
 	_, err = b.blnk.ProcessQueuedTransaction(ctx, &txn, b.cnf.Queue.EnableHotLane && t.Type() == b.cnf.Queue.HotQueueName)
 	if err != nil {
-		// Handle reference already used error
+		// ALREADY APPLIED IS THE EXPECTED OUTCOME HERE, NOT A SYSTEM FAULT.
+		//
+		// A duplicate-reference error on a QUEUED transaction means this exact transaction
+		// has already been written, and the two ways that happens are both routine:
+		//
+		//  1. Coalescing. A leader builds a batch out of its queued siblings and applies
+		//     all of them in one commit. Every follower in that batch still has its own
+		//     task, and each one arrives here to find its work already done. One batch of
+		//     2,000 children therefore produces up to 2,000 arrivals on this branch.
+		//  2. At-least-once delivery. asynq redelivers a task whose handler had already
+		//     committed — after a worker restart, a lost ack or a lease expiry.
+		//
+		// Neither is a fault, and the correct response to both is to acknowledge the task,
+		// which is what returning nil does.
+		//
+		// This branch used to call notification.NotifyError, and that is what turned a
+		// routine deduplication into an incident. NotifyError writes one ERROR line per
+		// occurrence AND publishes a system.error event — which, since events became
+		// outbox-backed, means a row in blnk.event_outbox for the relay to publish. So
+		// every already-applied follower cost an operator-facing error and a unit of load
+		// on the very pipeline the ledger's own events flow through. Measured under a
+		// coalescing load: 1,763 error lines and 1,366 pending system.error events, none of
+		// which described anything wrong.
+		//
+		// The outcome is still observable — it is recorded on the same histogram that
+		// counts successful tasks, under its own result label, so a genuine change in the
+		// rate of already-applied arrivals remains visible without paging anyone.
 		if blnk.IsDuplicateReferenceError(err) {
-			notification.NotifyError(err)
+			logrus.WithFields(logrus.Fields{
+				"transaction_id": txn.TransactionID,
+				"reference":      txn.Reference,
+			}).Info("Transaction was already applied; acknowledging without reprocessing")
+			metrics.QueueProcessingDuration.Record(ctx, time.Since(startTime).Seconds(),
+				otelmetric.WithAttributes(attribute.String("result", "already_applied")),
+			)
+
 			return nil
 		}
 
@@ -170,6 +203,202 @@ func shouldRejectLockContentionImmediately(cfg *config.Configuration, err error)
 	return hotpairs.IsLockContentionError(err)
 }
 
+// queueBacklogInterval is how often queue depths are republished. Backlog is a slow signal
+// — the alert over it dwells for minutes — so this is deliberately unhurried: each tick is
+// one Redis round trip per queue, and paying that every second would add load to the very
+// component under observation.
+const queueBacklogInterval = 15 * time.Second
+
+// queueBacklogCollector publishes the depth of every asynq queue as a gauge.
+//
+// WHY: A QUEUE THAT CANNOT KEEP PACE HAS NO SYMPTOM UNTIL SOMETHING ELSE BREAKS.
+//
+// The index queue reached 609,673 pending tasks during a sustained load run, draining at
+// 276/s against 550/s arriving. Nothing reported it. The asynqmon dashboard would have shown
+// it to anyone who happened to open the dashboard, and no alert could fire because no series
+// existed to alert on — so the imbalance was found by a load test rather than by the system
+// that was living through it.
+//
+// Depth alone is the right signal here, and it is worth being precise about why: an arrival
+// rate and a drain rate are both derivable from it, but the QUESTION an operator has is
+// "is work accumulating", and accumulation is exactly what depth measures directly. The
+// alert over this gauge dwells long enough that an ordinary burst — which is what a queue is
+// FOR — passes without complaint.
+type queueBacklogCollector struct {
+	inspector *asynq.Inspector
+	interval  time.Duration
+	stop      chan struct{}
+	done      chan struct{}
+}
+
+// newQueueBacklogCollector builds a collector against the same Redis the workers consume
+// from. It returns nil when Redis cannot be addressed, because a worker that cannot reach
+// Redis has a louder problem than its missing gauges.
+func newQueueBacklogCollector(conf *config.Configuration) *queueBacklogCollector {
+	redisOption, err := redis_db.ParseRedisURL(conf.Redis.Dns, conf.Redis.SkipTLSVerify)
+	if err != nil {
+		logrus.Errorf("queue backlog collector disabled; could not parse Redis URL: %v", err)
+
+		return nil
+	}
+
+	return &queueBacklogCollector{
+		inspector: asynq.NewInspector(asynq.RedisClientOpt{
+			Addr:      redisOption.Addr,
+			Password:  redisOption.Password,
+			DB:        redisOption.DB,
+			TLSConfig: redisOption.TLSConfig,
+		}),
+		interval: queueBacklogInterval,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+}
+
+// Start begins publishing depths until Stop is called or ctx is cancelled.
+func (q *queueBacklogCollector) Start(ctx context.Context) {
+	if q == nil {
+		return
+	}
+
+	go func() {
+		defer close(q.done)
+
+		ticker := time.NewTicker(q.interval)
+		defer ticker.Stop()
+
+		// Publish immediately, so a backlog that is already there on startup is visible
+		// without waiting out a first interval.
+		q.collect(ctx)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-q.stop:
+				return
+			case <-ticker.C:
+				q.collect(ctx)
+			}
+		}
+	}()
+}
+
+// Stop halts collection and waits for the loop to exit.
+func (q *queueBacklogCollector) Stop() {
+	if q == nil {
+		return
+	}
+
+	close(q.stop)
+	<-q.done
+
+	if err := q.inspector.Close(); err != nil {
+		logrus.Errorf("queue backlog collector: closing inspector: %v", err)
+	}
+}
+
+// collect publishes one reading per queue per waiting state.
+//
+// Failures are logged and dropped rather than retried: the next tick is 15 seconds away and
+// carries a fresh reading, so a transient Redis error costs one sample. Nothing here is
+// allowed to interfere with task processing.
+func (q *queueBacklogCollector) collect(ctx context.Context) {
+	queues, err := q.inspector.Queues()
+	if err != nil {
+		logrus.Warnf("queue backlog collector: listing queues: %v", err)
+
+		return
+	}
+
+	for _, name := range queues {
+		info, infoErr := q.inspector.GetQueueInfo(name)
+		if infoErr != nil {
+			logrus.Warnf("queue backlog collector: reading queue %q: %v", name, infoErr)
+
+			continue
+		}
+
+		// The four states are reported separately because they call for different actions.
+		// Pending is work that has arrived and not been started — the accumulation the
+		// alert watches. Active is work in flight. Retry and scheduled are work deferred to
+		// a future time, which looks like a backlog on a dashboard but is not one: a
+		// scheduled task is waiting for its clock, not for a worker.
+		for state, depth := range map[string]int{
+			"pending":   info.Pending,
+			"active":    info.Active,
+			"retry":     info.Retry,
+			"scheduled": info.Scheduled,
+		} {
+			metrics.QueueBacklog.Record(ctx, int64(depth),
+				otelmetric.WithAttributes(
+					attribute.String("queue", name),
+					attribute.String("state", state),
+				),
+			)
+		}
+	}
+}
+
+// searchIndexer holds the one TypeSense client a worker process needs, and remembers
+// whether the collection schema has been established.
+//
+// WHY THIS EXISTS: A PER-TASK SETUP COST THAT THE INDEX QUEUE CANNOT AFFORD.
+//
+// Both index handlers used to construct a client and call EnsureCollectionsExist on EVERY
+// task. That call is not a cached lookup — it issues a create for each of the five
+// collections and then upserts the default general ledger, so six HTTP round trips ran
+// before the task's own single write. Worse, each task built its own client, so each of
+// those seven requests opened a fresh connection: nothing was pooled or reused across
+// tasks, and a per-client circuit breaker never accumulated enough history to be useful.
+//
+// Measured against an IDLE local TypeSense, the schema work alone cost 10.66ms per task.
+// The index queue is fed once per indexed write, so at the validated 550 events/second the
+// arrival rate is 550/s while the drain rate is bounded by that setup: with this server's
+// twenty goroutines split three-to-one in the webhook queue's favour, roughly five slots
+// serve indexing, giving about 333/s before the real write is even attempted. The observed
+// drain was 276/s against 550/s arrivals — a net gain of ~274/s that grew the queue without
+// bound and peaked at 609,673 pending tasks.
+//
+// Reuse makes the schema work O(1) per PROCESS instead of O(1) per TASK, and lets the
+// underlying HTTP client pool connections across every task the process ever runs.
+//
+// WHY NOT sync.Once: a Once that ran during a TypeSense outage would record the failure
+// permanently, and every subsequent task would then write into collections that were never
+// created — for the life of the process. Success is what is latched here, not the attempt,
+// so a failed assurance is retried by the next task. The client itself is cached
+// unconditionally, because constructing one performs no I/O and cannot fail.
+type searchIndexer struct {
+	mu      sync.Mutex
+	client  *search.TypesenseClient
+	ensured bool
+}
+
+// clientFor returns the process-wide TypeSense client with its schema assured.
+//
+// The lock is held across the assurance deliberately: the point is that exactly one task
+// does that work while the others wait for it, rather than all of them racing to create
+// the same five collections. Once ensured is latched, the critical section is a pointer
+// read and a boolean test.
+func (s *searchIndexer) clientFor(ctx context.Context, apiKey string, hosts []string) (*search.TypesenseClient, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.client == nil {
+		s.client = search.NewTypesenseClient(apiKey, hosts)
+	}
+
+	if !s.ensured {
+		if err := s.client.EnsureCollectionsExist(ctx); err != nil {
+			return nil, err
+		}
+
+		s.ensured = true
+	}
+
+	return s.client, nil
+}
+
 // indexData indexes data into TypeSense for searchability.
 func (b *blnkInstance) indexData(ctx context.Context, t *asynq.Task) error {
 	if b.cnf.TypeSense.Dns == "" {
@@ -187,9 +416,8 @@ func (b *blnkInstance) indexData(ctx context.Context, t *asynq.Task) error {
 	collection := data.Collection
 	payload := data.Payload
 
-	// Initialize a new TypeSense client and ensure collections exist.
-	newSearch := search.NewTypesenseClient(b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns})
-	err := newSearch.EnsureCollectionsExist(ctx)
+	// The process-wide client, with its schema established once rather than per task.
+	newSearch, err := b.searchIndex.clientFor(ctx, b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns})
 	if err != nil {
 		logrus.Errorf("Failed to ensure collections exist: %v", err)
 		return err
@@ -220,9 +448,8 @@ func (b *blnkInstance) indexBatchData(ctx context.Context, t *asynq.Task) error 
 		return err
 	}
 
-	// Initialize a new TypeSense client and ensure collections exist.
-	newSearch := search.NewTypesenseClient(b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns})
-	err := newSearch.EnsureCollectionsExist(ctx)
+	// The same process-wide client the single-document handler uses, for the same reason.
+	newSearch, err := b.searchIndex.clientFor(ctx, b.cnf.TypeSenseKey, []string{b.cnf.TypeSense.Dns})
 	if err != nil {
 		logrus.Errorf("Failed to ensure collections exist: %v", err)
 		return err
@@ -509,6 +736,11 @@ func runWorkers(ctx context.Context, b *blnkInstance, conf *config.Configuration
 	recoveryProcessor := blnk.NewQueuedTransactionRecoveryProcessor(b.blnk)
 	recoveryProcessor.Start(ctx)
 
+	// Queue depths, so an arrival rate that outruns a drain rate is visible while it is
+	// still only an imbalance. See queueBacklogCollector.
+	backlogCollector := newQueueBacklogCollector(conf)
+	backlogCollector.Start(ctx)
+
 	logrus.Info("Workers started.")
 
 	// Wait for SIGINT/SIGTERM (or test-driven context cancellation).
@@ -517,6 +749,7 @@ func runWorkers(ctx context.Context, b *blnkInstance, conf *config.Configuration
 	logrus.Info("Shutdown signal received. Shutting down...")
 
 	recoveryProcessor.Stop()
+	backlogCollector.Stop()
 
 	if monitoringSrv != nil {
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

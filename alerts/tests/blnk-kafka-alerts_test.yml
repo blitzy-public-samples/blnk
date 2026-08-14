@@ -900,3 +900,63 @@ tests:
       - eval_time: 39m
         alertname: EventMetricsCollectionAbsent
         exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # A QUEUE THAT IS NOT KEEPING PACE. Both directions matter sharply here. Below the
+  # threshold must be silent because a queue exists so that bursts need not be served
+  # synchronously — a rule that paged on ordinary depth would page on the queue doing
+  # its job. And `retry` and `scheduled` must be silent at ANY depth, because both are
+  # work deferred to a future time rather than work waiting on a worker.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the queue backlog alert fires on sustained pending depth and ignores deferred work
+    input_series:
+      # Pending sits just under the threshold for two and a half minutes, then jumps
+      # above it and stays. The dwell therefore starts at t=150s and completes at t=750s.
+      - series: 'blnk_queue_backlog{job="blnk-worker",instance="blnk-worker:5004",queue="new:index",state="pending"}'
+        values: '24000+0x4 40000+0x60'
+      # Deferred work, parked far above the threshold for the whole window. It must never
+      # contribute: a scheduled task is waiting for its clock.
+      - series: 'blnk_queue_backlog{job="blnk-worker",instance="blnk-worker:5004",queue="new:index",state="scheduled"}'
+        values: '900000+0x64'
+      - series: 'blnk_queue_backlog{job="blnk-worker",instance="blnk-worker:5004",queue="new:index",state="retry"}'
+        values: '900000+0x64'
+    alert_rule_test:
+      # Under the threshold, and a mountain of deferred work beside it. Silent.
+      - eval_time: 2m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts: []
+      # Over the threshold but only five minutes in: breaching, inside the dwell.
+      - eval_time: 7m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts: []
+      # Ten minutes above the threshold.
+      - eval_time: 13m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              component: 'task-queue'
+              instance: 'blnk-worker:5004'
+              job: 'blnk-worker'
+              queue: 'new:index'
+              severity: 'warning'
+              state: 'pending'
+            exp_annotations:
+              summary: >-
+                A task queue has held a large backlog for 10 minutes and is not keeping pace
+              description: >-
+                Queue new:index on blnk-worker:5004 has had 40000 task(s) PENDING for 10
+                minutes, so work is arriving faster than the workers are completing it and
+                the queue is growing rather than absorbing a burst. This is a COUNT of
+                tasks not yet started, not an age. The failure this rule was written for
+                is the index queue: every task used to rebuild its TypeSense client and
+                re-assert the collection schema — six HTTP round trips on an unpooled
+                connection before its own single write — which capped the drain rate below
+                the arrival rate and grew the queue without bound. Check first whether the
+                per-task cost has regressed, then whether the queue is being starved of
+                worker slots by its weight relative to the others sharing the same server
+                (BLNK_QUEUE_WEBHOOK_CONCURRENCY sets the pool the webhook and index queues
+                share), and then whether the downstream service the tasks call is itself
+                slow. A backlog that clears the moment load stops is a capacity problem;
+                one that persists at idle is a failing task being retried.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#taskqueuebackloghigh

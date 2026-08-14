@@ -189,8 +189,12 @@ func eventStreamingInstruments() []namedInstrument {
 // There are no subscriber-record-delivery instruments in this inventory, and their
 // absence is the access model rather than an omission.
 
-// preExistingInstruments returns the sixteen instruments that predate the
-// event-streaming work, each labelled with its variable name.
+// preExistingInstruments returns the instruments OUTSIDE the event-streaming pipeline,
+// each labelled with its variable name.
+//
+// Sixteen of them predate that work, which is where the name comes from; QueueBacklog was
+// added later and belongs here rather than in the event-streaming table because it measures
+// the worker fleet's queues, not the event pipeline.
 //
 // See eventStreamingInstruments for why this is a function rather than a package-level
 // table.
@@ -212,6 +216,10 @@ func preExistingInstruments() []namedInstrument {
 		{"ChainBacklog", ChainBacklog},
 		{"ChainHeadSeq", ChainHeadSeq},
 		{"ChainLagSeconds", ChainLagSeconds},
+		// Added after the event-streaming work but belonging to this table rather than the
+		// other one: it measures the asynq worker fleet's queue depths, which is the same
+		// non-event area as the queue and worker instruments above it.
+		{"QueueBacklog", QueueBacklog},
 	}
 }
 
@@ -253,8 +261,10 @@ func TestEventStreamingInstruments_AreNonNilAfterPackageLoad(t *testing.T) {
 // before them.
 func TestPreExistingInstruments_RemainNonNilAfterEventStreamingAppend(t *testing.T) {
 	instruments := preExistingInstruments()
-	require.Len(t, instruments, 16,
-		"all sixteen pre-existing instruments must stay enumerated here; update this table only when metrics.go genuinely removes one")
+	require.Len(t, instruments, 17,
+		"every non-event-streaming instrument must stay enumerated here: the sixteen that predate "+
+			"the event pipeline plus QueueBacklog; grow this table when metrics.go adds another "+
+			"outside the pipeline, and shrink it only when metrics.go genuinely removes one")
 
 	for _, instrument := range instruments {
 		t.Run(instrument.name, func(t *testing.T) {

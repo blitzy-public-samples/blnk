@@ -195,11 +195,11 @@ spec:
             # records is ever exported.
             #
             # WHAT THAT COSTS, QUANTIFIED, and the asymmetry with the server decides how
-            # a DOWN target here should be read: all 15 rules in
+            # a DOWN target here should be read: all 16 rules in
             # alerts/blnk-kafka-alerts.yml evaluate series recorded by Blnk, and a rule
             # over a series nothing exports cannot fire and looks exactly like a healthy
             # system. What this variable does NOT do is disarm the event-streaming rules:
-            # every one of those 15 rules reads series the SERVER publishes — the relay
+            # every one of those 16 rules reads series the SERVER publishes — the relay
             # and its metrics collector run in the server role only, which is why
             # EventMetricsCollectionAbsent is scoped to job="blnk-server" — so they keep
             # evaluating whatever this role does. The cost of leaving it false here is the

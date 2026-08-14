@@ -732,7 +732,14 @@ k6 run \
   tests/loadtest/script.js
 
 echo "Waiting for queue drain benchmark to finish"
-wait "${QUEUE_BENCH_PID}"
+# CAPTURED RATHER THAN LEFT TO `set -e`, so a failed drain is reported WITH the paths of the
+# artifacts that explain it. The benchmark exits non-zero when the queues did not drain within
+# its timeout, and a bare `wait` under `set -euo pipefail` would abort here — before the
+# "Generated files" list below, which is the only place this script says where the summary it
+# just wrote actually is. The status is not swallowed: it is re-raised as this script's own
+# exit code at the end, after the list.
+QUEUE_BENCH_STATUS=0
+wait "${QUEUE_BENCH_PID}" || QUEUE_BENCH_STATUS=$?
 
 trap - EXIT
 
@@ -740,3 +747,15 @@ echo "Generated files:"
 echo "  ${SUMMARY_OUT}"
 echo "  ${NDJSON_OUT}"
 echo "  ${QUEUE_OUT}"
+
+# AND NOW THE VERDICT, as this script's exit code.
+#
+# A caller — CI, make, or a person running this in a loop — decides whether the run passed from
+# the status, not by parsing the JSON. So a run whose queues never drained must not report
+# success here just because k6 itself finished and the files were written. The benchmark has
+# already explained the failure on stderr and written the sample series that diagnoses it; this
+# only makes the status match what those say.
+if [[ "${QUEUE_BENCH_STATUS}" -ne 0 ]]; then
+  echo "Queue drain benchmark FAILED (exit ${QUEUE_BENCH_STATUS}); see ${QUEUE_OUT}" >&2
+  exit "${QUEUE_BENCH_STATUS}"
+fi

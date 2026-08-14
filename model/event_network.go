@@ -35,6 +35,14 @@ const MaxWebhookURLLength = 2048
 // ValidateWebhookURL judges a legacy webhook URL against the single policy every layer
 // that writes blnk.event_subscribers.webhook_url must apply.
 //
+// The policy, in the order it is applied: an absent or blank value means "clear the
+// record" and is acceptable; surrounding whitespace is refused rather than trimmed; the
+// value is bounded at MaxWebhookURLLength bytes; a literal space or ASCII control byte is
+// refused so the stored value is the one that was validated; userinfo is refused outright
+// so no credential is ever written to a column that is stored verbatim and echoed back;
+// the scheme must be https; a host must be present; and the host must not be an internal
+// destination.
+//
 // Parameters:
 //   - raw string: the URL exactly as it will be stored. Not trimmed by this function.
 //
@@ -64,11 +72,45 @@ func ValidateWebhookURL(raw string) (message, reason string) {
 			)
 	}
 
+	// LITERAL SPACE AND CONTROL BYTES BEFORE PARSING, so the answer names the actual
+	// problem. url.Parse accepts a literal space and folds it into the path, so
+	// "https://hooks.example.com/a b" was stored with the space intact and two callers
+	// spelling one endpoint two ways became two subscribers pointing at the same place.
+	// Control bytes the parser does reject, but only with its generic "invalid control
+	// character in URL", which tells a caller nothing about which byte to fix. One check
+	// answers both, ahead of the parse, and names the offset rather than the value.
+	if reason := rawURLLiteralByteReason(raw); reason != "" {
+		return "The webhook URL must not contain literal spaces or control characters", reason
+	}
+
 	// THE PARSER'S ERROR IS NOT RETURNED. url.Parse quotes the input back, and the input is a
 	// third party's endpoint that has no business in Blnk's error responses or logs.
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return "The webhook URL is not a valid URL", "the value could not be parsed as a URL"
+	}
+
+	// USERINFO BEFORE EVERYTHING ELSE ABOUT THE PARSED URL, and that ordering is the
+	// guarantee. A URL carrying credentials is refused on THAT ground whatever else is wrong
+	// with it, so "no userinfo is ever stored" holds independently of the scheme, host and
+	// destination rules below — none of which a caller can arrange to fail first in order to
+	// change the answer.
+	//
+	// The column is stored verbatim, read by operators, and echoed back by GET, so a password
+	// written into it is a password disclosed to everyone who can read a subscriber record, a
+	// support export or a database backup. Stripping the userinfo instead of refusing it would
+	// be worse: it would persist a destination the caller did not supply and quietly change
+	// where Blnk dials, so the refusal is the fix.
+	//
+	// Every spelling is caught, because parsed.User is non-nil for all of them: "user@host",
+	// "user:secret@host", percent-encoded secrets, and the empty "@host". An '@' in the path
+	// or the query is NOT userinfo — url.Parse only reads userinfo before the first '/' — so
+	// "https://hooks.example.com/hook@v2" and a mailto-style query value stay acceptable.
+	if parsed.User != nil {
+		return "The webhook URL must not embed credentials",
+			"the URL carries userinfo before the host; this column is stored verbatim, read by " +
+				"operators and returned by GET, so an embedded password would be disclosed wherever " +
+				"the subscriber record is. Send the credential in a header on the endpoint instead"
 	}
 
 	if parsed.Scheme != "https" {
@@ -90,6 +132,45 @@ func ValidateWebhookURL(raw string) (message, reason string) {
 	}
 
 	return "", ""
+}
+
+// asciiDEL is the delete control byte. It is neither printable nor a C0 control, so the
+// byte scan has to name it separately.
+const asciiDEL = 0x7f
+
+// rawURLLiteralByteReason reports why a URL may not be stored as written because it
+// contains a byte RFC 3986 requires to be percent-encoded, or "" when every byte is
+// acceptable.
+//
+// Only ASCII space, the C0 controls (which includes tab, carriage return and line feed)
+// and DEL are refused. Bytes at or above 0x80 are left alone deliberately: they are how a
+// UTF-8 path is written, url.Parse accepts them, and refusing them would reject endpoints
+// that work today for a purity that buys nothing here.
+//
+// Parameters:
+//   - raw string: the URL exactly as it would be stored.
+//
+// Returns:
+//   - string: a reason naming the byte's OFFSET and class, or "" when there is nothing to
+//     report. The offset and the class are the caller's own value and disclose nothing
+//     about the endpoint, which is why neither the URL nor the surrounding text is echoed.
+func rawURLLiteralByteReason(raw string) string {
+	for offset := 0; offset < len(raw); offset++ {
+		switch byteAt := raw[offset]; {
+		case byteAt == ' ':
+			return fmt.Sprintf(
+				"byte %d is a literal space; write it as %%20 so the stored value is the one that "+
+					"was validated", offset,
+			)
+		case byteAt < 0x20, byteAt == asciiDEL:
+			return fmt.Sprintf(
+				"byte %d is control character 0x%02x, which a URL may not contain literally; "+
+					"percent-encode it or remove it", offset, byteAt,
+			)
+		}
+	}
+
+	return ""
 }
 
 // InternalWebhookDestinationReason reports why a host is an internal destination, or ""

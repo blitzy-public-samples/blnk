@@ -1116,10 +1116,15 @@ func (g *dltRecordedFloatGauge) count() int {
 // Value.Emit is the rendering accessor of the attribute package version this module
 // pins, and it renders the string, int64 and bool attributes this pipeline records
 // exactly as the value was recorded.
+//
+// Value.String, not the deprecated Value.Emit: go.opentelemetry.io/otel v1.44.0 deprecated
+// Emit in favour of String, and the two are byte-identical for the BOOL, INT64 and STRING
+// kinds these instruments record — they diverge only in how they format float and slice
+// values, which nothing here carries.
 func dltAttributeMap(pairs []attribute.KeyValue) map[string]string {
 	attributes := make(map[string]string, len(pairs))
 	for _, pair := range pairs {
-		attributes[string(pair.Key)] = pair.Value.Emit()
+		attributes[string(pair.Key)] = pair.Value.String()
 	}
 
 	return attributes

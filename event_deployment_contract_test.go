@@ -462,12 +462,97 @@ func TestMakeRunRelay_PassesNoSecretOnTheCommandLine(t *testing.T) {
 			assert.False(t, strings.Contains(line, secret),
 				"a credential reached the server's command line; it must travel in the "+
 					"environment, which is where .env put it")
-			assert.Equal(t, `ARGV=start --config blnk.json --require-kafka`, line,
+			// NO blnk.json EXISTS IN THIS HARNESS, so --config is correctly absent. This
+			// assertion used to demand `--config blnk.json` here, which pinned the defect
+			// rather than the contract: naming a file that is not there is fatal in
+			// cmd/main.go, so the invocation it required could not start. The config-flag
+			// contract in all three of its cases is held by
+			// TestMakeRunRelay_PassesConfigOnlyWhenItMeansSomething below; this one cares only
+			// that nothing beyond the role and the delegating flag reaches argv.
+			assert.Equal(t, `ARGV=start --require-kafka`, line,
 				"the recipe must exec the server with exactly the delegating invocation and "+
-					"nothing else: the role, the config file it is to load, and the flag that "+
-					"makes the application refuse a deployment with no broker")
+					"nothing else: the role, and the flag that makes the application refuse a "+
+					"deployment with no broker. No blnk.json exists here, so --config must be "+
+					"omitted and the application configured from its environment")
 		}
 	}
+}
+
+// TestMakeRunRelay_PassesConfigOnlyWhenItMeansSomething holds the config-flag contract of the
+// relay recipe in all three of its cases.
+//
+// WHAT WENT WRONG. The recipe passed `--config "${CONFIG_FILE}"` unconditionally. cmd/main.go
+// draws a deliberate line — an explicitly NAMED configuration file that cannot be read is
+// fatal, while the DEFAULT path's absence is tolerated, because environment-only configuration
+// is a first-class mode and is how the compose stack, the Kubernetes manifests and this entire
+// test suite run. Passing the flag always erased that line: it turned the tolerated case into
+// the fatal one, so `make run_relay` was the only way to start Blnk that could not start it
+// from its environment. A clean checkout configured through `.env` — the arrangement
+// `stack.sh --init` produces and the runbook documents — failed with the application demanding
+// a file no instruction had asked anyone to create. Every other run target passes no `--config`
+// at all, so this was the odd one out as well as the broken one.
+//
+// The fix is not "never pass it" either, which would break `make run_relay
+// CONFIG_FILE=/etc/blnk/prod.json` by silently ignoring the path. The flag has to be passed
+// when it means something and omitted when it does not, and that is three distinct cases.
+func TestMakeRunRelay_PassesConfigOnlyWhenItMeansSomething(t *testing.T) {
+	const configWithBroker = `{"kafka":{"brokers":["file-declared:9092"]}}`
+
+	t.Run("no config file and none named: the flag is OMITTED", func(t *testing.T) {
+		// THE CASE THAT WAS BROKEN. The application must be left to configure itself from the
+		// environment, exactly as `make run` already does.
+		harness := newRelayMakeHarness(t, "KAFKA_BROKERS=env-bare:9092\n", "")
+
+		output, status := harness.run(t, nil)
+		require.Equal(t, 0, status, "output:\n%s", output)
+
+		argv := harness.effectiveArgv(t)
+		assert.NotContains(t, argv, "--config",
+			"with no blnk.json present and none named, --config must be omitted. Naming a file "+
+				"that is not there is fatal in cmd/main.go, so passing it here is the difference "+
+				"between a relay that starts from .env and one that refuses to start at all")
+		assert.Contains(t, argv, "--require-kafka",
+			"omitting --config must not also drop the delegating flag; the application still has "+
+				"to refuse a deployment with no broker")
+
+		// AND IT MUST SAY SO. An operator who expected a file to be read needs to know one was
+		// not, or a stale blnk.json in another directory becomes a long debugging session.
+		assert.Contains(t, output, "--config is not passed",
+			"the recipe must announce that it is configuring the application from the "+
+				"environment rather than from a file")
+	})
+
+	t.Run("a config file IS present: the flag is passed", func(t *testing.T) {
+		// Unchanged behaviour for everyone who has a blnk.json, which is also the file the
+		// broker-declaration gate reads.
+		harness := newRelayMakeHarness(t, "", configWithBroker)
+
+		output, status := harness.run(t, nil)
+		require.Equal(t, 0, status, "output:\n%s", output)
+
+		assert.Contains(t, harness.effectiveArgv(t), "--config blnk.json",
+			"a blnk.json that exists must still be passed, or the recipe would ignore the file "+
+				"an operator put there and start from a different configuration than the gate read")
+	})
+
+	t.Run("a NAMED file is passed even when it is absent", func(t *testing.T) {
+		// Naming a file is a statement that the file holds the configuration. Omitting the flag
+		// here would silently start the application from somewhere else, which is precisely the
+		// typo-becomes-a-deployment failure cmd/main.go's fatal diagnostic exists to prevent.
+		// The recipe must therefore pass it and let the application refuse.
+		harness := newRelayMakeHarness(t, "KAFKA_BROKERS=env-bare:9092\n", "")
+
+		command := exec.Command("make", "run_relay", "CONFIG_FILE=absent-on-purpose.json")
+		command.Dir = harness.dir
+		command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+		output, err := command.CombinedOutput()
+		require.NoError(t, err, "the recipe must not refuse; the application decides. output:\n%s", output)
+
+		assert.Contains(t, harness.effectiveArgv(t), "--config absent-on-purpose.json",
+			"a file named on the command line must reach the application even though it is not "+
+				"there, so the application can report that the file it was told to read is "+
+				"missing. Omitting it would start from the environment and never mention the path")
+	})
 }
 
 // ---------------------------------------------------------------------------------------

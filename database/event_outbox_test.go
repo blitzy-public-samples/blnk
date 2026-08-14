@@ -64,6 +64,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1597,10 +1598,25 @@ func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 	assert.Contains(t, issued, "webhook_dispatched = TRUE")
 	assert.Contains(t, issued, "claim_token = $2",
 		"the marker must be conditional on the claim, or a zombie worker can record a webhook that was never sent")
-	assert.NotContains(t, issued, "status =",
+	assert.NotContains(t, issued, "SET status",
 		"the dual-delivery marker must not disturb the relay state machine: the Kafka leg owns status")
-	assert.NotContains(t, issued, "locked_until",
-		"the dual-delivery marker must not touch the lease")
+
+	// THE LEASE IS RELEASED CONDITIONALLY, and the condition is the whole of it.
+	//
+	// Unconditional would break the dual-delivery caller, which calls this mid-claim and then
+	// records the Kafka leg under the SAME token. Never would leave the repair caller's
+	// terminal row leased for nothing — P5-F01. So the statement releases exactly in the
+	// states the repair claim offers and leaves the mid-claim states alone.
+	for _, clause := range []string{
+		"locked_until = CASE",
+		"claim_token = CASE",
+		"WHEN status IN ('dispatched', 'failed', 'dead_lettered') THEN NULL",
+		"ELSE locked_until",
+		"ELSE claim_token",
+	} {
+		assert.Containsf(t, issued, clause,
+			"the marker must release the lease only on a settled row (%q missing)", clause)
+	}
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -6471,7 +6487,93 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 			"an honest re-call from the claim holder must be idempotent, not reported as a lost claim")
 		assert.Error(t, ds.MarkWebhookDispatched(ctx, entry.ID, "someone-elses-token"),
 			"a worker that does not hold the claim must not be able to record a webhook it never sent")
+
+		// AND THE CLAIM SURVIVES, because the Kafka leg has not been recorded yet. The relay
+		// calls MarkEventDispatched next, presenting this same token; releasing the claim here
+		// would make that call report a lost claim and the row would be published again.
+		assert.NotEmpty(t, got.ClaimToken,
+			"a mid-claim dual-delivery marker must leave the claim in place for the Kafka leg that follows")
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}, false),
+			"the Kafka leg must still be recordable under the same token after the webhook marker")
 	})
+
+	// P5-F01: the repair leg's row is TERMINAL, so the webhook enqueue is the last thing its
+	// claim was taken for and the lease must not outlive it.
+	t.Run("a repaired terminal row releases its lease and its claim token", func(t *testing.T) {
+		for _, terminal := range []struct {
+			status string
+			settle func(t *testing.T, ds Datasource, id int64, token string)
+		}{
+			{
+				status: model.EventOutboxStatusDispatched,
+				settle: func(t *testing.T, ds Datasource, id int64, token string) {
+					require.NoError(t, ds.MarkEventDispatched(ctx, id, token, model.BrokerRecord{}, false))
+				},
+			},
+			{
+				status: model.EventOutboxStatusDeadLettered,
+				settle: func(t *testing.T, ds Datasource, id int64, token string) {
+					require.NoError(t, ds.MarkEventDeadLettered(ctx, id, token,
+						"blnk.transactions.dlt", nil, model.BrokerRecord{}))
+				},
+			},
+		} {
+			t.Run(terminal.status, func(t *testing.T) {
+				entry := newEventOutboxFixture(marker)
+				insertRealEventOutbox(t, ds, entry)
+
+				settleToken := claimEventOutboxToken(t, ds, entry)
+				terminal.settle(t, ds, entry.ID, settleToken)
+
+				settled, err := ds.GetEventByID(ctx, entry.EventID)
+				require.NoError(t, err)
+				require.Equal(t, terminal.status, settled.Status)
+
+				// The repair claim is what the webhook recovery pass takes: it leases a terminal
+				// row whose legacy leg is still owed, WITHOUT changing its status.
+				owed, err := ds.ClaimPendingWebhookDeliveries(ctx, 50, time.Minute)
+				require.NoError(t, err)
+
+				claimed := findEventOutbox(owed, entry.EventID)
+				require.NotNilf(t, claimed,
+					"the repair claim must offer a %s row whose webhook leg is still owed", terminal.status)
+				require.NotEmpty(t, claimed.ClaimToken)
+
+				require.NoError(t, ds.MarkWebhookDispatched(ctx, entry.ID, claimed.ClaimToken))
+
+				repaired, err := ds.GetEventByID(ctx, entry.EventID)
+				require.NoError(t, err)
+				assert.True(t, repaired.WebhookDispatched,
+					"the recovered legacy leg must be recorded")
+				assert.Equal(t, terminal.status, repaired.Status,
+					"repairing the legacy leg must not move the row's Kafka state")
+				assert.Nil(t, repaired.LockedUntil,
+					"a repaired terminal row must not keep its lease: nothing further is owed on that "+
+						"claim, and until the lease expired the row was out of reach of every other "+
+						"claim and indistinguishable from a repair still in flight")
+				assert.Empty(t, repaired.ClaimToken,
+					"and it must not keep the claim token either, for the same reason")
+			})
+		}
+	})
+}
+
+// findEventOutbox returns the claimed row carrying the given event id, or nil.
+//
+// Parameters:
+//   - claimed []model.EventOutbox: the batch a claim returned.
+//   - eventID string: the event id wanted.
+//
+// Returns:
+//   - *model.EventOutbox: the matching row, or nil when the batch does not hold it.
+func findEventOutbox(claimed []model.EventOutbox, eventID string) *model.EventOutbox {
+	for i := range claimed {
+		if claimed[i].EventID == eventID {
+			return &claimed[i]
+		}
+	}
+
+	return nil
 }
 
 // TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB is the replay
@@ -11989,6 +12091,19 @@ func TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB(t *test
 // been switched off. This test asserts the pin is in the catalog and that it produces the
 // intended plan, because without it the claim silently reverts to a cost that follows the
 // backlog: 2,215ms at 25,000 pending rows against 9.4ms, measured on the same table.
+//
+// enable_sort = off ALONE WAS NOT ENOUGH, and this test is written in the shape that found
+// that out. The head lookup's `= key_value` put the key into an equivalence class, which let
+// the planner fold the leading ORDER BY column to a constant and satisfy the whole ordering
+// from idx_event_outbox_claim_order with no sort node — so there was nothing for enable_sort
+// to exclude, and at the one-row estimate ANALYZE reports for an EMPTY claimable set the
+// age-ordered scan was the cheaper plan and won. The predicate is now a RANGE (`>= x AND
+// <= x`), which selects the same rows and forms no equivalence class; migration 1781252600
+// carries the measurements.
+//
+// So the plan is asserted in BOTH statistical states, and the empty one is asserted FIRST
+// because it is the one that used to fail: an outbox's claimable population is zero for long
+// stretches, so that is the state ANALYZE has most often last seen.
 func TestEventOutboxKeySpaceLookups_ArePinnedToTheEffectiveKeyIndex_RealDB(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -12011,10 +12126,61 @@ func TestEventOutboxKeySpaceLookups_ArePinnedToTheEffectiveKeyIndex_RealDB(t *te
 				"claimable row, and it does.", fn)
 	}
 
+	// THE BODIES MUST BE THE ONES THE FUNCTIONS ACTUALLY CARRY, or this test proves a plan
+	// nothing executes. The head lookup in particular must select its key by a RANGE: an
+	// equality forms an equivalence class, the leading ORDER BY column folds to a constant,
+	// and idx_event_outbox_claim_order then satisfies the ordering with no sort — which is the
+	// hole enable_sort = off cannot close. See migration 1781252600.
+	for _, fn := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "event_outbox_key_head",
+			body: eventOutboxEffectiveKeySQL("candidate") + " >= key_value",
+			want: []string{
+				eventOutboxEffectiveKeySQL("candidate") + " >= key_value",
+				eventOutboxEffectiveKeySQL("candidate") + " <= key_value",
+			},
+		},
+		{
+			name: "event_outbox_next_effective_key",
+			body: "",
+			want: []string{eventOutboxEffectiveKeySQL("candidate") + " > after_key"},
+		},
+	} {
+		var definition string
+		require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+			SELECT pg_get_functiondef(oid)
+			FROM pg_proc
+			WHERE pronamespace = 'blnk'::regnamespace AND proname = $1
+		`, fn.name).Scan(&definition))
+
+		for _, clause := range fn.want {
+			assert.Containsf(t, definition, clause,
+				"blnk.%s must select its key with %q. The equality form is what let the planner "+
+					"fold the ordering to a constant and answer a single-key question with an "+
+					"age-ordered scan of every claimable row.", fn.name, clause)
+		}
+
+		if fn.name == "event_outbox_key_head" {
+			assert.NotContainsf(t, definition,
+				eventOutboxEffectiveKeySQL("candidate")+" = key_value",
+				"blnk.%s must not carry the equality predicate: apply sql/1781252600.sql", fn.name)
+		}
+	}
+
 	// AND THE PIN MUST PRODUCE THE PLAN, which is a separate claim from carrying the setting.
 	// The body is planned here rather than the function called, because EXPLAIN of a call shows
 	// the call and not what happens inside it.
-	for name, statement := range map[string]string{
+	//
+	// IN BOTH STATISTICAL STATES. The empty one is where the equality form failed — an outbox's
+	// claimable population is zero for long stretches, so it is the state ANALYZE has most
+	// often last seen, and it is the state that costs the age-ordered scan below the seek. The
+	// populated one is where the amplification would be paid. A single state proves nothing:
+	// the equality form passed the populated state and failed the empty one.
+	statements := map[string]string{
 		"next key": `
 			SELECT ` + eventOutboxEffectiveKeySQL("candidate") + `
 			FROM blnk.event_outbox candidate
@@ -12026,39 +12192,79 @@ func TestEventOutboxKeySpaceLookups_ArePinnedToTheEffectiveKeyIndex_RealDB(t *te
 			SELECT candidate.id, candidate.occurred_at
 			FROM blnk.event_outbox candidate
 			WHERE candidate.status IN ('pending', 'processing')
-			  AND ` + eventOutboxEffectiveKeySQL("candidate") + ` = $1
+			  AND ` + eventOutboxEffectiveKeySQL("candidate") + ` >= $1
+			  AND ` + eventOutboxEffectiveKeySQL("candidate") + ` <= $1
 			ORDER BY ` + eventOutboxEffectiveKeySQL("candidate") + ` ASC,
 				candidate.occurred_at ASC, candidate.id ASC
 			LIMIT 1`,
+	}
+
+	for _, state := range []struct {
+		name     string
+		populate bool
+	}{
+		{name: "claimable population empty, statistics fresh"},
+		{name: "claimable population large, statistics fresh", populate: true},
 	} {
-		tx, err := ds.Conn.BeginTx(ctx, nil)
-		require.NoError(t, err)
+		marker := "planpin-" + uuid.NewString() + "-"
 
-		_, err = tx.ExecContext(ctx, "SET LOCAL enable_sort = off")
-		require.NoError(t, err, "the setting the function definition carries must be settable")
-
-		rows, err := tx.QueryContext(ctx, "EXPLAIN "+statement, "probe")
-		require.NoErrorf(t, err, "EXPLAIN of the %s lookup must succeed", name)
-
-		var plan strings.Builder
-		for rows.Next() {
-			var line string
-			require.NoError(t, rows.Scan(&line))
-			plan.WriteString(line)
-			plan.WriteString("\n")
+		if state.populate {
+			// Distinct keys, so the population is spread the way a real backlog is, and enough of
+			// them that a per-key filter would be visibly expensive.
+			for i := 0; i < 200; i++ {
+				entry := newEventOutboxFixture(marker)
+				shareEventOutboxKey(entry, marker+"key-"+strconv.Itoa(i))
+				insertRealEventOutbox(t, ds, entry)
+			}
 		}
 
-		require.NoError(t, rows.Err())
-		_ = rows.Close()
-		_ = tx.Rollback()
+		_, err := ds.Conn.ExecContext(ctx, "ANALYZE blnk.event_outbox")
+		require.NoError(t, err, "the plan must be asserted against statistics, not against their absence")
 
-		planText := plan.String()
-		assert.Containsf(t, planText, "idx_event_outbox_effective_key_inflight",
-			"under the pin, the %s lookup must SEEK on the effective-key index. Reached any other "+
-				"way it reads the claimable population per key, and the claim's cost then follows "+
-				"the backlog it is trying to drain.\nPlan was:\n%s", name, planText)
-		assert.NotContainsf(t, planText, "idx_event_outbox_claim_order",
-			"the %s lookup must not fall back to the age-ordered index: that is the plan the pin "+
-				"exists to exclude.\nPlan was:\n%s", name, planText)
+		for name, statement := range statements {
+			tx, err := ds.Conn.BeginTx(ctx, nil)
+			require.NoError(t, err)
+
+			_, err = tx.ExecContext(ctx, "SET LOCAL enable_sort = off")
+			require.NoError(t, err, "the setting the function definition carries must be settable")
+
+			rows, err := tx.QueryContext(ctx, "EXPLAIN "+statement, "probe")
+			require.NoErrorf(t, err, "EXPLAIN of the %s lookup must succeed", name)
+
+			var plan strings.Builder
+			for rows.Next() {
+				var line string
+				require.NoError(t, rows.Scan(&line))
+				plan.WriteString(line)
+				plan.WriteString("\n")
+			}
+
+			require.NoError(t, rows.Err())
+			_ = rows.Close()
+			_ = tx.Rollback()
+
+			planText := plan.String()
+			assert.Containsf(t, planText, "idx_event_outbox_effective_key_inflight",
+				"with the %s, the %s lookup must SEEK on the effective-key index. Reached any other "+
+					"way it reads the claimable population per key, and the claim's cost then follows "+
+					"the backlog it is trying to drain.\nPlan was:\n%s", state.name, name, planText)
+			assert.NotContainsf(t, planText, "idx_event_outbox_claim_order",
+				"with the %s, the %s lookup must not fall back to the age-ordered index: that is the "+
+					"plan the pin exists to exclude.\nPlan was:\n%s", state.name, name, planText)
+		}
+
+		if state.populate {
+			// Removed immediately rather than in a t.Cleanup: the SECOND state's assertions depend
+			// on the FIRST state's rows being gone, and a cleanup deferred to the end of the test
+			// would leave a populated table behind for the empty-state pass of a later run.
+			_, err := ds.Conn.ExecContext(ctx, `
+				DELETE FROM blnk.event_outbox
+				WHERE aggregate_id LIKE $1 OR partition_key LIKE $1
+			`, marker+"%")
+			require.NoError(t, err, "the fixtures must not outlive the state they were inserted for")
+
+			_, err = ds.Conn.ExecContext(ctx, "ANALYZE blnk.event_outbox")
+			require.NoError(t, err)
+		}
 	}
 }

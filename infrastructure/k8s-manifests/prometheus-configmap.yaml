@@ -575,3 +575,30 @@ data:
               summary: "No event metrics collector is reporting; every event-streaming alert is blind"
               description: "The blnk-server job has exported no event-metrics collection age for 10 minutes, which means no collector is running in any scraped server process. EVERY rule in this group is therefore evaluating a series that does not exist, and a rule over a missing series cannot fire and looks exactly like a healthy system — including DeadLetterMessageStuck, which is the one that pages on ledger events not reaching subscribers. Check that observability is enabled so /metrics is registered and served, that the metrics bearer token Prometheus uses matches the server's, and that the server process reached the collector start-up. The collector is unconditional in the server role, so its absence is a start-up or scrape-configuration fault rather than a Kafka one."
               runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#eventmetricscollectionabsent"
+          # ------------------------------------------------------------------------
+          # WORK ARRIVING FASTER THAN IT IS DONE. The index queue reached 609,673 pending
+          # tasks during a sustained load run — draining at 276/s against 550/s arriving —
+          # and nothing reported it, because no series existed for a rule to read. The
+          # dashboard showed it to whoever opened the dashboard; that is not monitoring.
+          # ------------------------------------------------------------------------
+          - alert: TaskQueueBacklogHigh
+            # PENDING ONLY, and bare so the queue label reaches the notification. Pending is
+            # work that has arrived and not been started, which is what accumulates when a
+            # drain rate falls behind an arrival rate. `retry` and `scheduled` are excluded
+            # deliberately: both are work deferred to a FUTURE time, so they look like a
+            # backlog on a dashboard while actually waiting on a clock rather than a worker,
+            # and `active` is work already in flight and bounded by the server's concurrency.
+            expr: blnk_queue_backlog{state="pending"} > 25000
+            # Ten minutes, because a queue exists precisely so that a burst does not have to
+            # be served synchronously. A depth this high that PERSISTS is no longer a burst:
+            # at the validated 550 events/second arrival rate a queue keeping pace sits near
+            # zero, and one that has held 25,000 for ten minutes is not going to recover on
+            # its own.
+            for: 10m
+            labels:
+              severity: warning
+              component: task-queue
+            annotations:
+              summary: "A task queue has held a large backlog for 10 minutes and is not keeping pace"
+              description: "Queue {{ $labels.queue }} on {{ $labels.instance }} has had {{ $value }} task(s) PENDING for 10 minutes, so work is arriving faster than the workers are completing it and the queue is growing rather than absorbing a burst. This is a COUNT of tasks not yet started, not an age. The failure this rule was written for is the index queue: every task used to rebuild its TypeSense client and re-assert the collection schema — six HTTP round trips on an unpooled connection before its own single write — which capped the drain rate below the arrival rate and grew the queue without bound. Check first whether the per-task cost has regressed, then whether the queue is being starved of worker slots by its weight relative to the others sharing the same server (BLNK_QUEUE_WEBHOOK_CONCURRENCY sets the pool the webhook and index queues share), and then whether the downstream service the tasks call is itself slow. A backlog that clears the moment load stops is a capacity problem; one that persists at idle is a failing task being retried."
+              runbook_url: "{{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md{{ end }}#taskqueuebackloghigh"

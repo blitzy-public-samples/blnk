@@ -123,10 +123,11 @@ var eventCatalogue = []eventCatalogueEntry{
 		deadLetterTopic: "blnk.transactions.dlt",
 		category:        "transactions",
 	},
-	// transaction.unknown is reachable, not hypothetical: the COMMIT status has no case in
-	// getEventFromStatus and falls through to it. That behaviour is preserved deliberately
-	// so the dual-delivery payload comparison stays exact, so the event name must route
-	// like any other.
+	// transaction.unknown is the mapping's DEFENSIVE DEFAULT for a status no case names, and
+	// no code path in this repository produces it — COMMIT does not, because
+	// updateTransactionDetails normalises it to APPLIED before the event name is derived
+	// (pinned by TestCommittedInflightTransaction_IsAnnouncedAsApplied). It is routed like
+	// any other name so that a status added in future cannot be dropped.
 	{
 		eventType:       "transaction.unknown",
 		vocabularyKey:   "transaction.unknown",
@@ -588,10 +589,11 @@ func TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic(t
 		{status: StatusInflight, eventType: "transaction.inflight"},
 		{status: StatusVoid, eventType: "transaction.void"},
 		{status: StatusRejected, eventType: "transaction.rejected"},
-		// COMMIT has no case in getEventFromStatus and falls through to the default. That is
-		// a PRE-EXISTING behaviour, preserved on purpose: correcting it here would make the
-		// dual-delivery payload comparison differ for a reason that has nothing to do with
-		// the transport.
+		// COMMIT has no case in getEventFromStatus and falls through to the default. The
+		// MAPPING behaviour is pinned here and is pre-existing; it is not, however, what a
+		// committed inflight transaction is announced under, because the status is normalised
+		// to APPLIED before the name is derived. See
+		// TestCommittedInflightTransaction_IsAnnouncedAsApplied.
 		{status: StatusCommit, eventType: "transaction.unknown"},
 	} {
 		t.Run(testCase.status, func(t *testing.T) {
@@ -1544,7 +1546,9 @@ func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) 
 	assert.Equal(t, "transaction.applied", getEventFromStatus(StatusApplied),
 		"the event vocabulary must remain callable, and unchanged, from event_topics.go")
 	assert.Equal(t, "transaction.unknown", getEventFromStatus(StatusCommit),
-		"and the deliberately preserved COMMIT fall-through must be untouched")
+		"and the mapping's default arm must be untouched. Note this is the MAPPING, not what a "+
+			"committed inflight transaction is announced under: its status is normalised to "+
+			"APPLIED first")
 }
 
 // ---------------------------------------------------------------------------------------

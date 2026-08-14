@@ -1510,6 +1510,205 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 
 // TestKubernetesConfig_ProjectsCredentialsFromSecrets is the guard.
 //
+// TestKubernetesWorkloads_AreHardenedCompletelyOrNotAtAll is the companion to the test
+// above, and it exists because that one names its workloads in a literal list.
+//
+// A list is right for what it asserts — probe paths and user ids legitimately differ per
+// workload, so they have to be stated one by one. What a list cannot do is notice a workload
+// that was never added to it. A new pod-bearing manifest joins this tree and the hardening
+// suite keeps passing without ever having looked at it, which is precisely what happened when
+// kafka-provision-job.yaml was added: every hardening test was green and none of them had
+// read the file.
+//
+// So this test enumerates the tree instead of naming it, and asserts the one invariant that
+// holds across every workload regardless of what it runs: HARDENING IS ALL OR NOTHING. A
+// workload that declares any part of the restricted posture must declare all of it.
+//
+// WHY THAT RATHER THAN "EVERYTHING MUST BE HARDENED", which would be the stronger-sounding
+// assertion and the wrong one. Four workloads in this tree — jaeger, postgres, redis and
+// typesense — run third-party images and carry no security context at all. That is the state
+// they arrived in, they are outside what this feature owns, and hardening them is a change
+// with its own testing to do: postgres needs write access to its data directory, redis and
+// typesense have their own uid expectations, and a readOnlyRootFilesystem imposed on any of
+// them by a test rather than by someone who ran it is a broken deployment. Asserting the
+// stronger property here would either fail the suite for pre-existing conditions or force a
+// scope this change has no business taking. PARTIAL hardening is the real regression: it
+// looks deliberate, reads as protected in review, and leaves the specific gap nobody chose.
+func TestKubernetesWorkloads_AreHardenedCompletelyOrNotAtAll(t *testing.T) {
+	manifests := filepath.Join(moduleRootDir(t), "infrastructure", "k8s-manifests")
+
+	entries, err := os.ReadDir(manifests)
+	require.NoError(t, err, "the manifest directory must be readable")
+
+	// The workloads this feature owns or introduced. Named explicitly BECAUSE the all-or-
+	// nothing rule below is satisfied by declaring nothing: without this set, deleting every
+	// security context from the Kafka manifests would pass. Membership is asserted, so
+	// hardening cannot be dropped from them and call itself consistent.
+	mustBeHardened := map[string]bool{
+		"kafka":           true,
+		"kafka-provision": true,
+		"server":          true,
+		"worker":          true,
+		"prometheus":      true,
+	}
+
+	found := make(map[string]bool, len(mustBeHardened))
+	inspected := 0
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
+			continue
+		}
+
+		for _, document := range readYAMLDocuments(t, filepath.Join(manifests, entry.Name())) {
+			podSpec, name, kind := workloadPodSpec(document)
+			if podSpec == nil {
+				continue
+			}
+			inspected++
+
+			pod, _ := podSpec["securityContext"].(map[string]interface{})
+			containers := allWorkloadContainers(podSpec)
+			require.NotEmptyf(t, containers, "%s/%s in %s declares no containers",
+				kind, name, entry.Name())
+
+			// Every signal that the restricted posture was intended, gathered before any of
+			// them is required, so the verdict is "some but not all" rather than "not this one".
+			declared := map[string]bool{
+				"pod securityContext.runAsNonRoot":   pod["runAsNonRoot"] == true,
+				"pod securityContext.runAsUser":      pod["runAsUser"] != nil,
+				"pod securityContext.fsGroup":        pod["fsGroup"] != nil,
+				"pod securityContext.seccompProfile": pod["seccompProfile"] != nil,
+			}
+			for _, container := range containers {
+				security, _ := container["securityContext"].(map[string]interface{})
+				if security["allowPrivilegeEscalation"] == false {
+					declared["a container's allowPrivilegeEscalation: false"] = true
+				}
+				if security["readOnlyRootFilesystem"] == true {
+					declared["a container's readOnlyRootFilesystem: true"] = true
+				}
+				if capabilities, isMap := security["capabilities"].(map[string]interface{}); isMap {
+					for _, dropped := range stringListValue(capabilities["drop"]) {
+						if dropped == "ALL" {
+							declared["a container's capabilities.drop: [ALL]"] = true
+						}
+					}
+				}
+			}
+
+			any := false
+			missing := make([]string, 0, len(declared))
+			for signal, present := range declared {
+				if present {
+					any = true
+				} else {
+					missing = append(missing, signal)
+				}
+			}
+			sort.Strings(missing)
+
+			if mustBeHardened[name] {
+				found[name] = true
+				require.Truef(t, any,
+					"%s/%s in %s declares no part of the restricted posture. It runs a broker or "+
+						"Blnk's own code and it is what this feature owns, so it must be hardened",
+					kind, name, entry.Name())
+			}
+
+			if !any {
+				// Deliberately unhardened, and not this test's business. See the comment above.
+				continue
+			}
+
+			assert.Emptyf(t, missing,
+				"%s/%s in %s is PARTLY hardened: it declares some of the restricted posture and is "+
+					"missing %v. Partial hardening is worse than none, because it reads as protected. "+
+					"Each missing piece removes a different protection: runAsNonRoot lets an image "+
+					"later rebuilt as root start anyway; fsGroup left unset leaves projected Secret "+
+					"material root-owned and unreadable to the process that needs it; a missing "+
+					"seccompProfile leaves the container on the unconfined default; "+
+					"allowPrivilegeEscalation unset lets a setuid binary in the image regain what "+
+					"dropping capabilities took away; and capabilities.drop [ALL] is what makes the "+
+					"non-root user actually unprivileged. Add the rest, or remove the security "+
+					"context entirely and be honestly unhardened",
+				kind, name, entry.Name(), missing)
+
+			// One container hardened and its sibling not is the same defect one level down, and
+			// the aggregate check above cannot see it: an initContainer that keeps a writable
+			// root filesystem while the main container drops it is a writable path into the same
+			// pod.
+			for _, container := range containers {
+				security, _ := container["securityContext"].(map[string]interface{})
+				assert.NotNilf(t, security,
+					"%s/%s in %s hardens the pod but container %q declares no securityContext of "+
+						"its own. Pod-level settings do not carry allowPrivilegeEscalation, "+
+						"readOnlyRootFilesystem or capabilities, so this container has none of them",
+					kind, name, entry.Name(), toStringValue(container["name"]))
+			}
+		}
+	}
+
+	require.Positive(t, inspected, "the manifest set must contain pod-bearing workloads")
+
+	for name := range mustBeHardened {
+		assert.Truef(t, found[name],
+			"no workload named %q was found in the manifest set. This test asserts that workload is "+
+				"hardened, so a rename or deletion must be reflected here rather than silently "+
+				"dropping the assertion", name)
+	}
+}
+
+// workloadPodSpec returns the pod spec of any pod-bearing workload, with its name and kind.
+// Returns a nil map for documents that carry no pod template, so callers can skip Services,
+// ConfigMaps and claims without enumerating what they are.
+func workloadPodSpec(document map[string]interface{}) (map[string]interface{}, string, string) {
+	if document == nil {
+		return nil, "", ""
+	}
+
+	kind := toStringValue(document["kind"])
+	spec, _ := document["spec"].(map[string]interface{})
+	metadata, _ := document["metadata"].(map[string]interface{})
+	name := toStringValue(metadata["name"])
+
+	switch kind {
+	case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job":
+		template, _ := spec["template"].(map[string]interface{})
+		podSpec, _ := template["spec"].(map[string]interface{})
+
+		return podSpec, name, kind
+
+	case "CronJob":
+		jobTemplate, _ := spec["jobTemplate"].(map[string]interface{})
+		jobSpec, _ := jobTemplate["spec"].(map[string]interface{})
+		template, _ := jobSpec["template"].(map[string]interface{})
+		podSpec, _ := template["spec"].(map[string]interface{})
+
+		return podSpec, name, kind
+	}
+
+	return nil, name, kind
+}
+
+// allWorkloadContainers returns a pod's init containers and its containers together, because
+// every hardening property below applies to both and an initContainer is the one more easily
+// forgotten.
+func allWorkloadContainers(podSpec map[string]interface{}) []map[string]interface{} {
+	collected := make([]map[string]interface{}, 0, 4)
+
+	for _, key := range []string{"initContainers", "containers"} {
+		list, _ := podSpec[key].([]interface{})
+		for _, raw := range list {
+			if container, isMap := raw.(map[string]interface{}); isMap {
+				collected = append(collected, container)
+			}
+		}
+	}
+
+	return collected
+}
+
 // Two defects that compounded.
 //
 // Adding a Secret reference does not remove a committed credential.
@@ -2641,4 +2840,224 @@ func collectSecretKeyRefs(node interface{}, into map[string]struct{}) {
 			collectSecretKeyRefs(value, into)
 		}
 	}
+}
+
+// TestCompose_ProjectsEveryCredentialAndEndpointItsOwnServicesNeed is the local-parity
+// contract, and it exists because "the service is in the file" was mistaken for "the
+// feature works".
+//
+// Three features were broken in the Compose stack in exactly the same way, and none of
+// them logged anything: the file STARTED the right containers and then did not tell the
+// application how to reach them or how to admit an operator.
+//
+//   - THE MASTER KEY. Every route under /events and /subscribers is gated on
+//     server.secret_key, so with no value projected the whole operator surface —
+//     dead-letter listing, replay, outbox statistics, subscriber CRUD and Kafka credential
+//     issuance — answered 403 to every caller, including one holding the key from .env.
+//   - SEARCH. TypeSense started, was healthy, and neither role was told where it was. The
+//     indexer runs on the WORKER, so its absence there grew the index queue without bound
+//     while /search on the server answered 404 and every ledger write still succeeded.
+//   - THE SCRAPE CREDENTIAL. With a metrics token set, Prometheus sent none, so both jobs
+//     collected nothing and all fifteen Kafka alert rules sat unable to fire. An alert that
+//     cannot fire is indistinguishable from a system with nothing wrong.
+//
+// So this test asserts the PROJECTION, per role, in both Compose files. It is deliberately
+// not a test of the application's behaviour — event_*_integration_test.go covers that. It
+// is a test that the local stack hands the application what the application needs, which is
+// the thing that was missing.
+func TestCompose_ProjectsEveryCredentialAndEndpointItsOwnServicesNeed(t *testing.T) {
+	for _, composeFile := range composeFiles {
+		t.Run(composeFile, func(t *testing.T) {
+			for _, role := range []string{"server", "worker"} {
+				t.Run(role, func(t *testing.T) {
+					environment := composeServiceEnvironment(t, composeFile, role)
+					defaults := composeResolvedDefaults(t, environment)
+
+					for _, projected := range []struct {
+						key  string
+						want string
+						why  string
+					}{
+						{
+							key:  "BLNK_SERVER_SECRET_KEY",
+							want: "",
+							why: "the master key gates every /events and /subscribers route. Its DEFAULT " +
+								"must stay empty — a stack with no operator credential should have those " +
+								"routes shut, not open on a published value — but it must be FORWARDED, " +
+								"or a key set in .env never reaches the process",
+						},
+						{
+							key:  "BLNK_SERVER_SECURE",
+							want: "",
+							why: "secure mode must be reachable from .env in both roles. The worker reads " +
+								"it too: MetricsAuthHandler refuses /metrics and the queue dashboard " +
+								"outright when secure mode is on with no bearer token, so projecting it " +
+								"on the server alone would leave the two roles in different postures",
+						},
+						{
+							key:  "BLNK_TYPESENSE_DNS",
+							want: "http://typesense:8108",
+							why: "the default must name the typesense service THIS FILE CREATES, over the " +
+								"compose network. A host-shaped default reaches the container's own " +
+								"loopback, and no default at all leaves the search client with nothing " +
+								"to dial",
+						},
+						{
+							key:  "BLNK_METRICS_BEARER_TOKEN",
+							want: "",
+							why: "one token guards the server's /metrics and the worker's /metrics and " +
+								"queue dashboard, and prometheus-init projects the same value into the " +
+								"volume Prometheus reads",
+						},
+						{
+							key:  "BLNK_ENABLE_OBSERVABILITY",
+							want: "true",
+							why: "this is what makes /metrics EXIST. With it off the handler is never " +
+								"registered and the endpoint answers 404, so the Prometheus targets are " +
+								"down for a reason no amount of correct authentication fixes",
+						},
+					} {
+						value, forwarded := environment[projected.key]
+						require.Truef(t, forwarded,
+							"%s: the %s service must forward %s — %s",
+							composeFile, role, projected.key, projected.why)
+
+						assert.NotNilf(t, value,
+							"%s: %s on the %s service must interpolate from .env rather than being a "+
+								"bare pass-through, so its default is visible in the file", composeFile,
+							projected.key, role)
+
+						assert.Equalf(t, projected.want, defaults[projected.key],
+							"%s: %s on the %s service must default to %q — %s", composeFile,
+							projected.key, role, projected.want, projected.why)
+					}
+
+					// THE SEARCH KEY IS ASSERTED SEPARATELY, because what matters about it is not its
+					// literal value but that it is DERIVED FROM THE SAME VARIABLE the typesense
+					// service is started with. Two independent literals would let the index and its
+					// clients drift, and the symptom of that drift is a healthy TypeSense refusing
+					// every request Blnk makes with 401.
+					searchKey, forwarded := environment["BLNK_TYPESENSE_KEY"]
+					require.Truef(t, forwarded,
+						"%s: the %s service must forward BLNK_TYPESENSE_KEY", composeFile, role)
+
+					rendered, isString := searchKey.(string)
+					require.Truef(t, isString,
+						"%s: BLNK_TYPESENSE_KEY on the %s service must interpolate", composeFile, role)
+					assert.Containsf(t, rendered, "TYPESENSE_API_KEY",
+						"%s: BLNK_TYPESENSE_KEY on the %s service must fall back to TYPESENSE_API_KEY, "+
+							"which is the same variable the typesense service's --api-key is built from. "+
+							"A separate literal here lets the index and its clients disagree", composeFile, role)
+				})
+			}
+
+			services := composeServices(t, filepath.Join(moduleRootDir(t), composeFile), composeFile)
+
+			t.Run("the typesense service derives its api-key from that same variable", func(t *testing.T) {
+				definition, isMap := services["typesense"].(map[string]interface{})
+				require.Truef(t, isMap, "%s must define the typesense service", composeFile)
+
+				command := composeStringList(t, definition["command"])
+				joined := strings.Join(command, " ")
+
+				assert.Containsf(t, joined, "--api-key=${TYPESENSE_API_KEY:-blnk-api-key}",
+					"%s: the typesense service's api-key must interpolate TYPESENSE_API_KEY with the "+
+						"same fallback the two roles use, so changing it in .env moves the index and "+
+						"its clients together. Got: %s", composeFile, joined)
+			})
+
+			t.Run("the scrape credential is materialised before prometheus starts", func(t *testing.T) {
+				// prometheus.yml authenticates UNCONDITIONALLY, and credentials_file is validated at
+				// config load: Prometheus refuses to start when the file is absent. So the one-shot
+				// that writes it is not a convenience, it is what makes that configuration safe on a
+				// clone that has never been touched.
+				initDefinition, isMap := services["prometheus-init"].(map[string]interface{})
+				require.Truef(t, isMap,
+					"%s must define the prometheus-init service. Without it prometheus.yml's "+
+						"credentials_file names a path that does not exist and Prometheus refuses to "+
+						"start at all", composeFile)
+
+				assert.Equalf(t, composeStringList(t, initDefinition["profiles"]), []string{"monitoring"},
+					"%s: prometheus-init must sit behind the SAME profile as prometheus — writing a "+
+						"credential for a Prometheus nobody started is pointless, and starting "+
+						"Prometheus without it is broken", composeFile)
+
+				assert.Equalf(t, composeImageRef(t, services, "prometheus", composeFile),
+					composeImageRef(t, services, "prometheus-init", composeFile),
+					"%s: prometheus-init must reuse the prometheus image so the one-shot adds nothing "+
+						"to pull and cannot drift to a different base", composeFile)
+
+				initEnv, isMap := initDefinition["environment"].(map[string]interface{})
+				require.Truef(t, isMap, "%s: prometheus-init must declare an environment", composeFile)
+				_, carriesToken := initEnv["BLNK_METRICS_BEARER_TOKEN"]
+				assert.Truef(t, carriesToken,
+					"%s: prometheus-init must read BLNK_METRICS_BEARER_TOKEN — the SAME variable the "+
+						"server and worker read, or the scrape credential can differ from the one that "+
+						"gates the endpoint", composeFile)
+
+				written := strings.Join(composeStringList(t, initDefinition["command"]), " ")
+				assert.Containsf(t, written, "printf '%s'",
+					"%s: prometheus-init must write the token with printf and no trailing newline — "+
+						"Prometheus sends the file's bytes verbatim, and a newline inside the bearer "+
+						"value is a token that never matches", composeFile)
+				assert.NotContainsf(t, written, "$BLNK_METRICS_BEARER_TOKEN ",
+					"%s: the token must not appear as an argument; an argv is visible in docker "+
+						"inspect and in the process table", composeFile)
+
+				promDefinition, isMap := services["prometheus"].(map[string]interface{})
+				require.Truef(t, isMap, "%s must define the prometheus service", composeFile)
+
+				mounts := composeStringList(t, promDefinition["volumes"])
+				assert.Containsf(t, mounts, "prometheus_secrets:/etc/prometheus/secrets:ro",
+					"%s: prometheus must mount the secrets volume READ-ONLY at the directory "+
+						"prometheus.yml's credentials_file paths resolve inside. Got: %v",
+					composeFile, mounts)
+
+				dependencies, isMap := promDefinition["depends_on"].(map[string]interface{})
+				require.Truef(t, isMap,
+					"%s: prometheus must express depends_on in the long form so the one-shot can be "+
+						"gated on COMPLETION rather than on having been started", composeFile)
+
+				gate, declared := dependencies["prometheus-init"].(map[string]interface{})
+				require.Truef(t, declared,
+					"%s: prometheus must depend on prometheus-init, or it can start against a "+
+						"missing credentials file and refuse to load its configuration", composeFile)
+				assert.Equalf(t, "service_completed_successfully", gate["condition"],
+					"%s: the gate must be service_completed_successfully. service_started would let "+
+						"Prometheus race the write it depends on", composeFile)
+			})
+		})
+	}
+
+	t.Run("prometheus.yml authenticates both scrapes unconditionally", func(t *testing.T) {
+		// The Kubernetes copy always did. The root copy did not, and the difference is the
+		// whole of what P7-F03b was: a token-guarded endpoint scraped without a token.
+		config := readYAMLFile(t, filepath.Join(moduleRootDir(t), "prometheus.yml"))
+
+		jobs, isList := config["scrape_configs"].([]interface{})
+		require.True(t, isList, "prometheus.yml must declare scrape_configs")
+		require.Len(t, jobs, 2, "prometheus.yml must scrape exactly the server and the worker")
+
+		for _, entry := range jobs {
+			job, isMap := entry.(map[string]interface{})
+			require.True(t, isMap)
+
+			name, _ := job["job_name"].(string)
+
+			authorization, authenticated := job["authorization"].(map[string]interface{})
+			require.Truef(t, authenticated,
+				"scrape job %q must carry an authorization block. Commented out, a stack with a "+
+					"metrics token collects NOTHING and every alert rule is inert with no error "+
+					"reported anywhere", name)
+
+			assert.Equalf(t, "Bearer", authorization["type"],
+				"scrape job %q must present a bearer token", name)
+			assert.Equalf(t, "/etc/prometheus/secrets/metrics-bearer-token",
+				authorization["credentials_file"],
+				"scrape job %q must read the credential from the file prometheus-init writes, and "+
+					"from a FILE rather than inline: inline puts the token in this committed "+
+					"document, and a file is re-read on every scrape so rotation needs no restart",
+				name)
+		}
+	})
 }

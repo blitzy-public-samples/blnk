@@ -1103,9 +1103,11 @@ func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 
 		for _, set := range attributeSets {
 			for _, kv := range set {
-				// Value.Emit renders every attribute type this span can carry, which is
-				// what the leak assertions below need to inspect.
-				rendered := kv.Value.Emit()
+				// Value.String renders every attribute type this span can carry, which is
+				// what the leak assertions below need to inspect. It replaces the deprecated
+				// Value.Emit; the two differ only in float and slice formatting, and a
+				// substring search for a leaked identifier is indifferent to that.
+				rendered := kv.Value.String()
 				assert.NotContains(t, rendered, ledgerID,
 					"attribute %q exports the ledger id in the clear", kv.Key)
 				assert.NotContains(t, rendered, balanceID,

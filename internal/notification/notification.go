@@ -165,6 +165,50 @@ func NotifyError(systemError error) {
 		// waiting test hang on exactly the failures it exists to detect.
 		defer announceNotifyErrorCompleted()
 
+		// NOT EVERY ERROR IS A FAULT, AND THE ONES THAT ARE NOT MUST NOT BE PUBLISHED.
+		//
+		// This gate is the difference between an incident channel that means something and one
+		// that is ignored. A reused transaction reference is the case it was written for: the
+		// ledger DETECTED a duplicate and REFUSED it, which is the reference mechanism working,
+		// and every route to it is a case the system handles correctly —
+		//
+		//   - a coalesced follower whose transaction a leader already committed as part of a
+		//     batch, which one batch of 2,000 children produces up to 2,000 of;
+		//   - an asynq redelivery of a task whose handler had already committed, which
+		//     at-least-once delivery guarantees will happen;
+		//   - a client resubmitting a reference, which the API answers with 409 and
+		//     TXN_DUPLICATE_REFERENCE.
+		//
+		// Reported as a system error it cost, per occurrence, one operator-facing ERROR line
+		// and one system.error event — and since events became outbox-backed, that event is a
+		// row in blnk.event_outbox for the relay to publish. A load run measured 1,763 error
+		// lines and 1,366 pending system.error events, so the ledger was paging its operators
+		// and loading its own event pipeline in proportion to how often it correctly rejected a
+		// duplicate.
+		//
+		// THE GATE IS HERE, AT THE NOTIFICATION LAYER, RATHER THAN AT EACH CALLER, and that is
+		// deliberate: the callers are spread across the transaction pipeline, some of them in
+		// files this change must not modify, and every one of them would have to make the same
+		// judgement correctly and keep making it. What "is a system error" means belongs to the
+		// package that defines system errors.
+		//
+		// Nothing is silenced. The error is still RETURNED by the code that produced it and
+		// still acted upon — 409 at the API, an acknowledgement in the worker, a rejected
+		// transaction in the ledger — and it is recorded here at info level so a single
+		// occurrence remains traceable. What stops is the paging and the publishing.
+		if reason, expected := expectedCondition(systemError); expected {
+			logrus.WithFields(logrus.Fields{
+				"event":  systemErrorEventType,
+				"reason": reason,
+				"error":  boundedErrorText(systemError),
+			}).Info(
+				"an expected condition was reported through the system-error channel; it is " +
+					"recorded here and deliberately not published as a system error",
+			)
+
+			return
+		}
+
 		// ONE OPERATOR RECORD PER OCCURRENCE, and it is emitted here — before anything can
 		// fail or be skipped — so an error is never swallowed.
 		correlationID := newCorrelationID()
@@ -297,6 +341,54 @@ var systemErrorSignatures = []struct {
 	{"must be", SystemErrorReasonValidation},
 	{"config", SystemErrorReasonConfiguration},
 	{"not configured", SystemErrorReasonConfiguration},
+}
+
+// SystemErrorReasonDuplicateReference names the one expected condition currently gated out
+// of the system-error channel.
+const SystemErrorReasonDuplicateReference = "duplicate_reference"
+
+// expectedConditionSignatures are error texts that describe the ledger WORKING, not failing.
+//
+// Matched on text because the callers construct these with fmt.Errorf rather than a typed
+// error, and several of them are in files this change must not modify — so a typed sentinel
+// cannot be introduced at the source. The signatures are therefore both required: "reference"
+// alone would swallow unrelated reference failures, and "already been used" alone would match
+// any resource. Both together identify exactly the duplicate-reference refusal, whose wording
+// is fixed by the two callers that produce it and by IsDuplicateReferenceError, which
+// classifies the same condition from the same text.
+var expectedConditionSignatures = []struct {
+	all    []string
+	reason string
+}{
+	{all: []string{"reference", "already been used"}, reason: SystemErrorReasonDuplicateReference},
+}
+
+// expectedCondition reports whether an error describes an expected condition rather than a
+// system fault, and names it.
+func expectedCondition(systemError error) (string, bool) {
+	if systemError == nil {
+		return "", false
+	}
+
+	lowered := strings.ToLower(systemError.Error())
+
+	for _, candidate := range expectedConditionSignatures {
+		matched := true
+
+		for _, fragment := range candidate.all {
+			if !strings.Contains(lowered, fragment) {
+				matched = false
+
+				break
+			}
+		}
+
+		if matched {
+			return candidate.reason, true
+		}
+	}
+
+	return "", false
 }
 
 // classifySystemError reduces an error to one reason from the vocabulary above.

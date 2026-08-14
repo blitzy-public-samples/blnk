@@ -384,6 +384,50 @@ spec:
               # required pod anti-affinity above means the three combined nodes can no
               # longer land on one machine, so a single node loss can no longer take
               # both the data and the whole quorum at once.
+              # INTER-BROKER AUTHENTICATION IS PLAIN WITH A STATIC JAAS, NOT SCRAM, AND THAT
+              # IS THE FIX FOR A CLUSTER THAT COULD NOT SURVIVE A CONTAINER RESTART.
+              #
+              # WHAT HAPPENED. After a liveness-probe restart of the kafka container, broker 0
+              # came up, replayed the metadata log to the high water mark, initialised its
+              # ScramPublisher and its StandardAuthorizer with 16 ACLs — and then rejected every
+              # inter-broker connection from kafka-1 and kafka-2 with "Authentication failed
+              # during authentication due to invalid credentials with SASL mechanism
+              # SCRAM-SHA-512", 629 times over twelve minutes, never recovering. It sat in
+              # "Waiting for the broker to be unfenced" for ever and the cluster stayed at 2/3.
+              #
+              # WHY. SCRAM credentials live in the KRaft METADATA LOG, seeded once by
+              # `kafka-storage format --add-scram` when the data volume was first formatted. The
+              # JAAS configuration below is regenerated from the SECRET on every pod start. Those
+              # two are separate stores of the same password, and NOTHING KEPT THEM EQUAL: rotate
+              # the admin secret, or re-deploy against a surviving PersistentVolumeClaim, and the
+              # log holds the old credential while every broker presents the new one. Formatting
+              # is skipped on an already-formatted volume, so re-running the init container does
+              # not repair it, and neither does deleting the pod. stack.sh warns about exactly
+              # this for compose ("if the broker volume predates them, its metadata log holds the
+              # OLD credentials: run --purge") and this tree had no equivalent guard.
+              #
+              # The failure is also silent in the way that matters: the broker RUNS. It is not
+              # crash-looping, it logs at INFO, and the message names neither the cause nor a
+              # remedy.
+              #
+              # THE FIX IS THE PATTERN THIS FILE ALREADY USES ONE LINE BELOW. The CONTROLLER
+              # listener authenticates with PLAIN against a static JAAS, and it kept working
+              # throughout the incident — raft votes were granted and follower transitions
+              # completed while the BROKER listener was rejecting everything. Inter-broker traffic
+              # now uses the same mechanism, so it depends only on server.properties, which is
+              # written from the Secret on every start and therefore CANNOT diverge from it.
+              # Rotating the admin secret becomes a rolling restart instead of a re-format.
+              #
+              # NOTHING ABOUT THE SUBSCRIBER MODEL CHANGES. SCRAM-SHA-512 stays enabled on the
+              # same listener and is still the only mechanism any non-broker client uses: Blnk,
+              # the provisioning job and every subscriber authenticate with their own SCRAM
+              # credential out of the metadata log, which is what per-subscriber principals and
+              # ACLs require. PLAIN is reachable only with the administrative password, which is
+              # already a super.user, so this grants nothing that was not already granted, and the
+              # PLAIN store below holds exactly one entry, for that same principal.
+              #
+              # The authenticated principal is the same administrative name under either
+              # mechanism, so super.users, the ACLs and every audit line are unchanged.
               cat >"${CONF_DIR}/server.properties" <<PROPERTIES
               process.roles=broker,controller
               node.id=${NODE_ID}
@@ -402,9 +446,10 @@ spec:
               ssl.truststore.password=${KAFKA_TLS_TRUSTSTORE_PASSWORD}
               ssl.endpoint.identification.algorithm=https
 
-              sasl.enabled.mechanisms=SCRAM-SHA-512
-              sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
-              listener.name.broker.sasl.enabled.mechanisms=SCRAM-SHA-512
+              sasl.enabled.mechanisms=PLAIN,SCRAM-SHA-512
+              sasl.mechanism.inter.broker.protocol=PLAIN
+              listener.name.broker.sasl.enabled.mechanisms=PLAIN,SCRAM-SHA-512
+              listener.name.broker.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_SASL_ADMIN_USER}" password="${KAFKA_SASL_ADMIN_SECRET}" user_${KAFKA_SASL_ADMIN_USER}="${KAFKA_SASL_ADMIN_SECRET}";
               listener.name.broker.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_SASL_ADMIN_USER}" password="${KAFKA_SASL_ADMIN_SECRET}";
 
               sasl.mechanism.controller.protocol=PLAIN
@@ -621,6 +666,16 @@ spec:
                 "SCRAM-SHA-512=[name=${KAFKA_SASL_ADMIN_USER},password=${KAFKA_SASL_ADMIN_SECRET},iterations=4096]" \
                 >"${ARGS}"
 
+              # WAS THE VOLUME ALREADY FORMATTED? Asked BEFORE the format, because
+              # --ignore-formatted makes the format itself silent about which case it took,
+              # and the answer decides whether --add-scram had any effect. On an
+              # already-formatted volume the SCRAM record in the metadata log is the one
+              # seeded when it was FIRST formatted, and this run's --add-scram is discarded.
+              PREFORMATTED=no
+              if [ -s "${LOG_DIRS%%,*}/meta.properties" ]; then
+                PREFORMATTED=yes
+              fi
+
               if /opt/kafka/bin/kafka-storage.sh format \
                   --cluster-id "${KAFKA_CLUSTER_ID}" \
                   --config "${CONF_DIR}/server.properties" \
@@ -634,6 +689,113 @@ spec:
                 echo "kafka-bootstrap: disagrees with an already-formatted volume, a rejected" >&2
                 echo "kafka-bootstrap: configuration value, and a log directory the container" >&2
                 echo "kafka-bootstrap: cannot write." >&2
+                exit 1
+              fi
+
+              # ---------------------------------------------------------------------------
+              # THE CREDENTIAL-DRIFT GUARD.
+              #
+              # --add-scram seeds the administrative SCRAM credential into the metadata log
+              # ONCE, at first format. Every later start regenerates server.properties from
+              # the Secret. Those are two stores of one password with nothing keeping them
+              # equal, and when they diverge — a rotated secret, or a re-deploy against a
+              # surviving PersistentVolumeClaim — the metadata log keeps the OLD password
+              # while every client presents the new one.
+              #
+              # The inter-broker listener no longer cares: it authenticates with PLAIN
+              # against the static JAAS above, so the quorum survives the divergence. But
+              # the SCRAM credential is what BLNK, the provisioning Job and this pod's own
+              # readiness probe present, so under drift those all fail — with
+              # "Authentication failed ... invalid credentials with SASL mechanism
+              # SCRAM-SHA-512" and nothing naming the cause. Formatting is skipped on a
+              # formatted volume, so neither restarting the container nor deleting the pod
+              # repairs it. It is permanent until somebody knows to look here.
+              #
+              # So the fingerprint of the credential the log was SEEDED with is recorded on
+              # the data volume, which persists exactly as the metadata log does, and every
+              # later start compares it. A mismatch fails the init container with the cause
+              # and the two remedies, which is strictly better than a broker that starts and
+              # rejects everything.
+              #
+              # A FINGERPRINT, NEVER THE PASSWORD: sha256 over user, a NUL, and the secret.
+              # It is written 0600 on a volume only this pod mounts, it is not reversible,
+              # and it is salted by nothing because it does not need to be — it exists to
+              # detect a change, not to withstand an offline attack on a volume an attacker
+              # would already have the metadata log from.
+              FINGERPRINT_FILE="${LOG_DIRS%%,*}/.blnk-admin-credential-fingerprint"
+              CREDENTIAL_FINGERPRINT="$(
+                printf '%s\0%s' "${KAFKA_SASL_ADMIN_USER}" "${KAFKA_SASL_ADMIN_SECRET}" \
+                  | sha256sum | cut -d' ' -f1
+              )"
+
+              if [ "${PREFORMATTED}" = "no" ]; then
+                # This run performed the format, so the log holds THIS credential. Record it.
+                ( umask 077; printf '%s\n' "${CREDENTIAL_FINGERPRINT}" >"${FINGERPRINT_FILE}" )
+                echo "kafka-bootstrap: formatted a new log directory and recorded the"
+                echo "kafka-bootstrap: administrative credential's fingerprint. A later change to"
+                echo "kafka-bootstrap: the kafka-credentials Secret will be detected here rather"
+                echo "kafka-bootstrap: than becoming an unexplained SCRAM rejection."
+              elif [ ! -s "${FINGERPRINT_FILE}" ]; then
+                # A volume formatted before this guard existed. It CANNOT be judged: writing
+                # the current fingerprint now would bless whatever is in the log, and refusing
+                # to start would break every cluster that upgraded into this manifest. So it
+                # warns, and says exactly how to establish the baseline deliberately.
+                echo "kafka-bootstrap: WARNING - this log directory was formatted before the" >&2
+                echo "kafka-bootstrap: credential-drift guard existed, so whether the metadata" >&2
+                echo "kafka-bootstrap: log's SCRAM credential still matches the kafka-credentials" >&2
+                echo "kafka-bootstrap: Secret cannot be determined here. Starting anyway." >&2
+                echo "kafka-bootstrap:" >&2
+                echo "kafka-bootstrap: To establish the baseline once you have CONFIRMED the" >&2
+                echo "kafka-bootstrap: credential works - Blnk publishes and the readiness probe" >&2
+                echo "kafka-bootstrap: passes - write the fingerprint from inside the pod:" >&2
+                echo "kafka-bootstrap:   printf '%s\\0%s' \"\${KAFKA_SASL_ADMIN_USER}\" \"\${KAFKA_SASL_ADMIN_SECRET}\" \\" >&2
+                echo "kafka-bootstrap:     | sha256sum | cut -d' ' -f1 >${FINGERPRINT_FILE}" >&2
+              elif [ "$(cat "${FINGERPRINT_FILE}")" != "${CREDENTIAL_FINGERPRINT}" ]; then
+                echo "kafka-bootstrap: REFUSING TO START: the administrative credential in the" >&2
+                echo "kafka-bootstrap: kafka-credentials Secret is NOT the one this log directory" >&2
+                echo "kafka-bootstrap: was formatted with." >&2
+                echo "kafka-bootstrap:" >&2
+                echo "kafka-bootstrap: SCRAM credentials live in the KRaft metadata log and are" >&2
+                echo "kafka-bootstrap: seeded only at first format. This volume's log still holds" >&2
+                echo "kafka-bootstrap: the OLD password, so Blnk, the Kafka provisioning Job and" >&2
+                echo "kafka-bootstrap: this pod's readiness probe would all be refused with" >&2
+                echo "kafka-bootstrap: 'invalid credentials with SASL mechanism SCRAM-SHA-512' and" >&2
+                echo "kafka-bootstrap: nothing would say why. Formatting is skipped on a formatted" >&2
+                echo "kafka-bootstrap: volume, so restarting the container or deleting the pod" >&2
+                echo "kafka-bootstrap: does not repair it." >&2
+                echo "kafka-bootstrap:" >&2
+                echo "kafka-bootstrap: Two remedies, and they are not equivalent:" >&2
+                echo "kafka-bootstrap:" >&2
+                echo "kafka-bootstrap:   1. KEEP THE DATA. Put the ORIGINAL admin secret back in" >&2
+                echo "kafka-bootstrap:      the kafka-credentials Secret, let the cluster come up," >&2
+                echo "kafka-bootstrap:      then rotate it properly through the broker itself:" >&2
+                echo "kafka-bootstrap:        kafka-configs.sh --bootstrap-server ... --alter \\" >&2
+                echo "kafka-bootstrap:          --entity-type users --entity-name <admin> \\" >&2
+                echo "kafka-bootstrap:          --add-config 'SCRAM-SHA-512=[password=<new>]'" >&2
+                echo "kafka-bootstrap:      That writes the new credential INTO the metadata log," >&2
+                echo "kafka-bootstrap:      which is the only rotation that survives a restart." >&2
+                echo "kafka-bootstrap:      Then update the Secret and this file:" >&2
+                echo "kafka-bootstrap:        printf '%s\\0%s' <admin> <new> | sha256sum | cut -d' ' -f1 \\" >&2
+                echo "kafka-bootstrap:          >${FINGERPRINT_FILE}" >&2
+                echo "kafka-bootstrap:" >&2
+                echo "kafka-bootstrap:   2. DISCARD THE DATA. Delete this pod's" >&2
+                echo "kafka-bootstrap:      PersistentVolumeClaim so the volume is re-formatted" >&2
+                echo "kafka-bootstrap:      with the current secret. This destroys the broker's" >&2
+                echo "kafka-bootstrap:      log: every event still on a topic, every ACL and every" >&2
+                echo "kafka-bootstrap:      subscriber's SCRAM credential on this node." >&2
+
+                # AND TAKE THE GENERATED CONFIGURATION WITH US, because it was written before
+                # this check ran and a file that survives a refusal is a file something can
+                # act on. Kubernetes will not start the main container after a failed init
+                # container, so nothing reads it today — but the main container's own guard is
+                # "refuse if server.properties is missing or empty", and clearing it here makes
+                # the two guards agree rather than relying on the pod lifecycle to keep them
+                # apart. It also means an operator who runs this script by hand to see what it
+                # says is not left holding a configuration the script declined to stand behind.
+                rm -f "${CONF_DIR}/server.properties" \
+                      "${CONF_DIR}/client-admin.properties" \
+                      "${CONF_DIR}/bootstrap-address"
+
                 exit 1
               fi
           env:

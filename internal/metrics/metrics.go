@@ -428,6 +428,17 @@ func nonNegativeAge(now, at time.Time) float64 {
 // to Kafka: the relay's backlog, counted as pending plus processing.
 var OutboxPendingBacklog metric.Int64Gauge
 
+// QueueBacklog is the number of tasks waiting in an asynq queue, attributed by queue name
+// and by the state the task is waiting in.
+//
+// It exists because a queue whose arrival rate exceeds its drain rate has no symptom until
+// something else breaks. The index queue reached 609,673 pending tasks under a sustained
+// load run while draining at 276/s against 550/s arriving, and nothing reported it: the
+// dashboard would have shown it to anyone who opened the dashboard, and no alert could fire
+// because no series existed. Publishing the depth is what makes the imbalance detectable
+// while it is still only an imbalance.
+var QueueBacklog metric.Int64Gauge
+
 // The three REPAIR instruments. Together they answer the only two questions worth
 // asking about a recovery in progress: how much is owed, and how fast it is being paid.
 
@@ -827,6 +838,14 @@ func Init() error {
 	OutboxPendingBacklog, err = meter.Int64Gauge("blnk.outbox.pending",
 		metric.WithDescription("Number of event outbox rows not yet published to Kafka"),
 		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	QueueBacklog, err = meter.Int64Gauge("blnk.queue.backlog",
+		metric.WithDescription("Tasks waiting in an asynq queue, by queue and wait state"),
+		metric.WithUnit("{task}"),
 	)
 	if err != nil {
 		return err

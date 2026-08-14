@@ -39,6 +39,16 @@ type Blnk struct {
 type blnkInstance struct {
 	blnk *blnk.Blnk            // Blnk object initialized from configuration
 	cnf  *config.Configuration // Configuration object holding runtime settings
+
+	// searchIndex caches the TypeSense client and its one-time collection-schema
+	// assurance for the lifetime of the worker process. Its zero value is ready to use,
+	// so every existing construction of this struct stays correct without change.
+	//
+	// It lives on the instance rather than in a package-level variable so that a test can
+	// exercise a handler against its own isolated indexer, and so two instances in one
+	// process cannot share cached state. It holds a mutex, which is why this struct is
+	// only ever used through a pointer.
+	searchIndex searchIndexer
 }
 
 // recoverPanic handles any panics during program execution and logs the error using Logrus.

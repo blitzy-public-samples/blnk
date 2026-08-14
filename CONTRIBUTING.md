@@ -14,12 +14,24 @@ By participating in this project, you agree to follow the [Code of Conduct](./CO
 
 ## Development Prerequisites
 
-- Go `1.25.12` or newer. `go.mod` declares the language version as `1.25.0` — the
+- Go `1.25.13` or newer. `go.mod` declares the language version as `1.25.0` — the
   minimum this module needs, so the floor is not raised for downstream builders — but
   build with the newest 1.25 patch, which is what CI and the release image use: earlier
-  1.25 patches carry fixed `net/url`, `crypto/x509`/`crypto/tls` and `cmd/go`/cgo
-  vulnerabilities that Blnk is exposed to through URL parsing, its TLS transports and
-  its own build.
+  1.25 patches carry fixed `net/url`, `net/http`, `crypto/tls`, `html/template`,
+  `encoding/xml` and `encoding/asn1` vulnerabilities that Blnk is exposed to through URL
+  parsing, its HTTP server and clients, and its TLS transports. `1.25.12` in particular
+  is reachably affected by seven of them, so a binary built with it is vulnerable even
+  though the source is identical.
+
+  The `Vulnerability scan` job in `.github/workflows/go.yml` is what enforces this. It
+  runs `govulncheck ./...`, which is a reachability analysis rather than an inventory: it
+  fails only when this module's own code can actually reach a vulnerable symbol. Run it
+  locally before opening a pull request that touches `go.mod` or adds a dependency:
+
+  ```bash
+  go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+  govulncheck ./...
+  ```
 - Docker and Docker Compose
 - PostgreSQL and Redis (you can run both via Docker Compose)
 

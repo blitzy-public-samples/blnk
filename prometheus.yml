@@ -77,72 +77,79 @@ global:
 rule_files:
   - '/etc/prometheus/alerts/*.yml'
 
-# AUTHENTICATION — READ THIS BEFORE RUNNING THE MONITORING PROFILE.
+# AUTHENTICATION — ENABLED UNCONDITIONALLY, AND THAT TOOK A COMPOSE CHANGE TO
+# MAKE SAFE.
 #
-# Blnk's /metrics endpoint is guarded by MetricsAuthHandler, whose behaviour
-# depends on two settings and has three distinct outcomes:
+# Blnk's /metrics endpoint is guarded by MetricsAuth, whose behaviour depends on
+# two settings and has three distinct outcomes:
 #
 #   1. server.secure false, no metrics_bearer_token  -> every scrape succeeds
-#      unauthenticated. This is the default local stack, and the jobs below work
-#      as written.
+#      unauthenticated. MetricsAuth calls c.Next() WITHOUT READING the
+#      Authorization header at all when no token is configured, so the bearer the
+#      jobs below present is simply ignored.
 #   2. metrics_bearer_token SET                      -> every request without
-#      `Authorization: Bearer <token>` is refused. The jobs below then collect
-#      NOTHING, every series the alert rules match on is absent, and all
-#      fifteen Kafka alerts sit permanently unable to fire. Prometheus shows
-#      the target as down; the rules report no error. An alert that cannot fire
-#      looks exactly like a system with nothing wrong.
+#      `Authorization: Bearer <token>` is refused. This is the case that used to
+#      break: the jobs collected NOTHING, every series the fifteen Kafka alert
+#      rules match on was absent, and the rules reported no error while being
+#      unable to fire. Prometheus showed the targets down. An alert that cannot
+#      fire looks exactly like a system with nothing wrong, which made this the
+#      worst kind of gap — the monitoring stack came up green and measured
+#      nothing.
 #   3. server.secure true with NO metrics_bearer_token -> the endpoint refuses
-#      every request outright, including authenticated ones.
+#      every request outright, including authenticated ones. Set a token.
 #
-# So if you have configured a token — which the production Kubernetes manifests
-# assume, and which any secure deployment requires — you MUST enable the two
-# authorization blocks below, and that takes a change in docker-compose.yaml as
-# well as here.
+# Cases 1 and 2 are BOTH served by the configuration as written, which is what
+# lets it be unconditional. The authorization blocks below were previously
+# commented out for a real reason — credentials_file is validated at CONFIG LOAD,
+# so Prometheus REFUSES TO START when the file is absent, and enabling them
+# against a host path would have broken every token-less local stack to fix a
+# case that does not apply to it. The old remedy was a comment telling the
+# operator to create the file by hand, and an instruction nobody executes is not
+# a control.
 #
-# Why this is commented out rather than simply enabled, unlike the Kubernetes
-# copy in infrastructure/k8s-manifests/prometheus-configmap.yaml where it is
-# unconditional: case 1 above is a legitimate and common way to run locally, and
-# credentials_file is validated at CONFIG LOAD. Prometheus refuses to start when
-# the file is absent, so enabling it unconditionally here would break every
-# local stack that does not use a token, to fix a case that does not apply to
-# them. Production has no such ambiguity — it always has a token — which is why
-# the Kubernetes side is enabled outright.
+# WHAT CHANGED: the file is now always present. The `prometheus-init` one-shot in
+# both compose files writes it into the `prometheus_secrets` volume before
+# Prometheus starts, on every bring-up, from the same BLNK_METRICS_BEARER_TOKEN
+# the server and worker read — so the scrape credential cannot drift from the one
+# that gates the endpoint. With no token configured the file is EMPTY, which
+# Prometheus accepts, and case 1 above is why an empty bearer is harmless.
+# Prometheus gates on that one-shot COMPLETING, so the ordering is enforced
+# rather than hoped for.
 #
-# TO ENABLE (two steps, both required):
-#
-#   1. Write the token to a file that is NOT committed, and mount it. The
-#      prometheus service in docker-compose.yaml already mounts ./alerts, so the
-#      rule_files glob above is armed; the token file is the one mount to add:
-#        volumes:
-#          - ./prometheus.yml:/etc/prometheus/prometheus.yml
-#          - ./alerts:/etc/prometheus/alerts:ro
-#          - ./.secrets/metrics-bearer-token:/etc/prometheus/secrets/metrics-bearer-token:ro
-#      Create the file with the same value as server.metrics_bearer_token in
-#      blnk.json (one token guards both the server and the worker):
-#        mkdir -p .secrets && printf '%s' "$BLNK_METRICS_BEARER_TOKEN" > .secrets/metrics-bearer-token
-#      Keep .secrets/ out of version control.
-#
-#   2. Uncomment the two authorization blocks below.
+# This is now the same posture as the Kubernetes copy in
+# infrastructure/k8s-manifests/prometheus-configmap.yaml, where it always was
+# unconditional — one fewer difference between the two environments, and
+# TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot normalises
+# scrape authentication away before comparing them, so neither side constrains
+# the other here.
 #
 # Use credentials_file and NOT inline `credentials`. Inline would put the token
 # into this committed file, which is how tokens end up in version control
 # history; and credentials_file is re-read on every scrape, so rotating the
 # token needs no restart.
 #
-# Verify afterwards at http://localhost:9090: /targets must show both jobs UP,
-# and /rules must list DeadLetterMessageStuck and SubscriberConsumerLagHigh.
-# Checking /targets alone is not enough — a target can be UP while the rules
-# never loaded.
+# Verify at http://localhost:9090: /targets must show both jobs UP, and /rules
+# must list DeadLetterMessageStuck and SubscriberConsumerLagHigh. Checking
+# /targets alone is not enough — a target can be UP while the rules never loaded.
+#
+# NOTE FOR HOST-SIDE TOOLING: `promtool check config prometheus.yml` run on the
+# HOST fails on the credentials_file path, which exists only inside the
+# container. That is not a defect in this file. The alert gate — `make alerts`
+# and the CI job — runs `check rules` and `test rules` against alerts/, never
+# `check config` against this file, so nothing in the build depends on the path
+# resolving outside the container. To check this file, check it where it runs:
+#   docker compose --profile monitoring exec prometheus \
+#     promtool check config /etc/prometheus/prometheus.yml
 scrape_configs:
   - job_name: 'blnk-server'
-    # authorization:
-    #   type: Bearer
-    #   credentials_file: /etc/prometheus/secrets/metrics-bearer-token
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics-bearer-token
     static_configs:
       - targets: ['server:5001']
   - job_name: 'blnk-worker'
-    # authorization:
-    #   type: Bearer
-    #   credentials_file: /etc/prometheus/secrets/metrics-bearer-token
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics-bearer-token
     static_configs:
       - targets: ['worker:5004']

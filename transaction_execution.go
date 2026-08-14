@@ -243,10 +243,37 @@ func (l *Blnk) validateTxn(ctx context.Context, transaction *model.Transaction) 
 	}
 
 	// If the transaction reference already exists, return an error
+	//
+	// A REUSED REFERENCE IS A VERDICT, NOT AN INCIDENT.
+	//
+	// This check used to raise notification.NotifyError, and that made it the dominant
+	// source of a storm measured under load: 1,366 pending system.error events and 1,763
+	// error lines. NotifyError writes one operator-facing ERROR line per occurrence AND
+	// publishes a system.error event — which, since events became outbox-backed, means an
+	// extra row in blnk.event_outbox for the relay to publish. So the ledger charged itself
+	// an incident record and a unit of event-pipeline load every time it successfully
+	// refused a duplicate.
+	//
+	// Every route into this branch is a case the system HANDLES correctly:
+	//
+	//   - A coalesced follower. A leader committed the follower's transaction as part of a
+	//     batch; the follower's own task then arrives and its reference is already present.
+	//     One batch of 2,000 children can produce 2,000 arrivals here.
+	//   - An asynq redelivery, after a worker restart, a lost acknowledgement or an expired
+	//     lease. At-least-once delivery guarantees this happens.
+	//   - A client resubmitting the same reference. That is what references are FOR: the API
+	//     answers 409 with TXN_DUPLICATE_REFERENCE, which is the idempotency guarantee
+	//     working as designed, not a fault in this service.
+	//
+	// The error is still returned, and every caller still acts on it — the API maps it to
+	// 409 and the worker acknowledges the task — so nothing is being swallowed. The span
+	// still records it, so a single request remains traceable. What no longer happens is
+	// paging an operator, and telling every event subscriber, about a duplicate that was
+	// correctly rejected.
 	if txn {
 		err := fmt.Errorf("reference %s has already been used", transaction.Reference)
 		span.RecordError(err)
-		notification.NotifyError(err)
+
 		return err
 	}
 
@@ -691,7 +718,10 @@ func (l *Blnk) validateAndPrepareTransaction(ctx context.Context, transaction *m
 	// Validate the transaction
 	if err := l.validateTxn(ctx, transaction); err != nil {
 		span.RecordError(err)
-		return nil, nil, nil, l.logAndRecordError(span, "transaction validation failed", err)
+
+		// A reused reference arrives here on every coalesced follower and every redelivery,
+		// so it is logged as the outcome it is rather than as a fault. See logAndRecordOutcome.
+		return nil, nil, nil, l.logAndRecordOutcome(span, "transaction validation failed", err)
 	}
 
 	// Retrieve the source and destination balances
@@ -877,4 +907,29 @@ func (l *Blnk) logAndRecordError(span trace.Span, msg string, err error) error {
 	span.RecordError(err)
 	logrus.WithError(err).Error(msg)
 	return fmt.Errorf("%s: %w", msg, err)
+}
+
+// logAndRecordOutcome is logAndRecordError, except that an outcome the ledger is SUPPOSED to
+// produce is recorded at info level instead of error level.
+//
+// The returned error and the span record are byte-for-byte what logAndRecordError produces,
+// which matters: the wrapped message is what api/errors.go classifies to decide the HTTP
+// status, so a caller's behaviour cannot change here — only the severity of the line written
+// about it.
+//
+// A reused reference is the case this exists for. Refusing a duplicate is the reference
+// mechanism working, and it happens once per coalesced follower and once per at-least-once
+// redelivery, so under load the ledger logged hundreds of ERROR lines describing itself
+// operating correctly. A log level that says "error" for a routine outcome is not a small
+// cosmetic problem: it is what makes a real error in the same stream impossible to find, and
+// error-line volume was part of what the load run reported.
+func (l *Blnk) logAndRecordOutcome(span trace.Span, msg string, err error) error {
+	if IsDuplicateReferenceError(err) {
+		span.RecordError(err)
+		logrus.WithError(err).Info(msg)
+
+		return fmt.Errorf("%s: %w", msg, err)
+	}
+
+	return l.logAndRecordError(span, msg, err)
 }
