@@ -20,11 +20,6 @@ import "net/http"
 
 // Domain-prefixed error codes. These are the canonical, client-facing codes
 // returned in the `error_detail.code` field of every error response.
-// Each code maps to exactly one default HTTP status (see statusByCode).
-//
-// The six legacy codes in apierror.go (NOT_FOUND, CONFLICT, ...) remain valid
-// for internal construction — they are normalized to their GEN_* equivalents
-// at the response boundary via Normalize.
 const (
 	// GEN — generic / cross-cutting
 	ErrGenMalformedRequest ErrorCode = "GEN_MALFORMED_REQUEST"
@@ -33,6 +28,7 @@ const (
 	ErrGenBadRequest       ErrorCode = "GEN_BAD_REQUEST"
 	ErrGenNotFound         ErrorCode = "GEN_NOT_FOUND"
 	ErrGenConflict         ErrorCode = "GEN_CONFLICT"
+	ErrGenGone             ErrorCode = "GEN_GONE" // a deprecated surface past its configured sunset
 	ErrGenResourceLocked   ErrorCode = "GEN_RESOURCE_LOCKED"
 	ErrGenPayloadTooLarge  ErrorCode = "GEN_PAYLOAD_TOO_LARGE"
 	ErrGenRateLimited      ErrorCode = "GEN_RATE_LIMITED"
@@ -128,6 +124,78 @@ const (
 
 	// ADMIN — administrative operations
 	ErrAdminBackupFailed ErrorCode = "ADMIN_BACKUP_FAILED"
+
+	// EVENT — event streaming, outbox & dead-letter. ErrKafkaUnavailable intentionally
+	// carries the EVENT_ prefix: keeping it in this family means the catalog gains exactly
+	// two new families rather than a third one holding a single code. It resolves to 503
+	// and not to the 500 used by the other *_FAILED codes because an unreachable broker is
+	// a retryable upstream condition, not a defect in this service — do not "correct" it.
+	ErrEventNotFound        ErrorCode = "EVENT_NOT_FOUND"
+	ErrEventNotDeadLettered ErrorCode = "EVENT_NOT_DEAD_LETTERED"
+	ErrEventReplayFailed    ErrorCode = "EVENT_REPLAY_FAILED"
+	ErrKafkaUnavailable     ErrorCode = "EVENT_KAFKA_UNAVAILABLE"
+
+	// THERE IS NO SEPARATE TIMEOUT CODE IN THIS FAMILY, and the absence is the contract
+	// rather than an oversight. A replay abandoned before the broker acknowledged it — the
+	// caller went away, or the request's deadline expired — is answered with
+	// EVENT_REPLAY_FAILED, and the accompanying message is what says the event is still
+	// dead-lettered and the request may simply be repeated. An EVENT_REPLAY_TIMEOUT value
+	// mapped to 504 was added here once and withdrawn: this family's public surface is the
+	// approved set of codes above, and widening it is a public API change that belongs to
+	// a separately approved plan, not to the implementation of one.
+	ErrEventKeyUnresolvable ErrorCode = "EVENT_KEY_UNRESOLVABLE"
+
+	// SUBSCRIBER — Kafka subscriber registry & credentials.
+	ErrSubscriberNotFound           ErrorCode = "SUBSCRIBER_NOT_FOUND"
+	ErrSubscriberProvisioningFailed ErrorCode = "SUBSCRIBER_PROVISIONING_FAILED"
+
+	// ErrSubscriberKeyScopeUnenforced is the refusal to issue a credential to a subscriber
+	// whose recorded partition_key_prefix nothing would enforce.
+	ErrSubscriberKeyScopeUnenforced ErrorCode = "SUBSCRIBER_KEY_SCOPE_UNENFORCED"
+
+	// ErrSubscriberKeyScopeRequired is the MIRROR of the code above: the refusal to issue
+	// a credential to a subscriber that records NO partition_key_prefix, in a deployment
+	// that has declared its subscriber access to be key-scoped.
+	ErrSubscriberKeyScopeRequired ErrorCode = "SUBSCRIBER_KEY_SCOPE_REQUIRED"
+
+	// ErrSubscriberSharedTopicAccessUnacknowledged is the refusal to mint a whole-topic
+	// credential in a production deployment that has declared nothing about its access
+	// model.
+	ErrSubscriberSharedTopicAccessUnacknowledged ErrorCode = "SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED"
+
+	// ErrSubscriberKeyScopeUnattested is the refusal to mint a key-scoped credential when
+	// the declared key-authorising component did not ATTEST the boundary it is supposed to
+	// keep.
+	ErrSubscriberKeyScopeUnattested ErrorCode = "SUBSCRIBER_KEY_SCOPE_UNATTESTED"
+
+	// ErrSubscriberAccessExceedsAuthorization is the refusal to issue a credential to a
+	// principal the broker would grant MORE access than the registry records.
+	ErrSubscriberAccessExceedsAuthorization ErrorCode = "SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION"
+
+	// ErrSubscriberBrokersNotConfigured is the refusal to issue a credential when NO Kafka
+	// broker list is configured at all.
+	ErrSubscriberBrokersNotConfigured ErrorCode = "SUBSCRIBER_BROKERS_NOT_CONFIGURED"
+
+	// ErrSubscriberDeprovisioning is the refusal to act on a subscriber whose broker-side
+	// access is being torn down.
+	ErrSubscriberDeprovisioning ErrorCode = "SUBSCRIBER_DEPROVISIONING"
+
+	// ErrSubscriberGrantEmpty is the refusal to mint a credential for a subscriber whose
+	// authorized-topic list is empty.
+	ErrSubscriberGrantEmpty ErrorCode = "SUBSCRIBER_GRANT_EMPTY"
+
+	// ErrSubscriberInsecureTransport is the refusal to return a one-time SASL password
+	// over a channel this deployment has not declared confidential.
+	ErrSubscriberInsecureTransport ErrorCode = "SUBSCRIBER_INSECURE_TRANSPORT"
+
+	// THERE IS NO SEPARATE TIMEOUT CODE IN THIS FAMILY EITHER, for the same reason there
+	// is none in the EVENT_ family. A credential issuance that runs out of the requirement
+	// five-second budget — or whose caller goes away — is answered with
+	// SUBSCRIBER_PROVISIONING_FAILED and its 503, which is the retryable answer this
+	// contract approves for the condition. Every layer of the issuance path reports that
+	// one code, so a client's retry policy does not depend on which dependency noticed the
+	// expiry first, and what the broker may be left holding is carried in the error
+	// DETAIL, which is the only place a status code could never carry it.
 )
 
 // statusByCode is the single source of truth for the default HTTP status of
@@ -139,6 +207,7 @@ var statusByCode = map[ErrorCode]int{
 	ErrGenBadRequest:       http.StatusBadRequest,
 	ErrGenNotFound:         http.StatusNotFound,
 	ErrGenConflict:         http.StatusConflict,
+	ErrGenGone:             http.StatusGone,
 	ErrGenResourceLocked:   http.StatusLocked,
 	ErrGenPayloadTooLarge:  http.StatusRequestEntityTooLarge,
 	ErrGenRateLimited:      http.StatusTooManyRequests,
@@ -223,6 +292,57 @@ var statusByCode = map[ErrorCode]int{
 
 	ErrAdminBackupFailed: http.StatusInternalServerError,
 
+	// EVENT — 503 for the broker being unreachable is deliberate (retryable
+	// upstream condition); every other *_FAILED code in this map is 500.
+	ErrEventNotFound:        http.StatusNotFound,
+	ErrEventNotDeadLettered: http.StatusConflict,
+	ErrEventReplayFailed:    http.StatusInternalServerError,
+	ErrKafkaUnavailable:     http.StatusServiceUnavailable,
+	// 500: an unkeyable event is a producer defect inside this service, not a caller error.
+	ErrEventKeyUnresolvable: http.StatusInternalServerError,
+
+	// SUBSCRIBER — 503 on provisioning failure is deliberate for the same reason.
+	ErrSubscriberNotFound:           http.StatusNotFound,
+	ErrSubscriberProvisioningFailed: http.StatusServiceUnavailable,
+	// Also 503: a dependency of issuance is unconfigured, not a malformed request.
+	ErrSubscriberBrokersNotConfigured: http.StatusServiceUnavailable,
+
+	// 409 for the three refusals below: the request is well formed and it is the
+	// registry row's state that has to change before it can be honoured.
+	ErrSubscriberDeprovisioning: http.StatusConflict,
+	ErrSubscriberGrantEmpty:     http.StatusConflict,
+	// Also 409: the remedy is a state change — declare a key-authorising component in
+	// front of the brokers (KAFKA_KEY_SCOPE_ENFORCEMENT), or drop the prefix — and not a
+	// retry. Kafka's authorizer has no message-key dimension, so no retry narrows what a
+	// credential would carry.
+	ErrSubscriberKeyScopeUnenforced: http.StatusConflict,
+	// Also 409, and the mirror of the entry above: the deployment declared a key-scoped access
+	// model and this row records no key scope, so the remedy is a state change — record the
+	// prefix, or acknowledge whole-topic access — and never a retry.
+	ErrSubscriberKeyScopeRequired: http.StatusConflict,
+	// Also 409: the deployment has declared nothing about its subscriber access model and
+	// this is a production posture, so the configuration is what changes. Not 403, which
+	// would say the CALLER is not permitted; the caller holds the master key and the
+	// deployment is what has not decided.
+	ErrSubscriberSharedTopicAccessUnacknowledged: http.StatusConflict,
+	// Also 409, and NOT 503 even when the attestation timed out: the declared enforcement
+	// point is part of the deployment's state, so a 503 would send an operator to a Kafka
+	// that never stopped answering. The detail's `retryable` flag separates a transport
+	// failure from a prefix mismatch.
+	ErrSubscriberKeyScopeUnattested: http.StatusConflict,
+	// Also 409, and NOT the 503 of SUBSCRIBER_PROVISIONING_FAILED: the broker answered and
+	// the boundary it would enforce is wider than the row records, which a retry cannot
+	// change. Without this entry the refusal would resolve to the unknown-code 500 — which
+	// is exactly what it did: the code was declared and returned from
+	// IssueSubscriberCredential while its row here was absent, so a deliberate 409
+	// judgement reached the caller as a server defect.
+	ErrSubscriberAccessExceedsAuthorization: http.StatusConflict,
+	// 403: the request is well formed and the caller is authorised; the server is refusing
+	// to put a one-time secret on a channel it cannot establish as confidential. Without
+	// this entry the refusal would resolve to the unknown-code 500 default and read as a
+	// defect in this service.
+	ErrSubscriberInsecureTransport: http.StatusForbidden,
+
 	// Legacy codes — same statuses MapErrorToHTTPStatus implied, with the
 	// BAD_REQUEST omission fixed (it previously fell through to 500).
 	ErrNotFound:       http.StatusNotFound,
@@ -246,7 +366,6 @@ var legacyToCanonical = map[ErrorCode]ErrorCode{
 }
 
 // Normalize converts a legacy error code to its canonical equivalent.
-// Canonical codes pass through unchanged.
 func Normalize(code ErrorCode) ErrorCode {
 	if canonical, ok := legacyToCanonical[code]; ok {
 		return canonical
@@ -255,7 +374,6 @@ func Normalize(code ErrorCode) ErrorCode {
 }
 
 // StatusForCode returns the default HTTP status for an error code.
-// Unknown codes default to 500.
 func StatusForCode(code ErrorCode) int {
 	if status, ok := statusByCode[code]; ok {
 		return status

@@ -17,25 +17,96 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/brianvoe/gofakeit/v6"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
-// realInfraConfig installs (via config.MockConfig) and returns a configuration
-// pointing at the local test services, following the same convention as the
-// api and root package suites: Postgres on :5432, Redis on :6379, and
-// Typesense on :8108 are hard test dependencies.
+// Default endpoints for the services this tier needs, used when the environment
+// names none. They are the same defaults the database and root suites carry, so a
+// developer running everything on the conventional local ports needs to export
+// nothing at all.
+const (
+	defaultCmdTestDSN     = "postgres://postgres:@localhost:5432/blnk?sslmode=disable"
+	defaultCmdTestRedis   = "localhost:6379"
+	defaultCmdTestBrokers = "localhost:9092"
+)
+
+// firstEnvValue returns the value of the first variable in names that is set to a
+// non-blank value, or fallback when none is.
+//
+// Blank is treated as unset deliberately.
+//
+// Parameters:
+//   - fallback string: the value to use when no name is set.
+//   - names ...string: the variables to consult, in precedence order.
+//
+// Returns:
+//   - string: the resolved value, never blank as long as fallback is not.
+func firstEnvValue(fallback string, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value
+		}
+	}
+	return fallback
+}
+
+// cmdTestDSN resolves the Postgres DSN this tier should use.
+//
+// The DSN is resolved from the environment rather than hardcoded, which would pin every
+// test in this tier to localhost:5432 no matter what the environment said.
+func cmdTestDSN() string {
+	return firstEnvValue(defaultCmdTestDSN, "TEST_DATABASE_URL", "BLNK_DATA_SOURCE_DNS")
+}
+
+// cmdTestRedisDSN resolves the Redis endpoint, following cmdTestDSN's precedence so
+// the whole tier relocates together. A stack moved to alternative ports is moved for
+// all of its services, and leaving one of them pinned would half-relocate the tier.
+func cmdTestRedisDSN() string {
+	return firstEnvValue(defaultCmdTestRedis, "TEST_REDIS_URL", "BLNK_REDIS_DNS")
+}
+
+// cmdTestKafkaBrokers resolves the broker list, honouring the deployment-mandated
+// KAFKA_BROKERS and the BLNK_-prefixed alias the configuration package resolves for it,
+// and splitting on commas exactly as the configuration loader does.
+func cmdTestKafkaBrokers() []string {
+	raw := firstEnvValue(defaultCmdTestBrokers, "KAFKA_BROKERS", "BLNK_KAFKA_BROKERS")
+	brokers := make([]string, 0, 1)
+	for _, candidate := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			brokers = append(brokers, trimmed)
+		}
+	}
+	if len(brokers) == 0 {
+		return []string{defaultCmdTestBrokers}
+	}
+	return brokers
+}
+
+// realInfraConfig installs (via config.MockConfig) and returns a configuration pointing
+// at the test services, following the same convention as the api and root package
+// suites: Postgres, Redis and Typesense are hard test dependencies. Their endpoints
+// come from the environment through the helpers above, defaulting to the conventional
+// local ports.
 func realInfraConfig(t *testing.T) *config.Configuration {
 	t.Helper()
 	cfg := &config.Configuration{
-		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
-		Redis:      config.RedisConfig{Dns: "localhost:6379"},
+		DataSource: config.DataSourceConfig{Dns: cmdTestDSN()},
+		Redis:      config.RedisConfig{Dns: cmdTestRedisDSN()},
 		Queue: config.QueueConfig{
 			TransactionQueue:    "transaction_queue_cmd_test",
 			NumberOfQueues:      1,
@@ -58,6 +129,137 @@ func realInfraConfig(t *testing.T) *config.Configuration {
 	fetched, err := config.Fetch()
 	require.NoError(t, err)
 	return fetched
+}
+
+// skipUnlessEventOutboxSchemaMatches skips the test unless the database behind ds
+// accepts the exact INSERT the event-capture path issues.
+//
+// The failure this guards against ran in BOTH directions. A database migrated to an
+//  42703. A query that checks for the presence of an enumerated column list detects the
+//     first and is blind to the second, and it also has to spell the column list a
+//     second time, which is how the list and the statement drift apart.
+//
+// Parameters:
+//   - t *testing.T: the test to skip.
+//   - ds database.IDataSource: the datasource whose insert path is probed.
+//   - dsn string: the DSN that was asked for, reported alongside what was reached.
+func skipUnlessEventOutboxSchemaMatches(t *testing.T, ds database.IDataSource, dsn string) {
+	t.Helper()
+
+	// Only the concrete datasource exposes a pool to open a transaction on. A wrapped or
+	// fake implementation is left to the assertions themselves — the probe is a
+	// diagnostic, not a requirement.
+	source, exposesPool := ds.(*database.Datasource)
+	if !exposesPool || source.Conn == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Reported, not asserted on.
+	//
+	// The port is the one the SERVER sees itself listening on, which is NOT the port in
+	// the DSN when the server sits behind a port mapping — a container published on 5452
+	// reports 5432.
+	var reachedDatabase, reachedAddress string
+	var reachedPort int
+	if err := source.Conn.QueryRowContext(ctx,
+		"SELECT current_database(), COALESCE(host(inet_server_addr()), 'local socket'), "+
+			"COALESCE(inet_server_port(), 0)",
+	).Scan(&reachedDatabase, &reachedAddress, &reachedPort); err != nil {
+		t.Skipf("cmd test suite: %s is not answering queries (%v). Start PostgreSQL and "+
+			"apply the migrations with `blnk migrate up`", dsn, err)
+	}
+
+	tx, err := source.Conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Skipf("cmd test suite: %s would not begin a transaction (%v)", dsn, err)
+	}
+	// Always rolled back — including on the success path, which is the point: the probe
+	// proves the statement is ACCEPTED without persisting a row.
+	defer func() { _ = tx.Rollback() }()
+
+	// event_id must be a CANONICAL UUID — the insert path validates it before binding
+	// anything — so it is minted as one rather than with the suffixed-id helper the rest
+	// of this file uses for ledger objects. A suffixed id fails validation and would make
+	// this probe skip every test in the tier on a perfectly good database, which is the
+	// worst possible failure mode for a guard: a skip looks like success.
+	probe := &model.EventOutbox{
+		EventID:     uuid.NewString(),
+		EventType:   "transaction.rejected",
+		AggregateID: model.GenerateUUIDWithSuffix("txnprobe"),
+		Topic:       "blnk.transactions",
+		Payload:     json.RawMessage(`{"event":"transaction.rejected","data":{}}`),
+		OccurredAt:  time.Now(),
+	}
+	// PartitionKey is set explicitly rather than left to a default: a persisted row never
+	// carries a blank key, so a probe with one would be testing a shape the product does
+	// not produce.
+	probe.PartitionKey = probe.AggregateID
+
+	if err := ds.InsertEventOutboxInTx(ctx, tx, probe); err != nil {
+		t.Skipf("cmd test suite: blnk.event_outbox does not accept the row the event-capture "+
+			"path writes (%v). %s The connection is on database %q, server-side %s:%d; this suite "+
+			"asked for %q — and note that database.GetDBConnection is a process-wide sync.Once "+
+			"singleton, so the FIRST DSN used in this test binary is the one in force. Apply "+
+			"THAT database's migrations with `blnk migrate up`, or point TEST_DATABASE_URL at a "+
+			"database migrated by this revision: a column this revision does not bind, or one it "+
+			"binds and the database does not have, produces this and would otherwise be reported "+
+			"as a product failure",
+			err, describeEventOutboxColumns(ctx, source.Conn), reachedDatabase, reachedAddress,
+			reachedPort, dsn)
+	}
+}
+
+// describeEventOutboxColumns summarises blnk.event_outbox's columns for the skip
+// message above.
+//
+// The NOT NULL columns that have no default are listed first because they are the
+// actionable subset: the insert names a fixed column list, so any column outside that
+// list which the table insists on and supplies no default for is precisely the drift
+// that refuses the row. The full name list follows, which answers the opposite
+// direction — a column the insert binds that the table does not have.
+//
+// Parameters:
+//   - ctx context.Context: carries the caller's timeout.
+//   - pool *sql.DB: the connection pool to query.
+//
+// Returns:
+//   - string: one sentence, always non-empty, safe to embed in a message.
+func describeEventOutboxColumns(ctx context.Context, pool *sql.DB) string {
+	rows, err := pool.QueryContext(ctx,
+		"SELECT column_name, is_nullable, column_default IS NOT NULL "+
+			"FROM information_schema.columns "+
+			"WHERE table_schema = 'blnk' AND table_name = 'event_outbox' "+
+			"ORDER BY ordinal_position")
+	if err != nil {
+		return fmt.Sprintf("(the column inventory could not be read: %v.)", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var all, mandatory []string
+	for rows.Next() {
+		var name, nullable string
+		var hasDefault bool
+		if err := rows.Scan(&name, &nullable, &hasDefault); err != nil {
+			return fmt.Sprintf("(the column inventory could not be read: %v.)", err)
+		}
+		all = append(all, name)
+		if nullable == "NO" && !hasDefault {
+			mandatory = append(mandatory, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Sprintf("(the column inventory could not be read: %v.)", err)
+	}
+	if len(all) == 0 {
+		return "The table does not exist at all, so no migration of this feature has been applied."
+	}
+
+	return fmt.Sprintf("The table has %d columns; those that are NOT NULL with no default — "+
+		"the ones a row must supply — are %v; all of them, in order, are %v.",
+		len(all), mandatory, all)
 }
 
 // newCmdTestInstance builds a blnkInstance backed by the real local Postgres

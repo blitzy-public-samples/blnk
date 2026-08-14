@@ -46,7 +46,6 @@ func contains(slice []string, val string) bool {
 }
 
 // parseBigInt parses a string into a *big.Int, returning an error if parsing fails.
-// This ensures we don't silently get nil values when database returns malformed data.
 func parseBigInt(s string) (*big.Int, error) {
 	n, ok := new(big.Int).SetString(s, 10)
 	if !ok {
@@ -56,7 +55,6 @@ func parseBigInt(s string) (*big.Int, error) {
 }
 
 // Prepares a dynamic SQL query based on the fields to be included.
-// This query fetches balance details, including optional joins for identity and ledger.
 func prepareQueries(queryBuilder strings.Builder, include []string) string {
 	var selectFields []string
 
@@ -106,7 +104,6 @@ func prepareQueries(queryBuilder strings.Builder, include []string) string {
 }
 
 // Scans a SQL row result and maps it into a Balance object, including optional identity and ledger data.
-// Converts string representations of big.Int fields into actual big.Int objects.
 func scanRow(row *sql.Row, include []string) (*model.Balance, error) {
 	balance := &model.Balance{}
 	identity := &model.Identity{}
@@ -192,15 +189,58 @@ func scanRow(row *sql.Row, include []string) (*model.Balance, error) {
 }
 
 // CreateBalance inserts a new balance record into the `blnk.balances` table in the database.
-// It handles the generation of a unique balance ID, default values for fields, and any necessary error handling.
 //
 // Parameters:
-// - balance: A model.Balance object containing the balance information to be created.
+//   - balance: A model.Balance object containing the balance information to be created.
+//   - prepareEvent: Optional. Builds the balance.created outbox row from the created balance,
+//     inside the transaction that created it. See EventPreparer for the contract.
 //
 // Returns:
-// - model.Balance: The created balance with its ID and timestamp populated.
-// - error: Returns an APIError in case of failures such as database conflicts or other issues.
-func (d Datasource) CreateBalance(balance model.Balance) (model.Balance, error) {
+//   - model.Balance: The created balance with its ID and timestamp populated, or the zero
+//     value on the idempotent indicator-conflict path.
+//   - error: Returns an APIError in case of failures such as database conflicts or other
+//     issues, or when the event could not be prepared or captured — in which case the
+//     balance is NOT created.
+func (d Datasource) CreateBalance(balance model.Balance, prepareEvent ...EventPreparer[model.Balance]) (model.Balance, error) {
+	ctx := context.Background()
+
+	prepare := firstEventPreparer(prepareEvent)
+	if prepare == nil {
+		return d.insertBalance(ctx, d.Conn, balance)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		return model.Balance{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	created, err := d.insertBalance(ctx, tx, balance)
+	if err != nil {
+		return model.Balance{}, err
+	}
+
+	// The idempotent indicator-conflict path: nothing was created, so there is nothing to
+	// commit and no creation to announce. The deferred rollback discards the aborted
+	// statement and the caller sees the same empty balance and nil error as always.
+	if created.BalanceID == "" {
+		return created, nil
+	}
+
+	if err := captureEntityEvent(ctx, d, tx, created, prepare); err != nil {
+		return model.Balance{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return model.Balance{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	return created, nil
+}
+
+// insertBalance performs the balance INSERT against either the connection or an open
+// transaction, and is the single statement both CreateBalance paths run.
+func (d Datasource) insertBalance(ctx context.Context, execer sqlExecer, balance model.Balance) (model.Balance, error) {
 	// Marshal metadata into JSON
 	metaDataJSON, err := json.Marshal(balance.MetaData)
 	if err != nil {
@@ -249,7 +289,7 @@ func (d Datasource) CreateBalance(balance model.Balance) (model.Balance, error) 
 	}
 
 	// Insert the balance into the database
-	_, err = d.Conn.ExecContext(context.Background(), `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO blnk.balances (balance_id, balance, credit_balance, debit_balance, currency, ledger_id, identity_id, indicator, created_at, meta_data, track_fund_lineage, allocation_strategy)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`, balance.BalanceID, balance.Balance.String(), balance.CreditBalance.String(), balance.DebitBalance.String(), balance.Currency, balance.LedgerID, identityID, indicator, balance.CreatedAt, &metaDataJSON, balance.TrackFundLineage, allocationStrategy)
@@ -278,7 +318,6 @@ func (d Datasource) CreateBalance(balance model.Balance) (model.Balance, error) 
 }
 
 // GetBalanceByID retrieves a balance by its ID from the database, along with optional related data such as identity or ledger, based on the `include` parameter.
-// The method starts a transaction, executes the query, and processes the result.
 //
 // Parameters:
 // - id: The unique ID of the balance to retrieve.
@@ -325,7 +364,6 @@ func (d Datasource) GetBalanceByID(id string, include []string, withQueued bool)
 }
 
 // GetBalanceByIDLite retrieves a balance by its unique ID with a lighter set of fields.
-// This version avoids loading additional related data like identity and ledger.
 //
 // Parameters:
 // - id: The ID of the balance to retrieve.
@@ -420,8 +458,6 @@ func (d Datasource) GetBalanceByIDLite(id string) (*model.Balance, error) {
 }
 
 // GetBalancesByIDsLite retrieves multiple balances by their IDs in a single query.
-// Returns a map of balance_id to Balance for easy lookup.
-// Balances that are not found are simply not included in the result map.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -523,8 +559,6 @@ func (d Datasource) GetBalancesByIDsLite(ctx context.Context, ids []string) (map
 }
 
 // GetBalanceByIndicator retrieves a balance from the database using the specified indicator and currency.
-// The function scans the query result into a Balance object and converts various fields from int64 to big.Int.
-// It returns the balance if found, or an error if the balance does not exist.
 //
 // Parameters:
 // - indicator: A unique identifier associated with the balance (e.g., an account identifier).
@@ -620,8 +654,6 @@ func (d Datasource) GetBalanceByIndicator(indicator, currency string) (*model.Ba
 }
 
 // GetAllBalances retrieves a limited set of balances from the database, up to 20 records.
-// It processes each balance by scanning the query result, converting numerical fields to big.Int, and parsing metadata from JSON format.
-// The function returns a slice of Balance objects or an error if any issues occur during the database query or data processing.
 //
 // Parameters:
 // - limit: The maximum number of balances to return (e.g., 20).
@@ -718,9 +750,6 @@ func (d Datasource) GetAllBalances(limit, offset int) ([]model.Balance, error) {
 }
 
 // GetSourceDestination retrieves balances for both the source and destination by their IDs.
-// It queries the database using a stored procedure `blnk.get_balances_by_id`, which takes the sourceId and destinationId as inputs.
-// The function processes each balance, converting balance fields to big.Int and parsing the metadata from JSON format.
-// It returns a slice of pointers to Balance objects or an error if any issues occur during the query or data processing.
 //
 // Parameters:
 // - sourceId: The ID of the source balance to retrieve.
@@ -808,8 +837,6 @@ func (d Datasource) GetSourceDestination(sourceId, destinationId string) ([]*mod
 }
 
 // UpdateBalances updates both the source and destination balances in a single transaction.
-// The function begins a database transaction, updates the balances, and commits the transaction if all updates succeed.
-// In case of any failure, the transaction is rolled back to ensure data integrity.
 //
 // Parameters:
 // - ctx: The context to manage the lifecycle of the transaction.
@@ -854,16 +881,6 @@ func (d Datasource) UpdateBalances(ctx context.Context, sourceBalance, destinati
 }
 
 // updateBalance updates a balance entry in the database.
-// This function handles the logic of updating all balance-related fields while ensuring data consistency using optimistic locking.
-// The version field is incremented after a successful update to maintain control over concurrent modifications.
-//
-// Parameters:
-// - ctx: The context for managing the operation's lifecycle and cancellation.
-// - tx: The database transaction in which the update is performed.
-// - balance: A pointer to the balance object containing the updated balance information.
-//
-// Returns:
-// - error: Returns an error if the update operation fails at any point, including issues with metadata marshalling, query execution, or optimistic locking.
 func updateBalance(ctx context.Context, tx *sql.Tx, balance *model.Balance) error {
 	// SQL query to update the balance
 	query := `
@@ -1054,8 +1071,6 @@ func updateBalanceChunk(ctx context.Context, tx *sql.Tx, balances []*model.Balan
 }
 
 // UpdateBalance updates an existing balance entry in the database.
-// This method takes a balance object and updates the corresponding fields in the database, based on the provided balance ID.
-// It handles both the balance data and the associated metadata.
 //
 // Parameters:
 // - balance: A pointer to the balance object containing the updated balance information. This includes fields such as `balance`, `credit_balance`, `debit_balance`, `currency`, and `meta_data`.
@@ -1096,12 +1111,9 @@ func (d Datasource) UpdateBalance(balance *model.Balance) error {
 }
 
 // CreateMonitor creates a new BalanceMonitor record in the database.
-// This function generates a unique MonitorID for the monitor, sets the creation timestamp,
-// and inserts the monitor's data into the `blnk.balance_monitors` table.
 //
 // Parameters:
 //   - monitor: A model.BalanceMonitor object containing details of the monitor to be created.
-//     It includes fields like balance ID, field to monitor, operator, value, precision, precise_value, description, callback URL, etc.
 //
 // Returns:
 // - model.BalanceMonitor: The newly created BalanceMonitor object with updated MonitorID and CreatedAt timestamp.
@@ -1146,7 +1158,6 @@ func (d Datasource) CreateMonitor(monitor model.BalanceMonitor) (model.BalanceMo
 }
 
 // GetMonitorByID retrieves a BalanceMonitor by its unique MonitorID from the database.
-// It queries the `blnk.balance_monitors` table and maps the result into a model.BalanceMonitor object.
 //
 // Parameters:
 // - id: The MonitorID of the monitor to retrieve.
@@ -1188,7 +1199,6 @@ func (d Datasource) GetMonitorByID(id string) (*model.BalanceMonitor, error) {
 }
 
 // GetAllMonitors retrieves all balance monitors from the database.
-// It queries the `blnk.balance_monitors` table and returns a list of all monitors.
 //
 // Returns:
 // - []model.BalanceMonitor: A slice of BalanceMonitor objects if the query is successful.
@@ -1238,7 +1248,6 @@ func (d Datasource) GetAllMonitors() ([]model.BalanceMonitor, error) {
 }
 
 // GetBalanceMonitors retrieves all balance monitors associated with a specific balance ID from the database.
-// It queries the `blnk.balance_monitors` table to find all monitors linked to the provided `balanceID`.
 //
 // Parameters:
 // - balanceID: The ID of the balance for which monitors are being retrieved.
@@ -1293,8 +1302,6 @@ func (d Datasource) GetBalanceMonitors(balanceID string) ([]model.BalanceMonitor
 }
 
 // UpdateMonitor updates an existing balance monitor in the database.
-// It updates fields such as `balance_id`, `field`, `operator`, `value`, `description`, and `call_back_url`
-// for the monitor identified by `monitor_id`.
 //
 // Parameters:
 // - monitor: A pointer to the `BalanceMonitor` object containing the updated values.
@@ -1330,7 +1337,6 @@ func (d Datasource) UpdateMonitor(monitor *model.BalanceMonitor) error {
 }
 
 // DeleteMonitor deletes a balance monitor from the database by its monitor ID.
-// It removes the monitor from the `blnk.balance_monitors` table.
 //
 // Parameters:
 // - id: The ID of the monitor to be deleted.
@@ -1364,8 +1370,6 @@ func (d Datasource) DeleteMonitor(id string) error {
 }
 
 // TakeBalanceSnapshots creates daily snapshots of balances in batches.
-// It uses the PostgreSQL function to process balances in chunks to avoid memory issues
-// with large datasets.
 //
 // Parameters:
 // - ctx: Context for the operation, allowing for timeouts and cancellation
@@ -1571,9 +1575,6 @@ func (d Datasource) calculateBalanceFromTransactions(ctx context.Context, tx *sq
 }
 
 // GetBalanceAtTime retrieves the balance state at a specific point in time.
-// It finds the most recent snapshot before the target time and applies any subsequent
-// transactions to calculate the exact balance state. If fromSource is true, it skips
-// using snapshots and calculates directly from all transactions.
 //
 // Parameters:
 // - ctx: Context for the database operations
@@ -1705,7 +1706,6 @@ func (d Datasource) UpdateBalanceIdentity(balanceID string, identityID string) e
 }
 
 // GetAllBalancesWithFilter retrieves balances with advanced filtering support.
-// It delegates to GetAllBalancesWithFilterAndOptions with nil options.
 //
 // Parameters:
 // - ctx: Context for the database operation.
@@ -1722,7 +1722,6 @@ func (d Datasource) GetAllBalancesWithFilter(ctx context.Context, filters *filte
 }
 
 // GetAllBalancesWithFilterAndOptions retrieves balances with filtering, sorting, and optional count.
-// It uses the filter package to build SQL WHERE and ORDER BY conditions.
 //
 // Parameters:
 // - ctx: Context for the database operation.

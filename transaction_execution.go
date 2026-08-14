@@ -100,18 +100,6 @@ func (l *Blnk) getSourceAndDestination(ctx context.Context, transaction *model.T
 }
 
 // resolveBalanceIDs resolves source and destination to actual balance IDs.
-// If the source or destination starts with "@", it indicates a balance indicator (like @world)
-// that needs to be resolved to an actual balance ID. This function creates the balance if needed.
-// This should be called BEFORE acquiring locks to ensure we lock on the correct balance IDs.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The transaction containing source and destination.
-//
-// Returns:
-// - sourceBalanceID string: The resolved source balance ID.
-// - destinationBalanceID string: The resolved destination balance ID.
-// - error: An error if the balance IDs could not be resolved.
 func (l *Blnk) resolveBalanceIDs(ctx context.Context, transaction *model.Transaction) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "ResolveBalanceIDs")
 	defer span.End()
@@ -148,15 +136,6 @@ func (l *Blnk) resolveBalanceIDs(ctx context.Context, transaction *model.Transac
 // acquireLock acquires distributed locks for a transaction to ensure exclusive access to both
 // source and destination balances. It uses a MultiLocker with deterministic ordering to prevent
 // deadlocks when multiple transactions target the same balances.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - sourceBalanceID string: The ID of the source balance to lock.
-// - destinationBalanceID string: The ID of the destination balance to lock.
-//
-// Returns:
-// - *redlock.MultiLocker: A pointer to the acquired MultiLocker if successful.
-// - error: An error if the locks could not be acquired.
 func (l *Blnk) acquireLock(ctx context.Context, sourceBalanceID, destinationBalanceID string) (*redlock.MultiLocker, error) {
 	ctx, span := tracer.Start(ctx, "Acquiring Lock")
 	defer span.End()
@@ -176,16 +155,6 @@ func (l *Blnk) acquireLock(ctx context.Context, sourceBalanceID, destinationBala
 }
 
 // updateTransactionDetails updates the details of a transaction, including source and destination balances and status.
-// It starts a tracing span, creates a new transaction object with updated details, and records relevant events.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The original transaction to be updated.
-// - sourceBalance *model.Balance: The source balance for the transaction.
-// - destinationBalance *model.Balance: The destination balance for the transaction.
-//
-// Returns:
-// - *model.Transaction: A pointer to the new transaction object with updated details.
 func (l *Blnk) updateTransactionDetails(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) *model.Transaction {
 	_, span := tracer.Start(ctx, "Updating Transaction Details")
 	defer span.End()
@@ -212,16 +181,11 @@ func (l *Blnk) updateTransactionDetails(ctx context.Context, transaction *model.
 	return &newTransaction
 }
 
-// postTransactionActions performs post-processing actions for a transaction.
-// It starts a tracing span, queues the transaction and balance data for indexing in dependency order,
-// sends a webhook notification, and processes fund lineage if applicable.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The transaction for which to perform post-processing actions.
-// - sourceBalance *model.Balance: The source balance (can be nil for rejected transactions).
-// - destinationBalance *model.Balance: The destination balance (can be nil for rejected transactions).
-func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) {
+// postTransactionActions performs post-processing actions for a transaction. It starts
+// a tracing span, queues the transaction and balance data for indexing in dependency
+// order, captures the transaction's event in the transactional outbox when it was not
+// already captured atomically, and processes fund lineage if applicable.
+func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance, eventCaptured bool) {
 	_, span := tracer.Start(ctx, "Post Transaction Actions")
 	defer span.End()
 	go func() {
@@ -246,29 +210,28 @@ func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Tr
 			notification.NotifyError(err)
 		}
 
-		// Send webhook notification
-		err = l.SendWebhook(NewWebhook{
-			Event:   getEventFromStatus(transaction.Status),
-			Payload: transaction,
-		})
-		if err != nil {
-			span.RecordError(err)
-			notification.NotifyError(err)
+		// PRODUCER CALL SITE for the seven status-derived transaction events, and the
+		// FALLBACK one: the atomic writers capture this event inside the ledger transaction,
+		// so this branch runs only for a transaction that was not persisted through one, or
+		// for a deployment with no Kafka brokers.
+		if !eventCaptured {
+			err = l.PublishEventDurably(context.WithoutCancel(ctx), NewWebhook{
+				Event:   getEventFromStatus(transaction.Status),
+				Payload: transaction,
+			}, WithEventLedgerID(transactionLedgerID(sourceBalance, destinationBalance)))
+			if err != nil {
+				span.RecordError(err)
+				notification.NotifyError(err)
+			}
 		}
 
-		span.AddEvent("Post-transaction actions completed")
+		span.AddEvent("Post-transaction actions completed", trace.WithAttributes(
+			attribute.Bool("event.captured_atomically", eventCaptured),
+		))
 	}()
 }
 
 // validateTxn validates a transaction by checking if its reference has already been used.
-// It starts a tracing span, checks the existence of the transaction reference, and records relevant events and errors.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The transaction to be validated.
-//
-// Returns:
-// - error: An error if the transaction reference has already been used or if there was an issue checking the reference.
 func (l *Blnk) validateTxn(ctx context.Context, transaction *model.Transaction) error {
 	ctx, span := tracer.Start(ctx, "Validating Transaction Reference")
 	defer span.End()
@@ -280,10 +243,37 @@ func (l *Blnk) validateTxn(ctx context.Context, transaction *model.Transaction) 
 	}
 
 	// If the transaction reference already exists, return an error
+	//
+	// A REUSED REFERENCE IS A VERDICT, NOT AN INCIDENT.
+	//
+	// This check used to raise notification.NotifyError, and that made it the dominant
+	// source of a storm measured under load: 1,366 pending system.error events and 1,763
+	// error lines. NotifyError writes one operator-facing ERROR line per occurrence AND
+	// publishes a system.error event — which, since events became outbox-backed, means an
+	// extra row in blnk.event_outbox for the relay to publish. So the ledger charged itself
+	// an incident record and a unit of event-pipeline load every time it successfully
+	// refused a duplicate.
+	//
+	// Every route into this branch is a case the system HANDLES correctly:
+	//
+	//   - A coalesced follower. A leader committed the follower's transaction as part of a
+	//     batch; the follower's own task then arrives and its reference is already present.
+	//     One batch of 2,000 children can produce 2,000 arrivals here.
+	//   - An asynq redelivery, after a worker restart, a lost acknowledgement or an expired
+	//     lease. At-least-once delivery guarantees this happens.
+	//   - A client resubmitting the same reference. That is what references are FOR: the API
+	//     answers 409 with TXN_DUPLICATE_REFERENCE, which is the idempotency guarantee
+	//     working as designed, not a fault in this service.
+	//
+	// The error is still returned, and every caller still acts on it — the API maps it to
+	// 409 and the worker acknowledges the task — so nothing is being swallowed. The span
+	// still records it, so a single request remains traceable. What no longer happens is
+	// paging an operator, and telling every event subscriber, about a duplicate that was
+	// correctly rejected.
 	if txn {
 		err := fmt.Errorf("reference %s has already been used", transaction.Reference)
 		span.RecordError(err)
-		notification.NotifyError(err)
+
 		return err
 	}
 
@@ -309,15 +299,6 @@ func IsDuplicateReferenceError(err error) bool {
 }
 
 // applyTransactionToBalances applies a transaction to the provided balances.
-// It starts a tracing span, calculates new balances, and updates the balances based on the transaction status.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - balances []*model.Balance: A slice of Balance models to be updated. The first balance is the source, and the second is the destination.
-// - transaction *model.Transaction: The transaction to be applied to the balances.
-//
-// Returns:
-// - error: An error if the balances could not be updated.
 func (l *Blnk) applyTransactionToBalances(ctx context.Context, balances []*model.Balance, transaction *model.Transaction) error {
 	_, span := tracer.Start(ctx, "Applying Transaction to Balances")
 	defer span.End()
@@ -366,17 +347,6 @@ func (l *Blnk) applyTransactionToBalances(ctx context.Context, balances []*model
 }
 
 // GetRefundableTransactionsByParentID retrieves refundable transactions by their parent transaction ID.
-// It starts a tracing span, fetches the transactions from the datasource, and records relevant events and errors.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - parentTransactionID string: The ID of the parent transaction.
-// - batchSize int: The number of transactions to retrieve in a batch.
-// - offset int64: The offset for pagination.
-//
-// Returns:
-// - []*model.Transaction: A slice of pointers to the retrieved Transaction models.
-// - error: An error if the transactions could not be retrieved.
 
 func (r transactionExecutionResult) usedCoalescing() bool {
 	return r.mode == transactionExecutionModeQueuedBatch || r.mode == transactionExecutionModeHotQueuedBatch
@@ -451,14 +421,6 @@ func (l *Blnk) processQueuedTransaction(ctx context.Context, transaction *model.
 }
 
 // RefundWorker processes refund transactions from the jobs channel and sends the results to the results channel.
-// It starts a tracing span, processes each transaction, and records relevant events and errors.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - jobs <-chan *model.Transaction: A channel from which transactions are received for processing.
-// - results chan<- BatchJobResult: A channel to which the results of the processing are sent.
-// - wg *sync.WaitGroup: A wait group to synchronize the completion of the worker.
-// - amount float64: The amount to be processed in the transaction.
 
 func (l *Blnk) ProcessQueuedTransaction(ctx context.Context, transaction *model.Transaction, hotLane bool) (*model.Transaction, error) {
 	result, err := l.processQueuedTransaction(ctx, transaction, hotLane)
@@ -469,7 +431,6 @@ func (l *Blnk) ProcessQueuedTransaction(ctx context.Context, transaction *model.
 }
 
 // RecordTransaction records a transaction by validating, processing balances, and finalizing the transaction.
-// It starts a tracing span, acquires a lock, and performs the necessary steps to record the transaction.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -520,13 +481,23 @@ func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.T
 			return work.transaction, nil
 		}
 
-		work, err = l.persistSingleTransactionExecutionWork(ctx, work)
+		work, eventCaptured, err := l.persistSingleTransactionExecutionWork(ctx, work)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
 
-		l.runTransactionPostCommitWork(ctx, span, []*model.Balance{sourceBalance, destinationBalance}, []queuedBatchPostCommitWork{work})
+		// The captured set carries what the frozen work shape cannot: which transactions had
+		// their event committed inside their own write, so the post-commit hook captures the
+		// rest and duplicates none. See runTransactionPostCommitWorkForCapturedEvents.
+		var capturedEvents map[string]struct{}
+		if eventCaptured {
+			capturedEvents = map[string]struct{}{work.transaction.TransactionID: {}}
+		}
+
+		l.runTransactionPostCommitWorkForCapturedEvents(ctx, span,
+			[]*model.Balance{sourceBalance, destinationBalance},
+			[]queuedBatchPostCommitWork{work}, nil, capturedEvents)
 
 		span.AddEvent("Transaction processed", trace.WithAttributes(attribute.String("transaction.id", work.transaction.TransactionID)))
 		logrus.Infof("Transaction %s processed successfully", work.transaction.TransactionID)
@@ -561,19 +532,107 @@ func (l *Blnk) runTransactionPostCommitWork(ctx context.Context, span trace.Span
 }
 
 // runTransactionPostCommitWorkWithHooks executes monitor checks, post-hooks, and
-// post-transaction actions for persisted work items, optionally reusing a preloaded hook set.
+// post-transaction actions for persisted work items, optionally reusing a preloaded
+// hook set.
 func (l *Blnk) runTransactionPostCommitWorkWithHooks(ctx context.Context, span trace.Span, orderedBalances []*model.Balance, postCommitWork []queuedBatchPostCommitWork, postHooks []*blnkhooks.Hook) {
-	monitorCtx := context.WithoutCancel(ctx)
-	for _, balance := range orderedBalances {
-		balance := balance
-		// Bound concurrent monitor checks instead of spawning one unbounded
-		// goroutine per balance; acquiring the semaphore applies backpressure
-		// outside the locked persistence path.
-		balanceMonitorSem <- struct{}{}
-		go func() {
-			defer func() { <-balanceMonitorSem }()
-			l.checkBalanceMonitors(monitorCtx, balance)
-		}()
+	// The captured set is RESOLVED FROM THE TABLE rather than passed in, because the
+	// caller cannot supply it. The coalescing path calls the atomic writer and then this
+	// function with the same work list, and the file doing so is frozen, so it cannot
+	// report that the writer captured the batch's events inside the mutation. Asking the
+	// outbox which events are already durable is the one answer that stays correct however
+	// this function is reached.
+	l.runTransactionPostCommitWorkForCapturedEvents(ctx, span, orderedBalances, postCommitWork, postHooks,
+		l.durableTransactionEvents(ctx, postCommitWork))
+}
+
+// durableTransactionEvents returns the ids of the transactions whose lifecycle event is
+// already recorded in the outbox.
+func (l *Blnk) durableTransactionEvents(ctx context.Context, postCommitWork []queuedBatchPostCommitWork) map[string]struct{} {
+	if len(postCommitWork) == 0 || l.datasource == nil {
+		return nil
+	}
+
+	if !eventPublishingConfigured(l.eventConfiguration()) {
+		return nil
+	}
+
+	// One event id per transaction, derived rather than looked up. model.EventIdentityFor
+	// is what makes transaction events derivable at all, and it is consulted here —
+	// instead of assuming the transaction id is the identity — so this cannot drift from
+	// the derivation PrepareEventOutbox performed when the row was written.
+	transactionsByEventID := make(map[string]string, len(postCommitWork))
+	eventIDs := make([]string, 0, len(postCommitWork))
+
+	for _, work := range postCommitWork {
+		transaction := work.transaction
+		if transaction == nil {
+			continue
+		}
+
+		eventType := getEventFromStatus(transaction.Status)
+		identity, derivable := model.EventIdentityFor(eventType, transaction)
+		if !derivable {
+			continue
+		}
+
+		eventID := model.DeriveEventID(identity, eventType, model.SchemaVersionV1)
+		transactionsByEventID[eventID] = transaction.TransactionID
+		eventIDs = append(eventIDs, eventID)
+	}
+
+	if len(eventIDs) == 0 {
+		return nil
+	}
+
+	present, err := l.datasource.ExistingEventIDs(ctx, eventIDs)
+	if err != nil {
+		logrus.WithError(err).Debug(
+			"could not determine which transaction events were already captured; " +
+				"the post-commit path will attempt capture and rely on the unique event id")
+
+		return nil
+	}
+
+	captured := make(map[string]struct{}, len(present))
+	for eventID := range present {
+		if transactionID, ok := transactionsByEventID[eventID]; ok {
+			captured[transactionID] = struct{}{}
+		}
+	}
+
+	return captured
+}
+
+// runTransactionPostCommitWorkForCapturedEvents is
+// runTransactionPostCommitWorkWithHooks with one extra fact: which of the work items
+// already had their ledger event captured inside the database transaction that
+// persisted them.
+func (l *Blnk) runTransactionPostCommitWorkForCapturedEvents(
+	ctx context.Context,
+	span trace.Span,
+	orderedBalances []*model.Balance,
+	postCommitWork []queuedBatchPostCommitWork,
+	postHooks []*blnkhooks.Hook,
+	capturedEvents map[string]struct{},
+) {
+	// THE POST-COMMIT MONITOR CHECK IS SKIPPED WHEN THE DURABLE HANDOFF OWNS IT. The two
+	// routes are mutually exclusive: the pre-commit pass enrols its rows only when event
+	// publishing is configured, and this route runs only when it is not. That exclusion —
+	// not any bookkeeping passed between them — is what stops one crossing being announced
+	// twice.
+	if !l.balanceMonitorHandoffEnabled() {
+		monitorCtx := context.WithoutCancel(ctx)
+		for _, balance := range orderedBalances {
+			balance := balance
+			// Bound concurrent monitor checks instead of spawning one unbounded
+			// goroutine per balance; acquiring the semaphore applies backpressure
+			// outside the locked persistence path.
+			balanceMonitorSem <- struct{}{}
+			go func() {
+				defer func() { <-balanceMonitorSem }()
+				l.checkBalanceMonitors(monitorCtx, balance)
+			}()
+		}
 	}
 
 	for _, work := range postCommitWork {
@@ -589,8 +648,21 @@ func (l *Blnk) runTransactionPostCommitWorkWithHooks(ctx context.Context, span t
 				logrus.WithError(err).Error("post-transaction hooks failed")
 			}
 		}
-		l.postTransactionActions(ctx, work.transaction, work.sourceBalance, work.destinationBalance)
+		l.postTransactionActions(ctx, work.transaction, work.sourceBalance, work.destinationBalance,
+			transactionEventAlreadyCaptured(capturedEvents, work.transaction))
 	}
+}
+
+// transactionEventAlreadyCaptured reports whether a transaction's event is already
+// durable.
+func transactionEventAlreadyCaptured(captured map[string]struct{}, transaction *model.Transaction) bool {
+	if len(captured) == 0 || transaction == nil {
+		return false
+	}
+
+	_, ok := captured[transaction.TransactionID]
+
+	return ok
 }
 
 // listHooksForExecution returns the current hook set for the requested type, or nil when
@@ -606,15 +678,6 @@ func (l *Blnk) listHooksForExecution(ctx context.Context, hookType blnkhooks.Hoo
 // executeWithLock executes a function with distributed locks to ensure exclusive access to both
 // source and destination balances. It resolves balance IDs first (handling @world indicators),
 // then acquires locks in deterministic order to prevent deadlocks.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The transaction for which to acquire the locks.
-// - fn func(context.Context) (*model.Transaction, error): The function to execute with the locks.
-//
-// Returns:
-// - *model.Transaction: A pointer to the Transaction model returned by the function.
-// - error: An error if the locks could not be acquired or if the function execution fails.
 func (l *Blnk) executeWithLock(ctx context.Context, transaction *model.Transaction, fn func(context.Context) (*model.Transaction, error)) (*model.Transaction, error) {
 	ctx, span := tracer.Start(ctx, "ExecuteWithLock")
 	defer span.End()
@@ -648,17 +711,6 @@ func (l *Blnk) executeWithLock(ctx context.Context, transaction *model.Transacti
 }
 
 // validateAndPrepareTransaction validates the transaction and prepares it by retrieving the source and destination balances.
-// It starts a tracing span, validates the transaction, retrieves the balances, and updates the transaction with the balance IDs.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The transaction to be validated and prepared.
-//
-// Returns:
-// - *model.Transaction: A pointer to the new transaction object with updated details.
-// - *model.Balance: A pointer to the source Balance model.
-// - *model.Balance: A pointer to the destination Balance model.
-// - error: An error if the transaction validation or balance retrieval fails.
 func (l *Blnk) validateAndPrepareTransaction(ctx context.Context, transaction *model.Transaction) (*model.Transaction, *model.Balance, *model.Balance, error) {
 	ctx, span := tracer.Start(ctx, "ValidateAndPrepareTransaction")
 	defer span.End()
@@ -666,7 +718,10 @@ func (l *Blnk) validateAndPrepareTransaction(ctx context.Context, transaction *m
 	// Validate the transaction
 	if err := l.validateTxn(ctx, transaction); err != nil {
 		span.RecordError(err)
-		return nil, nil, nil, l.logAndRecordError(span, "transaction validation failed", err)
+
+		// A reused reference arrives here on every coalesced follower and every redelivery,
+		// so it is logged as the outcome it is rather than as a fault. See logAndRecordOutcome.
+		return nil, nil, nil, l.logAndRecordOutcome(span, "transaction validation failed", err)
 	}
 
 	// Retrieve the source and destination balances
@@ -690,18 +745,6 @@ func (l *Blnk) validateAndPrepareTransaction(ctx context.Context, transaction *m
 }
 
 // processBalances processes the source and destination balances by applying the transaction in-memory.
-// It starts a tracing span, applies the transaction to the balances, and records relevant events and errors.
-// Note: The actual database update of balances is done atomically with the transaction persistence
-// step to ensure consistency.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - transaction *model.Transaction: The transaction to be applied to the balances.
-// - sourceBalance *model.Balance: The source balance to be updated.
-// - destinationBalance *model.Balance: The destination balance to be updated.
-//
-// Returns:
-// - error: An error if the transaction could not be applied to the balances.
 func (l *Blnk) processBalances(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) error {
 	ctx, span := tracer.Start(ctx, "ProcessBalances")
 	defer span.End()
@@ -716,8 +759,9 @@ func (l *Blnk) processBalances(ctx context.Context, transaction *model.Transacti
 	return nil
 }
 
-// buildTransactionExecutionWork converts an in-memory-applied transaction into the shared
-// persistence and post-commit work shape used by both single and batched execution paths.
+// buildTransactionExecutionWork converts an in-memory-applied transaction into the
+// shared persistence and post-commit work shape used by both single and batched
+// execution paths.
 func (l *Blnk) buildTransactionExecutionWork(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) (queuedBatchPostCommitWork, bool) {
 	transaction = l.updateTransactionDetails(ctx, transaction, sourceBalance, destinationBalance)
 	if transaction.PreciseAmount != nil && transaction.PreciseAmount.Cmp(big.NewInt(0)) == 0 {
@@ -736,25 +780,100 @@ func (l *Blnk) buildTransactionExecutionWork(ctx context.Context, transaction *m
 	}, false
 }
 
-// persistSingleTransactionExecutionWork atomically persists one prepared transaction, its
-// updated balances, and any lineage outbox using the shared execution work shape.
-func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work queuedBatchPostCommitWork) (queuedBatchPostCommitWork, error) {
+// transactionLedgerID resolves THE LEDGER a transaction belongs to, from the balances
+// it moves value between.
+func transactionLedgerID(sourceBalance, destinationBalance *model.Balance) string {
+	if sourceBalance != nil && strings.TrimSpace(sourceBalance.LedgerID) != "" {
+		return sourceBalance.LedgerID
+	}
+
+	if destinationBalance != nil {
+		return destinationBalance.LedgerID
+	}
+
+	return ""
+}
+
+// persistSingleTransactionExecutionWork atomically persists one prepared transaction,
+// its updated balances, any lineage outbox AND the transaction's Kafka event row, using
+// the shared execution work shape.
+func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work queuedBatchPostCommitWork) (queuedBatchPostCommitWork, bool, error) {
 	ctx, span := tracer.Start(ctx, "PersistSingleTransactionExecutionWork")
 	defer span.End()
 
-	transaction, err := l.datasource.RecordTransactionWithBalancesAndOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.outbox)
+	// PREPARED BEFORE THE WRITE, AND A FAILURE STOPS THE WRITE. Preparing costs one JSON
+	// marshal and no I/O — nothing here contacts a broker or a database — so the only
+	// failure it can report is a payload that will not serialise, which is a producer
+	// defect the caller must see rather than a transient condition to work around.
+	//
+	// The cost of that choice is that a serialisation defect blocks a financially valid
+	// mutation. It is accepted deliberately: the alternative commits a movement no
+	// subscriber is ever told about, with no outbox row for the daily reconciliation to
+	// count. Recorded in full under "A mutation whose event cannot be prepared is refused"
+	// in docs/event-streaming.md.
+	eventOutbox, err := l.prepareTransactionEventOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance)
 	if err != nil {
 		span.RecordError(err)
-		return queuedBatchPostCommitWork{}, l.logAndRecordError(span, "failed to persist transaction with balances", err)
+
+		return queuedBatchPostCommitWork{}, false, l.logAndRecordError(span,
+			"refusing to persist a transaction whose ledger event could not be prepared", err)
+	}
+
+	// THE MONITOR ALERTS TRAVEL WITH THE MUTATION TOO.
+	monitorEvents, err := l.prepareBalanceMonitorEvents(ctx,
+		[]*model.Balance{work.sourceBalance, work.destinationBalance})
+	if err != nil {
+		span.RecordError(err)
+
+		return queuedBatchPostCommitWork{}, false, l.logAndRecordError(span,
+			"refusing to persist a transaction whose balance monitor alert could not be prepared", err)
+	}
+
+	// THE EVENT ROWS TRAVEL WITH THE MUTATION. The writer inserts them inside the same
+	// database transaction as the two balance updates and the transaction row, so an event
+	// cannot outlive a rollback and the mutation cannot outlive a lost event. The
+	// transaction's own event leads; the monitor alerts follow it, and the writer skips
+	// nil entries so an unconfigured deployment passes a single nil exactly as before.
+	transaction, err := l.datasource.RecordTransactionWithBalancesAndOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.outbox,
+		append([]*model.EventOutbox{eventOutbox}, monitorEvents...)...)
+	if err != nil {
+		span.RecordError(err)
+		return queuedBatchPostCommitWork{}, false, l.logAndRecordError(span, "failed to persist transaction with balances", err)
 	}
 
 	work.transaction = transaction
+	// Reported only on the success path: the commit is what makes the events durable, so a
+	// failed write must leave the post-commit hook free to capture both the transaction event
+	// and the monitor alerts on the standalone path rather than believing they are stored.
+	eventCaptured := eventOutbox != nil
+
 	span.AddEvent("Transaction and balances persisted atomically", trace.WithAttributes(
 		attribute.String("transaction.id", transaction.TransactionID),
 		attribute.Bool("lineage.outbox_created", work.outbox != nil),
+		attribute.Bool("event.captured_in_transaction", eventCaptured),
+		attribute.Int("event.monitor_alerts_captured", len(monitorEvents)),
 	))
 
-	return work, nil
+	return work, eventCaptured, nil
+}
+
+// prepareTransactionEventOutbox builds the outbox row for a transaction's lifecycle
+// event, ready to be inserted inside the mutation's own database transaction.
+func (l *Blnk) prepareTransactionEventOutbox(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) (*model.EventOutbox, error) {
+	if transaction == nil {
+		return nil, nil
+	}
+
+	event := NewWebhook{
+		Event:   getEventFromStatus(transaction.Status),
+		Payload: transaction,
+	}
+
+	// The SAME resolver the post-commit fallback uses, so an event captured atomically and
+	// one captured after the commit are keyed identically. WithEventLedgerID ignores an empty
+	// value, so the rejection case needs no branch of its own.
+	return l.PrepareEventOutbox(ctx, event,
+		WithEventLedgerID(transactionLedgerID(sourceBalance, destinationBalance)))
 }
 
 func (l *Blnk) prepareTransactionOutbox(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) *model.LineageOutbox {
@@ -784,17 +903,33 @@ func (l *Blnk) releaseLock(ctx context.Context, locker *redlock.MultiLocker) {
 }
 
 // logAndRecordError logs an error message and records the error in the tracing span.
-// It returns a formatted error message combining the provided message and the original error.
-//
-// Parameters:
-// - span trace.Span: The tracing span to record the error.
-// - msg string: The error message to log and include in the formatted error.
-// - err error: The original error to be logged and recorded.
-//
-// Returns:
-// - error: A formatted error message combining the provided message and the original error.
 func (l *Blnk) logAndRecordError(span trace.Span, msg string, err error) error {
 	span.RecordError(err)
 	logrus.WithError(err).Error(msg)
 	return fmt.Errorf("%s: %w", msg, err)
+}
+
+// logAndRecordOutcome is logAndRecordError, except that an outcome the ledger is SUPPOSED to
+// produce is recorded at info level instead of error level.
+//
+// The returned error and the span record are byte-for-byte what logAndRecordError produces,
+// which matters: the wrapped message is what api/errors.go classifies to decide the HTTP
+// status, so a caller's behaviour cannot change here — only the severity of the line written
+// about it.
+//
+// A reused reference is the case this exists for. Refusing a duplicate is the reference
+// mechanism working, and it happens once per coalesced follower and once per at-least-once
+// redelivery, so under load the ledger logged hundreds of ERROR lines describing itself
+// operating correctly. A log level that says "error" for a routine outcome is not a small
+// cosmetic problem: it is what makes a real error in the same stream impossible to find, and
+// error-line volume was part of what the load run reported.
+func (l *Blnk) logAndRecordOutcome(span trace.Span, msg string, err error) error {
+	if IsDuplicateReferenceError(err) {
+		span.RecordError(err)
+		logrus.WithError(err).Info(msg)
+
+		return fmt.Errorf("%s: %w", msg, err)
+	}
+
+	return l.logAndRecordError(span, msg, err)
 }

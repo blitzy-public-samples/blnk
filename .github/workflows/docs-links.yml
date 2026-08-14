@@ -1,0 +1,93 @@
+# Copyright 2024 Blnk Finance Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# THE LINKS IN THIS REPOSITORY'S DOCUMENTATION MUST STILL GO SOMEWHERE.
+#
+# Two links in README.md's Quick start shipped as 404s:
+#
+#     https://docs.blnkfinance.com/api-reference
+#     https://docs.blnkfinance.com/tutorials/quick-start/create-your-first-ledger-balance-and-transaction
+#
+# THE SCHEDULE IS THE POINT. Neither link was edited in the commit that broke it, because
+# there was no such commit — the documentation site retired its own pages, and the README
+# became wrong while sitting perfectly still. A check that runs only on push and pull
+# request cannot observe that, which is why this workflow is driven by a clock. The weekly
+# run is the only thing in CI capable of catching the next retired page, and it catches it
+# before a prospective user following the Quick start does.
+#
+# This workflow is separate from Build and Test on purpose: adding a schedule there would
+# run the whole matrix — build, race, kafka, the full suite — every week to answer a
+# question about hyperlinks.
+name: Documentation links
+
+on:
+  # Editing documentation is the other way a link goes bad: a typo, or a path that was
+  # never right. Scoped to Markdown and to the checker itself so unrelated pull requests
+  # are not gated on a third party's uptime.
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - '**.md'
+      - 'scripts/check-doc-links.sh'
+      - 'event_docs_links_test.go'
+      - '.github/workflows/docs-links.yml'
+  push:
+    branches: [ "main" ]
+    paths:
+      - '**.md'
+      - 'scripts/check-doc-links.sh'
+      - 'event_docs_links_test.go'
+  schedule:
+    # 07:00 UTC every Monday. Link rot caused by somebody else's site has no commit to
+    # hang a trigger on, so it is found on a clock or it is not found at all.
+    - cron: '0 7 * * 1'
+  # Available on demand, for confirming a replacement URL without opening a pull request.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The hermetic half. No network, so it is never flaky and never skipped: relative links,
+  # section anchors, path CASE, and the retired slugs that must not come back.
+  structure:
+    name: Relative links and anchors
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+
+      - name: Resolve every relative link and section anchor
+        run: go test -count=1 -run 'TestDocumentationLinks' -v .
+
+  # The external half. Separate job so a dead link and a broken anchor are distinguishable
+  # at a glance in the checks list, and so this one's network dependence cannot mask the
+  # other's verdict.
+  liveness:
+    name: External link liveness
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails on 404 and 410 only. A rate limit, a refused unattended client or our own
+      # timeout is reported and does not fail the run — see the script's header for why
+      # that trade is deliberate.
+      - name: Resolve every external link
+        run: ./scripts/check-doc-links.sh

@@ -1,15 +1,80 @@
+# THE LEDGER DATABASE'S STORAGE CLAIM.
+# ==========================================================================
+# READ THIS BEFORE APPLYING OR EDITING: this claim is OPTIONAL, and it is the
+# pre-provisioning half of the StatefulSet's storage.
+# ==========================================================================
+# postgres-statefulset.yaml declares a volumeClaimTemplate named `pg-data`, and Kubernetes
+# materialises one claim per pod from it. The name it uses is derived, not chosen:
+#
+#     <template name>-<StatefulSet name>-<ordinal>
+#     pg-data         -postgres          -0
+#
+# That is exactly the object below. Applying this file BEFORE the StatefulSet
+# pre-provisions it; the StatefulSet then ADOPTS it rather than creating a second, because
+# a claim of that name already exists.
+#
+# WHY PRE-PROVISIONING IS WORTH HAVING HERE RATHER THAN JUST LETTING THE TEMPLATE RUN, and
+# it is a sharper reason for PostgreSQL than for the brokers. `volumeClaimTemplates` is
+# IMMUTABLE on a running StatefulSet: `kubectl apply` with a changed storage request is
+# rejected by the API server, so the size has to be right BEFORE the first apply or it
+# costs an orphan-and-reapply cycle to change (see docs/kafka-operations.md). This file is
+# where that decision can be made and reviewed on its own, and it is the only way to bind a
+# SPECIFIC PersistentVolume to the database — a named local NVMe disk, or a pre-existing
+# cloud disk restored from a snapshot, which is how a ledger gets restored from a backup —
+# none of which a template can express.
+#
+# THIS FILE PREVIOUSLY HELD A CLAIM NAMED `pg-data`, WHICH IS NOT A NAME ANYTHING LOOKS
+# FOR. It was a kompose conversion artifact: `pg-data` is the TEMPLATE's name, not the
+# claim's, so the StatefulSet created `pg-data-postgres-0` from the template and this object
+# sat Pending for ever, provisioning nothing and mounted by nobody. It also requested
+# 100Mi, four orders of magnitude below what the outbox needs, so anything that HAD adopted
+# it would have been worse than the orphan. The same defect and the same correction are
+# recorded in kafka-data-persistentvolumeclaim.yaml, whose bare singleton was replaced by
+# the three derived names its StatefulSet actually resolves.
+#
+# FIVE THINGS MUST STAY TRUE, and each is asserted by
+# TestManifests_PostgresStorageClaimIsPreProvisionedUnderTheNameTheSetResolves:
+#
+#   1. THE NAME. `pg-data-postgres-0` and nothing else. Renaming the StatefulSet or its
+#      volumeClaimTemplate silently orphans this: the set creates its own claim under the
+#      new name and this one sits unbound and unused, which is the original defect with
+#      extra steps.
+#   2. THE COUNT. One entry, because the StatefulSet declares one replica. This manifest
+#      set runs a SINGLE PostgreSQL instance and replication is the operator's to add; if
+#      you raise `replicas`, add an entry here in the same change, or the new pod's claim
+#      comes from the template while this one came from this file and the two can differ.
+#   3. THE SIZE. 10Gi, identical to the volumeClaimTemplate. Kubernetes does NOT reconcile a
+#      pre-existing claim against the template — it adopts what it finds — so a claim
+#      smaller than the template is adopted at the smaller size, silently.
+#
+#      10Gi IS THE UPSTREAM DEVELOPMENT REQUEST AND IS NOT A CAPACITY PLAN. At the
+#      validated 500 events a second the event outbox alone reaches hundreds of gibibytes;
+#      docs/kafka-operations.md carries the arithmetic — measured row cost, bloat factor,
+#      rate and retention period — and the figure it yields belongs BOTH here and in the
+#      template, changed together, before the first apply.
+#   4. THE ACCESS MODE. ReadWriteOnce, matching the template. A claim the scheduler treats
+#      differently from what the workload expects is a scheduling failure at the worst
+#      moment.
+#   5. THE STORAGE CLASS. Omitted here and in the template, so both take the cluster's
+#      default. Naming it on one side only means the adopted volume is backed by storage the
+#      workload never asked for — different IOPS, different durability, possibly a class
+#      that cannot expand.
+#
+# SKIP THIS FILE ENTIRELY and the StatefulSet creates `pg-data-postgres-0` from its own
+# template. That is a perfectly good outcome and the reason this is optional: apply it only
+# when you want to control the volume before the database first starts.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  creationTimestamp: null
-  labels:
-    io.kompose.service: pg-data
-  name: pg-data
+  name: pg-data-postgres-0
   namespace: blnk
+  labels:
+    app: postgres
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: blnk
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 100Mi
-status: {}
+      storage: 10Gi

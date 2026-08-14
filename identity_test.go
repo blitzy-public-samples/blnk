@@ -61,6 +61,8 @@ func TestCreateIdentity(t *testing.T) {
 	}
 	metaDataJSON, _ := json.Marshal(identity.MetaData)
 
+	// NO TRANSACTION IS SCRIPTED, and that is the graceful-degradation criterion rather
+	// than an omission.
 	mock.ExpectExec("INSERT INTO blnk.identity").
 		WithArgs(sqlmock.AnyArg(), identity.IdentityType, identity.FirstName, identity.LastName, identity.OtherNames, identity.Gender, identity.DOB, identity.EmailAddress, identity.PhoneNumber, identity.Nationality, identity.OrganizationName, identity.Category, identity.Street, identity.Country, identity.State, identity.PostCode, identity.City, sqlmock.AnyArg(), metaDataJSON).
 		WillReturnResult(sqlmock.NewResult(1, 1))

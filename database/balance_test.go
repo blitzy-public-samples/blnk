@@ -2135,3 +2135,125 @@ func TestParseBigInt(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateBalance_CommitsTheEventWithTheBalance is the requirement for balance
+// creation, and again the assertion is the SHAPE OF THE TRANSACTION rather than any
+// value in it.
+func TestCreateBalance_CommitsTheEventWithTheBalance(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+	balance := model.Balance{Currency: "USD", LedgerID: "ldg_4b1e7c30"}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.balances").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("INSERT INTO blnk.event_outbox").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(88)))
+	mock.ExpectCommit()
+
+	var seen model.Balance
+	created, err := ds.CreateBalance(balance, func(entity model.Balance) (*model.EventOutbox, error) {
+		seen = entity
+
+		return &model.EventOutbox{
+			EventID:      "5d6e7f8a-9b0c-4d1e-8f2a-3b4c5d6e7f80",
+			EventType:    "balance.created",
+			AggregateID:  entity.BalanceID,
+			PartitionKey: entity.LedgerID,
+			LedgerID:     entity.LedgerID,
+			Topic:        "blnk.balances",
+			Payload:      json.RawMessage(`{"event":"balance.created","data":{}}`),
+		}, nil
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, created.BalanceID, "bln_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the balance and its event must be inserted inside ONE transaction, in that order")
+
+	assert.Equal(t, created.BalanceID, seen.BalanceID,
+		"the preparer must be handed the created balance, carrying the generated id")
+	require.NotNil(t, seen.Balance,
+		"and carrying the amounts the insert defaulted, because the event payload is that finished "+
+			"balance and a nil amount would marshal as null")
+}
+
+// TestCreateBalance_TheIndicatorConflictCapturesNothing is the case that makes the
+// atomic capture MORE correct than the post-commit publish it replaced, not merely
+// safer.
+//
+// A unique violation on unique_indicator_currency is reported as SUCCESS with an empty
+// balance — this method's long-standing idempotent-create contract, meaning the balance
+// the caller asked for already exists under that indicator. The old post-commit publish
+// could not see that and announced balance.created anyway, with a payload holding no
+// id, no ledger and no currency.
+func TestCreateBalance_TheIndicatorConflictCapturesNothing(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.balances").
+		WillReturnError(&pq.Error{Code: "23505", Message: "duplicate key value violates unique constraint \"unique_indicator_currency\""})
+	mock.ExpectRollback()
+
+	prepared := false
+	created, err := ds.CreateBalance(model.Balance{Currency: "USD", Indicator: "payouts"},
+		func(model.Balance) (*model.EventOutbox, error) {
+			prepared = true
+
+			return nil, nil
+		})
+
+	require.NoError(t, err, "the indicator conflict is reported as success, unchanged")
+	assert.Empty(t, created.BalanceID, "and with an empty balance, unchanged")
+	assert.False(t, prepared,
+		"no event may be prepared or inserted for a balance that was not created; balance.created "+
+			"announcing an empty balance is what this replaces")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestCreateBalance_APreparerFailureCreatesNoBalance pins the fail-closed half.
+func TestCreateBalance_APreparerFailureCreatesNoBalance(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.balances").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectRollback()
+
+	prepareErr := errors.New("the payload could not be serialised")
+	created, err := ds.CreateBalance(model.Balance{Currency: "USD"},
+		func(model.Balance) (*model.EventOutbox, error) { return nil, prepareErr })
+
+	require.ErrorIs(t, err, prepareErr)
+	assert.Empty(t, created.BalanceID, "no balance may be reported as created")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the balance INSERT must be rolled back rather than left committed without its event")
+}
+
+// TestCreateBalance_WithoutAPreparerIssuesOneStatement keeps the unconfigured path free of a
+// transaction, and keeps every pre-existing caller's expectation matching.
+func TestCreateBalance_WithoutAPreparerIssuesOneStatement(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("INSERT INTO blnk.balances").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	created, err := ds.CreateBalance(model.Balance{Currency: "USD"})
+
+	require.NoError(t, err)
+	assert.Contains(t, created.BalanceID, "bln_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"a create with no preparer must issue exactly one statement and open no transaction")
+}

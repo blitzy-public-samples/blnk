@@ -180,15 +180,84 @@ func TestRespondErrorFallbackSanitizes(t *testing.T) {
 	assert.Equal(t, sanitizedInternalMessage, detail.Message)
 }
 
-func TestRespondErrorWithDefault(t *testing.T) {
-	c, w := newTestContext()
-	respondError(c, errors.New("some opaque reconciliation failure"), withDefault(apierror.ErrReconStartFailed))
+// TestRespondErrorWithDefault_SanitizesAServerFaultAndKeepsAClientFault is the guard.
+//
+// The comment described the intended rule and the assertion pinned its opposite.
+//
+// The message on this path is not one anybody wrote for a client.
+func TestRespondErrorWithDefault_SanitizesAServerFaultAndKeepsAClientFault(t *testing.T) {
+	t.Run("a 5xx default withholds the internal text", func(t *testing.T) {
+		c, w := newTestContext()
+		respondError(c, errors.New("pq: connection refused on 10.0.0.5"),
+			withDefault(apierror.ErrReconStartFailed))
 
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	raw, detail := decodeDetail(t, w)
-	assert.Equal(t, apierror.ErrReconStartFailed, detail.Code)
-	// 4xx/explicit-default paths keep the original message.
-	assert.Equal(t, "some opaque reconciliation failure", raw["error"])
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+		raw, detail := decodeDetail(t, w)
+		assert.Equal(t, apierror.ErrReconStartFailed, detail.Code,
+			"the caller's chosen code is still what identifies the failure")
+
+		// BOTH fields. The legacy flat string and the structured message are two renderings of
+		// one response, and a leak through either is a leak.
+		assert.Equal(t, sanitizedInternalMessage, raw["error"])
+		assert.Equal(t, sanitizedInternalMessage, detail.Message)
+		assert.NotContains(t, w.Body.String(), "10.0.0.5",
+			"the address must not reach the client anywhere in the body")
+	})
+
+	t.Run("a 503 default is a server fault too", func(t *testing.T) {
+		// Service Unavailable is the subscriber-provisioning default, and its unclassified
+		// errors come from the Kafka admin client — the richest source of broker addresses in
+		// the codebase. 5xx is the whole class, not 500 alone.
+		c, w := newTestContext()
+		respondError(c, errors.New("dial tcp 10.0.3.14:9092: connect: connection refused"),
+			withDefault(apierror.ErrSubscriberProvisioningFailed))
+
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		_, detail := decodeDetail(t, w)
+		assert.Equal(t, sanitizedInternalMessage, detail.Message)
+		assert.NotContains(t, w.Body.String(), "10.0.3.14")
+	})
+
+	t.Run("a 4xx default keeps the original message", func(t *testing.T) {
+		// The counterweight. A caller-actionable refusal must stay actionable, or sanitizing
+		// 5xx would have cost every validation message its content.
+		c, w := newTestContext()
+		respondError(c, errors.New("source and destination must differ"),
+			withDefault(apierror.ErrGenBadRequest))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		raw, detail := decodeDetail(t, w)
+		assert.Equal(t, "source and destination must differ", raw["error"])
+		assert.Equal(t, "source and destination must differ", detail.Message)
+	})
+
+	t.Run("an explicit fallback message is used verbatim on either status", func(t *testing.T) {
+		// A caller that named the wording chose it deliberately, so neither branch overrides it.
+		c, w := newTestContext()
+		respondError(c, errors.New("pq: relation \"blnk.foo\" does not exist"),
+			withDefault(apierror.ErrGenInternal), withFallbackMessage("could not start the run"))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+		_, detail := decodeDetail(t, w)
+		assert.Equal(t, "could not start the run", detail.Message)
+		assert.NotContains(t, w.Body.String(), "blnk.foo")
+	})
+
+	t.Run("an upgraded code decides the status, so it decides the sanitization", func(t *testing.T) {
+		// withDefault names a 4xx and withUpgrade rewrites it to a 5xx. Testing the raw default
+		// would read 4xx and let the driver's text out under the 500 that actually went.
+		c, w := newTestContext()
+		respondError(c, errors.New("pq: connection refused on 10.0.0.5"),
+			withDefault(apierror.ErrGenBadRequest),
+			withUpgrade(apierror.ErrGenBadRequest, apierror.ErrGenInternal))
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+		_, detail := decodeDetail(t, w)
+		assert.Equal(t, apierror.ErrGenInternal, detail.Code)
+		assert.Equal(t, sanitizedInternalMessage, detail.Message,
+			"the status that was sent is the one the rule must be keyed on")
+		assert.NotContains(t, w.Body.String(), "10.0.0.5")
+	})
 }
 
 func TestRespondBareAPIErrorShape(t *testing.T) {

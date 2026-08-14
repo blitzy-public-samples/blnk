@@ -34,23 +34,47 @@ import (
 
 // CreateIdentity inserts a new identity record into the database.
 //
-// IdentityID handling:
-//   - If the caller supplies identity.IdentityID, it is preserved as-is.
-//     The value must carry the canonical "idt_" prefix followed by a valid
-//     UUID; otherwise the request is rejected with a 400. This lets callers
-//     derive deterministic identity ids (e.g. UUIDv5 of an external holder
-//     key) and rely on the UNIQUE constraint on identity_id for safe
-//     concurrent creation: parallel requests for the same external holder
-//     produce identical ids, one wins the insert, the others receive 409
-//     Conflict and can fetch the existing row.
-//   - If identity.IdentityID is empty, a fresh id is generated (existing
-//     behaviour).
-//
 // Parameters:
-// - identity: The identity object to be inserted.
+//   - identity: The identity object to be inserted.
+//   - prepareEvent: Optional. Builds the identity.created outbox row from the created
+//     identity, inside the transaction that created it. See EventPreparer for the contract.
+//
 // Returns:
-// - The created identity object, or an error if the creation fails.
-func (d Datasource) CreateIdentity(identity model.Identity) (model.Identity, error) {
+//   - The created identity object, or an error if the creation fails — including when the
+//     event could not be prepared or captured, in which case the identity is NOT created.
+func (d Datasource) CreateIdentity(identity model.Identity, prepareEvent ...EventPreparer[model.Identity]) (model.Identity, error) {
+	ctx := context.Background()
+
+	prepare := firstEventPreparer(prepareEvent)
+	if prepare == nil {
+		return d.insertIdentity(ctx, d.Conn, identity)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		return identity, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	created, err := d.insertIdentity(ctx, tx, identity)
+	if err != nil {
+		return created, err
+	}
+
+	if err := captureEntityEvent(ctx, d, tx, created, prepare); err != nil {
+		return created, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return created, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	return created, nil
+}
+
+// insertIdentity performs the identity INSERT against either the connection or an open
+// transaction, and is the single statement both CreateIdentity paths run.
+func (d Datasource) insertIdentity(ctx context.Context, execer sqlExecer, identity model.Identity) (model.Identity, error) {
 	// Marshal metadata into JSON format
 	metaDataJSON, err := json.Marshal(identity.MetaData)
 	if err != nil {
@@ -71,7 +95,7 @@ func (d Datasource) CreateIdentity(identity model.Identity) (model.Identity, err
 	identity.CreatedAt = time.Now()
 
 	// Insert the identity record into the database
-	_, err = d.Conn.ExecContext(context.Background(), `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO blnk.identity (identity_id, identity_type, first_name, last_name, other_names, gender, dob, email_address, phone_number, nationality, organization_name, category, street, country, state, post_code, city, created_at, meta_data)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`, identity.IdentityID, identity.IdentityType, identity.FirstName, identity.LastName, identity.OtherNames, identity.Gender, identity.DOB, identity.EmailAddress, identity.PhoneNumber, identity.Nationality, identity.OrganizationName, identity.Category, identity.Street, identity.Country, identity.State, identity.PostCode, identity.City, identity.CreatedAt, metaDataJSON)
@@ -90,11 +114,6 @@ func (d Datasource) CreateIdentity(identity model.Identity) (model.Identity, err
 }
 
 // GetIdentityByID retrieves an identity from the database based on the given identity ID.
-// It starts a transaction, executes a query to fetch the identity details, and commits the transaction upon success.
-// Parameters:
-// - id: The ID of the identity to be retrieved.
-// Returns:
-// - A pointer to the Identity object if found, or an error if the identity is not found or the query fails.
 func (d Datasource) GetIdentityByID(id string) (*model.Identity, error) {
 	// Set a timeout for the context and ensure cancellation
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
@@ -150,9 +169,6 @@ func (d Datasource) GetIdentityByID(id string) (*model.Identity, error) {
 }
 
 // GetAllIdentities retrieves all identities from the database.
-// It executes a query to fetch all identity records, parses the result into Identity structs, and handles metadata unmarshalling.
-// Returns:
-// - A slice of Identity objects if successful, or an error if any operation fails.
 func (d Datasource) GetAllIdentities() ([]model.Identity, error) {
 	// Execute query to retrieve all identities, ordered by creation date
 	rows, err := d.Conn.QueryContext(context.Background(), `
@@ -203,11 +219,6 @@ func (d Datasource) GetAllIdentities() ([]model.Identity, error) {
 }
 
 // UpdateIdentity updates a specific identity record in the database.
-// It marshals the identity metadata, constructs an SQL update query, and checks the result.
-// Parameters:
-// - identity: A pointer to the Identity object containing the updated details.
-// Returns:
-// - An error if the update fails, or nil if successful.
 func (d Datasource) UpdateIdentity(identity *model.Identity) error {
 	var setFields []string
 	var args []interface{}
@@ -300,11 +311,6 @@ func (d Datasource) UpdateIdentity(identity *model.Identity) error {
 }
 
 // DeleteIdentity deletes a specific identity record from the database.
-// It executes the SQL delete query based on the provided identity ID.
-// Parameters:
-// - id: The ID of the identity to be deleted.
-// Returns:
-// - An error if the deletion fails, or nil if successful.
 func (d Datasource) DeleteIdentity(id string) error {
 	// Execute the SQL delete query
 	result, err := d.Conn.ExecContext(context.Background(), `
@@ -331,11 +337,6 @@ func (d Datasource) DeleteIdentity(id string) error {
 }
 
 // GetAllIdentitiesPaginated retrieves identities from the database with pagination support.
-// Parameters:
-// - limit: The maximum number of identities to return.
-// - offset: The offset to start fetching identities from (for pagination).
-// Returns:
-// - A slice of Identity objects if successful, or an error if any operation fails.
 func (d Datasource) GetAllIdentitiesPaginated(limit, offset int) ([]model.Identity, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -384,7 +385,6 @@ func (d Datasource) GetAllIdentitiesPaginated(limit, offset int) ([]model.Identi
 }
 
 // GetAllIdentitiesWithFilter retrieves identities with advanced filtering support.
-// It delegates to GetAllIdentitiesWithFilterAndOptions with nil options.
 //
 // Parameters:
 // - ctx: Context for the database operation.
@@ -401,7 +401,6 @@ func (d Datasource) GetAllIdentitiesWithFilter(ctx context.Context, filters *fil
 }
 
 // GetAllIdentitiesWithFilterAndOptions retrieves identities with filtering, sorting, and optional count.
-// It uses the filter package to build SQL WHERE and ORDER BY conditions.
 //
 // Parameters:
 // - ctx: Context for the database operation.

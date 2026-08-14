@@ -1,0 +1,1215 @@
+/*
+Copyright 2024 Blnk Finance Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// event_producer_atomicity_test.go exercises the writer-side capture that brings the
+// last two event families under the requirement, AGAINST A REAL POSTGRESQL.
+//
+// Three claims are made here, and they are about transaction boundaries rather than
+// about SQL:
+//
+//   - A `balance.monitor` crossing is decided AND its canonical blnk.event_outbox row
+//     inserted inside the transaction that moved the balance, whenever a
+//     BalanceMonitorAlertCapture is registered — which is what
+//     recordBalanceMonitorEvaluation does and what same-transaction capture asks for.
+//   - With no capture registered, the same transaction commits a
+//     balance_monitor_handoff instead: both decision inputs, frozen, for
+//     BalanceMonitorHandoffProcessor to convert.
+//   - A bulk batch's outcome and its summary event commit together.
+package database
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/model"
+	"github.com/brianvoe/gofakeit/v6"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// monitoredTestBalance creates a balance, and optionally a monitor on it, returning the
+// balance id.
+//
+// The monitor is what the handoff insert's EXISTS guard looks for, so a test that wants
+// a handoff written must ask for one and a test that wants none must not.
+func monitoredTestBalance(t *testing.T, ds Datasource, withMonitor bool) (string, string) {
+	t.Helper()
+
+	ledger, err := ds.CreateLedger(model.Ledger{Name: "handoff-" + gofakeit.UUID()})
+	require.NoError(t, err)
+
+	balance := &model.Balance{LedgerID: ledger.LedgerID, Currency: "USD"}
+	balance.InitializeBalanceFields()
+	created, err := ds.CreateBalance(*balance)
+	require.NoError(t, err)
+
+	if withMonitor {
+		_, err = ds.CreateMonitor(model.BalanceMonitor{
+			BalanceID: created.BalanceID,
+			Condition: model.AlertCondition{Field: "balance", Operator: ">=", Value: 1, PreciseValue: big.NewInt(100), Precision: 100},
+		})
+		require.NoError(t, err)
+	}
+
+	retireHandoffFixtures(t, ds, created.BalanceID, ledger.LedgerID)
+
+	return created.BalanceID, ledger.LedgerID
+}
+
+// retireHandoffFixtures deletes every row this test caused, in both tables, once it
+// ends.
+//
+// The database is SHARED with sibling clones and with the root package's own tiers,
+// which run in another process. A handoff or event row left behind is therefore not
+// merely clutter:
+//
+//   - A leaked event_outbox row is left PENDING, so the first relay to look — a live
+//     tier in another process — claims it, publishes it for real and stamps it with the
+//     broker coordinate it landed on.
+//   - A leaked handoff row is claim-visible, and the claim is global and oldest-first,
+//     so it is served AHEAD of the fixtures of any later test that reasons about batch
+//     composition.
+func retireHandoffFixtures(t *testing.T, ds Datasource, balanceID, ledgerID string) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if _, err := ds.Conn.Exec(
+			`DELETE FROM blnk.balance_monitor_handoff WHERE balance_id = $1`, balanceID); err != nil {
+			t.Logf("failed to remove balance monitor handoff fixtures for %q: %v", balanceID, err)
+		}
+
+		if _, err := ds.Conn.Exec(`
+			DELETE FROM blnk.event_outbox
+			WHERE ledger_id = $1 OR aggregate_id = $1 OR partition_key = $1 OR partition_key = $2
+		`, ledgerID, balanceID); err != nil {
+			t.Logf("failed to remove event outbox fixtures for ledger %q: %v", ledgerID, err)
+		}
+	})
+}
+
+// coordinatedTestBatchID mints a batch id and registers the cleanup for everything a
+// batch leaves behind: the coordinator row and the outcome event captured with it.
+func coordinatedTestBatchID(t *testing.T, ds Datasource) string {
+	t.Helper()
+
+	batchID := "bulk_" + gofakeit.UUID()
+
+	t.Cleanup(func() {
+		if _, err := ds.Conn.Exec(
+			`DELETE FROM blnk.event_outbox WHERE aggregate_id = $1 OR partition_key = $1`, batchID); err != nil {
+			t.Logf("failed to remove the outcome event for batch %q: %v", batchID, err)
+		}
+
+		if _, err := ds.Conn.Exec(
+			`DELETE FROM blnk.bulk_transaction_batches WHERE batch_id = $1`, batchID); err != nil {
+			t.Logf("failed to remove the coordinator row for batch %q: %v", batchID, err)
+		}
+	})
+
+	return batchID
+}
+
+// TestBalancesAwaitingMonitorEvaluation_SuppressesTheHandoffForABalanceEvaluatedWithTheMutation
+// is the guard on the duplicate two independently-built capture mechanisms create together.
+//
+// `balance.monitor` is brought inside the mutation's transaction by two routes.
+func TestBalancesAwaitingMonitorEvaluation_SuppressesTheHandoffForABalanceEvaluatedWithTheMutation(t *testing.T) {
+	monitorRow := func(balanceID string) *model.EventOutbox {
+		return &model.EventOutbox{
+			EventType: model.EventTypeBalanceMonitor,
+			Payload: json.RawMessage(fmt.Sprintf(
+				`{"event":"balance.monitor","data":{"monitor_id":"mon_1","balance_id":%q}}`, balanceID)),
+		}
+	}
+	source := &model.Balance{BalanceID: "bln_source"}
+	destination := &model.Balance{BalanceID: "bln_destination"}
+	both := []*model.Balance{source, destination}
+
+	t.Run("a balance whose alert travelled with the mutation is not handed off", func(t *testing.T) {
+		rows := []*model.EventOutbox{
+			{EventType: "transaction.applied", Payload: json.RawMessage(`{"event":"transaction.applied","data":{}}`)},
+			monitorRow("bln_source"),
+		}
+
+		awaiting := balancesAwaitingMonitorEvaluation(both, balancesAlreadyEvaluatedInTx(rows))
+
+		require.Len(t, awaiting, 1,
+			"the evaluated balance must be dropped, or the processor publishes its crossing again")
+		assert.Equal(t, "bln_destination", awaiting[0].BalanceID,
+			"and the balance nobody evaluated must survive, or its crossing is evaluated by neither route")
+	})
+
+	t.Run("a balance with no captured alert is still handed off", func(t *testing.T) {
+		// The read-failure case, and the reason coverage is taken from the rows rather than
+		// assumed from the path: a monitor read that failed before the write captures
+		// nothing, so the handoff is the only thing that will ever evaluate that balance.
+		awaiting := balancesAwaitingMonitorEvaluation(both, balancesAlreadyEvaluatedInTx(
+			[]*model.EventOutbox{monitorRow("bln_source")}))
+
+		assert.Len(t, awaiting, 1)
+
+		assert.Equal(t, both, balancesAwaitingMonitorEvaluation(both, nil),
+			"with nothing evaluated the input set is returned unchanged, which is the coalesced "+
+				"path's case and the common one")
+	})
+
+	t.Run("only balance.monitor rows count as coverage", func(t *testing.T) {
+		// The transaction's own event carries an aggregate id too. Reading coverage from
+		// anything but the monitor alert would suppress a handoff on the strength of an
+		// unrelated event and lose the crossing outright.
+		evaluated := balancesAlreadyEvaluatedInTx([]*model.EventOutbox{
+			{EventType: "transaction.applied", Payload: json.RawMessage(`{"event":"transaction.applied","data":{"balance_id":"bln_source"}}`)},
+			{EventType: "balance.created", Payload: json.RawMessage(`{"event":"balance.created","data":{"balance_id":"bln_source"}}`)},
+		})
+
+		assert.Empty(t, evaluated)
+	})
+
+	t.Run("an unreadable or balance-less payload yields no coverage", func(t *testing.T) {
+		// The safe direction: the handoff is written, the processor evaluates, and the worst
+		// case is the duplicate rather than an alert nobody evaluates.
+		evaluated := balancesAlreadyEvaluatedInTx([]*model.EventOutbox{
+			nil,
+			{EventType: model.EventTypeBalanceMonitor, Payload: json.RawMessage(`{`)},
+			{EventType: model.EventTypeBalanceMonitor, Payload: json.RawMessage(`{"event":"balance.monitor","data":{"monitor_id":"mon_1","balance_id":"   "}}`)},
+		})
+
+		assert.Empty(t, evaluated)
+	})
+}
+
+// insertHandoffsInOwnTx runs the writer's in-transaction insert on its own, so a test can
+// exercise the statement without driving a whole ledger mutation through it.
+//
+// It commits, because the point of every assertion below is what is DURABLE afterwards.
+func insertHandoffsInOwnTx(t *testing.T, ds Datasource, balances []*model.Balance) {
+	t.Helper()
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	require.NoError(t, insertBalanceMonitorHandoffsInTx(context.Background(), tx, balances))
+	require.NoError(t, tx.Commit())
+}
+
+// countHandoffsForBalance returns how many handoff rows exist for a balance.
+func countHandoffsForBalance(t *testing.T, ds Datasource, balanceID string) int {
+	t.Helper()
+
+	var count int
+	require.NoError(t, ds.Conn.QueryRow(
+		`SELECT COUNT(*) FROM blnk.balance_monitor_handoff WHERE balance_id = $1`, balanceID).Scan(&count))
+
+	return count
+}
+
+// storeEventPublishingConfigured installs a configuration that reports event publishing
+// as configured, for the duration of one test, and restores whatever was installed
+// before it.
+func storeEventPublishingConfigured(t *testing.T) {
+	t.Helper()
+
+	previous, _ := config.Fetch()
+	t.Cleanup(func() {
+		if previous == nil {
+			config.ConfigStore = atomic.Value{}
+
+			return
+		}
+		config.ConfigStore.Store(previous)
+	})
+
+	replacement := config.Configuration{}
+	if previous != nil {
+		replacement = *previous
+	}
+	if !replacement.EventPublishingConfigured() {
+		replacement.Kafka.Brokers = []string{"localhost:9092"}
+	}
+
+	config.ConfigStore.Store(&replacement)
+}
+
+// stubMonitorAlertCapture installs a BalanceMonitorAlertCapture for the duration of one
+// test and restores whatever was registered before it.
+//
+// Parameters:
+//   - t *testing.T: the test, for cleanup registration.
+//   - capture BalanceMonitorAlertCapture: the capture to install; nil reaches the
+//     handoff fallback.
+func stubMonitorAlertCapture(t *testing.T, capture BalanceMonitorAlertCapture) {
+	t.Helper()
+
+	previous := registeredBalanceMonitorAlertCapture()
+	RegisterBalanceMonitorAlertCapture(capture)
+	t.Cleanup(func() { RegisterBalanceMonitorAlertCapture(previous) })
+}
+
+// monitorAlertRowFor builds the row a real capture would build for one crossing,
+// without importing the root package.
+func monitorAlertRowFor(balance *model.Balance, monitor model.BalanceMonitor) *model.EventOutbox {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"event": model.EventTypeBalanceMonitor,
+		"data":  monitor,
+	})
+
+	return &model.EventOutbox{
+		EventID:       model.NewEventID(),
+		EventType:     model.EventTypeBalanceMonitor,
+		AggregateID:   monitor.MonitorID,
+		PartitionKey:  balance.LedgerID,
+		LedgerID:      balance.LedgerID,
+		Topic:         "blnk.balances",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       payload,
+		OccurredAt:    time.Now().UTC(),
+		Status:        model.OutboxStatusPending,
+	}
+}
+
+// countMonitorAlertsForLedger returns how many balance.monitor event rows exist for a ledger.
+//
+// The ledger is the right predicate because it is this event type's partition key and ledger
+// column; the alert's aggregate is the MONITOR, so a balance-keyed count would find nothing.
+func countMonitorAlertsForLedger(t *testing.T, ds Datasource, ledgerID string) int {
+	t.Helper()
+
+	var count int
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT COUNT(*) FROM blnk.event_outbox WHERE ledger_id = $1 AND event_type = $2
+	`, ledgerID, model.EventTypeBalanceMonitor).Scan(&count))
+
+	return count
+}
+
+// TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction
+// is the same-transaction assertion for `balance.monitor`, and it is the whole point of the
+// in-transaction capture.
+func TestRecordBalanceMonitorEvaluation_InsertsTheCanonicalAlertRowInTheMutationTransaction(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	captured := 0
+	stubMonitorAlertCapture(t, func(_ context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+		captured++
+
+		return monitorAlertRowFor(balance, monitor), nil
+	})
+
+	// The fixture's condition is balance >= 100 at precision 100, so this balance crosses it.
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, nil)
+
+	assert.Equal(t, 1, captured,
+		"the writer must evaluate the monitor itself and ask the capture to build exactly one row")
+	assert.Equal(t, 1, countMonitorAlertsForLedger(t, ds, ledgerID),
+		"the canonical balance.monitor row must be committed by the transaction that moved the balance")
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID),
+		"a handoff written alongside the canonical row would have the processor publish the same "+
+			"crossing a second time under a different event id")
+}
+
+// TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet asserts the
+// writer does not pay for a monitor that did not fire.
+//
+// This is strictly less write amplification than the handoff it replaces.
+func TestRecordBalanceMonitorEvaluation_WritesNothingWhenNoConditionIsMet(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	asked := 0
+	stubMonitorAlertCapture(t, func(_ context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+		asked++
+
+		return monitorAlertRowFor(balance, monitor), nil
+	})
+
+	// Below the fixture's >= 100 threshold, so the condition is not met.
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(1)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, nil)
+
+	assert.Zero(t, asked,
+		"the capture must be reached once per CROSSING, not once per monitored balance")
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID))
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID))
+}
+
+// TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered
+// asserts the fallback that keeps a Datasource built without the root service correct.
+func TestRecordBalanceMonitorEvaluation_FallsBackToTheHandoffWithNoCaptureRegistered(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	stubMonitorAlertCapture(t, nil)
+
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, nil)
+
+	assert.Equal(t, 1, countHandoffsForBalance(t, ds, balanceID),
+		"with no capture registered the movement must still commit its evaluation's inputs")
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID),
+		"and it cannot have built a canonical row, because building one is what it lacks")
+}
+
+// TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated
+// asserts the second gate: the pre-write pass and the writer must not both capture one
+// crossing.
+func TestRecordBalanceMonitorEvaluation_SuppressesItselfForABalanceTheCallerEvaluated(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	asked := 0
+	stubMonitorAlertCapture(t, func(_ context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+		asked++
+
+		return monitorAlertRowFor(balance, monitor), nil
+	})
+
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	// The caller's own alert for this balance, shaped exactly as balancesAlreadyEvaluatedInTx
+	// reads it: the balance id inside the marshalled monitor payload.
+	callerPayload, err := json.Marshal(map[string]interface{}{
+		"event": model.EventTypeBalanceMonitor,
+		"data":  map[string]interface{}{"balance_id": balanceID},
+	})
+	require.NoError(t, err)
+
+	recordEvaluationInOwnTx(t, ds, []*model.Balance{moved}, []*model.EventOutbox{
+		{EventType: model.EventTypeBalanceMonitor, Payload: callerPayload},
+	})
+
+	assert.Zero(t, asked, "the writer must not evaluate a balance the caller already evaluated")
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID))
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID),
+		"the caller's own row is inserted by the writer's event loop, not by this gate")
+}
+
+// TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails asserts
+// that a capture failure fails the WRITE.
+func TestCaptureBalanceMonitorAlertsInTx_AbandonsTheMutationWhenTheCaptureFails(t *testing.T) {
+	ds := openRealTestDB(t)
+	storeEventPublishingConfigured(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	stubMonitorAlertCapture(t, func(context.Context, *model.Balance, model.BalanceMonitor) (*model.EventOutbox, error) {
+		return nil, errors.New("the payload could not be serialized")
+	})
+
+	moved := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	moved.InitializeBalanceFields()
+	moved.Balance = big.NewInt(4242)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	err = recordBalanceMonitorEvaluation(context.Background(), ds, tx, trace.SpanFromContext(context.Background()),
+		[]*model.Balance{moved}, nil)
+	require.Error(t, err, "a capture failure must be returned so the writer rolls back")
+	assert.Contains(t, err.Error(), "balance monitor alert",
+		"the error must name what failed, or an operator reads it as an unrelated statement error")
+
+	require.NoError(t, tx.Rollback())
+
+	assert.Equal(t, 0, countMonitorAlertsForLedger(t, ds, ledgerID))
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID),
+		"a failed capture must not silently fall back to the handoff: the mutation is refused instead")
+}
+
+// TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction guards the one
+// mistake that would look like it worked.
+func TestCaptureBalanceMonitorAlertsInTx_RefusesToWriteOutsideATransaction(t *testing.T) {
+	_, _, err := captureBalanceMonitorAlertsInTx(context.Background(), Datasource{}, nil,
+		[]*model.Balance{{BalanceID: "bln_x"}},
+		func(context.Context, *model.Balance, model.BalanceMonitor) (*model.EventOutbox, error) {
+			return nil, nil
+		})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Failed to capture balance monitor alerts")
+}
+
+// recordEvaluationInOwnTx runs the writer's monitor gate inside a transaction of its own and
+// commits it, so a row read back afterwards is one the gate committed.
+func recordEvaluationInOwnTx(t *testing.T, ds Datasource, balances []*model.Balance, capturedEvents []*model.EventOutbox) {
+	t.Helper()
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	require.NoError(t, recordBalanceMonitorEvaluation(context.Background(), ds, tx,
+		trace.SpanFromContext(context.Background()), balances, capturedEvents))
+	require.NoError(t, tx.Commit())
+}
+
+// TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance is the assertion
+// that makes this affordable on the money path.
+//
+// The overwhelming majority of balances carry no monitor.
+func TestInsertBalanceMonitorHandoffsInTx_WritesOnlyForAMonitoredBalance(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	monitored, monitoredLedger := monitoredTestBalance(t, ds, true)
+	unmonitored, _ := monitoredTestBalance(t, ds, false)
+
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{
+		{BalanceID: monitored, LedgerID: monitoredLedger},
+		{BalanceID: unmonitored},
+	})
+
+	assert.Equal(t, 1, countHandoffsForBalance(t, ds, monitored),
+		"a monitored balance must get its evaluation intent recorded")
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, unmonitored),
+		"an unmonitored balance must write nothing at all, or the money path pays for every transaction")
+}
+
+// TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger asserts the row
+// carries everything the evaluation needs, so the evaluator can run in another process
+// and judge the state the transaction actually wrote — against the definitions that
+// were in force when it did.
+func TestInsertBalanceMonitorHandoffsInTx_StoresBothSnapshotsAndTheLedger(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	written := &model.Balance{BalanceID: balanceID, LedgerID: ledgerID}
+	written.InitializeBalanceFields()
+	written.Balance = big.NewInt(4242)
+
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{written})
+
+	var storedLedger sql.NullString
+	var snapshot, monitorSnapshot []byte
+	var status string
+	var attempts, maxAttempts, captured int
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT ledger_id, balance_snapshot, monitor_snapshot, status, attempts, max_attempts, events_captured
+		FROM blnk.balance_monitor_handoff WHERE balance_id = $1
+	`, balanceID).Scan(&storedLedger, &snapshot, &monitorSnapshot, &status, &attempts, &maxAttempts, &captured))
+
+	assert.Equal(t, ledgerID, storedLedger.String,
+		"the ledger travels on the row so the alert is attributable without a second read")
+	assert.Equal(t, model.OutboxStatusPending, status)
+	assert.Zero(t, attempts)
+	assert.Positive(t, maxAttempts, "the column default must supply a budget")
+	assert.Zero(t, captured)
+
+	decoded := &model.Balance{}
+	require.NoError(t, json.Unmarshal(snapshot, decoded))
+	require.NotNil(t, decoded.Balance)
+	assert.Equal(t, 0, decoded.Balance.Cmp(big.NewInt(4242)),
+		"the snapshot must be the value the transaction wrote, not the value read back later")
+
+	// THE MONITOR DEFINITIONS, read inside the same transaction and stored beside the balance.
+	require.NotEmpty(t, monitorSnapshot,
+		"a row written without the monitor snapshot leaves the evaluator to re-read a mutable "+
+			"table, which is the divergence this column closes")
+
+	handoff := &model.BalanceMonitorHandoff{MonitorSnapshot: monitorSnapshot}
+	monitors, snapshotted, err := handoff.Monitors()
+	require.NoError(t, err)
+	require.True(t, snapshotted)
+	require.Len(t, monitors, 1, "the fixture registers exactly one monitor on this balance")
+	assert.Equal(t, balanceID, monitors[0].BalanceID)
+	assert.Equal(t, ">=", monitors[0].Condition.Operator,
+		"the CONDITION is what the evaluation judges, so it has to survive the round trip")
+	assert.InDelta(t, float64(100), monitors[0].Condition.Precision, 0,
+		"and so does the precision, which scales the value the condition is compared against")
+	require.NotNil(t, monitors[0].Condition.PreciseValue,
+		"the precise value must never decode to nil: CheckCondition dereferences it")
+	assert.Equal(t, 0, monitors[0].Condition.PreciseValue.Cmp(big.NewInt(100)))
+}
+
+// TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead is what keeps the
+// event payload bytes unchanged by the snapshot.
+//
+// The `balance.monitor` payload is the marshalled monitor object.
+func TestSelectBalanceMonitorsInTx_DecodesTheSameValuesAsTheLiveRead(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	balanceID, _ := monitoredTestBalance(t, ds, true)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	snapshotted, err := selectBalanceMonitorsInTx(context.Background(), tx, []string{balanceID})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	live, err := ds.GetBalanceMonitors(balanceID)
+	require.NoError(t, err)
+
+	require.Len(t, snapshotted[balanceID], len(live),
+		"the two reads must see the same population, or the snapshot evaluates a different set")
+	require.Len(t, live, 1)
+	assert.Equal(t, live, snapshotted[balanceID],
+		"EVERY DECODED FIELD must match the live read, or the balance.monitor payload bytes change "+
+			"and the dual-delivery equivalence guarantee breaks for a reason nothing asked for")
+
+	// AND THE NULL TOLERANCE, which is the one place the two deliberately differ. A monitor row
+	// with an unset precision must never roll back a ledger movement.
+	_, err = ds.Conn.Exec(
+		`UPDATE blnk.balance_monitors SET precision = NULL, precise_value = NULL WHERE balance_id = $1`,
+		balanceID,
+	)
+	require.NoError(t, err)
+
+	nullTx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = nullTx.Rollback() }()
+
+	tolerant, err := selectBalanceMonitorsInTx(context.Background(), nullTx, []string{balanceID})
+	require.NoError(t, err,
+		"a NULL precision must not fail this read: it runs inside the balance's own transaction, "+
+			"and refusing would roll back a money movement over an alerting side effect")
+	require.NoError(t, nullTx.Commit())
+
+	require.Len(t, tolerant[balanceID], 1)
+	assert.Zero(t, tolerant[balanceID][0].Condition.Precision,
+		"a NULL precision flattens to the zero the non-null case would have produced")
+	require.NotNil(t, tolerant[balanceID][0].Condition.PreciseValue,
+		"and the precise value is still non-nil, because CheckCondition dereferences it")
+	assert.Equal(t, 0, tolerant[balanceID][0].Condition.PreciseValue.Cmp(big.NewInt(0)))
+}
+
+// TestSelectBalanceMonitorsInTx_ReturnsNothingForAnUnmonitoredBalance pins the answer the
+// write-amplification guard is built on.
+func TestSelectBalanceMonitorsInTx_ReturnsNothingForAnUnmonitoredBalance(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	unmonitored, _ := monitoredTestBalance(t, ds, false)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	monitors, err := selectBalanceMonitorsInTx(context.Background(), tx, []string{unmonitored})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	assert.Empty(t, monitors[unmonitored],
+		"an unmonitored balance must be absent from the map, which is what stops a handoff row "+
+			"being written for it")
+
+	// An empty id list is a no-op rather than a statement, so the common no-balances path pays
+	// nothing at all.
+	none, err := selectBalanceMonitorsInTx(context.Background(), nil, nil)
+	require.NoError(t, err, "an empty list must not require a transaction, because it makes no read")
+	assert.Empty(t, none)
+}
+
+// TestInsertBalanceMonitorHandoffsInTx_RollsBackWithItsTransaction is the atomicity assertion.
+//
+// The whole mechanism rests on the intent sharing the balance's transaction. If the row survived
+// a rollback, an alert would be evaluated for a movement that never happened.
+func TestInsertBalanceMonitorHandoffsInTx_RollsBackWithItsTransaction(t *testing.T) {
+	ds := openRealTestDB(t)
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+
+	tx, err := ds.Conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault})
+	require.NoError(t, err)
+	require.NoError(t, insertBalanceMonitorHandoffsInTx(context.Background(), tx,
+		[]*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}}))
+	require.NoError(t, tx.Rollback())
+
+	assert.Equal(t, 0, countHandoffsForBalance(t, ds, balanceID),
+		"a rolled-back movement must leave no evaluation intent behind")
+}
+
+// TestInsertBalanceMonitorHandoffsInTx_RefusesToWriteOutsideATransaction protects the
+// guarantee from a caller that would silently break it.
+//
+// A handoff written on its own connection would look exactly like a working one and
+// would reintroduce the crash window the mechanism exists to close.
+func TestInsertBalanceMonitorHandoffsInTx_RefusesToWriteOutsideATransaction(t *testing.T) {
+	err := insertBalanceMonitorHandoffsInTx(context.Background(), nil,
+		[]*model.Balance{{BalanceID: "bln_anything"}})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Failed to record balance monitor handoffs")
+}
+
+// TestBalanceMonitorHandoffClaim_LeasesFIFOAndSkipsHeldRows covers the three properties the
+// claim query is built for: oldest first, an incremented attempt, and a lease that another
+// claimer respects.
+func TestBalanceMonitorHandoffClaim_LeasesFIFOAndSkipsHeldRows(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	// DRAINED FIRST, and this is not tidying. The claim is global and strictly
+	// oldest-first, so pending rows left by earlier tests in this package would be claimed
+	// ahead of this test's and a batch-size assertion would see none of its own rows.
+	drainPendingHandoffs(t, ds)
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	for i := 0; i < 3; i++ {
+		insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+	}
+
+	first, err := ds.ClaimPendingBalanceMonitorHandoffs(ctx, 2, time.Minute)
+	require.NoError(t, err)
+	claimed := handoffsForBalance(first, balanceID)
+	require.Len(t, claimed, 2, "the batch size must bound the claim")
+
+	assert.False(t, claimed[1].CreatedAt.Before(claimed[0].CreatedAt),
+		"the batch must be returned oldest first, or a balance's evaluations run out of order")
+	assert.Equal(t, 1, claimed[0].Attempts, "the claim itself counts as the attempt")
+	assert.Equal(t, model.OutboxStatusProcessing, claimed[0].Status)
+	require.NotNil(t, claimed[0].LockedUntil)
+	assert.True(t, claimed[0].LockedUntil.After(time.Now()), "the lease must be in the future")
+
+	second, err := ds.ClaimPendingBalanceMonitorHandoffs(ctx, 10, time.Minute)
+	require.NoError(t, err)
+	remaining := handoffsForBalance(second, balanceID)
+	require.Len(t, remaining, 1, "a leased row must not be claimed again while the lease holds")
+	assert.NotEqual(t, claimed[0].HandoffID, remaining[0].HandoffID)
+}
+
+// TestClaimPendingBalanceMonitorHandoffQuery_KeepsTheShapeItsCorrectnessDependsOn
+// asserts the two clauses whose absence is invisible until the conditions that need
+// them occur.
+//
+//   - Without MATERIALIZED, the candidate selection is a semi-join subplan the planner
+//     may re-evaluate, and because this UPDATE writes `attempts` — the very column that
+//     subplan filters on — each re-evaluation applies the LIMIT again.
+//   - Without FOR UPDATE SKIP LOCKED, two processors block on each other instead of
+//     taking disjoint batches, which converts horizontal scaling into serialisation.
+//
+// A behavioural test cannot reliably reach either state, so the shape is asserted
+// directly.
+func TestClaimPendingBalanceMonitorHandoffQuery_KeepsTheShapeItsCorrectnessDependsOn(t *testing.T) {
+	assert.Contains(t, claimPendingBalanceMonitorHandoffQuery, "AS MATERIALIZED",
+		"the candidate selection must be materialised, or the batch size is a hint rather than a bound")
+	assert.Contains(t, claimPendingBalanceMonitorHandoffQuery, "FOR UPDATE SKIP LOCKED",
+		"two processors must take disjoint batches rather than block on one another")
+	assert.Contains(t, claimPendingBalanceMonitorHandoffQuery, "attempts = attempts + 1",
+		"the claim itself must spend an attempt, or a row that kills its processor is retried for ever")
+	assert.Contains(t, claimPendingBalanceMonitorHandoffQuery, "ORDER BY created_at ASC, id ASC",
+		"UPDATE ... RETURNING does not preserve the inner order, so the batch is re-sorted to stay FIFO")
+}
+
+// drainPendingHandoffs leases every currently claimable handoff far into the future.
+//
+// The claim query is global and oldest-first, so a test that wants to reason about ITS
+// rows has to move everything older out of the way.
+func drainPendingHandoffs(t *testing.T, ds Datasource) {
+	t.Helper()
+
+	for {
+		claimed, err := ds.ClaimPendingBalanceMonitorHandoffs(context.Background(), 500, time.Hour)
+		require.NoError(t, err)
+		if len(claimed) == 0 {
+			return
+		}
+	}
+}
+
+// handoffsForBalance filters a claim batch down to one balance's rows.
+//
+// The database is shared with other tests and with sibling clones, so a claim
+// legitimately returns rows this test knows nothing about.
+func handoffsForBalance(handoffs []model.BalanceMonitorHandoff, balanceID string) []model.BalanceMonitorHandoff {
+	filtered := make([]model.BalanceMonitorHandoff, 0, len(handoffs))
+	for _, handoff := range handoffs {
+		if handoff.BalanceID == balanceID {
+			filtered = append(filtered, handoff)
+		}
+	}
+
+	return filtered
+}
+
+// TestCompleteBalanceMonitorHandoffWithEvents_WritesTheAlertAndTheCompletionTogether is the
+// Same-transaction assertion at the repository boundary.
+func TestCompleteBalanceMonitorHandoffWithEvents_WritesTheAlertAndTheCompletionTogether(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+
+	claimed, err := ds.ClaimPendingBalanceMonitorHandoffs(ctx, 50, time.Minute)
+	require.NoError(t, err)
+	handoff := handoffsForBalance(claimed, balanceID)
+	require.Len(t, handoff, 1)
+
+	event := monitorAlertRow(handoff[0].HandoffID, ledgerID)
+	require.NoError(t, ds.CompleteBalanceMonitorHandoffWithEvents(ctx, handoff[0].HandoffID,
+		[]*model.EventOutbox{event}))
+
+	status, captured, processed := handoffState(t, ds, handoff[0].HandoffID)
+	assert.Equal(t, model.OutboxStatusCompleted, status)
+	assert.Equal(t, 1, captured, "the count distinguishes an alert that fired from one that did not")
+	assert.True(t, processed.Valid, "a terminal row must record when it became terminal")
+
+	var storedType string
+	require.NoError(t, ds.Conn.QueryRow(
+		`SELECT event_type FROM blnk.event_outbox WHERE event_id = $1`, event.EventID).Scan(&storedType))
+	assert.Equal(t, "balance.monitor", storedType,
+		"the alert must be durable in the same transaction that completed the handoff")
+}
+
+// TestCompleteBalanceMonitorHandoffWithEvents_IsIdempotentForARepeatedEvaluation is
+// what lets the completion skip a fence.
+//
+// A lapsed lease can let two processors evaluate one handoff.
+func TestCompleteBalanceMonitorHandoffWithEvents_IsIdempotentForARepeatedEvaluation(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+
+	claimed, err := ds.ClaimPendingBalanceMonitorHandoffs(ctx, 50, time.Minute)
+	require.NoError(t, err)
+	handoff := handoffsForBalance(claimed, balanceID)
+	require.Len(t, handoff, 1)
+
+	event := monitorAlertRow(handoff[0].HandoffID, ledgerID)
+	require.NoError(t, ds.CompleteBalanceMonitorHandoffWithEvents(ctx, handoff[0].HandoffID,
+		[]*model.EventOutbox{event}))
+
+	// The SAME derived row again, exactly as a second evaluation would produce it.
+	repeat := monitorAlertRow(handoff[0].HandoffID, ledgerID)
+	require.NoError(t, ds.CompleteBalanceMonitorHandoffWithEvents(ctx, handoff[0].HandoffID,
+		[]*model.EventOutbox{repeat}),
+		"a repeated evaluation must be absorbed, not reported as a failure that schedules a third")
+
+	var alerts int
+	require.NoError(t, ds.Conn.QueryRow(
+		`SELECT COUNT(*) FROM blnk.event_outbox WHERE event_id = $1`, event.EventID).Scan(&alerts))
+	assert.Equal(t, 1, alerts, "one firing must be one alert however many times it is evaluated")
+}
+
+// TestCompleteBalanceMonitorHandoffWithEvents_CompletesWithNoAlerts records the common case.
+//
+// "Evaluated, nothing fired" is a result. Without it, that state is indistinguishable from
+// "never evaluated", which is the only question worth asking when an expected alert is missing.
+func TestCompleteBalanceMonitorHandoffWithEvents_CompletesWithNoAlerts(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+
+	claimed, err := ds.ClaimPendingBalanceMonitorHandoffs(ctx, 50, time.Minute)
+	require.NoError(t, err)
+	handoff := handoffsForBalance(claimed, balanceID)
+	require.Len(t, handoff, 1)
+
+	require.NoError(t, ds.CompleteBalanceMonitorHandoffWithEvents(ctx, handoff[0].HandoffID, nil))
+
+	status, captured, _ := handoffState(t, ds, handoff[0].HandoffID)
+	assert.Equal(t, model.OutboxStatusCompleted, status)
+	assert.Zero(t, captured)
+}
+
+// TestMarkBalanceMonitorHandoffFailed_KeepsTheBudgetUnlessThePermanentFlagIsSet covers both
+// arms of the classification the evaluator supplies.
+func TestMarkBalanceMonitorHandoffFailed_KeepsTheBudgetUnlessThePermanentFlagIsSet(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+
+	claimed, err := ds.ClaimPendingBalanceMonitorHandoffs(ctx, 50, time.Minute)
+	require.NoError(t, err)
+	rows := handoffsForBalance(claimed, balanceID)
+	require.Len(t, rows, 2)
+
+	require.NoError(t, ds.MarkBalanceMonitorHandoffFailed(ctx, rows[0].HandoffID, "connection reset", false))
+	status, _, processed := handoffState(t, ds, rows[0].HandoffID)
+	assert.Equal(t, model.OutboxStatusPending, status,
+		"a retryable failure must return the row to pending so the next poll re-claims it")
+	assert.False(t, processed.Valid, "a row that is coming back is not processed")
+
+	require.NoError(t, ds.MarkBalanceMonitorHandoffFailed(ctx, rows[1].HandoffID, "snapshot will not decode", true))
+	status, _, processed = handoffState(t, ds, rows[1].HandoffID)
+	assert.Equal(t, model.OutboxStatusFailed, status,
+		"a permanent failure must not spend five more polls reaching the same conclusion")
+	assert.True(t, processed.Valid)
+}
+
+// TestCountBalanceMonitorHandoffByStatus_ReportsEveryPresentStatus underpins the operational
+// question the event outbox cannot answer: were a movement's monitors evaluated at all.
+func TestCountBalanceMonitorHandoffByStatus_ReportsEveryPresentStatus(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	balanceID, ledgerID := monitoredTestBalance(t, ds, true)
+	insertHandoffsInOwnTx(t, ds, []*model.Balance{{BalanceID: balanceID, LedgerID: ledgerID}})
+
+	before, err := ds.CountBalanceMonitorHandoffByStatus(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, before[model.OutboxStatusPending], int64(1),
+		"the pending row just written must be counted")
+}
+
+// handoffState reads the three fields the assertions above care about.
+func handoffState(t *testing.T, ds Datasource, handoffID string) (string, int, sql.NullTime) {
+	t.Helper()
+
+	var status string
+	var captured int
+	var processed sql.NullTime
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT status, events_captured, processed_at
+		FROM blnk.balance_monitor_handoff WHERE handoff_id = $1
+	`, handoffID).Scan(&status, &captured, &processed))
+
+	return status, captured, processed
+}
+
+// monitorAlertRow builds the alert row an evaluation would produce, with the DERIVED id.
+//
+// The id is derived here exactly as the evaluator derives it, which is what makes the
+// idempotence test above a test of the real mechanism rather than of a restated copy of it.
+func monitorAlertRow(handoffID, ledgerID string) *model.EventOutbox {
+	identity := model.BalanceMonitorEventIdentity(handoffID, "mon_"+handoffID)
+	payload := json.RawMessage(fmt.Sprintf(`{"event":"balance.monitor","data":{"monitor_id":%q}}`, "mon_"+handoffID))
+
+	return &model.EventOutbox{
+		EventID:       model.DeriveEventID(identity, "balance.monitor", model.SchemaVersionV1),
+		EventType:     "balance.monitor",
+		AggregateID:   ledgerID,
+		PartitionKey:  ledgerID,
+		LedgerID:      ledgerID,
+		Topic:         "blnk.balances",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       payload,
+		EventRaw:      payload,
+		OccurredAt:    time.Now().UTC(),
+		Status:        model.EventOutboxStatusPending,
+		MaxAttempts:   5,
+	}
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_CommitsTheOutcomeWithItsEvent is the
+// assertion for bulk_transaction.<status>.
+//
+// The batch has no batch-spanning transaction, so the summary is made atomic with the
+// coordinator's terminal transition instead.
+func TestFinalizeBulkTransactionBatchWithEvent_CommitsTheOutcomeWithItsEvent(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	require.NoError(t, ds.InsertBulkTransactionBatch(ctx, &model.BulkTransactionBatch{
+		BatchID: batchID, TransactionCount: 4, Atomic: true,
+	}))
+
+	event := bulkOutcomeRow(batchID, "applied")
+	performed, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusApplied, TransactionCount: 4}, event)
+
+	require.NoError(t, err)
+	assert.True(t, performed, "the first finalise performs the transition")
+
+	stored := bulkBatchState(t, ds, batchID)
+	assert.Equal(t, model.BulkBatchStatusApplied, stored.Status)
+	assert.Equal(t, event.EventID, stored.EventID,
+		"the coordinator must record which event carried the outcome, which is the proof of the pairing")
+	require.NotNil(t, stored.FinalizedAt)
+	assert.True(t, stored.IsTerminal())
+
+	var storedType string
+	require.NoError(t, ds.Conn.QueryRow(
+		`SELECT event_type FROM blnk.event_outbox WHERE event_id = $1`, event.EventID).Scan(&storedType))
+	assert.Equal(t, "bulk_transaction.applied", storedType)
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_IsIdempotentForTheSameOutcome is what makes
+// the retry safe.
+func TestFinalizeBulkTransactionBatchWithEvent_IsIdempotentForTheSameOutcome(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	require.NoError(t, ds.InsertBulkTransactionBatch(ctx, &model.BulkTransactionBatch{BatchID: batchID}))
+
+	outcome := &model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusInflight}
+	event := bulkOutcomeRow(batchID, "inflight")
+
+	performed, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID, outcome, event)
+	require.NoError(t, err)
+	require.True(t, performed)
+
+	performed, err = ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID, outcome, event)
+	require.NoError(t, err, "an already-recorded outcome must be reported as success")
+	assert.False(t, performed, "and it must say it did not perform the transition, so the caller stops")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingOutcome keeps two answers for
+// one batch from being silently reduced to one.
+func TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingOutcome(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	require.NoError(t, ds.InsertBulkTransactionBatch(ctx, &model.BulkTransactionBatch{BatchID: batchID}))
+
+	_, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusApplied},
+		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err)
+
+	_, err = ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusFailed},
+		bulkOutcomeRow(batchID, "failed"))
+
+	require.Error(t, err)
+	var apiErr apierror.APIError
+	require.True(t, errors.As(err, &apiErr))
+	assert.Equal(t, apierror.ErrConflict, apiErr.Code,
+		"a second, different outcome must be refused rather than overwriting the first")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch is the
+// replacement for the last standalone capture on a producer that has state to be atomic
+// with.
+func TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	event := bulkOutcomeRow(batchID, "applied")
+
+	performed, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{
+			BatchID:          batchID,
+			Status:           model.BulkBatchStatusApplied,
+			TransactionCount: 7,
+		},
+		event)
+
+	require.NoError(t, err,
+		"an unrecorded batch is adopted rather than refused: refusing it sends the producer to a "+
+			"capture that stands outside every transaction")
+	assert.True(t, performed, "the adoption recorded the outcome, so it counts as work performed")
+
+	// BOTH ROWS, or neither. The point of adoption is that the outcome record and its event
+	// share one commit, so the assertion has to be that both landed.
+	var storedStatus string
+	var storedCount int
+	var storedEventID string
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT status, transaction_count, event_id
+		FROM blnk.bulk_transaction_batches WHERE batch_id = $1
+	`, batchID).Scan(&storedStatus, &storedCount, &storedEventID))
+
+	assert.Equal(t, model.BulkBatchStatusApplied, storedStatus,
+		"the adopted row is written already-terminal")
+	assert.Equal(t, 7, storedCount, "and carries the outcome the producer computed")
+	assert.Equal(t, event.EventID, storedEventID,
+		"the event id is recorded so the outcome and its event stay joinable")
+
+	var events int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM blnk.event_outbox WHERE event_id = $1`, event.EventID).Scan(&events))
+	assert.Equal(t, 1, events, "the outcome event committed with the adopted row")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_AdoptionIsIdempotent covers the retry of an
+// adoption whose acknowledgement was lost.
+func TestFinalizeBulkTransactionBatchWithEvent_AdoptionIsIdempotent(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	outcome := &model.BulkTransactionBatch{
+		BatchID: batchID, Status: model.BulkBatchStatusApplied, TransactionCount: 2,
+	}
+
+	performed, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID, outcome,
+		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err)
+	require.True(t, performed)
+
+	performed, err = ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID, outcome,
+		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err, "the repeat finds the outcome already recorded and reports success")
+	assert.False(t, performed, "and reports that it performed no transition")
+
+	var events int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM blnk.event_outbox WHERE event_id = $1`,
+		bulkOutcomeRow(batchID, "applied").EventID).Scan(&events))
+	assert.Equal(t, 1, events, "one batch outcome must produce exactly one event")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingAdoptedOutcome keeps adoption
+// from overwriting an answer somebody else already recorded.
+func TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingAdoptedOutcome(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	_, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusApplied},
+		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err)
+
+	_, err = ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusFailed},
+		bulkOutcomeRow(batchID, "failed"))
+
+	require.Error(t, err, "two different outcomes for one batch must not both be accepted")
+	var apiErr apierror.APIError
+	require.True(t, errors.As(err, &apiErr))
+	assert.Equal(t, apierror.ErrConflict, apiErr.Code,
+		"the caller is told the state disagrees rather than silently having its answer discarded")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_RefusesANonTerminalOutcome keeps the
+// coordinator's one invariant enforceable.
+func TestFinalizeBulkTransactionBatchWithEvent_RefusesANonTerminalOutcome(t *testing.T) {
+	ds := openRealTestDB(t)
+
+	batchID := coordinatedTestBatchID(t, ds)
+	_, err := ds.FinalizeBulkTransactionBatchWithEvent(context.Background(), batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusProcessing},
+		bulkOutcomeRow(batchID, "processing"))
+
+	require.Error(t, err)
+
+	// APIError.Error() renders only "CODE: message" — the Details, which carry the offending
+	// status, are a separate field. Asserting on the code and the message is therefore the
+	// assertion that actually holds; a Contains on Error() would silently pass or fail for the
+	// wrong reason.
+	var apiErr apierror.APIError
+	require.True(t, errors.As(err, &apiErr))
+	assert.Equal(t, apierror.ErrInternalServer, apiErr.Code)
+	assert.Contains(t, apiErr.Message, "Failed to finalize the bulk transaction batch")
+	require.NotNil(t, apiErr.Details)
+	detail, ok := apiErr.Details.(error)
+	require.True(t, ok, "the offending status must travel in the details")
+	assert.Contains(t, detail.Error(), "not a terminal batch outcome")
+}
+
+// TestInsertBulkTransactionBatch_IsIdempotentOnTheBatchID keeps a retried request from failing a
+// batch because its coordinator was already recorded.
+func TestInsertBulkTransactionBatch_IsIdempotentOnTheBatchID(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batch := &model.BulkTransactionBatch{BatchID: coordinatedTestBatchID(t, ds), TransactionCount: 2}
+	require.NoError(t, ds.InsertBulkTransactionBatch(ctx, batch))
+	require.NoError(t, ds.InsertBulkTransactionBatch(ctx, batch),
+		"a repeated start must not fail the batch")
+}
+
+// TestCountUnfinalizedBulkTransactionBatches_CountsTheResidueBeyondTheGrace is the
+// visibility assertion for the one window the coordinator cannot close.
+//
+// A batch that began and never reported an outcome is not silent loss — it is a
+// countable state.
+func TestCountUnfinalizedBulkTransactionBatches_CountsTheResidueBeyondTheGrace(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	require.NoError(t, ds.InsertBulkTransactionBatch(ctx, &model.BulkTransactionBatch{BatchID: batchID}))
+
+	count, oldest, err := ds.CountUnfinalizedBulkTransactionBatches(ctx, 0)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, count, int64(1), "the batch just started is outstanding")
+	require.NotNil(t, oldest, "an outstanding batch must report when the oldest of them began")
+
+	// A grace period longer than the row's age must exclude it, or every in-flight batch is
+	// reported as stuck the moment it starts.
+	future, _, err := ds.CountUnfinalizedBulkTransactionBatches(ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Less(t, future, count,
+		"a batch younger than the grace period must not be counted as abandoned")
+}
+
+// bulkBatchState reads a coordinator row directly.
+func bulkBatchState(t *testing.T, ds Datasource, batchID string) model.BulkTransactionBatch {
+	t.Helper()
+
+	batch := model.BulkTransactionBatch{BatchID: batchID}
+	var errorMessage, eventID sql.NullString
+	var finalizedAt sql.NullTime
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT status, transaction_count, error_message, atomic, inflight, event_id, created_at, finalized_at
+		FROM blnk.bulk_transaction_batches WHERE batch_id = $1
+	`, batchID).Scan(&batch.Status, &batch.TransactionCount, &errorMessage, &batch.Atomic,
+		&batch.Inflight, &eventID, &batch.CreatedAt, &finalizedAt))
+
+	batch.ErrorMessage = errorMessage.String
+	batch.EventID = eventID.String
+	if finalizedAt.Valid {
+		at := finalizedAt.Time
+		batch.FinalizedAt = &at
+	}
+
+	return batch
+}
+
+// bulkOutcomeRow builds the outcome event row for a batch, with the derived id the producer
+// derives.
+func bulkOutcomeRow(batchID, status string) *model.EventOutbox {
+	eventType := "bulk_transaction." + status
+	payload := json.RawMessage(fmt.Sprintf(`{"event":%q,"data":{"batch_id":%q,"status":%q}}`,
+		eventType, batchID, status))
+
+	return &model.EventOutbox{
+		EventID:       model.DeriveEventID(batchID, eventType, model.SchemaVersionV1),
+		EventType:     eventType,
+		AggregateID:   batchID,
+		PartitionKey:  batchID,
+		Topic:         "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       payload,
+		EventRaw:      payload,
+		OccurredAt:    time.Now().UTC(),
+		Status:        model.EventOutboxStatusPending,
+		MaxAttempts:   5,
+	}
+}

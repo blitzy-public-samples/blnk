@@ -16,18 +16,160 @@ spec:
       labels:
         io.kompose.service: prometheus
     spec:
+      # THE SECOND HALF OF POD DISCOVERY, and the half that has no symptom of its own.
+      #
+      # prometheus-configmap.yaml discovers its targets with `kubernetes_sd_configs:
+      # role: pod` rather than static DNS names, because the server and worker are
+      # autoscaled between 2 and 10 replicas and a Service target load-balances — a
+      # static `server:5001` reaches one arbitrary pod per scrape, so per-process
+      # counters appear to reset and the other replicas' backlogs have no series at all.
+      # Pod discovery is therefore correct here.
+      #
+      # BOTH LINES BELOW ARE REQUIRED, AND EACH FAILS DIFFERENTLY.
+      #
+      #   serviceAccountName: without it the pod runs as the namespace's `default`
+      #   ServiceAccount, which the RoleBinding in prometheus-rbac.yaml does not bind
+      #   — so the API server answers 403 and discovery finds nothing.
+      #
+      #   automountServiceAccountToken: with it false there is no token file at
+      #   /var/run/secrets/kubernetes.io/serviceaccount/token at all, and Prometheus
+      #   logs `Cannot create service discovery … no such file or directory` once at
+      #   startup and then serves normally with zero targets.
+      serviceAccountName: prometheus
+      automountServiceAccountToken: true
+      # The prom/prometheus image already runs as nobody (65534), which the
+      # metrics-bearer-token mode below is chosen for. Stating it here makes it
+      # enforced rather than inherited: runAsNonRoot turns an image that is later
+      # rebuilt as root into a pod that refuses to start instead of one that quietly
+      # gains privilege. fsGroup matches so the TSDB emptyDir is writable.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - image: prom/prometheus:latest
+        # PINNED BY VERSION AND DIGEST. v3.13.2 is the release the alert rules in
+        # alerts/blnk-kafka-alerts.yml were validated against with `promtool check
+        # rules`, so this is the version they are known to parse under rather than
+        # whatever `latest` resolves to on the next image pull. Prometheus 3 rejected
+        # some Prometheus 2 configuration outright, which is exactly the breakage a
+        # floating tag introduces silently — and a Prometheus that fails to load its
+        # rules alerts on nothing, which looks identical to a healthy system.
+        - image: prom/prometheus:v3.13.2@sha256:1147c92841726a6fef55fe6124491d6f85480f8de204f7d420304ca5bbd0a8f7
           name: prometheus
           ports:
-            - containerPort: 9090
-          resources: {}
+            - name: web
+              containerPort: 9090
+          # Prometheus sizes its memory by active series and its retention window. With
+          # no limit it was BestEffort and first to be evicted under node pressure —
+          # which silences every alert in alerts/blnk-kafka-alerts.yml, including the
+          # dead-letter and consumer-lag rules whose whole purpose is to be heard when
+          # things are going wrong. Requests and limits are equal for memory because a
+          # TSDB that is over-committed is OOMKilled mid-compaction.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # /-/ready reports that the TSDB is loaded and Prometheus is serving; /-/healthy
+          # reports only that the process is up. Using the right one for each probe is
+          # what stops a long WAL replay from being restarted halfway through as a
+          # liveness failure while still keeping it out of the Service until it can
+          # answer queries.
+          startupProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: web
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           volumeMounts:
+            # The TSDB. readOnlyRootFilesystem is only viable with this: Prometheus
+            # writes its WAL and blocks under /prometheus, which is inside the image's
+            # root filesystem by default. emptyDir and not a PVC because this stack's
+            # Prometheus is the local alerting path, not the long-term store — the data
+            # is worth a pod lifetime, and a PVC would pin the Deployment to one node.
+            - name: prometheus-data
+              mountPath: /prometheus
             - name: prometheus-config
               mountPath: /etc/prometheus/prometheus.yml
               subPath: prometheus.yml
+            # Projects the ConfigMap's blnk-kafka-alerts.yml key into the directory the
+            # rule_files glob scans, /etc/prometheus/alerts/*.yml, which is what
+            # actually loads all 13 Kafka alerts. A second subPath mount on the SAME
+            # volume keeps the scrape-config mount above untouched. subPath must equal
+            # the ConfigMap data key and mountPath must fall inside that glob: a
+            # mismatch loads no rules and raises no error, surfacing only as an empty
+            # /api/v1/rules.
+            - name: prometheus-config
+              mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
+              subPath: blnk-kafka-alerts.yml
+            # The Kubernetes-only infrastructure rules, which live in a key of their own
+            # precisely because they are NOT part of the mirrored file above — they read
+            # kubelet_volume_stats_*, which has no equivalent in the Compose stack. A
+            # third subPath mount on the same volume, into the same directory the
+            # rule_files glob scans, so both rule files load. Same failure mode as the
+            # mount above if the two names disagree: no rules, no error, and an
+            # /api/v1/rules that is simply short.
+            - name: prometheus-config
+              mountPath: /etc/prometheus/alerts/blnk-infra-alerts.yml
+              subPath: blnk-infra-alerts.yml
+            # The metrics bearer token both scrape jobs authenticate with. Without it
+            # Prometheus scrapes an endpoint that answers every unauthenticated request
+            # with an error, so no series is collected and none of the 13 Kafka alerts
+            # can ever fire — a failure that looks exactly like health, because an
+            # absent alert and a healthy system are indistinguishable.
+            - name: metrics-bearer-token
+              mountPath: /etc/prometheus/secrets
+              readOnly: true
       restartPolicy: Always
       volumes:
+        - name: prometheus-data
+          emptyDir: {}
         - name: prometheus-config
           configMap:
             name: prometheus-config
+        # Secret, never ConfigMap. The token is a credential: a ConfigMap is stored
+        # unencrypted, is readable by anything holding get-configmap in the namespace,
+        # and is printed in full by `kubectl describe`.
+        - name: metrics-bearer-token
+          secret:
+            secretName: blnk-metrics-token
+            # items pins the filename, so the mounted path is exactly the
+            # credentials_file path in prometheus-configmap.yaml no matter what
+            # else the Secret gains later. Without it, every key in the Secret
+            # would appear in the directory and a renamed key would break the
+            # scrape with a file-not-found at config load.
+            items:
+              - key: metrics-bearer-token
+                path: metrics-bearer-token
+            # 0444, not 0400. Secret volume files are owned by root, and the
+            # prom/prometheus image runs as nobody (65534) — under 0400 the process
+            # could not read its own credential, and Prometheus would crash-loop on a
+            # permission error that reads like a missing file. 0444 is safe here because
+            # the volume exists only inside this pod's mount namespace; the token is not
+            # exposed to anything that could not already read the Secret.
+            defaultMode: 0444

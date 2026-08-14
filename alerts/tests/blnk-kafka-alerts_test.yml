@@ -1,0 +1,962 @@
+# Copyright 2024 Blnk Finance Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Unit tests for alerts/blnk-kafka-alerts.yml. Every rule in that file has a case here.
+#
+#     make alerts_test          # check rules + test rules, which CI also runs
+#     promtool test rules alerts/tests/blnk-kafka-alerts_test.yml
+#
+# WHY THIS FILE EXISTS. `promtool check rules` proves a rule file PARSES and that its
+# expressions are valid PromQL. It cannot prove a rule FIRES, and the two are
+# independent: SubscriberSettlementNotProgressing passed `check rules` for its entire
+# life while being unable to fire on the one deployment it exists for. Its expression was
+#
+#     blnk_subscribers_settlement_outstanding > 0
+#       and rate(blnk_subscribers_obligations_settled_total[30m]) == 0
+#
+# and the counter on the right has NO SERIES until the settlement pass discharges its
+# first obligation — OpenTelemetry exports the attribute sets that have been written, not
+# every instrument declared. `and` against an empty vector yields an empty vector, so a
+# growing backlog on a settler that had never settled anything produced no alert and no
+# error. A rule that is silent because nothing is wrong and a rule that is silent because
+# its right-hand series does not exist look identical from outside, which is what made
+# the defect survive review of the expression itself.
+#
+# WHAT EACH CASE ASSERTS. Every rule is driven past its own threshold and the alert is
+# asserted to fire, with its full rendered labels and annotations; and every rule is also
+# asserted NOT to fire below the threshold or inside its `for` duration. Both directions
+# are needed. A rule that only fires proves nothing about the boundary — one written `>=`
+# where the requirement says "more than" would pass a firing-only test while paging on a
+# value that is exactly at the limit — and a `for` duration is invisible to any test that
+# evaluates once.
+#
+# The rendered annotations are asserted in full rather than skipped, because a
+# notification a responder cannot act on is the same outage as no notification. That
+# includes the interpolated values: 901 seconds rendering as "15m 1s" is what proves
+# humanizeDuration is applied to an age, and the runbook_url resolving to its absolute
+# default is what proves the `with $externalLabels` fallback works where it is read — in
+# an email or a PagerDuty incident, not in a checkout.
+#
+# Alert-rule tests are used rather than promql_expr_test on purpose: they evaluate the
+# rule AS LOADED from the rule file, including its `for` duration, so the assertion is
+# about the deployed rule rather than about an expression restated here. A test that
+# quoted the expression back would pass no matter what the rule said.
+#
+# WHY THIS FILE IS IN A SUBDIRECTORY. prometheus.yml loads rules with the glob
+# /etc/prometheus/alerts/*.yml against the bind-mounted ./alerts directory, and a
+# unit-test file is not a rule file: `promtool check rules` rejects it outright ("field
+# tests not found in type rulefmt.RuleGroups"), so Prometheus would refuse the whole
+# configuration and every one of the fifteen rules would fail to load. The glob does not
+# recurse, so ./alerts/tests is inside the same mount and out of its reach.
+# TestPrometheusAlertsDirectory_HoldsOnlyRuleFiles keeps it that way.
+rule_files:
+  - ../blnk-kafka-alerts.yml
+
+# Matches the group's own `interval: 30s`, so a `for:` duration means the same number of
+# consecutive evaluations here as it does in Prometheus.
+evaluation_interval: 30s
+
+tests:
+  # ------------------------------------------------------------------------
+  # THIS IS ONE OF THE TWO THRESHOLDS THE ACCEPTANCE CRITERIA NAME: a dead-letter
+  # entry older than 15 minutes must alert. Both directions of the boundary are
+  # asserted, because a rule that fires at 900 as well as at 901 would page on an
+  # entry that is exactly at the limit rather than past it.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the dead-letter age alert fires one second past fifteen minutes
+    input_series:
+      # Exactly 900 for the first two and a half minutes, then 901.
+      - series: 'blnk_dlt_oldest_message_age_seconds{job="blnk-server",instance="blnk-server:5001",topic="blnk.transactions.dlt"}'
+        values: '900+0x4 901+0x8'
+    alert_rule_test:
+      # exactly 900 seconds is not MORE than 900, so nothing fires
+      - eval_time: 2m
+        alertname: DeadLetterMessageStuck
+        exp_alerts: []
+      # one second past the threshold, with no dwell to serve, so it fires at once
+      - eval_time: 3m
+        alertname: DeadLetterMessageStuck
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'critical'
+              topic: 'blnk.transactions.dlt'
+            exp_annotations:
+              summary: >-
+                Dead-lettered events unresolved for more than 15 minutes
+              description: >-
+                The oldest unresolved dead-letter entry destined for blnk.transactions.dlt (instance
+                blnk-server:5001) has been waiting 15m 1s. This value is an age, not a count: one
+                entry this old is enough to fire. REMEDIATION IS STATUS-DEPENDENT, so read the
+                status first with GET /events/dead-letter. A 'dead_lettered' entry is on its topic
+                and is replayable: triage it and replay it with POST
+                /events/dead-letter/:event_id/replay. A 'failed' entry is NOT replayable yet — its
+                retry budget is spent but the dead-letter write itself has not completed, so there
+                may be no message on the topic at all and replay is refused with
+                EVENT_NOT_DEAD_LETTERED; restore broker reachability so the dead-letter write
+                completes, then replay. GET /events/stats reports how many are in each state.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#deadlettermessagestuck
+
+  # ------------------------------------------------------------------------
+  # THE COUNT BESIDE THE AGE. This rule is what makes a repair leg that cannot clear
+  # itself alertable at all: the legacy webhook leg's rows are webhook_pending, which
+  # neither the dead-letter inventory nor blnk_outbox_pending includes, so before it
+  # existed a leg that never drained had no series any rule could read. Both directions
+  # matter here for a different reason than on a threshold rule: zero must NOT fire,
+  # because zero is the reading every healthy deployment publishes on every tick, and a
+  # rule that fired on it would page every operator for ever.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the repair backlog alert fires on work owed for fifteen minutes and never on zero
+    input_series:
+      # Drained for the first two and a half minutes, then three rows owed and never
+      # cleared. The dwell therefore starts at t=150s and completes at t=1050s.
+      - series: 'blnk_events_repair_backlog{job="blnk-server",instance="blnk-server:5001",leg="dead_letter"}'
+        values: '0+0x4 3+0x60'
+    alert_rule_test:
+      # An explicit zero is the healthy reading, published every tick. It must be silent.
+      - eval_time: 2m
+        alertname: EventRepairBacklogStuck
+        exp_alerts: []
+      # Owed for seven and a half minutes: breaching, inside the dwell, so pending.
+      - eval_time: 10m
+        alertname: EventRepairBacklogStuck
+        exp_alerts: []
+      # Owed for fifteen minutes.
+      - eval_time: 18m
+        alertname: EventRepairBacklogStuck
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              leg: 'dead_letter'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                A relay repair leg has been unable to clear its backlog for 15 minutes
+              description: >-
+                The dead_letter repair leg on blnk-server:5001 has owed 3 row(s) for 15 minutes, and
+                its pass runs every second — so it is failing, not queued. This value is a COUNT of
+                rows, not an age. leg="dead_letter" is the urgent one: those rows spent their retry
+                budget AND their <topic>.dlt write also failed, so each is the only copy of an event
+                that reached no Kafka topic at all, and GET /events/dead-letter reports them as
+                'failed' rather than 'dead_lettered' — replay refuses them with
+                EVENT_NOT_DEAD_LETTERED until the dead-letter write lands. Restore write access to
+                the .dlt sibling (broker reachability, then the topic's existence and the producer's
+                WRITE ACL on it) and the pass clears them itself. leg="legacy_webhook" is rows whose
+                Kafka leg is finished and whose legacy webhook enqueue keeps failing during the
+                migration window: check Redis and the asynq queue; those rows are abandoned once they
+                spend their enqueue budget, so a backlog that clears itself with events undelivered
+                to webhook subscribers is the failure mode to look for. blnk_events_repair_saturated
+                tells you whether the pass is merely configured too slowly to catch up.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventrepairbacklogstuck
+
+  # ------------------------------------------------------------------------
+  # A CLAIM THAT DOES NOT COMPLETE. The healthy value is exactly zero, so this asserts
+  # the boundary that matters — no timeouts at all is silent, one is not — and the dwell,
+  # because a single cancelled claim during an autovacuum pass must not page while a plan
+  # that has regressed must. A counter rate rather than a gauge: the condition is an
+  # EVENT, and a gauge of "the last claim timed out" would clear itself on the next tick
+  # and be missed by every scrape in between.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the relay claim timeout alert fires on the first timeout, after its dwell
+    input_series:
+      # No timeouts for the first ten minutes, then one, and the counter stays there:
+      # a claim that timed out once and recovered is still a claim that published nothing.
+      - series: 'blnk_events_relay_claims_total{job="blnk-server",instance="blnk-server:5001",outcome="timeout"}'
+        values: '0+0x20 1+0x40'
+    alert_rule_test:
+      # A relay whose claims all complete: the rate is zero, and zero is not MORE than zero.
+      - eval_time: 2m
+        alertname: EventRelayClaimTimingOut
+        exp_alerts: []
+      # The timeout is now inside the rate window, but the dwell has not been served.
+      - eval_time: 11m
+        alertname: EventRelayClaimTimingOut
+        exp_alerts: []
+      # Past the two-minute dwell.
+      - eval_time: 13m
+        alertname: EventRelayClaimTimingOut
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              outcome: 'timeout'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                The event relay's outbox claim is timing out, so nothing is being published
+              description: >-
+                One or more event outbox claims on blnk-server:5001 were cancelled at their 15
+                second budget in the last 10 minutes. A cancelled claim returns NO rows, so the
+                relay published nothing for that tick — and because the events are still sitting in
+                the outbox, no dead-letter or lag rule can see it; watch blnk_outbox_pending rising
+                against a flat blnk_events_published_total for the effect. Read the p99 of
+                blnk_events_relay_claim_duration_seconds and the rows-per-claim ratio
+                (blnk_events_relay_claimed_rows_total over
+                blnk_events_relay_claims_total{outcome="rows"}) to see how far the claim has drifted
+                from its normal single-digit milliseconds. The usual causes are a table whose
+                dead-tuple population has outgrown autovacuum, or a very large claimable backlog
+                concentrated on very few partition keys; ANALYZE blnk.event_outbox and confirm the
+                claim is still index-driven before changing anything else.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventrelayclaimtimingout
+
+  # ------------------------------------------------------------------------
+  # THE SECOND ACCEPTANCE THRESHOLD: subscriber consumer lag above 10,000 messages.
+  # The dwell is asserted as well as the threshold. Lag is legitimately spiky, so
+  # `for: 2m` is what keeps a burst that self-corrects from paging; a rule that fired
+  # on the first breaching scrape would satisfy the threshold and defeat the dwell.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the consumer lag alert fires past ten thousand, after its dwell
+    input_series:
+      # Ten thousand exactly, then one message past it from t=150s.
+      - series: 'blnk_kafka_consumer_lag{job="blnk-server",instance="blnk-server:5001",subscriber="9f2c4a1e",group="4b7d0c93",topic="blnk.transactions"}'
+        values: '10000+0x4 10001+0x20'
+    alert_rule_test:
+      # exactly 10,000 is not MORE than 10,000
+      - eval_time: 2m
+        alertname: SubscriberConsumerLagHigh
+        exp_alerts: []
+      # breaching, but only for one evaluation: pending, not firing
+      - eval_time: 3m
+        alertname: SubscriberConsumerLagHigh
+        exp_alerts: []
+      # breaching for longer than the two-minute dwell
+      - eval_time: 5m
+        alertname: SubscriberConsumerLagHigh
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              group: '4b7d0c93'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+              subscriber: '9f2c4a1e'
+              topic: 'blnk.transactions'
+            exp_annotations:
+              summary: >-
+                Subscriber consumer group lag is above 10,000 messages
+              description: >-
+                Subscriber 9f2c4a1e (consumer group 4b7d0c93) is 10k messages behind the end of
+                topic blnk.transactions. Confirm the consumer is running and keeping up before
+                Kafka's retention window is reached. The subscriber and group labels are PSEUDONYMS,
+                not names: each is a truncated SHA-256 of the identifier, so a metric label never
+                carries a subscriber name into a dashboard or a notification. They are stable, so
+                the same subscriber always produces the same label. Resolve one by listing the
+                registry through GET /subscribers and hashing each subscriber_id the same way, or
+                search the service logs for the matching subscriber_id_hash field.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscriberconsumerlaghigh
+
+  # ------------------------------------------------------------------------
+  # The age, not the count, is what fires. A marker cleared by a retry inside the
+  # hour is routine, so the boundary is asserted from below as well.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: an unrevoked credential alerts one second past the hour
+    input_series:
+      - series: 'blnk_subscribers_oldest_revocation_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '3600+0x4 3601+0x8'
+    alert_rule_test:
+      # exactly an hour is not past it
+      - eval_time: 2m
+        alertname: SubscriberRevocationOutstanding
+        exp_alerts: []
+      # one second past the hour
+      - eval_time: 3m
+        alertname: SubscriberRevocationOutstanding
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'critical'
+            exp_annotations:
+              summary: >-
+                A subscriber Kafka credential has been awaiting revocation for over an hour
+              description: >-
+                Blnk has been unable to revoke a subscriber's SASL/SCRAM credential for 1h 0m 1s
+                (instance blnk-server:5001), so a live credential exists at the broker for a
+                principal no registry row records an issuance for. It is NOT attributed to a
+                subscriber here on purpose — a subscriber label would export a tenant identifier
+                into every notification. List the affected rows with GET
+                /subscribers?revocation_pending=true, which scans the whole registry and returns
+                each subscriber with its revocation_pending_at instant and the kafka_principal that
+                has to be revoked, oldest exposure first; if that scan reports the registry is
+                larger than its bound, read blnk.event_subscribers filtering on
+                revocation_pending_at instead. Then prefer the automatic settlement paths, because
+                both are safe and both clear the marker: re-issue the credential if the subscriber
+                should keep access, or deprovision it if it should not. Revoke by hand only if
+                neither applies: kafka-configs --alter --delete-config SCRAM-SHA-512 --entity-type
+                users --entity-name <kafka_principal>.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscriberrevocationoutstanding
+
+  # ------------------------------------------------------------------------
+  # A credential that may exist on the broker beyond what the registry records. Same
+  # hour-long grace as revocation, for the same reason: the automatic settlement
+  # paths clear it in seconds when they are working.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: an orphaned credential alerts one second past the hour
+    input_series:
+      - series: 'blnk_subscribers_oldest_credential_orphan_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '3600+0x4 3601+0x8'
+    alert_rule_test:
+      # exactly an hour is not past it
+      - eval_time: 2m
+        alertname: SubscriberCredentialOrphaned
+        exp_alerts: []
+      # one second past the hour
+      - eval_time: 3m
+        alertname: SubscriberCredentialOrphaned
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'critical'
+            exp_annotations:
+              summary: >-
+                A subscriber Kafka credential has been unaccounted for over an hour
+              description: >-
+                An issuance left a SASL/SCRAM credential at the broker that Blnk could neither
+                record nor revoke, and it has stood for 1h 0m 1s (instance blnk-server:5001) — so a
+                principal can authenticate to the event bus while no registry row records an
+                issuance for it. NOT attributed to a subscriber on purpose: a subscriber label would
+                export a tenant identifier into every notification. Find the rows with GET
+                /subscribers and read credential_orphaned_at, which the registry projects. SETTLE IT
+                AUTOMATICALLY FIRST — POST /subscribers/<id>/kafka-credentials replaces the orphaned
+                credential by construction (Kafka stores one per principal), or DELETE
+                /subscribers/<id> revokes it; pick whichever matches whether the subscriber should
+                still have access. Only if neither can run, revoke by hand with: kafka-configs
+                --alter --delete-config SCRAM-SHA-512 --entity-type users --entity-name <principal>.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscribercredentialorphaned
+
+  # ------------------------------------------------------------------------
+  # A revocation the broker actively refused, which is a shorter grace than an
+  # outstanding one because a refusal will not clear itself.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a refused revocation alerts one second past fifteen minutes
+    input_series:
+      - series: 'blnk_subscribers_oldest_revocation_failure_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '900+0x4 901+0x8'
+    alert_rule_test:
+      # exactly 900 seconds is not past 900
+      - eval_time: 2m
+        alertname: SubscriberRevocationRefused
+        exp_alerts: []
+      # one second past it
+      - eval_time: 3m
+        alertname: SubscriberRevocationRefused
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                The broker refused a subscriber credential revocation
+              description: >-
+                Blnk's most recent attempt to revoke a subscriber's SASL/SCRAM credential was
+                refused by the broker 15m 1s ago (instance blnk-server:5001), and no attempt has
+                been made since. RETRYING ALONE WILL NOT HELP: a CLUSTER_AUTHORIZATION_FAILED means
+                the administrative principal is not in super.users or has lost its grants, and a
+                transport error means the broker is unreachable. Fix that first, then retry with
+                DELETE /subscribers/<id>. Find the rows with GET /subscribers and read
+                revocation_failed_at, which the registry projects. These rows also carry
+                revocation_pending_at, so SubscriberRevocationOutstanding will page on them once the
+                debt passes an hour.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscriberrevocationrefused
+
+  # ------------------------------------------------------------------------
+  # ANY unmeasured partition is enough — the comparison is `> 0`, not a ratio —
+  # because a topic with unreadable partitions is WITHHELD from the lag gauge
+  # entirely, so SubscriberConsumerLagHigh can report nothing for it. The five-minute
+  # dwell tolerates one rotation that raced a rebalance.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a partly-measured topic alerts after five minutes
+    input_series:
+      - series: 'blnk_kafka_consumer_lag_unmeasured_partitions{job="blnk-server",instance="blnk-server:5001",subscriber="9f2c4a1e",group="4b7d0c93",topic="blnk.transactions"}'
+        values: '0+0x4 1+0x30'
+    alert_rule_test:
+      # nothing unmeasured, nothing to report
+      - eval_time: 2m
+        alertname: ConsumerLagMeasurementDegraded
+        exp_alerts: []
+      # unmeasured, but inside the dwell
+      - eval_time: 6m
+        alertname: ConsumerLagMeasurementDegraded
+        exp_alerts: []
+      # unmeasured for longer than the dwell
+      - eval_time: 9m
+        alertname: ConsumerLagMeasurementDegraded
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              group: '4b7d0c93'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+              subscriber: '9f2c4a1e'
+              topic: 'blnk.transactions'
+            exp_annotations:
+              summary: >-
+                Consumer lag cannot be fully measured for a subscriber topic
+              description: >-
+                1 partition(s) of topic blnk.transactions could not be read when subscriber 9f2c4a1e
+                (consumer group 4b7d0c93) was last measured, so its lag is a lower bound and is
+                WITHHELD from blnk_kafka_consumer_lag — SubscriberConsumerLagHigh cannot fire for
+                this topic while this alert holds. Check broker and partition health first; the
+                partial total is in the event-metrics log line. The subscriber and group values are
+                opaque registry identifiers: resolve them through the subscriber registry.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#consumerlagmeasurementdegraded
+
+  # ------------------------------------------------------------------------
+  # max_over_time IS THE RULE, and this is the case that proves it. The gauge resets
+  # to zero when a rotation completes, so its instantaneous value is whatever point
+  # of a rotation the last scrape landed on. One 601-second rotation at t=300s is
+  # asserted to keep the rule firing at t=1200s — twenty-two minutes after the gauge
+  # returned to zero — and to stop firing once the sample leaves the window. A rule
+  # written against the bare gauge would pass the firing assertion below only if a
+  # scrape happened to land on the peak.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a single slow rotation alerts for the whole thirty-minute window
+    input_series:
+      # Zero, one 601-second rotation at t=300s, then zero for the rest of the hour.
+      - series: 'blnk_kafka_consumer_lag_pass_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '0+0x9 601 0+0x80'
+    alert_rule_test:
+      # before the slow rotation
+      - eval_time: 4m
+        alertname: SubscriberLagCoverageStale
+        exp_alerts: []
+      # still firing on a sample the gauge no longer carries, which is the whole point
+      - eval_time: 20m
+        alertname: SubscriberLagCoverageStale
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                The subscriber lag rotation is slower than the reading it refreshes
+              description: >-
+                The consumer-lag rotation on blnk-server:5001 has taken up to 10m 1s to get back
+                round the subscriber registry, against a ten-minute reading retention. A subscriber
+                the rotation does not return to inside that retention has its reading EXPIRE, so its
+                blnk_kafka_consumer_lag series stops being exported — and an absent series breaches
+                no threshold, so SubscriberConsumerLagHigh reports nothing wrong for exactly the
+                subscribers it can no longer see. Read blnk_kafka_consumer_lag_covered_subscribers
+                against blnk_subscribers_registered to see how much of the registry is currently
+                exported, then raise RELAY_SUBSCRIBER_METRICS_BUDGET so one tick measures more of
+                it, and narrow over-broad subscriber grants, because the cost is one round trip per
+                authorised topic per subscriber per tick. Do NOT reach for the collection interval:
+                it is fixed at 15 seconds and is not operator-configurable, and lengthening it would
+                make every reading staler, which is the condition this alert reports. A rotation
+                that is slow because measurements are FAILING shows up on
+                blnk_kafka_subscribers_unmeasured{reason="measure_failed"} instead, and needs the
+                broker rather than the budget.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscriberlagcoveragestale
+      # the slow rotation has left the thirty-minute window, so the rule clears
+      - eval_time: 36m
+        alertname: SubscriberLagCoverageStale
+        exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # Zero means at least one registered subscriber has NO lag series at all, so no
+  # per-subscriber rule could speak for it. The half-hour dwell is deliberate: a
+  # budget-limited registry is incomplete for one tick at a time in normal operation.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: incomplete lag coverage alerts after thirty minutes
+    input_series:
+      - series: 'blnk_kafka_consumer_lag_inventory_complete{job="blnk-server",instance="blnk-server:5001"}'
+        values: '1+0x4 0+0x80'
+    alert_rule_test:
+      # complete coverage
+      - eval_time: 2m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # incomplete, but well inside the dwell
+      - eval_time: 10m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # incomplete for over half an hour
+      - eval_time: 33m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                Consumer lag is not being measured for every registered subscriber
+              description: >-
+                The last blnk-server lag sweep on blnk-server:5001 did not produce a complete
+                reading for every registered subscriber, and has not for 30 minutes. Those
+                subscribers have NO lag series, so SubscriberConsumerLagHigh cannot fire for them
+                however far behind they are. Read blnk_kafka_subscribers_unmeasured to see how many
+                and why, then act on the reason: 'budget' means the registry is larger than one tick
+                can measure, so raise RELAY_SUBSCRIBER_METRICS_BUDGET; 'measure_failed' is a broker
+                or ACL fault; 'registry_failed' means the registry query itself is failing;
+                'topic_missing' means a row authorises a topic that does not exist, so provision the
+                topic or correct the row; 'unprovisioned' means the row has no topics to measure and
+                is the row's own problem; 'broker_unconfigured' means this deployment has no
+                KAFKA_BROKERS at all, so nothing about these rows can be measured — configure the
+                brokers or delete registry rows the deployment is not using, and note that a
+                deployment with no brokers AND no subscriber rows reports complete coverage and
+                never reaches this rule. The event-metrics log line carries registry_size,
+                resume_from and the topic names.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscriberlagcoverageincomplete
+
+  # ------------------------------------------------------------------------
+  # The negative direction held for longer than the dwell. The rule compares `== 0`,
+  # and the gauge's healthy value is 1, so a comparison written `>= 0` would be true
+  # on a fully-covered registry and page every deployment half an hour after start-up.
+  # Asserting only the sub-dwell silence would not catch that, because a rule that is
+  # wrong about the value is still pending inside its `for`.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: complete lag coverage keeps the coverage rule quiet for as long as it holds
+    input_series:
+      - series: 'blnk_kafka_consumer_lag_inventory_complete{job="blnk-server",instance="blnk-server:5001"}'
+        values: '1+0x90'
+    alert_rule_test:
+      # every registered subscriber has been measured throughout, so there is nothing to report
+      - eval_time: 35m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # and it stays quiet
+      - eval_time: 45m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # THE NO-KAFKA STEADY STATE, which is a SUPPORTED configuration and not a fault: a
+  # deployment with KAFKA_BROKERS unset and no subscriber rows. It used to publish
+  # inventory_complete = 0 — there was no sweep, so nothing set the boolean — and this rule
+  # then fired thirty minutes after start-up and stayed firing for ever, on a deployment
+  # where every reason on blnk_kafka_subscribers_unmeasured read zero. The instruction the
+  # notification carried ("act on the reason") had no reason to act on, and no action could
+  # clear it.
+  #
+  # The whole registry is published, zeros included, so the case asserts the reasons too:
+  # nothing unmeasured, nothing registered, coverage complete, and — for two hours, four
+  # times the dwell — nothing fires.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a deployment running without Kafka and without subscribers never reaches the coverage rule
+    input_series:
+      - series: 'blnk_kafka_consumer_lag_inventory_complete{job="blnk-server",instance="blnk-server:5001"}'
+        values: '1+0x240'
+      - series: 'blnk_subscribers_registered{job="blnk-server",instance="blnk-server:5001"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="budget"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="broker_unconfigured"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="unprovisioned"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="measure_failed"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="registry_failed"}'
+        values: '0+0x240'
+      - series: 'blnk_kafka_subscribers_unmeasured{job="blnk-server",instance="blnk-server:5001",reason="topic_missing"}'
+        values: '0+0x240'
+    alert_rule_test:
+      # past the dwell
+      - eval_time: 31m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # and four times past it, because the defect this replaces was permanent rather than
+      # transient: a rule that only failed to fire early would have looked identical.
+      - eval_time: 120m
+        alertname: SubscriberLagCoverageIncomplete
+        exp_alerts: []
+      # NOR ANY OTHER RULE. Every subscriber and coverage series this deployment publishes is
+      # in the input above, so this is also the assertion that the no-Kafka steady state pages
+      # nobody at all.
+      - eval_time: 120m
+        alertname: ConsumerLagMeasurementDegraded
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: SubscriberConsumerLagHigh
+        exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # THE REGRESSION CASE. Two subscribers owing something for 45 minutes, and no
+  # blnk_subscribers_obligations_settled_total series declared AT ALL — which is
+  # exactly the state of a deployment whose settlement pass has never discharged an
+  # obligation, and the state the `and ... == 0` form could not alert on. This case
+  # fails against that form and passes against `unless ... > 0`, which is the whole
+  # content of the fix.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a backlog alerts before the settled counter's first sample
+    input_series:
+      - series: 'blnk_subscribers_settlement_outstanding{job="blnk-server",instance="blnk-server:5001"}'
+        values: '2+0x90'
+    alert_rule_test:
+      # inside the half-hour dwell that keeps a briefly-paced-off settler from paging
+      - eval_time: 20m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts: []
+      # outstanding for over half an hour with nothing settled in that time
+      - eval_time: 31m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                Broker-side subscriber reconciliation is outstanding and nothing is settling it
+              description: >-
+                Subscriber obligations have been outstanding on blnk-server:5001 for over half an
+                hour with NOTHING discharged in that time, which is the signature of a settlement
+                pass that is not running rather than one that is busy. Check
+                blnk_subscribers_credential_cleanup_pending first — that count is the
+                security-relevant half, a credential that may exist beyond what is recorded — then
+                blnk_subscribers_grant_reconcile_pending, which means enforced access may not match
+                authorized_topics. Common causes: a server role started with no broker configured
+                while subscribers were provisioned against one, a processor that failed its wiring
+                check, or a loop that has died. Not attributed to a subscriber on purpose: a
+                subscriber label would export a tenant identifier into every notification. Find the
+                rows with GET /subscribers.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscribersettlementnotprogressing
+
+  # ------------------------------------------------------------------------
+  # What the `and ... == 0` form covered, and what had to be preserved while changing
+  # the operator: the counter exists but has not moved in half an hour. Changing an
+  # expression to catch a missed case must not narrow the case it already caught.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a flat settlement counter still alerts
+    input_series:
+      - series: 'blnk_subscribers_settlement_outstanding{job="blnk-server",instance="blnk-server:5001"}'
+        values: '3+0x90'
+      # Settled once long ago and nothing since: the counter exists, and its rate
+      # over the last half hour is zero.
+      - series: 'blnk_subscribers_obligations_settled_total{job="blnk-server",instance="blnk-server:5001"}'
+        values: '7+0x90'
+    alert_rule_test:
+      # a counter that exists and is flat is a stalled settler, exactly as before
+      - eval_time: 31m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                Broker-side subscriber reconciliation is outstanding and nothing is settling it
+              description: >-
+                Subscriber obligations have been outstanding on blnk-server:5001 for over half an
+                hour with NOTHING discharged in that time, which is the signature of a settlement
+                pass that is not running rather than one that is busy. Check
+                blnk_subscribers_credential_cleanup_pending first — that count is the
+                security-relevant half, a credential that may exist beyond what is recorded — then
+                blnk_subscribers_grant_reconcile_pending, which means enforced access may not match
+                authorized_topics. Common causes: a server role started with no broker configured
+                while subscribers were provisioned against one, a processor that failed its wiring
+                check, or a loop that has died. Not attributed to a subscriber on purpose: a
+                subscriber label would export a tenant identifier into every notification. Find the
+                rows with GET /subscribers.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscribersettlementnotprogressing
+
+  # ------------------------------------------------------------------------
+  # A backlog that is being discharged is a BUSY settler, not a stalled one. Without
+  # this case the absent-safe form would have traded a missed alert for a permanent
+  # false one on every deployment that fails a subscriber operation at all.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a moving settlement counter suppresses the alert
+    input_series:
+      - series: 'blnk_subscribers_settlement_outstanding{job="blnk-server",instance="blnk-server:5001"}'
+        values: '5+0x90'
+      # One obligation discharged per scrape: a positive rate throughout.
+      - series: 'blnk_subscribers_obligations_settled_total{job="blnk-server",instance="blnk-server:5001"}'
+        values: '0+1x90'
+    alert_rule_test:
+      # the pass is working
+      - eval_time: 31m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts: []
+      # and keeps working
+      - eval_time: 45m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # The age rule, which fires an hour after an obligation is raised. It is the
+  # companion to the not-progressing rule below, which fires half an hour earlier so
+  # that 'the mechanism is broken' precedes 'this obligation is stale'.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a stale settlement obligation alerts one second past the hour
+    input_series:
+      - series: 'blnk_subscribers_oldest_settlement_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '3600+0x4 3601+0x8'
+    alert_rule_test:
+      # exactly an hour is not past it
+      - eval_time: 2m
+        alertname: SubscriberSettlementOutstanding
+        exp_alerts: []
+      # one second past the hour
+      - eval_time: 3m
+        alertname: SubscriberSettlementOutstanding
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'critical'
+            exp_annotations:
+              summary: >-
+                Broker-side subscriber reconciliation has been outstanding for over an hour
+              description: >-
+                A subscriber's Kafka state has been diverged from its registry row for 1h 0m 1s
+                (instance blnk-server:5001) and the settlement pass has not closed it. Check
+                blnk_subscribers_credential_cleanup_pending first — that count is the
+                security-relevant half, a credential that may exist beyond what is recorded — then
+                blnk_subscribers_grant_reconcile_pending, which means enforced access may not match
+                authorized_topics. A flat blnk_subscribers_obligations_settled_total alongside a
+                non-zero backlog means the pass is stuck rather than busy; a rising one means it is
+                settling as fast as new obligations arrive, so look for what is producing them. Not
+                attributed to a subscriber on purpose: a subscriber label would export a tenant
+                identifier into every notification. Find the rows with GET /subscribers.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscribersettlementoutstanding
+
+  # ------------------------------------------------------------------------
+  # The collection interval is fixed at 15 seconds, so a reading older than two
+  # minutes means eight consecutive passes produced nothing. Every gauge downstream
+  # of the collector is only as current as this age.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a stale metrics collection alerts past two minutes
+    input_series:
+      - series: 'blnk_event_metrics_last_collection_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '120+0x4 121+0x20'
+    alert_rule_test:
+      # exactly 120 seconds is not past 120
+      - eval_time: 2m
+        alertname: EventMetricsCollectionStale
+        exp_alerts: []
+      # past it, but inside the two-minute dwell
+      - eval_time: 3m
+        alertname: EventMetricsCollectionStale
+        exp_alerts: []
+      # stale for longer than the dwell
+      - eval_time: 5m
+        alertname: EventMetricsCollectionStale
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                The event metrics collector has stopped refreshing its gauges
+              description: >-
+                No event-metrics collection has completed on blnk-server:5001 for 2m 1s, against a
+                15 second interval. EVERY event gauge is therefore frozen at its last reading and
+                still being scraped as if current — DeadLetterMessageStuck,
+                SubscriberConsumerLagHigh and SubscriberRevocationOutstanding are all evaluating
+                stale numbers and none of them can be relied on while this holds. Check the server
+                process for a stuck collection: each collection and each dependency call inside it
+                is deadline-bounded, so a hung database or broker should cost one degraded tick
+                rather than the loop, and a persistently rising age points at the process rather
+                than at a dependency.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventmetricscollectionstale
+
+  # ------------------------------------------------------------------------
+  # A collector that is RUNNING but not SUCCEEDING. Distinct from the stale rule
+  # above: a pass that starts and fails refreshes the collection age while leaving
+  # the success age climbing, so the stale rule alone would report nothing wrong.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a failing metrics collection alerts past five minutes
+    input_series:
+      - series: 'blnk_event_metrics_last_success_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '300+0x4 301+0x8'
+    alert_rule_test:
+      # exactly 300 seconds is not past 300
+      - eval_time: 2m
+        alertname: EventMetricsCollectionFailing
+        exp_alerts: []
+      # one second past it
+      - eval_time: 3m
+        alertname: EventMetricsCollectionFailing
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              instance: 'blnk-server:5001'
+              job: 'blnk-server'
+              severity: 'warning'
+            exp_annotations:
+              summary: >-
+                Every event metrics collection has failed for over five minutes
+              description: >-
+                The event-metrics collector on blnk-server:5001 has not completed a fully successful
+                collection for 5m 1s, although it is still ticking — so
+                blnk_event_metrics_last_collection_age_seconds looks healthy and the gauges it
+                cannot compute are quietly stale. Read blnk_event_metrics_collection_failures_total
+                to see WHICH collection is failing: 'outbox_backlog' and 'dead_letter_age' are
+                database faults, 'revocations' is the subscriber registry, and 'subscriber_lag' or
+                'subscriber_listing' are the broker and the registry query respectively. The
+                collector deliberately continues past a failure in any one collection, so the others
+                are still current.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventmetricscollectionfailing
+
+  # ------------------------------------------------------------------------
+  # THE ONLY absent() RULE, and the one that covers the failure every other rule in
+  # this file is blind to: a threshold cannot be breached by a series that does not
+  # exist. The worker's series is present throughout, which is what proves the rule
+  # is scoped to the server role rather than to the metric name.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a server exporting no collection age at all alerts after ten minutes
+    input_series:
+      # The WORKER is healthy and exporting. The rule must fire anyway, because
+      # the relay and the collector it reports on run in the server role.
+      - series: 'blnk_event_metrics_last_collection_age_seconds{job="blnk-worker",instance="blnk-worker:5004"}'
+        values: '5+0x80'
+    alert_rule_test:
+      # absent, but inside the ten-minute dwell
+      - eval_time: 5m
+        alertname: EventMetricsCollectionAbsent
+        exp_alerts: []
+      # absent for over ten minutes: the collector is not reporting at all
+      - eval_time: 11m
+        alertname: EventMetricsCollectionAbsent
+        exp_alerts:
+          - exp_labels:
+              component: 'event-streaming'
+              job: 'blnk-server'
+              severity: 'critical'
+            exp_annotations:
+              summary: >-
+                No event metrics collector is reporting; every event-streaming alert is blind
+              description: >-
+                The blnk-server job has exported no event-metrics collection age for 10 minutes,
+                which means no collector is running in any scraped server process. EVERY rule in
+                this group is therefore evaluating a series that does not exist, and a rule over a
+                missing series cannot fire and looks exactly like a healthy system — including
+                DeadLetterMessageStuck, which is the one that pages on ledger events not reaching
+                subscribers. Check that observability is enabled so /metrics is registered and
+                served, that the metrics bearer token Prometheus uses matches the server's, and that
+                the server process reached the collector start-up. The collector is unconditional in
+                the server role, so its absence is a start-up or scrape-configuration fault rather
+                than a Kafka one.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#eventmetricscollectionabsent
+
+  # ------------------------------------------------------------------------
+  # The negative direction. absent() is the one expression here that fires on the
+  # ABSENCE of data, so a rule that fired while the series was present would be
+  # permanently active on every healthy deployment and would be silenced within the
+  # day — taking the real signal with it.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: a server that is exporting keeps the absent rule quiet
+    input_series:
+      - series: 'blnk_event_metrics_last_collection_age_seconds{job="blnk-server",instance="blnk-server:5001"}'
+        values: '5+0x80'
+    alert_rule_test:
+      # the series is present, so there is nothing absent to report
+      - eval_time: 11m
+        alertname: EventMetricsCollectionAbsent
+        exp_alerts: []
+      # and it stays quiet
+      - eval_time: 39m
+        alertname: EventMetricsCollectionAbsent
+        exp_alerts: []
+
+  # ------------------------------------------------------------------------
+  # A QUEUE THAT IS NOT KEEPING PACE. Both directions matter sharply here. Below the
+  # threshold must be silent because a queue exists so that bursts need not be served
+  # synchronously — a rule that paged on ordinary depth would page on the queue doing
+  # its job. And `retry` and `scheduled` must be silent at ANY depth, because both are
+  # work deferred to a future time rather than work waiting on a worker.
+  # ------------------------------------------------------------------------
+  - interval: 30s
+    name: the queue backlog alert fires on sustained pending depth and ignores deferred work
+    input_series:
+      # Pending sits just under the threshold for two and a half minutes, then jumps
+      # above it and stays. The dwell therefore starts at t=150s and completes at t=750s.
+      - series: 'blnk_queue_backlog{job="blnk-worker",instance="blnk-worker:5004",queue="new:index",state="pending"}'
+        values: '24000+0x4 40000+0x60'
+      # Deferred work, parked far above the threshold for the whole window. It must never
+      # contribute: a scheduled task is waiting for its clock.
+      - series: 'blnk_queue_backlog{job="blnk-worker",instance="blnk-worker:5004",queue="new:index",state="scheduled"}'
+        values: '900000+0x64'
+      - series: 'blnk_queue_backlog{job="blnk-worker",instance="blnk-worker:5004",queue="new:index",state="retry"}'
+        values: '900000+0x64'
+    alert_rule_test:
+      # Under the threshold, and a mountain of deferred work beside it. Silent.
+      - eval_time: 2m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts: []
+      # Over the threshold but only five minutes in: breaching, inside the dwell.
+      - eval_time: 7m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts: []
+      # Ten minutes above the threshold.
+      - eval_time: 13m
+        alertname: TaskQueueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              component: 'task-queue'
+              instance: 'blnk-worker:5004'
+              job: 'blnk-worker'
+              queue: 'new:index'
+              severity: 'warning'
+              state: 'pending'
+            exp_annotations:
+              summary: >-
+                A task queue has held a large backlog for 10 minutes and is not keeping pace
+              description: >-
+                Queue new:index on blnk-worker:5004 has had 40000 task(s) PENDING for 10
+                minutes, so work is arriving faster than the workers are completing it and
+                the queue is growing rather than absorbing a burst. This is a COUNT of
+                tasks not yet started, not an age. The failure this rule was written for
+                is the index queue: every task used to rebuild its TypeSense client and
+                re-assert the collection schema — six HTTP round trips on an unpooled
+                connection before its own single write — which capped the drain rate below
+                the arrival rate and grew the queue without bound. Check first whether the
+                per-task cost has regressed, then whether the queue is being starved of
+                worker slots by its weight relative to the others sharing the same server
+                (BLNK_QUEUE_WEBHOOK_CONCURRENCY sets the pool the webhook and index queues
+                share), and then whether the downstream service the tasks call is itself
+                slow. A backlog that clears the moment load stops is a capacity problem;
+                one that persists at idle is a failing task being retried.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#taskqueuebackloghigh

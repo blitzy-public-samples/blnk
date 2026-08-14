@@ -19,6 +19,7 @@ package database
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/blnkfinance/blnk/model"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateLedger_Success(t *testing.T) {
@@ -328,4 +330,152 @@ func TestUpdateLedger_UniqueViolation(t *testing.T) {
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
 	assert.Equal(t, apierror.ErrConflict, apiErr.Code)
+}
+
+// TestCreateLedger_CommitsTheEventWithTheLedger is the requirement for ledger creation,
+// and the assertion is the SHAPE OF THE TRANSACTION rather than the value of anything.
+//
+// Ordered sqlmock expectations are what pin the repair: BEGIN, the ledger INSERT, the
+// event INSERT, COMMIT, in that order and inside one transaction.
+func TestCreateLedger_CommitsTheEventWithTheLedger(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+	ledger := model.Ledger{Name: "Atomic Ledger", MetaData: map[string]interface{}{"key": "value"}}
+
+	metaDataJSON, err := json.Marshal(ledger.MetaData)
+	require.NoError(t, err)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.ledgers").
+		WithArgs(metaDataJSON, ledger.Name, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("INSERT INTO blnk.event_outbox").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(41)))
+	mock.ExpectCommit()
+
+	var seen model.Ledger
+	created, err := ds.CreateLedger(ledger, func(entity model.Ledger) (*model.EventOutbox, error) {
+		seen = entity
+
+		return &model.EventOutbox{
+			EventID:      "9c1f4d2e-7b3a-4c58-8e6d-1f2a3b4c5d6e",
+			EventType:    "ledger.created",
+			AggregateID:  entity.LedgerID,
+			PartitionKey: entity.LedgerID,
+			LedgerID:     entity.LedgerID,
+			// The topic must be one Blnk owns — the insert validates that — and ledger.created
+			// routes to the subscriber-facing ledgers category, so that a subscriber credential
+			// can be granted it without also being handed blnk.system, which carries Blnk's own
+			// internal diagnostics. Spelled as a literal because TopicForEvent lives in the root
+			// blnk package, which this one cannot import — root imports database, not the
+			// reverse.
+			Topic:   "blnk." + model.EventCategorySystem,
+			Payload: json.RawMessage(`{"event":"ledger.created","data":{}}`),
+		}, nil
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, created.LedgerID, "ldg_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the ledger and its event must be inserted inside ONE transaction, in that order")
+
+	// The preparer sees the CREATED ledger, not the requested one. That is not a nicety:
+	// the event's aggregate id, partition key and payload are all derived from the
+	// generated id, so a preparer handed the caller's value would build an event
+	// describing a ledger that does not exist.
+	assert.Equal(t, created.LedgerID, seen.LedgerID,
+		"the preparer must be handed the created ledger, carrying the generated id")
+	assert.False(t, seen.CreatedAt.IsZero(),
+		"and carrying the creation timestamp the insert stamped")
+}
+
+// TestCreateLedger_APreparerFailureCreatesNoLedger pins the fail-closed half of the
+// same guarantee.
+//
+// If the event cannot be built there are two options, and only one of them is safe:
+// commit the ledger and lose the event, or refuse both.
+func TestCreateLedger_APreparerFailureCreatesNoLedger(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.ledgers").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectRollback()
+
+	prepareErr := errors.New("the payload could not be serialised")
+	created, err := ds.CreateLedger(model.Ledger{Name: "Doomed"},
+		func(model.Ledger) (*model.EventOutbox, error) { return nil, prepareErr })
+
+	require.ErrorIs(t, err, prepareErr, "the preparer's error must reach the caller unchanged")
+	assert.Empty(t, created.LedgerID, "and no ledger may be reported as created")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the ledger INSERT must be rolled back, not left committed with its event missing")
+}
+
+// TestCreateLedger_ANilRowCommitsTheLedgerAlone covers the unconfigured deployment,
+// which is the case that must not become a failure.
+func TestCreateLedger_ANilRowCommitsTheLedgerAlone(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.ledgers").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	created, err := ds.CreateLedger(model.Ledger{Name: "No Transport"},
+		func(model.Ledger) (*model.EventOutbox, error) { return nil, nil })
+
+	require.NoError(t, err)
+	assert.Contains(t, created.LedgerID, "ldg_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"no event insert may be issued for a nil row, and the ledger must still commit")
+}
+
+// TestCreateLedger_WithoutAPreparerIssuesOneStatement pins the cost of the unconfigured
+// path and the source-compatibility the variadic tail exists for.
+//
+// A caller that supplies NO preparer — every pre-existing caller, and the service
+// itself when nothing is configured — must take the original single-statement path.
+func TestCreateLedger_WithoutAPreparerIssuesOneStatement(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("INSERT INTO blnk.ledgers").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	created, err := ds.CreateLedger(model.Ledger{Name: "Plain"})
+
+	require.NoError(t, err)
+	assert.Contains(t, created.LedgerID, "ldg_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"a create with no preparer must issue exactly one statement and open no transaction")
+}
+
+// TestCreateLedger_ANilPreparerInTheTailIsSkipped covers the argument a caller
+// assembles conditionally.
+func TestCreateLedger_ANilPreparerInTheTailIsSkipped(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("INSERT INTO blnk.ledgers").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	created, err := ds.CreateLedger(model.Ledger{Name: "Conditional"}, nil)
+
+	require.NoError(t, err)
+	assert.Contains(t, created.LedgerID, "ldg_")
+	assert.NoError(t, mock.ExpectationsWereMet())
 }

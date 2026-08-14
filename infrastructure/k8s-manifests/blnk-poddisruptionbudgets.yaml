@@ -1,0 +1,64 @@
+# Availability bounds for VOLUNTARY disruption. PERF-P20.
+#
+# A rolling update is not the only thing that removes pods. A node drain for a kernel patch,
+# a cluster autoscaler consolidating underused nodes, or `kubectl drain` during maintenance
+# will evict every pod on a node at once — and none of those consult a Deployment's
+# maxUnavailable, which governs rollouts alone. Without a budget, a single drain can take
+# every replica of a role that happens to be co-located, and the update strategies next door
+# will not have prevented it.
+#
+# These two budgets are what the eviction API consults for the application roles. They
+# constrain only VOLUNTARY disruption: a node that fails outright, an OOM kill or a crash is
+# involuntary and no budget can stop it, which is why they are an availability floor for
+# planned work rather than a reliability guarantee.
+#
+# THE KAFKA BROKER'S BUDGET IS NOT HERE. It ships as `kafka-quorum` in the second document of
+# kafka-statefulset.yaml, co-located with the workload it protects, and it is the most
+# consequential budget in this folder: three KRaft voters with min.insync.replicas=2 tolerate
+# exactly one voluntary eviction at a time.
+#
+# A budget for it lived here as well, and that was the defect. Kubernetes documents a pod
+# matched by MORE THAN ONE PodDisruptionBudget as an unsupported configuration, and two
+# budgets over one selector are benign only for as long as they happen to agree — the moment
+# either is edited, the budget actually protecting a quorum during a node drain or a cluster
+# upgrade is whichever one the eviction API consulted, which is not a question this folder
+# should leave open. So the broker has exactly one budget, and it is the one that names its
+# purpose. Add a budget for a new workload here; for a workload that ships its own manifest
+# with its own policy, add it there instead, and never in both.
+#
+# maxUnavailable rather than minAvailable throughout, and deliberately: the server and worker
+# are autoscaled between 2 and 10 replicas, so a fixed minAvailable would either be too weak
+# at 10 replicas or block every drain at 2. maxUnavailable: 1 means the same thing at every
+# position the autoscaler can reach — one at a time, whatever the count.
+#
+# The selectors MUST match the workloads' pod labels exactly. A budget whose selector matches
+# nothing is not an error: it is admitted, reports zero expected pods, and protects nothing.
+# Verify with `kubectl -n blnk get pdb` and check that ALLOWED DISRUPTIONS and EXPECTED PODS
+# are populated rather than 0 and 0.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    io.kompose.service: server
+  name: server
+  namespace: blnk
+spec:
+  # The ledger's only HTTP surface. One replica out at a time, matching the rollout's
+  # maxSurge, so a drain cannot do what the rollout was configured never to do.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      io.kompose.service: server
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    io.kompose.service: worker
+  name: worker
+  namespace: blnk
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      io.kompose.service: worker

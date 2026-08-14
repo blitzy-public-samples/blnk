@@ -17,7 +17,9 @@ limitations under the License.
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/typesense/typesense-go/typesense/api"
@@ -27,6 +29,7 @@ import (
 	"github.com/blnkfinance/blnk/api/middleware"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
@@ -39,11 +42,14 @@ type Api struct {
 }
 
 // Router sets up the routes for the API and returns the router instance.
-//
-// Responses:
-// - 200 OK: When the router is successfully set up.
 func (a Api) Router() *gin.Engine {
 	router := a.router
+
+	// The webhook retirement guard is installed in NewAPI, ahead of authentication, rather
+	// than on this router. A guard added here would sit behind Authenticate below and so
+	// could never see the two request shapes the retirement has to answer: an unsupported
+	// verb on a retired path, and a caller whose credential has lapsed. Both must be 410
+	// rather than 405 or 401, because the surface itself is gone.
 
 	// Apply auth middleware to all routes
 	router.Use(a.auth.Authenticate())
@@ -147,6 +153,35 @@ func (a Api) Router() *gin.Engine {
 	router.GET("/api-keys", a.ListAPIKeys)
 	router.DELETE("/api-keys/:id", a.RevokeAPIKey)
 
+	// Event streaming routes. Both segments under "/events" are static on
+	// purpose: no route parameter is registered directly there, so the
+	// dead-letter and stats subtrees can never be shadowed.
+	router.GET("/events/dead-letter", a.ListDeadLetterEvents)
+	// Replay is the only write in the dead-letter workflow. There is no discard, edit or
+	// purge route: a dead-lettered row is evidence of a publish that failed, and the daily
+	// outbox-versus-offset reconciliation in docs/kafka-operations.md counts it.
+	router.POST("/events/dead-letter/:event_id/replay", a.ReplayDeadLetterEvent)
+	router.GET("/events/stats", a.GetEventOutboxStats)
+
+	// Subscriber routes: the registry of Kafka principals and their credentials.
+	router.POST("/subscribers", a.CreateSubscriber)
+	router.GET("/subscribers", a.ListSubscribers)
+	router.GET("/subscribers/:subscriber_id", a.GetSubscriber)
+	router.PUT("/subscribers/:subscriber_id", a.UpdateSubscriber)
+	router.DELETE("/subscribers/:subscriber_id", a.DeleteSubscriber)
+	router.POST("/subscribers/:subscriber_id/kafka-credentials", a.IssueKafkaCredentials)
+
+	// Every /subscribers route above is an OPERATOR action gated on the master key. None of
+	// them carries event data: subscribers consume Kafka directly with the per-subscriber
+	// SASL/SCRAM credential the last route issues, so no read-the-events endpoint exists
+	// here to proxy it.
+
+	// Deprecated webhook-subscription management routes.
+	router.POST(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.RegisterWebhookSubscription)
+	router.GET(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.GetWebhookSubscription)
+	router.PUT(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.UpdateWebhookSubscription)
+	router.DELETE(middleware.DeprecatedWebhookSubscriptionRoute, middleware.WebhookSunsetGuard(), a.DeleteWebhookSubscription)
+
 	return a.router
 }
 
@@ -166,16 +201,43 @@ func NewAPI(b *blnk.Blnk) *Api {
 	r := gin.New()
 
 	r.MaxMultipartMemory = 8 << 20 // 8 MiB
+
+	// PROXY TRUST, decided before any middleware runs, because everything that reports a
+	// client address depends on it.
+	if err := r.SetTrustedProxies(conf.TrustedProxyCIDRs()); err != nil {
+		logrus.WithField("cause", logsafe.Cause(err)).Error(
+			"BLNK_SERVER_TRUSTED_PROXIES is not a valid list of CIDR blocks or IP literals, so the " +
+				"API was not started. Correct it, or leave it unset to trust no proxy and take the " +
+				"client address from the connection itself",
+		)
+
+		return nil
+	}
+
 	r.Use(logrusAccessLogger())
 	r.Use(logrusRecovery())
+
+	// SecurityHeaders only SETS response headers and never aborts, so it precedes every
+	// middleware that can: an aborted response carries the same headers as a served one.
+	r.Use(middleware.SecurityHeaders())
+
+	// The retired-path barrier. It must precede every middleware that can abort, or a
+	// request to a retired path would be answered by whichever of them aborted first — 401
+	// from authentication, 413 from the size limit, 429 from the rate limiter — instead of
+	// the 410 the surface's retirement requires.
+	r.Use(middleware.WebhookSunsetPreAuthGuard())
+
 	r.Use(middleware.RequestSizeLimit(conf.Server.MaxRequestBodySizeMB * 1024 * 1024))
 	auth := middleware.NewAuthMiddleware(b)
 	r.Use(middleware.RateLimitMiddleware(conf))
-	r.Use(middleware.SecurityHeaders())
+	// The server span every request trace is rooted in, and the point from which the trace
+	// reaches the event pipeline: handlers pass c.Request.Context() into the service
+	// layer, the event capture writes the active trace context onto the outbox row, and
+	// the relay's publish links back to it. That chain starts here.
 	r.Use(otelgin.Middleware("BLNK",
 		otelgin.WithFilter(func(r *http.Request) bool {
-			// Exclude high-frequency operational endpoints from tracing
-			// to avoid polluting the trace feed with noise.
+			// Exclude high-frequency operational endpoints from tracing to avoid polluting the
+			// trace feed with noise.
 			return r.URL.Path != "/metrics"
 		}),
 	))
@@ -187,49 +249,55 @@ func NewAPI(b *blnk.Blnk) *Api {
 	return &Api{blnk: b, router: r, auth: auth}
 }
 
+// logrusAccessLogger logs one line per request, identifying it by ROUTE TEMPLATE rather
+// than by the path that was requested.
 func logrusAccessLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		path := c.Request.URL.Path
 		method := c.Request.Method
-		clientIP := c.ClientIP()
 
 		c.Next()
 
 		logrus.WithFields(logrus.Fields{
 			"method":       method,
-			"path":         path,
+			"route":        requestRoute(c),
 			"status":       c.Writer.Status(),
 			"latency_ms":   time.Since(start).Milliseconds(),
-			"client_ip":    clientIP,
+			"client_ip":    c.ClientIP(),
 			"error_count":  len(c.Errors),
 			"response_len": c.Writer.Size(),
 		}).Info("http request")
 	}
 }
 
+// logrusRecovery turns a panic into a 500 and records it WITHOUT putting the panic's
+// own text or the stack into the log at a normal level.
 func logrusRecovery() gin.HandlerFunc {
-	return gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
-		logrus.WithFields(logrus.Fields{
-			"method":    c.Request.Method,
-			"path":      c.Request.URL.Path,
-			"client_ip": c.ClientIP(),
-			"panic":     recovered,
-		}).Error("panic recovered")
+	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, recovered interface{}) {
+		fields := logrus.Fields{
+			"method":     c.Request.Method,
+			"route":      requestRoute(c),
+			"client_ip":  c.ClientIP(),
+			"panic_type": fmt.Sprintf("%T", recovered),
+			"panic":      redactedPanicMessage(recovered),
+		}
+
+		if logrus.IsLevelEnabled(logrus.DebugLevel) {
+			fields["panic_verbatim"] = logsafe.Value(
+				fmt.Sprintf("%v", recovered), logsafe.MaxErrorLength,
+			)
+			fields["stack"] = logsafe.Value(string(debug.Stack()), maxLoggedStackLength)
+		}
+
+		logrus.WithFields(fields).Error("panic recovered")
 		c.AbortWithStatus(http.StatusInternalServerError)
 	})
 }
 
 // Search performs a search query on a specified collection.
-// It binds the incoming JSON request to a SearchCollectionParams object,
-// executes the search query, and responds with the search results.
 //
 // Parameters:
 // - c: The Gin context containing the request and response.
-//
-// Responses:
-// - 400 Bad Request: If there's an error in binding JSON or performing the search.
-// - 201 Created: If the search query is successfully executed and results are returned.
 func (a Api) Search(c *gin.Context) {
 	collection, passed := c.Params.Get("collection")
 	if !passed {
@@ -254,15 +322,9 @@ func (a Api) Search(c *gin.Context) {
 }
 
 // MultiSearch performs a multi-search query.
-// It binds the incoming JSON request to a MultiSearchParameter object,
-// executes the multi-search query, and responds with the search results.
 //
 // Parameters:
 // - c: The Gin context containing the request and response.
-//
-// Responses:
-// - 400 Bad Request: If there's an error in binding JSON or performing the search.
-// - 200 OK: If the multi-search query is successfully executed and results are returned.
 func (a Api) MultiSearch(c *gin.Context) {
 	var searchRequests api.MultiSearchSearchesParameter
 	if err := c.BindJSON(&searchRequests); err != nil {
@@ -277,4 +339,53 @@ func (a Api) MultiSearch(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// maxLoggedStackLength caps the goroutine stack written to a debug-level field.
+const maxLoggedStackLength = 8192
+
+// unmatchedRoute is the route field for a request that matched no registered route.
+const unmatchedRoute = "unmatched"
+
+// requestRoute reports the matched route template for a request, or unmatchedRoute.
+func requestRoute(c *gin.Context) string {
+	route := c.FullPath()
+	if route == "" {
+		return unmatchedRoute
+	}
+
+	return logsafe.Value(route, logsafe.MaxValueLength)
+}
+
+// redactedPanicMessage renders a recovered value for a normal-level log line.
+func redactedPanicMessage(recovered interface{}) string {
+	if recovered == nil {
+		return ""
+	}
+
+	if err, isError := recovered.(error); isError {
+		return logsafe.Cause(err)
+	}
+
+	return logsafe.Cause(fmt.Errorf("%v", recovered))
+}
+
+// withLoggableCause attaches a dependency error to a log entry in the two renderings an
+// operator needs, and it is the ONLY way this package should put an error into a line.
+func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
+	if entry == nil {
+		entry = logrus.NewEntry(logrus.StandardLogger())
+	}
+
+	if err == nil {
+		return entry
+	}
+
+	entry = entry.WithField("cause", logsafe.Cause(err))
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		entry = entry.WithField("cause_verbatim", logsafe.CauseVerbatim(err))
+	}
+
+	return entry
 }

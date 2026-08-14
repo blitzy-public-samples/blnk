@@ -31,6 +31,114 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// resolveBatchEventOutboxes returns the event rows the batch writer must insert inside its
+// transaction: the caller's rows when it supplied any, otherwise rows derived from the
+// registered transaction event capture.
+func resolveBatchEventOutboxes(
+	ctx context.Context,
+	txns []*model.Transaction,
+	balances []*model.Balance,
+	supplied []*model.EventOutbox,
+) ([]*model.EventOutbox, error) {
+	rows, err := resolveEventOutboxes(len(txns), supplied)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+
+	return deriveBatchEventOutboxes(ctx, txns, balances)
+}
+
+// deriveBatchEventOutboxes builds one event row per transaction using the registered
+// capture.
+func deriveBatchEventOutboxes(
+	ctx context.Context,
+	txns []*model.Transaction,
+	balances []*model.Balance,
+) ([]*model.EventOutbox, error) {
+	capture := registeredTransactionEventCapture()
+	if capture == nil || len(txns) == 0 {
+		return nil, nil
+	}
+
+	ledgers := ledgerIDsByBalanceID(balances)
+
+	rows := make([]*model.EventOutbox, 0, len(txns))
+	captured, skipped := 0, 0
+
+	for _, txn := range txns {
+		if txn == nil {
+			continue
+		}
+
+		row, err := capture(ctx, txn, transactionLedgerIDFromSet(txn, ledgers))
+		if err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer,
+				"Failed to capture the ledger event for a batched transaction",
+				fmt.Errorf("blnk: capturing the event for transaction %q: %w", txn.TransactionID, err))
+		}
+
+		if row == nil {
+			skipped++
+
+			continue
+		}
+
+		captured++
+		rows = append(rows, row)
+	}
+
+	if captured == 0 {
+		return nil, nil
+	}
+
+	if skipped > 0 {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer,
+			"Failed to capture the ledger event for every batched transaction",
+			fmt.Errorf("blnk: %d of %d batched transactions produced no event row",
+				skipped, captured+skipped))
+	}
+
+	return rows, nil
+}
+
+// resolveEventOutboxes settles which event rows an atomic writer will insert, and enforces
+// the transaction-to-event cardinality.
+func resolveEventOutboxes(txnCount int, supplied []*model.EventOutbox) ([]*model.EventOutbox, error) {
+	present := make([]*model.EventOutbox, 0, len(supplied))
+	for _, row := range supplied {
+		if row != nil {
+			present = append(present, row)
+		}
+	}
+
+	if len(present) == 0 {
+		return nil, nil
+	}
+
+	// Counted over the rows that DESCRIBE a mutation. A repeatable event —
+	// balance.monitor, system.error — describes a condition rather than the mutation it
+	// travels with, so it rides along without being counted. See the note above.
+	describing := 0
+	for _, row := range present {
+		if !model.EventTypeIsRepeatable(row.EventType) {
+			describing++
+		}
+	}
+
+	// The equality is required only when the writer is actually committing transactions. A
+	// call carrying event rows and NO transactions is the batch-level case — one event
+	// describing a whole operation rather than one event per ledger mutation — and refusing it
+	// here would make that event unrepresentable.
+	if txnCount > 0 && describing != txnCount {
+		return nil, apierror.NewAPIError(apierror.ErrBadRequest,
+			"Each committed transaction must carry exactly one event",
+			fmt.Errorf("blnk: %d mutation-describing event rows supplied for %d transactions (%d rows in total)",
+				describing, txnCount, len(present)))
+	}
+
+	return present, nil
+}
+
 // utcOrNil normalizes an optional timestamp to UTC so the naive value stored
 // in timestamp-without-time-zone columns is timezone-independent.
 func utcOrNil(t *time.Time) *time.Time {
@@ -41,10 +149,61 @@ func utcOrNil(t *time.Time) *time.Time {
 	return &u
 }
 
-func (d Datasource) RecordTransaction(ctx context.Context, txn *model.Transaction) (*model.Transaction, error) {
+// RecordTransaction persists one transaction row, optionally together with the event that
+// describes it.
+//
+// Parameters:
+//   - ctx: The context for the operation.
+//   - txn: The transaction to record.
+//   - eventOutbox: Optional. The prepared event row to commit with the transaction.
+//
+// Returns:
+//   - *model.Transaction: The recorded transaction.
+//   - error: A typed error if the marshal, the insert, the event insert or the commit
+//     fails.
+func (d Datasource) RecordTransaction(ctx context.Context, txn *model.Transaction, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
 	// Start a new tracing span for the database operation
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "PersistTransaction")
 	defer span.End()
+
+	eventRows, err := resolveEventOutboxes(1, eventOutbox)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// THE QUEUE'S ACCEPTANCE IS AN EVENT TOO, and this is the only writer that sees it.
+	//
+	// A transaction the queue accepts is recorded here in the QUEUED or SCHEDULED state
+	// and then executed later by a worker, which persists the EXECUTED copy through an
+	// atomic writer. That writer captures transaction.applied for the copy; nothing
+	// captured anything for the accepted parent, so transaction.queued and
+	// transaction.scheduled were named in the catalogue and never published. Capturing
+	// them here — inside the same database transaction as the row they describe, on the
+	// same terms as every other event — is what makes the two names real.
+	//
+	// Only when the caller supplied nothing: transaction_rejection.go hands its own row in,
+	// and a caller's row is always authoritative over a derived one.
+	if len(eventRows) == 0 {
+		handoffEvent, captureErr := d.captureHandoffTransactionEvent(ctx, txn)
+		if captureErr != nil {
+			// REFUSING THE WRITE IS THE POINT. Preparing an event costs one JSON marshal, so
+			// the only failure it reports is a producer defect; committing the transaction
+			// anyway would accept a movement no subscriber is ever told about and leave no
+			// outbox row for the daily reconciliation to count. Same posture as
+			// persistSingleTransactionExecutionWork.
+			span.RecordError(captureErr)
+			return nil, captureErr
+		}
+
+		if handoffEvent != nil {
+			eventRows = []*model.EventOutbox{handoffEvent}
+		}
+	}
+
+	if len(eventRows) > 0 {
+		return d.recordTransactionWithEvents(ctx, span, txn, eventRows)
+	}
 
 	// Marshal transaction metadata into JSON format
 	metaDataJSON, err := json.Marshal(txn.MetaData)
@@ -74,8 +233,97 @@ func (d Datasource) RecordTransaction(ctx context.Context, txn *model.Transactio
 	return txn, nil
 }
 
-// recordTransactionInTx inserts a transaction record within an existing database transaction.
-// This is a helper function used by RecordTransactionWithBalances for atomic operations.
+// recordTransactionWithEvents inserts one transaction row and its event rows inside a
+// single transaction.
+func (d Datasource) recordTransactionWithEvents(ctx context.Context, span trace.Span, txn *model.Transaction, eventRows []*model.EventOutbox) (*model.Transaction, error) {
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		span.RecordError(err)
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := recordTransactionInTx(ctx, tx, txn); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	for _, e := range eventRows {
+		if err := d.InsertEventOutboxInTx(ctx, tx, e); err != nil {
+			span.RecordError(err)
+			return nil, fmt.Errorf("failed to insert event outbox: %w", err)
+		}
+		span.AddEvent("Event outbox entry inserted", trace.WithAttributes(
+			attribute.String("event.id", e.EventID),
+			attribute.String("event.type", e.EventType),
+			attribute.String("event.topic", e.Topic),
+		))
+	}
+
+	if err := tx.Commit(); err != nil {
+		span.RecordError(err)
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	span.AddEvent("Transaction and event recorded atomically", trace.WithAttributes(
+		attribute.String("transaction.id", txn.TransactionID),
+		attribute.String("transaction.reference", txn.Reference),
+		attribute.Int("event_outbox.count", len(eventRows)),
+	))
+
+	return txn, nil
+}
+
+// recordTransactionInTx inserts a transaction record within an existing database
+// transaction. This is a helper function used by RecordTransactionWithBalances for atomic
+// operations. RecordTransactionWithEvent records ONE transaction and its event in ONE
+// transaction.
+//
+// Parameters:
+//   - ctx context.Context: cancels the transaction.
+//   - txn *model.Transaction: the transaction to record.
+//   - event *model.EventOutbox: the prepared event row, or nil.
+//
+// Returns:
+//   - *model.Transaction: the recorded transaction, unchanged from the argument.
+//   - error: the insert, event-capture or commit failure. On any error NOTHING was
+//     committed — neither the transaction nor the event.
+func (d Datasource) RecordTransactionWithEvent(ctx context.Context, txn *model.Transaction, event *model.EventOutbox) (*model.Transaction, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "PersistTransactionWithEvent")
+	defer span.End()
+
+	tx, err := d.Conn.BeginTx(ctx, nil)
+	if err != nil {
+		span.RecordError(err)
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := recordTransactionInTx(ctx, tx, txn); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	if event != nil {
+		if err := d.InsertEventOutboxInTx(ctx, tx, event); err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		span.RecordError(err)
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	span.AddEvent("Transaction and event recorded atomically", trace.WithAttributes(
+		attribute.String("transaction.id", txn.TransactionID),
+		attribute.Bool("event.captured", event != nil),
+	))
+
+	return txn, nil
+}
+
 func recordTransactionInTx(ctx context.Context, tx *sql.Tx, txn *model.Transaction) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "recordTransactionInTx")
 	defer span.End()
@@ -244,21 +492,27 @@ func (d Datasource) RecordTransactionWithBalances(ctx context.Context, txn *mode
 	return txn, nil
 }
 
-// RecordTransactionWithBalancesAndOutbox atomically records a transaction, updates balances,
-// and optionally inserts a lineage outbox entry within a single database transaction.
-// This ensures that the lineage processing intent is captured atomically with the main transaction,
-// guaranteeing no lineage work is lost even if subsequent async operations fail.
+// RecordTransactionWithBalancesAndOutbox atomically records a transaction, updates
+// balances, and optionally inserts a lineage outbox entry and event outbox entries within a
+// single database transaction. This ensures that the lineage processing intent is captured
+// atomically with the main transaction, guaranteeing no lineage work is lost even if
+// subsequent async operations fail. The event outbox rows are captured under the same
+// guarantee, which is what makes a published event and the ledger mutation it describes
+// inseparable: both are written by this one transaction, so a rollback takes the event with
+// it and a commit can never leave the event behind.
 //
 // Parameters:
-// - ctx: Context for managing the request and tracing.
-// - txn: The transaction object containing details to be recorded.
-// - sourceBalance: The source balance to be updated.
-// - destinationBalance: The destination balance to be updated.
-// - outbox: Optional lineage outbox entry to insert atomically (can be nil if no lineage processing needed).
+//   - ctx: Context for managing the request and tracing.
+//   - txn: The transaction object containing details to be recorded.
+//   - sourceBalance: The source balance to be updated.
+//   - destinationBalance: The destination balance to be updated.
+//   - outbox: Optional lineage outbox entry to insert atomically (can be nil if no lineage
+//     processing needed).
+//   - eventOutbox: Optional event outbox entries to insert atomically.
 //
 // Returns:
 // - The recorded transaction if successful, or an error if any operation fails.
-func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox) (*model.Transaction, error) {
+func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordTransactionWithBalancesAndOutbox")
 	defer span.End()
 
@@ -299,6 +553,37 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		))
 	}
 
+	// Insert event outbox entries atomically, immediately after the lineage outbox and before
+	// the commit. This placement is the whole mechanism behind the transactional-outbox
+	// guarantee: the event rows share this transaction with the balance updates and the
+	// transaction record above, so the mutation and its events commit or roll back together.
+	eventRows, err := resolveEventOutboxes(1, eventOutbox)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	for _, e := range eventRows {
+		if err := d.InsertEventOutboxInTx(ctx, tx, e); err != nil {
+			span.RecordError(err)
+			return nil, fmt.Errorf("failed to insert event outbox: %w", err)
+		}
+		span.AddEvent("Event outbox entry inserted", trace.WithAttributes(
+			attribute.String("event.id", e.EventID),
+			attribute.String("event.type", e.EventType),
+			attribute.String("event.topic", e.Topic),
+			attribute.String("event.ledger_id", e.LedgerID),
+		))
+	}
+
+	// The balance-monitor alerts, and they go in HERE for the same reason the event rows do:
+	// the judgement of a balance's monitors belongs to the transaction that moved the balance,
+	// so a committed movement always carries its alerts and a rolled-back one carries none.
+	if err := recordBalanceMonitorEvaluation(ctx, d, tx, span,
+		[]*model.Balance{sourceBalance, destinationBalance}, eventRows); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		span.RecordError(err)
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
@@ -309,21 +594,23 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		attribute.String("source.balance_id", sourceBalance.BalanceID),
 		attribute.String("destination.balance_id", destinationBalance.BalanceID),
 		attribute.Bool("outbox.included", outbox != nil),
+		attribute.Int("event_outbox.count", len(eventRows)),
 	))
 
 	return txn, nil
 }
 
-// RecordTransactionsWithBalancesAndOutboxes atomically records multiple transactions, updates
-// the source and destination balances once, and inserts any lineage outbox entries in the same
-// database transaction.
-func (d Datasource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error) {
-	return d.RecordTransactionsWithBalanceSetAndOutboxes(ctx, txns, []*model.Balance{sourceBalance, destinationBalance}, outboxes)
+// RecordTransactionsWithBalancesAndOutboxes atomically records multiple transactions,
+// updates the source and destination balances once, and inserts any lineage and event
+// outbox entries in the same database transaction.
+func (d Datasource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
+	return d.RecordTransactionsWithBalanceSetAndOutboxes(ctx, txns, []*model.Balance{sourceBalance, destinationBalance}, outboxes, eventOutboxes...)
 }
 
-// RecordTransactionsWithBalanceSetAndOutboxes atomically records multiple transactions, updates
-// all changed balances, and inserts any lineage outbox entries in the same database transaction.
-func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error) {
+// RecordTransactionsWithBalanceSetAndOutboxes atomically records multiple transactions,
+// updates all changed balances, and inserts any lineage and event outbox entries in the
+// same database transaction.
+func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordTransactionsWithBalancesAndOutboxes")
 	defer span.End()
 
@@ -352,6 +639,28 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 		return nil, fmt.Errorf("failed to insert lineage outboxes: %w", err)
 	}
 
+	// Event outbox entries go in at the same point as in the single-transaction writer above —
+	// after the lineage outbox, before the commit — so the batch's events share the fate of
+	// the batch's balance updates.
+	eventRows, err := resolveBatchEventOutboxes(ctx, txns, balances, eventOutboxes)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if err := insertEventOutboxesInTx(ctx, tx, eventRows); err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("failed to insert event outboxes: %w", err)
+	}
+
+	// The balance-monitor alerts for every balance this batch moved that was not already
+	// evaluated with it. Deriving it from the balances the writer is already updating covers
+	// both. The coalesced caller supplies no monitor alerts, so every balance here is
+	// evaluated here.
+	if err := recordBalanceMonitorEvaluation(ctx, d, tx, span, balances, eventRows); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		span.RecordError(err)
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
@@ -361,15 +670,10 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 		attribute.Int("transaction.count", len(txns)),
 		attribute.Int("balance.count", len(balances)),
 		attribute.Int("outbox.count", len(outboxes)),
+		attribute.Int("event_outbox.count", len(eventRows)),
 	))
 
 	return txns, nil
 }
 
 // GetTransaction retrieves a transaction by its ID from the database.
-// It logs the transaction retrieval using OpenTelemetry tracing.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// - id: The unique transaction ID.
-// Returns:
-// - The retrieved transaction if successful, or an error if retrieval fails.

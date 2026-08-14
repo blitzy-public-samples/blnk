@@ -31,6 +31,20 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// RejectTransaction records a transaction as REJECTED together with the event that
+// announces it, atomically.
+//
+// Parameters:
+//   - ctx context.Context: the context for the operation.
+//   - transaction *model.Transaction: the transaction to reject. Its status and
+//     metadata are mutated before persistence.
+//   - reason string: the free-text rejection reason, recorded in metadata and
+//     categorised for the rejection metric.
+//
+// Returns:
+//   - *model.Transaction: the persisted, rejected transaction.
+//   - error: a typed error if the event could not be prepared or the persistence
+//     failed.
 func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transaction, reason string) (*model.Transaction, error) {
 	ctx, span := tracer.Start(ctx, "RejectTransaction")
 	defer span.End()
@@ -44,8 +58,29 @@ func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transac
 	}
 	transaction.MetaData["blnk_rejection_reason"] = reason
 
-	// Persist the transaction with the updated status and metadata
-	transaction, err := l.datasource.RecordTransaction(ctx, transaction)
+	// Prepared BEFORE persistence, so the writer can commit it with the status mutation. A
+	// nil row means publishing is not configured, and RecordTransaction's variadic tail
+	// accepts that as "no event", so an unconfigured deployment takes exactly the path it
+	// did before.
+	eventOutbox, err := l.PrepareEventOutbox(ctx, NewWebhook{
+		Event:   getEventFromStatus(transaction.Status),
+		Payload: transaction,
+	}, WithEventLedgerID(l.transactionRejectionLedgerID(transaction)))
+	if err != nil {
+		// THE REJECTION IS REFUSED, not committed with the event dropped. Preparation does no
+		// I/O, so the only failures it can report are a payload encoding/json will not marshal
+		// and a partition key that will not resolve — producer-side defects rather than
+		// transient conditions. Committing anyway would leave a status change no subscriber is
+		// told about and no outbox row for reconciliation to count. Recorded in full under
+		// "A mutation whose event cannot be prepared is refused" in docs/event-streaming.md.
+		span.RecordError(err)
+		logrus.WithError(err).WithField("transaction_id", transaction.TransactionID).
+			Error("failed to prepare the rejection event; the rejection was not persisted")
+		return nil, err
+	}
+
+	// Persist the transaction with the updated status and metadata, and its event, atomically
+	transaction, err = l.datasource.RecordTransaction(ctx, transaction, eventOutbox)
 	if err != nil {
 		span.RecordError(err)
 		logrus.WithError(err).Error("failed to save transaction to db")
@@ -70,13 +105,54 @@ func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transac
 		logrus.Info(transaction.ParentTransaction, "parent transaction", transaction.Atomic, "atomic", transaction.Inflight, "inflight")
 		parentTransactionID, ok := transaction.MetaData["QUEUED_PARENT_TRANSACTION"].(string)
 		if !ok {
+			// Note the consequence of capturing atomically: the rejection event is ALREADY
+			// durable at this point, so it is delivered even though this function returns an
+			// error. Under the previous ordering the event was produced after this line and a
+			// malformed batch reference suppressed it. Delivering it is the more honest outcome
+			// — the rejection genuinely happened and is committed — and it is what keeps the
+			// outbox's count reconcilable against the transactions table.
 			return nil, fmt.Errorf("parent transaction ID not found in meta data")
 		}
 		l.handleAsyncBulkTransactionFailure(ctx, errors.New("transaction rejected"), parentTransactionID, transaction.Atomic, transaction.Inflight)
 	}
-	// For rejected transactions, no balances were updated, so pass nil
-	l.postTransactionActions(ctx, transaction, nil, nil)
+	// For rejected transactions, no balances were updated, so pass nil.
+	l.postTransactionActions(ctx, transaction, nil, nil, eventOutbox != nil)
 	return transaction, nil
+}
+
+// transactionRejectionLedgerID resolves the ledger a rejected transaction belongs to,
+// so its event is keyed on the same dimension as every other event in that
+// transaction's lifecycle.
+func (l *Blnk) transactionRejectionLedgerID(transaction *model.Transaction) string {
+	if l == nil || l.datasource == nil || transaction == nil {
+		return ""
+	}
+
+	for _, balanceID := range []string{transaction.Source, transaction.Destination} {
+		trimmed := strings.TrimSpace(balanceID)
+		if trimmed == "" {
+			continue
+		}
+
+		balance, err := l.datasource.GetBalanceByIDLite(trimmed)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"transaction_id": transaction.TransactionID,
+				"balance_id":     trimmed,
+			}).Debug(
+				"could not resolve the ledger of a rejected transaction from its balance; the " +
+					"rejection event will be keyed on the balance instead of the ledger",
+			)
+
+			continue
+		}
+
+		if balance != nil && strings.TrimSpace(balance.LedgerID) != "" {
+			return strings.TrimSpace(balance.LedgerID)
+		}
+	}
+
+	return ""
 }
 
 // categorizeRejectionReason maps a free-text rejection reason to a bounded set of metric labels

@@ -30,15 +30,53 @@ import (
 )
 
 // CreateLedger inserts a new ledger record into the database, ensuring metadata is properly marshaled into JSON format.
-// It assigns a unique ledger ID with a suffix and captures the current timestamp as the creation time.
 //
 // Parameters:
-// - ledger: The ledger data to be inserted into the database.
+//   - ledger: The ledger data to be inserted into the database.
+//   - prepareEvent: Optional. Builds the ledger.created outbox row from the created ledger,
+//     inside the transaction that created it. See EventPreparer for the contract.
 //
 // Returns:
-// - model.Ledger: The created ledger object including the generated LedgerID and creation timestamp.
-// - error: An error if the ledger creation fails, including specific database error handling for conflicts.
-func (d Datasource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
+//   - model.Ledger: The created ledger object including the generated LedgerID and creation timestamp.
+//   - error: An error if the ledger creation fails, including specific database error handling for
+//     conflicts, or if the event could not be prepared or captured — in which case the ledger
+//     is NOT created.
+func (d Datasource) CreateLedger(ledger model.Ledger, prepareEvent ...EventPreparer[model.Ledger]) (model.Ledger, error) {
+	ctx := context.Background()
+
+	prepare := firstEventPreparer(prepareEvent)
+	if prepare == nil {
+		return d.insertLedger(ctx, d.Conn, ledger)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	// Rollback on every path that does not commit. It is a no-op after a successful
+	// commit, so the successful path costs nothing and the failing paths cannot leak a
+	// transaction.
+	defer func() { _ = tx.Rollback() }()
+
+	created, err := d.insertLedger(ctx, tx, ledger)
+	if err != nil {
+		return model.Ledger{}, err
+	}
+
+	if err := captureEntityEvent(ctx, d, tx, created, prepare); err != nil {
+		return model.Ledger{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	return created, nil
+}
+
+// insertLedger performs the ledger INSERT against either the connection or an open
+// transaction, and is the single statement both CreateLedger paths run.
+func (d Datasource) insertLedger(ctx context.Context, execer sqlExecer, ledger model.Ledger) (model.Ledger, error) {
 	// Marshal the metadata into JSON format
 	metaDataJSON, err := json.Marshal(ledger.MetaData)
 	if err != nil {
@@ -50,7 +88,7 @@ func (d Datasource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
 	ledger.CreatedAt = time.Now()
 
 	// Insert the ledger into the database
-	_, err = d.Conn.ExecContext(context.Background(), `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO blnk.ledgers (meta_data, name, ledger_id)
 		VALUES ($1, $2, $3)
 	`, metaDataJSON, ledger.Name, ledger.LedgerID)
@@ -72,7 +110,6 @@ func (d Datasource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
 }
 
 // GetAllLedgers retrieves a paginated list of ledger records from the database, unmarshaling their metadata from JSON format.
-// This method supports pagination and can be used to efficiently retrieve all ledgers over multiple requests.
 //
 // Parameters:
 // - limit: The maximum number of ledgers to return (e.g., 20).
@@ -129,7 +166,6 @@ func (d Datasource) GetAllLedgers(limit, offset int) ([]model.Ledger, error) {
 }
 
 // GetLedgerByID retrieves a ledger record from the database by its ID.
-// It handles cases where the ledger is not found and unmarshals the metadata from JSON format.
 //
 // Parameters:
 // - id: The unique ID of the ledger to retrieve.
@@ -167,7 +203,6 @@ func (d Datasource) GetLedgerByID(id string) (*model.Ledger, error) {
 }
 
 // UpdateLedger updates an existing ledger's name in the database.
-// It validates that the ledger exists and updates only the name field.
 //
 // Parameters:
 // - id: The unique ID of the ledger to update.
@@ -209,7 +244,6 @@ func (d Datasource) UpdateLedger(id, name string) (*model.Ledger, error) {
 }
 
 // GetAllLedgersWithFilter retrieves ledgers with advanced filtering support.
-// It delegates to GetAllLedgersWithFilterAndOptions with nil options.
 //
 // Parameters:
 // - ctx: Context for the database operation.
@@ -226,7 +260,6 @@ func (d Datasource) GetAllLedgersWithFilter(ctx context.Context, filters *filter
 }
 
 // GetAllLedgersWithFilterAndOptions retrieves ledgers with filtering, sorting, and optional count.
-// It uses the filter package to build SQL WHERE and ORDER BY conditions.
 //
 // Parameters:
 // - ctx: Context for the database operation.

@@ -1,0 +1,64 @@
+# Prometheus service account and the pod-read permission its service discovery needs.
+#
+# This file exists because of one property of Kubernetes service discovery: it
+# FAILS SILENTLY WITHOUT PERMISSION. Prometheus asks the API server to list and watch pods,
+# and when the request is refused it discovers no targets, reports no configuration error,
+# and starts cleanly. /targets is simply empty. Every series is then absent, every rule in
+# blnk-kafka-alerts.yml sits permanently unable to fire, and the absence of an alert is
+# indistinguishable from health — which is the same failure class the scrape-authentication
+# note in prometheus-configmap.yaml describes, arrived at from a different direction.
+#
+# So the discovery change in that ConfigMap is not complete without this file. Applying one
+# without the other yields a monitoring stack that looks correct and collects nothing.
+#
+# A namespace-scoped Role, NOT a ClusterRole, and that is a deliberate least-privilege
+# choice rather than an oversight. The scrape jobs restrict discovery with
+# `namespaces: names: [blnk]`, so the API requests Prometheus makes are namespaced and a
+# Role in this namespace satisfies them. A ClusterRole would grant read access to every pod
+# in the cluster — including their environment variable NAMES and their volume and secret
+# REFERENCES — to obtain nothing this deployment uses. If discovery is ever widened beyond
+# this namespace, this Role must become a ClusterRole and this RoleBinding a
+# ClusterRoleBinding; discovery would otherwise fail silently again, in the same way.
+#
+# Only pods are granted. `services` and `endpoints` are deliberately absent: role: pod
+# discovery reads pods alone, and granting the other two would be permission for a
+# capability nothing here uses.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    io.kompose.service: prometheus
+  name: prometheus
+  namespace: blnk
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    io.kompose.service: prometheus
+  name: prometheus-pod-reader
+  namespace: blnk
+rules:
+  # get, list AND watch. All three are required: Prometheus performs an initial list and
+  # then maintains a watch, so a Role granting only list produces discovery that works once
+  # and then never notices a pod being added or replaced — which is precisely the case
+  # pod churn is about, since an HPA replaces pods continuously.
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list', 'watch']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    io.kompose.service: prometheus
+  name: prometheus-pod-reader
+  namespace: blnk
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: blnk

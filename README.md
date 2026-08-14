@@ -7,7 +7,7 @@
 ![Build and Test Status](https://github.com/blnkfinance/blnk/actions/workflows/go.yml/badge.svg)
 ![Deploy to Docker Status](https://github.com/blnkfinance/blnk/actions/workflows/docker-publish.yml/badge.svg)
 ![Linter Status](https://github.com/blnkfinance/blnk/actions/workflows/lint.yml/badge.svg)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 
 <br/>
 
@@ -28,9 +28,10 @@ The fastest way to understand Blnk is to deploy a sandbox and follow the develop
 Start here:
 
 - [Install Blnk locally](https://docs.blnkfinance.com/home/install) or [Deploy your sandbox](https://cloud.blnkfinance.com/auth/sign-up?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
-- [Create your first ledger, balance, and transaction](https://docs.blnkfinance.com/tutorials/quick-start/create-your-first-ledger-balance-and-transaction?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
+- [Create your first ledger, balance, and transaction](https://docs.blnkfinance.com/tutorials/quick-start/wallet-management?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing), which the wallet quick start walks through in that order
 - [Explore Blnk tutorials](https://docs.blnkfinance.com/tutorials?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
-- [Read the API reference](https://docs.blnkfinance.com/api-reference?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
+- [Read the API reference](https://docs.blnkfinance.com/reference/overview?utm_source=github&utm_medium=readme_md&utm_campaign=oss_commercial_routing)
+- [Set up Kafka event streaming](docs/kafka-operations.md), which is optional: the Docker Compose stack ships a single-broker Kafka with SASL/SCRAM behind an opt-in `kafka` profile and provisions the topics at startup, and with `KAFKA_BROKERS` unset the ledger runs exactly as before
 
 <br/>
 
@@ -77,6 +78,16 @@ Blnk helps teams match external records, such as bank statements or payment proc
 ### Identity management
 
 Blnk lets teams create and manage identities, tokenize PII, and link identities to balances and transactions.
+
+### Event streaming
+
+Blnk publishes all thirteen of its event types to Kafka, so subscribers consume a stream directly instead of receiving HTTP pushes. Events are grouped into four category topics — `blnk.transactions`, `blnk.balances`, `blnk.identities` and `blnk.system` — each with a dead-letter sibling named by appending `.dlt`. Those eight names are the complete inventory and they all move with `KAFKA_TOPIC_PREFIX`. Three of the four categories can be granted to a subscriber; `blnk.system` carries `system.error` and `ledger.created` and is withheld unless the deployment declares `KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS=true` **and** that subscriber's grant names it. **Every `<topic>.dlt` name is Blnk-owned** — Blnk creates, writes to and triages them, never grants one to a subscriber, and does not implement or manage subscriber-side dead-lettering, so choose a different name for your own.
+
+Writes are exactly-once, delivery is at-least-once. Every event is captured into a PostgreSQL transactional outbox row, and for an event a mutation produces that row is written inside the same database transaction as the mutation, so the two commit together or neither does. Three event types can instead reach their row by a write that stands alone, because no producing transaction is open when the event comes into existence: `balance.monitor` only on a deployment with no broker, `bulk_transaction.<status>` only when the finalising transaction cannot commit, and `system.error` always, since it reports a failure rather than describing a mutation. A relay then publishes each row with bounded exponential retries and per-category dead-letter topics. Kafka delivery itself is at-least-once, and a relay can crash between a successful publish and the row being marked dispatched, so **deduplicate on `event_id`** — it is unique per event and it is your idempotency key.
+
+Each subscriber is a Kafka principal with its own SASL/SCRAM credentials and broker-enforced ACLs scoped to its topics and consumer group. If you run a webhook receiver today it keeps working through a 30-day dual-run window: Kafka publishing and legacy HTTP delivery run concurrently from the same outbox row, so both transports carry byte-identical payloads. After the `WEBHOOK_DEPRECATION_SUNSET_DATE` passes, HTTP delivery stops and the deprecated webhook-subscription routes answer `410 Gone`.
+
+Read [the event streaming reference](docs/event-streaming.md) for the topic catalogue, the event schema and the idempotency guidance, [the migration guide](docs/webhook-to-kafka-migration.md) if you run a webhook receiver today, and [the Kafka operations runbook](docs/kafka-operations.md) for provisioning, the ACL model and dead-letter triage.
 
 <br/>
 

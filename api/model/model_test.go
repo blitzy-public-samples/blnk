@@ -1,10 +1,12 @@
 package model
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/blnkfinance/blnk/model"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -611,4 +613,197 @@ func TestToBalanceMonitor(t *testing.T) {
 	assert.Equal(t, createMonitor.Condition.Operator, monitor.Condition.Operator)
 	assert.Equal(t, createMonitor.Condition.Value, monitor.Condition.Value)
 	assert.Equal(t, createMonitor.Condition.Precision, monitor.Condition.Precision)
+}
+
+// TestCreateSubscriberValidate_BoundsTheTopicGrant checks the request-body validation
+// for POST /subscribers.
+//
+// Both directions are asserted.
+//
+// It drives Validate(prefix), which is now the SINGLE validation entry point.
+func TestCreateSubscriberValidate_BoundsTheTopicGrant(t *testing.T) {
+	oversized := make([]string, model.MaxSubscriberTopics+1)
+	for i := range oversized {
+		oversized[i] = "blnk.transactions"
+	}
+
+	tests := []struct {
+		name    string
+		body    CreateSubscriber
+		wantErr bool
+		reason  string
+	}{
+		{
+			name:    "name only, no grant",
+			body:    CreateSubscriber{Name: "settlement consumer"},
+			wantErr: false,
+			reason:  "registration and provisioning are separate steps; a subscriber authorised for nothing is the fail-closed default",
+		},
+		{
+			name:    "an empty grant is an explicit revocation and is valid",
+			body:    CreateSubscriber{Name: "settlement consumer", AuthorizedTopics: []string{}},
+			wantErr: false,
+		},
+		{
+			name: "a well-formed grant",
+			body: CreateSubscriber{
+				Name:             "settlement consumer",
+				AuthorizedTopics: []string{"blnk.transactions", "blnk.balances"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "a dead-letter topic",
+			body: CreateSubscriber{
+				Name:             "wants the dlt",
+				AuthorizedTopics: []string{"blnk.transactions", "blnk.transactions.dlt"},
+			},
+			wantErr: true,
+			reason: "a `<topic>.dlt` sibling carries Blnk's OWN failure records — the original bytes " +
+				"of every event that exhausted its retry budget, across every ledger — so it has no " +
+				"subscriber audience and is not grantable, however well-formed the name is",
+		},
+		{
+			name:    "name is required",
+			body:    CreateSubscriber{AuthorizedTopics: []string{"blnk.transactions"}},
+			wantErr: true,
+			reason:  "an unnamed principal cannot be triaged, and the column is NOT NULL",
+		},
+		{
+			name:    "more topics than the ceiling",
+			body:    CreateSubscriber{Name: "greedy", AuthorizedTopics: oversized},
+			wantErr: true,
+			reason:  "every entry becomes an ACL binding and an element of a stored array",
+		},
+		{
+			name: "a topic belonging to another system",
+			body: CreateSubscriber{
+				Name:             "cross tenant",
+				AuthorizedTopics: []string{"blnk.transactions", "someone-else.orders"},
+			},
+			wantErr: true,
+			reason:  "granting access to another system's topic is not a decision Blnk may make on a subscriber's behalf",
+		},
+		{
+			name: "an internal Kafka topic",
+			body: CreateSubscriber{
+				Name:             "internals",
+				AuthorizedTopics: []string{"__consumer_offsets"},
+			},
+			wantErr: true,
+			reason:  "broker internals are never grantable through the subscriber registry",
+		},
+		{
+			name: "a duplicate entry",
+			body: CreateSubscriber{
+				Name:             "duplicated",
+				AuthorizedTopics: []string{"blnk.balances", "blnk.balances"},
+			},
+			wantErr: true,
+			reason:  "a duplicate inflates the ACL request and the stored row while granting nothing additional",
+		},
+		{
+			name: "a blank entry",
+			body: CreateSubscriber{
+				Name:             "blank",
+				AuthorizedTopics: []string{"blnk.balances", "  "},
+			},
+			wantErr: true,
+			reason:  "a blank grant authorises nothing yet still consumes a binding",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := tt.body
+			err := body.Validate(model.DefaultEventTopicPrefix)
+			if tt.wantErr {
+				assert.Error(t, err, tt.reason)
+				return
+			}
+			assert.NoError(t, err, tt.reason)
+		})
+	}
+}
+
+// TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent pins the
+// omitted-versus-empty distinction the update shape exists for.
+//
+// nil means the caller is not touching the authorised set, so an update to an unrelated
+// field must not be rejected on account of it.
+func TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent(t *testing.T) {
+	name := "renamed"
+	oversized := make([]string, model.MaxSubscriberTopics+1)
+	for i := range oversized {
+		oversized[i] = "blnk.identities"
+	}
+
+	t.Run("an omitted grant is not validated", func(t *testing.T) {
+		body := UpdateSubscriber{Name: &name}
+		assert.NoError(t, body.Validate(model.DefaultEventTopicPrefix),
+			"an update that does not mention the grant must not be rejected because of it")
+	})
+
+	t.Run("a present empty grant revokes everything and is valid", func(t *testing.T) {
+		body := UpdateSubscriber{AuthorizedTopics: []string{}}
+		assert.NoError(t, body.Validate(model.DefaultEventTopicPrefix),
+			"revoking every topic is a legitimate operation and must remain expressible")
+	})
+
+	t.Run("a present grant is bounded exactly as on create", func(t *testing.T) {
+		body := UpdateSubscriber{AuthorizedTopics: oversized}
+		assert.Error(t, body.Validate(model.DefaultEventTopicPrefix),
+			"an update replaces the whole grant, so a bound enforced only on create is no bound at all")
+	})
+
+	t.Run("a present grant is narrowed to the owned taxonomy", func(t *testing.T) {
+		body := UpdateSubscriber{AuthorizedTopics: []string{"someone-else.orders"}}
+		assert.Error(t, body.Validate(model.DefaultEventTopicPrefix))
+	})
+}
+
+// TestSubscriberDTOs_CapTheTopicArrayInTheBindingTags asserts the caps are applied by
+// the BINDER, before any handler code runs.
+//
+// This is a different guarantee from the Validate methods above and is why both exist.
+func TestSubscriberDTOs_CapTheTopicArrayInTheBindingTags(t *testing.T) {
+	oversizedCount := make([]string, model.MaxSubscriberTopics+1)
+	for i := range oversizedCount {
+		oversizedCount[i] = "blnk.transactions"
+	}
+	oversizedElement := []string{strings.Repeat("t", model.MaxTopicNameLength+1)}
+
+	t.Run("create caps the count", func(t *testing.T) {
+		assert.Error(t, binding.Validator.ValidateStruct(&CreateSubscriber{
+			Name: "greedy", AuthorizedTopics: oversizedCount,
+		}), "the binder must refuse an oversized topic array without any handler code running")
+	})
+
+	t.Run("create caps the element length", func(t *testing.T) {
+		assert.Error(t, binding.Validator.ValidateStruct(&CreateSubscriber{
+			Name: "greedy", AuthorizedTopics: oversizedElement,
+		}), "dive,max must bound each element, not only the array")
+	})
+
+	t.Run("create accepts a grant at the limits", func(t *testing.T) {
+		atLimit := make([]string, model.MaxSubscriberTopics)
+		for i := range atLimit {
+			atLimit[i] = strings.Repeat("t", model.MaxTopicNameLength)
+		}
+		assert.NoError(t, binding.Validator.ValidateStruct(&CreateSubscriber{
+			Name: "at the limit", AuthorizedTopics: atLimit,
+		}), "the limits themselves must be accepted; an off-by-one here would refuse a legitimate migration grant")
+	})
+
+	t.Run("update caps the count", func(t *testing.T) {
+		assert.Error(t, binding.Validator.ValidateStruct(&UpdateSubscriber{
+			AuthorizedTopics: oversizedCount,
+		}), "the update body carries the same caps as the create body")
+	})
+
+	t.Run("update caps the element length", func(t *testing.T) {
+		assert.Error(t, binding.Validator.ValidateStruct(&UpdateSubscriber{
+			AuthorizedTopics: oversizedElement,
+		}))
+	})
 }

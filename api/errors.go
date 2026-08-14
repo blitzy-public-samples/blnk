@@ -18,6 +18,7 @@ package api
 import (
 	"database/sql"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/blnkfinance/blnk"
@@ -25,16 +26,13 @@ import (
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	redlock "github.com/blnkfinance/blnk/internal/lock"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/blnkfinance/blnk/internal/tokenization"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
 
 // Every error response carries two payloads during the transition period:
-// the legacy field clients depend on today (flat "error"/"errors" string,
-// preserved verbatim) and the structured "error_detail" object with the
-// canonical error code. The legacy field is removed — and error_detail
-// renamed to error — at the next major release. See docs/errors.md.
 
 const errorDetailKey = "error_detail"
 
@@ -103,8 +101,6 @@ func respondCode(c *gin.Context, code apierror.ErrorCode, message string, detail
 }
 
 // respondError resolves err to a catalog code and writes the dual payload.
-// Resolution order: typed APIError → known sentinels → message patterns →
-// fallback (withDefault or GEN_INTERNAL with a sanitized message).
 func respondError(c *gin.Context, err error, opts ...respondOpt) {
 	o := buildOptions(opts)
 	if err == nil {
@@ -130,16 +126,43 @@ func respondError(c *gin.Context, err error, opts ...respondOpt) {
 
 	if o.defaultCode != "" {
 		msg := err.Error()
-		if o.fallbackMessage != "" {
+
+		switch {
+		case o.fallbackMessage != "":
+			// The caller chose the client-facing wording, so it is used verbatim.
 			msg = o.fallbackMessage
-			logrus.WithError(err).Error("API error masked by fallback message")
+			logrus.WithField("cause", logsafe.Cause(err)).Error("API error masked by fallback message")
+
+		case serverFacingStatus(o.defaultCode, o):
+			// A 5xx DEFAULT MUST NOT ECHO err.Error.
+			msg = sanitizedInternalMessage
+			logrus.WithFields(logrus.Fields{
+				"code":  string(o.defaultCode),
+				"cause": logsafe.Cause(err),
+			}).Error(
+				"unclassified error behind a server-fault default code; the response carries " +
+					"sanitized text and the cause is recorded here",
+			)
 		}
+
 		writeError(c, o.defaultCode, msg, nil, o)
 		return
 	}
 
-	logrus.WithError(err).Error("unclassified error in API response")
+	logrus.WithField("cause", logsafe.Cause(err)).Error("unclassified error in API response")
 	writeError(c, apierror.ErrGenInternal, sanitizedInternalMessage, nil, o)
+}
+
+// serverFacingStatus reports whether the response this code produces will be a
+// server-fault status, and therefore whether an unclassified error message must be
+// withheld from the client.
+func serverFacingStatus(code apierror.ErrorCode, o *respondOptions) bool {
+	effective := apierror.Normalize(code)
+	if to, ok := o.upgrades[effective]; ok {
+		effective = to
+	}
+
+	return apierror.StatusForCode(effective) >= http.StatusInternalServerError
 }
 
 func writeError(c *gin.Context, code apierror.ErrorCode, message string, details interface{}, o *respondOptions) {
@@ -180,11 +203,6 @@ func classifySentinel(err error) (apierror.ErrorCode, bool) {
 
 // messagePattern entries are evaluated in order; more specific patterns must
 // precede broader ones (e.g. "field ... not found" before bare "not found").
-// This table bridges the core packages' unstructured fmt.Errorf messages to
-// catalog codes without editing ~280 core call sites. Any core error later
-// converted to a typed APIError bypasses this table entirely (it resolves in
-// respondError's errors.As step), so entries here can be retired
-// incrementally as core adopts typed errors.
 type messagePattern struct {
 	contains []string // all substrings must match
 	code     apierror.ErrorCode

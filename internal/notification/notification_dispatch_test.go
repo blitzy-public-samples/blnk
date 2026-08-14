@@ -31,11 +31,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// storeNotificationConfig installs a configuration with the given Slack and
-// webhook URLs. DataSource/Redis DNS are required by config validation but are
-// never dialed by the notification package.
+// storeNotificationConfig installs a configuration with the given Slack and webhook
+// URLs. DataSource/Redis DNS are required by config validation but are never dialed by
+// the notification package. restoreConfigStoreAfterTest captures the process-global
+// configuration and puts it back on cleanup.
+func restoreConfigStoreAfterTest(t *testing.T) {
+	t.Helper()
+
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+		}
+	})
+}
+
 func storeNotificationConfig(t *testing.T, slackURL, webhookURL string) {
 	t.Helper()
+
+	restoreConfigStoreAfterTest(t)
+
 	config.MockConfig(&config.Configuration{
 		Redis:      config.RedisConfig{Dns: "localhost:6379"},
 		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
@@ -249,10 +264,25 @@ func TestNotifyError_WebhookSenderReceivesSystemError(t *testing.T) {
 		assert.Equal(t, "system.error", got.event)
 		payloadMap, ok := got.payload.(map[string]interface{})
 		require.True(t, ok, "payload should be a map, got %T", got.payload)
-		assert.Equal(t, "queue worker crashed", payloadMap["error"])
+
+		// THE PAYLOAD IS THE FROZEN LEGACY CONTRACT, asserted at the dispatch boundary
+		// because this is the exact value that leaves the package. The frozen payload requires
+		// it to match the webhook body field-for-field, and that body has always been
+		// {"error", "time"}: a subscriber re-points its consumer at a Kafka topic and its
+		// body handling keeps working, which is the whole point of the migration.
+		assert.Equal(t, "queue worker crashed", payloadMap["error"],
+			"the error text is the value subscribers parse; it must be carried verbatim")
+
 		ts, ok := payloadMap["time"].(time.Time)
 		require.True(t, ok, "payload time should be a time.Time")
 		assert.WithinDuration(t, time.Now(), ts, 10*time.Second)
+
+		// Exactly two keys.
+		assert.Len(t, payloadMap, 2,
+			"the system.error payload is a published contract: error and time, and nothing else")
+		assert.NotContains(t, payloadMap, "reason")
+		assert.NotContains(t, payloadMap, "correlation_id")
+		assert.NotContains(t, payloadMap, "error_code")
 	case <-time.After(3 * time.Second):
 		t.Fatal("webhook sender was never invoked by NotifyError")
 	}
@@ -317,33 +347,70 @@ func TestNotifyError_SenderErrorIsSwallowed(t *testing.T) {
 	}
 }
 
+// TestNotifyError_DispatchesToBothSlackAndWebhook asserts both channels are reached AND
+// the order they are reached in.
+//
+// The durable event is attempted FIRST and Slack second.
+//
+// The wait is the completion seam rather than a receive on the sender's channel.
 func TestNotifyError_DispatchesToBothSlackAndWebhook(t *testing.T) {
 	original := webhookSender
 	defer RegisterWebhookSender(original)
 
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	record := func(channel string) {
+		mu.Lock()
+		order = append(order, channel)
+		mu.Unlock()
+	}
+
 	server, captured := newSlackCaptureServer(http.StatusOK, `{}`)
 	defer server.Close()
 
-	storeNotificationConfig(t, server.URL, "http://example.invalid/webhook-target")
+	// Wrapped so the Slack hit is recorded in the same ordered log as the event capture. The
+	// capture server records the request itself; this only records WHEN, relative to the sender.
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		record("slack")
+		server.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer slack.Close()
+
+	storeNotificationConfig(t, slack.URL, "http://example.invalid/webhook-target")
 
 	senderCalled := make(chan string, 1)
 	RegisterWebhookSender(func(event string, payload interface{}) error {
+		record("event")
 		senderCalled <- event
+
 		return nil
 	})
 
+	awaitCompletion := awaitNotifyError(t)
+
 	NotifyError(errors.New("dual channel failure"))
+
+	awaitCompletion()
 
 	select {
 	case event := <-senderCalled:
 		assert.Equal(t, "system.error", event)
-	case <-time.After(3 * time.Second):
+	default:
 		t.Fatal("webhook sender was never invoked")
 	}
 
-	// Slack is called synchronously before the webhook sender inside the
-	// NotifyError goroutine, so by now it must have been hit.
 	reqs := captured()
 	require.Len(t, reqs, 1, "Slack should have received the error notification")
 	assert.Contains(t, string(reqs[0].body), "dual channel failure")
+
+	mu.Lock()
+	sequence := append([]string(nil), order...)
+	mu.Unlock()
+
+	assert.Equal(t, []string{"event", "slack"}, sequence,
+		"the durable event must be attempted BEFORE the optional Slack delivery: Slack is a "+
+			"third-party POST with a 30-second budget, and letting it run first delays every "+
+			"system.error's outbox row by that budget during the outage that produced it")
 }

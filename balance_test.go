@@ -162,6 +162,8 @@ func TestCreateBalance(t *testing.T) {
 
 	// Convert metadata to JSON for mocking
 	metaDataJSON, _ := json.Marshal(balance.MetaData)
+	// NO TRANSACTION IS SCRIPTED, and that is the graceful-degradation criterion rather
+	// than an omission.
 	mock.ExpectExec("INSERT INTO blnk.balances").
 		WithArgs(sqlmock.AnyArg(), balance.Balance.String(), balance.CreditBalance.String(), balance.DebitBalance.String(), balance.Currency, balance.LedgerID, balance.IdentityID, sqlmock.AnyArg(), sqlmock.AnyArg(), metaDataJSON, false, "FIFO").
 		WillReturnResult(sqlmock.NewResult(1, 1))

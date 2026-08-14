@@ -22,6 +22,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -648,6 +649,15 @@ func (a Api) BulkVoidInflight(c *gin.Context) {
 		respondCode(c, apierror.ErrTxnBulkLimitExceeded, "too many transaction_ids; max is "+strconv.Itoa(model2.MaxBulkInflightItems), nil)
 		return
 	}
+	// Refused here, before anything is enqueued. See blankInflightID.
+	for i, id := range req.TransactionIDs {
+		if blankInflightID(id) {
+			respondCode(c, apierror.ErrTxnValidation,
+				"transaction_ids["+strconv.Itoa(i)+"] cannot be empty", nil)
+
+			return
+		}
+	}
 
 	items := make([]blnk.BulkInflightItem, len(req.TransactionIDs))
 	for i, id := range req.TransactionIDs {
@@ -672,6 +682,32 @@ func (a Api) BulkVoidInflight(c *gin.Context) {
 // response: QUEUED on success, ALREADY_QUEUED when one is already in flight
 // (both count as accepted), and a classified failure code if pre-validation
 // rejects the item synchronously.
+// blankInflightID reports whether a bulk inflight item carries no usable transaction id.
+//
+// WHY A BLANK ID HAS TO BE REFUSED AT THE EDGE, RATHER THAN FAILING LATER.
+//
+// An item with an empty transaction_id used to be accepted: the request answered 200, and
+// the item was enqueued like any other. The queue derives each task's identity from the id
+// it was given, so a blank one produces the task id "inflight-action:" — a name that is
+// both meaningless and, being a constant, THE SAME for every blank item ever submitted. The
+// worker then cannot resolve a transaction from it, fails, and asynq retries on its
+// schedule; because the task id is shared, retries of unrelated requests collide on the one
+// name. The result the load run recorded was a task that could never succeed being retried
+// indefinitely inside the queue that carries real ledger work.
+//
+// Nothing downstream can repair this, because by the time the task exists the identifying
+// information has already been lost — which is precisely why the check belongs here, before
+// the enqueue and before the precision lookups that would otherwise be spent on an item
+// that cannot be processed. A blank required field is a malformed payload, in the same
+// class as the empty-list and over-limit refusals above, so it is answered the same way:
+// 400, with the offending index named so the caller can find it in the array it sent.
+//
+// Whitespace counts as blank. " " is not an identifier, and accepting it would leave the
+// same unusable task id one space longer.
+func blankInflightID(id string) bool {
+	return strings.TrimSpace(id) == ""
+}
+
 func (a Api) queueBulkInflight(ctx context.Context, action string, items []blnk.BulkInflightItem) model2.BulkInflightResponse {
 	resp := model2.BulkInflightResponse{Results: make([]model2.BulkInflightResult, 0, len(items))}
 	for _, it := range items {
@@ -712,6 +748,16 @@ func (a Api) BulkCommitInflight(c *gin.Context) {
 	if len(req.Transactions) > model2.MaxBulkInflightItems {
 		respondCode(c, apierror.ErrTxnBulkLimitExceeded, "too many transactions; max is "+strconv.Itoa(model2.MaxBulkInflightItems), nil)
 		return
+	}
+	// Refused here, before the precision lookups below and before anything is enqueued.
+	// See blankInflightID.
+	for i, it := range req.Transactions {
+		if blankInflightID(it.TransactionID) {
+			respondCode(c, apierror.ErrTxnValidation,
+				"transactions["+strconv.Itoa(i)+"].transaction_id cannot be empty", nil)
+
+			return
+		}
 	}
 
 	cnf, err := config.Fetch()

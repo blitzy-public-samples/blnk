@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/internal/notification"
@@ -39,7 +40,6 @@ var (
 )
 
 // NewBalanceTracker creates a new BalanceTracker instance.
-// It initializes the Balances and Frequencies maps.
 //
 // Returns:
 // - *model.BalanceTracker: A pointer to the newly created BalanceTracker instance.
@@ -50,16 +50,21 @@ func NewBalanceTracker() *model.BalanceTracker {
 	}
 }
 
-// checkBalanceMonitors checks the balance monitors for a given updated balance.
-// It starts a tracing span, fetches the monitors, and checks each monitor's condition.
-// If a condition is met, it sends a webhook notification.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - updatedBalance *model.Balance: A pointer to the updated Balance model.
+// checkBalanceMonitors checks the balance monitors for a given updated balance. It
+// starts a tracing span, fetches the monitors, and checks each monitor's condition. If
+// a condition is met, it captures a balance.monitor event in the outbox through the
+// DURABLE standalone path, because the balance movement that satisfied the condition
+// has already been committed by the time this runs and the capture is therefore the
+// alert's only chance.
 func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.Balance) {
 	_, span := balanceTracer.Start(ctx, "CheckBalanceMonitors")
 	defer span.End()
+
+	// THIS IS NOW THE LEGACY-ONLY PATH, and the guard is what keeps it that way.
+	if l.balanceMonitorHandoffEnabled() {
+		span.AddEvent("Monitor evaluation deferred to the durable handoff")
+		return
+	}
 
 	// Fetch monitors using cache (avoids DB query on every transaction)
 	monitors, err := l.getBalanceMonitorsCached(ctx, updatedBalance.BalanceID)
@@ -73,11 +78,21 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 	for _, monitor := range monitors {
 		if monitor.CheckCondition(updatedBalance) {
 			span.AddEvent(fmt.Sprintf("Condition met for balance: %s", monitor.MonitorID))
+
+			// BOUNDED, and acquired here rather than inside the goroutine so a database that
+			// cannot keep up is felt as backpressure instead of absorbed as an unbounded pile-up
+			// of goroutines. One balance can carry many monitors and many of them can fire on
+			// one update, so the fan-out here is a product of two counts rather than one per
+			// transaction — the shape most likely to exhaust memory first.
+			postCommitEventPublishSem <- struct{}{}
 			go func(monitor model.BalanceMonitor) {
-				err := l.SendWebhook(NewWebhook{
+				defer func() { <-postCommitEventPublishSem }()
+
+				// PRODUCER CALL SITE FOR balance.monitor — THE FALLBACK ONE.
+				err := l.PublishEventDurably(ctx, NewWebhook{
 					Event:   "balance.monitor",
 					Payload: monitor,
-				})
+				}, WithEventLedgerID(updatedBalance.LedgerID))
 				if err != nil {
 					notification.NotifyError(err)
 				}
@@ -86,27 +101,112 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 	}
 }
 
+// prepareBalanceMonitorEvents evaluates the monitors of balances a mutation has just
+// changed and returns the balance.monitor rows to enrol in that mutation's own
+// transaction.
+func (l *Blnk) prepareBalanceMonitorEvents(
+	ctx context.Context,
+	balances []*model.Balance,
+) ([]*model.EventOutbox, error) {
+	ctx, span := balanceTracer.Start(ctx, "PrepareBalanceMonitorEvents")
+	defer span.End()
+
+	var (
+		rows []*model.EventOutbox
+		// Which balances were actually READ AND EVALUATED, deduplicated so the span
+		// attribute counts balances rather than visits.
+		evaluated map[string]struct{}
+	)
+
+	if l == nil || l.datasource == nil {
+		return nil, nil
+	}
+
+	// NO CACHE IS NOT A REASON TO SKIP THIS. The monitor read below tolerates a nil cache
+	// on both its read and its write-back, so the only thing a missing cache costs is the
+	// cache.
+
+	for _, balance := range balances {
+		if balance == nil {
+			continue
+		}
+
+		monitors, err := l.getBalanceMonitorsCached(ctx, balance.BalanceID)
+		if err != nil {
+			// Reported and stepped past, never returned: see the error policy above.
+			span.RecordError(err)
+			logrus.WithError(err).WithField("balance", balance.BalanceID).Warn(
+				"balance monitors could not be read before the write, so any crossing they " +
+					"describe is not captured with this movement",
+			)
+
+			continue
+		}
+
+		if evaluated == nil {
+			evaluated = make(map[string]struct{}, len(balances))
+		}
+		evaluated[balance.BalanceID] = struct{}{}
+
+		for _, monitor := range monitors {
+			if !monitor.CheckCondition(balance) {
+				continue
+			}
+
+			row, prepareErr := l.prepareBalanceMonitorAlertRow(ctx, balance, monitor)
+			if prepareErr != nil {
+				span.RecordError(prepareErr)
+
+				return nil, prepareErr
+			}
+
+			// Nil is the unconfigured case: no brokers, so no event pipeline and no row to
+			// capture. That deployment publishes this crossing over the legacy transport from
+			// the post-commit route instead, which is the route that runs precisely when
+			// publishing is unconfigured.
+			if row == nil {
+				continue
+			}
+
+			rows = append(rows, row)
+		}
+	}
+
+	span.SetAttributes(
+		attribute.Int("balance.monitors_evaluated_for", len(evaluated)),
+		attribute.Int("balance.monitor_events_captured", len(rows)),
+	)
+
+	return rows, nil
+}
+
+// prepareBalanceMonitorAlertRow builds the canonical balance.monitor outbox row for ONE
+// crossing: one monitor, on one balance, as that balance has just been written.
+func (l *Blnk) prepareBalanceMonitorAlertRow(ctx context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+	return l.PrepareEventOutbox(ctx, NewWebhook{
+		Event:   balanceMonitorEventType,
+		Payload: monitor,
+	}, WithEventLedgerID(balance.LedgerID))
+}
+
 // getBalanceMonitorsCached retrieves balance monitors with caching.
-// It first checks the cache for monitors, and if not found, fetches from the database
-// and caches the result with a 5-minute TTL.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - balanceID string: The ID of the balance to get monitors for.
-//
-// Returns:
-// - []model.BalanceMonitor: A slice of monitors for the balance.
-// - error: An error if the monitors could not be retrieved.
 func (l *Blnk) getBalanceMonitorsCached(ctx context.Context, balanceID string) ([]model.BalanceMonitor, error) {
 	cacheKey := "monitors:" + balanceID
 
 	var monitors []model.BalanceMonitor
-	err := l.cache.Get(ctx, cacheKey, &monitors)
-	if err == nil && monitors != nil {
-		return monitors, nil
+
+	// GUARDED ON BOTH SIDES, because this function is reachable on an instance built
+	// without a cache — production always has one, tests construct Blnk directly, and the
+	// monitor capture path must behave the same either way. cache.Cache is an interface,
+	// so a nil field is a nil interface and calling through it panics rather than
+	// returning an error.
+	if l.cache != nil {
+		if err := l.cache.Get(ctx, cacheKey, &monitors); err == nil && monitors != nil {
+			return monitors, nil
+		}
 	}
 
-	monitors, err = l.datasource.GetBalanceMonitors(balanceID)
+	monitors, err := l.datasource.GetBalanceMonitors(balanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -115,23 +215,15 @@ func (l *Blnk) getBalanceMonitorsCached(ctx context.Context, balanceID string) (
 		monitors = []model.BalanceMonitor{}
 	}
 
-	_ = l.cache.Set(ctx, cacheKey, monitors, 5*time.Minute)
+	// The write-back, guarded for the same reason as the read above.
+	if l.cache != nil {
+		_ = l.cache.Set(ctx, cacheKey, monitors, 5*time.Minute)
+	}
+
 	return monitors, nil
 }
 
 // getOrCreateBalanceByIndicator retrieves a balance by its indicator and currency.
-// If the balance does not exist, it creates a new one.
-// It starts a tracing span, fetches or creates the balance, and records relevant events.
-// When EnableQueuedChecks is enabled in the transaction config, it will fetch the balance with queued data included.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - indicator string: The indicator for the balance.
-// - currency string: The currency for the balance.
-//
-// Returns:
-// - *model.Balance: A pointer to the Balance model.
-// - error: An error if the balance could not be retrieved or created.
 func (l *Blnk) getOrCreateBalanceByIndicator(ctx context.Context, indicator, currency string) (*model.Balance, error) {
 	ctx, span := balanceTracer.Start(ctx, "GetOrCreateBalanceByIndicator")
 	defer span.End()
@@ -189,15 +281,17 @@ func (l *Blnk) getOrCreateBalanceByIndicator(ctx context.Context, indicator, cur
 	return balance, nil
 }
 
-// postBalanceActions performs some actions after a balance has been created.
-// It starts a tracing span, sends the balance to the search index queue, and sends a webhook notification.
-//
-// Parameters:
-// - ctx context.Context: The context for the operation.
-// - balance *model.Balance: A pointer to the newly created Balance model.
+// postBalanceActions performs some actions after a balance has been created. It starts
+// a tracing span and sends the balance to the search index queue.
 func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
-	_, span := balanceTracer.Start(ctx, "PostBalanceActions")
+	ctx, span := balanceTracer.Start(ctx, "PostBalanceActions")
 	defer span.End()
+
+	// The publish context is DETACHED FROM CANCELLATION but not from the trace, using the
+	// same context.WithoutCancel idiom runTransactionPostCommitWorkWithHooks already
+	// applies to the monitor goroutines in transaction_execution.go. It is derived here,
+	// outside the goroutine, because ctx is still live at this point.
+	publishCtx := context.WithoutCancel(ctx)
 
 	go func() {
 		err := l.queue.queueIndexData(balance.BalanceID, "balances", balance)
@@ -205,10 +299,10 @@ func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
 			span.RecordError(err)
 			notification.NotifyError(err)
 		}
-		err = l.SendWebhook(NewWebhook{
+		err = l.publishEntityEventWhenUncaptured(publishCtx, balance.BalanceID, NewWebhook{
 			Event:   "balance.created",
 			Payload: balance,
-		})
+		}, WithEventLedgerID(balance.LedgerID))
 		if err != nil {
 			span.RecordError(err)
 			notification.NotifyError(err)
@@ -217,8 +311,27 @@ func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
 	}()
 }
 
-// CreateBalance creates a new balance.
-// It starts a tracing span, creates the balance, and performs post-creation actions.
+// balanceCreatedEventPreparer returns the preparer that builds the balance.created
+// outbox row, for the repository to insert INSIDE the transaction that inserts the
+// balance.
+func (l *Blnk) balanceCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Balance] {
+	// A NIL PREPARER when nothing is configured, so the repository stays on its
+	// single-statement path instead of opening a transaction to insert no event. See
+	// eventCaptureEnabled.
+	if !l.eventCaptureEnabled() {
+		return nil
+	}
+
+	return func(created model.Balance) (*model.EventOutbox, error) {
+		return l.PrepareEventOutbox(ctx, NewWebhook{
+			Event:   "balance.created",
+			Payload: &created,
+		}, WithEventLedgerID(created.LedgerID))
+	}
+}
+
+// CreateBalance creates a new balance. It starts a tracing span, creates the balance,
+// and performs post-creation actions.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -231,7 +344,7 @@ func (l *Blnk) CreateBalance(ctx context.Context, balance model.Balance) (model.
 	ctx, span := balanceTracer.Start(ctx, "CreateBalance")
 	defer span.End()
 
-	balance, err := l.datasource.CreateBalance(balance)
+	balance, err := l.datasource.CreateBalance(balance, l.balanceCreatedEventPreparer(ctx))
 	if err != nil {
 		span.RecordError(err)
 		return model.Balance{}, err
@@ -243,7 +356,6 @@ func (l *Blnk) CreateBalance(ctx context.Context, balance model.Balance) (model.
 }
 
 // GetBalanceByID retrieves a balance by its ID.
-// It starts a tracing span, fetches the balance, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -267,7 +379,6 @@ func (l *Blnk) GetBalanceByID(ctx context.Context, id string, include []string, 
 }
 
 // GetAllBalances retrieves all balances.
-// It starts a tracing span, fetches all balances, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -289,7 +400,6 @@ func (l *Blnk) GetAllBalances(ctx context.Context, limit, offset int) ([]model.B
 }
 
 // GetAllBalancesWithFilter retrieves balances using advanced filters.
-// It starts a tracing span, fetches balances matching the filter criteria, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -328,8 +438,6 @@ func (l *Blnk) GetAllBalancesWithFilterAndOptions(ctx context.Context, filters *
 }
 
 // CreateMonitor creates a new balance monitor.
-// It starts a tracing span, applies precision to the monitor's condition value, and creates the monitor.
-// It records relevant events and errors.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -358,7 +466,6 @@ func (l *Blnk) CreateMonitor(ctx context.Context, monitor model.BalanceMonitor) 
 }
 
 // GetMonitorByID retrieves a balance monitor by its ID.
-// It starts a tracing span, fetches the monitor, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -381,7 +488,6 @@ func (l *Blnk) GetMonitorByID(ctx context.Context, id string) (*model.BalanceMon
 }
 
 // GetAllMonitors retrieves all balance monitors.
-// It starts a tracing span, fetches all monitors, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -403,7 +509,6 @@ func (l *Blnk) GetAllMonitors(ctx context.Context) ([]model.BalanceMonitor, erro
 }
 
 // GetBalanceMonitors retrieves all monitors for a given balance ID.
-// It starts a tracing span, fetches the monitors, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -426,7 +531,6 @@ func (l *Blnk) GetBalanceMonitors(ctx context.Context, balanceID string) ([]mode
 }
 
 // UpdateMonitor updates an existing balance monitor.
-// It starts a tracing span, updates the monitor, and records relevant events and errors.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -451,7 +555,6 @@ func (l *Blnk) UpdateMonitor(ctx context.Context, monitor *model.BalanceMonitor)
 }
 
 // DeleteMonitor deletes a balance monitor by its ID.
-// It starts a tracing span, deletes the monitor, and records relevant events and errors.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -482,8 +585,6 @@ func (l *Blnk) DeleteMonitor(ctx context.Context, id string) error {
 }
 
 // TakeBalanceSnapshots creates daily snapshots of balances in batches.
-// It accepts a batch size parameter to control the number of balances processed at once,
-// helping to manage memory usage for large datasets.
 //
 // Parameters:
 // - ctx context.Context: The context for managing the operation's lifecycle and cancellation
@@ -548,8 +649,6 @@ func (l *Blnk) TakeBalanceSnapshots(ctx context.Context, batchSize int) {
 }
 
 // GetBalanceAtTime retrieves a balance's state at a specific point in time.
-// It can either use balance snapshots for efficiency or calculate from all source transactions
-// based on the fromSource parameter.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -602,7 +701,6 @@ func (l *Blnk) GetBalanceAtTime(ctx context.Context, balanceID string, targetTim
 }
 
 // GetBalanceByIndicator retrieves a balance by its indicator and currency.
-// It starts a tracing span, fetches the balance, and records relevant events.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -632,7 +730,6 @@ func (l *Blnk) GetBalanceByIndicator(ctx context.Context, indicator, currency st
 }
 
 // UpdateBalanceIdentity updates only the identity_id associated with a balance.
-// It validates that both the balance and the identity exist before applying the change.
 //
 // Parameters:
 // - balanceID string: The ID of the balance whose identity reference should be modified.

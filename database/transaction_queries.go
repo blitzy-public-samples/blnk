@@ -81,13 +81,6 @@ func (d Datasource) GetTransaction(ctx context.Context, id string) (*model.Trans
 }
 
 // IsParentTransactionVoid checks if a parent transaction has a status of 'VOID'.
-// It uses OpenTelemetry to trace the operation and returns a boolean indicating
-// whether any child transaction linked to the parent has a 'VOID' status.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// - parentID: The unique ID of the parent transaction.
-// Returns:
-// - A boolean indicating whether the parent transaction is void, or an error if the check fails.
 func (d Datasource) IsParentTransactionVoid(ctx context.Context, parentID string) (bool, error) {
 	// Start a new tracing span for the database operation
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "IsParentTransactionVoid")
@@ -121,12 +114,6 @@ func (d Datasource) IsParentTransactionVoid(ctx context.Context, parentID string
 }
 
 // TransactionExistsByRef checks if a transaction with a given reference exists in the database.
-// It uses OpenTelemetry to trace the operation and returns a boolean indicating whether the transaction exists.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// - reference: The reference of the transaction to check for existence.
-// Returns:
-// - A boolean indicating whether the transaction exists, or an error if the check fails.
 func (d Datasource) TransactionExistsByRef(ctx context.Context, reference string) (bool, error) {
 	// Start a new tracing span for the database operation
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "TransactionExistsByRef")
@@ -203,12 +190,6 @@ func (d Datasource) GetExistingTransactionReferences(ctx context.Context, refere
 }
 
 // GetTransactionByRef retrieves a transaction from the database using the provided reference.
-// It traces the operation using OpenTelemetry and returns the transaction or an error.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// - reference: The reference of the transaction to retrieve.
-// Returns:
-// - A model.Transaction representing the transaction or an error if the retrieval fails.
 func (d Datasource) GetTransactionByRef(ctx context.Context, reference string) (model.Transaction, error) {
 	// Start a new tracing span for the database operation
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "GetTransactionByRef")
@@ -258,11 +239,6 @@ func (d Datasource) GetTransactionByRef(ctx context.Context, reference string) (
 }
 
 // GetAllTransactions retrieves all transactions from the database, ordered by creation date in descending order.
-// It traces the operation using OpenTelemetry and returns an error if the retrieval or processing fails.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// Returns:
-// - A slice of transactions or an error if the retrieval fails.
 func (d Datasource) GetAllTransactions(ctx context.Context, limit, offset int) ([]model.Transaction, error) {
 	// Start a new tracing span for the operation
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "GetAllTransactions")
@@ -294,6 +270,12 @@ func (d Datasource) GetAllTransactions(ctx context.Context, limit, offset int) (
 		var metaDataJSON []byte
 		var preciseAmountStr string
 		var effectiveDate sql.NullTime
+		// parent_transaction is NULLABLE and every top-level transaction stores SQL NULL in
+		// it, so it must be read through a sql.NullString. Scanning it straight into the
+		// struct's string field failed the whole query with "converting NULL to string is
+		// unsupported" — which took down the reindex path that calls this method, for any
+		// ledger holding a transaction with no parent, which is to say almost all of them.
+		var parentTransaction sql.NullString
 
 		// Scan each row into the Transaction struct
 		err = rows.Scan(
@@ -311,12 +293,16 @@ func (d Datasource) GetAllTransactions(ctx context.Context, limit, offset int) (
 			&transaction.CreatedAt,
 			&effectiveDate,
 			&metaDataJSON,
-			&transaction.ParentTransaction,
+			&parentTransaction,
 		)
 		if err != nil {
 			span.RecordError(err)
 			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan transaction data", err)
 		}
+
+		// SQL NULL becomes the empty string, which is how the rest of this package represents
+		// "no parent" in the model.
+		transaction.ParentTransaction = parentTransaction.String
 
 		// Preserve the business/value date through reindex (nil for old records,
 		// where GetEffectiveDate falls back to created_at).
@@ -359,9 +345,3 @@ func (d Datasource) GetAllTransactions(ctx context.Context, limit, offset int) (
 }
 
 // GetTotalCommittedTransactions calculates the total committed transaction amounts for a given parent transaction.
-// It uses OpenTelemetry for tracing and returns the total or an error if the retrieval fails.
-// Parameters:
-// - ctx: Context for managing the request and tracing.
-// - parentID: The ID of the parent transaction to retrieve totals for.
-// Returns:
-// - The total committed amount as *big.Int, or 0 if no transactions are found, along with an error if the retrieval fails.

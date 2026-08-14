@@ -19,6 +19,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -208,6 +209,73 @@ func resetReindexManager() {
 	globalReindexManager.mu.Lock()
 	globalReindexManager.service = nil
 	globalReindexManager.mu.Unlock()
+}
+
+// safeResponseBody renders a response for a FAILURE MESSAGE with every secret-shaped
+// field withheld.
+//
+// The two shapes that leaked are mirror images.
+func safeResponseBody(w *httptest.ResponseRecorder) string {
+	raw := w.Body.Bytes()
+	if len(raw) == 0 {
+		return fmt.Sprintf("status=%d body=<empty>", w.Code)
+	}
+
+	var decoded interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return fmt.Sprintf("status=%d body=<%d bytes, not JSON, withheld>", w.Code, len(raw))
+	}
+
+	rendered, err := json.Marshal(withoutSecretFields(decoded))
+	if err != nil {
+		// Unreachable for a value that just decoded, and reported rather than ignored so a
+		// diagnostic never silently becomes empty.
+		return fmt.Sprintf("status=%d body=<%d bytes, unrenderable, withheld>", w.Code, len(raw))
+	}
+
+	return fmt.Sprintf("status=%d body=%s", w.Code, rendered)
+}
+
+// withoutSecretFields returns a copy of a decoded JSON value with every secret-shaped field
+// replaced. The input is not modified, so a caller may still assert on the original body.
+func withoutSecretFields(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		sanitised := make(map[string]interface{}, len(typed))
+		for key, nested := range typed {
+			if isSecretFieldName(key) {
+				sanitised[key] = "[withheld by safeResponseBody]"
+
+				continue
+			}
+
+			sanitised[key] = withoutSecretFields(nested)
+		}
+
+		return sanitised
+	case []interface{}:
+		sanitised := make([]interface{}, len(typed))
+		for index, nested := range typed {
+			sanitised[index] = withoutSecretFields(nested)
+		}
+
+		return sanitised
+	default:
+		return value
+	}
+}
+
+// isSecretFieldName reports whether a JSON key names something that must not be written to
+// durable output.
+func isSecretFieldName(key string) bool {
+	lowered := strings.ToLower(key)
+	for _, marker := range []string{"password", "secret", "token", "passphrase"} {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // assertErrorCode asserts the standard dual error payload: the response has

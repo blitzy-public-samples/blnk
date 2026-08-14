@@ -1,0 +1,87 @@
+# THE BROKER'S STORAGE CLAIMS, ONE PER BROKER.
+# ==========================================================================
+# READ THIS BEFORE APPLYING OR EDITING: these three claims are OPTIONAL, and they are
+# the pre-provisioning half of the StatefulSet's storage.
+# ==========================================================================
+# kafka-statefulset.yaml declares a volumeClaimTemplate named `kafka-data`, and
+# Kubernetes materialises one claim per pod from it. The names it uses are derived, not
+# chosen:
+#
+#     <template name>-<StatefulSet name>-<ordinal>
+#     kafka-data      -kafka             -0 / -1 / -2
+#
+# Those are exactly the three objects below. Applying this file BEFORE the StatefulSet
+# pre-provisions them; the StatefulSet then ADOPTS each one rather than creating a
+# second, because a claim of that name already exists.
+#
+# It is the only way to control the storage of an individual broker. Because the claim
+# exists before any pod does, you can bind a specific PersistentVolume to a specific
+# ordinal — a named local NVMe disk, a pre-existing cloud disk restored from a snapshot,
+# or a different StorageClass for one broker — none of which a single template can
+# express.
+#
+#   1. THE NAMES. `kafka-data-kafka-<n>` and nothing else. Renaming the StatefulSet or
+#      its volumeClaimTemplate silently orphans all three: the set creates its own
+#      claims under the new names and these sit unbound and unused, which is the
+#      original defect with extra steps.
+#   2. THE COUNT. One entry per replica. The StatefulSet declares 3 — the KRaft quorum
+#      needs three voters to tolerate one loss — so raising `replicas` requires adding
+#      an entry here in the same change, or the new broker's claim is created from the
+#      template while its siblings came from this file and the two can differ.
+#   3. THE SIZE. 200Gi, identical to the volumeClaimTemplate. Kubernetes does NOT
+#      reconcile a pre-existing claim against the template — it adopts what it finds —
+#      so a claim smaller than the template is adopted at the smaller size, silently,
+#      and the broker's retention arithmetic no longer fits its disk.
+#   4. THE ACCESS MODE. ReadWriteOnce, matching the template. A claim the scheduler
+#      treats differently from what the workload expects is a scheduling failure at the
+#      worst moment.
+#   5. THE STORAGE CLASS. Omitted here and in the template, so both take the cluster's
+#      default.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka-data
+  name: kafka-data-kafka-0
+  namespace: blnk
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+status: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka-data
+  name: kafka-data-kafka-1
+  namespace: blnk
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+status: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka-data
+  name: kafka-data-kafka-2
+  namespace: blnk
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+status: {}

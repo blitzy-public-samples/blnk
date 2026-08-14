@@ -14,8 +14,21 @@ spec:
   selector:
     matchLabels:
       io.kompose.service: server
+  # ROLLINGUPDATE, NOT RECREATE. Recreate is what kompose emits from a Compose file, and
+  # it means every replica is TERMINATED BEFORE any replacement is created: a full
+  # outage of the ledger's only HTTP surface on every image change, every configuration
+  # change and every rollback. That is not a degradation to be tolerated; it is the
+  # deployment being unavailable by design.
+  #
+  # maxUnavailable: 0 makes the rollout strictly additive. A new pod is created, it must
+  # pass the readiness probe below, and only then is an old one removed — so the number
+  # of pods serving traffic never falls below the current replica count, and a
+  # replacement that cannot reach the database never displaces a working pod.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       annotations:
@@ -25,31 +38,629 @@ spec:
       labels:
         io.kompose.service: server
     spec:
-      containers:
-        - args:
-            - blnk migrate up --config /blnk.json && blnk start --config /blnk.json
+      # No API access is needed from this pod: Blnk talks to Postgres, Redis, Kafka and
+      # TypeSense, never to the Kubernetes API. Leaving the token mounted hands a
+      # namespace-scoped credential to the process most exposed to the network.
+      automountServiceAccountToken: false
+      # RESTRICTED, NON-ROOT EXECUTION.
+      #
+      # fsGroup matches so the projected kafka-tls CA is group-readable by this uid
+      # rather than root-only.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # MIGRATIONS MOVE HERE, AND THAT IS WHAT MAKES SHUTDOWN CORRECT.
+      initContainers:
+        - name: migrate
+          image: blnk:REPLACE_WITH_PINNED_DIGEST
           command:
-            - /bin/sh
-            - -c
+            - blnk
+            - migrate
+            - up
+            - --config
+            - /blnk.json
+          # MIGRATIONS NEED THE DATABASE AND REDIS, and the second half of that was the
+          # defect. "Migrations need the database and nothing else" is true of the SQL this
+          # container applies and false of the PROCESS that applies it: `blnk migrate up`
+          # runs through the root command's PersistentPreRunE, which builds the whole
+          # service container for ProcessRoleTool — including the Redis client — before the
+          # migrate subcommand's own RunE is ever reached. config.validateRequiredFields
+          # refuses to start without a Redis DSN for the same reason.
+          #
+          # So a container given no BLNK_REDIS_DNS does not skip Redis; it falls back to the
+          # value in the mounted blnk.json, which is the unauthenticated "redis:6379" this
+          # repository ships as its no-password default. Against the Redis this tree
+          # actually deploys — password-protected, --requirepass from Secret blnk-redis —
+          # that connection is refused with NOAUTH, the init container exits non-zero, and
+          # the pod restarts it for ever. The server never starts, the migrations never
+          # apply, and the only evidence is a NOAUTH line in a container that is not the one
+          # anybody looks at.
+          #
+          # The fix is the SAME secret reference the main container carries, verbatim
+          # including optional: true — one Redis, one DSN, and a value the two containers of
+          # one pod cannot disagree about. optional stays true so a deployment running an
+          # unauthenticated Redis (where blnk.json's default IS correct) is unaffected.
           env:
-            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-              value: http://jaeger:4318/v1/traces
-            - name: TZ
-              value: Etc/UTC
-          image: jerryenebeli/blnk:0.13.3
-          name: server
-          ports:
-            - containerPort: 5001
-            - containerPort: 80
-            - containerPort: 443
-          resources: {}
+            - name: BLNK_DATA_SOURCE_DNS
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-datasource
+                  key: dsn
+            - name: BLNK_REDIS_DNS
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-redis
+                  key: dns
+                  optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           volumeMounts:
             - name: blnk-config
               mountPath: /blnk.json
               subPath: blnk.json
+      containers:
+        - command:
+            - blnk
+            - start
+            - --config
+            - /blnk.json
+          env:
+            # THE HEAP'S KNOWLEDGE OF ITS OWN CONTAINER. Go's collector sizes the heap
+            # against GOGC alone unless told otherwise, so it does not know a cgroup limit
+            # exists: it grows until the kernel OOM-kills the container, and the pod
+            # restarts mid-backlog with no panic, no log line and nothing on the process to
+            # explain it. GOMEMLIMIT makes the limit below a GC target rather than a
+            # discovery.
+            #
+            # 448MiB against a 512Mi limit leaves ~64MiB for everything the Go heap is not:
+            # the runtime's own stacks and metadata, the SQL and Kafka drivers' buffers, and
+            # the OS pages the binary itself occupies. It is a SOFT limit, so the collector
+            # works harder as it is approached rather than failing an allocation — which is
+            # the behaviour wanted here, because the alternative to a slower relay is a
+            # killed one.
+            #
+            # Measured before choosing it: draining a 500,000-row backlog holds RSS at a
+            # 90MiB plateau with the in-use heap under 21MiB, so this ceiling is roughly
+            # five times the observed working set and exists for the pathological case
+            # rather than the ordinary one.
+            - name: GOMEMLIMIT
+              value: 448MiB
+            # Which proxies may be believed when they say who the client is. Empty — as
+            # blnk-config.yaml ships it — means trust nothing, so the address in the
+            # access log is the peer that opened the connection and cannot be forged by
+            # a caller's X-Forwarded-For header. Set it only when an Ingress or external
+            # load balancer fronts this Service, and then only to that proxy's address
+            # range. optional: true so a ConfigMap predating this key still starts the
+            # pod.
+            - name: BLNK_SERVER_TRUSTED_PROXIES
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_SERVER_TRUSTED_PROXIES
+                  optional: true
+            # ---------------------------------------------------------------------
+            # AUTHENTICATION. THIS IS THE KEY THAT DECIDES WHETHER THE LEDGER IS OPEN TO
+            # THE NETWORK.
+            #
+            # api/middleware/auth.go reads it and, when it is false, calls c.Next()
+            # BEFORE looking for a credential at all — every request is admitted. Not
+            # "read-only", not "rate-limited": create transactions, read balances, mint
+            # API keys.
+            #
+            # It comes from the ConfigMap so the posture is greppable in one place, and
+            # optional: true so a cluster whose ConfigMap predates the key still rolls
+            # out — but blnk-config.yaml ships it as "true", and there is no supported
+            # production posture in which it is false.
+            #
+            # SETTING IT TRUE HAS TWO CONSEQUENCES YOU MUST SATISFY IN THE SAME CHANGE.
+            # First, BLNK_SERVER_SECRET_KEY below becomes the only way in, so an empty
+            # value locks every caller out.
+            - name: BLNK_SERVER_SECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_SERVER_SECURE
+                  optional: true
+            # The master key. Compared in constant time in auth.go and granted every
+            # permission, which is precisely why it is a Secret and not a ConfigMap
+            # value: a ConfigMap is stored unencrypted, is readable by anything with
+            # get-configmap in this namespace, and is printed in full by `kubectl
+            # describe`.
+            #
+            # umask 077 && printf '%s' "$(openssl rand -hex 32)" >
+            # server-secret-key
+            #   kubectl -n blnk create secret generic blnk-secrets \
+            #     --from-file=server-secret-key=./server-secret-key
+            - name: BLNK_SERVER_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-secrets
+                  key: server-secret-key
+                  optional: true
+            # ---------------------------------------------------------------------
+            # DATA-STORE CREDENTIALS. Both are DSNs that carry a password in their
+            # userinfo, which makes the DSN itself a credential.
+            #
+            # These override the matching values in the blnk.json this pod mounts —
+            # config/config.go applies the environment AFTER decoding the file, so the
+            # environment wins and the two can never disagree. That is what lets
+            # blnk.json keep a working unauthenticated in-cluster default for a cluster
+            # mid-migration while a cluster with Secrets provisioned uses them, with no
+            # edit to the ConfigMap.
+            #
+            #   umask 077 && mkdir -p ./blnk-redis && cd ./blnk-redis
+            #   printf '%s' '<generated>' > password
+            #   printf 'redis://:%s@redis:6379' '<generated>' > dns
+            #   kubectl -n blnk create secret generic blnk-redis \
+            #     --from-file=password=./password --from-file=dns=./dns
+            #   cd .. && shred -u ./blnk-redis/* && rmdir ./blnk-redis
+            #
+            # BY FILE, NOT --from-literal, for the reason kafka-statefulset.yaml states
+            # at length: a --from-literal value is a command ARGUMENT, world-readable in
+            # /proc/<pid>/cmdline for the life of the process and recorded verbatim by
+            # the shell's history and by any audit or CI tooling that logs command
+            # lines. A secret manager delivering the value as a file or through an API
+            # is better still, and is the same principle.
+            - name: BLNK_REDIS_DNS
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-redis
+                  key: dns
+                  optional: true
+            # REQUIRED once secure mode is on AND BLNK_TYPESENSE_DNS names a host:
+            # config/config.go refuses to start rather than assume the "blnk-api-key"
+            # literal published in this repository's compose files and README. Unset is
+            # correct for a deployment that does not use search — nothing is indexed and
+            # Blnk says so once.
+            - name: BLNK_TYPESENSE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-secrets
+                  key: typesense-api-key
+                  optional: true
+            # ---------------------------------------------------------------------
+            # Kafka event streaming, outbox relay and webhook deprecation.
+            #
+            # THE VALUES BELOW ARE STILL PARSED AND VALIDATED, so "inactive" is not
+            # "ignored". Configuration load checks them whether or not brokers are set:
+            # a WEBHOOK_DEPRECATION_SUNSET_DATE that is not RFC3339 is FATAL, an illegal
+            # KAFKA_TOPIC_PREFIX is rejected, and a half-supplied SASL pair is refused.
+            # A malformed value here keeps the pod out of Ready even where nothing is
+            # published.
+            # ---------------------------------------------------------------------
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_BROKERS
+            # The subscriber-facing bootstrap list, which is NOT KAFKA_BROKERS: that one
+            # is a Service name resolvable only inside this cluster, so reporting it to
+            # an external subscriber returns an endpoint it cannot dial. Empty refuses
+            # credential issuance with 503 rather than falling back to it. See
+            # blnk-config.yaml.
+            - name: KAFKA_SUBSCRIBER_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SUBSCRIBER_BROKERS
+            # WHETHER ANYTHING AUTHORISES RECORD KEYS, and the endpoint of whatever
+            # does. "none" — the shipped value — makes credential issuance REFUSE a
+            # subscriber that records a partition_key_prefix, with 409
+            # SUBSCRIBER_KEY_SCOPE_UNENFORCED: Kafka's authorizer has no message-key
+            # dimension, Blnk ships no component that supplies one, and Blnk serves no
+            # records itself. Both keys are projected HERE and not onto the worker,
+            # because issuance is an API-server operation.
+            - name: KAFKA_KEY_SCOPE_ENFORCEMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_ENFORCEMENT
+            - name: KAFKA_KEY_SCOPE_GATEWAY_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_GATEWAY_BROKERS
+            # AND THE CONTROL ENDPOINT OF THAT COMPONENT, which is the part of the
+            # declaration Blnk verifies instead of trusting: issuance binds the recorded
+            # prefix there and requires the component to attest that exact binding
+            # before a secret exists, and deregistration withdraws it. A mode and an
+            # address with no reachable endpoint are read as NO declaration, so
+            # key-scoped issuance refuses.
+            #
+            #   - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TOKEN valueFrom:
+            #     secretKeyRef: name: kafka-key-scope-gateway key: attestation-token
+            - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_URL
+            - name: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_KEY_SCOPE_GATEWAY_ATTESTATION_TIMEOUT_MS
+            # THE DEPLOYMENT'S DECLARATION ABOUT WHOLE-TOPIC SUBSCRIBER READS. With
+            # BLNK_SERVER_SECURE=true one of the two declarations is mandatory: either
+            # the key-scoped model above, or this acknowledgement that a subscriber
+            # credential reads every record on each topic it is granted. Neither, and
+            # issuance refuses with 409 SUBSCRIBER_SHARED_TOPIC_ACCESS_UNACKNOWLEDGED.
+            # Projected here only, for the same reason as the keys above.
+            - name: KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SUBSCRIBER_SHARED_TOPIC_ACCESS
+            # THE DEPLOYMENT'S DECLARATION ABOUT THE INTERNAL CATEGORY TOPIC. "true"
+            # acknowledges that a subscriber granted blnk.system reads Blnk's own error
+            # text verbatim, for the whole cluster, plus every event type the catalogue
+            # does not yet recognise. It decides only whether that name may appear in a
+            # grant; publishing is unaffected.
+            - name: KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SUBSCRIBER_INTERNAL_TOPIC_ACCESS
+            - name: KAFKA_TOPIC_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TOPIC_PREFIX
+            # The namespaces this deployment USED TO own. Empty unless
+            # KAFKA_TOPIC_PREFIX has been changed with events still in the outbox, in
+            # which case declaring the previous one here is what keeps those committed
+            # rows publishable, dead-letterable and replayable after this pod restarts.
+            # blnk-config.yaml carries the full reasoning; the server audits the outbox
+            # at start-up and names any namespace it should have been told about.
+            - name: KAFKA_HISTORICAL_TOPIC_PREFIXES
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_HISTORICAL_TOPIC_PREFIXES
+            - name: KAFKA_SASL_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SASL_USER
+            # ONE RULE FOR THE TWO ROLES, and every Kafka entry on both Deployments
+            # follows it: THE SERVER PUBLISHES AND ADMINISTERS; THE WORKER CAPTURES
+            # OUTBOX ROWS AND HOLDS NO KAFKA CREDENTIAL AT ALL.
+            #
+            # The server publishes because the only two producers in Blnk — the event
+            # relay and the dead-letter writer — run in this role, started by
+            # cmd/server.go. It administers because the topic assurance at start-up and
+            # POST /subscribers/{id}/kafka-credentials both go through the Kafka admin
+            # client.
+            #
+            # The worker publishes nothing. Its event work is a WRITE TO POSTGRESQL:
+            # every capture site funnels into Blnk.publishEvent, which inserts a
+            # blnk.event_outbox row and returns — it never touches a broker.
+            #
+            # The variable's own documentation lives at its entry further down this
+            # file, which is the only place it is described.
+            - name: KAFKA_SASL_ADMIN_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SASL_ADMIN_USER
+            - name: KAFKA_TLS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TLS_ENABLED
+            - name: KAFKA_TLS_CA_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TLS_CA_FILE
+            - name: KAFKA_MIN_PARTITIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_MIN_PARTITIONS
+            - name: KAFKA_REPLICATION_FACTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_REPLICATION_FACTOR
+            - name: KAFKA_ALLOW_PARTITION_GROWTH
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_ALLOW_PARTITION_GROWTH
+            - name: RELAY_MAX_RETRY_ATTEMPTS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_MAX_RETRY_ATTEMPTS
+            - name: RELAY_RETRY_BASE_BACKOFF_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_RETRY_BASE_BACKOFF_MS
+            - name: RELAY_RETRY_MAX_BACKOFF_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_RETRY_MAX_BACKOFF_MS
+            - name: RELAY_EVENT_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_EVENT_RETENTION_DAYS
+            # Purge CAPACITY: a different question from the period above, namely how
+            # fast that period is enforced. The two multiply to rows-per-hour, and
+            # capacity below the event arrival rate means the period is not enforced at
+            # all — the sweeper never catches up and the table grows anyway. This role
+            # is where the sweep runs, so these are read here.
+            - name: RELAY_EVENT_RETENTION_BATCH_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_EVENT_RETENTION_BATCH_SIZE
+            - name: RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
+            - name: WEBHOOK_DEPRECATION_SUNSET_DATE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: WEBHOOK_DEPRECATION_SUNSET_DATE
+            # Log verbosity. Projected because the event pipeline's per-event
+            # diagnostics are emitted at DEBUG on purpose — the successful-publish
+            # lines, the metrics collector's per-tick summary and the consumer-lag
+            # retirement notice — so raising it is how a delivery investigation is done
+            # without rebuilding this image. Empty means info, which is what
+            # blnk-config.yaml ships.
+            - name: BLNK_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_LOG_LEVEL
+            # ---------------------------------------------------------------------
+            # SERVER-ONLY KNOBS THAT WERE IN THE CONFIGMAP AND REACHED NEITHER ROLE.
+            - name: BLNK_RATE_LIMIT_RPS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_RATE_LIMIT_RPS
+            - name: BLNK_RATE_LIMIT_BURST
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_RATE_LIMIT_BURST
+            # How many subscribers one metrics tick measures consumer lag for.
+            # cmd/server.go passes it to the collector's WithSubscriberBudget, and the
+            # collector runs beside the relay — in this role.
+            - name: RELAY_SUBSCRIBER_METRICS_BUDGET
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_SUBSCRIBER_METRICS_BUDGET
+            # Whether the publisher may authenticate as the ADMIN principal when no
+            # producer credential is configured. It is read where a producer is built,
+            # and this is the only role that builds one: the worker captures events into
+            # the outbox and publishes nothing.
+            - name: KAFKA_ALLOW_ADMIN_PRODUCER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_ALLOW_ADMIN_PRODUCER
+            # THE DATABASE DSN, FROM A SECRET AND NOT FROM THE CONFIGMAP.
+            - name: BLNK_DATA_SOURCE_DNS
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-datasource
+                  key: dsn
+            # The PRODUCER password. A credential, so it comes from a Secret rather than
+            # from the ConfigMap, and it is the only Kafka credential this role needs:
+            # publishing requires Write and Describe on the Blnk-owned topics and
+            # nothing more.
+            - name: KAFKA_SASL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: producer-secret
+                  # optional so a deployment that has not adopted Kafka still starts. A
+                  # required reference would hold every pod in
+                  # CreateContainerConfigError until the Secret existed, which is both
+                  # wrong for the shipped state — KAFKA_BROKERS is empty, so there is
+                  # nothing to authenticate to — and a worse failure than the
+                  # alternative: unset, config/config.go names the missing variable in
+                  # the boot log and the construction path refuses to dial anything
+                  # half-authenticated.
+                  optional: true
+            # The ADMINISTRATIVE password, on the SERVER ONLY.
+            - name: KAFKA_SASL_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: admin-secret
+                  # optional so a deployment that has not adopted Kafka still starts. A
+                  # required reference would hold every pod in
+                  # CreateContainerConfigError until the Secret existed, which is both
+                  # wrong for the shipped state — KAFKA_BROKERS is empty, so there is
+                  # nothing to authenticate to — and a worse failure than the
+                  # alternative: unset, config/config.go names the missing variable in
+                  # the boot log and the construction path refuses to dial anything
+                  # half-authenticated.
+                  optional: true
+            # WHETHER THIS ROLE HAS A /metrics ROUTE AT ALL, and the token below is
+            # worthless without it.
+            - name: BLNK_ENABLE_OBSERVABILITY
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_ENABLE_OBSERVABILITY
+            # /metrics IS BEARER-AUTHENTICATED, AND BOTH SIDES NEED THE SAME TOKEN.
+            - name: BLNK_METRICS_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-metrics-token
+                  key: metrics-bearer-token
+                  # optional for the same migration reason as the master key above, and
+                  # it fails the same way: cmd/workers.go passes this value to
+                  # middleware.MetricsAuthHandler together with Server.Secure, so with
+                  # secure mode on and the token empty every scrape is refused rather
+                  # than the endpoint being open.
+                  optional: true
+            # Whether X-Forwarded-Proto may be believed, which is what lets the
+            # credential-issuance endpoint accept a request that arrived over TLS
+            # terminated at the ingress. blnk-config.yaml documents the ingress contract
+            # this asserts and what to check before trusting it.
+            - name: BLNK_SERVER_TRUST_FORWARDED_PROTO
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_SERVER_TRUST_FORWARDED_PROTO
+            # The loopback exception for credential issuance, projected on the SERVER
+            # role only because that is the role serving the endpoint. It ships "false"
+            # in the ConfigMap: in a cluster a loopback peer is a sidecar hop rather
+            # than evidence of confidentiality, so believing it would put a one-time
+            # SASL password on whatever the hop before it was.
+            - name: BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_SERVER_ALLOW_LOOPBACK_CREDENTIAL_ISSUANCE
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: http://jaeger:4318/v1/traces
+            - name: TZ
+              value: Etc/UTC
+          # THE RELEASE THAT CONTAINS THE EVENT PIPELINE, and it has to be, because
+          # every Kafka variable above is inert without it.
+          image: blnk:REPLACE_WITH_PINNED_DIGEST
+          name: server
+          # ./heartbeat.db is written relative to the working directory when
+          # BLNK_ENABLE_TELEMETRY is on (cmd/server.go's getOrCreateHeartbeatID). The
+          # image sets no WORKDIR, so that resolved to "/" — unwritable under
+          # readOnlyRootFilesystem. Naming a directory backed by an emptyDir keeps the
+          # root filesystem read-only and still lets the write land.
+          workingDir: /var/lib/blnk
+          # ONLY 5001. The manifest also declared 80 and 443, and nothing has ever
+          # listened on either: cmd/server.go always calls startServer -> plain
+          # ListenAndServe on Server.Port, and serveTLS — the CertMagic path those two
+          # ports were for — is unreachable dead code that the linter reports as unused.
+          # Advertising a plaintext port 80 that serves nothing is the "public plaintext
+          # access" this removes.
+          ports:
+            - name: http
+              containerPort: 5001
+          # STARTUP, then LIVENESS and READINESS — three probes, each answering a
+          # different question, because one probe cannot answer all three.
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          # LIVENESS IS DELIBERATELY WEAKER THAN READINESS, following the same reasoning
+          # as the Kafka broker's probes: /health checks the DATABASE, and a liveness
+          # probe on a dependency-aware endpoint restarts every replica during a
+          # database blip — converting a dependency outage into a cluster-wide crash
+          # loop, which no restart can fix. So liveness asks only whether the process
+          # still holds its port. A hung or dead process is restarted; an unreachable
+          # database is not answered by restarting.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # READINESS IS THE DEPENDENCY-AWARE ONE, and it must be: /health fetches the
+          # configuration and opens a bounded database round trip, answering 503 when
+          # either fails. That is exactly the right admission decision — a replica that
+          # cannot reach the database cannot serve a ledger request, so it is removed
+          # from the Service instead of returning errors, and it is not killed, so it
+          # rejoins by itself when the database returns.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # MEASURED REQUESTS AND LIMITS. `resources: {}` placed this pod in the
+          # BestEffort QoS class, which is the first thing evicted under node pressure —
+          # and it made server-hpa.yaml's targets meaningless, because a utilization
+          # target is a percentage OF THE REQUEST. With no request there is no
+          # denominator, the HPA reports unknown metrics, and the autoscaler this
+          # deployment is configured with never scales at all.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              # It binds a port above 1024 and calls no privileged syscall, so
+              # it needs no
+              # capability at all — not even NET_BIND_SERVICE.
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: '2'
+              # EQUAL TO THE REQUEST, on purpose: a Go heap given a limit above
+              # its request
+              # is OOMKilled under exactly the burst the request was sized for.
+              memory: 512Mi
+          volumeMounts:
+            - name: blnk-config
+              mountPath: /blnk.json
+              subPath: blnk.json
+            # Writable scratch for the working directory above. emptyDir and not a PVC
+            # deliberately: heartbeat.db is a telemetry installation id, so losing it on
+            # reschedule costs a new id and nothing else, and a PVC would tie this
+            # Deployment to a single node.
+            - name: blnk-state
+              mountPath: /var/lib/blnk
+            # The certificate authority Blnk verifies the brokers against, at the path
+            # KAFKA_TLS_CA_FILE names.
+            - name: kafka-tls
+              mountPath: /etc/kafka/tls
+              readOnly: true
       restartPolicy: Always
+      # SIZED AGAINST THE PROCESS'S OWN SHUTDOWN BUDGET(/P11), not left at the 30-second
+      # default. The server's ordered shutdown is: a 20-second bounded HTTP drain, then
+      # the background processors are joined, then the service container's release
+      # drains scheduled cleanups for up to 10 further seconds. Worst case that is
+      # roughly 40 seconds, and the default 30 would SIGKILL partway through it —
+      # abandoning in-flight ledger requests and leaving a subscriber-provisioning
+      # cleanup unrun, which is the one piece of shutdown work that leaves a live
+      # credential behind.
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: blnk-config
           configMap:
             name: blnk-config
-status: {} 
+        - name: blnk-state
+          emptyDir: {}
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+            optional: true
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0444
+status: {}

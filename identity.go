@@ -23,21 +23,25 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/internal/notification"
 	"github.com/blnkfinance/blnk/internal/tokenization"
 	"github.com/blnkfinance/blnk/model"
 )
 
-// postIdentityActions performs actions after an identity has been created.
-// It sends the newly created identity to the search index queue and sends a webhook notification.
-func (l *Blnk) postIdentityActions(_ context.Context, identity *model.Identity) {
+// postIdentityActions performs actions after an identity has been created. It sends the
+// newly created identity to the search index queue.
+func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity) {
+	// Derived outside the goroutine, while ctx is still live. See postLedgerActions.
+	publishCtx := context.WithoutCancel(ctx)
+
 	go func() {
 		err := l.queue.queueIndexData(identity.IdentityID, "identities", identity)
 		if err != nil {
 			notification.NotifyError(err)
 		}
-		err = l.SendWebhook(NewWebhook{
+		err = l.publishEntityEventWhenUncaptured(publishCtx, identity.IdentityID, NewWebhook{
 			Event:   "identity.created",
 			Payload: identity,
 		})
@@ -47,20 +51,42 @@ func (l *Blnk) postIdentityActions(_ context.Context, identity *model.Identity) 
 	}()
 }
 
-// CreateIdentity creates a new identity in the database.
+// identityCreatedEventPreparer returns the preparer that builds the identity.created
+// outbox row, for the repository to insert INSIDE the transaction that inserts the
+// identity.
+func (l *Blnk) identityCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Identity] {
+	// A NIL PREPARER when nothing is configured, so the repository stays on its
+	// single-statement path instead of opening a transaction to insert no event. See
+	// eventCaptureEnabled.
+	if !l.eventCaptureEnabled() {
+		return nil
+	}
+
+	return func(created model.Identity) (*model.EventOutbox, error) {
+		return l.PrepareEventOutbox(ctx, NewWebhook{
+			Event:   "identity.created",
+			Payload: &created,
+		})
+	}
+}
+
+// CreateIdentity creates a new identity together with its identity.created event,
+// atomically.
 //
 // Parameters:
-// - identity model.Identity: The Identity model to be created.
 //
 // Returns:
-// - model.Identity: The created Identity model.
-// - error: An error if the identity could not be created.
+//   - model.Identity: The created Identity model.
+//   - error: An error if the identity could not be created, or if its event could not be
+//     captured.
 func (l *Blnk) CreateIdentity(identity model.Identity) (model.Identity, error) {
-	identity, err := l.datasource.CreateIdentity(identity)
+	ctx := context.Background()
+
+	identity, err := l.datasource.CreateIdentity(identity, l.identityCreatedEventPreparer(ctx))
 	if err != nil {
 		return model.Identity{}, err
 	}
-	l.postIdentityActions(context.Background(), &identity)
+	l.postIdentityActions(ctx, &identity)
 	return identity, nil
 }
 
@@ -336,7 +362,6 @@ func (l *Blnk) TokenizeAllPII(identityID string) error {
 }
 
 // GetDetokenizedIdentity returns a copy of the identity with all fields detokenized.
-// Note: This does not modify the stored identity.
 //
 // Parameters:
 // - identityID string: The ID of the identity.

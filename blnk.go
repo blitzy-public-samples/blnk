@@ -17,8 +17,13 @@ limitations under the License.
 package blnk
 
 import (
+	"context"
 	"embed"
+	"errors"
+	"io"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/hibiken/asynq"
@@ -35,6 +40,7 @@ import (
 
 	"github.com/blnkfinance/blnk/model"
 	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 )
 
 // Blnk represents the main struct for the Blnk application.
@@ -47,10 +53,42 @@ type Blnk struct {
 	bt          *model.BalanceTracker
 	tokenizer   *tokenization.TokenizationService
 	httpClient  *http.Client
+	events      EventPublisher // Kafka-backed ledger event publisher; the no-op implementation when no brokers are configured.
 	Hooks       hooks.HookManager
 	config      *config.Configuration
 	cache       cache.Cache
 	hotPairs    *hotpairs.Manager
+
+	// kafkaAdminMu guards kafkaAdmin, which is resolved on first use rather than at
+	// construction.
+	kafkaAdminMu sync.Mutex
+
+	// kafkaAdmin is the PROCESS-WIDE Kafka administrative client.
+	kafkaAdmin *KafkaAdminClient
+
+	// background tracks compensating work scheduled off a response path.
+	background sync.WaitGroup
+
+	// censusOnce builds eventCensus on first use, so a Blnk assembled as a struct literal
+	// is as bounded as one NewBlnk returned.
+	censusOnce sync.Once
+
+	// eventCensus memoises the outbox's per-status census, so its cost is bounded by the
+	// reuse window rather than by how often the statistics are asked for.
+	eventCensus *eventStatusCensus
+
+	// legacyWebhookNow is the clock ProcessWebhook evaluates the webhook sunset against.
+	legacyWebhookNow func() time.Time
+}
+
+// legacyWebhookClock returns the clock the legacy transport reads, defaulting to the
+// wall clock.
+func (b *Blnk) legacyWebhookClock() time.Time {
+	if b == nil || b.legacyWebhookNow == nil {
+		return time.Now()
+	}
+
+	return b.legacyWebhookNow()
 }
 
 const (
@@ -86,6 +124,25 @@ func initializeRedisClients(config *config.Configuration) (redis.UniversalClient
 	return redisClient.Client(), asynqClient, nil
 }
 
+// closeInitializedEventPublisher releases the publisher initializeEventPublisher built.
+func closeInitializedEventPublisher(publisher EventPublisher) {
+	if publisher == nil {
+		return
+	}
+
+	closer, closeable := publisher.(io.Closer)
+	if !closeable {
+		return
+	}
+
+	if err := closer.Close(); err != nil {
+		withLoggableCause(nil, err).Warn(
+			"blnk: closing the event publisher after a failed initialization; its connections are " +
+				"released when the process exits",
+		)
+	}
+}
+
 // initializeTokenizationService creates and configures the tokenization service
 func initializeTokenizationService(config *config.Configuration) *tokenization.TokenizationService {
 	if config.TokenizationSecret == "" {
@@ -100,16 +157,87 @@ func initializeTokenizationService(config *config.Configuration) *tokenization.T
 func initializeHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
+		// The redirect refusal and the dial guard are the two halves of the legacy
+		// transport's destination policy: a 3xx must not be able to walk a delivery onto an
+		// address the URL check approved of, and a hostname must be judged by what it
+		// actually resolves to rather than by how it is spelled. See the destination-guard
+		// section of webhooks.go.
+		CheckRedirect: refuseLegacyWebhookRedirect,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   guardLegacyWebhookDial,
+			}).DialContext,
 		},
 	}
 }
 
-// NewBlnk initializes a new instance of Blnk with the provided database datasource.
-// It fetches the configuration, initializes Redis client, balance tracker, queue, and search client.
+// ProcessRole is which of Blnk's process roles a service container is being built for.
+type ProcessRole string
+
+const (
+	// ProcessRoleServer is the API server, which also hosts the event outbox relay, the
+	// event metrics collector and the retention sweeper. It is the ONLY role that
+	// publishes to Kafka, and therefore the only one that builds a producer.
+	ProcessRoleServer ProcessRole = "server"
+
+	// ProcessRoleWorker is the asynq worker: transaction processing, transaction hooks,
+	// search indexing and, during the dual-delivery window, legacy webhook delivery.
+	ProcessRoleWorker ProcessRole = "worker"
+
+	// ProcessRoleTool is a one-shot command — migrate, verify-chain — that neither serves
+	// requests nor drains a queue. It publishes nothing and builds no producer.
+	ProcessRoleTool ProcessRole = "tool"
+)
+
+// PublishesEvents reports whether this role produces Kafka messages and therefore needs
+// a real publisher.
+//
+// Returns:
+//   - bool: true only for ProcessRoleServer.
+func (r ProcessRole) PublishesEvents() bool {
+	return r == ProcessRoleServer
+}
+
+// initializeEventPublisher creates and configures the Kafka event publisher for this
+// process: ONE instance, built once and shared for the process lifetime, in the same
+// shape as initializeHTTPClient.
+func initializeEventPublisher(configuration *config.Configuration, role ProcessRole) (EventPublisher, error) {
+	if !role.PublishesEvents() {
+		// Debug rather than info: this is the normal, correct state for the role and it is
+		// reported on every worker start-up. The condition an operator needs to notice is a
+		// role that DOES publish and cannot, which NewEventPublisher reports itself.
+		logrus.WithField("role", string(role)).Debug(
+			"this process role does not publish ledger events, so no Kafka producer is built; " +
+				"events are still captured in the outbox and published by the relay in the server role",
+		)
+
+		return NewNoopEventPublisher(), nil
+	}
+
+	publisher, err := NewEventPublisher(configuration)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unreachable today — NewEventPublisher returns the no-op rather than nil for every
+	// unconfigured case — and asserted anyway so the field's invariant is established
+	// HERE, at the wiring site that owns it. Close and the relay both read b.events, and
+	// "never nil" is far cheaper to guarantee once than to re-check at each use.
+	if publisher == nil {
+		return NewNoopEventPublisher(), nil
+	}
+
+	return publisher, nil
+}
+
+// NewBlnk initializes a new instance of Blnk with the provided database datasource. It
+// fetches the configuration, initializes Redis client, balance tracker, queue, and
+// search client.
 //
 // Parameters:
 // - db database.IDataSource: The datasource for database operations.
@@ -118,13 +246,41 @@ func initializeHTTPClient() *http.Client {
 // - *Blnk: A pointer to the newly created Blnk instance.
 // - error: An error if any of the initialization steps fail.
 func NewBlnk(db database.IDataSource) (*Blnk, error) {
+	return NewBlnkForRole(db, ProcessRoleServer)
+}
+
+// NewBlnkForRole initializes a Blnk instance for a named process role.
+//
+// Parameters:
+//   - db database.IDataSource: the datasource for database operations.
+//   - role ProcessRole: which process is being built. Only ProcessRoleServer receives a
+//     real event publisher.
+//
+// Returns:
+//   - *Blnk: the service container.
+//   - error: a configuration or construction failure.
+func NewBlnkForRole(db database.IDataSource, role ProcessRole) (*Blnk, error) {
 	configuration, err := config.Fetch()
+	if err != nil {
+		return nil, err
+	}
+
+	// THE EVENT PUBLISHER IS BUILT FIRST, BEFORE ANY POOLED RESOURCE, so that a refusal
+	// here cannot leak one. Closing pooled resources on that error path would also work;
+	// ordering removes the class rather than one instance of it, because the publisher
+	// validates PURE CONFIGURATION and opens no connection — there is nothing to unwind if
+	// it refuses, and no future resource added between here and there can reintroduce the
+	// leak.
+	eventPublisher, err := initializeEventPublisher(configuration, role)
 	if err != nil {
 		return nil, err
 	}
 
 	redisClient, asynqClient, err := initializeRedisClients(configuration)
 	if err != nil {
+		// The publisher above owns per-topic writers, so it is closed rather than dropped:
+		closeInitializedEventPublisher(eventPublisher)
+
 		return nil, err
 	}
 
@@ -152,32 +308,212 @@ func NewBlnk(db database.IDataSource) (*Blnk, error) {
 		search:      newSearch,
 		tokenizer:   tokenizer,
 		httpClient:  httpClient,
+		events:      eventPublisher,
 		Hooks:       hookManager,
 		config:      configuration,
 		cache:       newCache,
 		hotPairs:    hotPairManager,
 	}
 
+	// PRODUCER CALL SITE FOR system.error, and the only one that is an indirection rather
+	// than a direct emission. internal/notification cannot import this package, so it
+	// holds a registered WebhookSender instead and NotifyError calls through it.
 	notification.RegisterWebhookSender(func(event string, payload interface{}) error {
-		return b.SendWebhook(NewWebhook{
+		capture, cancel := context.WithTimeout(context.Background(), systemErrorCaptureBudget)
+		defer cancel()
+
+		return b.PublishEvent(capture, NewWebhook{
 			Event:   event,
 			Payload: payload,
 		})
 	})
 
+	// SAME-TRANSACTION CAPTURE FOR THE COALESCED BATCH, and the second indirection in this
+	// constructor, for the same structural reason as the one above: the database package
+	// cannot import this one, so it holds a registered capture instead.
+	database.RegisterTransactionEventCapture(
+		func(ctx context.Context, txn *model.Transaction, ledgerID string) (*model.EventOutbox, error) {
+			return b.PrepareEventOutbox(ctx, NewWebhook{
+				Event:   getEventFromStatus(txn.Status),
+				Payload: txn,
+			}, WithEventLedgerID(ledgerID))
+		})
+
+	// SAME-TRANSACTION CAPTURE FOR BALANCE MONITOR ALERTS, and the third indirection in
+	// this constructor, for the same structural reason as the two above.
+	database.RegisterBalanceMonitorAlertCapture(
+		func(ctx context.Context, balance *model.Balance, monitor model.BalanceMonitor) (*model.EventOutbox, error) {
+			return b.prepareBalanceMonitorAlertRow(ctx, balance, monitor)
+		})
+
 	return b, nil
 }
 
-// Close properly closes all connections and resources used by the Blnk instance.
-func (b *Blnk) Close() error {
-	if b.asynqClient != nil {
-		return b.asynqClient.Close()
+// KafkaAdmin returns the process-wide Kafka administrative client, building it on first
+// use.
+//
+// Returns:
+//   - *KafkaAdminClient: the shared client, never nil when the error is nil.
+//   - error: when the configuration cannot be read, or the SASL credentials, the TLS
+//     material or the plaintext acknowledgement make a secure transport impossible.
+func (b *Blnk) KafkaAdmin() (*KafkaAdminClient, error) {
+	if b == nil {
+		return nil, errors.New("blnk: no instance, so no Kafka administrative client")
 	}
-	return nil
+
+	b.kafkaAdminMu.Lock()
+	defer b.kafkaAdminMu.Unlock()
+
+	if b.kafkaAdmin != nil {
+		return b.kafkaAdmin, nil
+	}
+
+	configuration := b.config
+	if configuration == nil {
+		fetched, err := config.Fetch()
+		if err != nil {
+			return nil, err
+		}
+
+		configuration = fetched
+	}
+
+	admin, err := NewKafkaAdmin(configuration)
+	if err != nil {
+		return nil, err
+	}
+
+	b.kafkaAdmin = admin
+
+	return b.kafkaAdmin, nil
+}
+
+// scheduleBackgroundWork runs a compensating task off the caller's goroutine and tracks
+// it so Close can wait for it.
+func (b *Blnk) scheduleBackgroundWork(task func()) {
+	if b == nil || task == nil {
+		return
+	}
+
+	b.background.Add(1)
+
+	go func() {
+		defer b.background.Done()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logrus.WithField("panic", recovered).Error(
+					"blnk: a scheduled background cleanup panicked; the work it owed did not complete, " +
+						"and whatever it was compensating is described by the log lines around this one",
+				)
+			}
+		}()
+
+		task()
+	}()
+}
+
+// waitForBackgroundWork blocks until every scheduled cleanup has finished or the grace
+// period expires, and reports which happened.
+func (b *Blnk) waitForBackgroundWork(grace time.Duration) bool {
+	if b == nil {
+		return true
+	}
+
+	drained := make(chan struct{})
+
+	go func() {
+		b.background.Wait()
+		close(drained)
+	}()
+
+	if grace <= 0 {
+		select {
+		case <-drained:
+			return true
+		default:
+			return false
+		}
+	}
+
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	select {
+	case <-drained:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// backgroundWorkDrainGrace bounds how long Close waits for scheduled cleanups.
+const backgroundWorkDrainGrace = 10 * time.Second
+
+// systemErrorCaptureBudget bounds the single outbox insert that captures a
+// system.error.
+const systemErrorCaptureBudget = 10 * time.Second
+
+// Close properly closes all connections and resources used by the Blnk instance.
+//
+// Returns:
+//   - error: the joined close errors, or nil when everything closed cleanly.
+func (b *Blnk) Close() error {
+	// SCHEDULED CLEANUPS FIRST, and before anything they depend on is released. They hold
+	// a provisioning fence and reach the broker through the administrative client closed
+	// below, so draining them afterwards would mean draining them into a closed transport
+	// — the cleanup would fail on shutdown, which is precisely when its residue is least
+	// likely to be noticed.
+	if !b.waitForBackgroundWork(backgroundWorkDrainGrace) {
+		logrus.Warn(
+			"blnk: shutting down with scheduled cleanups still running after the drain grace period; " +
+				"a credential revocation or fence release may not have completed. The preceding log " +
+				"lines name anything that was outstanding, and a held fence expires with its lease",
+		)
+	}
+
+	var publisherErr error
+	if publisher, ok := b.events.(TopicEventPublisher); ok {
+		publisherErr = publisher.Close()
+	}
+
+	// The process-wide administrative client. Closed here and only here: every
+	// subscriber service that borrowed it treats it as not owned, so no request path can take
+	// the transport away from the next one.
+	var adminErr error
+
+	b.kafkaAdminMu.Lock()
+	admin := b.kafkaAdmin
+	b.kafkaAdmin = nil
+	b.kafkaAdminMu.Unlock()
+
+	if admin != nil {
+		adminErr = admin.Close()
+	}
+
+	var asynqErr error
+	if b.asynqClient != nil {
+		asynqErr = b.asynqClient.Close()
+	}
+
+	err := errors.Join(publisherErr, adminErr, asynqErr)
+
+	// LOGGED, because the defect this method's invocation fixes was that nothing invoked
+	// it A release step that leaves no trace is one an operator cannot confirm ran, and
+	// the symptom of it not running — Kafka writer goroutines and broker connections
+	// surviving the process's own shutdown sequence — is not visible from outside either.
+	if err != nil {
+		logrus.WithError(err).Warn(
+			"blnk: releasing service resources reported errors; the process is exiting anyway, so " +
+				"these describe what was not closed cleanly rather than work still to do",
+		)
+	} else {
+		logrus.Info("blnk: service resources released")
+	}
+
+	return err
 }
 
 // Config returns the cached configuration for the Blnk instance.
-// Falls back to config.Fetch() if not initialized (for backward compatibility with tests).
 func (b *Blnk) Config() *config.Configuration {
 	if b.config != nil {
 		return b.config

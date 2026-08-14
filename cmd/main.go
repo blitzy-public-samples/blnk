@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/config"
@@ -35,10 +36,19 @@ type Blnk struct {
 }
 
 // blnkInstance holds the Blnk instance and its configuration.
-// This is used to store the runtime instance and configuration globally within the application.
 type blnkInstance struct {
 	blnk *blnk.Blnk            // Blnk object initialized from configuration
 	cnf  *config.Configuration // Configuration object holding runtime settings
+
+	// searchIndex caches the TypeSense client and its one-time collection-schema
+	// assurance for the lifetime of the worker process. Its zero value is ready to use,
+	// so every existing construction of this struct stays correct without change.
+	//
+	// It lives on the instance rather than in a package-level variable so that a test can
+	// exercise a handler against its own isolated indexer, and so two instances in one
+	// process cannot share cached state. It holds a mutex, which is why this struct is
+	// only ever used through a pointer.
+	searchIndex searchIndexer
 }
 
 // recoverPanic handles any panics during program execution and logs the error using Logrus.
@@ -52,7 +62,7 @@ func recoverPanic() {
 // loadInstance loads the configuration file and initializes the Blnk
 // instance into app. Extracted from preRun so the initialization sequence
 // returns errors instead of exiting, keeping the Fatal at the command layer.
-func loadInstance(app *blnkInstance, configFile string) error {
+func loadInstance(app *blnkInstance, configFile string, role blnk.ProcessRole) error {
 	// Initialize configuration from the specified configuration file.
 	if err := config.InitConfig(configFile); err != nil {
 		return fmt.Errorf("error loading config: %w", err)
@@ -65,7 +75,7 @@ func loadInstance(app *blnkInstance, configFile string) error {
 	}
 
 	// Initialize the Blnk instance using the fetched configuration.
-	newBlnk, err := setupBlnk(cnf)
+	newBlnk, err := setupBlnkForRole(cnf, role)
 	if err != nil {
 		notification.NotifyError(err) // Notify via the internal notification system
 		return err
@@ -78,20 +88,103 @@ func loadInstance(app *blnkInstance, configFile string) error {
 	return nil
 }
 
+// defaultConfigFile is the path --config falls back to, and the only path whose ABSENCE is
+// tolerated: an environment-only deployment is a first-class configuration mode, and the
+// compose stack, the Kubernetes manifests and the whole test suite all run that way.
+const defaultConfigFile = "./blnk.json"
+
 // preRun sets up the configuration and initializes the Blnk instance before running any command.
-// It ensures that the configuration is loaded, and the Blnk instance is initialized properly.
-func preRun(app *blnkInstance) func(cmd *cobra.Command, args []string) error {
+//
+// THE FLAG IS READ THROUGH A POINTER, and it has to be. --config is a persistent flag bound
+// to a variable in NewCLI, and this hook is built before Cobra has parsed anything; taking the
+// value now would capture the default. Dereferencing here reads what the operator actually
+// passed. The literal that used to sit in its place made the flag dead: `blnk start --config
+// /somewhere/else.json` loaded ./blnk.json and reported nothing, so `make run_relay
+// CONFIG_FILE=<path>` could gate on one file and launch a process reading another.
+//
+// AN EXPLICIT PATH THAT IS NOT THERE IS AN ERROR; the default path's absence is not. Naming a
+// file is a statement that the file holds the configuration, and silently continuing from the
+// environment is how a typo becomes a deployment with defaults nobody chose. The default path
+// keeps its existing behaviour, so nothing that runs without a blnk.json changes.
+//
+// Parameters:
+//   - app *blnkInstance: the instance the loaded configuration is attached to.
+//   - configFile *string: the variable --config is bound to. May be nil, in which case the
+//     default path is used.
+func preRun(app *blnkInstance, configFile *string) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
-		if err := loadInstance(app, "blnk.json"); err != nil {
+		path := defaultConfigFile
+		if configFile != nil && strings.TrimSpace(*configFile) != "" {
+			path = strings.TrimSpace(*configFile)
+		}
+
+		if configFileWasNamed(cmd) {
+			if _, err := os.Stat(path); err != nil {
+				log.Fatalf(
+					"--config names %q, which cannot be read: %v. A configuration file that was "+
+						"asked for by name is required to exist; remove the flag to configure this "+
+						"process from its environment instead",
+					path, err,
+				)
+			}
+		}
+
+		if err := loadInstance(app, path, processRoleFor(cmd)); err != nil {
 			log.Fatal(err)
 		}
 		return nil
 	}
 }
 
+// configFileWasNamed reports whether --config was given on the command line, as opposed to
+// resolving to its default.
+//
+// Cobra records the flag as changed on the FlagSet that parsed it. For a persistent flag on
+// the root command that is the executing subcommand's own complete set, but the root's
+// persistent set is checked as well so the answer does not depend on which set Cobra chose to
+// merge the flag into.
+func configFileWasNamed(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+
+	if flag := cmd.Flags().Lookup("config"); flag != nil && flag.Changed {
+		return true
+	}
+
+	if root := cmd.Root(); root != nil {
+		if flag := root.PersistentFlags().Lookup("config"); flag != nil && flag.Changed {
+			return true
+		}
+	}
+
+	return false
+}
+
+// processRoleFor maps the subcommand being executed to the process role its service container
+// should be built for.
+func processRoleFor(cmd *cobra.Command) blnk.ProcessRole {
+	if cmd == nil {
+		return blnk.ProcessRoleServer
+	}
+
+	switch cmd.Name() {
+	case "workers":
+		return blnk.ProcessRoleWorker
+	case "migrate", "verify-chain":
+		return blnk.ProcessRoleTool
+	default:
+		return blnk.ProcessRoleServer
+	}
+}
+
 // setupBlnk creates and initializes a new Blnk instance based on the provided configuration.
-// It connects to the data source (such as a database) using the configuration settings.
 func setupBlnk(cfg *config.Configuration) (*blnk.Blnk, error) {
+	return setupBlnkForRole(cfg, blnk.ProcessRoleServer)
+}
+
+// setupBlnkForRole is setupBlnk with the process role made explicit.
+func setupBlnkForRole(cfg *config.Configuration, role blnk.ProcessRole) (*blnk.Blnk, error) {
 	// Initialize a new data source from the configuration.
 	db, err := database.NewDataSource(cfg)
 	if err != nil {
@@ -99,7 +192,7 @@ func setupBlnk(cfg *config.Configuration) (*blnk.Blnk, error) {
 	}
 
 	// Create a new Blnk instance using the initialized data source.
-	newBlnk, err := blnk.NewBlnk(db)
+	newBlnk, err := blnk.NewBlnkForRole(db, role)
 	if err != nil {
 		logrus.Error(err) // Log the error using Logrus
 		return &blnk.Blnk{}, fmt.Errorf("error creating blnk: %v", err)
@@ -108,7 +201,6 @@ func setupBlnk(cfg *config.Configuration) (*blnk.Blnk, error) {
 }
 
 // NewCLI creates the command-line interface (CLI) for the Blnk application.
-// It sets up the root command and subcommands like serverCommands, workerCommands, and migrateCommands.
 func NewCLI() *Blnk {
 	var configFile string // Configuration file path (defaults to ./blnk.json)
 	b := &blnkInstance{}  // Instance of Blnk to be passed into commands
@@ -118,13 +210,26 @@ func NewCLI() *Blnk {
 		Use:   "blnk",
 		Short: "Open source ledger",                       // Brief description for the CLI tool
 		Run:   func(cmd *cobra.Command, args []string) {}, // Main function for the root command
+
+		// A RUNTIME FAILURE IS NOT A USAGE ERROR. `blnk start` now returns its errors so the
+		// stack unwinds through every deferred shutdown instead of calling os.Exit from deep
+		// inside the command, and Cobra's default response to a returned error is to print the
+		// full usage text after it. For a server that failed to bind a port, or a
+		// configuration file that would not parse, that pushes the one line that says what
+		// happened above a screen of flag documentation which has nothing to do with it.
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 
 	// Add a persistent flag to the root command for specifying the config file.
-	rootCmd.PersistentFlags().StringVar(&configFile, "config", "./blnk.json", "Configuration file for wallet lite")
+	rootCmd.PersistentFlags().StringVar(&configFile, "config", defaultConfigFile,
+		"Configuration file to load. Absent by default, in which case configuration comes "+
+			"from the environment; a path given here must exist")
 
-	// Set the persistent pre-run hook to initialize the app and config before executing any command.
-	rootCmd.PersistentPreRunE = preRun(b)
+	// Set the persistent pre-run hook to initialize the app and config before executing any
+	// command. The flag's variable is passed by ADDRESS because this runs before Cobra has
+	// parsed the command line.
+	rootCmd.PersistentPreRunE = preRun(b, &configFile)
 
 	// Add various subcommands to the root command.
 	rootCmd.AddCommand(serverCommands(b))      // Command for starting the server
@@ -136,7 +241,6 @@ func NewCLI() *Blnk {
 }
 
 // executeCLI runs the root command, handling any errors that occur during execution.
-// It serves as the main entry point for the CLI application.
 func (w Blnk) executeCLI() {
 	if err := w.cmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err) // Print any errors that occur
@@ -145,7 +249,6 @@ func (w Blnk) executeCLI() {
 }
 
 // main is the main function and the entry point for the application.
-// It recovers from any panic, initializes the CLI, and executes it.
 func main() {
 	defer recoverPanic() // Ensure that any panic is handled gracefully
 

@@ -19,54 +19,77 @@ package blnk
 import (
 	"context"
 
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/internal/notification"
 	"github.com/blnkfinance/blnk/model"
 )
 
-// postLedgerActions performs some actions after a ledger has been created.
-// It sends the newly created ledger to the search index queue, which indexes the ledger in Typesense.
-// It also sends a webhook notification.
-//
-// Parameters:
-// - _ context.Context: The context for the operation (not used in this function).
-// - ledger *model.Ledger: A pointer to the newly created Ledger model.
-func (l *Blnk) postLedgerActions(_ context.Context, ledger *model.Ledger) {
+// postLedgerActions performs some actions after a ledger has been created. It sends the
+// newly created ledger to the search index queue, which indexes the ledger in
+// Typesense.
+func (l *Blnk) postLedgerActions(ctx context.Context, ledger *model.Ledger) {
+	// Derived outside the goroutine, while ctx is still live, and detached from
+	// cancellation for the same reason postBalanceActions detaches: CreateLedger is
+	// reached from the API with the request context, which net/http cancels as soon as the
+	// handler returns, and the enqueue below would then fail whenever the response won the
+	// race.
+	publishCtx := context.WithoutCancel(ctx)
+
 	go func() {
 		err := l.queue.queueIndexData(ledger.LedgerID, "ledgers", ledger)
 		if err != nil {
 			notification.NotifyError(err)
 		}
-		err = l.SendWebhook(NewWebhook{
+		err = l.publishEntityEventWhenUncaptured(publishCtx, ledger.LedgerID, NewWebhook{
 			Event:   "ledger.created",
 			Payload: ledger,
-		})
+		}, WithEventLedgerID(ledger.LedgerID))
 		if err != nil {
 			notification.NotifyError(err)
 		}
 	}()
 }
 
-// CreateLedger creates a new ledger.
-// It calls postLedgerActions after a successful creation.
+// ledgerCreatedEventPreparer returns the preparer that builds the ledger.created outbox
+// row, for the repository to insert INSIDE the transaction that inserts the ledger.
+func (l *Blnk) ledgerCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Ledger] {
+	// A NIL PREPARER when nothing is configured, so the repository stays on its
+	// single-statement path instead of opening a transaction to insert no event. See
+	// eventCaptureEnabled.
+	if !l.eventCaptureEnabled() {
+		return nil
+	}
+
+	return func(created model.Ledger) (*model.EventOutbox, error) {
+		return l.PrepareEventOutbox(ctx, NewWebhook{
+			Event:   "ledger.created",
+			Payload: &created,
+		}, WithEventLedgerID(created.LedgerID))
+	}
+}
+
+// CreateLedger creates a new ledger together with its ledger.created event, atomically.
 //
 // Parameters:
 // - ledger: A Ledger model representing the ledger to be created.
 //
 // Returns:
-// - model.Ledger: The created Ledger model.
-// - error: An error if the ledger could not be created.
+//   - model.Ledger: The created Ledger model.
+//   - error: An error if the ledger could not be created, or if its event could not be
+//     captured.
 func (l *Blnk) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
-	ledger, err := l.datasource.CreateLedger(ledger)
+	ctx := context.Background()
+
+	ledger, err := l.datasource.CreateLedger(ledger, l.ledgerCreatedEventPreparer(ctx))
 	if err != nil {
 		return model.Ledger{}, err
 	}
-	l.postLedgerActions(context.Background(), &ledger)
+	l.postLedgerActions(ctx, &ledger)
 	return ledger, nil
 }
 
 // GetAllLedgers retrieves all ledgers from the datasource.
-// It returns a slice of Ledger models and an error if the operation fails.
 //
 // Returns:
 // - []model.Ledger: A slice of Ledger models.
@@ -76,7 +99,6 @@ func (l *Blnk) GetAllLedgers(limit, offset int) ([]model.Ledger, error) {
 }
 
 // GetAllLedgersWithFilter retrieves ledgers from the datasource using advanced filters.
-// It returns a slice of Ledger models and an error if the operation fails.
 //
 // Parameters:
 // - ctx: Context for the operation.
@@ -109,7 +131,6 @@ func (l *Blnk) GetAllLedgersWithFilterAndOptions(ctx context.Context, filters *f
 }
 
 // GetLedgerByID retrieves a ledger by its ID from the datasource.
-// It returns a pointer to the Ledger model and an error if the operation fails.
 //
 // Parameters:
 // - id: A string representing the ID of the ledger to retrieve.
@@ -122,7 +143,6 @@ func (l *Blnk) GetLedgerByID(id string) (*model.Ledger, error) {
 }
 
 // UpdateLedger updates an existing ledger's name.
-// It calls postLedgerActions after a successful update to handle indexing and webhooks.
 //
 // Parameters:
 // - id: A string representing the ID of the ledger to update.

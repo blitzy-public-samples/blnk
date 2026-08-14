@@ -1,17 +1,155 @@
 global:
   scrape_interval: 15s
 
+  # external_labels are attached to every scraped series AND are readable from an
+  # alerting rule's annotations as $externalLabels, which is what makes them the
+  # supported way to inject a per-deployment value into a rule file that is
+  # otherwise identical everywhere.
+  #
+  # runbook_base_url is the documentation base every rule's runbook_url resolves
+  # against. Each rule renders
+  #     {{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}<public docs>{{ end }}#<rule>
+  # so an unset label yields the public copy of docs/kafka-operations.md and a set
+  # one yields this deployment's own copy — in both cases with the fragment naming
+  # the rule that fired, so the link opens that rule's procedure rather than the top
+  # of a 1,200-line document.
+  #
+  # UNCOMMENT AND POINT IT AT YOUR OWN RUNBOOK if you publish one. Leave it commented
+  # to use the public documentation; the rules work either way, which is why this is
+  # not required configuration.
+  # Left fully commented rather than declared empty, deliberately: an
+  # `external_labels:` key with every entry commented out parses as null, and a
+  # null where a mapping is expected is the kind of change that breaks a
+  # configuration load for a value nobody is using yet.
+  # external_labels:
+  #   runbook_base_url: 'https://runbooks.internal.example/blnk/kafka'
+
+# Alerting rules to evaluate. A rule file is inert unless it is listed here,
+# so this stanza — not the mere presence of the file — is what arms the
+# FIFTEEN rules in alerts/blnk-kafka-alerts.yml: nine CONDITION rules (a
+# dead-letter entry unresolved for more than 15 minutes, a relay repair leg
+# unable to clear its backlog for the same fifteen minutes, an outbox claim
+# that is timing out so nothing is published, a subscriber consumer group
+# trailing by more than 10,000 messages, a credential awaiting revocation for
+# over an hour, an unaccounted credential, a revocation the broker refused, and
+# the two subscriber-settlement rules) and six
+# MEASURABILITY rules that
+# fire when Blnk cannot tell whether a condition rule should — degraded lag
+# measurement, a stale or incomplete lag rotation, and the three
+# event-metrics-collector rules. Those rules match on the Prometheus forms of
+# the OTel instrument names declared in internal/metrics/metrics.go, dots
+# becoming underscores.
+#
+# NONE OF THEM CAN FIRE UNLESS /metrics EXISTS, which takes
+# BLNK_ENABLE_OBSERVABILITY=true on the scraped role — both Compose files now
+# default it to true, and blnk-config.yaml ships it true for Kubernetes.
+# Without it neither role registers the endpoint and every scrape below 404s.
+#
+# The pattern below is a path INSIDE the Prometheus container, not a
+# repository path: the prometheus service bind-mounts this repository's
+# ./alerts directory into /etc/prometheus/alerts, alongside ./prometheus.yml
+# at /etc/prometheus/prometheus.yml. Keep that mount in step with this path —
+# otherwise the rules never load, which shows up as their absence from /rules
+# rather than as a startup error.
+#
+# The glob is deliberate. It resolves for either mount style, file-level
+#   ./alerts/blnk-kafka-alerts.yml:/etc/prometheus/alerts/blnk-kafka-alerts.yml
+# or directory-level
+#   ./alerts:/etc/prometheus/alerts
+# it picks up rule files added to ./alerts later without a further edit here,
+# and it keeps `promtool check config prometheus.yml` usable on a host that
+# has no /etc/prometheus, where a literal path instead fails outright with
+# "does not point to an existing file". A matched glob is still validated in
+# full, so nothing is traded away for that robustness.
+#
+# THIS FILE EXISTS TWICE. Kubernetes has no bind mounts, so both this
+# configuration and the rule file travel as data in
+# infrastructure/k8s-manifests/prometheus-configmap.yaml. Edit BOTH copies
+# together: two hand-maintained copies of an alerting configuration diverge
+# silently — each file stays valid, each reads correctly in review, and the
+# only symptom is one environment alerting while the other does not.
+#
+# That is checked rather than trusted. TestPrometheusConfigParity_KeepsThe
+# KubernetesCopyInStepWithTheRoot compares the two copies SEMANTICALLY, and
+# TestPrometheusRuleFiles_AreMountedWhereTheGlobResolves asserts that both
+# Compose files mount a source at the directory this glob resolves against.
+# Either edit made alone fails a test instead of shipping.
+rule_files:
+  - '/etc/prometheus/alerts/*.yml'
+
+# AUTHENTICATION — ENABLED UNCONDITIONALLY, AND THAT TOOK A COMPOSE CHANGE TO
+# MAKE SAFE.
+#
+# Blnk's /metrics endpoint is guarded by MetricsAuth, whose behaviour depends on
+# two settings and has three distinct outcomes:
+#
+#   1. server.secure false, no metrics_bearer_token  -> every scrape succeeds
+#      unauthenticated. MetricsAuth calls c.Next() WITHOUT READING the
+#      Authorization header at all when no token is configured, so the bearer the
+#      jobs below present is simply ignored.
+#   2. metrics_bearer_token SET                      -> every request without
+#      `Authorization: Bearer <token>` is refused. This is the case that used to
+#      break: the jobs collected NOTHING, every series the fifteen Kafka alert
+#      rules match on was absent, and the rules reported no error while being
+#      unable to fire. Prometheus showed the targets down. An alert that cannot
+#      fire looks exactly like a system with nothing wrong, which made this the
+#      worst kind of gap — the monitoring stack came up green and measured
+#      nothing.
+#   3. server.secure true with NO metrics_bearer_token -> the endpoint refuses
+#      every request outright, including authenticated ones. Set a token.
+#
+# Cases 1 and 2 are BOTH served by the configuration as written, which is what
+# lets it be unconditional. The authorization blocks below were previously
+# commented out for a real reason — credentials_file is validated at CONFIG LOAD,
+# so Prometheus REFUSES TO START when the file is absent, and enabling them
+# against a host path would have broken every token-less local stack to fix a
+# case that does not apply to it. The old remedy was a comment telling the
+# operator to create the file by hand, and an instruction nobody executes is not
+# a control.
+#
+# WHAT CHANGED: the file is now always present. The `prometheus-init` one-shot in
+# both compose files writes it into the `prometheus_secrets` volume before
+# Prometheus starts, on every bring-up, from the same BLNK_METRICS_BEARER_TOKEN
+# the server and worker read — so the scrape credential cannot drift from the one
+# that gates the endpoint. With no token configured the file is EMPTY, which
+# Prometheus accepts, and case 1 above is why an empty bearer is harmless.
+# Prometheus gates on that one-shot COMPLETING, so the ordering is enforced
+# rather than hoped for.
+#
+# This is now the same posture as the Kubernetes copy in
+# infrastructure/k8s-manifests/prometheus-configmap.yaml, where it always was
+# unconditional — one fewer difference between the two environments, and
+# TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot normalises
+# scrape authentication away before comparing them, so neither side constrains
+# the other here.
+#
+# Use credentials_file and NOT inline `credentials`. Inline would put the token
+# into this committed file, which is how tokens end up in version control
+# history; and credentials_file is re-read on every scrape, so rotating the
+# token needs no restart.
+#
+# Verify at http://localhost:9090: /targets must show both jobs UP, and /rules
+# must list DeadLetterMessageStuck and SubscriberConsumerLagHigh. Checking
+# /targets alone is not enough — a target can be UP while the rules never loaded.
+#
+# NOTE FOR HOST-SIDE TOOLING: `promtool check config prometheus.yml` run on the
+# HOST fails on the credentials_file path, which exists only inside the
+# container. That is not a defect in this file. The alert gate — `make alerts`
+# and the CI job — runs `check rules` and `test rules` against alerts/, never
+# `check config` against this file, so nothing in the build depends on the path
+# resolving outside the container. To check this file, check it where it runs:
+#   docker compose --profile monitoring exec prometheus \
+#     promtool check config /etc/prometheus/prometheus.yml
 scrape_configs:
   - job_name: 'blnk-server'
-    # Uncomment to authenticate when metrics_bearer_token is configured in blnk.json:
-    # authorization:
-    #   type: Bearer
-    #   credentials: '<your-metrics-bearer-token>'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics-bearer-token
     static_configs:
       - targets: ['server:5001']
   - job_name: 'blnk-worker'
-    # authorization:
-    #   type: Bearer
-    #   credentials: '<your-metrics-bearer-token>'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics-bearer-token
     static_configs:
       - targets: ['worker:5004']

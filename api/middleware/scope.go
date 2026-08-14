@@ -19,11 +19,9 @@ package middleware
 import "strings"
 
 // Resource represents a protected API resource that can be accessed via API keys.
-// Each resource corresponds to a specific API endpoint category.
 type Resource string
 
 // Action represents the allowed actions on a resource.
-// Actions include read, write, delete, and wildcard (*).
 type Action string
 
 const (
@@ -46,6 +44,8 @@ const (
 	ResourceReconciliation  Resource = "reconciliation"
 	ResourceMetadata        Resource = "metadata"
 	ResourceBackup          Resource = "backup"
+	ResourceEvents          Resource = "events"
+	ResourceSubscribers     Resource = "subscribers"
 	ResourceAll             Resource = "*"
 )
 

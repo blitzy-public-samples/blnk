@@ -1,0 +1,55 @@
+# THE WORKER'S METRICS ENDPOINT, WITHOUT WHICH IT IS NEVER SCRAPED.
+#
+# prometheus-configmap.yaml declares a `blnk-worker` scrape job pointing at
+# `worker:5004`, and there was no Service named `worker` in this folder. A Prometheus
+# static target is a DNS name, and a Deployment does not create one — only a Service
+# does. So every scrape of this role failed to resolve, and the failure was as quiet
+# as a monitoring failure can be: the job simply showed as down in a UI nobody had a
+# reason to open, while the server job beside it stayed up. The alerting this feature
+# depends on reads gauges the WORKER publishes, so "the worker is not scraped" means
+# the dead-letter age and consumer-lag rules evaluate on a metric that is only ever
+# half-collected.
+#
+# ClusterIP, NOT LoadBalancer, and the difference from server-service.yaml is
+# deliberate. The server is a public JSON API and is meant to be reachable from
+# outside the cluster. This Service exists solely so that Prometheus, which runs
+# inside it, can resolve one name — and 5004 serves /metrics, which discloses ledger
+# throughput, balance counts and queue depths. Publishing that through an external
+# load balancer would put operational telemetry on the internet in order to solve a
+# name-resolution problem inside the cluster. ClusterIP is also the default, and it is
+# stated explicitly here rather than left implicit so the choice is legible next to
+# its externally-published neighbour.
+#
+# /metrics IS STILL AUTHENTICATED. This Service makes the endpoint REACHABLE, not
+# open: it requires the bearer token from Secret blnk-metrics-token, which
+# worker-deployment.yaml now projects so the worker can verify what
+# prometheus-deployment.yaml presents. Reachability and authorization are separate
+# concerns and both are needed — before this file the endpoint was unreachable, and
+# before the worker held the token it could not have validated a scrape that reached
+# it.
+#
+# The selector must match worker-deployment.yaml's pod labels exactly. A Service whose
+# selector matches nothing resolves to a name with no endpoints, which fails in
+# exactly the same way as having no Service at all while looking correct in `kubectl
+# get svc`.
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    kompose.cmd: kompose convert -f docker-compose.yaml -o k8s-manifests/
+    kompose.version: 1.26.1 (a9d05d509)
+  creationTimestamp: null
+  labels:
+    io.kompose.service: worker
+  name: worker
+  namespace: blnk
+spec:
+  type: ClusterIP
+  ports:
+    - name: "5004"
+      port: 5004
+      targetPort: 5004
+  selector:
+    io.kompose.service: worker
+status:
+  loadBalancer: {}
